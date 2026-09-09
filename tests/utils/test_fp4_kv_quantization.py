@@ -330,12 +330,22 @@ def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
     k_head_dim, v_head_dim = 64, 128
 
     def rand_cache(hd):
-        return torch.randint(0, 256, (num_pages, page_size, num_kv_heads, hd // 2),
-                             dtype=torch.uint8, device="cuda")
+        return torch.randint(
+            0,
+            256,
+            (num_pages, page_size, num_kv_heads, hd // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        )
 
     def rand_scales(hd):
-        return torch.randint(1, 120, (num_pages, page_size, num_kv_heads, hd // 16),
-                             dtype=torch.uint8, device="cuda").view(torch.float8_e4m3fn)
+        return torch.randint(
+            1,
+            120,
+            (num_pages, page_size, num_kv_heads, hd // 16),
+            dtype=torch.uint8,
+            device="cuda",
+        ).view(torch.float8_e4m3fn)
 
     k_cache_nhd, v_cache_nhd = rand_cache(k_head_dim), rand_cache(v_head_dim)
     k_scales_nhd, v_scales_nhd = rand_scales(k_head_dim), rand_scales(v_head_dim)
@@ -349,7 +359,9 @@ def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
     k_scales = make_non_contiguous_last_dim_view(to_layout(k_scales_nhd))
     v_scales = make_non_contiguous_last_dim_view(to_layout(v_scales_nhd))
 
-    block_tables = torch.tensor([[2, 5, 1], [6, 3, 0]], dtype=torch.int32, device="cuda")
+    block_tables = torch.tensor(
+        [[2, 5, 1], [6, 3, 0]], dtype=torch.int32, device="cuda"
+    )
     seq_lens = torch.tensor([7, 4], dtype=torch.int32, device="cuda")
     k_scale_val, v_scale_val = 0.7601996, 0.31234
     k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device="cuda")
@@ -366,8 +378,15 @@ def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
     output_k, output_v = offset_output(k_head_dim), offset_output(v_head_dim)
 
     flashinfer.nvfp4_kv_dequantize_paged(
-        (k_cache, v_cache), (k_scales, v_scales), block_tables, seq_lens, k_scale, v_scale,
-        output_k, output_v, kv_layout=kv_layout,
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        block_tables,
+        seq_lens,
+        k_scale,
+        v_scale,
+        output_k,
+        output_v,
+        kv_layout=kv_layout,
     )
 
     ref_k = torch.full_like(output_k, 123.0)
@@ -377,9 +396,11 @@ def test_nvfp4_kv_dequantize_paged_bitexact_unaligned(kv_layout, dtype):
             page = int(block_tables[batch_idx, token_idx // page_size].item())
             entry = token_idx % page_size
             ref_k[batch_idx, token_idx] = reference_dequant(
-                k_cache_nhd[page, entry], k_scales_nhd[page, entry], k_scale_val, dtype)
+                k_cache_nhd[page, entry], k_scales_nhd[page, entry], k_scale_val, dtype
+            )
             ref_v[batch_idx, token_idx] = reference_dequant(
-                v_cache_nhd[page, entry], v_scales_nhd[page, entry], v_scale_val, dtype)
+                v_cache_nhd[page, entry], v_scales_nhd[page, entry], v_scale_val, dtype
+            )
 
     # invalid rows are left at the sentinel in both, so a full bit-exact compare is valid
     assert_bit_identical(output_k, ref_k)

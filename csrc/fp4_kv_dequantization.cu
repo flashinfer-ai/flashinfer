@@ -40,9 +40,9 @@ __device__ __constant__ float E2M1_LUT[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f, 
 __device__ __forceinline__ float e2m1_to_f32(uint32_t n) {
   const uint32_t e = (n >> 1) & 0x3u;
   const uint32_t m = n & 0x1u;
-  const float mag = (e == 0u) ? (0.5f * static_cast<float>(m))
-                              : (static_cast<float>(1u << (e - 1u)) *
-                                 (1.0f + 0.5f * static_cast<float>(m)));
+  const float mag =
+      (e == 0u) ? (0.5f * static_cast<float>(m))
+                : (static_cast<float>(1u << (e - 1u)) * (1.0f + 0.5f * static_cast<float>(m)));
   return (n & 0x8u) ? -mag : mag;
 }
 
@@ -177,10 +177,10 @@ __global__ void nvfp4_paged_dequant_blockwise_kernel(
     alignas(16) OutType res[16];
     decode_block<OutType>(w0, w1, static_cast<float>(sc), global_scale, res);
 
-    OutType* row_out = output +
-                       ((static_cast<int64_t>(batch) * max_seq_len + token) * num_heads + head) *
-                           head_dim +
-                       static_cast<int64_t>(blk) * 16;
+    OutType* row_out =
+        output +
+        ((static_cast<int64_t>(batch) * max_seq_len + token) * num_heads + head) * head_dim +
+        static_cast<int64_t>(blk) * 16;
     if constexpr (ALIGNED) {
       reinterpret_cast<float4*>(row_out)[0] = reinterpret_cast<const float4*>(res)[0];
       reinterpret_cast<float4*>(row_out)[1] = reinterpret_cast<const float4*>(res)[1];
