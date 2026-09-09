@@ -16,6 +16,11 @@ limitations under the License.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 import pytest
@@ -30,7 +35,7 @@ INTEGER_DTYPES = (
 )
 
 
-def _skip_if_not_supported(use_cp: bool = False):
+def _skip_if_not_supported():
     """Skip where no GDN prefill kernel exists for this device."""
     device = torch.device("cuda")
     major, _ = get_compute_capability(device)
@@ -159,7 +164,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     """A pool + state_indices in-place update must match the packed,
     sequence-ordered baseline bitwise (the kernel math is identical; only the
     addressed gmem row differs)."""
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     D = 128
     num_seqs = len(seq_lens)
@@ -207,7 +212,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_integer_index_dtypes(index_dtype, use_cp):
     """Sequence and state indices retain their integer dtype across dispatch."""
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 8, 128
     seq_lens = [64]
@@ -254,7 +259,7 @@ def test_prefill_integer_index_dtypes(index_dtype, use_cp):
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_preserves_inner_strides(use_cp):
     """Indexed state views use the tensor's actual shape and strides."""
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 8, 128
     seq_lens = [64]
@@ -399,7 +404,7 @@ def test_prefill_state_indices_rejects_auto_pool_without_initial_state():
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_without_final_state(use_cp):
     """A state pool can supply initial state without requesting a final state."""
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [64, 512]
@@ -442,7 +447,7 @@ def test_prefill_state_indices_without_final_state(use_cp):
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_none_is_default(use_cp):
     """state_indices=None must reproduce the packed path exactly (default)."""
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 192]
@@ -468,7 +473,7 @@ def test_prefill_initial_state_without_final_state(use_cp):
     combination did not compile at all. It is a public contract: a caller may
     start from a state and want only the output.
     """
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 8, 128
     seq_lens = [256, 512]
@@ -526,7 +531,7 @@ def test_prefill_state_indices_pools_of_different_sizes(use_cp):
     staying put says nothing about whether the selected ones hold the right
     numbers, or whether the right initial row was read.
     """
-    _skip_if_not_supported(use_cp)
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 8, 128
     seq_lens = [256, 512]
@@ -619,3 +624,67 @@ def test_prefill_state_indices_pools_of_different_sizes(use_cp):
         assert torch.equal(out_pool[r], sentinel[r]), (
             f"output pool row {r} was written although no sequence selected it"
         )
+
+
+def _run_invalid_slot_child(case_name):
+    """Launch the native prefill with one out-of-pool `state_indices` entry.
+
+    Runs in a child process: the bounds check is a device-side assert, which
+    poisons the CUDA context for everything that follows it.
+    """
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [128]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=0
+    )
+    perm = [1]
+    pool = _make_pool(init_state, perm, 3, 0, torch.float32, device)
+    idx = torch.tensor(perm, dtype=torch.int32, device=device)
+    idx[0] = -1 if case_name == "negative" else int(pool.shape[0])
+    _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp=False)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("case_name", ("negative", "upper"))
+def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(case_name):
+    """An id outside [0, N_pool) must be caught, not read past the pool.
+
+    The overrun is otherwise silent: the caching allocator carves both pools out
+    of a much larger block, so an out-of-range slot lands in a neighbouring
+    tensor and neither the kernel nor compute-sanitizer reports anything.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(repo_root), *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])]
+    )
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--invalid-slot", case_name],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+    )
+    combined = completed.stdout + completed.stderr
+    if "SKIP" in combined:
+        pytest.skip(combined.strip().splitlines()[-1])
+    assert completed.returncode != 0, combined
+    assert "_assert_async_cuda_kernel" in combined, combined
+    assert "GDN prefill state_indices must contain slots in" in combined, combined
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--invalid-slot":
+    # Report the skip on stdout rather than through pytest.skip: this runs as a
+    # plain script, and the parent turns the marker into the skip.
+    if not torch.cuda.is_available():
+        print("SKIP: no CUDA device")
+    elif get_compute_capability(torch.device("cuda"))[0] not in (8, 9, 10, 12):
+        print("SKIP: no GDN prefill kernel for this device")
+    elif (
+        is_sm100a_supported(torch.device("cuda"))
+        and (int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0) < 13
+    ):
+        print("SKIP: SM100 GDN prefill requires CUDA 13+")
+    else:
+        _run_invalid_slot_child(sys.argv[2])
