@@ -47,12 +47,40 @@ FMHA Decode
 
     batch_decode_with_paged_kv_cache
     get_prims_ts_batch_decode_workspace_size
+    prepare_prims_ts_batch_decode_with_kv_cache
     prims_ts_batch_decode_with_kv_cache
+
+.. autoclass:: PrimsTSBatchDecodePlan
+    :members:
 
 .. autoclass:: BatchDecodePagedTSWrapper
     :members:
 
     .. automethod:: __init__
+
+QToken-KvBlock-Sparse-Attention
+--------------------------------
+
+QToken-KvBlock-Sparse-Attention consumes per-query
+``indexer_block_ids[total_q, block_topk]`` and a dense physical
+``block_table``. Packed prefill uses ``[total_q, Hq, D]`` with
+``qo_indptr``; fixed MTP decode uses ``[B, Nq, G, Hq, D]``.
+``kv_block_size`` is the semantic sparse K/V atom and currently supports
+only four tokens. The wrapper plans capacity outside CUDA Graph capture and
+runs live route metadata on the hot path.
+
+.. autosummary::
+    :toctree: ../generated
+
+    QTokenKvBlockSparsePagedTSWrapper
+    get_q_token_kv_block_sparse_workspace_size
+    q_token_kv_block_sparse_attention_with_paged_kv_cache
+    validate_q_token_kv_block_sparse_group_size
+    suggest_q_token_kv_block_sparse_group_size
+    make_q_token_kv_block_sparse_qo_indptr
+
+.. autoclass:: QTokenKvBlockSparsePagedTSWrapper
+    :members:
 
 Block-Sparse FMHA
 -----------------

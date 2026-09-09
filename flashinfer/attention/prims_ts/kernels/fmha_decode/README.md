@@ -17,6 +17,40 @@ control (CLC) assigns work to resident CTAs. Underfilled fixed-Q grids may
 instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
+QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
+blocks and causal tail directly through the dense page table. Q2/Q4/Q5 sort at
+most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
+shared memory, unique equal logical IDs while OR-reducing query-membership
+bits, and map only the compact union. Work and temporary storage therefore do
+not scale with the configured model length or global cache capacity. Plain
+Int32 locators and packed membership words remain separate outputs; membership
+bits are never fused into a locator.
+
+The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
+(PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
+release only after their page indices, membership words, and sequence lengths
+are published. Every active attention CTA allocates and initializes its task
+barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
+read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
+initialization and acquire, then contracts the useful runtime prefix. Pruned
+split CTAs use the same TMEM teardown and dependent-release helpers before a
+CTA-uniform PTX exit. Padded packed-Q CTAs have no task resources; they still
+acquire through their explicit zero-work path and signal a following reducer
+when one exists. A final nonsplit attention grid has no dependent to release.
+Standalone attention over an already-built QToken-KvBlock-Sparse-Attention metadata triple remains stream
+ordered and does not enter this PDL chain.
+
+When split-KV uses a separate reduction kernel, each active attention CTA
+signals at its true tail after task completion and TMEM teardown. Deferred QToken-KvBlock-Sparse-Attention
+split padding retires as described above, while other runtime-inactive CTAs use
+their terminal zero-work branch. The reducer initializes its register state
+and any required shared-memory storage, then waits before reading any
+producer-written partial output or statistics.
+Independent query-offset metadata may be read before that wait. QToken-KvBlock-Sparse-Attention sequence
+lengths remain behind it because they originate in the metadata producer two
+PDL stages upstream. This preserves producer-to-reducer overlap while gating
+every producer-dependent global-memory read.
+
 ## Public APIs
 
 Import these entry points from `flashinfer.attention.prims_ts`:
@@ -26,6 +60,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
+| `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
@@ -63,26 +98,12 @@ skips change the effective domain; persistent Q-dependent causal plans do the
 same while recycling the task graph. This kernel mode is independent of
 whether the plan or run owns the length vector.
 
-## Shared decode wrapper
+## Dense page tables only
 
-`flashinfer.BatchDecodeWithPagedKVCacheWrapper(..., backend="prims-ts")`
-adapts the shared CSR planning API to the native fixed-table interface.
-Optional `seq_lens` accepts `uint32`, `int32`, or `int64` CPU/CUDA tensors;
-planning copies validated lengths into owned int32 CUDA storage. Call `plan()`
-again to change these lengths. An explicit `block_tables` must be an int32 or
-uint32 CUDA tensor on the wrapper device, with unit inner stride and
-non-overlapping rows. The adapter retains int32 tables directly and uses an
-int32 view of uint32 tables, preserving storage and subsequent caller updates.
-Active page IDs must fit in signed int32 and index the physical cache;
-inactive entries are ignored. When omitted, the table is derived from the CSR
-inputs during planning.
-
-This backend requires `kv_layout="HND"` and does not support the shared
-wrapper's `use_cuda_graph=True` replanning flow. Manual capture of `run()` is
-supported after planning, but binds to that completed plan. Keep the wrapper
-and captured tensors alive, and recapture after re-planning. Page IDs may
-change between completed replays while the captured storage and layout stay
-fixed; plan-owned sequence lengths may not.
+Use `BatchDecodePagedTSWrapper` or the standalone PrimTS APIs with a dense
+`[B, max_pages]` block table. CSR inputs and the shared
+`BatchDecodeWithPagedKVCacheWrapper(backend="prims-ts")` adapter are not
+supported. Rows may have padding between them; each row must be contiguous.
 
 ## Supported contract
 
@@ -96,7 +117,7 @@ fixed; plan-owned sequence lengths may not.
 | Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
-| Page size | 16, 32, 64, or 128 tokens |
+| Page size | 4, 16, 32, 64, or 128 tokens |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
@@ -209,7 +230,11 @@ num_pages = B * pages_per_request
 
 q = torch.randn(B, Hq, D, device=device, dtype=torch.float16)
 kv = torch.randn(
-    num_pages, 2, Hkv, page_size, D,
+    num_pages,
+    2,
+    Hkv,
+    page_size,
+    D,
     device=device,
     dtype=torch.float16,
 )

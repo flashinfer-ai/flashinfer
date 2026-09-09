@@ -393,15 +393,15 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
         "flashinfer.attention.prims_ts.decode",
         "batch_decode_with_paged_kv_cache",
-    ): 12,
+    ): 24,
     (
         "flashinfer.attention.prims_ts.decode",
         "prims_ts_batch_decode_with_kv_cache",
-    ): 12,
+    ): 24,
     (
         "flashinfer.attention.prims_ts.decode",
         "BatchDecodePagedTSWrapper.run",
-    ): 24,
+    ): 48,
     (
         "flashinfer.attention.prims_ts.mla_decode",
         "batch_mla_decode_with_paged_kv_cache",
@@ -775,6 +775,8 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
 
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_wrapper._plan_state = SimpleNamespace(
+        page_size=page_size,
+        storage_page_size=page_size,
         use_packed_q=False,
         seq_len_q=seq_len_q,
         output_dtype=torch.bfloat16,
@@ -892,6 +894,125 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     assert "window_left" not in fmha_definitions[2]["inputs"]
 
 
+def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages():
+    """Encoded locators retain semantic page four over larger cache pages."""
+    from flashinfer.attention.prims_ts.decode import (
+        BatchDecodePagedTSWrapper,
+        batch_decode_with_paged_kv_cache,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+    from flashinfer.fi_trace import fi_trace
+    from flashinfer.trace.templates.attention import (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+    )
+
+    batch_size, seq_len_q, max_seq_len = 2, 4, 64
+    semantic_page_size, storage_page_size = 4, 32
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 64
+    num_physical_pages = batch_size * max_seq_len // storage_page_size
+    max_num_semantic_pages = max_seq_len // semantic_page_size
+    q = torch.empty(batch_size, seq_len_q, num_qo_heads, head_dim, dtype=torch.bfloat16)
+    k_cache = torch.empty(
+        num_physical_pages,
+        num_kv_heads,
+        storage_page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.empty_like(k_cache)
+    block_table = torch.arange(
+        batch_size * max_num_semantic_pages, dtype=torch.int32
+    ).reshape(batch_size, max_num_semantic_pages)
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32)
+    workspace = torch.empty(4096, dtype=torch.uint8)
+
+    one_shot_kwargs = {
+        "q": q,
+        "paged_kv_cache": (k_cache, v_cache),
+        "block_tables": block_table,
+        "seq_lens_kv": seq_lens,
+        "seq_len_q": seq_len_q,
+        "page_size": semantic_page_size,
+    }
+    standalone_kwargs = {
+        "query": q,
+        "kv_cache": (k_cache, v_cache),
+        "workspace_buffer": workspace,
+        "block_tables": block_table,
+        "seq_lens": seq_lens,
+        "max_seq_len": max_seq_len,
+        "seq_len_q": seq_len_q,
+        "page_size": semantic_page_size,
+    }
+
+    direct_templates = (
+        attention_ts_decode_trace_dispatch(**one_shot_kwargs),
+        prims_ts_decode_trace_dispatch(**standalone_kwargs),
+    )
+    for template in direct_templates:
+        assert "_encoded_page4" in template.name_prefix
+        assert template.axes["page_size"].value == semantic_page_size
+        assert template.inputs["semantic_page_size"].param == "page_size"
+        assert template.inputs["semantic_page_size"].optional is False
+
+    definitions = (
+        batch_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs),
+        prims_ts_batch_decode_with_kv_cache.fi_trace(**standalone_kwargs),
+    )
+    for definition in definitions:
+        assert "_encoded_page4" in definition["name"]
+        assert definition["axes"]["storage_page_size"]["value"] == 32
+        assert definition["axes"]["page_size"]["value"] == 4
+        assert "optional" not in definition["inputs"]["semantic_page_size"]
+        assert "storage_page_size > page_size" in definition["constraints"]
+        assert "storage_page_size % page_size == 0" in definition["constraints"]
+        for cache_name in ("k_cache", "v_cache"):
+            assert definition["inputs"][cache_name]["shape"] == [
+                "num_pages",
+                "num_kv_heads",
+                "storage_page_size",
+                "head_dim",
+            ]
+
+    default_template = attention_ts_decode_trace_dispatch(
+        **{**one_shot_kwargs, "page_size": storage_page_size}
+    )
+    assert "_encoded_page4" not in default_template.name_prefix
+    assert "storage_page_size" not in default_template.axes
+    assert "semantic_page_size" not in default_template.inputs
+
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        page_size=semantic_page_size,
+        storage_page_size=storage_page_size,
+        use_packed_q=False,
+        seq_len_q=seq_len_q,
+        output_dtype=torch.bfloat16,
+        mask_type="causal",
+        window_left=-1,
+        max_kv_len=max_seq_len,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
+    )
+    wrapper_kwargs = dict(
+        q=q,
+        paged_kv_cache=(k_cache, v_cache),
+        seq_lens=seq_lens,
+        block_tables=block_table,
+    )
+    wrapper_definition = fi_trace(wrapper.run, **wrapper_kwargs)
+    assert "_encoded_page4" in wrapper_definition["name"]
+    assert wrapper_definition["axes"]["storage_page_size"]["value"] == 32
+    assert wrapper_definition["axes"]["page_size"]["value"] == 4
+    assert "semantic_page_size" not in wrapper_definition["inputs"]
+
+    wrapper._plan_state.storage_page_size = 16
+    with pytest.raises(ValueError, match="does not match the wrapper plan"):
+        fi_trace(wrapper.run, **wrapper_kwargs)
+
+
 def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
     """An omitted out override must retain the wrapper plan's output dtype."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
@@ -913,6 +1034,8 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
 
     wrapper = BatchDecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
+        page_size=page_size,
+        storage_page_size=page_size,
         use_packed_q=False,
         seq_len_q=1,
         output_dtype=torch.float16,
@@ -952,6 +1075,8 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
 
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_wrapper._plan_state = SimpleNamespace(
+        page_size=page_size,
+        storage_page_size=page_size,
         use_packed_q=True,
         seq_len_q=3,
         output_dtype=torch.bfloat16,
@@ -1052,6 +1177,8 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
         "qo_indptr": qo_indptr,
     }
     fmha_base = {
+        "page_size": page_size,
+        "storage_page_size": page_size,
         "use_packed_q": True,
         "seq_len_q": 3,
         "output_dtype": torch.bfloat16,

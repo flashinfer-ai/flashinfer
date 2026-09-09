@@ -97,6 +97,9 @@ from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
+from .q_token_kv_block_sparse_metadata import (
+    gen_prims_ts_q_token_kv_block_sparse_metadata_module as gen_prims_ts_q_token_kv_block_sparse_metadata_module,
+)
 from .fp4_kv_dequantization import (
     gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
 )
