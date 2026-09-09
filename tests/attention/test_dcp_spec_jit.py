@@ -11,7 +11,7 @@ import torch
 
 import flashinfer.cake_dcp as cake_dcp
 
-from flashinfer.dcp import (
+from flashinfer.cake_dcp import (
     _select_fp8_num_split,
     _select_num_split,
     get_dcp_spec_counter_bytes,
@@ -19,7 +19,7 @@ from flashinfer.dcp import (
     run_dcp_spec_decode,
 )
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from flashinfer.jit.dcp import get_dcp_spec_fp8_uri, get_dcp_spec_uri
+from flashinfer.jit.cake_dcp import get_dcp_spec_fp8_uri, get_dcp_spec_uri
 from flashinfer.jit.cake_fmha import (
     CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
     CAKE_FMHA_MANIFEST_SHA256,
@@ -53,7 +53,7 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
 
 
 def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
-    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
     monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
     monkeypatch.setattr(
@@ -204,7 +204,7 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
 def test_dcp_target_keeps_independent_architecture_baselines(
     monkeypatch, capability, target
 ) -> None:
-    dcp = importlib.import_module("flashinfer.dcp")
+    dcp = importlib.import_module("flashinfer.cake_dcp")
     monkeypatch.setattr(dcp, "get_compute_capability", lambda _device: capability)
     monkeypatch.setattr(dcp, "_is_cuda_version_at_least", lambda _version: True)
     assert dcp._select_target(None) == target
@@ -255,10 +255,10 @@ def _empty_rank_inputs(
 
 
 def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
-    dcp = importlib.import_module("flashinfer.dcp")
+    dcp = importlib.import_module("flashinfer.cake_dcp")
     launches = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)
@@ -271,10 +271,10 @@ def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
 def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
     monkeypatch,
 ) -> None:
-    dcp = importlib.import_module("flashinfer.dcp")
+    dcp = importlib.import_module("flashinfer.cake_dcp")
     launches = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(jit_dcp, "load_dcp_spec_fp8_module", lambda *args: module)
@@ -298,11 +298,11 @@ def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
 def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     monkeypatch,
 ) -> None:
-    dcp = importlib.import_module("flashinfer.dcp")
+    dcp = importlib.import_module("flashinfer.cake_dcp")
     launches = []
     loader_calls = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(
@@ -336,7 +336,7 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
 
 
 def test_bf16_page16_rejects_nonunit_bmm2_scale(monkeypatch) -> None:
-    dcp = importlib.import_module("flashinfer.dcp")
+    dcp = importlib.import_module("flashinfer.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     with pytest.raises(ValueError, match="BF16/page16"):
@@ -344,10 +344,10 @@ def test_bf16_page16_rejects_nonunit_bmm2_scale(monkeypatch) -> None:
 
 
 def test_bf16_page16_q3_reaches_native_v1_route(monkeypatch) -> None:
-    dcp = importlib.import_module("flashinfer.dcp")
+    dcp = importlib.import_module("flashinfer.cake_dcp")
     launches = []
     module = SimpleNamespace(run=lambda *args: launches.append(args))
-    jit_dcp = importlib.import_module("flashinfer.jit.dcp")
+    jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
     monkeypatch.setattr(dcp, "_select_target", lambda _device: "sm100a")
     monkeypatch.setattr(jit_dcp, "load_dcp_spec_module", lambda *args: module)

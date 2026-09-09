@@ -194,6 +194,7 @@ def _is_authenticated_request_ordered_plan(
 
 def _run_cake_fmha_request_ordered_paged_decode(
     *,
+    backend: Literal["cake"],
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -210,7 +211,11 @@ def _run_cake_fmha_request_ordered_paged_decode(
     uses_shared_paged_kv_idx: bool,
     plan: CakeFmhaRequestOrderedDecodePlan,
 ) -> None:
-    """Launch one generated request-ordered program without auxiliary kernels."""
+    """Launch the explicitly selected Cake backend without auxiliary kernels.
+
+    ``backend`` is the typed handoff from the public dispatcher; route admission
+    has already rejected any other backend before entering this function.
+    """
 
     if not query.is_cuda:
         raise ValueError("request-ordered Cake FMHA tensors must be on CUDA")

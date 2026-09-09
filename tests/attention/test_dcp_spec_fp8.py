@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from flashinfer.dcp import (
+from flashinfer.cake_dcp import (
     get_dcp_spec_counter_bytes,
     get_dcp_spec_workspace_size_bytes,
 )

@@ -3718,7 +3718,7 @@ def trtllm_batch_decode_with_kv_cache(
             if lse is not None
             else torch.empty(lse_shape, dtype=torch.float32, device=query.device)
         )
-        from .dcp import run_dcp_spec_decode
+        from .cake_dcp import run_dcp_spec_decode
 
         run_dcp_spec_decode(
             query=query,
@@ -4033,6 +4033,7 @@ def trtllm_batch_decode_with_kv_cache(
                     "request_order_plan does not match batch, q_len, or LSE mode"
                 )
             _run_cake_fmha_request_ordered_paged_decode(
+                backend="cake",
                 query=query,
                 key_cache=k_cache,
                 value_cache=v_cache,
