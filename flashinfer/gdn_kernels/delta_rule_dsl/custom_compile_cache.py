@@ -43,6 +43,38 @@ def sm12x_compile_options(
     return (sm12x_gpu_arch(device),)
 
 
+@lru_cache(maxsize=8)
+def _sm8x_gpu_arch_cached(device_type: str, device_index: int | None) -> cute.GPUArch:
+    device = (
+        torch.device(device_type)
+        if device_index is None
+        else torch.device(device_type, device_index)
+    )
+    major, minor = torch.cuda.get_device_capability(device)
+    if major != 8:
+        raise RuntimeError(
+            f"sm8x_gpu_arch requires an SM8x device, got compute capability "
+            f"{major}.{minor}"
+        )
+    # No architecture-specific suffix before SM90: sm_80 and sm_86 name the
+    # target outright, and asking for sm_80a is not a target the driver has.
+    return cute.GPUArch(f"sm_{major}{minor}")
+
+
+def sm8x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
+    """Return the on-device CuteDSL arch for SM8x (``sm_80`` / ``sm_86`` ...)."""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return _sm8x_gpu_arch_cached(d.type, d.index)
+
+
+def sm8x_compile_options(
+    device: str | torch.device = "cuda",
+) -> tuple[cute.GPUArch]:
+    return (sm8x_gpu_arch(device),)
+
+
 _TMA_CLUSTER_LOAD = (
     "cp.async.bulk.tensor.3d.shared::cluster.global.tile."
     "mbarrier::complete_tx::bytes.L2::cache_hint"

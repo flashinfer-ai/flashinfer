@@ -96,12 +96,14 @@ except (ImportError, RuntimeError):
 
 try:
     from .delta_rule_dsl import (
+        chunk_gated_delta_rule_sm80,
         chunk_gated_delta_rule_sm90,
         chunk_gated_delta_rule_sm120,
         cp_delta_rule_dsl_sm90,
         cp_delta_rule_dsl_sm120,
     )
 except (ImportError, RuntimeError):
+    chunk_gated_delta_rule_sm80 = None  # type: ignore
     chunk_gated_delta_rule_sm90 = None  # type: ignore
     chunk_gated_delta_rule_sm120 = None  # type: ignore
     cp_delta_rule_dsl_sm90 = None  # type: ignore
@@ -121,6 +123,7 @@ __all__ = [
     "get_tile_v_mtp",
     "get_vec_size_mtp",
     "get_mtp_config",
+    "chunk_gated_delta_rule_sm80",
     "chunk_gated_delta_rule_sm90",
     "chunk_gated_delta_rule_sm100",
     "chunk_gated_delta_rule_sm120",

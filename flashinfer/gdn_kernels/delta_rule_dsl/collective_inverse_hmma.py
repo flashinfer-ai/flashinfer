@@ -16,9 +16,31 @@ class CollectiveInverse:
         self,
         garbage_filled_diagonal: bool = True,
         garbage_filled_upper_triangular: bool = False,
+        has_stmatrix: bool = True,
     ):
         self.garbage_filled_diagonal = garbage_filled_diagonal
         self.garbage_filled_upper_triangular = garbage_filled_upper_triangular
+        # stmatrix does not exist before sm_90. Callers targeting an older
+        # architecture pass False and get ordinary register-to-shared stores
+        # instead; see _store_atom for why that is a drop-in.
+        self.has_stmatrix = has_stmatrix
+
+    def _store_atom(self, num_matrices: int):
+        """The register-to-shared atom for writing an accumulator back.
+
+        Every use of this goes through ``make_tiled_copy_C``, which takes its
+        thread-value map from the MMA rather than from the atom, so the two
+        forms put each element at the same address. They differ in how many
+        instructions that takes: stmatrix moves an 8x8 tile per thread group,
+        an ordinary store moves one element. None of these sites transposes,
+        which is the case a plain store could not reproduce.
+        """
+        if self.has_stmatrix:
+            return cute.make_copy_atom(
+                warp.StMatrix8x8x16bOp(transpose=False, num_matrices=num_matrices),
+                cutlass.Float16,
+            )
+        return cute.make_copy_atom(cute.nvgpu.CopyR2SOp(), cutlass.Float16)
 
     # ── Level 1: NxN Gauss elimination on diagonal blocks ───────────────────────
 
@@ -126,9 +148,7 @@ class CollectiveInverse:
         b_atom = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=1), cutlass.Float16
         )
-        o_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=1), cutlass.Float16
-        )
+        o_atom = self._store_atom(1)
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(b_atom, tiled_mma)
@@ -207,9 +227,7 @@ class CollectiveInverse:
         b_atom = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=2), cutlass.Float16
         )
-        o_atom = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=2), cutlass.Float16
-        )
+        o_atom = self._store_atom(2)
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma)
         C_tiled_copy = cute.make_tiled_copy_B(b_atom, tiled_mma)
@@ -308,9 +326,7 @@ class CollectiveInverse:
         O_atom_s2r = cute.make_copy_atom(
             warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
         )
-        O_atom_r2s = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4), cutlass.Float16
-        )
+        O_atom_r2s = self._store_atom(4)
 
         D_tiled_copy = cute.make_tiled_copy_A(dinv_atom, tiled_mma1)
         C_tiled_copy = cute.make_tiled_copy_B(c_atom, tiled_mma1)

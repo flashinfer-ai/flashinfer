@@ -2477,6 +2477,19 @@ def delta_rule_prefill_dsl_sm90(
         ("alpha", alpha),
         ("beta", beta),
         ("state_indices", state_indices),
+        # state_checkpoints reaches the kernel as reshape(-1). On a tensor
+        # that is not contiguous that returns a copy, so the kernel writes its
+        # checkpoints into a temporary that is freed on return -- every
+        # checkpoint lost, nothing raised. Measured on the sm80 path: a pool
+        # sliced as pool[::2] writes 0 of 4.
+        ("state_checkpoints", state_checkpoints),
+        # checkpoint_cu_starts is passed unreshaped, so that is not its
+        # failure. Its problem is the compile cache: mark_layout_dynamic bakes
+        # a unit stride whenever a dimension has one, and the cache key
+        # carries dtypes and tile config but no strides -- so a first
+        # contiguous call would bake stride 1 and a later strided one would
+        # reuse that kernel and misread every offset.
+        ("checkpoint_cu_starts", checkpoint_cu_starts),
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
