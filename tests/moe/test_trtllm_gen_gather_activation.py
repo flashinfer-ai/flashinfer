@@ -35,6 +35,8 @@ import torch
 
 from flashinfer import shuffle_matrix_a
 from flashinfer.fused_moe import (
+    bgmv_moe_gemm2_lora_delta,
+    fill_w_ptr,
     WeightLayout,
     convert_to_block_layout,
     trtllm_bf16_routed_moe,
@@ -501,3 +503,118 @@ def test_gather_matches_fused_moe_activation_output(num_tokens, ep_shard):
     torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
     # Rows for the routing kernels' own sentinel must be bitwise zero.
     assert (out.view(torch.int16)[inactive] == 0).all()
+
+
+def _build_w_ptr(weights, num_experts):
+    """[num_slices, num_experts] int64 base-pointer table + shared lora_stride."""
+    device = weights[0].device
+    w_ptr = torch.zeros(len(weights), num_experts, dtype=torch.int64, device=device)
+    stride = 0
+    for s, w in enumerate(weights):
+        stride = fill_w_ptr(w_ptr, w, num_experts, s)
+    return w_ptr, stride
+
+
+def _ref_fc2_delta(
+    act_perm, perm, lora_a, lora_b, topk_ids, topk_weights, lora_ids, scale
+):
+    """Independent reference for the whole FC2 delta:
+    delta[t] = scale * sum_j w[t,j] * ( B[l,e] @ (A[l,e] @ a[t,j]) ), where
+    a[t,j] = act_perm[perm[t*k+j]] for perm >= 0 and 0 otherwise."""
+    T, k = topk_ids.shape
+    inter = lora_a[0].shape[3]
+    hidden = lora_b[0].shape[2]
+    out = torch.zeros(T, hidden, dtype=torch.float32, device=act_perm.device)
+    af = act_perm.float()
+    flat = perm.reshape(-1)
+    zero_vec = torch.zeros(inter, device=act_perm.device)
+    for t in range(T):
+        lid = int(lora_ids[t])
+        if lid < 0:
+            continue
+        for j in range(k):
+            p = int(flat[t * k + j])
+            a_vec = af[p] if p >= 0 else zero_vec
+            e = int(topk_ids[t, j])
+            w = float(topk_weights[t, j])
+            a = lora_a[0][lid, e].float()
+            b = lora_b[0][lid, e].float()
+            out[t] += scale * w * (b @ (a @ a_vec))
+    return out
+
+
+@pytest.mark.parametrize("T", [4, 16])
+def test_gemm2_lora_delta_gather_equivalence(T):
+    """``bgmv_moe_gemm2_lora_delta`` now gathers with this op.
+
+    Two checks: the delta matches an independent torch reference, and feeding the
+    builder the already-gathered activation under an identity permutation
+    reproduces it — the second isolates the gather from the rest of the builder.
+    """
+    if get_compute_capability(torch.device("cuda"))[0] not in (10,):
+        pytest.skip("BGMV MoE kernels are validated on SM100/SM103")
+    device = torch.device("cuda")
+    torch.manual_seed(stable_seed("bgmv", T))
+    num_experts, k, max_loras = 8, 2, 4
+    rank, hidden, inter = 32, 768, 768
+    P = T * k
+
+    lora_a = [
+        torch.randn(
+            max_loras, num_experts, rank, inter, dtype=torch.bfloat16, device=device
+        )
+        * 0.02
+    ]
+    lora_b = [
+        torch.randn(
+            max_loras, num_experts, hidden, rank, dtype=torch.bfloat16, device=device
+        )
+        * 0.02
+    ]
+    w_ptr_a, stride_a = _build_w_ptr(lora_a, num_experts)
+    w_ptr_b, stride_b = _build_w_ptr(lora_b, num_experts)
+
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:k] for _ in range(T)]
+    )
+    topk_weights = torch.softmax(torch.randn(T, k, device=device), dim=-1)
+    lora_ids = torch.randint(0, max_loras, (T,), dtype=torch.int64, device=device)
+
+    activation_output, e2p, _ = make_case(
+        T, k, inter, inactive_frac=0.25, seed=stable_seed("bgmv-case", T)
+    )
+    # The reference feeds the pre-gathered rows, so the padding rows are gone and
+    # the NaN poison with them.
+    gathered = reference_gather(activation_output, e2p, k).reshape(P, inter)
+    identity = torch.arange(P, dtype=torch.int32, device=device)
+
+    def delta(act, perm):
+        return bgmv_moe_gemm2_lora_delta(
+            act,
+            perm,
+            w_ptr_a,
+            stride_a,
+            w_ptr_b,
+            stride_b,
+            topk_ids,
+            topk_weights,
+            lora_ids,
+            rank,
+            hidden,
+            scale=0.5,
+        )
+
+    out = delta(activation_output, e2p)
+    ref = delta(gathered, identity)
+    assert out.shape == (T, hidden)
+
+    # A dead gather (all-zero output) would make the two runs agree, so pin the
+    # magnitude against a reference that never touches the kernel first.
+    ref_torch = _ref_fc2_delta(
+        activation_output, e2p, lora_a, lora_b, topk_ids, topk_weights, lora_ids, 0.5
+    )
+    assert torch.count_nonzero(ref_torch), "the reference delta is degenerate"
+    torch.testing.assert_close(out.float(), ref_torch, atol=2e-3, rtol=2e-2)
+    # The identity-permutation run feeds the BGMV kernels bitwise-identical rows,
+    # so only the atomicAdd order can differ.
+    torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)

@@ -34,7 +34,53 @@ from typing import Tuple
 import torch
 
 from ..api_logging import flashinfer_api
+from ..utils import get_compute_capability
 from .bgmv_moe import bgmv_moe_expand, bgmv_moe_shrink
+from .trtllm_gen_gather_activation import trtllm_gen_moe_gather_activation
+
+
+def _gather_permuted_activation(
+    gemm1_activation_output: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    top_k: int,
+    num_slots: int,
+    lora_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reorder a permuted post-SwiGLU activation into expanded ``[T*top_k, I]`` order.
+
+    ``trtllm_gen_moe_gather_activation`` fuses this into a single copy kernel, but it is built
+    only for the trtllm-gen MoE architectures and for 16-bit activations. The eager gather is
+    kept for everything else, so the builder still runs wherever the BGMV kernels do.
+    """
+    if expanded_idx_to_permuted_idx.numel() != num_slots:
+        raise ValueError(
+            f"expanded_idx_to_permuted_idx must have T*top_k = {num_slots} elements, got "
+            f"{expanded_idx_to_permuted_idx.numel()}"
+        )
+    inter = gemm1_activation_output.shape[1]
+    device = gemm1_activation_output.device
+    major, minor = get_compute_capability(device)
+    if gemm1_activation_output.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ) and trtllm_gen_moe_gather_activation.is_compute_capability_supported(
+        major * 10 + minor
+    ):
+        return (
+            trtllm_gen_moe_gather_activation(
+                gemm1_activation_output,
+                expanded_idx_to_permuted_idx.to(torch.int32),
+                top_k,
+            )
+            .reshape(num_slots, inter)
+            .to(lora_dtype)
+        )
+
+    perm = expanded_idx_to_permuted_idx.reshape(-1).to(torch.int64)
+    valid = perm >= 0
+    a_exp = torch.zeros(num_slots, inter, dtype=lora_dtype, device=device)
+    a_exp[valid] = gemm1_activation_output[perm[valid]].to(lora_dtype)
+    return a_exp
 
 
 def _expanded_pairs(
@@ -212,8 +258,10 @@ def bgmv_moe_gemm2_lora_delta(
     """FC2 (down_proj) LoRA delta for a routed MoE, to be ADDED to the MoE output.
 
     Consumes the post-SwiGLU activation returned by ``trtllm_*_moe`` (called with
-    ``gemm1_lora_delta`` set and ``do_finalize=True``). For each routed pair
-    ``(token t, slot j)`` with expert ``e`` and adapter ``l``::
+    ``gemm1_lora_delta`` set and ``do_finalize=True``); the permuted -> expanded reorder
+    of that tensor runs on :func:`trtllm_gen_moe_gather_activation` where that op is
+    supported and eagerly everywhere else. For each routed pair ``(token t, slot j)``
+    with expert ``e`` and adapter ``l``::
 
         delta[t] = scale * Σ_j  w[t, j] * ( B_down[l,e] @ (A_down[l,e] @ a[t, j]) )
 
@@ -260,7 +308,6 @@ def bgmv_moe_gemm2_lora_delta(
     )
     T, k = topk_ids.shape
     P = T * k
-    inter = gemm1_activation_output.shape[1]
     hidden = hidden_size
     device = gemm1_activation_output.device
 
@@ -268,10 +315,9 @@ def bgmv_moe_gemm2_lora_delta(
     lora_idx = lora_ids.to(torch.int64)
 
     # Gather permuted activation into expanded [P, I] order; inactive slots (perm < 0) stay 0.
-    perm = expanded_idx_to_permuted_idx.to(torch.int64)
-    valid = perm >= 0
-    a_exp = torch.zeros(P, inter, dtype=lora_dtype, device=device)
-    a_exp[valid] = gemm1_activation_output[perm[valid]].to(lora_dtype)
+    a_exp = _gather_permuted_activation(
+        gemm1_activation_output, expanded_idx_to_permuted_idx, k, P, lora_dtype
+    )
 
     # Shrink: a_exp @ A_down -> [1, P, rank]. Per-pair input read (per_pair_input=True).
     shrink_out = torch.zeros(1, P, rank, dtype=lora_dtype, device=device)

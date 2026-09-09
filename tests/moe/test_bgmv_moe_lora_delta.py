@@ -277,6 +277,67 @@ def test_gemm2_lora_delta(T, hidden, inter, rank, dtype):
     torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
 
 
+def test_gemm2_lora_delta_float32_activation():
+    """A float32 activation takes the eager gather: the fused one is bf16/fp16 only."""
+    _skip_if_unsupported_sm()
+    device = torch.device("cuda")
+    torch.manual_seed(4)
+    T, k, num_experts, max_loras, rank, hidden, inter = 8, 2, 8, 4, 32, 768, 768
+    scale = 0.5
+    P = T * k
+
+    lora_a = [
+        torch.randn(
+            max_loras, num_experts, rank, inter, dtype=torch.bfloat16, device=device
+        )
+        * 0.02
+    ]
+    lora_b = [
+        torch.randn(
+            max_loras, num_experts, hidden, rank, dtype=torch.bfloat16, device=device
+        )
+        * 0.02
+    ]
+    topk_ids, topk_weights, lora_ids = _make_routing(
+        T, k, num_experts, max_loras, device
+    )
+    act_perm = torch.randn(P, inter, dtype=torch.float32, device=device) * 0.1
+    perm = torch.randperm(P, dtype=torch.int64, device=device)
+
+    w_ptr_a, stride_a = _build_w_ptr(lora_a, num_experts)
+    w_ptr_b, stride_b = _build_w_ptr(lora_b, num_experts)
+    out = bgmv_moe_gemm2_lora_delta(
+        act_perm,
+        perm,
+        w_ptr_a,
+        stride_a,
+        w_ptr_b,
+        stride_b,
+        topk_ids,
+        topk_weights,
+        lora_ids,
+        rank,
+        hidden,
+        scale=scale,
+    )
+
+    # The gather narrows to lora_dtype, so the reference sees the rounded activation.
+    ref = _ref_fc2_delta(
+        act_perm.to(torch.bfloat16),
+        perm,
+        lora_a,
+        lora_b,
+        topk_ids,
+        topk_weights,
+        lora_ids,
+        scale,
+    )
+
+    assert out.shape == (T, hidden)
+    assert torch.count_nonzero(ref)
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
 def test_gemm2_inactive_slot_zeroed():
     """`expanded_idx_to_permuted_idx < 0` (inactive slot) must contribute nothing."""
     _skip_if_unsupported_sm()
