@@ -1,4 +1,4 @@
-"""Host-only unit tests for the sm90_pull_fp8 mega-kernel backend wiring.
+"""Host-only unit tests for the sm90_fp8_fp8_bf16_pull_cutedsl mega-kernel backend wiring.
 
 No GPU / no kernel compile: config dataclass defaults, registry resolution via
 ``create_mega_kernel``, public re-exports, and runtime-requirement plumbing.
@@ -16,8 +16,8 @@ import dataclasses
 
 import pytest
 
-from flashinfer.moe_ep import Sm90PullFp8MegaMoeConfig
-from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8 import (
+from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
     Sm90PullFp8MegaKernelBackend,
 )
 from flashinfer.moe_ep.core.kernel.registry import (
@@ -26,14 +26,16 @@ from flashinfer.moe_ep.core.kernel.registry import (
 )
 
 
-def _config(**overrides) -> Sm90PullFp8MegaMoeConfig:
-    return Sm90PullFp8MegaMoeConfig(intermediate_size=1024, top_k=4, **overrides)
+def _config(**overrides) -> Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+        intermediate_size=1024, top_k=4, **overrides
+    )
 
 
 class TestSm90PullFp8Config:
     def test_defaults(self) -> None:
         cfg = _config()
-        assert cfg.kernel_name == "sm90_pull_fp8"
+        assert cfg.kernel_name == "sm90_fp8_fp8_bf16_pull_cutedsl"
         assert cfg.kind == "fp8_e4m3"
         assert cfg.fp8_scale_mode == "per_tensor"
         assert cfg.fp8_accum_mode == "1xacc"
@@ -55,20 +57,26 @@ class TestSm90PullFp8Config:
     def test_registry_resolves_backend(self) -> None:
         backend = create_mega_kernel(_config())
         assert isinstance(backend, Sm90PullFp8MegaKernelBackend)
-        assert backend.kernel_name() == "sm90_pull_fp8"
-        assert Sm90PullFp8MegaKernelBackend.kernel_name() == "sm90_pull_fp8"
+        assert backend.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"
+        assert (
+            Sm90PullFp8MegaKernelBackend.kernel_name()
+            == "sm90_fp8_fp8_bf16_pull_cutedsl"
+        )
 
     def test_registry_lists_kernel_in_unknown_error(self) -> None:
         bogus = dataclasses.replace(_config(), kernel_name="definitely_not_a_kernel")
-        with pytest.raises(KeyError, match="sm90_pull_fp8"):
+        with pytest.raises(KeyError, match="sm90_fp8_fp8_bf16_pull_cutedsl"):
             create_mega_kernel(bogus)
 
     def test_public_reexports(self) -> None:
         import flashinfer.moe_ep as moe_ep
 
-        assert moe_ep.Sm90PullFp8MegaMoeConfig is Sm90PullFp8MegaMoeConfig
+        assert (
+            moe_ep.Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+            is Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+        )
         assert callable(moe_ep.preprocess_sm90_pull_fp8_mega_weights)
-        assert "Sm90PullFp8MegaMoeConfig" in moe_ep.__all__
+        assert "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig" in moe_ep.__all__
         assert "preprocess_sm90_pull_fp8_mega_weights" in moe_ep.__all__
 
 

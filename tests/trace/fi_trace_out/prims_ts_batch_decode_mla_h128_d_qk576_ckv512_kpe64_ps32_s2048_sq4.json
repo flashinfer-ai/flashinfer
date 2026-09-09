@@ -1,0 +1,168 @@
+{
+  "name": "prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4",
+  "description": "Standalone PrimTS MLA decode with concatenated latent/RoPE query and KV dimensions, native dense page tables, runtime KV lengths, and caller-owned workspace. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets.",
+  "op_type": "mla_paged",
+  "tags": [
+    "fi_api:flashinfer.attention.prims_ts.mla_decode.prims_ts_batch_decode_with_kv_cache_mla",
+    "stage:decode",
+    "backend:prims-ts",
+    "status:experimental",
+    "mla"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Number of MLA decode requests."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 128
+    },
+    "head_dim_qk": {
+      "type": "const",
+      "value": 576
+    },
+    "kv_lora_rank": {
+      "type": "const",
+      "value": 512
+    },
+    "qk_rope_head_dim": {
+      "type": "const",
+      "value": 64
+    },
+    "num_pages": {
+      "type": "var",
+      "description": "Physical MLA cache page capacity."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 32
+    },
+    "max_pages_per_seq": {
+      "type": "var",
+      "description": "Block-table column capacity."
+    },
+    "workspace_size": {
+      "type": "var",
+      "description": "Caller workspace size in bytes."
+    },
+    "max_seq_len": {
+      "type": "const",
+      "value": 2048,
+      "description": "Exact compiled maximum KV sequence length."
+    },
+    "len_qo_indptr": {
+      "type": "var",
+      "description": "Length of cumulative Q offsets."
+    },
+    "seq_len_q": {
+      "type": "const",
+      "value": 4,
+      "description": "Fixed query length per request."
+    }
+  },
+  "constraints": [
+    "head_dim_qk == kv_lora_rank + qk_rope_head_dim",
+    "kv_lora_rank == 512",
+    "qk_rope_head_dim == 64",
+    "page_size in (16, 32, 64, 128)",
+    "block_tables.shape[0] == batch_size",
+    "seq_len_q >= 1"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "batch_size",
+        "seq_len_q",
+        "num_heads",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16"
+    },
+    "kv_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16"
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "int8",
+      "description": "Exclusive caller-owned int8/uint8 scratch buffer."
+    },
+    "kv_lora_rank": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "qk_rope_head_dim": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32"
+    },
+    "max_seq_len": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "qo_indptr": {
+      "shape": [
+        "len_qo_indptr"
+      ],
+      "dtype": "int32",
+      "optional": true
+    },
+    "max_seq_len_q": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "bmm1_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "mask_type": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    },
+    "out_dtype": {
+      "shape": null,
+      "dtype": "dtype",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len_q",
+        "num_heads",
+        "kv_lora_rank"
+      ],
+      "dtype": "bfloat16",
+      "param": "out"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

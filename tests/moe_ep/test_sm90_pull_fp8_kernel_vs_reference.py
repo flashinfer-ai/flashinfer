@@ -234,10 +234,10 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
     assert pkg.Fp8BlockScaleK == FP8_BLOCK_K
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90_pull_fp8.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.weights import (
         preprocess_mega_weights,
     )
 

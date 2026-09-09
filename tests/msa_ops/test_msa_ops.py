@@ -883,9 +883,11 @@ def test_sparse_decode_nvfp4_scale_size_guard():
 # ---------------------------------------------------------------------------
 
 
-# P=128 exercises the count-rank kernel, P=256 the radix kernel (crossover at 128).
-@pytest.mark.parametrize("P", [128, 256])
-def test_msa_topk_select_forced_and_clamped(P):
+# nvp = P - 56 lands each case on a different dispatch: P=88 count-rank,
+# P=128 with S=2400 q-tiled chunked (S covers the ragged 32-query tail),
+# P=256 row-per-CTA chunked, P=2560 radix.
+@pytest.mark.parametrize("P,S", [(88, 64), (128, 2400), (256, 64), (2560, 64)])
+def test_msa_topk_select_forced_and_clamped(P, S):
     """Forced begin/end blocks are always selected within the topk budget;
     num_valid_pages clamps the candidate range."""
     _skip_if_unsupported()
@@ -893,7 +895,7 @@ def test_msa_topk_select_forced_and_clamped(P):
 
     torch.manual_seed(120)
     dev = "cuda"
-    H, S = 2, 64
+    H = 2
     topk, nvp, fb, fe = 16, P - 56, 3, 2
     max_score = torch.randn(H, P, S, dtype=torch.float32, device=dev)
     max_score[:, nvp:, :] = float("-inf")
@@ -910,8 +912,9 @@ def test_msa_topk_select_forced_and_clamped(P):
     )
     torch.cuda.synchronize()
     forced = set(range(fb)) | set(range(nvp - fe, nvp))
+    q_step = max(1, S // 64)  # sample rows when S is large
     for h in range(H):
-        for qi in range(S):
+        for qi in range(0, S, q_step):
             row = out[qi, h]
             valid = row[row >= 0]
             assert valid.numel() == topk
@@ -1181,16 +1184,21 @@ def test_msa_proxy_score(B, Hq, Hkv, seqs_q, seqs_k, causal):
 
 
 @pytest.mark.parametrize(
-    "B,Hq,Hkv,seqlen_q,seqlen_k,causal",
+    "B,Hq,Hkv,seqlen_q,seqlen_k,causal,explicit_qoff",
     [
-        (4, 4, 1, 1, 8192, True),  # group 4, q_len 1 -> packed (4 x 16 tile)
-        (2, 4, 1, 16, 4096, True),  # group 4, q_len at the gate edge (16)
-        (3, 8, 2, 8, 2048, True),  # group 4 (Hq/Hkv), q_len 8
-        (2, 4, 1, 16, 4096, False),  # non-causal packed
+        (4, 4, 1, 1, 8192, True, False),  # group 4, q_len 1 -> stream
+        (2, 4, 1, 16, 4096, True, False),  # group 4, gate-edge q_len 16 -> packed
+        (3, 8, 2, 8, 2048, True, False),  # group 4 (Hq/Hkv), q_len 8 -> key-major
+        (2, 4, 1, 16, 4096, False, False),  # non-causal packed
+        (2, 4, 1, 8, 4096, True, True),  # explicit q_offset masks mid-sequence
+        (2, 4, 1, 16, 4096, True, True),  # explicit q_offset, row-major packed
     ],
 )
-def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
-    """Short-q decode dispatches the head-fused packed bf16 kernel; group 4 with
+def test_msa_proxy_score_decode_packed(
+    B, Hq, Hkv, seqlen_q, seqlen_k, causal, explicit_qoff
+):
+    """Short-q decode dispatches the head-fused kernels: key-major for fused
+    multi-token tiles of at most 32 rows, packed row-major above. Group 4 with
     q_len <= 16 is the MiniMax-M3 indexer shape."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score
@@ -1203,11 +1211,36 @@ def test_msa_proxy_score_decode_packed(B, Hq, Hkv, seqlen_q, seqlen_k, causal):
     total_q, total_k = int(cu_q[-1]), int(cu_k[-1])
     q = torch.randn(total_q, Hq, 128, dtype=torch.bfloat16, device=dev) / 3
     k = torch.randn(total_k, Hkv, 128, dtype=torch.bfloat16, device=dev) / 3
-    out = msa_proxy_score(q, k, cu_q, cu_k, causal=causal)
+    qoff = None
+    if explicit_qoff:
+        # Positions strictly inside each sequence so the causal limit bites.
+        qoff = torch.tensor(
+            [seqlen_k // 2 + 37 * b for b in range(B)], dtype=torch.int32, device=dev
+        )
+    out = msa_proxy_score(q, k, cu_q, cu_k, causal=causal, q_offset=qoff)
     torch.cuda.synchronize()
-    ref = _ref_proxy_score(
-        q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), causal, out.shape[1]
-    )
+    if explicit_qoff:
+        # Same reference, with the causal diagonal moved to the given offset:
+        # query token t of batch b may see kv positions <= t + qoff[b].
+        mkt = out.shape[1]
+        G = Hq // Hkv
+        ref = torch.full((Hq, mkt, total_q), float("-inf"), dtype=torch.float32)
+        for b in range(B):
+            qlo = b * seqlen_q
+            for h in range(Hq):
+                kb = k[b * seqlen_k : (b + 1) * seqlen_k, h // G].float().cpu()
+                s = q[qlo : qlo + seqlen_q, h].float().cpu() @ kb.T
+                qi = torch.arange(seqlen_q).unsqueeze(1) + int(qoff[b])
+                ki = torch.arange(seqlen_k).unsqueeze(0)
+                s = s.masked_fill(ki > qi, float("-inf"))
+                for t in range(-(-seqlen_k // BLK_KV)):
+                    ref[h, t, qlo : qlo + seqlen_q] = s[
+                        :, t * BLK_KV : (t + 1) * BLK_KV
+                    ].amax(dim=1)
+    else:
+        ref = _ref_proxy_score(
+            q.cpu(), k.cpu(), cu_q.cpu(), cu_k.cpu(), causal, out.shape[1]
+        )
     got = out.cpu()
     assert ((got == float("-inf")) == (ref == float("-inf"))).all(), "-inf pattern"
     fin = ref != float("-inf")
@@ -1286,12 +1319,17 @@ def test_msa_proxy_score_decode_packed_paged(Hq, Hkv, seqs_q, seqs_k):
         (8, 1, True, False),  # group 8 (stream upper gate), paged
         (4, 1, False, True),  # explicit q_offset masks mid-sequence
         (4, 1, True, True),
+        (3, 1, False, False),  # group 3 (does not divide 64)
+        (3, 1, True, False),  # group 3, paged
+        (3, 1, False, True),  # group 3, explicit q_offset
+        (1, 1, True, True),  # group 1, paged + explicit q_offset
     ],
 )
 def test_msa_proxy_score_decode_stream(Hq, Hkv, paged, explicit_qoff):
-    """Single-token decode dispatches the stream kernel; cover ragged varlen
-    with non-128 tails, an empty sequence, multi kv-head, group sizes 1-8,
-    paged KV, and an explicit causal q_offset."""
+    """Single-token bf16 decode dispatches the stream kernel; cover ragged
+    varlen with non-128 tails, an empty sequence, multi kv-head, group sizes
+    1-8 including ones not dividing 64, paged KV, and an explicit causal
+    q_offset."""
     _skip_if_unsupported()
     from flashinfer.msa_ops import msa_proxy_score
 
@@ -1437,6 +1475,102 @@ def test_msa_proxy_score_paged_fp8():
     )
     torch.cuda.synchronize()
     assert torch.equal(out_paged, out_flat)
+    # Decode shapes route fp8 K to the decode schedules; the e4m3 upconvert is
+    # exact, so results must stay bit-identical to the same call on
+    # dequantized K. The fp16-q case covers the f16 convert target.
+    k8_pg = k_pg.to(torch.float8_e4m3fn).contiguous()
+    for sq, qdt in ((1, torch.bfloat16), (4, torch.bfloat16), (4, torch.float16)):
+        cu_qd = torch.arange(0, (B + 1) * sq, sq, dtype=torch.int32, device=dev)
+        # e4m3-representable q, as deployment provides: the fp8 key-major
+        # schedule regroups products across mma instructions, and exactness
+        # under regrouping needs every dot term exact in f32.
+        qd = (
+            (torch.randn(B * sq, Hq, 128, device=dev) / 3)
+            .to(torch.float8_e4m3fn)
+            .to(qdt)
+        )
+        out8 = msa_proxy_score(qd, k8, cu_qd, cu_k, causal=True)
+        out_deq8 = msa_proxy_score(qd, k8.to(qdt), cu_qd, cu_k, causal=True)
+        pg8 = msa_proxy_score(
+            qd, k8_pg, cu_qd, page_table=ptab, seqused_k=seqused, causal=True
+        )
+        pg_deq8 = msa_proxy_score(
+            qd, k8_pg.to(qdt), cu_qd, page_table=ptab, seqused_k=seqused, causal=True
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out8, out_deq8)
+        assert torch.equal(pg8, pg_deq8)
+        if qdt is torch.bfloat16:
+            # Native fp8 q: same exact math, so bit-identical to the bf16-q
+            # call on the same values.
+            qd8 = qd.to(torch.float8_e4m3fn)
+            out_q8 = msa_proxy_score(qd8, k8, cu_qd, cu_k, causal=True)
+            pg_q8 = msa_proxy_score(
+                qd8, k8_pg, cu_qd, page_table=ptab, seqused_k=seqused, causal=True
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(out_q8, out8)
+            assert torch.equal(pg_q8, pg8)
+            # fp8 q without fp8 k has no kernel; the dispatch must reject it.
+            with pytest.raises(ValueError, match="fp8 q requires fp8 k"):
+                msa_proxy_score(qd8, k8.to(qdt), cu_qd, cu_k, causal=True)
+    # Prefill-shape fp8 q takes the internal upconvert fallback; identical to
+    # upconverting at the call site.
+    q8_pre = q.to(torch.float8_e4m3fn)
+    out_pre8 = msa_proxy_score(q8_pre, k8, cu_q, cu_k, causal=True)
+    out_pre_ref = msa_proxy_score(
+        q8_pre.to(torch.bfloat16), k8, cu_q, cu_k, causal=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out_pre8, out_pre_ref)
+    # The fp8 key-split schedule (fused tile > 32 rows: group 4, q_len 12) and
+    # the fp8 stream schedule (group 3, not dividing 64), flat and paged,
+    # under the same exactness contract.
+    for Hq2, Hkv2, sq2 in ((4, 1, 12), (3, 1, 1)):
+        seqs2 = [700, 260]
+        B2 = len(seqs2)
+        cu_k2 = torch.tensor(
+            [0] + list(torch.tensor(seqs2).cumsum(0)), dtype=torch.int32, device=dev
+        )
+        cu_q2 = torch.arange(0, (B2 + 1) * sq2, sq2, dtype=torch.int32, device=dev)
+        q2 = (
+            (torch.randn(B2 * sq2, Hq2, 128, device=dev) / 3)
+            .to(torch.float8_e4m3fn)
+            .to(torch.bfloat16)
+        )
+        k2 = (torch.randn(int(cu_k2[-1]), Hkv2, 128, device=dev) / 3).to(
+            torch.float8_e4m3fn
+        )
+        npg2 = [-(-s // BLK_KV) for s in seqs2]
+        k_pg2 = torch.zeros(
+            sum(npg2), Hkv2, BLK_KV, 128, dtype=torch.float8_e4m3fn, device=dev
+        )
+        ptab2 = torch.full((B2, max(npg2)), -1, dtype=torch.int32, device=dev)
+        pi2 = 0
+        for b in range(B2):
+            for blk in range(npg2[b]):
+                ptab2[b, blk] = pi2
+                lo = int(cu_k2[b]) + blk * BLK_KV
+                hi = min(lo + BLK_KV, int(cu_k2[b + 1]))
+                k_pg2[pi2, :, : hi - lo] = k2[lo:hi].transpose(0, 1)
+                pi2 += 1
+        sk2 = torch.tensor(seqs2, dtype=torch.int32, device=dev)
+        o8 = msa_proxy_score(q2, k2, cu_q2, cu_k2, causal=True)
+        odq = msa_proxy_score(q2, k2.to(torch.bfloat16), cu_q2, cu_k2, causal=True)
+        p8 = msa_proxy_score(
+            q2, k_pg2, cu_q2, page_table=ptab2, seqused_k=sk2, causal=True
+        )
+        pdq = msa_proxy_score(
+            q2,
+            k_pg2.to(torch.bfloat16),
+            cu_q2,
+            page_table=ptab2,
+            seqused_k=sk2,
+            causal=True,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(o8, odq)
+        assert torch.equal(p8, pdq)
 
 
 def test_e2e_full_pipeline_from_raw_tensors():
@@ -1696,10 +1830,13 @@ def test_fp8_q_decode():
 
 
 def test_msa_topk_select_countrank_matches_radix_on_nan():
-    """Both kernels must produce the same, deterministic selection even when the
-    proxy emits NaN scores (count-rank ranks on the radix bit-key)."""
+    """All three kernels must produce the same, deterministic selection even
+    when the proxy emits NaN scores (all rank on the radix bit-key)."""
     _skip_if_unsupported()
-    from flashinfer.msa_ops.sparse_topk_select import _get_compiled_topk
+    from flashinfer.msa_ops.sparse_topk_select import (
+        _get_compiled_topk,
+        _get_compiled_topk_chunked,
+    )
 
     dev = "cuda"
     H, P, S, topk = 2, 100, 64, 16
@@ -1717,3 +1854,18 @@ def test_msa_topk_select_countrank_matches_radix_on_nan():
         outs.append(out.cpu())
     assert torch.equal(outs[0], outs[2]), "count-rank nondeterministic on NaN"
     assert torch.equal(outs[0], outs[1]), "count-rank != radix on NaN scores"
+
+    num_chunks = 2
+    chunk_len = (P + num_chunks - 1) // num_chunks
+    cand_key = torch.empty(S, H, num_chunks * topk, dtype=torch.int32, device=dev)
+    cand_idx = torch.empty_like(cand_key)
+    for tiled in (False, False, True, True):
+        out = torch.empty(S, H, topk, dtype=torch.int32, device=dev)
+        _get_compiled_topk_chunked(topk, tiled)(
+            score, cand_key, cand_idx, out, P, 0, 0, num_chunks, chunk_len, S, H
+        )
+        outs.append(out.cpu())
+    assert torch.equal(outs[3], outs[4]), "chunked nondeterministic on NaN"
+    assert torch.equal(outs[0], outs[3]), "chunked != count-rank on NaN scores"
+    assert torch.equal(outs[5], outs[6]), "tiled chunked nondeterministic on NaN"
+    assert torch.equal(outs[0], outs[5]), "tiled chunked != count-rank on NaN scores"

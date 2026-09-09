@@ -181,7 +181,11 @@ class MoEEpSplitLayer(nn.Module):
         result: torch.Tensor | None = None
         try:
             if not self.enable_timing:
-                dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+                dispatch = handle.dispatch(
+                    DispatchInputParams(
+                        x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
+                    )
+                )
                 expert_out = self._inner_compute(dispatch)
                 combine = handle.combine(
                     CombineInputParams(
@@ -199,7 +203,11 @@ class MoEEpSplitLayer(nn.Module):
                     for k in ("dispatch", "compute", "combine")
                 }
                 ev["dispatch"][0].record()
-                dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+                dispatch = handle.dispatch(
+                    DispatchInputParams(
+                        x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
+                    )
+                )
                 ev["dispatch"][1].record()
                 ev["compute"][0].record()
                 expert_out = self._inner_compute(dispatch)

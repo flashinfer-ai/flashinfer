@@ -140,21 +140,27 @@ def validate_split_forward_inputs(
 
 
 def _installed_nccl_version() -> "tuple[int, int, int] | None":
-    """Best-effort probe of the NCCL version the EP backend will load.
+    """Best-effort probe of the NCCL version the EP backend will actually load.
 
-    Prefers the nvidia-nccl-cu13 pip wheel's metadata (cuda-pathfinder loads
-    that wheel's libnccl first when present); falls back to ncclGetVersion on
-    the dynamic linker's default search path (covers NGC-style images with a
-    system NCCL and no pip wheel). Returns None when undeterminable — callers
-    must not block in that case.
+    Asks the *loaded* library first (``ncclGetVersion`` through the dynamic
+    linker), and only falls back to the nvidia-nccl-cu13 wheel's metadata when
+    no libnccl can be opened. Returns None when undeterminable — callers must
+    not block in that case.
+
+    Order matters, and this used to be the other way round. Installing the
+    wheel does NOT guarantee it is the copy that loads: NGC-style images ship a
+    system libnccl (e.g. /usr/lib/<triple>/libnccl.so.2.30.4) that the linker
+    finds first, and torch pulls it in before flashinfer is even imported, so
+    the later RTLD_GLOBAL preload in the nccl_ep backend cannot displace it.
+    Trusting the metadata there reports a version that is merely *installed*,
+    passes the Blackwell floor below, and then libnccl_ep — which since
+    nccl-extensions 0.1.0 is built against 2.30.7 and refuses anything older —
+    prints "NCCL library is too old" and aborts the process with
+    ncclInvalidUsage before any Python exception can be raised. Probing the
+    loaded library turns that into the actionable error below. Put the wheel's
+    lib dir ahead of the system one on LD_LIBRARY_PATH to fix the environment
+    (docker/install/build_flashinfer_ep_pytorch.sh does this).
     """
-    try:
-        from importlib.metadata import version
-
-        parts = version("nvidia-nccl-cu13").split(".")[:3]
-        return tuple(int(p) for p in parts)  # type: ignore[return-value]
-    except Exception:
-        pass
     try:
         import ctypes
 
@@ -167,6 +173,13 @@ def _installed_nccl_version() -> "tuple[int, int, int] | None":
             return (code // 10000, (code // 100) % 100, code % 100)
     except Exception:
         pass
+    try:
+        from importlib.metadata import version
+
+        parts = version("nvidia-nccl-cu13").split(".")[:3]
+        return tuple(int(p) for p in parts)  # type: ignore[return-value]
+    except Exception:
+        pass
     return None
 
 
@@ -174,8 +187,10 @@ def validate_arch_for_backend(backend: str) -> None:
     """Check the GPU arch and CUDA version are supported by `backend`."""
     import torch
 
-    # The EP runtime wheels (nccl4py, nvidia-nccl-cu13, nixl-cu13) are
-    # CUDA-13-only, so a torch built for CUDA 12 can't drive either backend —
+    # The EP runtime stack is CUDA-13-only here: nvidia-nccl-cu13 and
+    # nixl-cu13 ship CUDA-13 binaries only. (nccl-extensions itself bundles
+    # both cu12 and cu13 libnccl_ep.so, but the rest of the stack does not.)
+    # So a torch built for CUDA 12 can't drive either backend —
     # fail here with a clear message instead of a cryptic dlopen error later.
     # Parse defensively: custom/nightly torch builds can carry version
     # strings this check shouldn't crash on; skip it when unparseable.
@@ -186,8 +201,8 @@ def validate_arch_for_backend(backend: str) -> None:
         cuda_major = None
     if cuda_major is not None and cuda_major < 13:
         raise MoEEpConfigError(
-            f"{backend} requires CUDA 13: the EP runtime wheels (nccl4py, "
-            f"nvidia-nccl-cu13, nixl-cu13) ship CUDA-13 binaries only, but "
+            f"{backend} requires CUDA 13: the EP runtime wheels "
+            f"(nvidia-nccl-cu13, nixl-cu13) ship CUDA-13 binaries only, but "
             f"the installed torch was built for CUDA {cuda_ver}. Install a "
             "CUDA-13 torch build to use flashinfer.moe_ep."
         )
@@ -217,6 +232,36 @@ def validate_arch_for_backend(backend: str) -> None:
             )
 
 
+# nccl_ep instantiates its low-latency kernels only for these hidden sizes
+# (contrib/nccl_ep/device/macros.cuh, SWITCH_HIDDEN). Anything else reaches
+# EP_HOST_ASSERT(false and "Unsupported hidden") in device/low_latency.cu, which
+# aborts the process from C++ with no Python traceback -- under a test harness
+# that surfaces only as the worker dying on a signal.
+_NCCL_EP_LL_HIDDEN_SIZES = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
+    """Reject hidden sizes the LL kernels were never instantiated for.
+
+    LL only; HT is not hidden-size specialized. Raises rather than letting the
+    device-side host assert abort the process.
+    """
+    if backend != "nccl_ep" or params.algorithm is not EpAlgorithm.LOW_LATENCY:
+        return
+    hidden = params.token_hidden_size
+    if hidden in _NCCL_EP_LL_HIDDEN_SIZES:
+        return
+    supported = ", ".join(str(h) for h in _NCCL_EP_LL_HIDDEN_SIZES)
+    raise MoEEpConfigError(
+        f"nccl_ep low-latency does not support token_hidden_size={hidden}. "
+        f"Its kernels are instantiated only for: {supported} "
+        "(contrib/nccl_ep/device/macros.cuh SWITCH_HIDDEN); any other value "
+        "aborts the process in device/low_latency.cu. Round the layer's hidden "
+        "size up to one of the supported values, or use "
+        "EpAlgorithm.HIGH_THROUGHPUT, which is not hidden-size specialized."
+    )
+
+
 def validate_mega_arch() -> None:
     import torch
 
@@ -243,8 +288,27 @@ def validate_mega_arch_sm90() -> None:
     cc = _device_capability()
     if cc != (9, 0):
         raise MoEEpArchError(
-            f"sm90_pull_fp8 mega kernel requires sm_90 (Hopper); host has "
+            f"sm90_fp8_fp8_bf16_pull_cutedsl mega kernel requires sm_90 (Hopper); host has "
             f"sm_{cc[0]}{cc[1]}"
+        )
+
+
+def validate_mega_arch_sm120() -> None:
+    """Arch gate for the SM120 (Blackwell-consumer) mega kernels.
+
+    The SM120 swap-AB MXFP8 CuTeDSL mega kernel uses the warp-level MMA path
+    compiled for the consumer Blackwell family (sm_120 / sm_121). Datacenter
+    Blackwell (sm_100/sm_103) hosts use the sm_100 tree's kernels instead.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc[0] != 12:
+        raise MoEEpArchError(
+            f"sm120_mxfp8_mxfp8_bf16_cutedsl mega kernel requires sm_120/sm_121 "
+            f"(Blackwell-consumer); host has sm_{cc[0]}{cc[1]}"
         )
 
 

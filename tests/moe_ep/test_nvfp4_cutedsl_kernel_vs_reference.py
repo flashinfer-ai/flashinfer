@@ -1,7 +1,7 @@
 """Single-GPU checks: NVFP4 ``nvfp4_mega_moe`` vs a pure-torch oracle.
 
 NVFP4 counterpart of ``test_mxfp8_cutedsl_preprocess_vs_reference.py``: validates
-that ``nvfp4_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
+that ``sm100_nvfp4_nvfp4_bf16_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
 with an independent plain quant, and that a single-rank ``nvfp4_mega_moe``
 launch matches a pure-torch dequant reference (fp32 GEMMs + SwiGLU + fc1-out
 NVFP4 round-trip) after the in-kernel top-k reduction.
@@ -27,7 +27,7 @@ import pytest
 # Verify only through the cutedsl_megamoe shim public API (plus the FI backend
 # helpers); never import the src/ kernel packages directly, so a new src/ drop
 # can't silently break this test.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 NVFP4_BLOCK = 16
 
@@ -146,10 +146,10 @@ def _plain_nvfp4_from_bf16(problem: dict):
     """bf16 weights → kernel fp4 + plain e4m3 SF (pre-swizzle layout)."""
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         _interleave_gate_up_16,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         nvfp4_quantize_per_block_16,
     )
 
@@ -211,7 +211,7 @@ def _torch_nvfp4_mega_reference(
     """
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         nvfp4_quantize_per_block_16,
     )
 
@@ -273,10 +273,10 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import to_blocked
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import to_blocked
 
     problem = _single_rank_problem()
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
@@ -360,13 +360,13 @@ def test_nvfp4_kernel_matches_torch_reference(
     pytest.importorskip("triton")
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )

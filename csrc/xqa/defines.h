@@ -171,7 +171,9 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #endif
 
 // true should be better if warpTile.x * cacheElemSize < 128. otherwise use false.
-#define GRP_LOAD_V (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1)
+// HEAD_ELEMS > 256 requires the group-shared full-head V buffer (see nbHeadSplits in mha.cu).
+#define GRP_LOAD_V \
+  (CACHE_ELEM_ENUM != 0) || (HEAD_ELEMS == 256 && BEAM_WIDTH > 1) || (HEAD_ELEMS > 256)
 
 // use custom barrier for NVRTC to avoid pulling in many headers
 #ifndef USE_CUSTOM_BARRIER

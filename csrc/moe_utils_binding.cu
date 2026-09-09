@@ -343,6 +343,14 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_activation_bf16, moe_activation_bf1
 // - total_num_padded_tokens: [1], total number of padded tokens
 // - num_non_exiting_tiles: [1], number of non-exiting tiles
 
+// Batch size from which the cooperative routing kernel switches to contiguous
+// per-CTA route windows (see DataBase::mUseContiguousRouteWindows). The gather
+// locality it buys only pays off once a grouped-GEMM tile's slice of the
+// activation tensor outgrows the uTLB: measured on B200 it is neutral at or
+// below 32K tokens, roughly break-even at 64K, and worth 1.15-1.17x end to end
+// on the fused MoE pipeline at 128K.
+static constexpr int32_t kContiguousRouteWindowMinTokens = 65536;
+
 void moe_sort(
     // Inputs
     int64_t token_selected_experts_ptr,  // [num_tokens, top_k], int32
@@ -365,6 +373,7 @@ void moe_sort(
   // Configure dtypes
   routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   routingData.mUsePdl = use_pdl;
+  routingData.mUseContiguousRouteWindows = num_tokens >= kContiguousRouteWindowMinTokens;
 
   // Input tensors (pre-computed expert selections)
   routingData.mPtrTopKIds = reinterpret_cast<int32_t*>(token_selected_experts_ptr);

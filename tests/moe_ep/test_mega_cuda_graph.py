@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_blackwell():
@@ -48,8 +48,8 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         MegaConfig,
         MoEEpMegaLayer,
         MoEWeightPack,
-        Mxfp8CutedslMegaMoeConfig,
-        Nvfp4CutedslMegaMoeConfig,
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     num_experts = 4
@@ -75,11 +75,11 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
     )
 
     if backend_name == "nvfp4":
-        mk = Nvfp4CutedslMegaMoeConfig(
+        mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
     else:
-        mk = Mxfp8CutedslMegaMoeConfig(
+        mk = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
 
@@ -245,6 +245,32 @@ def test_mega_compute_output_none_returns_workspace_view(monkeypatch):
 
 
 @pytest.mark.arch_blackwell
+def test_mega_layer_forward_output_view_public_api(monkeypatch):
+    """The public opt-in returns the same workspace view as output=None."""
+    import torch
+
+    _require_blackwell()
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    layer, problem = _single_rank_layer("nvfp4")
+    try:
+        layer.warmup()
+        assert layer.supports_output_view
+        workspace = layer._workspace
+        for num_tokens, seed in ((64, 60), (32, 61), (64, 62), (0, 63), (48, 64)):
+            t = _random_batch(problem, seed=seed, num_tokens=num_tokens)
+            y_copy = layer.forward(t).clone()
+            y_view = layer.forward(t, return_workspace_view=True)
+            torch.cuda.synchronize()
+            assert y_view.shape == (num_tokens, problem["hidden"])
+            if num_tokens:
+                assert y_view.data_ptr() == workspace.output_activation.data_ptr()
+            assert torch.equal(y_view, y_copy)
+    finally:
+        layer.destroy()
+
+
+@pytest.mark.arch_blackwell
 def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
     """Engine pattern: one graph per batch size + eager calls, interleaved.
 
@@ -264,16 +290,16 @@ def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
         t64 = _random_batch(problem, seed=51, num_tokens=64)
         t32 = _random_batch(problem, seed=52, num_tokens=32)
 
-        y64_ref = layer.forward(t64).clone()
-        y32_ref = layer.forward(t32).clone()
+        y64_ref = layer.forward(t64, return_workspace_view=True).clone()
+        y32_ref = layer.forward(t32, return_workspace_view=True).clone()
         torch.cuda.synchronize()
 
         g64 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g64):
-            y64_g = layer.forward(t64)
+            y64_g = layer.forward(t64, return_workspace_view=True)
         g32 = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g32):
-            y32_g = layer.forward(t32)
+            y32_g = layer.forward(t32, return_workspace_view=True)
 
         # Small replay AFTER large replay: the 64-row staging must not leak
         # into the 32-row step.

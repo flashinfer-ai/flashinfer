@@ -136,7 +136,7 @@ not report a CUDA version.
 If the detected CUDA minor version is newer than the latest available
 ``flashinfer-jit-cache`` wheel in the same major version, the command uses the
 newest compatible wheel label. For example, CUDA 13.3 resolves to ``cu130``
-when ``cu130`` is the newest available CUDA 13 wheel.
+and CUDA 13.5 resolves to ``cu134``.
 
 Download Kernels
 ----------------

@@ -995,16 +995,14 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
 @torch.inference_mode()
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
-def test_sm100_cp_delta_rule_external_state_dtype(
+def test_cp_delta_rule_external_state_dtype(
     qkv_factory,
     state_dtype,
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
-    device = torch.device("cuda")
-    if not is_sm100a_supported(device):
-        pytest.skip("typed CP state requires SM100/SM103")
     _skip_if_cp_unsupported()
+    device = torch.device("cuda")
     _seed_all(seed)
     dtype = torch.bfloat16
     head_size = 128

@@ -1,11 +1,11 @@
-"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (nvfp4_cutedsl).
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl).
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
+``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -20,7 +20,7 @@ Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
 self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
 ownership, cross-rank combine), because both sides run the same CUDA kernel.
 ``test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle`` closes that gap with
-the sm90_pull_fp8 twin's methodology: each rank all-gathers the actual plain
+the sm90_fp8_fp8_bf16_pull_cutedsl twin's methodology: each rank all-gathers the actual plain
 quantized weight legs and checks its real-EP kernel output slice against the
 single-GPU pure-torch oracle run on its staged tokens + the global expert set.
 """
@@ -32,9 +32,9 @@ import os
 import pytest
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -80,7 +80,7 @@ def _make_inputs(
 def _make_epilogue_params(rank: int, num_local_experts: int):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         make_dummy_epilogue_params,
     )
 
@@ -220,15 +220,15 @@ def _reference_nvfp4_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -290,12 +290,12 @@ def _reference_nvfp4_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -373,7 +373,7 @@ def _assert_ikr_close(y, y_ref, *, topk):
 
 
 def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_extra):
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
     kwargs = dict(
         intermediate_size=problem["intermediate"],
@@ -388,7 +388,7 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
             fc1_norm_const=problem["fc1_norm_const"],
         )
     kwargs.update(config_extra)
-    return Nvfp4CutedslMegaMoeConfig(**kwargs)
+    return Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**kwargs)
 
 
 def _run_mega_layer(
@@ -400,6 +400,7 @@ def _run_mega_layer(
     max_tokens: int = 64,
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
+    check_output_view: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -416,7 +417,7 @@ def _run_mega_layer(
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -444,7 +445,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 get_symm_buffer_for_mega_moe,
             )
 
@@ -514,6 +515,19 @@ def _run_mega_layer(
         # kernel's tail cleanup of its workspace counters/flags -- this is the
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
+
+        if check_output_view:
+            assert mega.supports_output_view
+            y_view = mega.forward(t, return_workspace_view=True)
+            torch.cuda.synchronize()
+            assert y_view.shape == (problem["num_tokens"], problem["hidden"])
+            assert y_view.data_ptr() == mega._workspace.output_activation.data_ptr()
+            y_view_copy = y_view.clone()
+            y_view_repeat = mega.forward(t, return_workspace_view=True)
+            torch.cuda.synchronize()
+            assert torch.equal(y_view_copy, y_layer)
+            assert torch.equal(y_view_repeat, y_layer)
+
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -570,23 +584,25 @@ def _run_mega_layer(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
-    """MoEEpMegaLayer (nvfp4_cutedsl) with on-the-fly bf16→NVFP4 staging.
+    """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with on-the-fly bf16→NVFP4 staging.
 
     Per-expert ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are supplied
-    via :class:`Nvfp4CutedslMegaMoeConfig` (workspace allocation).
+    via :class:`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` (workspace allocation).
     """
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
-    print(f"rank {rank}: nvfp4_cutedsl mega layer (staged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
-    """MoEEpMegaLayer (nvfp4_cutedsl) with pre-staged NVFP4 activations.
+    """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with pre-staged NVFP4 activations.
 
     Per-expert epilogue scalars are supplied via :class:`MoEEpTensors` and copied
     into the symm workspace when ``quantize_input=False``.
@@ -596,7 +612,9 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, quantize_input=False)
-    print(f"rank {rank}: nvfp4_cutedsl mega layer (prestaged inputs) matches reference")
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (prestaged inputs) matches reference"
+    )
 
 
 @pytest.mark.gpu_4
@@ -616,7 +634,29 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
     rank = _run_mega_layer(
         rank, world_size, quantize_input=True, num_tokens=2048, max_tokens=2048
     )
-    print(f"rank {rank}: nvfp4_cutedsl mega layer (large tokens) matches reference")
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (large tokens) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("num_tokens", [64, 2048])
+def test_moe_ep_nvfp4_cutedsl_mega_layer_output_view(num_tokens):
+    """Public output-view API is bit-exact and reusable on every EP rank."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=num_tokens,
+        max_tokens=num_tokens,
+        check_output_view=True,
+    )
+    print(f"rank {rank}: output view matches copied output for {num_tokens} tokens")
 
 
 @pytest.mark.gpu_4
@@ -644,7 +684,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_mid_tokens_matches_reference(num_tokens
         max_tokens=num_tokens,
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (mid tokens={num_tokens}) "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (mid tokens={num_tokens}) "
         "matches reference"
     )
 
@@ -669,8 +709,194 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce():
         rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (in_kernel_fc2_reduce) "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (in_kernel_fc2_reduce) "
         "matches reference within tolerance"
+    )
+
+
+def _run_mega_layer_zero_token_ikr_regression(
+    rank,
+    world_size,
+    *,
+    num_iters: int = 60,
+):
+    """Interleave num_tokens=0 and real forward() calls, in_kernel_fc2_reduce=True,
+    no barrier between iterations, at an independent per-rank schedule.
+
+    NVFP4 mirror of the MXFP8 regression guard in
+    test_moe_ep_mxfp8_cutedsl_mega_multirank.py -- same bug, same fix, same
+    kernel architecture, different dtype.  ``nvfp4_mega_moe()`` has the
+    identical num_tokens==0 shortcut (spelled via the ``fc2_reduces_topk``
+    property, which is just ``in_kernel_fc2_reduce`` under a different name):
+
+        if n == 0 and symm_buffer._frontend.config.fc2_reduces_topk:
+            return symm_buffer.output_activation[:0] if y is None else None
+
+    that used to return WITHOUT ever calling frontend.run() (i.e. without
+    launching the kernel at all). Sm100MegaMoEKernel (NVFP4) shares the same
+    persistent-megakernel scheduler infra as MXFP8
+    (MoEFusedFc12SchedulerParams.get_grid_shape, sized from hardware
+    occupancy, never from num_tokens), so the same fix -- fall through to the
+    same full-buffer frontend.run() call every nonzero num_tokens already
+    takes -- applies unchanged. See
+    kernel_src/cutedsl_megamoe/shim/nvfp4.py::nvfp4_mega_moe.
+
+    Shapes/scale intentionally match the real repro (hidden=2048,
+    intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384),
+    not this file's usual small test defaults, with genuinely independent
+    (per-rank-seeded ``random.Random``, not a fixed formula) per-rank timing --
+    see the MXFP8 twin's docstring for why both matter (the same test at
+    smaller scale plus a deterministic schedule passes vacuously even without
+    the fix).
+
+    CAVEAT: see the MXFP8 twin's docstring for the full story on why this is
+    hard to make reliably fail pre-fix under pytest specifically (it does
+    reliably fail pre-fix as a plain torchrun-launched script -- see
+    tests/moe_ep/../repro_ikr_zero_token_idle.py, the authoritative
+    regression artifact for this bug); this test is kept as a documented,
+    passing correctness check of the exact scenario under the project's
+    normal test harness, with a deliberate (if unproven-sufficient) timing
+    nudge to improve its odds of catching a real regression.
+    """
+    import random
+    import time
+
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        ensure_moe_ep_cuda_device,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+
+    hidden = 2048
+    intermediate = 768
+    num_experts = 128
+    topk = 8
+    max_tokens = 16384
+    real_tokens = 4
+    assert num_experts % world_size == 0
+    num_local_experts = num_experts // world_size
+
+    w13, w2 = _make_bf16_weights(
+        rank,
+        num_local_experts=num_local_experts,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    warmup_hidden_states, warmup_topk_weights, warmup_topk_ids = _make_inputs(
+        rank, num_tokens=real_tokens, hidden=hidden, num_experts=num_experts, topk=topk
+    )
+    fc1_alpha, fc2_alpha, fc1_norm_const = _make_epilogue_params(
+        rank, num_local_experts
+    )
+    megakernel_config = _megakernel_config(
+        dict(
+            intermediate=intermediate,
+            topk=topk,
+            gate_up_clamp=10.0,
+            fast_math=True,
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            fc1_norm_const=fc1_norm_const,
+        ),
+        epilogue_via_config=True,
+        in_kernel_fc2_reduce=True,
+    )
+
+    mega = MoEEpMegaLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=max_tokens,
+            token_hidden_size=hidden,
+        ),
+        weights=MoEWeightPack(w13=w13, w2=w2),
+        backend=MegaConfig(megakernel=megakernel_config, preprocess_weights=True),
+    )
+    try:
+        # Matched-count collective warmup -- every rank calls forward() with
+        # real tokens once, together, before the independent-cadence loop.
+        mega.forward(
+            MoEEpTensors(
+                hidden_states=warmup_hidden_states,
+                topk_ids=warmup_topk_ids,
+                topk_weights=warmup_topk_weights,
+            )
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        # Independently-seeded per-rank RNG, no barrier between iterations:
+        # rank 0 always real (mirrors an always-busy rank); other ranks
+        # independently coin-flip zero/real every iteration, so each rank's
+        # actual wall-clock cadence diverges from its peers' in a way a fixed
+        # formula doesn't produce. Seeded for CI reproducibility.
+        rnd = random.Random(4242 + rank)
+        for it in range(num_iters):
+            n = real_tokens if rank == 0 else (0 if rnd.random() < 0.5 else real_tokens)
+            g = torch.Generator(device="cuda").manual_seed(1000 * it + rank)
+            hidden_states = torch.randn(
+                n, hidden, dtype=torch.bfloat16, device="cuda", generator=g
+            )
+            scores = torch.randn(
+                n, num_experts, dtype=torch.float32, device="cuda", generator=g
+            )
+            topk_weights, topk_ids = torch.topk(
+                scores, topk, dim=-1, largest=True, sorted=False
+            )
+            t = MoEEpTensors(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids.to(torch.int64),
+                topk_weights=topk_weights.to(torch.float32),
+            )
+            if n > 0:
+                # Nudge real per-rank wall-clock divergence: pre-fix, a
+                # zero-token round skips the kernel launch entirely and is
+                # near-instant, while a real round pays actual GPU cost --
+                # under plain torchrun that gap alone is enough to desync
+                # ranks within tens of rounds, but empirically not reliably
+                # under pytest (unconfirmed why; see the CAVEAT above). This
+                # doesn't guarantee detection here, just improves the odds.
+                time.sleep(0.003)
+            y = mega.forward(t)
+            torch.cuda.synchronize()
+            assert y.shape == (n, hidden)
+            assert y.dtype == torch.bfloat16
+            assert torch.isfinite(y).all()
+
+        dist.barrier()
+        return rank
+    finally:
+        mega.destroy()
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regression():
+    """Zero-token / in_kernel_fc2_reduce livelock regression guard (NVFP4).
+
+    See ``_run_mega_layer_zero_token_ikr_regression`` for the full bug
+    writeup. Before the fix, this reliably livelocks within tens of
+    iterations; after the fix, all ``num_iters`` complete cleanly regardless
+    of each rank's independent zero/nonzero token schedule.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer_zero_token_ikr_regression(rank, world_size)
+    print(
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer survives "
+        "interleaved zero-token/real in_kernel_fc2_reduce forward calls"
     )
 
 
@@ -694,7 +920,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_quantized_combine(combine_dtype):
         rank, world_size, quantize_input=True, combine_dtype=combine_dtype
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega layer (combine_dtype={combine_dtype}) "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (combine_dtype={combine_dtype}) "
         "matches reference"
     )
 
@@ -744,7 +970,7 @@ def _run_mega_torch_oracle(
     Parity tests alone cannot catch a kernel that is wrong but self-consistent
     at ``world_size > 1`` (peer-pull addressing, expert→rank ownership,
     peer-token dequant, cross-rank combine), because both sides run the same
-    CUDA kernel; this closes that gap (sm90_pull_fp8 twin methodology).
+    CUDA kernel; this closes that gap (sm90_fp8_fp8_bf16_pull_cutedsl twin methodology).
 
     Every rank stages its own bf16 shard, runs the fused kernel with real
     cross-rank NVSHMEM traffic, then all-gathers the ACTUAL plain (pre-swizzle)
@@ -773,14 +999,14 @@ def _run_mega_torch_oracle(
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         nvfp4_mega_moe,
     )
@@ -838,117 +1064,125 @@ def _run_mega_torch_oracle(
             fc2_alpha=problem["fc2_alpha"],
             fc1_norm_const=problem["fc1_norm_const"],
         )
-        stage_mega_moe_inputs(
-            problem["hidden_states"],
-            problem["topk_weights"],
-            problem["topk_ids"],
-            symm_buffer.x[:n],
-            symm_buffer.x_sf[:n],
-            symm_buffer.topk_idx[:n],
-            symm_buffer.topk_weights[:n],
-        )
-        # Snapshot exactly what the kernel consumes (this rank's shard).
-        x_local = symm_buffer.x[:n].clone()
-        x_sf_local = symm_buffer.x_sf[:n].clone()
-        idx_local = symm_buffer.topk_idx[:n].clone()
-        w_local = symm_buffer.topk_weights[:n].clone()
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x[:n],
+                symm_buffer.x_sf[:n],
+                symm_buffer.topk_idx[:n],
+                symm_buffer.topk_weights[:n],
+            )
+            # Snapshot exactly what the kernel consumes (this rank's shard).
+            x_local = symm_buffer.x[:n].clone()
+            x_sf_local = symm_buffer.x_sf[:n].clone()
+            idx_local = symm_buffer.topk_idx[:n].clone()
+            w_local = symm_buffer.topk_weights[:n].clone()
 
-        transformed_l1, transformed_l2 = preprocess_mega_weights(
-            MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
-            intermediate_size=problem["intermediate"],
-            hidden_size=problem["hidden"],
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
-
-        y_kernel = torch.empty(
-            n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-        )
-        nvfp4_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=n,
-            gate_up_clamp=problem["gate_up_clamp"],
-            fast_math=problem["fast_math"],
-        )
-        torch.cuda.synchronize()
-        dist.barrier()
-        symm_buffer.destroy()
-
-        # Reassemble the global expert set from each rank's ACTUAL plain
-        # (pre-swizzle) quantized weight legs; (R, E_local, ...) → (E, ...)
-        # rank-major matches the global expert id convention.
-        fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
-        fc1_w_g = _all_gather_stack(fc1_plain).flatten(0, 1)
-        fc1_sf_g = _all_gather_stack(fc1_sf).flatten(0, 1)
-        fc2_w_g = _all_gather_stack(fc2_plain).flatten(0, 1)
-        fc2_sf_g = _all_gather_stack(fc2_sf).flatten(0, 1)
-
-        # Model the quantized combine wire in the reference: each per-topk fc2
-        # term goes bf16 → wire quantize → dequantize exactly as the device
-        # combine encoder + topk_reduce do.
-        term_transform = None
-        if combine_dtype != "bf16":
-            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-                CombineFormat,
-                combine_roundtrip_to_fp32,
+            transformed_l1, transformed_l2 = preprocess_mega_weights(
+                MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+                intermediate_size=problem["intermediate"],
+                hidden_size=problem["hidden"],
+                gate_up_clamp=problem["gate_up_clamp"],
             )
 
-            wire = CombineFormat.parse(
-                {"nvfp4": "16e2m1xbf16", "mxfp8": "32e4m3xe8m0"}[combine_dtype]
+            y_kernel = torch.empty(
+                n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+            )
+            nvfp4_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fast_math=problem["fast_math"],
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            # Reassemble the global expert set from each rank's ACTUAL plain
+            # (pre-swizzle) quantized weight legs; (R, E_local, ...) → (E, ...)
+            # rank-major matches the global expert id convention.
+            fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
+            fc1_w_g = _all_gather_stack(fc1_plain).flatten(0, 1)
+            fc1_sf_g = _all_gather_stack(fc1_sf).flatten(0, 1)
+            fc2_w_g = _all_gather_stack(fc2_plain).flatten(0, 1)
+            fc2_sf_g = _all_gather_stack(fc2_sf).flatten(0, 1)
+
+            # Model the quantized combine wire in the reference: each per-topk fc2
+            # term goes bf16 → wire quantize → dequantize exactly as the device
+            # combine encoder + topk_reduce do.
+            term_transform = None
+            if combine_dtype != "bf16":
+                from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                    CombineFormat,
+                    combine_roundtrip_to_fp32,
+                )
+
+                wire = CombineFormat.parse(
+                    {"nvfp4": "16e2m1xbf16", "mxfp8": "32e4m3xe8m0"}[combine_dtype]
+                )
+
+                def term_transform(t):
+                    return combine_roundtrip_to_fp32(t.to(torch.bfloat16).float(), wire)
+
+            y_ref = _torch_nvfp4_mega_reference(
+                act_packed=x_local,
+                act_sf=x_sf_local,
+                topk_idx=idx_local,
+                topk_weights=w_local,
+                fc1_weight=fc1_w_g,
+                fc1_sf=fc1_sf_g,
+                fc2_weight=fc2_w_g,
+                fc2_sf=fc2_sf_g,
+                hidden=problem["hidden"],
+                intermediate=problem["intermediate"],
+                gate_up_clamp=problem["gate_up_clamp"],
+                term_transform=term_transform,
             )
 
-            def term_transform(t):
-                return combine_roundtrip_to_fp32(t.to(torch.bfloat16).float(), wire)
-
-        y_ref = _torch_nvfp4_mega_reference(
-            act_packed=x_local,
-            act_sf=x_sf_local,
-            topk_idx=idx_local,
-            topk_weights=w_local,
-            fc1_weight=fc1_w_g,
-            fc1_sf=fc1_sf_g,
-            fc2_weight=fc2_w_g,
-            fc2_sf=fc2_sf_g,
-            hidden=problem["hidden"],
-            intermediate=problem["intermediate"],
-            gate_up_clamp=problem["gate_up_clamp"],
-            term_transform=term_transform,
-        )
-
-        assert torch.isfinite(y_kernel).all()
-        yk = y_kernel.to(torch.float32)
-        yr = y_ref.to(torch.float32)
-        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
-        print(
-            f"[nvfp4 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce} "
-            f"combine={combine_dtype}] rel_l2={rel_l2.item():.4g} "
-            f"max|d|={(yk - yr).abs().max().item():.4g} "
-            f"amax(ref)={yr.abs().max().item():.4g}"
-        )
-        # Single-GPU oracle tolerances: the residual is NVFP4 RTNE flips at
-        # fc1-out + accumulation-order noise; atol scales with the output
-        # range (random unscaled weights put |y|~1e4 here).
-        atol = 2e-3 * yr.abs().max().item()
-        if in_kernel_fc2_reduce:
-            # The REDG reduce accumulates the K per-topk bf16 terms in
-            # nondeterministic order vs the reference's fp32 sum; widen the
-            # quant band by the bf16 K-term accumulation band per row (same
-            # bound as _assert_ikr_close).
-            diff = (yk - yr).abs()
-            row_scale = torch.maximum(yk.abs(), yr.abs()).amax(dim=1, keepdim=True)
-            tol = atol + 0.05 * yr.abs() + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
-            worst = (diff - tol).max().item()
-            assert worst <= 0.0, (
-                f"ikr oracle output outside the widened band "
-                f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            yr = y_ref.to(torch.float32)
+            rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
+            print(
+                f"[nvfp4 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce} "
+                f"combine={combine_dtype}] rel_l2={rel_l2.item():.4g} "
+                f"max|d|={(yk - yr).abs().max().item():.4g} "
+                f"amax(ref)={yr.abs().max().item():.4g}"
             )
-            assert rel_l2.item() < 0.03
-        else:
-            torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
-            assert rel_l2.item() < 0.02
-        return rank
+            # Single-GPU oracle tolerances: the residual is NVFP4 RTNE flips at
+            # fc1-out + accumulation-order noise; atol scales with the output
+            # range (random unscaled weights put |y|~1e4 here).
+            atol = 2e-3 * yr.abs().max().item()
+            if in_kernel_fc2_reduce:
+                # The REDG reduce accumulates the K per-topk bf16 terms in
+                # nondeterministic order vs the reference's fp32 sum; widen the
+                # quant band by the bf16 K-term accumulation band per row (same
+                # bound as _assert_ikr_close).
+                diff = (yk - yr).abs()
+                row_scale = torch.maximum(yk.abs(), yr.abs()).amax(dim=1, keepdim=True)
+                tol = (
+                    atol
+                    + 0.05 * yr.abs()
+                    + (problem["topk"] * 2.0**-8 * 8.0) * row_scale
+                )
+                worst = (diff - tol).max().item()
+                assert worst <= 0.0, (
+                    f"ikr oracle output outside the widened band "
+                    f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+                )
+                assert rel_l2.item() < 0.03
+            else:
+                torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+                assert rel_l2.item() < 0.02
+            return rank
+        finally:
+            # A failing rank must still free its symmetric-heap slice;
+            # leaking it turns a clean failure into a multi-rank hang.
+            symm_buffer.destroy()
     finally:
         finalize_moe_ep_runtime(runtime)
 
@@ -980,7 +1214,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
         combine_dtype=combine_dtype,
     )
     print(
-        f"rank {rank}: nvfp4_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
+        f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
         f"combine={combine_dtype}) matches the multi-rank torch oracle"
     )
 
@@ -992,7 +1226,7 @@ def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 
@@ -1037,7 +1271,7 @@ def test_nvfp4_cutedsl_staging_uses_input_norm_const():
 
     import torch
 
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
 
@@ -1086,38 +1320,38 @@ def test_nvfp4_cutedsl_staging_uses_input_norm_const():
 
 
 def test_nvfp4_cutedsl_mega_kernel_is_registered():
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     kernel = create_mega_kernel(
-        Nvfp4CutedslMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
-    assert kernel.kernel_name() == "nvfp4_cutedsl"
+    assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
 def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
-    cfg = Nvfp4CutedslMegaMoeConfig(
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         in_kernel_fc2_reduce=True,
     )
     assert cfg.combine_dtype == "bf16"
-    assert create_mega_kernel(cfg).kernel_name() == "nvfp4_cutedsl"
+    assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
-    cfg_q = Nvfp4CutedslMegaMoeConfig(
+    cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
         combine_dtype="nvfp4",
     )
-    assert create_mega_kernel(cfg_q).kernel_name() == "nvfp4_cutedsl"
+    assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         MegaMoENvfp4Config,
     )
 
@@ -1147,7 +1381,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
 
 
 def test_tuner_is_valid_quantized_combine_rules():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner
 
     # quantized combine excludes the in-kernel REDG reduce ...
     assert not tuner.is_valid(
@@ -1170,7 +1404,7 @@ def test_tuner_is_valid_quantized_combine_rules():
 
 
 def test_autotune_nvfp4_candidates_cover_ikr():
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         nvfp4_candidates,
     )
 
