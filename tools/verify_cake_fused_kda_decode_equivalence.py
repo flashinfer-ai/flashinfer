@@ -334,7 +334,7 @@ def _wide_num_slots(num_rows, conv_stride, state_stride, qkv_size, num_heads):
 
 
 def _selected_slots(torch, state_indices):
-    return torch.unique(state_indices[state_indices > 0], sorted=True)
+    return torch.unique(state_indices[state_indices > 0], sorted=True).to(torch.long)
 
 
 def _mutable_views(torch, tensors, selected_slots):
