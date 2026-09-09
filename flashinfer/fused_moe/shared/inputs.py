@@ -113,15 +113,24 @@ def fake_trtllm_moe_output(
     expert_weights: Optional[torch.Tensor] = None,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
     num_fused_shared_experts: int = 0,
+    finalized_hidden_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
-    """Model the native TRT-LLM MoE result contract for FakeTensor tracing."""
+    """Model the native TRT-LLM MoE result contract for FakeTensor tracing.
+
+    ``hidden_size`` is GEMM2's N, i.e. the width of the unfinalized expert rows.
+    ``finalized_hidden_size`` is the narrower caller-visible width of the
+    finalized output (``valid_hidden_size`` when declared); it defaults to
+    ``hidden_size``, which is the case whenever no valid dims were supplied.
+    """
     num_tokens = hidden_states.shape[0]
+    if finalized_hidden_size is None:
+        finalized_hidden_size = hidden_size
     if do_finalize:
         finalized = (
             output
-            if output is not None and output.shape[1] == hidden_size
+            if output is not None and output.shape[1] == finalized_hidden_size
             else hidden_states.new_empty(
-                (num_tokens, hidden_size), dtype=torch.bfloat16
+                (num_tokens, finalized_hidden_size), dtype=torch.bfloat16
             )
         )
         if gemm1_lora_delta is None:
