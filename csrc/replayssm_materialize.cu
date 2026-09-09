@@ -25,6 +25,8 @@
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
 
+#include <cassert>
+#include <cstdio>
 #include <limits>
 
 #include "tvm_ffi_utils.h"
@@ -119,7 +121,30 @@ __global__ void materialize_replay_kernel(MaterializeParams p) {
     if (virtual_request != last_virtual_request) {
       physical_request = active_request_indices[virtual_request];
       if (physical_request < 0) break;
+#ifndef NDEBUG
+      if (physical_request >= p.batch) {
+        if (warp == 0 && lane == 0) {
+          printf("ReplaySSM invalid active request: virtual=%d physical=%d batch=%d\n",
+                 virtual_request, physical_request, p.batch);
+          assert(false);
+        }
+        return;
+      }
+#endif
       count = replay_prefix_len[physical_request];
+#ifndef NDEBUG
+      int const debug_start = ring_start[physical_request];
+      if (count < 0 || count > MAX_WINDOW || debug_start < 0 || debug_start >= p.ring_buffer_len) {
+        if (warp == 0 && lane == 0) {
+          printf(
+              "ReplaySSM invalid metadata: virtual=%d physical=%d replay_prefix_len=%d "
+              "max_window=%d ring_start=%d ring_buffer_len=%d\n",
+              virtual_request, physical_request, count, MAX_WINDOW, debug_start, p.ring_buffer_len);
+          assert(false);
+        }
+        return;
+      }
+#endif
       last_virtual_request = virtual_request;
     }
     int64_t const table = int64_t(layer) * p.batch + physical_request;
