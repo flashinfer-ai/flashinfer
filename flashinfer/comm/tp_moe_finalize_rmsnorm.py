@@ -1,38 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""TP2/4/8 MoE finalize and post-expert RMSNorm on SM100/SM103.
+"""TP MoE finalize and post-expert RMSNorm on SM100/SM103.
 
 One candidate-owned kernel, no framework collective.  The input is the raw
 permuted GEMM2 buffer plus its expanded-to-permuted row map; resolving that map
 inside the kernel avoids materializing the logical [T,K,H] partial-row tensor.
-The cross-rank sum is expert-sharded instead of replicated. For TP4, the naive
-one-shot all-gather forces every rank to *receive* three full copies of that
-logical tensor (four with a multicast push, because the
-switch loops the sender's own copy back), even though the only thing anybody
-needs out of it is the [T,H] finalized row.  Sharding the experts moves the
-fabric cost onto the small tensor. The following example describes TP4;
-TP2 and TP8 assign four and one expert slots per rank, respectively:
+The TP group size P must exceed one and evenly divide K_EXPERTS. Each rank
+owns KO = K_EXPERTS / P expert slots:
 
-  phase 1 (scatter by expert owner): rank r owns experts [2r, 2r+1].  Every
-      rank pushes the six expert rows it does *not* own straight from registers
-      into the owning rank's Lamport slot -- 3/4 of the payload out, 3/4 in,
-      unicast, one store per expert row.  Nothing is broadcast.
-  phase 2 (local finalize of the owned experts): the owner sums the four BF16
-      rows in rank order in FP32, rounds once to BF16, RMS-normalizes over the
-      full H (the whole row is local now, so only the H-split needs a cluster
-      reduction), applies the routing weight in FP32 and accumulates its two
-      experts into an FP32 partial output row.
+  phase 1 (scatter by expert owner): rank r owns slots [r*KO, (r+1)*KO).
+      Each rank pushes its partial rows for other owners straight from
+      registers into those owners' Lamport slots, using unicast stores.
+  phase 2 (local finalize of the owned experts): the owner sums the BF16
+      partial rows from all ranks in rank order in FP32, rounds once to BF16,
+      RMS-normalizes over the full H, applies the routing weight in FP32,
+      and accumulates its owned slots into an FP32 partial output row.
   phase 3 (all-reduce the partial output): one multimem.st broadcast of the
-      FP32 [T,H] partial row -- a quarter of the payload -- then each rank sums
-      the four partials in rank order and rounds once to BF16.
+      FP32 [T,H] partial row, then each rank sums the partials in rank order
+      and rounds once to BF16.
 
-Fabric per rank, in units of the BF16 partial-row payload D:
-      egress 0.75 + 0.25 = 1.00 D      ingress 0.75 + 1.00 = 1.75 D
-versus 1.00 D / 4.00 D for the replicated one-shot push.  The bottleneck
-direction drops 2.3x.  Local memory traffic drops by a similar factor, and each
-thread now normalizes two expert rows instead of eight, so the arithmetic in the
-finalize body drops ~2.5x as well.  The price is a second fabric hop, which at
-decode shapes is hidden underneath the fixed per-launch floor.
+Sharding expert slots distributes normalization work across ranks. The second
+communication hop exchanges only the smaller [T,H] partial outputs.
 
 Both hops use the same flag-free Lamport transport: destination slots are
 pre-armed with a negative-zero sentinel (0x80008000 for the BF16 hop,
@@ -917,11 +905,12 @@ def _group_all(
 
 
 def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
-    """Collectively initialize the process-wide TP2/4/8 multicast workspace.
+    """Collectively initialize the process-wide TP multicast workspace.
 
-    ``group`` is the exact 2-, 4-, or 8-rank tensor-parallel group. The default
-    process group is used when it is omitted. Availability is reduced across
-    the group, so every rank returns the same verdict.
+    ``group`` is the exact tensor-parallel group. Its size must exceed one and
+    evenly divide ``K_EXPERTS``. The default process group is used when it is
+    omitted. Availability is reduced across the group, so every rank returns
+    the same verdict.
     """
     if _WS.initialized:
         if group is not None and group is not _WS.group:
@@ -1197,7 +1186,7 @@ def supports_tp_moe_finalize_rmsnorm(
     norm_weight: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
-    """Return whether tensors satisfy the TP2/4/8 SM100/SM103 kernel contract."""
+    """Return whether tensors satisfy the TP SM100/SM103 kernel contract."""
     if (
         not _WS.available
         or gemm2_permuted.ndim != 2
