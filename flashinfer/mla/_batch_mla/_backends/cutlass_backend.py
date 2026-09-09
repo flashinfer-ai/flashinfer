@@ -7,14 +7,14 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import ClassVar, Optional, cast
+from typing import ClassVar, Optional, Union, cast
 
 import torch
 
 from ....jit.mla import gen_mla_module
 from ....utils import check_shape_dtype_device, get_compute_capability
 from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
-from .._planning import _MLAPlanArguments
+from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 
 
 def _get_compute_capability(device: torch.device):
@@ -125,6 +125,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
         self.device = float_workspace_buffer.device
 
     @classmethod
+    @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionCutlassBackend":
@@ -256,6 +257,10 @@ class _BatchMLAPagedAttentionCutlassBackend:
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[Union[float, torch.Tensor]] = None,
+        bmm2_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # ---------------------------------------------------------------------------
         # Validate the run contract and resolve backend inputs
@@ -275,6 +280,15 @@ class _BatchMLAPagedAttentionCutlassBackend:
                 "ckv_scale / kpe_scale / ckv_scale_arr are only supported with "
                 "an fa2/fa3 backend and FP8 kv_data_type."
             )
+        if sinks is not None:
+            raise ValueError("sinks are not supported with cutlass backend.")
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is not supported with "
+                "cutlass backend."
+            )
+        if bmm1_scale is not None or bmm2_scale is not None:
+            raise ValueError("BMM scales are not supported with cutlass backend.")
         if (kv_len is None) != (page_table is None):
             raise ValueError(
                 "run-time kv_len and page_table must both be omitted or both be provided."
