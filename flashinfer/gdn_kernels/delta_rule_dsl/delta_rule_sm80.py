@@ -23,6 +23,7 @@ from .varlen_helper import is_integer_dtype
 
 @functools.cache
 def _sm80_compile_options(device):
+    """The compile options this kernel is built with: the device's SM8x arch."""
     return (cute.EnableTVMFFI(True),) + sm8x_compile_options(device)
 
 
@@ -171,6 +172,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         head_size: int,
         element_size: int,
     ) -> bool:
+        """Whether this configuration is one the kernel was built for."""
         ratio = (
             num_q_heads // num_v_heads
             if num_q_heads > num_v_heads
@@ -335,6 +337,10 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         num_v_heads: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
     ) -> WorkDesc:
+        """Which (sequence, head, value slice) this block owns.
+
+        The value slice varies fastest, so blocks sharing a sequence and a
+        head are adjacent and likeliest to find each other's lines in L2."""
         bx, _, _ = cute.arch.block_idx()
         # The value slice varies fastest, so the blocks sharing a sequence and a
         # head are adjacent. They read the same Q, K, alpha and beta, and
@@ -493,6 +499,13 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         alpha_stage: cutlass.Int32,
         beta_stage: cutlass.Int32,
     ):
+        """Apply the decay ratio and beta to the KK accumulator, in place.
+
+        Two per-element scales the GEMM cannot carry: `exp2` of the cumulative
+        log-decay difference between the two tokens a KK entry pairs, and beta
+        on the row. Both read the coordinate tensor rather than recomputing an
+        index, because the fragment's layout is the MMA's, not the tile's.
+        """
         if cutlass.const_expr(self.needs_alpha):
             alpha_cumlog = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
             for i in cutlass.range_constexpr(cute.size(tKKrKK)):
@@ -517,6 +530,13 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         is_final_block: bool,
         B: cutlass.Int32,
     ):
+        """Zero the entries a causal chunk product must not keep.
+
+        Strictly-upper entries always, and on the final block anything whose
+        row or column is past the sequence's own token count -- the tile is
+        read whole, so out-of-range rows hold whatever the zero-fill left and
+        have to be masked rather than skipped.
+        """
         for i in cutlass.range_constexpr(cute.size(frag)):
             s, t = coord_tensor[i]
             pred = s >= t
@@ -536,6 +556,11 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         alpha_stage: cutlass.Int32,
         scale: cutlass.Float32,
     ):
+        """Scale the QK accumulator by the decay ratio and the softmax scale.
+
+        With no gates there is no ratio to apply and the scale is the only
+        factor, which is why the two branches are not one expression.
+        """
         if cutlass.const_expr(self.needs_alpha):
             alpha_cumlog = sAlpha[None, AlphaProcessor.CUMSUM_LOG, alpha_stage]
             for i in cutlass.range_constexpr(cute.size(tQKrQK)):
@@ -563,6 +588,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         qk_tiled_mma,
         qk_thread_idx: cutlass.Int32,
     ):
+        """Convert the QK accumulator to Element and publish it to shared."""
         r2s_atom = cute.make_copy_atom(cute.nvgpu.CopyR2SOp(), self.dtype)
         qk_tiled_copy = cute.make_tiled_copy_C(r2s_atom, qk_tiled_mma)
         qk_thr_copy = qk_tiled_copy.get_slice(qk_thread_idx)
@@ -584,6 +610,12 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         alpha_stage: cutlass.Int32,
         scale: cutlass.Float32,
     ):
+        """Scale the O1 term by the query token's cumulative decay.
+
+        O1 is the state's contribution, so the factor is the decay from the
+        chunk's start to the query token -- a per-column scale, taken from the
+        coordinate tensor.
+        """
         if cutlass.const_expr(self.needs_alpha):
             alpha_cpscale = sAlpha[None, AlphaProcessor.CUMPROD_SCALE, alpha_stage]
             for i in cutlass.range_constexpr(cute.size(tOrO)):
@@ -603,6 +635,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         sAlpha: cute.Tensor,
         alpha_stage: cutlass.Int32,
     ):
+        """Scale the S@K term by the key token's cumulative decay."""
         if cutlass.const_expr(self.needs_alpha):
             alpha_cp = sAlpha[None, AlphaProcessor.CUMPROD, alpha_stage]
             for i in cutlass.range_constexpr(cute.size(tSKrSK)):
@@ -694,6 +727,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
 
     @cute.jit
     def _rep_slice(self, t: cute.Tensor, rep, d_is_mode1: cutlass.Constexpr):
+        """Pick one repeat of a staged tile, whichever axis `d` sits on."""
         if cutlass.const_expr(d_is_mode1):
             return t[None, rep, 0]
         return t[None, 0, rep]
@@ -811,6 +845,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         v_row_offset: cutlass.Int32,
         tid: cutlass.Int32,
     ):
+        """Issue this block's share of the Q, K and V tiles on `cp.async`."""
         blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
         # Rows of this tile the sequence actually owns. A full tile clamps to
         # the tile height, so the predicate costs nothing on the common path.
@@ -1000,6 +1035,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         num_sab_heads: cutlass.Int32,
         alpha_stage: cutlass.Int32,
     ):
+        """Load the alpha channels for one block and derive the cumulative ones."""
         lane_id = cute.arch.lane_idx()
         sAlpha_k = sAlpha[None, None, alpha_stage]
         num_iters = self.BLK_Q // 32
@@ -1027,6 +1063,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         num_sab_heads: cutlass.Int32,
         beta_stage: cutlass.Int32,
     ):
+        """Load beta for one block."""
         lane_id = cute.arch.lane_idx()
         sBeta_k = sBeta[None, beta_stage]
         num_iters = self.BLK_KV // 32
@@ -1123,6 +1160,12 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         gKV: cute.Tensor,
         kv_thr_mma,
     ):
+        """Read a state tile into the accumulator, by coordinate.
+
+        The accumulator's layout is the MMA's and the global state is (k, v),
+        so walking the coordinates is what pairs them without materializing a
+        transposed copy.
+        """
         c_kv = cute.make_identity_tensor((self.D_v, self.D))
         tKVcKV = kv_thr_mma.partition_C(c_kv)
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
@@ -1158,6 +1201,11 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         block_end: cutlass.Int32,
         seq_len: cutlass.Int32,
     ):
+        """Write a checkpoint when this block ends on a multiple of the period.
+
+        The condition is `block_end % checkpoint_every_n_tokens == 0`, so a
+        sequence whose length is not a multiple writes floor(length/period)
+        checkpoints and the tail is not one of them."""
         if cutlass.const_expr(self.needs_checkpointing):
             if (
                 block_end <= seq_len
@@ -2653,6 +2701,11 @@ def _get_prefill_kernel(
     blk_v,
     v32=False,
 ):
+    """One kernel object per compile-time configuration.
+
+    Cached, because building it re-derives every layout; the arguments are
+    exactly the fields the compile key carries, so two calls that would
+    compile the same binary get the same object."""
     return _FullyFusedDeltaRuleSm80(
         needs_alpha,
         needs_beta,

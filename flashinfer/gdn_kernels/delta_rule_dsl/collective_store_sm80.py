@@ -33,6 +33,12 @@ class CollectiveStoreSm80:
     """Writes O tiles from shared memory with predicated vector stores."""
 
     def __init__(self, blk_q: int, d: int, num_threads: int):
+        """Fix the tile and the thread count the store is laid out for.
+
+        All three are compile-time here: the vector width is derived from `d`
+        and refused if `d` does not divide by it, so a shape this store cannot
+        write is rejected at construction rather than at launch.
+        """
         self.BLK_Q = blk_q
         self.D = d
         self.num_threads = num_threads

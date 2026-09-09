@@ -512,6 +512,13 @@ def _cp_delta_rule_rejection_reason(
     checkpoint_cu_starts: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
 ) -> Optional[str]:
+    """Why CP cannot serve this call, or ``None`` if it can.
+
+    A string rather than a raised error, so the caller decides: `use_cp=True`
+    turns it into the message of an exception, and `use_cp="auto"` reads it as
+    "take the fused path". Returning early on the first reason keeps the
+    message about the thing the caller is most likely to fix.
+    """
     if arch_major == 8:
         # Reachable only with `use_cp=True`. The heuristic that picks CP on its
         # own still lists 9, 10 and 12, so nothing dispatches here by itself.

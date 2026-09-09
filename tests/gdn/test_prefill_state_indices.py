@@ -31,6 +31,7 @@ INTEGER_DTYPES = (
 
 
 def _skip_if_not_supported(use_cp: bool = False):
+    """Skip where no GDN prefill kernel exists for this device."""
     device = torch.device("cuda")
     major, _ = get_compute_capability(device)
     if major not in (8, 9, 10, 12):

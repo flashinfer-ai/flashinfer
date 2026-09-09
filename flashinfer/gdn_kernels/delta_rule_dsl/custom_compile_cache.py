@@ -45,6 +45,14 @@ def sm12x_compile_options(
 
 @lru_cache(maxsize=8)
 def _sm8x_gpu_arch_cached(device_type: str, device_index: int | None) -> cute.GPUArch:
+    """The arch string for one device, cached on its type and index.
+
+    Keyed on the two halves of the device rather than on a `torch.device`,
+    because two equal devices are not the same object and would miss the
+    cache. Refuses anything but compute capability 8.x: the caller asked for
+    SM8x, and returning another arch would compile for a target the kernel was
+    not written against.
+    """
     device = (
         torch.device(device_type)
         if device_index is None
@@ -72,6 +80,7 @@ def sm8x_gpu_arch(device: str | torch.device = "cuda") -> cute.GPUArch:
 def sm8x_compile_options(
     device: str | torch.device = "cuda",
 ) -> tuple[cute.GPUArch]:
+    """The compile options an SM8x kernel is compiled with: just its arch."""
     return (sm8x_gpu_arch(device),)
 
 
