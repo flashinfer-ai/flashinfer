@@ -3,7 +3,7 @@
   "description": "BF16 RMSNorm and indexed AdaLN, prepacked MXFP8 QKV GEMM, Q/K RMSNorm and split-half NeoX RoPE, followed by destination-major E4M3 and UE8M0 packing.",
   "op_type": "minimax_h3_mxfp8_pre_attention",
   "tags": [
-    "fi_api:flashinfer.minimax_h3.MiniMaxH3Mxfp8PreAttention.run",
+    "fi_api:flashinfer.cake_minimax_h3.MiniMaxH3Mxfp8PreAttention.run",
     "stage:pre_attention",
     "status:verified",
     "dtype:mxfp8"

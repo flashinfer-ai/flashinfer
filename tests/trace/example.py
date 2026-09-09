@@ -137,7 +137,7 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
-from flashinfer.minimax_h3 import MiniMaxH3Mxfp8PreAttention
+from flashinfer.cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
@@ -166,9 +166,7 @@ MiniMaxH3Mxfp8PreAttention.run.fi_trace(
     adaln_scale=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
     adaln_shift=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
     adaln_index=torch.empty((_mh_M,), dtype=torch.int32, device="meta"),
-    qkv_weight_q=torch.empty(
-        (21504, 5376), dtype=torch.float8_e4m3fn, device="meta"
-    ),
+    qkv_weight_q=torch.empty((21504, 5376), dtype=torch.float8_e4m3fn, device="meta"),
     qkv_weight_sf=torch.empty(
         (21504 * (5376 // 32),), dtype=torch.uint8, device="meta"
     ),

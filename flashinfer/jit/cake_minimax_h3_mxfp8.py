@@ -89,11 +89,7 @@ def gen_minimax_h3_mxfp8_aot_modules(
     specs: dict[str, JitSpec] = {}
     for M, P in MINIMAX_H3_MXFP8_SHAPES:
         route = module.minimax_h3_mxfp8_route_record(M, P)
-        if (
-            route.get("target") != target
-            or route.get("M") != M
-            or route.get("P") != P
-        ):
+        if route.get("target") != target or route.get("M") != M or route.get("P") != P:
             raise RuntimeError(
                 f"MiniMax-H3 MXFP8 route identity mismatch for {target}:{M}:{P}"
             )

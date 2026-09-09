@@ -20,7 +20,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.minimax_h3 import MiniMaxH3Mxfp8PreAttention
+from flashinfer.cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention
 
 
 _RUN_TENSOR_NAMES = (
@@ -49,7 +49,7 @@ def test_prepared_api_preserves_caller_owned_outputs(monkeypatch) -> None:
             calls.append("run")
             return output
 
-    generated = ModuleType("flashinfer.diffusion_ops.minimax_h3_mxfp8")
+    generated = ModuleType("flashinfer.diffusion_ops.cake_minimax_h3_mxfp8")
 
     def _prepare(**kwargs):
         calls.append(kwargs)
@@ -81,17 +81,13 @@ def test_prepared_api_preserves_caller_owned_outputs(monkeypatch) -> None:
     [((10, 0), "sm100a"), ((10, 3), "sm103a")],
 )
 def test_exact_architecture_router(monkeypatch, capability, expected) -> None:
-    router = pytest.importorskip(
-        "flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention"
-    )
+    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
     assert router.minimax_h3_mxfp8_target(torch.device("cuda")) == expected
 
 
 def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
-    router = pytest.importorskip(
-        "flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention"
-    )
+    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
         router.minimax_h3_mxfp8_target(torch.device("cuda"))
@@ -105,20 +101,16 @@ def _aligned_workspace(size: int, device: torch.device):
     return backing, backing[offset : offset + size]
 
 
-@pytest.mark.parametrize("invalid_index", [-1, 9, -(2**31), 2**31 - 1])
-def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
+def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
     ):
         pytest.skip("requires SM100a or SM103a")
 
-    router = pytest.importorskip(
-        "flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention"
-    )
+    router = pytest.importorskip("flashinfer.jit.cake_minimax_h3_mxfp8_pre_attention")
     from flashinfer.gemm import gemm_base
 
-    M, P = 1, 8
     hidden, qkv_width, head_dim = 5376, 21504, 128
     device = torch.device("cuda")
     rows_per_destination = M * (56 // P) * 3
@@ -129,30 +121,22 @@ def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
         "x_norm_weight": torch.ones((hidden,), dtype=torch.bfloat16, device=device),
         "adaln_scale": torch.zeros((9, hidden), dtype=torch.bfloat16, device=device),
         "adaln_shift": torch.zeros((9, hidden), dtype=torch.bfloat16, device=device),
-        "adaln_index": torch.full(
-            (M,), invalid_index, dtype=torch.int32, device=device
-        ),
+        "adaln_index": torch.full((M,), adaln_index, dtype=torch.int32, device=device),
         "qkv_weight_q": torch.zeros(
             (qkv_width, hidden), dtype=torch.float8_e4m3fn, device=device
         ),
         "qkv_weight_sf": torch.zeros(
             (qkv_width * (hidden // 32),), dtype=torch.uint8, device=device
         ),
-        "q_norm_weight": torch.ones(
-            (head_dim,), dtype=torch.bfloat16, device=device
-        ),
-        "k_norm_weight": torch.ones(
-            (head_dim,), dtype=torch.bfloat16, device=device
-        ),
+        "q_norm_weight": torch.ones((head_dim,), dtype=torch.bfloat16, device=device),
+        "k_norm_weight": torch.ones((head_dim,), dtype=torch.bfloat16, device=device),
         "rope_cos_sin": torch.zeros((M, 96), dtype=torch.bfloat16, device=device),
         "out_q": torch.ones(
             (P, M, 56 // P, 3, head_dim),
             dtype=torch.float8_e4m3fn,
             device=device,
         ),
-        "out_sf": torch.full(
-            (P, out_sf_stride), 255, dtype=torch.uint8, device=device
-        ),
+        "out_sf": torch.full((P, out_sf_stride), 255, dtype=torch.uint8, device=device),
     }
     route = router.minimax_h3_mxfp8_route_record(device, M, P)
     norm_backing, norm_workspace = _aligned_workspace(
@@ -160,24 +144,16 @@ def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
         device,
     )
     post_backing, post_workspace = _aligned_workspace(
-        int(
-            route["stages"]["qk_rope_destination_mxfp8_pack"][
-                "tma_workspace_bytes"
-            ]
-        ),
+        int(route["stages"]["qk_rope_destination_mxfp8_pack"]["tma_workspace_bytes"]),
         device,
     )
     operation = MiniMaxH3Mxfp8PreAttention(
         **values,
-        activation_q=torch.empty(
-            (M, hidden), dtype=torch.float8_e4m3fn, device=device
-        ),
+        activation_q=torch.empty((M, hidden), dtype=torch.float8_e4m3fn, device=device),
         activation_sf=torch.empty(
             (activation_sf_len,), dtype=torch.uint8, device=device
         ),
-        qkv_bf16=torch.empty(
-            (M, qkv_width), dtype=torch.bfloat16, device=device
-        ),
+        qkv_bf16=torch.empty((M, qkv_width), dtype=torch.bfloat16, device=device),
         gemm_workspace=torch.empty(
             (int(gemm_base.DEFAULT_WORKSPACE_SIZE),),
             dtype=torch.uint8,
@@ -186,6 +162,21 @@ def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
         P=P,
         norm_descriptor_workspace=norm_workspace,
         post_descriptor_workspace=post_workspace,
+    )
+    return (
+        operation,
+        values,
+        norm_backing,
+        norm_workspace,
+        post_backing,
+        post_workspace,
+    )
+
+
+@pytest.mark.parametrize("invalid_index", [-1, 9, -(2**31), 2**31 - 1])
+def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
+    operation, values, norm_backing, norm_workspace, post_backing, post_workspace = (
+        _prepare_zero_smoke(invalid_index)
     )
     actual_q, actual_sf = operation.run(**values)
     torch.cuda.synchronize()
@@ -198,8 +189,74 @@ def test_invalid_adaln_row_writes_zero_to_caller_outputs(invalid_index) -> None:
     assert post_backing is not None or post_workspace is None
 
 
+def test_prepared_api_cuda_graph_replay() -> None:
+    operation, values, *_workspaces = _prepare_zero_smoke(-1)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        operation.run(**values)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_q, captured_sf = operation.run(**values)
+    values["out_q"].fill_(1)
+    values["out_sf"].fill_(255)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured_q is values["out_q"]
+    assert captured_sf is values["out_sf"]
+    assert torch.count_nonzero(captured_q.view(torch.uint8)).item() == 0
+    assert torch.count_nonzero(captured_sf).item() == 0
+
+
+def test_prepared_instances_run_on_independent_streams() -> None:
+    first, first_values, first_norm, _first_norm_view, first_post, _first_post_view = (
+        _prepare_zero_smoke(-1)
+    )
+    (
+        second,
+        second_values,
+        second_norm,
+        _second_norm_view,
+        second_post,
+        _second_post_view,
+    ) = _prepare_zero_smoke(0)
+    second_values["adaln_shift"][0].fill_(1)
+    second_values["qkv_weight_q"].fill_(1)
+    second_values["qkv_weight_sf"].fill_(127)
+    first_stream = torch.cuda.Stream()
+    second_stream = torch.cuda.Stream()
+    current_stream = torch.cuda.current_stream()
+    first_stream.wait_stream(current_stream)
+    second_stream.wait_stream(current_stream)
+
+    with torch.cuda.stream(first_stream):
+        first_q, first_sf = first.run(**first_values)
+    with torch.cuda.stream(second_stream):
+        second_q, second_sf = second.run(**second_values)
+    first_stream.synchronize()
+    second_stream.synchronize()
+
+    assert first_q is first_values["out_q"]
+    assert first_sf is first_values["out_sf"]
+    assert second_q is second_values["out_q"]
+    assert second_sf is second_values["out_sf"]
+    assert torch.count_nonzero(first_q.view(torch.uint8)).item() == 0
+    assert torch.count_nonzero(first_sf).item() == 0
+    assert torch.count_nonzero(second_q.view(torch.uint8)).item() > 0
+    assert torch.count_nonzero(second_sf).item() > 0
+    if first_norm is not None:
+        assert second_norm is not None
+        assert first_norm is not second_norm
+    if first_post is not None:
+        assert second_post is not None
+        assert first_post is not second_post
+
+
 def test_aot_inventory_covers_every_exact_route(monkeypatch) -> None:
-    from flashinfer.jit import minimax_h3_mxfp8 as jit
+    from flashinfer.jit import cake_minimax_h3_mxfp8 as jit
 
     calls = []
 
