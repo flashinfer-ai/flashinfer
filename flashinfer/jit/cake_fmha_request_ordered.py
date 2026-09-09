@@ -225,8 +225,8 @@ def get_cake_fmha_request_ordered_module_spec(
             f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
             f'"{spec.kernel_symbol}")'
         )
-        == 1,
-        f"module {name} kernel lookup",
+        == 2,
+        f"module {name} ordinary and capture kernel lookups",
     )
     _require(
         binding.count(f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({spec.ffi_entry},") == 1,
