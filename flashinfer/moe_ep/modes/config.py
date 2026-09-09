@@ -20,6 +20,7 @@ class SplitConfig:
 
     comm: object = field(default_factory=NcclEpConfig)
     kernel: object = field(default_factory=IdentityConfig)
+    skip_combine: bool = False
 
 
 @dataclass

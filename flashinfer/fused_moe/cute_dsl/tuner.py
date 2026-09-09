@@ -505,6 +505,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         situ_linear_beta: Optional[float] = None,
         use_per_token_activation: bool = False,
         quant_mode: str = "w4a4",
+        enable_tile_signal: bool = False,
+        store_permuted_c: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
@@ -530,6 +532,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.situ_linear_beta = situ_linear_beta
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
+        self.enable_tile_signal = enable_tile_signal
+        self.store_permuted_c = store_permuted_c
+        self.tile_signal_state: Optional[Dict[str, Any]] = None
+        self.tile_ready: Optional[torch.Tensor] = None
+        self.gemm2_c: Optional[torch.Tensor] = None
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -660,6 +667,8 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.situ_linear_beta,
                 self.use_per_token_activation,
                 self.quant_mode,
+                self.enable_tile_signal,
+                self.store_permuted_c,
             )
         )
 
@@ -677,6 +686,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.use_fused_finalize,
             self.output_dtype,
             self.enable_pdl,
+            self.enable_tile_signal,
+            self.store_permuted_c,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -734,6 +745,14 @@ class CuteDslFusedMoERunner(TunableRunner):
 
         def _tactic_ok(tactic):
             tile_size, gemm1_tactic, gemm2_tactic = tactic
+            if self.enable_tile_signal or self.store_permuted_c:
+                if _is_rubin_tactic(tactic):
+                    return False
+                if tile_size != 128:
+                    return False
+                gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, _ = gemm2_tactic
+                if gemm2_mma_tiler_mn != (128, 128) or gemm2_cluster_shape_mn != (1, 1):
+                    return False
             permuted_m = get_max_num_permuted_tokens(
                 num_tokens, self.top_k, self.num_local_experts, tile_size
             )
@@ -964,6 +983,10 @@ class CuteDslFusedMoERunner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            tile_ready=kwargs.pop("tile_ready", self.tile_ready),
+            tile_signal_state=kwargs.pop("tile_signal_state", self.tile_signal_state),
+            store_permuted_c=kwargs.pop("store_permuted_c", self.store_permuted_c),
+            gemm2_c=kwargs.pop("gemm2_c", self.gemm2_c),
             **kwargs,
         )
 

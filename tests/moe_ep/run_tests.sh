@@ -10,6 +10,7 @@
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_nvfp4  # 4-GPU NVFP4 split-path numerics
+#   bash tests/moe_ep/run_tests.sh split_path_correctness_fused_gemm2_combine  # 4-GPU NVFP4 overlap combine
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_ht     # 4-GPU HT (FLAT) split-path numerics
 #   bash tests/moe_ep/run_tests.sh oracle        # 1-GPU torch-oracle correctness (all paths)
 #   bash tests/moe_ep/run_tests.sh oracle_sm90   # 1-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl vs drop reference
@@ -196,6 +197,16 @@ run_split_path_correctness_nvfp4() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v \
+    -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
+}
+
+run_split_path_correctness_fused_gemm2_combine() {
+  require_nccl_ep || return 1
+
+  NPROC_CORRECTNESS="${NPROC_CORRECTNESS:-4}"
+  "${TORCHRUN}" --nproc_per_node="${NPROC_CORRECTNESS}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_fused_gemm2_combine_correctness.py -v -s \
     -m "nvep and gpu_4 and arch_blackwell" --backend=nccl_ep
 }
 
@@ -398,6 +409,7 @@ run_all() {
   run_section "split-path multirank (NCCL-EP)" run_multirank
   run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16
   run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4
+  run_section "split_path_correctness_fused_gemm2_combine (4 GPU)" run_split_path_correctness_fused_gemm2_combine
   run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht
   run_section "mega multirank (Blackwell)" run_mega
   run_section "smoke scripts" run_smoke
@@ -413,6 +425,7 @@ case "${1:-all}" in
   multirank) run_section "split-path multirank (NCCL-EP)" run_multirank; print_summary ;;
   split_path_correctness_bf16) run_section "split_path_correctness_bf16 (4 GPU)" run_split_path_correctness_bf16; print_summary ;;
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
+  split_path_correctness_fused_gemm2_combine) run_section "split_path_correctness_fused_gemm2_combine (4 GPU)" run_split_path_correctness_fused_gemm2_combine; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
@@ -422,7 +435,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|mega_sm120|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_fused_gemm2_combine|split_path_correctness_ht|mega|mega_sm90|mega_sm120|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

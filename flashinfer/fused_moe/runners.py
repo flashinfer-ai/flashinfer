@@ -68,6 +68,7 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -3850,6 +3851,16 @@ class CuteDslRunner(MoERunner):
         self.device = torch.device(device)
         self._inner: Any = None
         self.tuning_config = TuningConfig()
+        self._enable_tile_signal = False
+        self._store_permuted_c = False
+        for candidate in config.backend:
+            if isinstance(candidate, CuteDslConfig):
+                self._enable_tile_signal = bool(candidate.enable_tile_signal)
+                self._store_permuted_c = bool(candidate.store_permuted_c)
+                break
+        self.tile_signal_state: dict[str, Any] = {}
+        self._tile_ready: torch.Tensor | None = None
+        self._gemm2_c: torch.Tensor | None = None
 
     def _build(self) -> None:
         """Create the shape-independent CuTe DSL tuning runner."""
@@ -3882,8 +3893,11 @@ class CuteDslRunner(MoERunner):
                     if self.config.quant.variant is QuantVariant.MXFP4
                     else "w4a4"
                 ),
+                enable_tile_signal=self._enable_tile_signal,
+                store_permuted_c=self._store_permuted_c,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
+            self._inner.tile_signal_state = self.tile_signal_state
         elif self.config.quant.variant is QuantVariant.W4A16:
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
@@ -3911,7 +3925,47 @@ class CuteDslRunner(MoERunner):
         return super()._cache_key_extras() + (
             bool(self._inner.use_fused_finalize),
             bool(self._inner.enable_pdl),
+            bool(self._enable_tile_signal),
+            bool(self._store_permuted_c),
         )
+
+    def _ensure_tile_ready(self, num_tokens: int, hidden_size: int) -> torch.Tensor:
+        from .cute_dsl.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+            gemm2_tile_ready_numel,
+        )
+        from .cute_dsl.moe_utils import get_max_num_permuted_tokens
+
+        nle = self.config.experts.local_num_experts or self.config.routing.num_experts
+        permuted_m = get_max_num_permuted_tokens(
+            num_tokens, self._inner.top_k, nle, tile_size=128
+        )
+        needed = gemm2_tile_ready_numel(permuted_m, hidden_size, (128, 128))
+        buf = self._tile_ready
+        if buf is None or int(buf.numel()) < needed:
+            buf = torch.zeros(needed, dtype=torch.int32, device=self.device)
+            self._tile_ready = buf
+        return buf
+
+    def _ensure_gemm2_c(self, num_tokens: int, hidden_size: int) -> torch.Tensor:
+        from .cute_dsl.moe_utils import get_max_num_permuted_tokens
+
+        nle = self.config.experts.local_num_experts or self.config.routing.num_experts
+        permuted_m = get_max_num_permuted_tokens(
+            num_tokens, self._inner.top_k, nle, tile_size=128
+        )
+        buf = self._gemm2_c
+        if (
+            buf is None
+            or int(buf.shape[0]) < permuted_m
+            or int(buf.shape[1]) != hidden_size
+        ):
+            buf = torch.empty(
+                (permuted_m, hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._gemm2_c = buf
+        return buf
 
     def forward(
         self,
@@ -3921,8 +3975,20 @@ class CuteDslRunner(MoERunner):
         **kwargs: Any,
     ) -> torch.Tensor:
         self._require_built()
+        extra: dict[str, Any] = {
+            "store_permuted_c": self._store_permuted_c,
+            "tile_signal_state": self.tile_signal_state,
+        }
+        if self.config.quant.variant is QuantVariant.NVFP4 and (
+            self._enable_tile_signal or self._store_permuted_c
+        ):
+            num_tokens = int(inputs[0].shape[0])
+            hidden_size = int(inputs[0].shape[1]) * 2  # NVFP4 packed
+            extra["tile_ready"] = self._ensure_tile_ready(num_tokens, hidden_size)
+            extra["gemm2_c"] = self._ensure_gemm2_c(num_tokens, hidden_size)
+        extra.update(kwargs)
         return self._inner.forward(
-            inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+            inputs, tactic=tactic, do_preparation=do_preparation, **extra
         )
 
     def pack_inputs(

@@ -118,6 +118,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="time the comm-only identity path (no compute_config)",
     )
+    p.add_argument(
+        "--method",
+        choices=["split-moe", "fused-gemm2-combine"],
+        default="split-moe",
+        help="split-moe: fused-finalize GEMM2 + NCCL combine. "
+        "fused-gemm2-combine: dense C + tile-ready overlap ship (NVFP4 LL "
+        "EXPERT_MAJOR only).",
+    )
     args = p.parse_args()
     if args.reference:
         args.num_experts = _REFERENCE["num_experts"]
@@ -143,7 +151,6 @@ def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, 
         QuantVariant,
         RoutingConfig,
         TrtllmBf16Config,
-        TrtllmFp4Config,
     )
     from flashinfer.moe_ep import MoEWeightPack
 
@@ -172,11 +179,17 @@ def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, 
     canonical = MoEWeightPack(w13=w13, w2=w2)
 
     if args.quant == "nvfp4":
+        # Same CuteDSL compute as fused-gemm2-combine. Do not list
+        # TrtllmFp4Config: weight materialize prepares only the first backend.
+        if args.method == "fused-gemm2-combine":
+            cute = CuteDslConfig(enable_tile_signal=True, store_permuted_c=True)
+        else:
+            cute = CuteDslConfig()
         cfg = MoEConfig(
             routing=routing,
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=experts,
-            backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+            backend=BackendOptions(candidates=(cute,)),
             execution=execution,
         )
     else:
@@ -276,6 +289,16 @@ def main() -> int:
     else:
         compute_max_tokens = local_num_experts * per_rank * world_size
 
+    if args.method == "fused-gemm2-combine":
+        if args.quant != "nvfp4":
+            raise SystemExit("fused-gemm2-combine requires --quant nvfp4")
+        if args.algorithm != "ll":
+            raise SystemExit("fused-gemm2-combine requires --algorithm ll")
+        if args.layout != "expert_major":
+            raise SystemExit("fused-gemm2-combine requires --layout expert_major")
+        if args.baseline:
+            raise SystemExit("fused-gemm2-combine is incompatible with --baseline")
+
     comm = _comm_config(args.backend)
     if args.baseline:
         layer_backend: SplitConfig | str = SplitConfig(
@@ -297,6 +320,7 @@ def main() -> int:
         layer_backend = SplitConfig(
             comm=comm,
             kernel=FusedMoeKernelConfig(moe_config=moe_config),
+            skip_combine=(args.method == "fused-gemm2-combine"),
         )
         layer_weights = canonical_weights
 
@@ -308,13 +332,13 @@ def main() -> int:
         algorithm=ep_algorithm,
         layout=ep_layout,
     )
+    from statistics import median
+    from time import perf_counter
+
     layer = MoEEpLayer(
         bootstrap, fleet_params, weights=layer_weights, backend=layer_backend
     )
     t = MoEEpTensors(hidden_states=x, topk_ids=topk_ids, topk_weights=topk_weights)
-
-    from statistics import median
-    from time import perf_counter
 
     layer.enable_timing = True
 
@@ -368,12 +392,25 @@ def main() -> int:
     if rank == 0:
         mode = "identity" if args.baseline else args.quant
         layout_name = "ht_flat" if args.algorithm == "ht" else args.layout
+        overlap_note = ""
+        kernel = getattr(layer, "_kernel", None)
+        stats = (
+            getattr(kernel, "last_overlap_stats", None) if kernel is not None else None
+        )
+        if stats:
+            overlap_note = (
+                f" overlap_live_rows={stats.get('live_rows')} "
+                f"overlap_live_bytes={stats.get('live_bytes')} "
+                f"overlap_expected_rows={stats.get('expected_rows')}"
+            )
         print(
-            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,dispatch_us,compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps\n"
-            f"BENCH_CSV,{args.algorithm},{layout_name},{args.tokens},{world_size},{args.backend},{mode},"
+            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,method,dispatch_us,compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps\n"
+            f"BENCH_CSV,{args.algorithm},{layout_name},{args.tokens},{world_size},{args.backend},{mode},{args.method},"
             f"{d_us:.1f},{cp_us:.1f},{cb_us:.1f},{e2e_us:.1f},{tok_s:.1f},"
             f"{disp_gbps:.1f},{disp_rdma:.1f},{comb_gbps:.1f},{comb_rdma:.1f}"
         )
+        if overlap_note:
+            print(f"OVERLAP_STATS,{overlap_note.strip()}")
     layer.destroy()
     dist.destroy_process_group()
     return 0
