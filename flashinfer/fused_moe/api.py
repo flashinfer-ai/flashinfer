@@ -215,8 +215,10 @@ class QuantConfig:
         ``torch.float16``.
     variant : QuantVariant or None
         Deprecated preset that expands to ``weight`` / ``activation`` and emits
-        a ``DeprecationWarning``. May be combined with an explicit pair only
-        when they agree. The stored ``variant`` attribute is derived from the
+        a ``DeprecationWarning``. An explicit non-BF16 pair given alongside it
+        must agree with the expansion; an explicit BF16×BF16 is
+        indistinguishable from the omitted default and is overridden by the
+        preset. The stored ``variant`` attribute is derived from the
         pair (``init=False``), so ``dataclasses.replace`` never replays it.
         Output stays at its default unless passed explicitly.
         ``QuantVariant.W4A16`` is rejected; spell the pair
