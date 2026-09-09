@@ -4019,9 +4019,7 @@ def trtllm_batch_decode_with_kv_cache(
                     q_len=q_len_per_req,
                     write_lse=lse is not None,
                 )
-            if not isinstance(
-                request_order_plan, CakeFmhaRequestOrderedDecodePlan
-            ):
+            if not isinstance(request_order_plan, CakeFmhaRequestOrderedDecodePlan):
                 raise TypeError(
                     "request_order_plan must be returned by "
                     "plan_cake_fmha_request_ordered_paged_decode"

@@ -56,9 +56,7 @@ def _require(condition: bool, message: str) -> None:
 
 def _source_root() -> Path:
     installed = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / "cake_fmha"
-        / "request_ordered_paged_decode"
+        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / "request_ordered_paged_decode"
     )
     checkout = (
         Path(__file__).resolve().parents[2]
@@ -349,9 +347,7 @@ def _compile_cubin(spec: CakeFmhaRequestOrderedModuleSpec) -> bytes:
     options = _nvrtc_options(spec)
     if any("o1" in option.lower() for option in options):
         raise RuntimeError(f"forbidden O1 option in Cake FMHA NVRTC flags: {options}")
-    result, program = nvrtc.nvrtcCreateProgram(
-        source, b"kernel.cu", 0, [], []
-    )
+    result, program = nvrtc.nvrtcCreateProgram(source, b"kernel.cu", 0, [], [])
     if not _result_ok(result):
         raise RuntimeError(f"nvrtcCreateProgram failed for {spec.name}: {result}")
     try:
@@ -467,7 +463,10 @@ def load_cake_fmha_request_ordered_module(name: str):
         extra_ldflags=["-lcuda"],
         build_directory=str(build_directory),
     )
-    _require(callable(getattr(result, spec.ffi_entry, None)), f"missing FFI entry {spec.ffi_entry}")
+    _require(
+        callable(getattr(result, spec.ffi_entry, None)),
+        f"missing FFI entry {spec.ffi_entry}",
+    )
     logger.info("Loaded request-ordered Cake FMHA module %s", name)
     return result
 

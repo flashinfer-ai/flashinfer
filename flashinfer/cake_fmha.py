@@ -57,12 +57,13 @@ def _request_ordered_plan_from_route(
     route: dict[str, Any], *, batch_size: int
 ) -> CakeFmhaRequestOrderedDecodePlan:
     plan = route["build_plan"]
+    grid_x, grid_y, grid_z = (int(value) for value in plan["grid"])
     return CakeFmhaRequestOrderedDecodePlan(
         module_name=str(route["module_name"]),
         batch_size=batch_size,
         q_len=int(plan["q_len"]),
         workspace_parts=int(plan["workspace_parts"]),
-        grid=tuple(int(value) for value in plan["grid"]),
+        grid=(grid_x, grid_y, grid_z),
         total_tiles=int(plan["total_tiles"]),
         write_lse=bool(plan["write_lse"]),
     )
