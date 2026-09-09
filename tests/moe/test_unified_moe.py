@@ -541,7 +541,11 @@ class TestQuantConfig:
 
     @pytest.mark.parametrize(
         "kwargs",
-        [{"weight": QuantFormat.MXFP4}, {"activation": QuantFormat.BF16}],
+        [
+            {"weight": QuantFormat.MXFP4},
+            {"weight": QuantFormat.NVFP4},
+            {"activation": QuantFormat.BF16},
+        ],
     )
     def test_omitted_axis_defaults_to_bf16(self, kwargs):
         cfg = QuantConfig(**kwargs)
