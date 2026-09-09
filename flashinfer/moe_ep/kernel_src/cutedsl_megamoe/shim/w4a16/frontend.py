@@ -264,8 +264,8 @@ class MegaMoEW4A16Frontend:
         )
         kwargs = self._runtime_kwargs(inputs, mega)
         kwargs["max_active_clusters"] = max_active_clusters
-        # The 640-thread launch starts with 96 registers per thread; steady
-        # targets 176/80/64/80/80 reuse its initial 61440 registers.
+        # Start with 61440 registers per CTA; the kernel redistributes this
+        # pool among the five warpgroup roles.
         kwargs["options"] = "--ptxas-options='-maxrregcount=96'"
         if c.enable_iket:
             kwargs["options"] += " iket"

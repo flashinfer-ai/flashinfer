@@ -1147,11 +1147,10 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             activation_pipe.producer_tail(state)
 
         if warp >= 12:
-            # Redistribute only the CTA's initial 640*96 register allocation.
-            # 128*(176+80+64+80+80) = 61440 registers after redistribution.
-            cute.arch.setmaxregister_decrease(80)
-            # Both groups decode disjoint halves of the same K tile. This
-            # 80-register budget keeps both groups within the CTA register pool.
+            # Both decode groups retain their initial 96-register allocation.
+            # Control80 and dispatch64 donate exactly what epilogue144 needs:
+            # 128*(144+80+64+96+96) = 640*96 = 61440 registers.
+            # Each group still decodes a disjoint half of the same K tile.
             transform_group_idx = (warp - self.transform_warp_id[0]) // 4
             transform_local_tidx = tidx - 32 * (
                 self.transform_warp_id[0] + transform_group_idx * 4
@@ -1279,7 +1278,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             acc_pipe.producer_tail(acc_state)
 
         if warp < 4:
-            cute.arch.setmaxregister_increase(176)
+            cute.arch.setmaxregister_increase(144)
             self.epilogue.run(
                 epi_smem_storage=None,
                 tmem_ptr=tmem.retrieve_ptr(cutlass.Float32),
