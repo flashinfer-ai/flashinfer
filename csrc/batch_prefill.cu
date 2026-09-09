@@ -289,6 +289,20 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
       RaggedParams, PagedParams, [&] {
         PagedParams params;
 
+        if constexpr (HEAD_DIM_QK == HEAD_DIM_VO && HEAD_DIM_VO < 512) {
+          // These caches address K and V through a single set of page offsets in the
+          // kernel (KernelTraits::SEPARATE_KV_OFFSETS), so the two pools must agree on
+          // strides. Independent K/V strides stay supported for the asymmetric (NVFP4
+          // VO-split) layout and for the large-head configurations that reach the
+          // shared-KV-smem on-the-fly producer.
+          for (int i = 0; i < paged_k_cache.ndim(); ++i) {
+            TVM_FFI_ICHECK_EQ(paged_k_cache.stride(i), paged_v_cache.stride(i))
+                << "k/v strides differ at dim " << i
+                << "; independent K/V strides require head_dim_qk != head_dim_vo or head_dim >= "
+                   "512";
+          }
+        }
+
         params.q = static_cast<DTypeQ*>(q.data_ptr());
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,

@@ -406,6 +406,16 @@ struct KernelTraits {
   static constexpr uint32_t REPACK_STRIDE_QK = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t REPACK_STRIDE_VO = HEAD_DIM_VO / upcast_size<DTypeQ_>();
 
+  // Whether the K and V pools can carry different page strides. Two families can:
+  // the asymmetric NVFP4 VO-split cache (head_dim_qk != head_dim_vo), and the
+  // large-head configurations, which reach the shared-KV-smem on-the-fly producer
+  // (USE_VO_SPLIT requires head_dim >= 512) and route V through the V strides
+  // there. Everywhere else the launcher requires the two pools to share strides,
+  // so a V page offset is bit-identical to the K one; keeping a second in-register
+  // offset array for that case costs NUM_PAGED_KV_OFFSETS extra 64-bit registers
+  // per thread and drops occupancy (~26% on B300 fa2_tc decode, NVBug 6634590).
+  static constexpr bool SEPARATE_KV_OFFSETS = (HEAD_DIM_QK != HEAD_DIM_VO) || (HEAD_DIM_VO >= 512);
+
   static constexpr bool IsInvalid() {
     // The first clause prunes (CTA_TILE_Q, head_dim) pairs FA2DetermineCtaTileQ
     // never selects: it picks from {16, 32} when head_dim_vo >= 512 (VO-split),
@@ -4008,10 +4018,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // Separate K/V page offsets: the K and V pools may carry different strides
       // (e.g. NVFP4 VO-split caches where head_dim_qk != head_dim_vo). The K/V-shared
       // smem path computes offsets on the fly, so the arrays collapse to [1] stubs there.
+      // With shared strides (KTraits::SEPARATE_KV_OFFSETS == false) the V offsets equal
+      // the K offsets, so the V array collapses to a [1] stub as well rather than
+      // doubling this thread's 64-bit offset registers.
+      constexpr uint32_t NUM_PAGED_V_OFFSETS =
+          KTraits::SEPARATE_KV_OFFSETS ? NUM_PAGED_KV_OFFSETS : 1;
       [[maybe_unused]] size_t
           thr_local_kv_offset_k[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_KV_OFFSETS];
       [[maybe_unused]] size_t
-          thr_local_kv_offset_v[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_KV_OFFSETS];
+          thr_local_kv_offset_v[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_V_OFFSETS];
 
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -4070,8 +4085,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
           thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
               page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
-          thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
-              page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+          if constexpr (KTraits::SEPARATE_KV_OFFSETS) {
+            thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+                page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+          }
         }
         page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data, 0,
                                         thr_local_kv_offset_k, chunk_size, warp_idx, lane_idx);
@@ -4083,8 +4100,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       cp_async::commit_group();
       // Shared K/V loads V(0) inside iter 0 after Q.K^T; preloading it would clobber K(0).
       if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
-        page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
-                                       thr_local_kv_offset_v, chunk_size, warp_idx, lane_idx);
+        // With shared K/V strides the V rows sit at the K offsets, so the V
+        // producer reads the K array and the V offsets never reach a register.
+        if constexpr (KTraits::SEPARATE_KV_OFFSETS) {
+          page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
+                                         thr_local_kv_offset_v, chunk_size, warp_idx, lane_idx);
+        } else {
+          page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
+                                         thr_local_kv_offset_k, chunk_size, warp_idx, lane_idx);
+        }
         page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
                                           v_sf_stride_page, v_sf_stride_h, v_sf_stride_n,
@@ -4177,8 +4201,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
             thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
                 page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
-            thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
-                page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+            if constexpr (KTraits::SEPARATE_KV_OFFSETS) {
+              thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+                  page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+            }
           }
         }
         // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
@@ -4331,9 +4357,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::commit_group();
           packed_page_iter_base = next_packed_page_iter_base;
         } else {
-          page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                         (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
-                                         chunk_size, warp_idx, lane_idx);
+          if constexpr (KTraits::SEPARATE_KV_OFFSETS) {
+            page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
+                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
+                                           chunk_size, warp_idx, lane_idx);
+          } else {
+            page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
+                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
+                                           chunk_size, warp_idx, lane_idx);
+          }
           page_produce_kv_sf<true, KTraits>(
               &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
               last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, v_sf_stride_page,
