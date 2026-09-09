@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_ATTENTION_SPARSE_PRE_INDEXER_CUH_
 #define FLASHINFER_ATTENTION_SPARSE_PRE_INDEXER_CUH_
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -85,6 +86,16 @@ __device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float x) {
 template <>
 __device__ __forceinline__ half from_float<half>(float x) {
   return __float2half(x);
+}
+// Narrowing to the indexer's output dtype. There is deliberately no matching
+// ``to_float``: ``round_to`` is defined in terms of both, so leaving this one out
+// turns an accidental ``round_to<__nv_fp8_e4m3>`` into a compile error instead of a
+// silent precision loss. Only the final store may narrow -- see ``apply_norm_rope``,
+// which must keep rounding to the compute dtype so a fused result still matches an
+// unfused one.
+template <>
+__device__ __forceinline__ __nv_fp8_e4m3 from_float<__nv_fp8_e4m3>(float x) {
+  return __nv_fp8_e4m3(x);
 }
 
 // A value as the cache will hold it. The pooled group and the normalised row
@@ -253,7 +264,7 @@ __device__ __forceinline__ void load_weight(float (&w)[kPer<D>], const DType* __
  * runtime; a negative one means that divisor is not a power of two and the
  * launch takes the general path.
  */
-template <typename DType>
+template <typename DType, typename OutDType = DType>
 struct QSAPreIndexerParams {
   const DType* q;
   int64_t q_stride_token;
@@ -268,7 +279,7 @@ struct QSAPreIndexerParams {
   const DType* q_norm_weight;
   const DType* k_norm_weight;
   float eps;
-  DType* q_out;
+  OutDType* q_out;
   int64_t q_out_stride_token;
   int64_t q_out_stride_head;
   DType* state_cache;
@@ -281,7 +292,7 @@ struct QSAPreIndexerParams {
   const int64_t* logical_positions;
   const int64_t* compressed_slots;
   const int32_t* work_metadata;
-  DType* compressed_cache;
+  OutDType* compressed_cache;
   int64_t compressed_stride_block;
   int64_t compressed_stride_token;
   int32_t num_tokens;
@@ -313,8 +324,10 @@ namespace sparse_pre_indexer {
  * \tparam POW2 whether the compression ratio, the ring and the compressed page
  *   are all powers of two, which is what turns their divisions into shifts
  */
-template <int D, bool MROPE_Q, bool MROPE_K, bool POS_2D, bool CACHE_POS, bool POW2, typename DType>
-__global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParams<DType> a) {
+template <int D, bool MROPE_Q, bool MROPE_K, bool POS_2D, bool CACHE_POS, bool POW2, typename DType,
+          typename OutDType = DType>
+__global__ void __launch_bounds__(kBlock)
+    QSAPreIndexerKernel(QSAPreIndexerParams<DType, OutDType> a) {
   const int lane = threadIdx.x % kWarp;
   const int warp = threadIdx.x / kWarp;
   const int block = static_cast<int>(blockIdx.x);
@@ -375,9 +388,10 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
           // unroll and put the staged rows in local memory.
           if (i < n && (!tail || token0 + t < a.num_tokens)) {
             norm_rope<D, DType>(v[t][i], weight, c[t], sn[t], a.eps);
-            store_row<D, DType>(a.q_out + static_cast<int64_t>(token0 + t) * a.q_out_stride_token +
-                                    static_cast<int64_t>(h0 + i) * a.q_out_stride_head,
-                                v[t][i], lane);
+            store_row<D, OutDType>(a.q_out +
+                                       static_cast<int64_t>(token0 + t) * a.q_out_stride_token +
+                                       static_cast<int64_t>(h0 + i) * a.q_out_stride_head,
+                                   v[t][i], lane);
           }
         }
       }
@@ -509,9 +523,9 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
           POW2 ? (compressed_slot >> a.comp_shift) : compressed_slot / a.comp_page_size;
       const int64_t comp_row =
           POW2 ? (compressed_slot & (a.comp_page_size - 1)) : compressed_slot % a.comp_page_size;
-      store_row<D, DType>(a.compressed_cache + comp_block * a.compressed_stride_block +
-                              comp_row * a.compressed_stride_token,
-                          acc, lane);
+      store_row<D, OutDType>(a.compressed_cache + comp_block * a.compressed_stride_block +
+                                 comp_row * a.compressed_stride_token,
+                             acc, lane);
     }
   }
 
@@ -572,8 +586,8 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
  * outside anything an activation reaches, but it is silent, so it is stated
  * rather than left to be discovered.
  */
-template <uint32_t HEAD_DIM, typename DType>
-cudaError_t QSAPreIndexer(QSAPreIndexerParams<DType> params, bool mrope_k, bool pos_2d,
+template <uint32_t HEAD_DIM, typename DType, typename OutDType = DType>
+cudaError_t QSAPreIndexer(QSAPreIndexerParams<DType, OutDType> params, bool mrope_k, bool pos_2d,
                           bool cache_pos, cudaStream_t stream = nullptr) {
   using namespace sparse_pre_indexer;
   static_assert(HEAD_DIM == 128 || HEAD_DIM == 256,
@@ -593,12 +607,12 @@ cudaError_t QSAPreIndexer(QSAPreIndexerParams<DType> params, bool mrope_k, bool 
   auto launch = [&](auto mrope_q_tag, auto mrope_k_tag, auto pos_2d_tag, auto cache_pos_tag) {
     if (pow2) {
       QSAPreIndexerKernel<HEAD_DIM, decltype(mrope_q_tag)::value, decltype(mrope_k_tag)::value,
-                          decltype(pos_2d_tag)::value, decltype(cache_pos_tag)::value, true, DType>
-          <<<grid, kBlock, 0, stream>>>(params);
+                          decltype(pos_2d_tag)::value, decltype(cache_pos_tag)::value, true, DType,
+                          OutDType><<<grid, kBlock, 0, stream>>>(params);
     } else {
       QSAPreIndexerKernel<HEAD_DIM, decltype(mrope_q_tag)::value, decltype(mrope_k_tag)::value,
-                          decltype(pos_2d_tag)::value, decltype(cache_pos_tag)::value, false, DType>
-          <<<grid, kBlock, 0, stream>>>(params);
+                          decltype(pos_2d_tag)::value, decltype(cache_pos_tag)::value, false, DType,
+                          OutDType><<<grid, kBlock, 0, stream>>>(params);
     }
     status = cudaGetLastError();
   };

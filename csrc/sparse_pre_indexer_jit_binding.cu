@@ -23,4 +23,7 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
                      TensorView compressed_slots, TensorView work_metadata, int64_t compress_ratio,
                      int64_t mrope_h, int64_t mrope_w, bool is_k_mrope, bool cache_has_rope_pos);
 
+int64_t qsa_pre_indexer_dispatch_mask();
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_pre_indexer, qsa_pre_indexer);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(qsa_pre_indexer_dispatch_mask, qsa_pre_indexer_dispatch_mask);
