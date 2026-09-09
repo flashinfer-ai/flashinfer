@@ -2261,6 +2261,123 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_with_explicit_cu_seqlens(
     )
 
 
+@pytest.mark.parametrize("emulated_capability", [(9, 0), (12, 0)])
+@pytest.mark.parametrize("num_heads", [64, 16])
+def test_t1_unbounded_softplus_auto_falls_back_to_cute_on_unservable_arch(
+    flash_kda_device, monkeypatch, num_heads, emulated_capability
+):
+    """Cake eligibility is irrelevant when the arch cannot run Cake at all.
+
+    The candidate gate carries no compute-capability term but the selector
+    requires exact CC 10.0/10.3, so off those two the gate commits to Cake's
+    state convention for every T=1 unbounded-softplus call, including
+    Cake-shaped ones. Emulating the capability keeps this pinned on the only
+    hardware the surrounding file runs on.
+    """
+
+    num_sequences = 2
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4935 + num_heads)
+    state_slots = 2 * num_sequences + 1
+    case = _make_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
+        num_tokens=1,
+        seed=4935 + num_heads,
+    )
+    A_log = (
+        torch.rand(
+            num_heads,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        )
+        - 1.5
+    )
+    dt_bias = torch.randn(
+        num_heads * _D,
+        dtype=torch.float32,
+        device=flash_kda_device,
+        generator=generator,
+    )
+    state_indices = (
+        2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device) + 1
+    )
+    logical_initial = torch.randn(
+        (state_slots, num_heads, _D, _D),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+        generator=generator,
+    )
+    # Deliberately Cake-eligible: l2norm on, unpadded, indexed.
+    case.update(
+        beta_is_logit=True,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_gate_in_kernel=True,
+        lower_bound=None,
+        ssm_state_indices=state_indices,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    # Patch before the baseline too, so both spellings route identically and the
+    # only variable is ``backend``.
+    monkeypatch.setattr(
+        recurrent_module,
+        "get_compute_capability",
+        lambda *args, **kwargs: emulated_capability,
+    )
+
+    baseline_state = logical_initial.clone()
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(
+            baseline_case := dict(case),
+            state=baseline_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    actual_state = logical_initial.clone()
+    actual_before = actual_state.clone()
+    actual_output, actual_state_result = recurrent_kda(
+        **_call_kwargs(
+            dict(baseline_case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="auto",
+    )
+
+    assert frozen_calls == []
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state[state_indices].float(),
+        baseline_state[state_indices].float(),
+        atol=0,
+        rtol=0,
+    )
+    untouched = torch.ones(state_slots, dtype=torch.bool, device=flash_kda_device)
+    untouched[state_indices.to(torch.long)] = False
+    torch.testing.assert_close(
+        actual_state[untouched], actual_before[untouched], atol=0, rtol=0
+    )
+
+
 def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_dsl(
     flash_kda_device, monkeypatch
 ):
