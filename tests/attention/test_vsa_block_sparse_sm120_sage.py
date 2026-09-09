@@ -452,7 +452,7 @@ def test_vsa_sm120_sage_wrong_arch_dtype_guards():
     ks = torch.ones(batch, num_heads, num_blocks, dtype=torch.float32, device=device)
     vs = torch.ones(batch, num_heads, HEAD_DIM, dtype=torch.float32, device=device)
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(TypeError):
         bsa_attn_sm120_blk64_sage_fwd(
             q_bf16,
             k,
