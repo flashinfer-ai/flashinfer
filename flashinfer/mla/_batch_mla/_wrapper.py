@@ -118,11 +118,10 @@ class _BatchMLAPagedAttentionCuteDslBackend:
                 preflight = getattr(backend_type, "preflight_plan_from_wrapper", None)
                 if preflight is not None:
                     preflight(plan_args)
+                return backend_type.plan_from_wrapper(plan_args)
             except _BackendPlanUnsupportedError as exc:
                 typed_rejections.append(f"{capabilities.backend_name}: {exc}")
                 continue
-            else:
-                return backend_type.plan_from_wrapper(plan_args)
 
         raise _BackendPlanUnsupportedError("; ".join(typed_rejections))
 
