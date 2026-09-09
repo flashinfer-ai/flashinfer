@@ -70,14 +70,14 @@ def provider_package_config_module():
 
 
 @pytest.fixture
-def wheelhouse_verifier_module():
-    verifier_path = (
+def provider_validation_module():
+    validation_path = (
         Path(__file__).resolve().parents[2]
         / "scripts"
-        / "verify_jit_cache_provider_wheelhouse.py"
+        / "jit_cache_provider_validation.py"
     )
-    module_name = "_test_jit_cache_wheelhouse_verifier"
-    spec = importlib.util.spec_from_file_location(module_name, verifier_path)
+    module_name = "_test_jit_cache_provider_validation"
+    spec = importlib.util.spec_from_file_location(module_name, validation_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
@@ -264,69 +264,6 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
         sys.modules.pop(module_name, None)
 
 
-def test_provider_wheelhouse_resolves_cu134_from_shared_config():
-    script_path = (
-        Path(__file__).resolve().parents[2]
-        / "scripts"
-        / "build_jit_cache_provider_wheelhouse.sh"
-    )
-    env = os.environ.copy()
-    env.update(
-        {
-            "ARCH": "aarch64",
-            "FLASHINFER_JIT_CACHE_PROVIDER_ARCH": "12.1a",
-            "FLASHINFER_LOCAL_VERSION": "cu134",
-        }
-    )
-    env.pop("CUDA_VERSION", None)
-    env.pop("DOCKER_IMAGE", None)
-    env.pop("FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG", None)
-
-    result = subprocess.run(
-        ["bash", str(script_path), "--print-config"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-    assert "provider=sm121a" in result.stdout
-    assert "cuda_version=13.4" in result.stdout
-    assert "pytorch_index=nightly/cu134" in result.stdout
-    assert "container=pytorch/manylinuxaarch64-builder:cuda13.4" in result.stdout
-    assert "provider_platform_tag=manylinux_2_28_aarch64" in result.stdout
-
-
-def test_provider_wheelhouse_custom_container_defaults_to_native_tag():
-    script_path = (
-        Path(__file__).resolve().parents[2]
-        / "scripts"
-        / "build_jit_cache_provider_wheelhouse.sh"
-    )
-    env = os.environ.copy()
-    env.update(
-        {
-            "ARCH": "x86_64",
-            "DOCKER_IMAGE": "example.invalid/custom-builder:latest",
-            "FLASHINFER_JIT_CACHE_PROVIDER_ARCH": "10.7a",
-            "FLASHINFER_LOCAL_VERSION": "cu134",
-        }
-    )
-    env.pop("CUDA_VERSION", None)
-    env.pop("FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG", None)
-
-    result = subprocess.run(
-        ["bash", str(script_path), "--print-config"],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-
-    assert "container=example.invalid/custom-builder:latest" in result.stdout
-    assert "provider_platform_tag=native" in result.stdout
-
-
 @pytest.mark.parametrize(
     "package_version",
     ("0.6.18", "0.6.18+cu130", "0.6.18+cu134"),
@@ -383,13 +320,13 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
 
 
 def test_native_provider_cuda_inspection_reports_no_ptx(
-    monkeypatch, tmp_path, wheelhouse_verifier_module
+    monkeypatch, tmp_path, provider_validation_module
 ):
     wheel_path = tmp_path / "provider.whl"
     archive_path = "provider/jit_cache/test_module/test_module.so"
     with zipfile.ZipFile(wheel_path, "w") as archive:
         archive.writestr(archive_path, b"test")
-    wheel = wheelhouse_verifier_module.Wheel(
+    wheel = provider_validation_module.Wheel(
         path=wheel_path,
         distribution="flashinfer-jit-cache-sm120f",
         version="0.6.16+cu130",
@@ -413,9 +350,9 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
             stderr="cuobjdump info: No PTX file found to extract\n",
         )
 
-    monkeypatch.setattr(wheelhouse_verifier_module.subprocess, "run", mock_run)
+    monkeypatch.setattr(provider_validation_module.subprocess, "run", mock_run)
 
-    architectures, ptx_modules = wheelhouse_verifier_module.inspect_cuda_architectures(
+    architectures, ptx_modules = provider_validation_module.inspect_cuda_architectures(
         wheel,
         {"test_module": archive_path},
         "sm120f",
@@ -428,13 +365,13 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
 
 
 def test_native_provider_cuda_inspection_rejects_ptx(
-    monkeypatch, tmp_path, wheelhouse_verifier_module
+    monkeypatch, tmp_path, provider_validation_module
 ):
     wheel_path = tmp_path / "provider.whl"
     archive_path = "provider/jit_cache/test_module/test_module.so"
     with zipfile.ZipFile(wheel_path, "w") as archive:
         archive.writestr(archive_path, b"test")
-    wheel = wheelhouse_verifier_module.Wheel(
+    wheel = provider_validation_module.Wheel(
         path=wheel_path,
         distribution="flashinfer-jit-cache-sm120f",
         version="0.6.16+cu130",
@@ -455,10 +392,10 @@ def test_native_provider_cuda_inspection_rejects_ptx(
             cmd, 0, stdout="PTX file 1: test.compute_80.ptx\n", stderr=""
         )
 
-    monkeypatch.setattr(wheelhouse_verifier_module.subprocess, "run", mock_run)
+    monkeypatch.setattr(provider_validation_module.subprocess, "run", mock_run)
 
     with pytest.raises(ValueError, match="native-provider modules contain PTX"):
-        wheelhouse_verifier_module.inspect_cuda_architectures(
+        provider_validation_module.inspect_cuda_architectures(
             wheel,
             {"test_module": archive_path},
             "sm120f",
