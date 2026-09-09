@@ -639,6 +639,18 @@ def get_cuda_python_version() -> str:
     return cuda.__version__
 
 
+def is_sm8x_supported(device: torch.device) -> bool:
+    """Check if the device is any SM8x GPU (SM80, SM86, SM89, ...).
+
+    Uses a major-version check so SM8x minor variants are covered without code
+    changes, matching ``is_sm100a_supported`` and ``is_sm12x_supported``. There
+    is no ``a`` suffix to require: architecture-specific targets start at SM90,
+    and asking for ``sm_80a`` names no target the driver has.
+    """
+    major, _ = get_compute_capability(device)
+    return major == 8
+
+
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
