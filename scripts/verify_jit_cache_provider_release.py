@@ -21,7 +21,10 @@ from verify_jit_cache_provider_wheelhouse import (
 
 
 def validate_shim(
-    wheel: Wheel, expected_version: str, expected_providers: set[str]
+    wheel: Wheel,
+    expected_version: str,
+    expected_providers: set[str],
+    expected_platform_tag: str | None = None,
 ) -> None:
     require(
         canonicalize_distribution(wheel.distribution) == "flashinfer-jit-cache",
@@ -35,6 +38,11 @@ def validate_shim(
         not any(path.endswith(".so") for path in wheel.contents),
         "Shim wheel must not contain shared libraries",
     )
+    if expected_platform_tag:
+        require(
+            wheel.path.name.endswith(f"-{expected_platform_tag}.whl"),
+            f"Shim wheel {wheel.path.name} does not use {expected_platform_tag}",
+        )
     requirements = dict(map(normalize_requirement, wheel.requirements))
     expected_requirements = {
         f"flashinfer-jit-cache-{provider}": expected_version
@@ -148,7 +156,12 @@ def main() -> int:
     )
 
     shim = wheels["flashinfer-jit-cache"]
-    validate_shim(shim, args.version, expected_providers)
+    validate_shim(
+        shim,
+        args.version,
+        expected_providers,
+        args.provider_platform_tag,
+    )
     providers = {}
     for provider in expected_providers:
         wheel = wheels[f"flashinfer-jit-cache-{provider}"]

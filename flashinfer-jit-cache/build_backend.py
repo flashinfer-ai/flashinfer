@@ -279,12 +279,10 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
     _prepare_build()
 
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig.build_wheel(
-                wheel_directory, config_settings, metadata_directory
-            )
-    return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    # Shim requirements differ by CPU platform, so both wheel kinds need a
+    # platform tag even though the shim itself contains only Python metadata.
+    with _MonkeyPatchBdistWheel():
+        return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
@@ -297,35 +295,26 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     if _orig_build_editable is None:
         raise RuntimeError("build_editable not supported by setuptools backend")
 
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig_build_editable(
-                wheel_directory, config_settings, metadata_directory
-            )
-
-    return _orig_build_editable(wheel_directory, config_settings, metadata_directory)
+    with _MonkeyPatchBdistWheel():
+        return _orig_build_editable(
+            wheel_directory, config_settings, metadata_directory
+        )
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     """Prepare metadata with platform-specific wheel tags."""
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig.prepare_metadata_for_build_wheel(
-                metadata_directory, config_settings
-            )
-    return _orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+    with _MonkeyPatchBdistWheel():
+        return _orig.prepare_metadata_for_build_wheel(
+            metadata_directory, config_settings
+        )
 
 
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
     """Prepare metadata for editable install."""
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig.prepare_metadata_for_build_editable(
-                metadata_directory, config_settings
-            )
-    return _orig.prepare_metadata_for_build_editable(
-        metadata_directory, config_settings
-    )
+    with _MonkeyPatchBdistWheel():
+        return _orig.prepare_metadata_for_build_editable(
+            metadata_directory, config_settings
+        )
 
 
 def get_requires_for_build_wheel(config_settings=None):

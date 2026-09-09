@@ -91,7 +91,9 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
 
 def test_release_verifier_requires_exact_provider_set(release_verifier_module):
     shim = release_verifier_module.Wheel(
-        path=Path("flashinfer_jit_cache.whl"),
+        path=Path(
+            "flashinfer_jit_cache-0.6.16+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+        ),
         distribution="flashinfer-jit-cache",
         version="0.6.16+cu130",
         requirements=(
@@ -102,10 +104,26 @@ def test_release_verifier_requires_exact_provider_set(release_verifier_module):
         metadata_path="flashinfer_jit_cache-0.6.16.dist-info/METADATA",
     )
 
-    release_verifier_module.validate_shim(shim, "0.6.16+cu130", {"sm80", "sm90a"})
+    release_verifier_module.validate_shim(
+        shim,
+        "0.6.16+cu130",
+        {"sm80", "sm90a"},
+        "manylinux_2_28_x86_64",
+    )
     with pytest.raises(ValueError, match="do not match"):
         release_verifier_module.validate_shim(
-            shim, "0.6.16+cu130", {"sm80", "sm90a", "sm120f"}
+            shim,
+            "0.6.16+cu130",
+            {"sm80", "sm90a", "sm120f"},
+            "manylinux_2_28_x86_64",
+        )
+
+    with pytest.raises(ValueError, match="does not use manylinux_2_28_aarch64"):
+        release_verifier_module.validate_shim(
+            shim,
+            "0.6.16+cu130",
+            {"sm80", "sm90a"},
+            "manylinux_2_28_aarch64",
         )
 
 
