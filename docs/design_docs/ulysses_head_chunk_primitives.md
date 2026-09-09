@@ -97,6 +97,32 @@ There is no safe rank-local fallback after one rank has entered a collective.
 An error at that point aborts the distributed call; fallback can only be
 selected jointly before the call or at the next initialization.
 
+## Path-selection guidance
+
+The four benchmark paths serve different purposes and are not ordered from
+slowest to fastest:
+
+| Path | Intended use |
+| --- | --- |
+| Ordinary Ulysses | Allocation-stable production baseline and fallback. |
+| Whole-QKV fusion | Reduce three Q/K/V input collectives to one without splitting attention into head chunks. Enable only when the exact backend and shape benchmark faster than ordinary Ulysses. |
+| Sequential head chunks | Correctness and attribution control; it isolates chunking overhead and is not intended as a production speed path. |
+| Overlapped head chunks | Pipeline input communication, attention, and output communication. Enable only for an offline-whitelisted configuration with a repeatable gain beyond the measurement noise. |
+
+Whole-QKV fusion is useful when collective-count reduction is worth more than
+its fused pack and output-merge work. Head-chunk overlap is useful when enough
+communication remains exposed for attention on another chunk to hide it. Fast
+links or fast attention can reverse either tradeoff because pack, merge, event,
+and stream-scheduling costs remain. Therefore an integration should benchmark
+all applicable paths against the allocation-stable ordinary baseline and pick
+the lowest measured latency; neither fusion nor overlap is a universal default.
+
+The whitelist key should include at least `(GPU, topology, transport backend,
+attention backend, dtype, sequence geometry, local_heads, world_size)`. A
+framework-defined confidence margin should reject gains comparable to run-to-run
+noise. The selected path and schedule must be agreed by all ranks before any
+collective begins.
+
 ## Backend behavior
 
 - NCCL uses caller-owned send/receive workspace in the opt-in path.
@@ -124,9 +150,11 @@ The test suite covers:
   warmup in explicit-buffer communication paths;
 - exact reconstruction against ordinary scatter/gather references.
 
-The NVLink head-chunk path requires a separate NVLink-machine run before an
-upstream PR can mark that backend validated. The local SM120 PCIe environment
-can only exercise its topology rejection/fallback behavior.
+The custom-NVLink head-chunk path has been functionally validated on a B200
+full-NVLink mesh, including zero-difference reconstruction against ordinary
+scatter/gather. Its performance is shape-dependent and is not admitted by
+default. The SM120 PCIe runs exercise the NCCL path and the NVLink topology
+rejection/fallback behavior.
 
 ## Reference performance
 
@@ -135,8 +163,12 @@ ordinary baseline already uses destination passing and reusable workspace, so
 the comparison isolates QKV fusion, head chunking, and overlap instead of
 allocator noise. These are operator-pipeline measurements, not model E2E.
 
-RTX PRO 6000 Blackwell Server Edition, NCCL over PCIe, 3 warmups and 7 timed
-iterations:
+The following RTX PRO 6000 Blackwell Server Edition results were recorded with
+the pre-review implementation at commit `45052623`, using NCCL over PCIe, 3
+warmups and 7 timed iterations. They explain the motivation for the primitives,
+but are not a current-head performance claim: commit `e782390a` changed several
+Triton divisors/strides from compile-time to runtime arguments and the current
+code has not yet been rerun on SM120 hardware.
 
 | Physical shape `[B, S, H, D]` | Ulysses | Schedule | Ordinary median | Overlap median | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
@@ -156,6 +188,69 @@ time to NCCL SendRecv, 28.5% to attention, and about 0.6% to the three layout
 kernels. The next material optimization target is transport exposure and
 resource contention, not arithmetic inside pack/merge.
 
+### B200 full-NVLink reference
+
+The following current-head (`e782390a`) BF16 measurements used 6 available
+NVIDIA B200 GPUs (SM100) on an NV18 full mesh. MiniMax H3 has 56 attention
+heads, so its exact shape is valid for Ulysses world sizes 2 and 4 but not 6.
+Each row uses 5 warmups and 20 timed iterations in each of three independent
+process runs. Latencies are the median of the three run medians; speedups are
+the median of three paired ordinary/variant ratios. The NCCL and custom-NVLink
+results are separate transport experiments.
+
+| Transport | Shape | Ulysses | Schedule | Ordinary | Whole QKV | Whole speedup | Chunk overlap | Overlap speedup |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| NCCL | T2V `[1,37760,56,128]` | 2 | `[7,14,7]` | 18.184 ms | 18.049 ms | 0.998x | 17.863 ms | 1.020x |
+| NCCL | T2V `[1,37760,56,128]` | 4 | `[2,10,2]` | 8.977 ms | 8.981 ms | 0.999x | 9.026 ms | 0.998x |
+| NCCL | I2V `[1,39808,56,128]` | 2 | `[7,14,7]` | 20.044 ms | 19.818 ms | 1.011x | 19.854 ms | 1.025x |
+| NCCL | I2V `[1,39808,56,128]` | 4 | `[2,10,2]` | 9.954 ms | 9.868 ms | 1.013x | 10.163 ms | 0.979x |
+| Custom NVLink | T2V `[1,37760,56,128]` | 2 | `[7,14,7]` | 17.732 ms | 19.120 ms | 0.927x | 18.293 ms | 0.974x |
+| Custom NVLink | T2V `[1,37760,56,128]` | 4 | `[2,10,2]` | 8.824 ms | 9.261 ms | 0.953x | 9.173 ms | 0.962x |
+| Custom NVLink | I2V `[1,39808,56,128]` | 2 | `[7,14,7]` | 20.173 ms | 20.752 ms | 0.977x | 20.080 ms | 1.004x |
+| Custom NVLink | I2V `[1,39808,56,128]` | 4 | `[2,10,2]` | 9.765 ms | 10.381 ms | 0.944x | 10.211 ms | 0.953x |
+
+All compared outputs had zero maximum absolute difference in these runs. On
+this machine, NCCL W2 overlap gains are only about 2%--2.5% and W4 does not
+show a repeatable gain. With the custom NVLink transport, ordinary Ulysses is
+the correct default for these shapes; its already-low communication exposure
+does not amortize the current extra pack, merge, and multi-stream scheduling.
+These results are an admission counterexample, not a claim that head chunking
+is unhelpful on all SM100 systems.
+
+The same current head was also tested at physical `S=37888`, matching a
+separate MiniMax-H3 distributed-FA4 experiment exactly:
+
+| Transport | Ulysses | Ordinary | Whole QKV | Whole speedup | Chunk overlap | Overlap speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Custom NVLink | 2 | 17.735 ms | 18.889 ms | 0.934x | 18.294 ms | 0.969x |
+| Custom NVLink | 4 | 8.745 ms | 9.310 ms | 0.939x | 9.164 ms | 0.956x |
+
+### Relationship to SM100 attention-kernel fusion
+
+Head-chunk transport and distributed attention-kernel fusion are complementary
+portfolio backends, not two layers that should always be nested. A separate
+local SM100 prototype pushes K/V into symmetric windows, loads remote Q tiles
+inside FA4, and owner-scatters O from the FA4 epilogue. That removes bulk Q and
+O collective stages instead of scheduling the same stages on side streams.
+It is not implemented by this change and depends on an architecture-specific
+FA4 patch.
+
+In the same pinned B200 environment and physical work domain
+`[1,37888,56,128]`, a common one-time dispatcher selecting that separate
+backend measured:
+
+| Ulysses | Ordinary dense-prefix | Distributed FA4 | Speedup | Reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 18.379 ms | 16.149 ms | 1.138x | 12.13% |
+| 4 | 9.266 ms | 8.182 ms | 1.132x | 11.70% |
+
+Valid-prefix maximum absolute error was `0` on U2 and `0.0002441` on U4. These
+numbers show why SM100 should select an architecture-specific kernel backend
+when it is available; they are not performance claims for the primitives in
+this PR. A framework can share the request contract, rank-consistent planning,
+workspace lifetime, and ordinary fallback while registering different SM90,
+SM100, and SM120 execution backends.
+
 ## Non-goals and follow-up work
 
 - The benchmark-local three-stream executor is a reference, not a runtime API.
@@ -166,3 +261,6 @@ resource contention, not arithmetic inside pack/merge.
   review; FP8 attention compute with BF16 communication can integrate first.
 - A custom PCIe P2P or topology-aware transport may reduce the dominant NCCL
   cost, but should be developed independently from these layout primitives.
+- Remote-Q loading and owner-O scattering inside an attention kernel are not
+  part of this change; an SM100 distributed-FA4 backend requires a separate
+  kernel-focused contribution and validation matrix.
