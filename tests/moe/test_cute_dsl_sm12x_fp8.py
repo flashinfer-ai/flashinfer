@@ -1,9 +1,10 @@
-"""cute_dsl_sm12x_moe_gemm_fp8: correctness against a pure-torch reference."""
+"""SM12x FP8 internal MoE ops against pure-Torch references."""
 
 import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
@@ -84,3 +85,51 @@ def test_cute_dsl_sm12x_moe_gemm_fp8_matches_reference():
     out = cute_dsl_sm12x_moe_gemm_fp8(a, a_scale, b, b_scale, m_indptr)
     diff = calc_diff(out.float(), ref.float())
     assert diff < 1e-3, f"calc_diff={diff:.6e}"
+
+
+def make_gated_inputs(m_per_expert_list, n, k):
+    torch.random.manual_seed(0)
+    offsets = [0]
+    for count in m_per_expert_list:
+        offsets.append(offsets[-1] + count)
+    a = torch.randn(offsets[-1], k, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(len(m_per_expert_list), 2 * n, k, dtype=torch.bfloat16,
+                    device="cuda") / math.sqrt(k)
+    m_indptr = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    ref = torch.zeros(offsets[-1], n, dtype=torch.bfloat16, device="cuda")
+    for expert in range(len(m_per_expert_list)):
+        start, end = offsets[expert], offsets[expert + 1]
+        if start < end:
+            gemm1 = a[start:end] @ b[expert].t()
+            ref[start:end] = F.silu(gemm1[:, n:]) * gemm1[:, :n]
+    a_fp8, a_scale = per_token_cast_to_fp8_for_moe_gemm(a, m_indptr)
+    b_fp8, b_scale = zip(*(per_block_cast_to_fp8(x) for x in b))
+    return (a_fp8, torch.stack(b_fp8), a_scale,
+            torch.stack(b_scale).transpose(-1, -2).contiguous(), m_indptr, ref)
+
+
+def test_cute_dsl_sm12x_fc1_act_fp8_matches_reference():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_fp8
+    a, b, a_sf, b_sf, offsets, ref = make_gated_inputs([64] * 4, 512, 512)
+    out = cute_dsl_sm12x_fc1_act_fp8(a, a_sf, b, b_sf, offsets)
+    assert calc_diff(out.float(), ref.float()) < 2e-3
+
+
+def test_cute_dsl_sm12x_fc1_act_q1_fp8_smoke():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_q1_fp8
+    a, b, a_sf, b_sf, offsets, _ = make_gated_inputs([64] * 4, 512, 512)
+    q, sf = cute_dsl_sm12x_fc1_act_q1_fp8(a, a_sf, b, b_sf, offsets)
+    assert q.dtype == torch.float8_e4m3fn and not torch.isnan(q.float()).any() and sf.numel() > 0
+
+
+def test_cute_dsl_sm12x_fc2_finalize_fp8_smoke():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_fp8
+    a, b, a_sf, b_sf, offsets, _ = make_inputs([64] * 4, 512, 512)
+    rows = a.shape[0]
+    tok = torch.randint(0, rows, (rows,), device="cuda", dtype=torch.int32)
+    out = cute_dsl_sm12x_fc2_finalize_fp8(
+        a, a_sf, b, b_sf, offsets, tok, torch.rand(rows, device="cuda"), rows)
+    assert out.shape == (rows, 512) and not torch.isnan(out.float()).any()
