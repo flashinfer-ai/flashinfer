@@ -23,7 +23,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchDecodePagedTSWrapper` | Reusable `plan()`/`run()` interface; owns compiled callables and scratch. |
+| `BatchDecodePagedTSWrapper` | Reusable `plan()`/`run()` interface; owns compiled callables and binds scratch from a caller-provided or wrapper-owned reusable buffer. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
