@@ -21,6 +21,11 @@
         2048
       ]
     },
+    "world_sizes": [
+      2,
+      4,
+      8
+    ],
     "prepared_packed_qkv": {
       "dtypes": [
         "bfloat16"
@@ -33,12 +38,7 @@
           1280
         ]
       }
-    },
-    "world_sizes": [
-      2,
-      4,
-      8
-    ]
+    }
   },
   "kernel_count": 12,
   "kernel_symbols": [
@@ -68,7 +68,8 @@
     "main": {
       "block_threads": 192,
       "dynamic_smem_bytes": 197632,
-      "grid_x": "(min(M, 2432) / 128) * (N / 256)"
+      "grid_x": "(min(M, 2432) / 128) * (N / 256)",
+      "grid_y": "4 if world_size == 8 and M == 512 and N == 1280 else 1"
     }
   },
   "route_coverage": {
@@ -104,6 +105,6 @@
     }
   },
   "schema_version": 1,
-  "source_sha256": "6ba37efcba102135f0155ef5e162143ad71bc27e52699c9aae05b9d9ace99433",
+  "source_sha256": "b6100fed6f90c86ec9f882d99f6fbd2199f2fe91b458e9a82f9e4a6d20f77fdc",
   "tma_abi": "pointer"
 }

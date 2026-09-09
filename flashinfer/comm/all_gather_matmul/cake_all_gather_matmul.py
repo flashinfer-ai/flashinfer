@@ -466,10 +466,12 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
 
   const uint32_t grid_x =
       static_cast<uint32_t>((chunk_rows / 128) * (n / 256));
+  const uint32_t grid_y =
+      static_cast<uint32_t>(world_size == 8 && rows == 512 && n == 1280 ? 4 : 1);
   CUstream stream = reinterpret_cast<CUstream>(
       static_cast<uintptr_t>(cuda_stream));
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      kernel.Launch(args, tvm::ffi::dim3(grid_x, 1, 1),
+      kernel.Launch(args, tvm::ffi::dim3(grid_x, grid_y, 1),
                     tvm::ffi::dim3(kMainThreads, 1, 1), stream,
                     kMainSmemBytes));
 }
@@ -750,8 +752,8 @@ def _resolved_main_smem_bytes(source: bytes) -> int:
     return values[0]
 
 
-def _launch_contract(source: bytes) -> dict[str, Any]:
-    return {
+def _launch_contract(source: bytes, arch: str) -> dict[str, Any]:
+    launch = {
         "barrier": {
             "block_threads": 32,
             "dynamic_smem_bytes": 0,
@@ -763,6 +765,11 @@ def _launch_contract(source: bytes) -> dict[str, Any]:
             "grid_x": "(min(M, 2432) / 128) * (N / 256)",
         },
     }
+    if arch == "sm_103a":
+        launch["main"]["grid_y"] = (
+            "4 if world_size == 8 and M == 512 and N == 1280 else 1"
+        )
+    return launch
 
 
 def _constraints_for_arch(arch: str) -> dict[str, Any]:
@@ -830,7 +837,7 @@ def _program_source(arch: str) -> tuple[Path, dict[str, Any]]:
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
         "kernel_count": 12,
-        "launch": _launch_contract(source_bytes),
+        "launch": _launch_contract(source_bytes, arch),
         "constraints": _constraints_for_arch(arch),
         "kernel_symbols": list(_KERNEL_SYMBOLS),
         "route_coverage": _ROUTE_COVERAGE,

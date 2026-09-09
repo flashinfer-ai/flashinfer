@@ -56,7 +56,7 @@ def _manifest(backend, source: bytes, arch: str):
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
         "kernel_count": 12,
-        "launch": backend._launch_contract(source),
+        "launch": backend._launch_contract(source, arch),
         "constraints": backend._constraints_for_arch(arch),
         "kernel_symbols": list(backend._KERNEL_SYMBOLS),
         "route_coverage": copy.deepcopy(backend._ROUTE_COVERAGE),
@@ -162,14 +162,14 @@ def test_source_launch_contract_rejects_missing_or_divergent_main_smem(source):
     backend = _backend()
 
     with pytest.raises(RuntimeError, match="one uniform SMEM_TOTAL"):
-        backend._launch_contract(source)
+        backend._launch_contract(source, "sm_100a")
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_packaged_program_has_self_contained_pointer_abi(arch):
     backend = _backend()
 
-    source_path, _ = backend._program_source(arch)
+    source_path, manifest = backend._program_source(arch)
     source = source_path.read_bytes()
 
     assert (
@@ -178,6 +178,12 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
     )
     assert source.count(b"CakeTensorMap const*") == 18
     assert backend._resolved_main_smem_bytes(source) == 197632
+    if arch == "sm_103a":
+        assert manifest["launch"]["main"]["grid_y"] == (
+            "4 if world_size == 8 and M == 512 and N == 1280 else 1"
+        )
+    else:
+        assert "grid_y" not in manifest["launch"]["main"]
 
 
 def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
@@ -212,9 +218,10 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
         "                      dtype_code == 0" in rendered
     )
 
-    sm100_source, sm100_manifest = backend._program_source("sm_100a")
-    assert sm100_source.read_bytes() == source_path.read_bytes()
+    _, sm100_manifest = backend._program_source("sm_100a")
     assert "prepared_packed_qkv" not in sm100_manifest["constraints"]
+    sm100_rendered = backend._render_host_source("test_module", sm100_manifest)
+    assert "kPackedQkvExperimentSupported =\n    false;" in sm100_rendered
 
 
 @pytest.mark.parametrize(
