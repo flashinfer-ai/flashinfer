@@ -39,6 +39,30 @@ _CURRENT_ALIGNMENT_ASSERT = (
     "static_assert(alignof(FlashInferTensorMap) == 128, "
     '"kernel tensor-map ABI must be 128-byte aligned");'
 )
+_EMPTY_CUOBJDUMP_TRAILERS = {
+    "--dump-sass": (
+        "\nFatbin elf code:\n"
+        "================\n"
+        "arch = sm_100a\n"
+        "code version = [1,8]\n"
+        "host = linux\n"
+        "compile_size = 64bit\n"
+        "compressed\n\n"
+        "\tcode for sm_100a\n"
+    ),
+    "--dump-resource-usage": (
+        "\nFatbin elf code:\n"
+        "================\n"
+        "arch = sm_100a\n"
+        "code version = [1,8]\n"
+        "host = linux\n"
+        "compile_size = 64bit\n"
+        "compressed\n\n"
+        "Resource usage:\n"
+        " Common:\n"
+        "  GLOBAL:0\n"
+    ),
+}
 _HEAD_DIM = 128
 _FULL_DOMAIN_HEADS = (12, 24, 32, 48, 96)
 _FULL_DOMAIN_TAIL_ROWS = (384, 512, 768, 1024, 1536, 2048, 4096)
@@ -267,15 +291,77 @@ def _tool_output(command):
     return _run(tuple(command)).strip()
 
 
+def _normalize_cuobjdump_record(output, option):
+    trailer = _EMPTY_CUOBJDUMP_TRAILERS[option]
+    while output.endswith(trailer):
+        output = output[: -len(trailer)]
+    return output
+
+
 def _cuobjdump_record(cuobjdump, library, symbol, option):
     output = _run((cuobjdump, option, "--function", symbol, str(library)))
     if symbol not in output:
         raise RuntimeError(f"cuobjdump did not report {symbol!r} from {library}")
-    return (
+    normalized = (
         output.replace(str(library), "<CONTAINER>")
         .replace(library.name, "<CONTAINER>")
         .replace(symbol, "CAKE_FUSED_KDA_KERNEL_SYMBOL")
     )
+    return _normalize_cuobjdump_record(normalized, option)
+
+
+def _canonicalize_reused_worker_evidence(result, details_root):
+    for variant in result["variants"]:
+        variant_root = details_root / variant["name"]
+        evidence = {}
+        for label, filename, option in (
+            ("object", "object.sass.txt", "--dump-sass"),
+            ("library", "library.sass.txt", "--dump-sass"),
+            ("object_resources", "object.resources.txt", "--dump-resource-usage"),
+            ("library_resources", "library.resources.txt", "--dump-resource-usage"),
+        ):
+            path = variant_root / filename
+            if not path.is_file() or path.is_symlink():
+                raise RuntimeError(f"reused worker evidence is missing: {path}")
+            raw = path.read_text()
+            evidence[label] = (
+                hashlib.sha256(raw.encode()).hexdigest(),
+                hashlib.sha256(
+                    _normalize_cuobjdump_record(raw, option).encode()
+                ).hexdigest(),
+            )
+        raw_sass_sha256 = _canonical_json_sha256(
+            {
+                "object": evidence["object"][0],
+                "library": evidence["library"][0],
+            }
+        )
+        raw_resource_usage_sha256 = _canonical_json_sha256(
+            {
+                "object": evidence["object_resources"][0],
+                "library": evidence["library_resources"][0],
+            }
+        )
+        if (
+            variant["sass_sha256"] != raw_sass_sha256
+            or variant["resource_usage_sha256"] != raw_resource_usage_sha256
+        ):
+            raise RuntimeError(
+                f"reused worker evidence hashes changed for {variant['name']}"
+            )
+        variant["sass_sha256"] = _canonical_json_sha256(
+            {
+                "object": evidence["object"][1],
+                "library": evidence["library"][1],
+            }
+        )
+        variant["resource_usage_sha256"] = _canonical_json_sha256(
+            {
+                "object": evidence["object_resources"][1],
+                "library": evidence["library_resources"][1],
+            }
+        )
+    return result
 
 
 def _ninja_object_for_source(spec, source):
@@ -857,6 +943,9 @@ def _orchestrator(args):
     predecessor_root = Path(args.predecessor_root).resolve()
     output = Path(args.output).resolve()
     work_root = Path(args.work_root).resolve()
+    reuse_work_root = (
+        None if args.reuse_work_root is None else Path(args.reuse_work_root).resolve()
+    )
     checkpoint_path = Path(args.predecessor_checkpoint).resolve()
     rows_root = Path(args.predecessor_rows_root).resolve()
     manifest_path = (
@@ -869,6 +958,8 @@ def _orchestrator(args):
         raise RuntimeError("verifier must be executed from the current repository")
     if output.is_relative_to(current_root) or work_root.is_relative_to(current_root):
         raise RuntimeError("proof output and work root must be outside the repository")
+    if reuse_work_root is not None and reuse_work_root.is_relative_to(current_root):
+        raise RuntimeError("reused proof work root must be outside the repository")
     if output.exists():
         raise RuntimeError("equivalence output already exists")
     if (
@@ -901,6 +992,16 @@ def _orchestrator(args):
         ("predecessor", predecessor_root),
         ("current", current_root),
     ):
+        if reuse_work_root is not None:
+            result = reuse_work_root / f"{side}.json"
+            details_root = reuse_work_root / f"{side}-details"
+            if not result.is_file() or result.is_symlink() or not details_root.is_dir():
+                raise RuntimeError(f"reused {side} worker result is unavailable")
+            side_results[side] = _canonicalize_reused_worker_evidence(
+                json.loads(result.read_text()), details_root
+            )
+            _record_progress(f"orchestrator: {side} worker evidence reused")
+            continue
         _record_progress(f"orchestrator: {side} worker starting")
         workspace = work_root / f"{side}-workspace"
         result = work_root / f"{side}.json"
@@ -947,7 +1048,24 @@ def _orchestrator(args):
     if predecessor_result["commit"] != predecessor_commit:
         raise RuntimeError("predecessor worker commit changed")
     if current_result["commit"] != current_commit:
-        raise RuntimeError("current worker commit changed")
+        changed_paths = _run(
+            (
+                "git",
+                "diff",
+                "--name-only",
+                "--diff-filter=ACDMRTUXB",
+                f"{current_result['commit']}..{current_commit}",
+                "--",
+            ),
+            cwd=current_root,
+        ).splitlines()
+        verifier_path = script_path.relative_to(current_root).as_posix()
+        proof_only_paths = [
+            "tests/jit/test_flash_kda_frozen_idents_jit.py",
+            verifier_path,
+        ]
+        if reuse_work_root is None or changed_paths != proof_only_paths:
+            raise RuntimeError("current worker commit changed outside proof-only paths")
 
     manifest = json.loads(manifest_path.read_text())
     predecessor_binding = (
@@ -980,6 +1098,11 @@ def _orchestrator(args):
             predecessor_root / "csrc/kda" / manifest_variant["body"]
         ).read_text()
         new_source = (current_csrc / new["body"]).read_text()
+        if (
+            old["source_sha256"] != hashlib.sha256(old_source.encode()).hexdigest()
+            or new["source_sha256"] != hashlib.sha256(new_source.encode()).hexdigest()
+        ):
+            raise RuntimeError(f"worker source evidence changed for {name}")
         old_normalized = _normalize_kernel_symbol(
             _normalize_predecessor_kernel_source(old_source),
             old["kernel_symbol"],
@@ -1120,6 +1243,7 @@ def _parse_args():
     parser.add_argument("--predecessor-checkpoint")
     parser.add_argument("--predecessor-rows-root")
     parser.add_argument("--work-root")
+    parser.add_argument("--reuse-work-root")
     parser.add_argument("--output")
     parser.add_argument(
         "--worker-side", choices=("predecessor", "current"), help=argparse.SUPPRESS
