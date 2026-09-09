@@ -16,6 +16,7 @@
 import functools
 import os
 
+import cutlass
 import cutlass.cute as cute
 import torch
 
@@ -23,7 +24,7 @@ from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
-from ._moe_utils.moe_epilogue import EpiMethod, scatter_supports
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
 from .kernel_moe_mxfp8_mxfp4_fc2_finalize import (
@@ -68,6 +69,8 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc2FinalizeOp:
     def is_constructible(cls, tile, epi: EpiMethod = DEFAULT_EPI) -> bool:
         if not dsl_targets_sm12x():
             return False
+        if epi not in EPIS or not EPI_CONFIGS[epi].supports_tile(tile):
+            return False
         try:
             CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize(
                 make_cfg(tuple(tile), resolve_stage(tuple(tile), epi), epi=epi), 1
@@ -81,16 +84,13 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc2FinalizeOp:
         cls, *, n: int, k: int, tile, epi: EpiMethod = DEFAULT_EPI
     ) -> bool:
         t = tuple(tile)
-        if (
-            t[:2] not in cls.TILES
-            or t[2] != BK
-            or epi not in EPIS
-            or not scatter_supports(n)
-        ):
+        if t[:2] not in cls.TILES or t[2] != BK or epi not in EPIS:
             return False
-        if n <= 0 or k <= 0 or k % t[2] != 0:
+        if n <= 0 or k <= 0 or n % t[1] != 0 or k % t[2] != 0:
             return False
-        return cls.is_constructible(t, epi)
+        return EPI_CONFIGS[epi].can_implement(
+            t, n, cutlass.BFloat16.width
+        ) and cls.is_constructible(t, epi)
 
     def build(self, grid_x: int):
         return CuteDslSm120MoeMxfp8Mxfp4Fc2Finalize(self.cfg, grid_x)
@@ -219,6 +219,8 @@ def cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
         src_token.to(torch.int32),
         pair_scales.to(torch.float32),
         m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
     )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out
@@ -295,6 +297,8 @@ class _Fc2FinalizeRunner(TunableRunner):
             src_token.to(torch.int32),
             pair_scales.to(torch.float32),
             m_indptr.to(torch.int32),
+            op.cfg.epi,
+            op.cfg.TILE,
         )
         sm_version = "sm_{}{}".format(props.major, props.minor)
         compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)

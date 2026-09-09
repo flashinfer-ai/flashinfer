@@ -15,6 +15,7 @@
 
 import functools
 
+import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.common import DSLUserCodeError
@@ -23,7 +24,7 @@ from ....tllm_enums import ActivationType
 from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN
 from ....utils import ceil_div
 from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
-from ._moe_utils.moe_epilogue import EpiMethod
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
 from .kernel_moe_fp8_fc1_act_q1 import (
     GRAN_K,
@@ -98,15 +99,15 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
 
     @staticmethod
     def is_valid_alignment(n: int, k: int, tile) -> bool:
-        return (
-            n > 0 and k > 0 and k % tile[2] == 0 and n % GRAN_N == 0 and n % GRAN_K == 0
-        )
+        return n > 0 and k > 0 and n % tile[1] == 0 and k % tile[2] == 0
 
     @classmethod
     def is_constructible(
         cls, tile, epi=DEFAULT_EPI, activation=ActivationType.Swiglu
     ) -> bool:
         if not dsl_targets_sm12x():
+            return False
+        if epi not in epi_tactics(tile) or not EPI_CONFIGS[epi].supports_tile(tile):
             return False
         try:
             stage = resolve_stage(tuple(tile), epi)
@@ -134,6 +135,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
             and activation in cls.ACTIVATIONS
             and epi in epi_tactics(tile)
             and cls.is_valid_alignment(n, k, tile)
+            and EPI_CONFIGS[epi].can_implement(tile, n, cutlass.Float8E4M3FN.width)
             and cls.is_constructible(tile, epi, activation)
         )
 
@@ -238,6 +240,16 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
     sf = torch.zeros(
         out_sf_shape(m, n, num_experts), dtype=torch.float32, device=a_q.device
     )
-    args = make_args(a_q, a_scale, b_q, b_scale, q, sf, m_indptr.to(torch.int32))
+    args = make_args(
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        q,
+        sf,
+        m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
+    )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return q, sf

@@ -16,6 +16,7 @@
 import functools
 import os
 
+import cutlass
 import cutlass.cute as cute
 import torch
 
@@ -30,7 +31,7 @@ from ....tllm_enums import (
 from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN, UE8M0_PACK_NUM
 from ....utils import ceil_div
 from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
-from ._moe_utils.moe_epilogue import EpiMethod
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
 from .kernel_moe_mxfp8_mxfp4_fc1_act_q1 import (
@@ -112,20 +113,15 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
 
     @staticmethod
     def is_valid_alignment(n: int, k: int, tile) -> bool:
-        return (
-            n > 0
-            and k > 0
-            and k % tile[2] == 0
-            and n % SF_M_ALIGN == 0
-            and n % tile[1] == 0
-            and n % BK == 0
-        )
+        return n > 0 and k > 0 and n % tile[1] == 0 and k % tile[2] == 0
 
     @classmethod
     def is_constructible(
         cls, tile, epi=DEFAULT_EPI, activation=ActivationType.Swiglu
     ) -> bool:
         if not dsl_targets_sm12x():
+            return False
+        if epi not in epi_tactics(tile) or not EPI_CONFIGS[epi].supports_tile(tile):
             return False
         try:
             stage = resolve_stage(tuple(tile), epi)
@@ -153,6 +149,7 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
             and activation in cls.ACTIVATIONS
             and epi in epi_tactics(tile)
             and cls.is_valid_alignment(n, k, tile)
+            and EPI_CONFIGS[epi].can_implement(tile, n, cutlass.Float8E4M3FN.width)
             and cls.is_constructible(tile, epi, activation)
         )
 
@@ -344,7 +341,15 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
     ):
         raise ValueError("out_sf does not match the Q1 scale output contract")
     args = make_args(
-        a_q, a_scale, b_q, b_scale, q, sf.view(torch.uint8), m_indptr.to(torch.int32)
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        q,
+        sf.view(torch.uint8),
+        m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
     )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return q, sf
@@ -445,6 +450,8 @@ class _Fc1ActQ1Runner(TunableRunner):
             q,
             sf.view(torch.uint8),
             m_indptr.to(torch.int32),
+            op.cfg.epi,
+            op.cfg.TILE,
         )
         sm_version = "sm_{}{}".format(props.major, props.minor)
         compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
