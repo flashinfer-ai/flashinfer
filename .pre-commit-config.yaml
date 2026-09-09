@@ -54,7 +54,7 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
-        files: ^(?!csrc/kda/cake_fused_kda_decode_.*\.cu$).*
+        files: ^(?!csrc/kda/cake_fused_kda_decode_(?:.*\.cu|binding\.cuh)$).*
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break their static source-registry identities.
         exclude: |
