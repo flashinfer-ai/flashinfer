@@ -470,6 +470,27 @@ def test_blockscaled_compile_accepts_operation_specific_disk_cache(monkeypatch):
     assert calls == [("mm_mxfp8", "mxfp8_1_2_17", compile_kernel, extra_key_files)]
 
 
+def _mm_mxfp8_split_k_test_tactic(m, k):
+    """Derive the wiring test tactic from the split-K kernel contract."""
+    import cutlass
+
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_splitk import (
+        Sm100BlockScaledSplitKGemmKernel,
+    )
+
+    split_k_slices = Sm100BlockScaledSplitKGemmKernel.SUPPORTED_SPLIT_K_SLICES[0]
+    assert Sm100BlockScaledSplitKGemmKernel.is_valid_tactic(
+        m, k, cutlass.Float8E4M3FN, split_k_slices
+    )
+    return (
+        Sm100BlockScaledSplitKGemmKernel.mma_tiler_mn_for_m(m),
+        (1, 1),
+        True,
+        False,
+        split_k_slices,
+    )
+
+
 @pytest.mark.parametrize(
     "m,n,k,tactic",
     [
@@ -484,7 +505,7 @@ def test_blockscaled_compile_accepts_operation_specific_disk_cache(monkeypatch):
             8,
             128,
             256,
-            ((128, 8), (1, 1), True, False, 2),
+            _mm_mxfp8_split_k_test_tactic(8, 256),
             id="split-k",
         ),
     ],
