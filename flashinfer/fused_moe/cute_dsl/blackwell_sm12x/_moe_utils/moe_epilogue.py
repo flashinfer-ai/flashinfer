@@ -50,10 +50,10 @@ class EpiConfig(abc.ABC):
     QUANT_AT: Optional[QuantPoint] = None
     DRAINS_SC_IN_WG = False
     epi_stages = 1
-    STORE_BITS = None
+    STORE_BITS: Optional[int] = None
     HAS_R2S = True
-    S2R_BITS = None
-    S2G_BITS = None
+    S2R_BITS: Optional[int] = None
+    S2G_BITS: Optional[int] = None
     _PERIOD_BYTES = {
         cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128: 128,
         cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64: 64,

@@ -589,11 +589,10 @@ class CuteDslSm120MoeMxfp8Mxfp4Grouped:
                 cute.struct.MemRange[cfg.epi.out_dtype, epi_elems], 128
             ]
 
-        assert (
-            cfg.smem_bytes
-            <= SharedStorage.__sizeof__()
-            <= cfg.smem_bytes + cfg.MBAR_RESERVE
-        ), f"smem model {cfg.smem_bytes} B vs allocated {SharedStorage.__sizeof__()} B"
+        smem_size = SharedStorage.size_in_bytes()  # type: ignore[attr-defined]
+        assert cfg.smem_bytes <= smem_size <= cfg.smem_bytes + cfg.MBAR_RESERVE, (
+            f"smem model {cfg.smem_bytes} B vs allocated {smem_size} B"
+        )
 
         self.storage = SharedStorage
         self.kernel(
@@ -888,7 +887,7 @@ class CuteDslSm120MoeMxfp8Mxfp4Grouped:
                     tiledmma.partition_shape_C((bm, bn)), cfg.ACC
                 )
                 acc.fill(0.0)
-                for sf_cycle in cutlass.range(num_sf_cycles):
+                for _sf_cycle in cutlass.range(num_sf_cycles):
                     acc, a_phase, b_phase = mma(
                         tiledmma,
                         self.mma,

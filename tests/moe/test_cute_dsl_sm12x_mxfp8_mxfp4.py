@@ -177,12 +177,20 @@ def make_gated_inputs(m_per_expert_list, n, k):
     a, a_sf, b, b_sf, offsets, ref2n = make_inputs(
         m_per_expert_list, 2 * n, k, torch.float32
     )
-    return a, a_sf, b, b_sf, offsets, (F.silu(ref2n[:, n:]) * ref2n[:, :n]).to(torch.bfloat16)
+    return (
+        a,
+        a_sf,
+        b,
+        b_sf,
+        offsets,
+        (F.silu(ref2n[:, n:]) * ref2n[:, :n]).to(torch.bfloat16),
+    )
 
 
 def test_cute_dsl_sm12x_fc1_act_mxfp8_mxfp4_matches_reference():
     skip_if_not_sm120()
     from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_mxfp8_mxfp4
+
     a, a_sf, b, b_sf, offsets, ref = make_gated_inputs([64] * 4, 512, 512)
     out = cute_dsl_sm12x_fc1_act_mxfp8_mxfp4(a, a_sf, b, b_sf, offsets)
     assert calc_diff(out.float(), ref.float()) < 8e-3
@@ -191,6 +199,7 @@ def test_cute_dsl_sm12x_fc1_act_mxfp8_mxfp4_matches_reference():
 def test_cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4_smoke():
     skip_if_not_sm120()
     from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4
+
     a, a_sf, b, b_sf, offsets, _ = make_gated_inputs([64] * 4, 512, 512)
     q, sf = cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(a, a_sf, b, b_sf, offsets)
     assert not torch.isnan(q.float()).any() and sf.numel() > 0
@@ -199,9 +208,11 @@ def test_cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4_smoke():
 def test_cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4_smoke():
     skip_if_not_sm120()
     from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+
     a, a_sf, b, b_sf, offsets, _ = make_inputs([64] * 4, 512, 512)
     rows = a.shape[0]
     tok = torch.randint(0, rows, (rows,), device="cuda", dtype=torch.int32)
     out = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
-        a, a_sf, b, b_sf, offsets, tok, torch.rand(rows, device="cuda"), rows)
+        a, a_sf, b, b_sf, offsets, tok, torch.rand(rows, device="cuda"), rows
+    )
     assert out.shape == (rows, 512) and not torch.isnan(out.float()).any()

@@ -810,11 +810,10 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                 cute.struct.MemRange[cfg.epi.out_dtype, epi_elems], 128
             ]
 
-        assert (
-            cfg.smem_bytes
-            <= SharedStorage.__sizeof__()
-            <= cfg.smem_bytes + cfg.MBAR_RESERVE
-        ), f"smem model {cfg.smem_bytes} B vs allocated {SharedStorage.__sizeof__()} B"
+        smem_size = SharedStorage.size_in_bytes()  # type: ignore[attr-defined]
+        assert cfg.smem_bytes <= smem_size <= cfg.smem_bytes + cfg.MBAR_RESERVE, (
+            f"smem model {cfg.smem_bytes} B vs allocated {smem_size} B"
+        )
 
         self.storage = SharedStorage
         self.kernel(

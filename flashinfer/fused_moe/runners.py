@@ -5823,7 +5823,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
 # ---------------------------------------------------------------------------
 
 
-def _sm12x_mxfp8_mxfp4_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+def _sm12x_mxfp8_mxfp4_activation_kwargs(
+    activation: ActivationConfig,
+) -> dict[str, Any]:
     if isinstance(activation, SwiGLU):
         default = SwiGLU()
         if activation.alpha != default.alpha or activation.beta != default.beta:
@@ -5832,7 +5834,9 @@ def _sm12x_mxfp8_mxfp4_activation_kwargs(activation: ActivationConfig) -> dict[s
             )
         return {
             "activation": ActivationType.Swiglu,
-            "swiglu_limit": None if activation.limit == default.limit else activation.limit,
+            "swiglu_limit": None
+            if activation.limit == default.limit
+            else activation.limit,
         }
     if isinstance(activation, SiTU):
         if activation.linear_scale is None or activation.clamp_limit is not None:
@@ -5954,7 +5958,9 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
         if act.hidden_states_q.dtype is not torch.bfloat16:
             raise TypeError("SM12x MXFP8 x MXFP4 requires BF16 hidden states.")
         if act.hidden_states_scale is not None or act.per_token_scale is not None:
-            raise ValueError("SM12x MXFP8 x MXFP4 requires activation scales to be None.")
+            raise ValueError(
+                "SM12x MXFP8 x MXFP4 requires activation scales to be None."
+            )
         _validate_prerouted_inputs(
             act,
             act.hidden_states_q.shape[0],
@@ -5966,7 +5972,9 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
         view = weights.get_view(self.backend_key)
         missing = [key for key in self.required_weight_keys if key not in view]
         if missing:
-            raise KeyError(f"{self.backend_key} prepared weights are missing {missing}.")
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
         _validate_sm12x_mxfp8_mxfp4_weight_view(view, act.hidden_states_q, self.config)
         x = act.hidden_states_q
         num_experts = self.config.routing.num_experts
