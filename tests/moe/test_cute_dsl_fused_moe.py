@@ -3442,7 +3442,29 @@ class TestOddTileCountBoundsContract:
         offs = torch.arange(top_k, device=device).unsqueeze(0)
         return ((idx + offs) % target_tiles).to(torch.int32)
 
-    def _run_eager(self, tensors, buffers, num_experts, top_k):
+    @staticmethod
+    def _default_tactic_kwargs():
+        """Arch-correct tactic parameters for a direct ``_moe_core_impl`` call.
+
+        SM107 rejects the Blackwell defaults outright ("SM107 requires the
+        Rubin tactic parameters mma_tiler and mma_inst_shape"), so the tactic
+        has to come from the same place the runner gets it. Filtered by
+        signature because ``_extract_tactic_params`` also returns keys
+        ``_moe_core_impl`` does not take (``is_rubin``, ``*_raster_along_m``).
+        """
+        import inspect
+
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            _extract_tactic_params,
+            _get_default_tactic,
+        )
+
+        allowed = set(inspect.signature(_moe_core_impl).parameters)
+        params = _extract_tactic_params(_get_default_tactic())
+        return {k: v for k, v in params.items() if k in allowed}
+
+    def _run_eager(self, tensors, buffers, num_experts, top_k, tactic_kwargs):
         from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
 
         return _moe_core_impl(
@@ -3460,9 +3482,9 @@ class TestOddTileCountBoundsContract:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_experts,
-            tile_size=self.TILE_SIZE,
             moe_sort_buffers=buffers,
             output_dtype=torch.bfloat16,
+            **tactic_kwargs,
         )
 
     @pytest.mark.parametrize("target_tiles", [9, 11])
@@ -3488,19 +3510,21 @@ class TestOddTileCountBoundsContract:
             num_tokens, top_k, target_tiles
         )
 
+        tactic_kwargs = self._default_tactic_kwargs()
+        tile_size = tactic_kwargs.get("tile_size", self.TILE_SIZE)
         buffers = allocate_moe_sort_buffers(
             num_tokens=num_tokens,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_experts,
-            tile_tokens_dim=self.TILE_SIZE,
+            tile_tokens_dim=tile_size,
             device="cuda",
         )
         assert buffers, "allocate_moe_sort_buffers returned nothing to poison"
         for buf in buffers.values():
             buf.fill_(self.POISON)
 
-        result = self._run_eager(tensors, buffers, num_experts, top_k)
+        result = self._run_eager(tensors, buffers, num_experts, top_k, tactic_kwargs)
         torch.cuda.synchronize()
 
         # The whole point of the test: confirm routing really produced an odd
