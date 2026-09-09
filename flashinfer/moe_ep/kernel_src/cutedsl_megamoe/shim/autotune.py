@@ -123,45 +123,26 @@ def bf16_candidates() -> List[Dict[str, Any]]:
 
 
 def w4a16_candidates() -> List[Dict[str, Any]]:
-    """Sixteen depth3 tactics and two curated depth2 W4A16 variants.
+    """Eight M256 W4A16 tactics with explicit scheduler depth 2.
 
-    The kernel keeps two dequantization warp groups and derives its pipeline
-    depths from the existing resource fitters. Precision, clamps and the
-    post-FC2 routing/reduction contract are unchanged across candidates.
+    Both geometries use two-CTA instructions and two dequantization warp
+    groups. Explicit M128 configurations remain supported by the kernel.
     """
-    out = [
+    return [
         dict(
             _SWEEP_BASE,
             mma_tiler_mnk=tile,
-            cluster_shape_mnk=cluster,
-            use_2cta_instrs=tile[0] == 256,
+            cluster_shape_mnk=(2, 1, 1),
+            use_2cta_instrs=True,
             flag_batch=flag_batch,
             token_back_mode=token_back,
             in_kernel_fc2_reduce=False,
-            num_sched_stages=3,
+            num_sched_stages=2,
         )
-        for tile, cluster in (
-            ((256, 128, 256), (2, 1, 1)),
-            ((256, 64, 256), (2, 1, 1)),
-            ((128, 64, 256), (2, 1, 1)),
-            ((128, 64, 256), (1, 1, 1)),
-        )
+        for tile in ((256, 128, 256), (256, 64, 256))
         for flag_batch in (4, 8)
         for token_back in ("epi_warps", "reuse_dispatch_warps")
     ]
-
-    # Explicit depth3 above resets the config after a depth2 candidate.
-    out += [
-        dict(knobs, num_sched_stages=2)
-        for knobs in out
-        if knobs["cluster_shape_mnk"] == (2, 1, 1)
-        and (knobs["mma_tiler_mnk"], knobs["flag_batch"], knobs["token_back_mode"])
-        in (
-            ((256, 64, 256), 8, "epi_warps"),
-            ((256, 128, 256), 4, "reuse_dispatch_warps"),
-        )
-    ]
-    return out
 
 
 def autotune_knobs(

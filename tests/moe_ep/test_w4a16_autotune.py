@@ -286,25 +286,21 @@ def test_catalog_winner_restores_scheduler_depth_and_invalidates_compile(factory
     )
 
     candidates = w4a16_candidates()
-    stage2 = [knobs for knobs in candidates if knobs.get("num_sched_stages") == 2]
-    # Include an omitted default so the regression cannot silently skip it.
-    stage3 = [knobs for knobs in candidates if knobs.get("num_sched_stages", 3) == 3]
-    assert stage2 and stage3
+    assert candidates
     workspace = factory(4, 257, 2, 64, 64, 0, 1, gate_up_clamp=1.5, knobs={})
     frontend = workspace._frontend
     try:
-        for choice in stage2:
-            for winner in stage3:
-                frontend.apply_knobs(choice)
-                assert frontend.config.num_sched_stages == 2
-                stage2_key = frontend._compile_key()
-                frontend._mega, frontend._mega_key = object(), stage2_key
-                with mock.patch.object(frontend, "_release_workspace") as release:
-                    frontend.apply_knobs(winner)
-                release.assert_called_once_with()
-                assert frontend.config.num_sched_stages == 3
-                assert frontend._compile_key() != stage2_key
-                assert frontend._mega is None and frontend._mega_key is None
-                assert frontend.config.gate_up_clamp == 1.5
+        for winner in candidates:
+            frontend.apply_knobs(dict(winner, num_sched_stages=3))
+            assert frontend.config.num_sched_stages == 3
+            stage3_key = frontend._compile_key()
+            frontend._mega, frontend._mega_key = object(), stage3_key
+            with mock.patch.object(frontend, "_release_workspace") as release:
+                frontend.apply_knobs(winner)
+            release.assert_called_once_with()
+            assert frontend.config.num_sched_stages == 2
+            assert frontend._compile_key() != stage3_key
+            assert frontend._mega is None and frontend._mega_key is None
+            assert frontend.config.gate_up_clamp == 1.5
     finally:
         workspace.destroy()
