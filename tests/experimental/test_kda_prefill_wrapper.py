@@ -27,7 +27,7 @@ import torch
 
 from flashinfer.kda import RecurrentKDAPrefillWrapper
 
-from tests.test_helpers.kda_prefill import cpu_route_tensors
+from tests.test_helpers.kda_prefill import cpu_route_tensors, packed_prefill_inputs
 
 kda_api = importlib.import_module("flashinfer.kda")
 
@@ -91,3 +91,32 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
     assert calls[0]["backend"] == "cute-dsl"
     assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
     assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
+
+
+def test_prefill_wrapper_planned_path_matches_eager_reference(cuda_device):
+    """The planned path must agree with the eager packed path it wraps.
+
+    The wrapper only reorders work and stages metadata, so the reference is the
+    same kernels driven without a plan.
+    """
+
+    if torch.cuda.get_device_capability(cuda_device) not in ((10, 0), (10, 3)):
+        pytest.skip("packed CuTe DSL prefill requires CC 10.0 or 10.3")
+
+    inputs = packed_prefill_inputs(cuda_device, seq_lens=[7, 29, 13], seed=4936)
+    common = dict(inputs)
+    cu_seqlens = common.pop("cu_seqlens")
+
+    expected_output, expected_state = kda_api.recurrent_kda(
+        **common,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        backend="cute-dsl",
+    )
+
+    wrapper = RecurrentKDAPrefillWrapper(cuda_device)
+    wrapper.plan(cu_seqlens)
+    actual_output, actual_state = wrapper.run(**common, output_final_state=True)
+
+    torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+    torch.testing.assert_close(actual_state, expected_state, atol=0, rtol=0)

@@ -35,3 +35,35 @@ def cpu_route_tensors(token_count=2):
         "lower_bound": -5.0,
         "beta_is_logit": True,
     }
+
+
+def packed_prefill_inputs(device, *, seq_lens, num_heads=2, seed=0):
+    """Realistic packed multi-token prefill inputs on ``device``."""
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(shape, dtype=torch.bfloat16, scale=1.0):
+        out = torch.randn(
+            shape, dtype=torch.float32, device=device, generator=generator
+        )
+        return (scale * out).to(dtype)
+
+    total_tokens = sum(seq_lens)
+    shape = (1, total_tokens, num_heads, 128)
+    offsets = [0]
+    for length in seq_lens:
+        offsets.append(offsets[-1] + length)
+    return {
+        "q": randn(shape),
+        "k": randn(shape),
+        "v": randn(shape),
+        "g": randn(shape, scale=0.1),
+        "beta": randn((1, total_tokens, num_heads)),
+        "A_log": randn(num_heads, dtype=torch.float32, scale=0.1),
+        "dt_bias": randn((num_heads, 128), dtype=torch.float32, scale=0.1),
+        "cu_seqlens": torch.tensor(offsets, dtype=torch.int64, device=device),
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "beta_is_logit": True,
+    }
