@@ -6203,6 +6203,7 @@ class MegaMoeFc12Runner(MoERunner):
             num_local_experts,
             tile_size,
             device=str(self.device),
+            include_expert_counts=True,
         )
         # Hidden size is determined by the activation/weight view, so the
         # FC12 launcher is allocated lazily in pack_inputs.
@@ -6334,9 +6335,9 @@ class MegaMoeFc12Runner(MoERunner):
         from .cute_dsl.moe_utils import moe_permute, moe_sort, moe_unpermute
         from .megamoe_fc12 import Bf16Fc12Inputs
 
-        hidden_states, topk_ids, topk_weights, fc1_weight, fc2_weight, output = (
-            inputs[:6]
-        )
+        hidden_states, topk_ids, topk_weights, fc1_weight, fc2_weight, output = inputs[
+            :6
+        ]
         routing = self.config.routing
         result = moe_sort(
             topk_ids,
@@ -6348,6 +6349,7 @@ class MegaMoeFc12Runner(MoERunner):
             tile_tokens_dim=64,
             **self._sort_buffers,
         )
+        assert result.expert_counts is not None
         torch.cumsum(result.expert_counts, dim=0, out=self._expert_end_offsets)
         moe_permute(
             hidden_states,

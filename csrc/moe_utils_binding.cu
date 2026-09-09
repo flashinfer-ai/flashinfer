@@ -43,6 +43,19 @@ inline int32_t computeLog2(int32_t val) {
   }
   return out;
 }
+
+__global__ void count_local_expert_routes(const int32_t* topk_ids, int32_t num_tokens,
+                                          int32_t top_k, int32_t local_expert_offset,
+                                          int32_t num_local_experts, int32_t* expert_counts) {
+  int64_t const num_routes = static_cast<int64_t>(num_tokens) * top_k;
+  for (int64_t route = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       route < num_routes; route += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    int32_t const local_expert = topk_ids[route] - local_expert_offset;
+    if (static_cast<uint32_t>(local_expert) < static_cast<uint32_t>(num_local_experts)) {
+      atomicAdd(expert_counts + local_expert_offset + local_expert, 1);
+    }
+  }
+}
 }  // namespace
 
 // ============================ moePermute bindings ============================
@@ -364,6 +377,10 @@ void moe_sort(
     // Optional: expert counts buffer for large token counts (>1024)
     // Should be size 2 * num_experts, int32
     int64_t expert_counts_ptr,
+    // Optional persistent [num_local_experts] output histogram. This is
+    // distinct from mPtrExpertCounts, which is private routing scratch on
+    // some small-batch paths.
+    int64_t out_expert_counts_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
     int64_t cuda_stream_ptr) {
@@ -431,6 +448,19 @@ void moe_sort(
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   moe::dev::routing::routingDeepSeek::run(routingData, stream);
+
+  if (out_expert_counts_ptr != 0) {
+    auto* out_counts = reinterpret_cast<int32_t*>(out_expert_counts_ptr);
+    cudaMemsetAsync(out_counts + local_expert_offset, 0, sizeof(int32_t) * num_local_experts,
+                    stream);
+    constexpr int32_t kThreads = 256;
+    int32_t blocks =
+        static_cast<int32_t>((static_cast<int64_t>(num_tokens) * top_k + kThreads - 1) / kThreads);
+    blocks = blocks > 0 ? blocks : 1;
+    count_local_expert_routes<<<blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<int32_t const*>(token_selected_experts_ptr), num_tokens, top_k,
+        local_expert_offset, num_local_experts, out_counts);
+  }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort, moe_sort);
