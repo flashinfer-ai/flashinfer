@@ -125,6 +125,33 @@ band, that is a real signal, not marginality.
 `all` and `smoke` targets also exist. Split-path numerics are **bf16-only** for
 now.
 
+### Split MegaMOE FC12
+
+Use the regular split composition; `MegaMoeFc12Config` is a
+`flashinfer.fused_moe` backend, not a separate EP transport or split-kernel:
+
+```python
+from flashinfer.fused_moe import (
+    BackendOptions, ExpertConfig, MegaMoeFc12Config, MoEConfig,
+    QuantConfig, RoutingConfig,
+)
+from flashinfer.moe_ep import FusedMoeKernelConfig, NcclEpConfig, SplitConfig
+
+moe_config = MoEConfig(
+    routing=RoutingConfig(num_experts=32, top_k=8),
+    quant=QuantConfig(),
+    experts=ExpertConfig(intermediate_size=2048, local_num_experts=8),
+    backend=BackendOptions((MegaMoeFc12Config(),)),
+)
+backend = SplitConfig(
+    comm=NcclEpConfig(), kernel=FusedMoeKernelConfig(moe_config=moe_config)
+)
+```
+
+The bridge keeps low-latency `EXPERT_MAJOR` capacity-wide by design.
+`RANK_MAJOR` and high-throughput inputs use their received routes, which the
+unified backend sorts and compacts before FC12.
+
 ### Running the NIXL-EP tests
 
 NIXL-EP is the second split-path transport (`backend="nixl_ep"`), currently

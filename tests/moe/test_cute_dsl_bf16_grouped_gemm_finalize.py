@@ -61,6 +61,7 @@ def _build_case(num_experts, top_k, num_tokens, hidden, inter, tile_m, dtype):
         permuted_idx_to_expanded_idx,
         _total_padded,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
     )
