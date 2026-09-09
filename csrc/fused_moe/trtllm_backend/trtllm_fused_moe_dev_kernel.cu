@@ -666,6 +666,100 @@ void run(Data const& data, void* stream) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+namespace gatherActivation {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace tg = batchedGemm::trtllm::gen;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Copies one row of numElems elements, or zero-fills it when the slot is inactive
+// (inPtr == nullptr). The inactive test is hoisted out of the grid-stride loop because it is
+// uniform for the row.
+template <typename Elem>
+inline __device__ void copyOrZeroRow(Elem* outPtr, Elem const* inPtr, int numElems,
+                                     Elem const& zero) {
+  int const startIdx = threadIdx.x + blockDim.x * blockIdx.x;
+  int const strideIdx = blockDim.x * gridDim.x;
+  if (inPtr == nullptr) {
+    for (int idx = startIdx; idx < numElems; idx += strideIdx) {
+      outPtr[idx] = zero;
+    }
+  } else {
+    for (int idx = startIdx; idx < numElems; idx += strideIdx) {
+      outPtr[idx] = inPtr[idx];
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void gatherActivationKernel(KernelParams params) {
+  using Type = typename KernelParams::Type;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Unlike the activation and permute kernels this one does not trigger the launch completion
+  // up front: the secondary kernel consumes the gathered rows, so releasing it before the
+  // copies land would race.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  int const numElems = params.useVecCopy ? params.innerDim / NumEltsPerVec : params.innerDim;
+  // An all-zero float4 is 16 zero bytes, i.e. exactly +0 for both supported element dtypes.
+  float4 const zeroVec = make_float4(0.f, 0.f, 0.f, 0.f);
+  Type const zeroElt = Type(0.f);
+
+  for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z) {
+    // Loop over experts per token
+    for (int k = blockIdx.y; k < params.topK; k += gridDim.y) {
+      int const expandedIdx = tokenIdx * params.topK + k;
+      // The routing kernels write -1 for a slot routed outside the local expert shard.
+      int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+      assert(permutedIdx < params.numPaddedRows);
+
+      // Use int64_t to avoid overflow when permutedIdx * numElems > INT32_MAX
+      int64_t const outOffset = (int64_t)expandedIdx * numElems;
+      if (params.useVecCopy) {
+        auto* outVecPtr = reinterpret_cast<float4*>(params.outPtr) + outOffset;
+        auto const* inVecPtr = reinterpret_cast<float4 const*>(params.inPtr);
+        copyOrZeroRow(outVecPtr,
+                      permutedIdx < 0 ? nullptr : inVecPtr + (int64_t)permutedIdx * numElems,
+                      numElems, zeroVec);
+      } else {
+        copyOrZeroRow(params.outPtr + outOffset,
+                      permutedIdx < 0 ? nullptr : params.inPtr + (int64_t)permutedIdx * numElems,
+                      numElems, zeroElt);
+      }
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void run(Data const& data, void* stream) {
+  int const numElemsPerRow =
+      useVectorizedCopy(data) ? data.innerDim / NumEltsPerVec : data.innerDim;
+  // One block covers at most one row, so a block wider than the row would idle most of its
+  // threads: the common intermediate sizes are only 64-256 vectors wide.
+  int const numThreads = std::min(256, (numElemsPerRow + 31) / 32 * 32);
+  int const numBlocksX = (numElemsPerRow + numThreads - 1) / numThreads;
+  // Both the token and the slot loop stride over their grid dimension, so capping the grid
+  // (CUDA allows at most 65535 blocks in y and z) still covers the full extent.
+  dim3 numBlocks(numBlocksX, std::min(1024, data.topK), std::min(8192, data.numTokens));
+
+  LAUNCH_GATHER_ACTIVATION(data, gatherActivationKernel, numBlocks, numThreads, 0, stream);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+}  // namespace gatherActivation
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 namespace finalize {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

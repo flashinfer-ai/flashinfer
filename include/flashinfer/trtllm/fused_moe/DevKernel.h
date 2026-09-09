@@ -116,6 +116,19 @@ namespace moe::dev {
     FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
   }
 
+// The MoE activation gather is a pure copy that keeps the element dtype of the FC1 output, and
+// the only unquantized post-activation dtypes the trtllm-gen MoE returns are Bfloat16 and Fp16.
+#define LAUNCH_GATHER_ACTIVATION(data, kernel, numBlocks, numThreads, smemSize, stream)            \
+  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                         \
+    LAUNCH_PDL(data, false, cutlass::half_t, kernel, numBlocks, numThreads, smemSize, stream);     \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                              \
+    LAUNCH_PDL(data, false, cutlass::bfloat16_t, kernel, numBlocks, numThreads, smemSize, stream); \
+  } else {                                                                                         \
+    FLASHINFER_CHECK(false,                                                                        \
+                     "Unsupported dtypeElt: the MoE activation gather only supports Bfloat16 "     \
+                     "and Fp16.");                                                                 \
+  }
+
 #define LAUNCH_EXPW(data, kernel, topK, numBlocks, numThreads, smemSize, stream)                  \
   if (data.mDtypeElt == tg::Dtype::Fp16 && data.mDtypeExpW == tg::Dtype::Fp32) {                  \
     LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, float, topK), kernel, numBlocks,          \
@@ -362,6 +375,91 @@ void run(Data const& data, void* stream);
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace permute
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace gatherActivation {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace tg = batchedGemm::trtllm::gen;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Number of elements moved by one 128-bit access. Both element dtypes this stage supports
+// (Bfloat16 and Fp16) are 16 bits wide.
+int32_t constexpr NumEltsPerVec = 8;
+
+struct Data {
+  tg::Dtype mDtypeElt{tg::Dtype::Bfloat16};
+  bool mUsePdl{false};
+
+  // Post-activation FC1 output in permuted layout, [numPaddedRows, innerDim]. Rows that no
+  // expanded index points at are never read.
+  void const* inPtr;
+  // Gathered output in expanded (token, slot) layout, [numTokens, topK, innerDim].
+  void* outPtr;
+  // [numTokens * topK] map from the expanded index to the permuted row. A negative entry (the
+  // routing kernels emit -1) marks a slot routed to an expert outside the local expert-parallel
+  // shard; its output row is filled with zeros.
+  int32_t const* expandedIdxToPermutedIdx;
+
+  int32_t innerDim;
+  int32_t numTokens;
+  int32_t topK;
+  // Row count of inPtr, i.e. the routing-padded token count. Only used to bounds-check the
+  // permuted indices in debug builds.
+  int32_t numPaddedRows;
+};
+
+// A row starts at permutedIdx * innerDim, so 128-bit accesses are only legal when innerDim is a
+// multiple of the vector width and both buffers are 16-byte aligned. A case that fails either
+// condition cannot be split into a vectorized body plus a scalar tail -- the row base itself
+// would be misaligned -- so it falls back to element-wise copies.
+inline bool useVectorizedCopy(Data const& data) {
+  return data.innerDim % NumEltsPerVec == 0 && reinterpret_cast<uintptr_t>(data.inPtr) % 16 == 0 &&
+         reinterpret_cast<uintptr_t>(data.outPtr) % 16 == 0;
+}
+
+template <typename Type_, bool UsePdl_>
+struct KernelParams {
+  using Type = Type_;
+  static constexpr bool UsePdl = UsePdl_;
+  static_assert(cutlass::sizeof_bits<Type>::value == 16,
+                "The MoE activation gather only supports 16-bit element types.");
+
+  Type const* inPtr;
+  Type* outPtr;
+  int32_t const* expandedIdxToPermutedIdx;
+
+  int32_t innerDim;
+  int32_t numTokens;
+  int32_t topK;
+  int32_t numPaddedRows;
+  bool useVecCopy;
+
+  static KernelParams setKernelParams(Data const& data) {
+    KernelParams params;
+
+    params.inPtr = (Type const*)data.inPtr;
+    params.outPtr = (Type*)data.outPtr;
+    params.expandedIdxToPermutedIdx = data.expandedIdxToPermutedIdx;
+
+    params.innerDim = data.innerDim;
+    params.numTokens = data.numTokens;
+    params.topK = data.topK;
+    params.numPaddedRows = data.numPaddedRows;
+    params.useVecCopy = useVectorizedCopy(data);
+
+    return params;
+  }
+};
+
+void run(Data const& data, void* stream);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+}  // namespace gatherActivation
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -364,13 +364,12 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     )
 
 
-def gen_trtllm_gen_routing_module() -> JitSpec:
-    """JitSpec for the standalone trtllm-gen MoE routing stage.
+def _fetch_bmm_export_headers() -> None:
+    """Fetch the trtllm-gen BMM export headers and symlink them for C++ includes.
 
-    Compiles only the routing kernels plus the Routing::Runner dispatcher
-    (trtllm_fused_moe_routing_runner.cu), so the routing stage can be built and
-    tested without the batched-GEMM stack of fused_moe_trtllm_sm100. Only the
-    BMM export headers are needed (for btg::Dtype et al.), not the GEMM cubins.
+    The standalone MoE-stage modules need those headers (for btg::Dtype et al.) but
+    none of the GEMM cubins, so they share one symlink root under the cubin dir rather
+    than the per-module gen_root the fused-MoE module builds for its filtered metainfo.
     """
     checksum = get_artifact(
         f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
@@ -389,6 +388,17 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+
+
+def gen_trtllm_gen_routing_module() -> JitSpec:
+    """JitSpec for the standalone trtllm-gen MoE routing stage.
+
+    Compiles only the routing kernels plus the Routing::Runner dispatcher
+    (trtllm_fused_moe_routing_runner.cu), so the routing stage can be built and
+    tested without the batched-GEMM stack of fused_moe_trtllm_sm100. Only the
+    BMM export headers are needed (for btg::Dtype et al.), not the GEMM cubins.
+    """
+    _fetch_bmm_export_headers()
 
     nvcc_flags = [
         "-DTLLM_GEN_EXPORT_INTERFACE",
@@ -420,6 +430,44 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR,
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
+            jit_env.FLASHINFER_CUBIN_DIR,
+        ],
+    )
+
+
+def gen_trtllm_gen_moe_gather_activation_module() -> JitSpec:
+    """JitSpec for the standalone trtllm-gen MoE activation gather.
+
+    Compiles only the dev kernels (trtllm_fused_moe_dev_kernel.cu) plus its
+    binding, so the permuted -> expanded gather can be built and tested without
+    the batched-GEMM stack of fused_moe_trtllm_sm100. Only the BMM export
+    headers are needed (for btg::Dtype et al.), not the GEMM cubins.
+    """
+    _fetch_bmm_export_headers()
+
+    nvcc_flags = [
+        "-DTLLM_GEN_EXPORT_INTERFACE",
+        "-DTLLM_ENABLE_CUDA",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+    ] + current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 12]
+    )
+
+    return gen_jit_spec(
+        "trtllm_gen_moe_gather_activation",
+        [
+            jit_env.FLASHINFER_CSRC_DIR
+            / "trtllm_fused_moe_gather_activation_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[

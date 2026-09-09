@@ -4736,3 +4736,111 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
     },
     tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
 )
+
+
+# Standalone trtllm-gen activation gather
+# ---------------------------------------------------------------------------
+
+
+def _trtllm_gen_moe_gather_activation_reference(
+    *,
+    activation_output: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    top_k: int,
+    **_unused,
+):
+    """Reference for the trtllm-gen MoE activation gather.
+
+    out[t, k] = activation_output[perm(t, k)] if perm(t, k) >= 0 else 0.
+    """
+    intermediate_size = activation_output.shape[1]
+    perm = expanded_idx_to_permuted_idx.reshape(-1).long()
+    num_tokens = perm.numel() // top_k
+    active = (perm >= 0).unsqueeze(-1)
+    gathered = activation_output[perm.clamp(min=0)]
+    gathered = torch.where(active, gathered, torch.zeros_like(gathered))
+    return gathered.reshape(num_tokens, top_k, intermediate_size)
+
+
+def _trtllm_gen_moe_gather_activation_init(
+    *,
+    num_tokens: int,
+    intermediate_size: int = 1024,
+    top_k: int = 8,
+    # Both derived: the synthetic permutation below maps the num_tokens * top_k
+    # expanded slots into a slightly larger padded row space.
+    num_expanded: int = 0,
+    num_padded: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the standalone trtllm-gen MoE activation gather.
+
+    Mimics one expert-parallel shard: the expanded slots map to distinct rows of
+    a padded buffer, and ~1/8 of them are marked inactive (-1).
+    """
+    torch.manual_seed(seed)
+    num_expanded = num_tokens * top_k
+    num_padded = max(num_padded, num_expanded + 64)
+    activation_output = torch.randn(
+        num_padded, intermediate_size, dtype=torch.bfloat16, device=device
+    )
+    expanded_idx_to_permuted_idx = torch.randperm(num_padded, device=device)[
+        :num_expanded
+    ].to(torch.int32)
+    inactive = torch.rand(num_expanded, device=device) < 0.125
+    expanded_idx_to_permuted_idx = torch.where(
+        inactive, -1, expanded_idx_to_permuted_idx
+    )
+    return {
+        "activation_output": activation_output,
+        "expanded_idx_to_permuted_idx": expanded_idx_to_permuted_idx,
+        "top_k": top_k,
+    }
+
+
+trtllm_gen_moe_gather_activation_trace = TraceTemplate(
+    op_type="moe_gather_activation",
+    name_prefix="trtllm_gen_moe_gather_activation",
+    description=(
+        "Standalone trtllm-gen MoE activation gather: reorders the permuted "
+        "post-activation FC1 output into expanded (token, slot) order through "
+        "expanded_idx_to_permuted_idx, writing exact zeros for slots routed "
+        "outside the local expert-parallel shard (negative index). Padded rows "
+        "of the source, i.e. rows no expanded index points at, are never read."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "intermediate_size": Const(abbrev="i"),
+        "top_k": Const(abbrev="k"),
+        "num_expanded": Var(description="num_tokens * top_k, the routed slot count."),
+        "num_padded": Var(
+            description="Number of permuted FC1 rows, the routing-padded count."
+        ),
+    },
+    inputs={
+        "activation_output": Tensor(
+            ["num_padded", "intermediate_size"],
+            dtype="bfloat16",
+            description="Permuted post-activation FC1 output rows.",
+        ),
+        # Flat, as the trtllm-gen launcher returns it: a "num_tokens, top_k" shape
+        # here would bind the top_k axis to a dimension the real tensor does not have.
+        "expanded_idx_to_permuted_idx": Tensor(
+            ["num_expanded"],
+            dtype="int32",
+            description="Expanded slot -> permuted row; negative marks an inactive slot.",
+        ),
+        "top_k": Scalar("int32", description="Routed slots per token."),
+    },
+    outputs={
+        "out": Tensor(
+            ["num_tokens", "top_k", "intermediate_size"],
+            dtype_from="activation_output",
+        ),
+    },
+    constraints=["num_expanded == num_tokens * top_k"],
+    tags=["status:verified", "moe"],
+    reference=_trtllm_gen_moe_gather_activation_reference,
+    init=_trtllm_gen_moe_gather_activation_init,
+)
