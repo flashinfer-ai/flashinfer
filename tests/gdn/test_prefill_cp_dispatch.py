@@ -18,6 +18,14 @@ import torch
 import flashinfer.gdn_prefill as gp
 
 
+# Every case here builds its inputs on the device, so the whole file needs one.
+# It needs nothing else: the kernel entries are replaced with recorders, so no
+# case launches anything and none of them cares which architecture this is.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the inputs are built on the device"
+)
+
+
 HEAD_SIZE = 128
 CP_ENTRIES = (
     "cp_delta_rule_dsl_sm80",
@@ -269,12 +277,20 @@ def test_the_private_maximum_is_validated(bad):
         gp.chunk_gated_delta_rule(_max_seq_len=bad, **call)
 
 
-def test_the_private_maximum_accepts_the_edges():
-    """1 and `total_seq_len` are both legal; only the kernel entry is mocked."""
-    for mx in (1, 4096):
-        call = _inputs([4096], 1)
-        out = gp.chunk_gated_delta_rule(_max_seq_len=mx, use_cp=False, **call)
-        assert out.shape == (4096, 1, HEAD_SIZE)
+@pytest.mark.parametrize("mx", [1, 4096])
+def test_the_private_maximum_accepts_the_edges(monkeypatch, mx):
+    """1 and `total_seq_len` are both legal, and neither reaches a kernel.
+
+    This used to call the public entry with nothing mocked and assert the
+    output's shape, which reached the real architecture-specific entry and
+    launched. That made one case in this file depend on the device it ran on,
+    which is the thing the file exists to avoid -- and it raised
+    `NotImplementedError` rather than skipping on an architecture with no GDN
+    prefill kernel.
+    """
+    call = _inputs([4096], 1)
+    got = _dispatch(monkeypatch, arch=8, _max_seq_len=mx, use_cp=False, **call)
+    assert got == "chunk_gated_delta_rule_sm80"
 
 
 # ─── the V32 fused specialization's auto rule ────────────────────────────────
