@@ -507,7 +507,9 @@ class TestBackendOptions:
 
 class TestQuantConfig:
     def test_default_is_bf16(self):
-        assert QuantConfig().pair == (QuantFormat.BF16, QuantFormat.BF16)
+        cfg = QuantConfig()
+        assert cfg.pair == (QuantFormat.BF16, QuantFormat.BF16)
+        assert cfg.output is QuantFormat.BF16
 
     def test_explicit_pair(self):
         assert QuantConfig(
