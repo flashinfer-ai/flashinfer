@@ -657,6 +657,7 @@ def _head_chunk_body(rank, world_size, group, arg):
 
     offset = 0
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for head_count in schedule:
             fused_out = torch.empty(

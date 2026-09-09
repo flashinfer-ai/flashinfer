@@ -252,6 +252,8 @@ def main():
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--json", type=str, default="")
     args = parser.parse_args()
+    if args.iters <= 0:
+        parser.error("--iters must be greater than zero")
 
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
@@ -371,7 +373,10 @@ def main():
     # Compile kernels and verify the complete mapping before timing.
     reference = ordinary()
     fused_result = whole_fused()
-    sequential_result = pipeline.sequential(q, k, v)
+    # The reference pipeline reuses one output buffer for both variants, so
+    # preserve the serial result before overlap() overwrites that buffer.
+    # This clone is correctness-only and remains outside the timed paths.
+    sequential_result = pipeline.sequential(q, k, v).clone()
     overlap_result = pipeline.overlap(q, k, v)
     torch.cuda.synchronize(device)
     for name, result in (

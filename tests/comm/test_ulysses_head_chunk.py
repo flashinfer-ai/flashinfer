@@ -97,6 +97,7 @@ def test_merge_output_reconstructs_uneven_schedule_on_nondefault_stream(
     full = torch.randn(B, S, W * H_LOCAL, D, device="cuda", dtype=dtype)
     reconstructed = torch.full_like(full, float("nan"))
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     offset = 0
     with torch.cuda.stream(stream):
         for head_count in schedule:

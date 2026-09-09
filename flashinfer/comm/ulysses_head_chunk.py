@@ -163,9 +163,9 @@ def _launch_pack_qkv(
     head_count,
     nccl_layout,
 ) -> None:
-    from ..triton.ulysses import pack_ulysses_qkv_head_chunk
+    from ..triton.ulysses import _pack_ulysses_qkv_head_chunk
 
-    pack_ulysses_qkv_head_chunk(
+    _pack_ulysses_qkv_head_chunk(
         out,
         query,
         key,
@@ -309,9 +309,9 @@ def _launch_merge_rank_major(
     local_heads,
     head_offset,
 ) -> None:
-    from ..triton.ulysses import merge_ulysses_output_head_chunk
+    from ..triton.ulysses import _merge_ulysses_output_head_chunk
 
-    merge_ulysses_output_head_chunk(
+    _merge_ulysses_output_head_chunk(
         received_rank_major,
         out,
         world_size=world_size,
@@ -390,9 +390,9 @@ def _launch_pack_output_sequence(
     *,
     world_size,
 ) -> None:
-    from ..triton.ulysses import pack_ulysses_output_sequence_chunk
+    from ..triton.ulysses import _pack_ulysses_output_sequence_chunk
 
-    pack_ulysses_output_sequence_chunk(
+    _pack_ulysses_output_sequence_chunk(
         out_rank_major,
         source,
         world_size=world_size,

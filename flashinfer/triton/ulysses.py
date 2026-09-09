@@ -17,6 +17,10 @@ limitations under the License.
 import triton
 import triton.language as tl
 
+# Model/topology invariants stay specialized so index division can be folded.
+# Resolution, head-band schedule, offsets, and tensor strides remain runtime
+# arguments to avoid recompiling for each request shape or positive-strided view.
+
 
 @triton.jit
 def _pack_ulysses_qkv_head_chunk_kernel(
@@ -25,25 +29,25 @@ def _pack_ulysses_qkv_head_chunk_kernel(
     key,
     value,
     total,
-    batch: tl.constexpr,
-    seq_len: tl.constexpr,
+    batch,
+    seq_len,
     world_size: tl.constexpr,
     local_heads: tl.constexpr,
-    chunk_heads: tl.constexpr,
-    head_offset: tl.constexpr,
+    chunk_heads,
+    head_offset,
     head_dim: tl.constexpr,
-    q_batch_stride: tl.constexpr,
-    q_seq_stride: tl.constexpr,
-    q_head_stride: tl.constexpr,
-    q_dim_stride: tl.constexpr,
-    k_batch_stride: tl.constexpr,
-    k_seq_stride: tl.constexpr,
-    k_head_stride: tl.constexpr,
-    k_dim_stride: tl.constexpr,
-    v_batch_stride: tl.constexpr,
-    v_seq_stride: tl.constexpr,
-    v_head_stride: tl.constexpr,
-    v_dim_stride: tl.constexpr,
+    q_batch_stride,
+    q_seq_stride,
+    q_head_stride,
+    q_dim_stride,
+    k_batch_stride,
+    k_seq_stride,
+    k_head_stride,
+    k_dim_stride,
+    v_batch_stride,
+    v_seq_stride,
+    v_head_stride,
+    v_dim_stride,
     nccl_layout: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -113,15 +117,15 @@ def _pack_ulysses_output_sequence_chunk_kernel(
     output,
     source,
     total,
-    batch: tl.constexpr,
-    local_seq: tl.constexpr,
+    batch,
+    local_seq,
     world_size: tl.constexpr,
-    chunk_heads: tl.constexpr,
+    chunk_heads,
     head_dim: tl.constexpr,
-    source_batch_stride: tl.constexpr,
-    source_seq_stride: tl.constexpr,
-    source_head_stride: tl.constexpr,
-    source_dim_stride: tl.constexpr,
+    source_batch_stride,
+    source_seq_stride,
+    source_head_stride,
+    source_dim_stride,
     BLOCK: tl.constexpr,
 ):
     """Pack ``[B,W*S,HC,D]`` into NCCL send-major ``[W,B,S,HC,D]``."""
@@ -150,22 +154,22 @@ def _merge_ulysses_output_head_chunk_kernel(
     received,
     output,
     total,
-    batch: tl.constexpr,
-    local_seq: tl.constexpr,
+    batch,
+    local_seq,
     world_size: tl.constexpr,
     local_heads: tl.constexpr,
-    chunk_heads: tl.constexpr,
-    head_offset: tl.constexpr,
+    chunk_heads,
+    head_offset,
     head_dim: tl.constexpr,
-    recv_rank_stride: tl.constexpr,
-    recv_batch_stride: tl.constexpr,
-    recv_seq_stride: tl.constexpr,
-    recv_head_stride: tl.constexpr,
-    recv_dim_stride: tl.constexpr,
-    out_batch_stride: tl.constexpr,
-    out_seq_stride: tl.constexpr,
-    out_head_stride: tl.constexpr,
-    out_dim_stride: tl.constexpr,
+    recv_rank_stride,
+    recv_batch_stride,
+    recv_seq_stride,
+    recv_head_stride,
+    recv_dim_stride,
+    out_batch_stride,
+    out_seq_stride,
+    out_head_stride,
+    out_dim_stride,
     BLOCK: tl.constexpr,
 ):
     """Merge logical ``[source_rank,B,S,HC,D]`` bands into full output."""
@@ -201,7 +205,7 @@ def _merge_ulysses_output_head_chunk_kernel(
     )
 
 
-def pack_ulysses_qkv_head_chunk(
+def _pack_ulysses_qkv_head_chunk(
     output,
     query,
     key,
@@ -237,7 +241,7 @@ def pack_ulysses_qkv_head_chunk(
     )
 
 
-def pack_ulysses_output_sequence_chunk(
+def _pack_ulysses_output_sequence_chunk(
     output,
     source,
     *,
@@ -261,7 +265,7 @@ def pack_ulysses_output_sequence_chunk(
     )
 
 
-def merge_ulysses_output_head_chunk(
+def _merge_ulysses_output_head_chunk(
     received_rank_major,
     output,
     *,
