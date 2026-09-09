@@ -95,7 +95,7 @@ from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
-    SmemKvReuseCreditResource,
+    _prefetch_prepared_sparse_row,
     create_block_sparse_load_tasks_per_inst,
     create_correction_task,
     create_correction_task_one_inst_qkv,
@@ -343,6 +343,8 @@ def _build_decode_gen_schedule(
     sparse_row_route_offsets: cute.Pointer | None = None,
     sparse_row_route_counts: cute.Pointer | None = None,
     sparse_route_metadata: cute.Pointer | None = None,
+    sparse_row_route_begin: Int32 | None = None,
+    sparse_route_count: Int32 | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -744,7 +746,6 @@ def _build_decode_gen_schedule(
     # ------------------------------------------------------------------
     work_queue = None
     schedule_token_throttle = None
-    smem_kv_reuse_credit = None
     # CLC remains the single persistent policy for every supported topology.
     # The stock static WorkQueue advances and decodes coordinates separately
     # in every task, which regresses multi-wave decode workloads. CLC computes
@@ -802,17 +803,6 @@ def _build_decode_gen_schedule(
             ),
             name="schedule_token_throttle",
         )
-        if cfg.uses_rotating_kv256_exchange:
-            smem_kv_reuse_credit = SmemKvReuseCreditResource(
-                cfg=cfg,
-                pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
-                    num_stages=1,
-                    producer_group=load_grp,
-                    consumer_group=correction_grp,
-                    cta_layout_vmnk=cta_layout,
-                ),
-                name="smem_kv_reuse_credit",
-            )
     smem_q = SmemQResource(
         pipeline_config=smem_q_cfg,
         cfg=cfg,
@@ -1238,6 +1228,8 @@ def _build_decode_gen_schedule(
         "seq_len_q": seq_len_q,
         "sparse_row_route_offsets": sparse_row_route_offsets,
         "sparse_row_route_counts": sparse_row_route_counts,
+        "sparse_row_route_begin": sparse_row_route_begin,
+        "sparse_route_count": sparse_route_count,
         "num_heads_kv": num_heads_kv,
     }
     if use_one_inst_qkv:
@@ -1308,7 +1300,6 @@ def _build_decode_gen_schedule(
                 smem_kv,
                 work_queue,
                 schedule_token_throttle,
-                smem_kv_reuse_credit,
                 cfg,
                 domain=load_domain,
                 domain_bias=0,
@@ -1452,7 +1443,6 @@ def _build_decode_gen_schedule(
             tmem_corr0,
             tmem_corr1,
             work_queue,
-            smem_kv_reuse_credit,
             cfg,
             domain=corr_domain,
             tmem_stats_done0=tmem_stats_done0,
@@ -1628,10 +1618,6 @@ def _build_decode_gen_schedule(
         )
     if schedule_token_throttle is not None:
         resource_dependency_graph[schedule_token_throttle] = [work_queue]
-    if smem_kv_reuse_credit is not None:
-        # A self-edge models the one-slot ownership token: Load produces it
-        # for the current tile and Correction consumes it before the next Load.
-        resource_dependency_graph[smem_kv_reuse_credit] = [smem_kv_reuse_credit]
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
@@ -1683,8 +1669,6 @@ def _build_decode_gen_schedule(
         smem_allocator.add_resource(work_queue)
     if schedule_token_throttle is not None:
         smem_allocator.add_resource(schedule_token_throttle)
-    if smem_kv_reuse_credit is not None:
-        smem_allocator.add_resource(smem_kv_reuse_credit)
     smem_allocator.add_resource(smem_q)
     if smem_page_offsets is not None:
         smem_allocator.add_resource(smem_page_offsets)
@@ -1722,18 +1706,6 @@ def _build_decode_gen_schedule(
     smem_allocator.add_resource(tmem_corr0)
     if not use_one_inst_qkv:
         smem_allocator.add_resource(tmem_corr1)
-    if cfg.tile_size_kv == 256:
-        # KV256 direct-output correction rotates one compact 35,840-byte
-        # payload through the shared 192-KiB K/V ring. Split-KV retains the
-        # fixed full exchange. Neither path increases the CTA SMEM footprint.
-        correction_exchange_requirements = tmem_corr1.get_smem_requirements()
-        if correction_exchange_requirements:
-            smem_allocator.add_alias_group(
-                [
-                    smem_kv.get_smem_requirements(),
-                    correction_exchange_requirements,
-                ]
-            )
     smem_allocator.add_tmem_ptr(
         SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
     )
@@ -1796,13 +1768,15 @@ def _build_decode_gen_schedule(
         p0_alloc = smem_p0.get_tmem_requirements()[0]
         p1_alloc = smem_p1.get_tmem_requirements()[0]
         o_alloc = tmem_o.get_tmem_requirements()[0]
-        if cfg.tile_size_kv == 256:
-            # KV256 keeps O in the low 256 columns and overlays packed P on
-            # each S region from its first column. Softmax streams K32
-            # fragments in order, so every 16-column P store only overwrites
-            # scores that have already been consumed. Starting P after the
-            # nominal stats columns would instead clobber the next unread S
-            # fragment; KV256 keeps its softmax stats in SMEM.
+        if cfg.streams_tmem_p_fragments:
+            # Streamed profiles keep O in the low 256 columns and overlay
+            # packed P on each S region from its first column. Softmax streams
+            # K32 fragments in order, so every 16-column P store only
+            # overwrites scores that have already been consumed. Starting P
+            # after the nominal stats columns would instead clobber the next
+            # unread S fragment; streamed profiles keep their softmax stats in
+            # SMEM.
+            assert cfg.keeps_stats_via_smem
             o_alloc.offset = 0
             s0_alloc.offset = 2 * cfg.tmem_o_stage_cols
             s1_alloc.offset = s0_alloc.offset + cfg.tmem_s_cols
@@ -1857,12 +1831,8 @@ def _build_decode_gen_schedule(
     eager_init_resources = (
         [tmem_corr0] if use_one_inst_qkv else [tmem_corr0, tmem_corr1]
     )
-    if smem_kv_reuse_credit is not None:
-        # Initialize the persistent ring cursor under the same CTA-wide fence
-        # and barrier used by other manually managed SMEM control state.
-        eager_init_resources.append(smem_kv_reuse_credit)
     if cfg.streams_tmem_p_fragments:
-        # KV256's TMEM P operands use one-way per-fragment ready barriers.
+        # Streamed TMEM P operands use one-way per-fragment ready barriers.
         # Initialize them beside correction's manually managed SMEM state.
         eager_init_resources.extend([smem_p0, smem_p1])
 
@@ -1885,10 +1855,10 @@ def _has_unmodeled_tmem_p_alias_protocol(cfg: FmhaDecodeConfig) -> bool:
     """Whether exhaustive TS checking would report a known false P/S race.
 
     The staged D256 path selects one of two physical P/S stages at runtime.
-    Static KV256 instead orders streamed P fragments with private mbarriers and
+    Static streamed profiles instead order P fragments with private mbarriers and
     reuses the matching TmemO-full barrier as the next-QK overwrite credit.
     Those intra-work protocols are below TaskManager's resource transitions,
-    so its allocation-level checker cannot prove them. Persistent KV256 has
+    so its allocation-level checker cannot prove them. Persistent streaming has
     enough task-level ordering for the checker and remains covered.
     """
     return cfg.uses_staged_one_inst_tmem_p or (
@@ -2095,6 +2065,27 @@ def _run_decode_gen_active(
     if cutlass.const_expr(cfg.max_seq_len_q > 1):
         q_output_rows = g_h_r * Int32(cfg.max_seq_len_q)
 
+    # Static block-sparse tiles read their prepared row header here, before
+    # TMEM allocation and barrier setup, so that global-memory round trip is
+    # hidden instead of stalling every task at its first schedule step.
+    sparse_row_route_begin = None
+    sparse_route_count = None
+    if cutlass.const_expr(
+        cfg.use_block_sparse
+        and not cfg.use_persistent_scheduler
+        and g_sparse_row_route_offsets is not None
+        and g_sparse_row_route_counts is not None
+    ):
+        sparse_row_route_begin, sparse_route_count = _prefetch_prepared_sparse_row(
+            cfg,
+            g_sparse_row_route_offsets,
+            g_sparse_row_route_counts,
+            q_group_idx,
+            h_k_idx,
+            b_idx,
+            g_h_k,
+        )
+
     (
         task_list,
         dep_graph,
@@ -2145,6 +2136,8 @@ def _run_decode_gen_active(
         sparse_row_route_offsets=g_sparse_row_route_offsets,
         sparse_row_route_counts=g_sparse_row_route_counts,
         sparse_route_metadata=g_sparse_route_metadata,
+        sparse_row_route_begin=sparse_row_route_begin,
+        sparse_route_count=sparse_route_count,
     )
 
     smem_allocator.allocate()
