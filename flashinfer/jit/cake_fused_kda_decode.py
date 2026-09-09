@@ -108,7 +108,7 @@ class CakeFusedKDADecodeEligibility:
 
 @dataclass(frozen=True)
 class CakeFusedKDADecodeVariant:
-    """One explicitly registered Cake device source and launch description."""
+    """One explicitly registered CUDA source and launch description."""
 
     name: str
     target: CakeFusedKDADecodeTarget
