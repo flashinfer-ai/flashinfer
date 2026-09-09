@@ -278,3 +278,33 @@ def test_cached_c1_geometry_and_cluster_change_preserve_lifecycle(factory):
         assert frontend.config.token_back_mode == "reuse_dispatch_warps"
     finally:
         workspace.destroy()
+
+
+def test_catalog_winner_restores_scheduler_depth_and_invalidates_compile(factory):
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+        w4a16_candidates,
+    )
+
+    candidates = w4a16_candidates()
+    stage2 = [knobs for knobs in candidates if knobs.get("num_sched_stages") == 2]
+    # Include an omitted default so the regression cannot silently skip it.
+    stage3 = [knobs for knobs in candidates if knobs.get("num_sched_stages", 3) == 3]
+    assert stage2 and stage3
+    workspace = factory(4, 257, 2, 64, 64, 0, 1, gate_up_clamp=1.5, knobs={})
+    frontend = workspace._frontend
+    try:
+        for choice in stage2:
+            for winner in stage3:
+                frontend.apply_knobs(choice)
+                assert frontend.config.num_sched_stages == 2
+                stage2_key = frontend._compile_key()
+                frontend._mega, frontend._mega_key = object(), stage2_key
+                with mock.patch.object(frontend, "_release_workspace") as release:
+                    frontend.apply_knobs(winner)
+                release.assert_called_once_with()
+                assert frontend.config.num_sched_stages == 3
+                assert frontend._compile_key() != stage2_key
+                assert frontend._mega is None and frontend._mega_key is None
+                assert frontend.config.gate_up_clamp == 1.5
+    finally:
+        workspace.destroy()
