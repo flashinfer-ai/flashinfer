@@ -32,6 +32,7 @@ from .core import (
     gen_tgv_gemm_sm10x_module,
     gen_gemm_sm90_module,
 )
+from .svdquant_sm120 import gen_gemm_sm120_module_cutlass_nvfp4_svdquant
 from .deepgemm import gen_deepgemm_sm100_module
 from .fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
 
@@ -39,6 +40,7 @@ __all__ = [
     "gen_gemm_module",
     "gen_gemm_sm100_module_cutlass_fp4",
     "gen_gemm_sm100_module_cutlass_nvfp4_svdquant",
+    "gen_gemm_sm120_module_cutlass_nvfp4_svdquant",
     "gen_gemm_sm103_module_cutlass_fp4",
     "gen_gemm_sm120_module_cutlass_fp4",
     "gen_gemm_sm100_module_cutlass_fp8",
