@@ -42,6 +42,7 @@ FUSED_ENTRIES = (
 
 
 def _inputs(seq_lens, heads, dtype=torch.bfloat16):
+    """One cell's shapes, on the device, with nothing the entries read."""
     dev = torch.device("cuda")
     total = sum(seq_lens)
     q = torch.randn(total, heads, HEAD_SIZE, dtype=dtype, device=dev)
@@ -66,7 +67,10 @@ def _dispatch(monkeypatch, *, arch, sm_count=80, minor=0, kwargs_out=None, **cal
     fired = []
 
     def recorder(name):
+        """A stand-in that records which entry fired instead of launching."""
+
         def f(*a, **kw):
+            """Record the name and the keywords, and return nothing."""
             fired.append(name)
             if kwargs_out is not None:
                 kwargs_out.update(kw)
@@ -138,6 +142,7 @@ def test_auto_still_declines_cp_when_there_is_plenty_of_work(monkeypatch, arch):
     ],
 )
 def test_auto_on_sm80_picks_cp_inside_the_rule(monkeypatch, seq_lens, heads):
+    """Inside the fitted region, auto takes CP."""
     call = _inputs(seq_lens, heads)
     got = _dispatch(monkeypatch, arch=8, _max_seq_len=max(seq_lens), **call)
     assert got == "cp_delta_rule_dsl_sm80"
@@ -154,6 +159,7 @@ def test_auto_on_sm80_picks_cp_inside_the_rule(monkeypatch, seq_lens, heads):
     ],
 )
 def test_auto_on_sm80_picks_fused_outside_the_rule(monkeypatch, seq_lens, heads, why):
+    """Outside it, auto stays on the fused kernel."""
     call = _inputs(seq_lens, heads)
     got = _dispatch(monkeypatch, arch=8, _max_seq_len=max(seq_lens), **call)
     assert got == "chunk_gated_delta_rule_sm80", why
@@ -241,6 +247,7 @@ def test_explicit_cp_on_sm80_still_runs_cp(monkeypatch):
 
 
 def test_explicit_cp_false_never_runs_cp(monkeypatch):
+    """`use_cp=False` reaches the fused entry whatever the rule says."""
     for arch, fused in (
         (8, "chunk_gated_delta_rule_sm80"),
         (9, "chunk_gated_delta_rule_sm90"),
@@ -355,6 +362,7 @@ def _offered_v32(monkeypatch, **overrides):
 
 
 def test_v32_offered_on_its_exact_contract(monkeypatch):
+    """The one validated shape is offered the specialization."""
     got, offered = _offered_v32(monkeypatch)
     assert got == "chunk_gated_delta_rule_sm80"
     assert offered is True
@@ -369,6 +377,7 @@ def test_v32_not_offered_off_cc80(monkeypatch, minor):
 
 
 def test_v32_not_offered_without_an_exact_maximum(monkeypatch):
+    """No exact longest sequence, no offer."""
     got, offered = _offered_v32(monkeypatch, _max_seq_len=None)
     assert got == "chunk_gated_delta_rule_sm80"
     assert offered is False
@@ -376,12 +385,14 @@ def test_v32_not_offered_without_an_exact_maximum(monkeypatch):
 
 @pytest.mark.parametrize("length", [8191, 8193, 4096])
 def test_v32_not_offered_at_other_lengths(monkeypatch, length):
+    """One token either side of 8192 declines."""
     got, offered = _offered_v32(monkeypatch, seq_lens=(length,))
     assert got == "chunk_gated_delta_rule_sm80"
     assert offered is False
 
 
 def test_v32_not_offered_for_more_than_one_sequence(monkeypatch):
+    """Two sequences decline."""
     got, offered = _offered_v32(monkeypatch, seq_lens=(8192, 8192))
     assert got == "chunk_gated_delta_rule_sm80"
     assert offered is False
@@ -389,6 +400,7 @@ def test_v32_not_offered_for_more_than_one_sequence(monkeypatch):
 
 @pytest.mark.parametrize("heads", [(2, 8), (8, 32), (4, 4), (16, 4)])
 def test_v32_not_offered_at_other_head_counts(monkeypatch, heads):
+    """Other head counts decline."""
     got, offered = _offered_v32(monkeypatch, heads=heads)
     assert got in ("chunk_gated_delta_rule_sm80", "cp_delta_rule_dsl_sm80")
     if got == "chunk_gated_delta_rule_sm80":
@@ -404,6 +416,7 @@ def test_v32_not_offered_when_the_caller_asks_for_cp(monkeypatch):
 
 @pytest.mark.parametrize("arch", [9, 10, 12])
 def test_v32_keyword_never_reaches_other_arches(monkeypatch, arch):
+    """The private keyword is SM8x-only."""
     call = _v32_inputs()
     kwargs = {}
     got = _dispatch(monkeypatch, arch=arch, kwargs_out=kwargs, **call)
@@ -412,6 +425,7 @@ def test_v32_keyword_never_reaches_other_arches(monkeypatch, arch):
 
 
 def test_v32_is_not_a_public_parameter():
+    """It is not in the public signature."""
     import inspect
 
     assert "_v32" not in inspect.signature(gp.chunk_gated_delta_rule).parameters

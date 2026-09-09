@@ -49,6 +49,7 @@ BACKEND_CP_HEAD_CASES = (
 
 
 def _skip_if_not_supported(backend, use_cp):
+    """Skip where no GDN prefill kernel exists for this device."""
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
     if backend == "cake_gdn" and (major, minor) not in ((10, 0), (10, 3)):
