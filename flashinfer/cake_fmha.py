@@ -192,6 +192,79 @@ def _is_authenticated_request_ordered_plan(
     return False
 
 
+class CakeFmhaRequestOrderedCapture:
+    """Explicit descriptor preparation for Q produced inside CUDA Graph capture.
+
+    Construct with the selected plans outside capture, after warming each
+    module's ordinary launch path. Allocate a distinct caller workspace for
+    every live graph/layer binding before capture. Pass this object as
+    ``request_order_capture`` when recording the public decode call, then call
+    :meth:`finalize` after the graph context exits and before its first replay.
+    Call :meth:`discard` if recording or finalization fails, and discard that
+    graph. The object retains descriptor workspaces, not intermediate Q tensors;
+    keep it alive with its graph. Ordinary prewarmed calls are unchanged.
+    """
+
+    def __init__(self, plans: Sequence[CakeFmhaRequestOrderedDecodePlan]) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("create request-order capture preparation outside capture")
+        if not plans:
+            raise ValueError("request-order capture preparation requires selected plans")
+        self._plans = frozenset(plans)
+        self._tokens: dict[str, tuple[Any, int]] = {}
+        self._workspaces: dict[int, torch.Tensor] = {}
+        self._state = "recording"
+        try:
+            for plan in plans:
+                if not _is_authenticated_request_ordered_plan(plan):
+                    raise ValueError("request-order capture plan is not an exported route")
+                if plan.module_name not in self._tokens:
+                    module = load_cake_fmha_request_ordered_module(plan.module_name)
+                    self._tokens[plan.module_name] = (module, module.begin_tma_capture())
+        except BaseException:
+            self.discard()
+            raise
+
+    @property
+    def finalized(self) -> bool:
+        return self._state == "finalized"
+
+    def _record(
+        self,
+        plan: CakeFmhaRequestOrderedDecodePlan,
+        workspace: torch.Tensor,
+        arguments: tuple[Any, ...],
+    ) -> None:
+        if self._state != "recording" or plan not in self._plans:
+            raise ValueError("request-order capture is not recording this selected plan")
+        if not torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("request_order_capture is only used inside CUDA Graph capture")
+        module, token = self._tokens[plan.module_name]
+        module.run_tma_capture(token, *arguments)
+        self._workspaces[workspace.data_ptr()] = workspace
+
+    def finalize(self) -> None:
+        """Upload recorded tensor maps after capture, before publishing/replaying it."""
+        if self._state != "recording":
+            raise RuntimeError("request-order capture preparation has already finished")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("finalize request-order descriptors after capture ends")
+        for name, (module, token) in tuple(self._tokens.items()):
+            module.finalize_tma_capture(token)
+            del self._tokens[name]
+        self._state = "finalized"
+
+    def discard(self) -> None:
+        """Release unfinished host records; the associated graph must be discarded."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("discard request-order descriptor records after capture ends")
+        for name, (module, token) in tuple(self._tokens.items()):
+            module.discard_tma_capture(token)
+            del self._tokens[name]
+        self._workspaces.clear()
+        self._state = "discarded"
+
+
 def _run_cake_fmha_request_ordered_paged_decode(
     *,
     backend: Literal["cake"],
@@ -210,6 +283,7 @@ def _run_cake_fmha_request_ordered_paged_decode(
     bmm2_scale: torch.Tensor,
     uses_shared_paged_kv_idx: bool,
     plan: CakeFmhaRequestOrderedDecodePlan,
+    capture: CakeFmhaRequestOrderedCapture | None = None,
 ) -> None:
     """Launch the explicitly selected Cake backend without auxiliary kernels.
 
@@ -386,7 +460,7 @@ def _run_cake_fmha_request_ordered_paged_decode(
 
     module = load_cake_fmha_request_ordered_module(plan.module_name)
     with tvm_ffi.use_torch_stream():
-        module.run(
+        arguments = (
             query,
             key_cache.view(torch.uint8),
             value_cache.view(torch.uint8),
@@ -412,6 +486,10 @@ def _run_cake_fmha_request_ordered_paged_decode(
             tma_workspace,
             *plan.grid,
         )
+        if capture is None:
+            module.run(*arguments)
+        else:
+            capture._record(plan, workspace_buffer, arguments)
 
 
 @dataclass(frozen=True)
