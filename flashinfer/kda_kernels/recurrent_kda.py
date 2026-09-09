@@ -1876,6 +1876,11 @@ def run_recurrent_kda(
             raises rather than falling back when its contract is unsupported.
             ``"auto"`` selects Cake only for its native equal-head/D128/T1
             unbounded-softplus contract and otherwise preserves CuTe DSL.
+            ``"auto"`` accepts exactly what ``"cute-dsl"`` accepts. Note that
+            with ``ssm_state_indices`` and ``output_final_state=True`` the
+            returned state follows whichever backend ran: the whole pool from
+            Cake, or the gathered ``[B, HV, V, K]`` rows from CuTe DSL. The
+            in-place pool update is the same either way.
 
     Returns:
         Tuple[torch.Tensor, Optional[torch.Tensor]]:
