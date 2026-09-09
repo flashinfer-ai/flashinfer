@@ -94,6 +94,12 @@ def sm110_gqa_decode(
         dtype=torch.int32,
         device=q.device,
     )
+    min_length, max_length = torch.aminmax(sequence_lengths)
+    if min_length.item() < 1 or max_length.item() > capacity:
+        raise ValueError(
+            "sequence_lengths values must be within the inclusive range "
+            f"[1, {capacity}]"
+        )
 
     if out is None:
         out = torch.empty_like(q)

@@ -87,15 +87,14 @@ def _measure_shape(
         generator=generator,
     )
     sequence_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
-    out = torch.empty_like(q)
     positions = torch.arange(capacity, device="cuda")
     mask = positions.view(1, 1, 1, capacity) < sequence_lengths.view(batch, 1, 1, 1)
     sdpa_q = q.unsqueeze(2)
     sdpa_k = kv[:, 0]
     sdpa_v = kv[:, 1]
 
-    def candidate() -> None:
-        sm110_gqa_decode(q, kv, sequence_lengths, out=out)
+    def candidate() -> torch.Tensor:
+        return sm110_gqa_decode(q, kv, sequence_lengths)
 
     def torch_sdpa() -> torch.Tensor:
         return F.scaled_dot_product_attention(
@@ -137,6 +136,7 @@ def main() -> None:
         "compute_capability": list(torch.cuda.get_device_capability()),
         "cuda": torch.version.cuda,
         "timing": "same-process cold-L2 CUPTI median GPU activity span",
+        "output_allocation": "both timed paths allocate and return their output",
         "rows": rows,
     }
     payload = json.dumps(result, indent=2, sort_keys=True)

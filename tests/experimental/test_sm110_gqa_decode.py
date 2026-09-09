@@ -60,6 +60,41 @@ def test_generated_source_closure() -> None:
     }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize(
+    ("capacity", "lengths"),
+    [
+        (64, [1, 0]),
+        (64, [1, 65]),
+        (65, [1, -1]),
+        (65, [1, 66]),
+    ],
+    ids=(
+        "short-non-positive",
+        "short-oversized",
+        "long-non-positive",
+        "long-oversized",
+    ),
+)
+def test_sm110_gqa_decode_rejects_invalid_sequence_lengths(
+    capacity: int,
+    lengths: list[int],
+) -> None:
+    batch = len(lengths)
+    q = torch.empty((batch, 32, 128), dtype=torch.float16, device="cuda")
+    kv = torch.empty((batch, 2, 8, capacity, 128), dtype=torch.float16, device="cuda")
+    sequence_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"sequence_lengths values must be within the inclusive range "
+            rf"\[1, {capacity}\]"
+        ),
+    ):
+        sm110_gqa_decode(q, kv, sequence_lengths)
+
+
 @pytest.mark.skipif(not _has_sm110(), reason="requires an exact SM110 GPU")
 @pytest.mark.parametrize(
     ("batch", "capacity", "lengths", "seed"),

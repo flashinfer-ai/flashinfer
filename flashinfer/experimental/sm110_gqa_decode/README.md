@@ -14,8 +14,8 @@ The input contract is:
 - `q`: contiguous FP16 `[batch, 32, 128]`
 - `kv`: contiguous FP16 `[batch, 2, 8, capacity, 128]`, with K at index 0 and
   V at index 1
-- `sequence_lengths`: contiguous CUDA int32 `[batch]`; each value selects a
-  valid prefix no larger than `capacity`
+- `sequence_lengths`: contiguous CUDA int32 `[batch]`; every value must be in
+  the inclusive range `[1, capacity]`
 - `out`: optional caller-owned contiguous FP16 `[batch, 32, 128]`
 
 Capacities through 64 use a 256-thread short-prefix kernel. Larger capacities
