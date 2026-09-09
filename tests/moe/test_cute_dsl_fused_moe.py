@@ -3403,3 +3403,242 @@ class TestRubinMultiCtaTacticRejected:
         assert synthetic not in ALL_RUBIN_MOE_TACTICS, (
             "a multi-CTA tactic is present in the enumerated Rubin list"
         )
+
+
+class TestOddTileCountBoundsContract:
+    """Exercise the active-count bounds contract at an *odd* tile count.
+
+    ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
+    uninitialized; both GEMMs must read strictly within that count. An odd
+    count is the interesting case, because a multi-CTA rounding scheme would
+    round it up and read exactly one entry the routing kernel never wrote.
+
+    Routing is constructed so the tile count is deterministic and odd, and
+    the count is asserted at runtime -- without that assertion a change in
+    tiling could silently make this an even-count test that proves nothing.
+
+    Between CUDA-graph replays the routing is changed in place, so tail
+    entries written by the previous replay remain in the buffers. If any
+    consumer ever read past the active count, those stale values would
+    surface as divergence rather than being harmlessly ignored.
+    """
+
+    pytestmark = _requires_dsl_arch
+
+    TILE_SIZE = 128
+    POISON = 0x7FFFFFFE
+
+    @staticmethod
+    def _routing_for_tile_count(num_tokens, top_k, target_tiles, device="cuda"):
+        """Route every token across the first ``target_tiles`` experts.
+
+        Each token picks ``top_k`` distinct experts from a window of
+        ``target_tiles``, so exactly that many experts are non-empty. Sized
+        so no expert exceeds one tile, making the tile count exactly
+        ``target_tiles``.
+        """
+        assert target_tiles >= top_k, "need at least top_k experts to fill"
+        idx = torch.arange(num_tokens, device=device).unsqueeze(1)
+        offs = torch.arange(top_k, device=device).unsqueeze(0)
+        return ((idx + offs) % target_tiles).to(torch.int32)
+
+    def _run_eager(self, tensors, buffers, num_experts, top_k):
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        return _moe_core_impl(
+            x=tensors["x"],
+            x_sf=tensors["x_sf"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            tile_size=self.TILE_SIZE,
+            moe_sort_buffers=buffers,
+            output_dtype=torch.bfloat16,
+        )
+
+    @pytest.mark.parametrize("target_tiles", [9, 11])
+    def test_odd_tile_count_with_poisoned_buffers(self, target_tiles: int):
+        """Eager run at an odd tile count with both tile maps poisoned."""
+        from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers
+
+        assert target_tiles % 2 == 1, "this test is about odd tile counts"
+
+        num_tokens, top_k = 64, 8
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 256
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        tensors["token_selected_experts"] = self._routing_for_tile_count(
+            num_tokens, top_k, target_tiles
+        )
+
+        buffers = allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            tile_tokens_dim=self.TILE_SIZE,
+            device="cuda",
+        )
+        assert buffers, "allocate_moe_sort_buffers returned nothing to poison"
+        for buf in buffers.values():
+            buf.fill_(self.POISON)
+
+        result = self._run_eager(tensors, buffers, num_experts, top_k)
+        torch.cuda.synchronize()
+
+        # The whole point of the test: confirm routing really produced an odd
+        # count. If tiling changes, fail loudly instead of silently passing.
+        active = int(buffers["out_num_non_exiting_tiles"][0].item())
+        assert active == target_tiles, (
+            f"expected {target_tiles} active tiles, routing produced {active}; "
+            f"this test no longer exercises the odd-count case"
+        )
+
+        assert not torch.isnan(result).any(), "NaN with poisoned buffers"
+        assert not torch.isinf(result).any(), "Inf with poisoned buffers"
+
+        # Entries past the active count must still hold poison -- proof that
+        # nothing wrote them and, combined with a correct result, that nothing
+        # read them either.
+        tail = buffers["out_tile_idx_to_expert_idx"][active:]
+        assert (tail == self.POISON).all(), (
+            "routing wrote past num_non_exiting_tiles; the uninitialized-tail "
+            "contract documented in moe_sort no longer holds"
+        )
+
+        ref_output = compute_reference_moe_fp4(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+            gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+            gemm1_alpha=tensors["w1_alpha"],
+            gemm2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            num_local_experts=num_experts,
+            local_expert_offset=0,
+        )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, (
+            f"odd tile count {target_tiles}: only {percent_within * 100:.2f}% "
+            f"within tolerance (atol={atol:.4f}) -- a poison sentinel from "
+            f"past the active count leaked into the result"
+        )
+
+    def test_cuda_graph_replay_with_changed_routing(self):
+        """Replay twice at odd tile counts, changing routing in between.
+
+        The second replay runs with tail entries left over from the first, so
+        a consumer reading past the active count would diverge from the eager
+        reference for that routing.
+        """
+        num_tokens, top_k = 64, 8
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 256
+
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        routing_a = self._routing_for_tile_count(num_tokens, top_k, 9)
+        routing_b = self._routing_for_tile_count(num_tokens, top_k, 11)
+
+        from flashinfer import CuteDslMoEWrapper
+
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=True,
+            max_num_tokens=num_tokens,
+            activation_type=ActivationType.Swiglu,
+        )
+
+        routing_slot = tensors["token_selected_experts"]
+        routing_slot.copy_(routing_a)
+
+        def _run():
+            return moe.run(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=routing_slot,
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+            )
+
+        for _ in range(3):
+            _run()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            output = _run()
+        torch.cuda.synchronize()
+
+        for routing, label in ((routing_a, "A"), (routing_b, "B")):
+            # In-place so the captured graph sees the new routing, and any
+            # tail values written by the previous replay stay put.
+            routing_slot.copy_(routing)
+            g.replay()
+            torch.cuda.synchronize()
+
+            assert not torch.isnan(output).any(), f"NaN after replay {label}"
+            assert not torch.isinf(output).any(), f"Inf after replay {label}"
+
+            ref_output = compute_reference_moe_fp4(
+                hidden_states=tensors["x_bf16"].float().cuda(),
+                gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                gemm1_alpha=tensors["w1_alpha"],
+                gemm2_alpha=tensors["w2_alpha"],
+                token_selected_experts=routing_slot,
+                token_final_scales=tensors["token_final_scales"],
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                fc2_input_scale=tensors["fc2_input_scale"],
+                num_local_experts=num_experts,
+                local_expert_offset=0,
+            )
+            passed, percent_within, atol = check_accuracy(output, ref_output)
+            assert passed, (
+                f"replay {label}: only {percent_within * 100:.2f}% within "
+                f"tolerance (atol={atol:.4f}) -- stale tile-map tail from the "
+                f"previous replay leaked into this one"
+            )
