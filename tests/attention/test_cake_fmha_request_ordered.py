@@ -125,7 +125,9 @@ def test_request_order_plan_uses_graph_safe_fallback_for_other_lengths(
 
 def test_decode_api_exposes_order_pointer_and_host_plan_at_the_end() -> None:
     parameters = list(
-        inspect.signature(flashinfer.decode.trtllm_batch_decode_with_kv_cache).parameters
+        inspect.signature(
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache
+        ).parameters
     )
     assert parameters[-2:] == ["request_order", "request_order_plan"]
 
