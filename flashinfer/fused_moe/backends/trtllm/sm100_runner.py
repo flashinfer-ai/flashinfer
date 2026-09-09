@@ -64,6 +64,7 @@ class MoERunner(TunableRunner):
         hidden_size: int,
         intermediate_size: int,
         activation_type: int = ActivationType.Swiglu.value,
+        hidden_size_output: Optional[int] = None,
         use_shuffled_weight: bool = False,
         weight_layout: int = WeightLayout.MajorK,
         use_packed_weights: bool = False,
@@ -79,6 +80,9 @@ class MoERunner(TunableRunner):
         self.dtype_weights = dtype_weights
         self.fp8_quantization_type = fp8_quantization_type
         self.hidden_size = hidden_size
+        self.hidden_size_output = (
+            hidden_size if hidden_size_output is None else hidden_size_output
+        )
         self.intermediate_size = intermediate_size
         self.activation_type = ActivationType(activation_type)
         self.use_shuffled_weight = use_shuffled_weight
@@ -112,6 +116,7 @@ class MoERunner(TunableRunner):
             int(self.dtype_weights),
             int(self.fp8_quantization_type),
             int(self.hidden_size),
+            int(self.hidden_size_output),
             int(self.intermediate_size),
             int(self.activation_type),
             bool(self.use_shuffled_weight),
@@ -173,6 +178,7 @@ class MoERunner(TunableRunner):
             self.fp8_quantization_type,
             self.top_k + nfse,
             self.hidden_size,
+            self.hidden_size_output,
             self.intermediate_size,
             self.num_local_experts + nfse,
             self.activation_type,
@@ -212,6 +218,7 @@ class MoERunner(TunableRunner):
             self.fp8_quantization_type,
             self.top_k + self.num_fused_shared_experts,
             self.hidden_size,
+            self.hidden_size_output,
             self.intermediate_size,
             self.num_local_experts + self.num_fused_shared_experts,
             self.activation_type,
@@ -394,6 +401,8 @@ class MoERunner(TunableRunner):
                     list(da_routing_metadata),
                     list(da_body_workspace),
                     prepare_da_body,
+                    kwargs.get("valid_hidden_size"),
+                    kwargs.get("valid_intermediate_size"),
                 )
             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
@@ -513,6 +522,8 @@ class MoERunner(TunableRunner):
                 list(da_routing_metadata),
                 list(da_body_workspace),
                 prepare_da_body,
+                kwargs.get("valid_hidden_size"),
+                kwargs.get("valid_intermediate_size"),
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
@@ -560,6 +571,8 @@ class MoERunner(TunableRunner):
                 list(da_routing_metadata),
                 list(da_body_workspace),
                 prepare_da_body,
+                kwargs.get("valid_hidden_size"),
+                kwargs.get("valid_intermediate_size"),
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)

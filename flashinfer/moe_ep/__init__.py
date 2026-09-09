@@ -99,6 +99,11 @@ Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
 
+from .cake_mxfp8_megamoe_ep16 import (
+    CakeMxfp8MegaMoeEp16,
+    CakeMxfp8MegaMoeEp16Weights,
+    preprocess_cake_mxfp8_megamoe_ep16_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -163,6 +168,9 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "CakeMxfp8MegaMoeEp16",
+    "CakeMxfp8MegaMoeEp16Weights",
+    "preprocess_cake_mxfp8_megamoe_ep16_weights",
     "Bf16CutedslMegaMoeConfig",
     "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
     "CombineInputParams",
@@ -308,7 +316,7 @@ def supports_fault_tolerance(backend: str) -> bool:
 
     Rank masking needs more than the backend being present:
 
-    * ``nccl_ep`` also needs an nccl4py whose ``GroupConfig`` carries
+    * ``nccl_ep`` also needs an nccl-extensions whose ``GroupConfig`` carries
       ``enable_mask`` and a libnccl exporting the ``ncclEpMask*`` symbols.
       Both are feature-detected, never version-pinned.
     * ``nixl_ep``'s mask buffer is allocated unconditionally by

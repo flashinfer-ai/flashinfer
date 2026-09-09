@@ -346,6 +346,7 @@ def _enumerate_valid_tactics(
             Fp8QuantizationType.NoneFp8,
             top_k,
             hidden_size,
+            hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
             activation_type.value,
@@ -894,6 +895,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["dtype_weights"],
             cfg["fp8_quantization_type"],
             top_k,
+            hidden_size,
             hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
