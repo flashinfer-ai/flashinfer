@@ -122,6 +122,15 @@ scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
 It is also reachable through
 :func:`flashinfer.cake_fmha.cake_batch_decode_with_kv_cache`; the non-null
 ``causal_seqlens_kv_global`` argument is the explicit add-on selection key.
+On SM103, the same Cake entrypoint accepts a device ``request_order`` tensor
+for BF16-query, FP8-E4M3 paged decode with head dimension 256.  Precompute an
+optional immutable length-aware schedule with
+:func:`flashinfer.plan_cake_fmha_request_ordered_paged_decode` before graph
+capture.  Page-table rows must be padded to
+``4 * ceil(max_seq_len / 256)`` entries, and the exact tensor/workspace binding
+must be invoked once eagerly to initialize its TMA descriptors before capture.
+After that prewarm, changing only the order tensor contents does not require
+recapture.
 
 .. currentmodule:: flashinfer
 
@@ -130,6 +139,8 @@ It is also reachable through
 
     get_dcp_spec_workspace_size_bytes
     get_dcp_spec_counter_bytes
+    plan_cake_fmha_request_ordered_paged_decode
+    CakeFmhaRequestOrderedDecodePlan
 
 .. currentmodule:: flashinfer.decode
 

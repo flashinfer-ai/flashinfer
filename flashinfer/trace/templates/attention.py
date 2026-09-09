@@ -3280,6 +3280,12 @@ trtllm_batch_decode_trace = TraceTemplate(
             dtype="int32",
             description="Actual KV sequence length per batch entry.",
         ),
+        "request_order": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            optional=True,
+            description="Graph-stable launch-slot to logical-request mapping.",
+        ),
         "max_seq_len": Scalar(
             "int32", description="Maximum K/V sequence length in the batch."
         ),

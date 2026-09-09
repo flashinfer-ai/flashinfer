@@ -62,6 +62,12 @@ from .cake_fmha import (
     cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
 )
 from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_fmha import (
+    CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
+)
+from .cake_fmha import (
+    plan_cake_fmha_request_ordered_paged_decode as plan_cake_fmha_request_ordered_paged_decode,
+)
 from .decode import (
     BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
 )

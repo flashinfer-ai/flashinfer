@@ -3351,6 +3351,8 @@ def trtllm_batch_decode_with_kv_cache(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
+    request_order: Optional[torch.Tensor] = None,
+    request_order_plan: Optional[Any] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -3564,6 +3566,24 @@ def trtllm_batch_decode_with_kv_cache(
         ``"k_only"`` selects the optimized K-only transform cubins, and
         ``"separate_kv"`` selects the separate transformed-K/V cubins.
 
+    request_order : Optional[torch.Tensor] = None
+        Optional contiguous int32 CUDA tensor of shape ``[batch_size]`` with
+        ``request_order[launch_slot] = logical_request_index``. This is
+        supported by the SM103 Cake backend for BF16 Q/O, FP8 E4M3 HND K/V,
+        head dimension 256, page size 64, 8 query heads, 1 KV head, and
+        ``q_len_per_req`` 1 or 6. Its contents may change in place between
+        CUDA Graph replays; a null pointer preserves the existing path.
+
+    request_order_plan : Optional[CakeFmhaRequestOrderedDecodePlan] = None
+        Optional immutable plan returned by
+        :func:`flashinfer.plan_cake_fmha_request_ordered_paged_decode` before
+        graph capture. When omitted, request ordering uses a safe single-split
+        generated route. Page-table rows must be padded to
+        ``4 * ceil(max_seq_len / 256)`` entries. Run one eager invocation with
+        the exact tensors and workspace before graph capture so its TMA
+        descriptors are initialized; subsequent replays may update only the
+        contents of ``request_order`` in place.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -3572,6 +3592,12 @@ def trtllm_batch_decode_with_kv_cache(
         Only returned when ``return_lse`` is True. Shape ``[num_tokens, num_qo_heads]``
         with dtype ``torch.float32``.
     """
+    if request_order is not None and backend != "cake":
+        raise ValueError("request_order requires the explicit backend='cake'")
+    if request_order_plan is not None and request_order is None:
+        raise ValueError("request_order_plan requires a device request_order tensor")
+    if request_order is not None and causal_seqlens_kv_global is not None:
+        raise ValueError("request_order is not supported by DCP speculative decode")
     if causal_seqlens_kv_global is not None and enable_pdl is True:
         raise ValueError("DCP speculative decode does not support enable_pdl=True")
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
@@ -3938,13 +3964,6 @@ def trtllm_batch_decode_with_kv_cache(
                 )
 
         num_qo_heads = query.size(1)
-        multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-            multi_ctas_kv_counter_buffer,
-            batch_size,
-            num_qo_heads,
-            sm_count,
-            query.device,
-        )
         lse_shape = (query.size(0), num_qo_heads)
         if lse is not None:
             check_shape_dtype_device(lse, lse_shape, torch.float32, query.device, "lse")
@@ -3957,6 +3976,90 @@ def trtllm_batch_decode_with_kv_cache(
         else:
             lse_stride_tokens = 0
             lse_stride_heads = 0
+
+        if request_order is not None:
+            from .cake_fmha import (
+                CakeFmhaRequestOrderedDecodePlan,
+                _fallback_cake_fmha_request_ordered_plan,
+                _run_cake_fmha_request_ordered_paged_decode,
+            )
+
+            if q_len_per_req not in (1, 6) or cum_seq_lens_q is not None:
+                raise ValueError(
+                    "request-ordered Cake FMHA requires uniform q_len_per_req 1 or 6"
+                )
+            if (
+                kv_layout != "HND"
+                or window_left != -1
+                or mask is not None
+                or sinks is not None
+                or k_block_scales is not None
+                or v_block_scales is not None
+                or enable_block_sparse_attention
+                or skip_softmax_threshold_scale_factor not in (None, 1e-30)
+            ):
+                raise ValueError(
+                    "request-ordered Cake FMHA requires causal dense HND paging "
+                    "without masks, sinks, block scales, block sparsity, or skip-softmax"
+                )
+            if enable_pdl is not True:
+                raise ValueError("request-ordered Cake FMHA requires enable_pdl=True")
+            if o_scale is not None and float(o_scale) != 1.0:
+                raise ValueError("request-ordered Cake FMHA requires o_scale=1.0")
+            if o_sf_scale is not None or o_sf_vec_size is not None:
+                raise ValueError("request-ordered Cake FMHA requires BF16 output")
+            if bmm1_scale_log2 is None or not isinstance(bmm2_scale, torch.Tensor):
+                raise ValueError(
+                    "request-ordered Cake FMHA requires device bmm1_scale_log2 and "
+                    "bmm2_scale tensors so replay adds no scale-conversion kernel"
+                )
+            if request_order_plan is None:
+                request_order_plan = _fallback_cake_fmha_request_ordered_plan(
+                    batch_size=batch_size,
+                    q_len=q_len_per_req,
+                    write_lse=lse is not None,
+                )
+            if not isinstance(
+                request_order_plan, CakeFmhaRequestOrderedDecodePlan
+            ):
+                raise TypeError(
+                    "request_order_plan must be returned by "
+                    "plan_cake_fmha_request_ordered_paged_decode"
+                )
+            if (
+                request_order_plan.batch_size != batch_size
+                or request_order_plan.q_len != q_len_per_req
+                or request_order_plan.write_lse is not (lse is not None)
+            ):
+                raise ValueError(
+                    "request_order_plan does not match batch, q_len, or LSE mode"
+                )
+            _run_cake_fmha_request_ordered_paged_decode(
+                query=query,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                out=out,
+                lse=lse,
+                workspace_buffer=workspace_buffer,
+                completion_buffer=multi_ctas_kv_counter_buffer,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                request_order=request_order,
+                max_seq_len=max_seq_len,
+                bmm1_scale_log2=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                plan=request_order_plan,
+            )
+            return (out, lse) if return_lse else out
+
+        multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+            multi_ctas_kv_counter_buffer,
+            batch_size,
+            num_qo_heads,
+            sm_count,
+            query.device,
+        )
 
         if backend == "cake":
             from .cake_fmha import (
