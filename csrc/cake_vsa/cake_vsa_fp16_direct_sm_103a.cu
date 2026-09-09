@@ -1,3 +1,4 @@
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -5,8 +6,6 @@ typedef unsigned long long uint64_t;
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
@@ -37,9 +36,12 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_Q2K_SMEM_OFF 168960
 #define SMEM_Q2K_SMEM_STAGE_BYTES 32768
 #define SMEM_Q2K_SMEM_STRIDE 32768
-#define SMEM_KV_FP8_SMEM_OFF 185344
-#define SMEM_KV_FP8_SMEM_STAGE_BYTES 16384
-#define SMEM_KV_FP8_SMEM_STRIDE 16384
+#define SMEM_KV_QUANT_SMEM_OFF 185344
+#define SMEM_KV_QUANT_SMEM_STAGE_BYTES 16384
+#define SMEM_KV_QUANT_SMEM_STRIDE 16384
+#define SMEM_KV_NVFP4_SCALE_SMEM_OFF 200704
+#define SMEM_KV_NVFP4_SCALE_SMEM_STAGE_BYTES 1024
+#define SMEM_KV_NVFP4_SCALE_SMEM_STRIDE 1024
 #define SMEM_TOTAL 201728
 #define THREADS 512
 
@@ -478,6 +480,17 @@ __device__ __forceinline__ uint64_t make_smem_desc(int addr) {
 }
 
 
+__device__ __forceinline__ void tma_3d_gmem2smem(
+    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cta.global"
+        ".mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3, %4}], [%5];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+           "r"(mbar_addr) : "memory");
+}
+
+
 __device__ __forceinline__ void tma_4d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
     asm volatile(
@@ -507,7 +520,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap const* k, CakeTensorMap const* v, __half* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int total_q, int num_q_heads, int num_kv_heads, int topk, int batch_size, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
+kernel_minimax_sparse_prefill_union_sm100(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap k_scale, const __grid_constant__ CUtensorMap v, const __grid_constant__ CUtensorMap v_scale, __half* __restrict__ out, float* __restrict__ lse, float* __restrict__ temperature_lse, int* __restrict__ q2k_indices, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int total_q, int num_q_heads, int num_kv_heads, int topk, int batch_size, int uniform_q_len, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float k_global_scale, float v_global_scale, float lse_temperature_scale, int return_softmax_lse, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -519,13 +532,6 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(q)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(k)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(v)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     float* scale_smem = reinterpret_cast<float*>(smem_raw + 1024);
@@ -540,11 +546,13 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
     const int v_smem_addr = smem + 70656;
     int* q2k_smem = reinterpret_cast<int*>(smem_raw + 168960);
     const int q2k_smem_addr = smem + 168960;
-    uint8_t* kv_fp8_smem = reinterpret_cast<uint8_t*>(smem_raw + 185344);
-    const int kv_fp8_smem_addr = smem + 185344;
+    uint8_t* kv_quant_smem = reinterpret_cast<uint8_t*>(smem_raw + 185344);
+    const int kv_quant_smem_addr = smem + 185344;
+    uint8_t* kv_nvfp4_scale_smem = reinterpret_cast<uint8_t*>(smem_raw + 200704);
+    const int kv_nvfp4_scale_smem_addr = smem + 200704;
 
-    // Mbarrier init (13 groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (15 groups, 30 barriers)
+    // Mbarriers at smem_raw[0..240)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -563,30 +571,38 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
             mbarrier_init(smem + 64, 1);
-            // kv_src_full: 1 barriers, init_count=1
+            // v_full: 3 barriers, init_count=1
             mbarrier_init(smem + 72, 1);
-            // kv_src_empty: 1 barriers, init_count=1
             mbarrier_init(smem + 80, 1);
-            // s_full: 2 barriers, init_count=1
             mbarrier_init(smem + 88, 1);
+            // v_empty: 3 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
+            mbarrier_init(smem + 104, 1);
+            mbarrier_init(smem + 112, 1);
+            // kv_src_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 120, 1);
+            // kv_src_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 128, 1);
+            // s_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 136, 1);
+            mbarrier_init(smem + 144, 1);
             // p_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 104, 256);
-            mbarrier_init(smem + 112, 256);
+            mbarrier_init(smem + 152, 256);
+            mbarrier_init(smem + 160, 256);
             // p_full_tail: 2 barriers, init_count=128
-            mbarrier_init(smem + 120, 128);
-            mbarrier_init(smem + 128, 128);
+            mbarrier_init(smem + 168, 128);
+            mbarrier_init(smem + 176, 128);
             // corr_sig: 2 barriers, init_count=128
-            mbarrier_init(smem + 136, 128);
-            mbarrier_init(smem + 144, 128);
-            // corr_done: 2 barriers, init_count=128
-            mbarrier_init(smem + 152, 128);
-            mbarrier_init(smem + 160, 128);
-            // o_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 168, 1);
-            mbarrier_init(smem + 176, 1);
-            // tmem_dealloc: 1 barriers, init_count=128
             mbarrier_init(smem + 184, 128);
+            mbarrier_init(smem + 192, 128);
+            // corr_done: 2 barriers, init_count=128
+            mbarrier_init(smem + 200, 128);
+            mbarrier_init(smem + 208, 128);
+            // o_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 224, 1);
+            // tmem_dealloc: 1 barriers, init_count=128
+            mbarrier_init(smem + 232, 128);
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
     }
@@ -594,9 +610,9 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 240);
     if (warp == 0) {
-        int _tmem_hold = smem + 192;
+        int _tmem_hold = smem + 240;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -609,15 +625,17 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
     #define q2k_full_addr (mbar_base + 16)
     #define kv_full_addr (mbar_base + 24)
     #define kv_empty_addr (mbar_base + 48)
-    #define kv_src_full_addr (mbar_base + 72)
-    #define kv_src_empty_addr (mbar_base + 80)
-    #define s_full_addr (mbar_base + 88)
-    #define p_full_addr (mbar_base + 104)
-    #define p_full_tail_addr (mbar_base + 120)
-    #define corr_sig_addr (mbar_base + 136)
-    #define corr_done_addr (mbar_base + 152)
-    #define o_full_addr (mbar_base + 168)
-    #define tmem_dealloc_addr (mbar_base + 184)
+    #define v_full_addr (mbar_base + 72)
+    #define v_empty_addr (mbar_base + 96)
+    #define kv_src_full_addr (mbar_base + 120)
+    #define kv_src_empty_addr (mbar_base + 128)
+    #define s_full_addr (mbar_base + 136)
+    #define p_full_addr (mbar_base + 152)
+    #define p_full_tail_addr (mbar_base + 168)
+    #define corr_sig_addr (mbar_base + 184)
+    #define corr_done_addr (mbar_base + 200)
+    #define o_full_addr (mbar_base + 216)
+    #define tmem_dealloc_addr (mbar_base + 232)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -641,16 +659,29 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             int q_tile = 0;
             int tile_prefix = 0;
             int tile_active = 0;
-            for (int candidate_batch = 0; candidate_batch < batch_size; candidate_batch++) {
-                int candidate_q_begin = cu_seqlens_q[candidate_batch];
-                int candidate_q_len = cu_seqlens_q[candidate_batch + 1] - candidate_q_begin;
-                int candidate_tiles = (candidate_q_len + 256 - 1) / 256;
-                if (linear_tile >= tile_prefix && linear_tile < tile_prefix + candidate_tiles) {
-                    batch = candidate_batch;
-                    q_tile = linear_tile - tile_prefix;
+            const int tile_size = 256;
+            if (uniform_q_len > 0) {
+                int uniform_tiles = (uniform_q_len + tile_size - 1) / tile_size;
+                batch = linear_tile / uniform_tiles;
+                q_tile = linear_tile - batch * uniform_tiles;
+                if (batch < batch_size) {
                     tile_active = 1;
                 }
-                tile_prefix = tile_prefix + candidate_tiles;
+                if (tile_active == 0) {
+                    batch = 0;
+                }
+            } else {
+                for (int candidate_batch = 0; candidate_batch < batch_size; candidate_batch++) {
+                    int candidate_q_begin = cu_seqlens_q[candidate_batch];
+                    int candidate_q_len = cu_seqlens_q[candidate_batch + 1] - candidate_q_begin;
+                    int candidate_tiles = (candidate_q_len + tile_size - 1) / tile_size;
+                    if (linear_tile >= tile_prefix && linear_tile < tile_prefix + candidate_tiles) {
+                        batch = candidate_batch;
+                        q_tile = linear_tile - tile_prefix;
+                        tile_active = 1;
+                    }
+                    tile_prefix = tile_prefix + candidate_tiles;
+                }
             }
             int work_head = blockIdx.y;
             int group_size = num_q_heads / num_kv_heads;
@@ -711,6 +742,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             float row_sum = 0.0f;
             float temperature_sum = 0.0f;
             unsigned int selection_mask = 0;
+            unsigned int selection_mask_high = 0;
             unsigned int _phase_q2k_full_0 = 0;
             mbarrier_wait(q2k_full_addr, _phase_q2k_full_0);
             _phase_q2k_full_0 ^= 1;
@@ -725,6 +757,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     }
                 }
             }
+            int folded_valid_limit = kv_len;
             unsigned int _phase_s_full = 0;
             unsigned int _phase_corr_done = 0;
             #pragma unroll 1
@@ -734,27 +767,31 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 _phase_s_full ^= 1;
                 int selected = 0;
                 if (row_valid != 0) {
-                    if (num_n_blocks <= 32) {
-                        selected = (int)((selection_mask & (unsigned int)1 << (unsigned int)n_block) != 0);
-                    } else {
-                        #pragma unroll 1
-                        for (int slot_1 = 0; slot_1 < topk; slot_1++) {
-                            selected = selected | (int)(q2k_smem[slot_1 * selection_rows + query_in_tile] == n_block);
+                    {
+                        if (num_n_blocks <= 32) {
+                            selected = (int)((selection_mask & (unsigned int)1 << (unsigned int)n_block) != 0);
+                        } else {
+                            #pragma unroll 1
+                            for (int slot_1 = 0; slot_1 < topk; slot_1++) {
+                                selected = selected | (int)(q2k_smem[slot_1 * selection_rows + query_in_tile] == n_block);
+                            }
                         }
                     }
                 }
                 int valid_cols = 0;
                 if (selected != 0) {
-                    valid_cols = kv_len - n_block * 128;
+                    {
+                        valid_cols = kv_len - n_block * 128;
+                        if (causal != 0) {
+                            int query_position = query_offset + q_local_base + query_in_tile;
+                            int causal_cols = query_position - n_block * 128 + 1;
+                            if (valid_cols > causal_cols) {
+                                valid_cols = causal_cols;
+                            }
+                        }
+                    }
                     if (valid_cols > 128) {
                         valid_cols = 128;
-                    }
-                    if (causal != 0) {
-                        int query_position = query_offset + q_local_base + query_in_tile;
-                        int causal_cols = query_position - n_block * 128 + 1;
-                        if (valid_cols > causal_cols) {
-                            valid_cols = causal_cols;
-                        }
                     }
                     if (valid_cols < 0) {
                         valid_cols = 0;
@@ -766,8 +803,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
                     : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31]), "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
-                    : "r"(score_base)
-                    : "memory");
+                    : "r"(score_base));
                 int body_valid = valid_cols;
                 if (body_valid < 0) {
                     body_valid = 0;
@@ -821,13 +857,12 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
                     : "=f"(_tmem_load_1[0]), "=f"(_tmem_load_1[1]), "=f"(_tmem_load_1[2]), "=f"(_tmem_load_1[3]), "=f"(_tmem_load_1[4]), "=f"(_tmem_load_1[5]), "=f"(_tmem_load_1[6]), "=f"(_tmem_load_1[7]), "=f"(_tmem_load_1[8]), "=f"(_tmem_load_1[9]), "=f"(_tmem_load_1[10]), "=f"(_tmem_load_1[11]), "=f"(_tmem_load_1[12]), "=f"(_tmem_load_1[13]), "=f"(_tmem_load_1[14]), "=f"(_tmem_load_1[15]), "=f"(_tmem_load_1[16]), "=f"(_tmem_load_1[17]), "=f"(_tmem_load_1[18]), "=f"(_tmem_load_1[19]), "=f"(_tmem_load_1[20]), "=f"(_tmem_load_1[21]), "=f"(_tmem_load_1[22]), "=f"(_tmem_load_1[23]), "=f"(_tmem_load_1[24]), "=f"(_tmem_load_1[25]), "=f"(_tmem_load_1[26]), "=f"(_tmem_load_1[27]), "=f"(_tmem_load_1[28]), "=f"(_tmem_load_1[29]), "=f"(_tmem_load_1[30]), "=f"(_tmem_load_1[31]), "=f"(_tmem_load_1[32]), "=f"(_tmem_load_1[33]), "=f"(_tmem_load_1[34]), "=f"(_tmem_load_1[35]), "=f"(_tmem_load_1[36]), "=f"(_tmem_load_1[37]), "=f"(_tmem_load_1[38]), "=f"(_tmem_load_1[39]), "=f"(_tmem_load_1[40]), "=f"(_tmem_load_1[41]), "=f"(_tmem_load_1[42]), "=f"(_tmem_load_1[43]), "=f"(_tmem_load_1[44]), "=f"(_tmem_load_1[45]), "=f"(_tmem_load_1[46]), "=f"(_tmem_load_1[47]), "=f"(_tmem_load_1[48]), "=f"(_tmem_load_1[49]), "=f"(_tmem_load_1[50]), "=f"(_tmem_load_1[51]), "=f"(_tmem_load_1[52]), "=f"(_tmem_load_1[53]), "=f"(_tmem_load_1[54]), "=f"(_tmem_load_1[55]), "=f"(_tmem_load_1[56]), "=f"(_tmem_load_1[57]), "=f"(_tmem_load_1[58]), "=f"(_tmem_load_1[59]), "=f"(_tmem_load_1[60]), "=f"(_tmem_load_1[61]), "=f"(_tmem_load_1[62]), "=f"(_tmem_load_1[63])
-                    : "r"(score_base + 64)
-                    : "memory");
+                    : "r"(score_base + 64));
                 int tail_valid = valid_cols - 64;
                 if (tail_valid < 0) {
                     tail_valid = 0;
                 }
-                if (tail_valid > 0 && tail_valid < 64) {
+                if (valid_cols > 0 && tail_valid < 64) {
                     uint32_t _slice_lo_mask_2;
                     {
                         int _lim_5 = tail_valid;
@@ -936,9 +971,8 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                         "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
                         : "=f"(_tmem_load_2[0]), "=f"(_tmem_load_2[1]), "=f"(_tmem_load_2[2]), "=f"(_tmem_load_2[3]), "=f"(_tmem_load_2[4]), "=f"(_tmem_load_2[5]), "=f"(_tmem_load_2[6]), "=f"(_tmem_load_2[7]), "=f"(_tmem_load_2[8]), "=f"(_tmem_load_2[9]), "=f"(_tmem_load_2[10]), "=f"(_tmem_load_2[11]), "=f"(_tmem_load_2[12]), "=f"(_tmem_load_2[13]), "=f"(_tmem_load_2[14]), "=f"(_tmem_load_2[15]), "=f"(_tmem_load_2[16]), "=f"(_tmem_load_2[17]), "=f"(_tmem_load_2[18]), "=f"(_tmem_load_2[19]), "=f"(_tmem_load_2[20]), "=f"(_tmem_load_2[21]), "=f"(_tmem_load_2[22]), "=f"(_tmem_load_2[23]), "=f"(_tmem_load_2[24]), "=f"(_tmem_load_2[25]), "=f"(_tmem_load_2[26]), "=f"(_tmem_load_2[27]), "=f"(_tmem_load_2[28]), "=f"(_tmem_load_2[29]), "=f"(_tmem_load_2[30]), "=f"(_tmem_load_2[31]), "=f"(_tmem_load_2[32]), "=f"(_tmem_load_2[33]), "=f"(_tmem_load_2[34]), "=f"(_tmem_load_2[35]), "=f"(_tmem_load_2[36]), "=f"(_tmem_load_2[37]), "=f"(_tmem_load_2[38]), "=f"(_tmem_load_2[39]), "=f"(_tmem_load_2[40]), "=f"(_tmem_load_2[41]), "=f"(_tmem_load_2[42]), "=f"(_tmem_load_2[43]), "=f"(_tmem_load_2[44]), "=f"(_tmem_load_2[45]), "=f"(_tmem_load_2[46]), "=f"(_tmem_load_2[47]), "=f"(_tmem_load_2[48]), "=f"(_tmem_load_2[49]), "=f"(_tmem_load_2[50]), "=f"(_tmem_load_2[51]), "=f"(_tmem_load_2[52]), "=f"(_tmem_load_2[53]), "=f"(_tmem_load_2[54]), "=f"(_tmem_load_2[55]), "=f"(_tmem_load_2[56]), "=f"(_tmem_load_2[57]), "=f"(_tmem_load_2[58]), "=f"(_tmem_load_2[59]), "=f"(_tmem_load_2[60]), "=f"(_tmem_load_2[61]), "=f"(_tmem_load_2[62]), "=f"(_tmem_load_2[63])
-                        : "r"(score_base + 64)
-                        : "memory");
-                    if (tail_valid > 0 && tail_valid < 64) {
+                        : "r"(score_base + 64));
+                    if (valid_cols > 0 && tail_valid < 64) {
                         uint32_t _slice_lo_mask_4;
                         {
                             int _lim_16 = tail_valid;
@@ -990,15 +1024,13 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                        :: "r"(p_base + 32), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[15]))
-                        : "memory");
+                        :: "r"(p_base + 32), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16[15])));
                     float _tmem_load_3[64];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
                         : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31]), "=f"(_tmem_load_3[32]), "=f"(_tmem_load_3[33]), "=f"(_tmem_load_3[34]), "=f"(_tmem_load_3[35]), "=f"(_tmem_load_3[36]), "=f"(_tmem_load_3[37]), "=f"(_tmem_load_3[38]), "=f"(_tmem_load_3[39]), "=f"(_tmem_load_3[40]), "=f"(_tmem_load_3[41]), "=f"(_tmem_load_3[42]), "=f"(_tmem_load_3[43]), "=f"(_tmem_load_3[44]), "=f"(_tmem_load_3[45]), "=f"(_tmem_load_3[46]), "=f"(_tmem_load_3[47]), "=f"(_tmem_load_3[48]), "=f"(_tmem_load_3[49]), "=f"(_tmem_load_3[50]), "=f"(_tmem_load_3[51]), "=f"(_tmem_load_3[52]), "=f"(_tmem_load_3[53]), "=f"(_tmem_load_3[54]), "=f"(_tmem_load_3[55]), "=f"(_tmem_load_3[56]), "=f"(_tmem_load_3[57]), "=f"(_tmem_load_3[58]), "=f"(_tmem_load_3[59]), "=f"(_tmem_load_3[60]), "=f"(_tmem_load_3[61]), "=f"(_tmem_load_3[62]), "=f"(_tmem_load_3[63])
-                        : "r"(score_base)
-                        : "memory");
+                        : "r"(score_base));
                     if (body_valid > 0 && body_valid < 64) {
                         uint32_t _slice_lo_mask_6;
                         {
@@ -1052,8 +1084,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x32.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
-                        :: "r"(p_base), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[31]))
-                        : "memory");
+                        :: "r"(p_base), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_3_f16[31])));
                     float2 _reg_reduce_sum2_28 = make_float2(0.0f, 0.0f);
                     softmax_block_sum(&_tmem_load_3[0], &_reg_reduce_sum2_28);
                     softmax_block_sum(&_tmem_load_3[32], &_reg_reduce_sum2_28);
@@ -1072,8 +1103,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                        :: "r"(p_base + 48), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[15]))
-                        : "memory");
+                        :: "r"(p_base + 48), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_2_f16_1[15])));
                     float2 _reg_reduce_sum2_29 = make_float2(0.0f, 0.0f);
                     softmax_block_sum(&_tmem_load_2[0], &_reg_reduce_sum2_29);
                     softmax_block_sum(&_tmem_load_2[32], &_reg_reduce_sum2_29);
@@ -1098,8 +1128,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                        :: "r"(p_base + 32), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[15]))
-                        : "memory");
+                        :: "r"(p_base + 32), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16[15])));
                     const float2 _fma_b2_32 = {softmax_scale_log2, softmax_scale_log2};
                     const float2 _fma_c2_33 = {score_bias, score_bias};
                     #pragma unroll
@@ -1117,8 +1146,9 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x32.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
-                        :: "r"(p_base), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[31]))
-                        : "memory");
+                        :: "r"(p_base), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[15])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[16])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[17])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[18])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[19])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[20])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[21])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[22])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[23])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[24])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[25])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[26])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[27])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[28])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[29])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[30])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_0_f16[31])));
+                    float _fma_1 = __fmaf_rn(row_sum, acc_scale, _tmem_load_0[0]);
+                    _tmem_load_0[0] = _fma_1;
                     float2 _reg_reduce_sum2_34 = make_float2(0.0f, 0.0f);
                     softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_34);
                     softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_34);
@@ -1137,8 +1167,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                        :: "r"(p_base + 48), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[15]))
-                        : "memory");
+                        :: "r"(p_base + 48), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_f16_1[15])));
                     float2 _reg_reduce_sum2_35 = make_float2(0.0f, 0.0f);
                     softmax_block_sum(&_tmem_load_1[0], &_reg_reduce_sum2_35);
                     softmax_block_sum(&_tmem_load_1[32], &_reg_reduce_sum2_35);
@@ -1149,9 +1178,11 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 }
                 mbarrier_wait(corr_done_addr + (stage) * 8, _phase_corr_done);
                 _phase_corr_done ^= 1;
-                row_sum = row_sum * acc_scale + block_sum;
                 if (return_temperature_lse != 0) {
+                    row_sum = row_sum * acc_scale + block_sum;
                     temperature_sum = temperature_sum * temperature_acc_scale + block_temperature_sum;
+                } else {
+                    row_sum = block_sum;
                 }
             }
             scale_smem[256 + stage_offset + my_row] = row_sum;
@@ -1169,16 +1200,29 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             int q_tile_1 = 0;
             int tile_prefix_1 = 0;
             int tile_active_1 = 0;
-            for (int candidate_batch_1 = 0; candidate_batch_1 < batch_size; candidate_batch_1++) {
-                int candidate_q_begin_1 = cu_seqlens_q[candidate_batch_1];
-                int candidate_q_len_1 = cu_seqlens_q[candidate_batch_1 + 1] - candidate_q_begin_1;
-                int candidate_tiles_1 = (candidate_q_len_1 + 256 - 1) / 256;
-                if (linear_tile_1 >= tile_prefix_1 && linear_tile_1 < tile_prefix_1 + candidate_tiles_1) {
-                    batch_1 = candidate_batch_1;
-                    q_tile_1 = linear_tile_1 - tile_prefix_1;
+            const int tile_size_1 = 256;
+            if (uniform_q_len > 0) {
+                int uniform_tiles_1 = (uniform_q_len + tile_size_1 - 1) / tile_size_1;
+                batch_1 = linear_tile_1 / uniform_tiles_1;
+                q_tile_1 = linear_tile_1 - batch_1 * uniform_tiles_1;
+                if (batch_1 < batch_size) {
                     tile_active_1 = 1;
                 }
-                tile_prefix_1 = tile_prefix_1 + candidate_tiles_1;
+                if (tile_active_1 == 0) {
+                    batch_1 = 0;
+                }
+            } else {
+                for (int candidate_batch_1 = 0; candidate_batch_1 < batch_size; candidate_batch_1++) {
+                    int candidate_q_begin_1 = cu_seqlens_q[candidate_batch_1];
+                    int candidate_q_len_1 = cu_seqlens_q[candidate_batch_1 + 1] - candidate_q_begin_1;
+                    int candidate_tiles_1 = (candidate_q_len_1 + tile_size_1 - 1) / tile_size_1;
+                    if (linear_tile_1 >= tile_prefix_1 && linear_tile_1 < tile_prefix_1 + candidate_tiles_1) {
+                        batch_1 = candidate_batch_1;
+                        q_tile_1 = linear_tile_1 - tile_prefix_1;
+                        tile_active_1 = 1;
+                    }
+                    tile_prefix_1 = tile_prefix_1 + candidate_tiles_1;
+                }
             }
             int work_head_1 = blockIdx.y;
             int group_size_1 = num_q_heads / num_kv_heads;
@@ -1304,7 +1348,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 if (stage_valid_1 < 0) {
                     stage_valid_1 = 0;
                 }
-                int output_row = (query * num_q_heads + output_head) * 128;
+                long long output_row = ((long long)query * (long long)num_q_heads + (long long)output_head) * 128;
                 #pragma unroll
                 for (int col_2 = 0; col_2 < 8; col_2++) {
                     float _tmem_load_6[16];
@@ -1330,8 +1374,8 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                             _pk[5] = __floats2half2_rn(_tmem_load_6[0 + 10], _tmem_load_6[0 + 11]);
                             _pk[6] = __floats2half2_rn(_tmem_load_6[0 + 12], _tmem_load_6[0 + 13]);
                             _pk[7] = __floats2half2_rn(_tmem_load_6[0 + 14], _tmem_load_6[0 + 15]);
-                            *reinterpret_cast<uint4*>(&((__half*)(out + (output_row + col_2 * 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                            *reinterpret_cast<uint4*>(&((__half*)(out + (output_row + col_2 * 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                            *reinterpret_cast<uint4*>(&((__half*)(out + (output_row + (long long)(col_2 * 16))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            *reinterpret_cast<uint4*>(&((__half*)(out + (output_row + (long long)(col_2 * 16))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
                         }
                     }
                 }
@@ -1360,16 +1404,29 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             int q_tile_2 = 0;
             int tile_prefix_2 = 0;
             int tile_active_2 = 0;
-            for (int candidate_batch_2 = 0; candidate_batch_2 < batch_size; candidate_batch_2++) {
-                int candidate_q_begin_2 = cu_seqlens_q[candidate_batch_2];
-                int candidate_q_len_2 = cu_seqlens_q[candidate_batch_2 + 1] - candidate_q_begin_2;
-                int candidate_tiles_2 = (candidate_q_len_2 + 256 - 1) / 256;
-                if (linear_tile_2 >= tile_prefix_2 && linear_tile_2 < tile_prefix_2 + candidate_tiles_2) {
-                    batch_2 = candidate_batch_2;
-                    q_tile_2 = linear_tile_2 - tile_prefix_2;
+            const int tile_size_2 = 256;
+            if (uniform_q_len > 0) {
+                int uniform_tiles_2 = (uniform_q_len + tile_size_2 - 1) / tile_size_2;
+                batch_2 = linear_tile_2 / uniform_tiles_2;
+                q_tile_2 = linear_tile_2 - batch_2 * uniform_tiles_2;
+                if (batch_2 < batch_size) {
                     tile_active_2 = 1;
                 }
-                tile_prefix_2 = tile_prefix_2 + candidate_tiles_2;
+                if (tile_active_2 == 0) {
+                    batch_2 = 0;
+                }
+            } else {
+                for (int candidate_batch_2 = 0; candidate_batch_2 < batch_size; candidate_batch_2++) {
+                    int candidate_q_begin_2 = cu_seqlens_q[candidate_batch_2];
+                    int candidate_q_len_2 = cu_seqlens_q[candidate_batch_2 + 1] - candidate_q_begin_2;
+                    int candidate_tiles_2 = (candidate_q_len_2 + tile_size_2 - 1) / tile_size_2;
+                    if (linear_tile_2 >= tile_prefix_2 && linear_tile_2 < tile_prefix_2 + candidate_tiles_2) {
+                        batch_2 = candidate_batch_2;
+                        q_tile_2 = linear_tile_2 - tile_prefix_2;
+                        tile_active_2 = 1;
+                    }
+                    tile_prefix_2 = tile_prefix_2 + candidate_tiles_2;
+                }
             }
             int work_head_2 = blockIdx.y;
             int group_size_2 = num_q_heads / num_kv_heads;
@@ -1544,16 +1601,20 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             for (int __1 = 0; __1 < num_n_blocks_2 - 1; __1++) {
                 unsigned int v_stage = kv_stage;
                 unsigned int v_phase = kv_phase;
-                kv_stage += 1;
-                if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
-                mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
+                {
+                    kv_stage += 1;
+                    if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+                }
+                {
+                    mbarrier_wait(kv_full_addr + (v_stage) * 8, v_phase);
+                }
                 mbarrier_wait(p_full_addr, _phase_p_full_0);
                 _phase_p_full_0 ^= 1;
                 int _mma_b_lo_2 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 2048);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1561,24 +1622,30 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output0), "r"(_mma_b_lo_2), "r"(tmem_scores0 + 64), "r"(((first_pv) ? 0 : 1)));
                 mbarrier_wait(p_full_tail_addr, _phase_p_full_tail_0);
@@ -1587,7 +1654,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1595,12 +1662,14 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "add.u32 ta, %2, 48;\n\t"
                     "add.u32 blo, %1, 768;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output0), "r"(_mma_b_lo_3), "r"(tmem_scores0 + 64), "r"(1));
                 unsigned int k_stage = kv_stage;
@@ -1671,7 +1740,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1679,24 +1748,30 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output1), "r"(_mma_b_lo_5), "r"(tmem_scores1 + 64), "r"(((first_pv) ? 0 : 1)));
                 mbarrier_wait(p_full_tail_addr + 8, _phase_p_full_tail_1);
@@ -1705,7 +1780,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1713,15 +1788,19 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "add.u32 ta, %2, 48;\n\t"
                     "add.u32 blo, %1, 768;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output1), "r"(_mma_b_lo_6), "r"(tmem_scores1 + 64), "r"(1));
-                elect_commit(kv_empty_addr + (v_stage) * 8);
+                {
+                    elect_commit(kv_empty_addr + (v_stage) * 8);
+                }
                 int _mma_a_lo_7 = make_warp_uniform(((q1_smem_addr) >> 4) & 0x3FFF);
                 int _mma_b_lo_7 = make_warp_uniform((((kv_smem_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
                 asm volatile(
@@ -1782,14 +1861,16 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                 elect_commit(kv_empty_addr + (k_stage) * 8);
                 first_pv = 0;
             }
-            mbarrier_wait(kv_full_addr + (kv_stage) * 8, kv_phase);
+            {
+                mbarrier_wait(kv_full_addr + (kv_stage) * 8, kv_phase);
+            }
             mbarrier_wait(p_full_addr, _phase_p_full_0);
             _phase_p_full_0 ^= 1;
             int _mma_b_lo_8 = make_warp_uniform(((((v_smem_addr) >> 4) & 0x3FFF) | 0x4000000) + (kv_stage) * 2048);
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1797,24 +1878,30 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output0), "r"(_mma_b_lo_8), "r"(tmem_scores0 + 64), "r"(((first_pv) ? 0 : 1)));
             mbarrier_wait(p_full_tail_addr, _phase_p_full_tail_0);
@@ -1823,7 +1910,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1831,12 +1918,14 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "add.u32 ta, %2, 48;\n\t"
                     "add.u32 blo, %1, 768;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output0), "r"(_mma_b_lo_9), "r"(tmem_scores0 + 64), "r"(1));
             mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
@@ -1845,7 +1934,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1853,24 +1942,30 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 24], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 32], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 40], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output1), "r"(_mma_b_lo_10), "r"(tmem_scores1 + 64), "r"(((first_pv) ? 0 : 1)));
             mbarrier_wait(p_full_tail_addr + 8, _phase_p_full_tail_1);
@@ -1879,7 +1974,7 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -1887,15 +1982,19 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "add.u32 ta, %2, 48;\n\t"
                     "add.u32 blo, %1, 768;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 48], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%2 + 56], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output1), "r"(_mma_b_lo_11), "r"(tmem_scores1 + 64), "r"(1));
-            elect_commit(kv_empty_addr + (kv_stage) * 8);
+            {
+                elect_commit(kv_empty_addr + (kv_stage) * 8);
+            }
             elect_commit2(o_full_addr, o_full_addr + 8);
             unsigned int _phase_tmem_dealloc_0 = 0;
             mbarrier_wait(tmem_dealloc_addr, _phase_tmem_dealloc_0);
@@ -1912,16 +2011,29 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             int q_tile_3 = 0;
             int tile_prefix_3 = 0;
             int tile_active_3 = 0;
-            for (int candidate_batch_3 = 0; candidate_batch_3 < batch_size; candidate_batch_3++) {
-                int candidate_q_begin_3 = cu_seqlens_q[candidate_batch_3];
-                int candidate_q_len_3 = cu_seqlens_q[candidate_batch_3 + 1] - candidate_q_begin_3;
-                int candidate_tiles_3 = (candidate_q_len_3 + 256 - 1) / 256;
-                if (linear_tile_3 >= tile_prefix_3 && linear_tile_3 < tile_prefix_3 + candidate_tiles_3) {
-                    batch_3 = candidate_batch_3;
-                    q_tile_3 = linear_tile_3 - tile_prefix_3;
+            const int tile_size_3 = 256;
+            if (uniform_q_len > 0) {
+                int uniform_tiles_3 = (uniform_q_len + tile_size_3 - 1) / tile_size_3;
+                batch_3 = linear_tile_3 / uniform_tiles_3;
+                q_tile_3 = linear_tile_3 - batch_3 * uniform_tiles_3;
+                if (batch_3 < batch_size) {
                     tile_active_3 = 1;
                 }
-                tile_prefix_3 = tile_prefix_3 + candidate_tiles_3;
+                if (tile_active_3 == 0) {
+                    batch_3 = 0;
+                }
+            } else {
+                for (int candidate_batch_3 = 0; candidate_batch_3 < batch_size; candidate_batch_3++) {
+                    int candidate_q_begin_3 = cu_seqlens_q[candidate_batch_3];
+                    int candidate_q_len_3 = cu_seqlens_q[candidate_batch_3 + 1] - candidate_q_begin_3;
+                    int candidate_tiles_3 = (candidate_q_len_3 + tile_size_3 - 1) / tile_size_3;
+                    if (linear_tile_3 >= tile_prefix_3 && linear_tile_3 < tile_prefix_3 + candidate_tiles_3) {
+                        batch_3 = candidate_batch_3;
+                        q_tile_3 = linear_tile_3 - tile_prefix_3;
+                        tile_active_3 = 1;
+                    }
+                    tile_prefix_3 = tile_prefix_3 + candidate_tiles_3;
+                }
             }
             int work_head_3 = blockIdx.y;
             int group_size_3 = num_q_heads / num_kv_heads;
@@ -1961,6 +2073,16 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             if (q_valid_3 == 0 || num_n_blocks_3 <= 0) {
                 num_n_blocks_3 = 1;
             }
+            if (elect_sync()) {
+                mbarrier_arrive_expect_tx(q_full_addr, 32768);
+                {
+                    tma_4d_gmem2smem(q0_smem_addr, (&q), 0, query_base_3, q_head_3, 0, q_full_addr);
+                }
+                mbarrier_arrive_expect_tx(q_full_addr + 8, 32768);
+                {
+                    tma_4d_gmem2smem(q1_smem_addr, (&q), 0, query_base_3 + 128, q_head_3, 0, q_full_addr + 8);
+                }
+            }
             int selection_base = (kv_head_3 * total_q + query_base_3) * topk;
             int selection_elems = q_valid_3 * topk;
             const int selection_rows_1 = 256;
@@ -1984,16 +2106,6 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
             asm volatile("barrier.sync 8, 32;" ::: "memory");
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             mbarrier_arrive(q2k_full_addr);
-            if (elect_sync()) {
-                mbarrier_arrive_expect_tx(q_full_addr, 32768);
-                {
-                    tma_4d_gmem2smem(q0_smem_addr, q, 0, query_base_3, q_head_3, 0, q_full_addr);
-                }
-                mbarrier_arrive_expect_tx(q_full_addr + 8, 32768);
-                {
-                    tma_4d_gmem2smem(q1_smem_addr, q, 0, query_base_3 + 128, q_head_3, 0, q_full_addr + 8);
-                }
-            }
             unsigned int load_stage = 0;
             unsigned int kv_src_empty_phase = 1;
             unsigned int _phase_kv_empty = 1;
@@ -2008,35 +2120,39 @@ kernel_minimax_sparse_prefill_union_sm100(CakeTensorMap const* q, CakeTensorMap 
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
                         int token0 = token_base;
                         int token1 = token_base + 64;
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768, k, 0, token0, 0, page_head, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 8192, k, 0, token1, 0, page_head, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 16384, k, 0, token0, 1, page_head, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 24576, k, 0, token1, 1, page_head, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768, (&k), 0, token0, 0, page_head, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 8192, (&k), 0, token1, 0, page_head, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 16384, (&k), 0, token0, 1, page_head, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 32768 + 24576, (&k), 0, token1, 1, page_head, kv_full_addr + (load_stage) * 8);
                     }
                 }
                 load_stage += 1;
                 if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
                 {
-                    mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
-                    if (elect_sync()) {
-                        mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
-                        int token0_1 = token_base;
-                        int token1_1 = token_base + 64;
-                        tma_4d_gmem2smem(v_smem_addr + load_stage * 32768, v, 0, token0_1, 0, page_head, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 8192, v, 0, token1_1, 0, page_head, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 16384, v, 0, token0_1, 1, page_head, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 24576, v, 0, token1_1, 1, page_head, kv_full_addr + (load_stage) * 8);
+                    {
+                        mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 32768);
+                            int token0_1 = token_base;
+                            int token1_1 = token_base + 64;
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768, (&v), 0, token0_1, 0, page_head, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 8192, (&v), 0, token1_1, 0, page_head, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 16384, (&v), 0, token0_1, 1, page_head, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 32768 + 24576, (&v), 0, token1_1, 1, page_head, kv_full_addr + (load_stage) * 8);
+                        }
                     }
                 }
-                load_stage += 1;
-                if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
+                {
+                    load_stage += 1;
+                    if (load_stage == 3) { load_stage = 0; _phase_kv_empty ^= 1; }
+                }
             }
         }
     }
     // ---- Role: transform ----
     if (warp == 13 || warp == 15) {
         { // transform_main
-
+            unsigned int _phase_v_empty = 1;
         }
     }
 

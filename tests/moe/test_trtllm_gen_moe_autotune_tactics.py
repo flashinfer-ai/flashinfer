@@ -335,6 +335,7 @@ def _enumerate_valid_tactics(
             Fp8QuantizationType.NoneFp8,
             top_k,
             hidden_size,
+            hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
             activation_type.value,
@@ -362,7 +363,9 @@ def test_nvfp4_per_token_all_tactics_are_correct(
         pytest.skip("Only work on SM100 / SM103.")
 
     torch.manual_seed(42)
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         "NvFP4xNvFP4",
@@ -473,7 +476,9 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
         torch.cuda.synchronize()
         return output
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         "NvFP4xNvFP4",
@@ -595,7 +600,9 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         f"[{quant_mode}] reference output is not finite — bad test setup"
     )
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         quant_mode,
@@ -846,6 +853,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["fp8_quantization_type"],
             top_k,
             hidden_size,
+            hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
             ActivationType.Swiglu.value,
@@ -939,7 +947,9 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
         f"[{quant_mode}] reference output is not finite — bad test setup"
     )
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_fp8_valid_tactics(
         moe_op,
         quant_mode,

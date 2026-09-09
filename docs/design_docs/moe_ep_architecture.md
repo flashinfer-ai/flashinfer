@@ -50,7 +50,7 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 
 | Backend | Config | Transport | Modes | Constraints |
 |---|---|---|---|---|
-| `nccl_ep` | `NcclEpConfig` | NCCL (nccl4py wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | LL device kernel whitelists per-token row widths and caps top-k at 8 — see the runbook's "NCCL-EP low-latency device-kernel limits" |
+| `nccl_ep` | `NcclEpConfig` | NCCL (nccl-extensions wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | LL device kernel whitelists per-token row widths and caps top-k at 8 — see the runbook's "NCCL-EP low-latency device-kernel limits" |
 | `nixl_ep` | `NvepConfig` | NIXL over UCX device API (GPU-initiated RDMA) | LL `EXPERT_MAJOR` only | needs `BUILD_NIXL_EP=1` (UCX v1.21+ device headers) and `BootstrapConfig.tcp_store`; `max_tokens_per_rank ≤ 1024`; hidden ∈ {2048, 2560, 3072, 4096, 5120, 6144, 7168, 8192}; handles top-k > 8 |
 
 #### Kernel backends (post-dispatch inner compute)
@@ -60,8 +60,7 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 | `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
 | `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
 | `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16, quantized post-dispatch in the bridge) | NVFP4 (block-16) | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
-| `fused_moe` with `CuteDslConfig` | NVFP4 (block-16) or BF16 (W4A16) | NVFP4 or 4-bit (W4A16) | BF16 | SM100/SM103 | same `MoELayer` AutoTuner |
-| `sm100_mxfp8_mxfp4_bf16_cutedsl` (`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig`) | MXFP8 (block-32 UE8M0; quantized post-dispatch, or pre-dispatch packed payload with `mxfp8_dispatch=True`, nccl_ep only, bit-identical) | MXFP4 (block-32 UE8M0) | BF16 | SM100/SM103 | `tactic=` pins a kernel tactic; unpinned runs the AutoTuner default tactic (tactic sweep only under an autotune context — not tuned in the shipped benchmarks) |
+| `fused_moe` with `CuteDslConfig` | NVFP4 (W4A4), MXFP8 (W4A8), or BF16 (W4A16); W4A8 may use pre-dispatch packed payloads with `mxfp8_dispatch=True` | NVFP4/MXFP4 | BF16 | SM100/SM103 (W4A4/W4A16 also SM107) | same `MoELayer` AutoTuner |
 
 `fused_moe` accepts exactly one backend candidate per `MoEConfig` (weight
 views are prepared for the first match only). The W4A8 split kernel requires
@@ -186,7 +185,7 @@ moe_ep/
   config.py, tensors.py, weights.py, layer.py, algo_knobs.py, errors.py
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
-  backends/split/kernel/{identity,fused_moe,sm100/mxfp8_mxfp4_bf16_cutedsl}
+  backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
@@ -239,7 +238,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 - LL **EXPERT_MAJOR** — `[num_local_experts, cap, hidden]` (`cap = max_tokens_per_rank * world`), each row pre-assigned to one expert; the bridge synthesizes `top_k=1` / `final_scales=1` and **combine owns the real top-k reweight**.
 - LL **RANK_MAJOR** / **HT FLAT** — `[world, max_tokens_per_rank, hidden]` carrying received `topk_idx` / `topk_weights`; the runner uses the real `top_k` with non-local picks masked to weight 0, and combine just sums across ranks.
 
-Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`); NVFP4 activations are quantized in the bridge (linear SF layout). W4A8 (MXFP8 activations × MXFP4 weights) is a separate dedicated split kernel backend, `sm100_mxfp8_mxfp4_bf16_cutedsl`, with its own routing synthesis mirroring this bridge and an optional MXFP8-packed dispatch payload (see **Available backends**).
+BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant.variant`); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
@@ -277,7 +276,7 @@ classDiagram
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
-| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; bf16 + NVFP4; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
+| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; BF16 + W4A4/W4A8/W4A16; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
 | Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
@@ -303,7 +302,7 @@ When `auto_bootstrap=False`: dist must be up at layer construction if `process_g
 
 Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`. Missing libs raise `MoEEpNotBuiltError`.
 
-**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`. The EP backends are ON by default: NCCL-EP needs no build step (`nccl4py>=0.3.1` is a base dependency), and the NIXL-EP meson build runs best-effort unless opted out with `BUILD_NIXL_EP=0` (set `BUILD_NIXL_EP=1` to make missing build deps a hard error; `BUILD_NVEP=0` turns both backends off).
+**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl-extensions`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`. The EP backends are ON by default: NCCL-EP needs no build step (`nccl-extensions>=0.1.0` is a base dependency; `nccl.ep` moved there out of `nccl4py` in nccl4py 0.4.1), and the NIXL-EP meson build runs best-effort unless opted out with `BUILD_NIXL_EP=0` (set `BUILD_NIXL_EP=1` to make missing build deps a hard error; `BUILD_NVEP=0` turns both backends off).
 
 ## Lifetimes
 

@@ -426,17 +426,16 @@ def _distributed_moe_config(
         MoEConfig,
         MoEFinalizeConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=CFG.num_experts, top_k=CFG.top_k),
         quant=QuantConfig(
-            variant=(
-                QuantVariant.NVFP4
-                if variant.use_nvfp4_activations
-                else QuantVariant.W4A16
+            weight=QuantFormat.NVFP4,
+            activation=(
+                QuantFormat.NVFP4 if variant.use_nvfp4_activations else QuantFormat.BF16
             ),
             per_token_scale=(
                 args.use_per_token_activation and variant.use_nvfp4_activations
@@ -881,10 +880,11 @@ def _create_distributed_moe_layer(
     )
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for(
-        "cute_dsl_nvfp4",
+        "cute_dsl",
         CuteDslConfig.prepare_weights(
             w13,
             w2,
+            variant=moe_config.quant.variant,
             num_local_experts=num_local_experts,
             hidden_size=CFG.hidden_size,
             intermediate_size=intermediate_size,
