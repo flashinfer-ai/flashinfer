@@ -646,6 +646,16 @@ for benchmarking and bring-up.
 | `FLASHINFER_KDA_OO_REC_VSPLIT` | batch policy | Override the grouped recurrent backend's value-column split per CTA. |
 | `FLASHINFER_KDA_OO_MBP` | grid policy | Override the WY kernel's minimum-blocks-per-SM launch-bound hint. |
 
+##### Ulysses PCIe / RDMA Transport (experimental)
+
+Read when `UlyssesCommunicator` uses the PCIe backend -- named explicitly, or selected by `backend="auto"` where NVLink is unavailable and `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is set. Every rank must set these identically (rank-ordered lists take one comma-separated value per rank).
+
+| Variable | Default | Read in | Effect |
+|----------|---------|---------|--------|
+| `FLASHINFER_ULYSSES_PCIE_NICS` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Override automatic PCI-distance NIC routing for the RDMA routes: mlx5 device names, one per rank in rank order. |
+| `FLASHINFER_ULYSSES_PCIE_GID_INDICES` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Pick one GID table index per rank when a chosen NIC has several usable IPv4 RoCE v2 entries. |
+| `FLASHINFER_ULYSSES_PCIE_ROUTE` | `auto` | `flashinfer/comm/ulysses_topology.py` | `p2p` forces the all-P2P route; `rdma` forces all-RDMA (per-rank mlx5 to every peer) at world size 2/4/8; `hybrid` forces the eight-rank 4+4 NUMA hybrid; forced RDMA routes fall back to all-P2P with a `RuntimeWarning` when their requirements are unmet; `auto` prefers the all-RDMA route at world sizes 4 and 8. |
+
 ##### Experimental Packed-KDA Decode Tuning
 
 These low-level overrides are for benchmarking and kernel bring-up. Production

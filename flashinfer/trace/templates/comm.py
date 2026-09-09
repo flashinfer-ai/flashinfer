@@ -360,3 +360,192 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
     reference=_pcie_ipc_all_reduce_reference,
     init=_pcie_ipc_all_reduce_init,
 )
+# ── Ulysses 4-D layout transforms ─────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def _ulysses_single_rank_reference(
+    x: torch.Tensor, out: torch.Tensor = None, **_unused
+) -> torch.Tensor:
+    """Single-rank reference; multi-rank permutation is tested under tests/comm."""
+    result = x.clone()
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+class _UlyssesSingleRankTraceTemplate(TraceTemplate):
+    """Route trace-apply by the communicator's real process-group size.
+
+    ``world_size`` has no ordinary source: it is neither a tensor dimension nor
+    a scalar argument, but a property of the bound communicator that the
+    collectives are *methods* on. The standard ``param=`` / ``Scalar`` routes
+    cannot reach it, so the axis extractor reads it off the receiver instead.
+    """
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def extract_world_size(kwargs):
+            communicator = kwargs.get("self")
+            world_size = getattr(communicator, "world_size", None)
+            return None if world_size is None else int(world_size)
+
+        extractors["world_size"] = extract_world_size
+        return extractors
+
+
+_ulysses_scatter_heads_template = _UlyssesSingleRankTraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_scatter_heads",
+    description=(
+        "Ulysses context-parallel scatter-heads transform from per-rank sequence "
+        "shards to per-rank head shards. The reference models world_size=1; "
+        "multi-rank correctness is exercised by tests/comm/."
+    ),
+    axes={
+        "batch_size": Var(),
+        "local_seq_len": Var(
+            description="Sequence tokens owned by this rank before scatter."
+        ),
+        "global_num_heads": Var(description="Head count before rank sharding."),
+        "world_size": Const(
+            value=1,
+            abbrev="ws",
+            description="fi_trace models the single-rank identity case only.",
+        ),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "x": Tensor(["batch_size", "local_seq_len", "global_num_heads", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "local_seq_len", "global_num_heads", "head_dim"],
+            dtype_from="x",
+            param="out",
+        )
+    },
+    constraints=["world_size == 1"],
+    tags=["status:experimental", "stage:comm"],
+    reference=_ulysses_single_rank_reference,
+)
+
+
+_ulysses_gather_heads_template = _UlyssesSingleRankTraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_gather_heads",
+    description=(
+        "Inverse Ulysses context-parallel transform from per-rank head shards "
+        "to per-rank sequence shards. The reference models world_size=1; "
+        "multi-rank correctness is exercised by tests/comm/."
+    ),
+    axes={
+        "batch_size": Var(),
+        "global_seq_len": Var(
+            description="Full sequence length before the inverse transform."
+        ),
+        "local_num_heads": Var(description="Head slice owned by this rank."),
+        "world_size": Const(
+            value=1,
+            abbrev="ws",
+            description="fi_trace models the single-rank identity case only.",
+        ),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "x": Tensor(["batch_size", "global_seq_len", "local_num_heads", "head_dim"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "global_seq_len", "local_num_heads", "head_dim"],
+            dtype_from="x",
+            param="out",
+        )
+    },
+    constraints=["world_size == 1"],
+    tags=["status:experimental", "stage:comm"],
+    reference=_ulysses_single_rank_reference,
+)
+
+
+_ulysses_exchange_chunks_template = _UlyssesSingleRankTraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_exchange_chunks",
+    description=(
+        "Equal-length chunk all-to-all over an already-packed payload: chunk "
+        "``r`` goes to peer ``r`` and lands in slot ``rank`` there. Unlike the "
+        "two head-axis transforms this one interleaves nothing, so it is the "
+        "identity at world_size=1 by shape as well as by value. The reference "
+        "models world_size=1; multi-rank correctness is exercised by "
+        "tests/comm/."
+    ),
+    # Every axis the operand carries is read off its shape; only world_size
+    # comes off the communicator, so it is the one with a fixed value here.
+    axes={
+        "batch_size": Const(
+            abbrev="",
+            description="Pinned to 1: one row per operand is what lets the "
+            "transport address each peer's bytes contiguously.",
+        ),
+        "seq_len": Const(abbrev="", description="Pinned to 1, as above."),
+        "chunk_count": Const(
+            abbrev="",
+            description="Chunks in the operand, one per peer, so equal to "
+            "world_size by construction.",
+        ),
+        "world_size": Const(
+            value=1,
+            abbrev="ws",
+            description="fi_trace models the single-rank identity case only.",
+        ),
+        "chunk": Const(abbrev="c", description="Elements in one peer's chunk."),
+    },
+    inputs={
+        "x": Tensor(["batch_size", "seq_len", "chunk_count", "chunk"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "chunk_count", "chunk"],
+            dtype_from="x",
+            param="out",
+        )
+    },
+    constraints=["world_size == 1", "chunk_count == world_size"],
+    tags=["status:experimental", "stage:comm"],
+    reference=_ulysses_single_rank_reference,
+)
+
+
+def _ulysses_single_rank_trace_dispatch(template, **kwargs):
+    """Trace only the identity case; multi-rank collectives have no local reference."""
+    communicator = kwargs.get("self")
+    return template if getattr(communicator, "world_size", None) == 1 else None
+
+
+def ulysses_scatter_heads_trace(**kwargs):
+    return _ulysses_single_rank_trace_dispatch(
+        _ulysses_scatter_heads_template, **kwargs
+    )
+
+
+def ulysses_gather_heads_trace(**kwargs):
+    return _ulysses_single_rank_trace_dispatch(_ulysses_gather_heads_template, **kwargs)
+
+
+def ulysses_exchange_chunks_trace(**kwargs):
+    return _ulysses_single_rank_trace_dispatch(
+        _ulysses_exchange_chunks_template, **kwargs
+    )
+
+
+ulysses_scatter_heads_trace.templates = (  # type: ignore[attr-defined]
+    _ulysses_scatter_heads_template,
+)
+ulysses_gather_heads_trace.templates = (  # type: ignore[attr-defined]
+    _ulysses_gather_heads_template,
+)
+ulysses_exchange_chunks_trace.templates = (  # type: ignore[attr-defined]
+    _ulysses_exchange_chunks_template,
+)
