@@ -4216,6 +4216,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
         RoutingInputMode.FromLogits,
+        RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -6139,6 +6140,243 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+
+class MegaMoeFc12Runner(MoERunner):
+    """Standalone FC1/SwiGLU/FC2 MegaMOE runner.
+
+    The runner deliberately enters through the regular token-major contract:
+    ``moe_sort`` builds compact expert maps, ``moe_permute`` performs the
+    physical gather, FC12 processes only live expert rows, and
+    ``moe_unpermute`` restores token-major results.
+    """
+
+    backend_key = "megamoe_fc12"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supported_quant_variants = (
+        (QuantFormat.BF16, QuantFormat.BF16),
+        (QuantFormat.MXFP8, QuantFormat.BF16),
+    )
+    supported_activation_classes = (SwiGLU,)
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        self._sort_buffers: Optional[dict[str, torch.Tensor]] = None
+        self._permuted_input: Optional[torch.Tensor] = None
+        self._permuted_output: Optional[torch.Tensor] = None
+        self._expert_end_offsets: Optional[torch.Tensor] = None
+        self._launcher: Any = None
+        self.tuning_config = TuningConfig()
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..utils import get_compute_capability
+
+        if get_compute_capability(self.device) != (10, 0):
+            raise NotImplementedError(
+                "The BF16 MegaMOE FC12 launcher is validated on SM100 only."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("MegaMOE FC12 requires do_finalize=True.")
+
+    def _build(self) -> None:
+        from .cute_dsl.moe_utils import (
+            allocate_moe_sort_buffers,
+        )
+
+        experts = self.config.experts
+        routing = self.config.routing
+        num_local_experts = experts.local_num_experts or routing.num_experts
+        max_tokens = self.config.execution.tune_max_num_tokens
+        # FC12's native data-plane row padding is 64, which also makes the
+        # generic permutation output directly consumable without repacking.
+        tile_size = 64
+        self._sort_buffers = allocate_moe_sort_buffers(
+            max_tokens,
+            routing.num_experts,
+            routing.top_k,
+            num_local_experts,
+            tile_size,
+            device=str(self.device),
+        )
+        # Hidden size is determined by the activation/weight view, so the
+        # FC12 launcher is allocated lazily in pack_inputs.
+
+    def _allocate_workspaces(
+        self, max_rows: int, hidden: int, num_local_experts: int
+    ) -> None:
+        if self._permuted_input is not None:
+            return
+        from .megamoe_fc12 import Bf16Fc12Launcher, Bf16Mxfp8Fc12Launcher
+
+        self._permuted_input = torch.empty(
+            (max_rows, hidden), dtype=torch.bfloat16, device=self.device
+        )
+        self._permuted_output = torch.empty_like(self._permuted_input)
+        self._expert_end_offsets = torch.empty(
+            (num_local_experts,), dtype=torch.int32, device=self.device
+        )
+        launcher_cls = (
+            Bf16Mxfp8Fc12Launcher
+            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.BF16)
+            else Bf16Fc12Launcher
+        )
+        self._launcher = launcher_cls(
+            num_local_experts,
+            max_rows,
+            hidden,
+            self.config.experts.intermediate_size,
+        )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode not in self.supported_routing_modes:
+            raise NotImplementedError(
+                f"MegaMOE FC12 does not support {act.routing_input_mode!r}."
+            )
+        routing = self.config.routing
+        if act.routing_input_mode is RoutingInputMode.FromLogits:
+            _validate_logits_inputs(
+                act, act.num_tokens, routing.num_experts, type(self).__name__
+            )
+            from .trtllm_gen_routing import trtllm_gen_routing
+
+            routed = trtllm_gen_routing(
+                act.routing_logits,
+                act.routing_bias,
+                routing.method,
+                routing.top_k,
+                n_group=routing.n_group or 0,
+                topk_group=routing.topk_group or 0,
+                local_expert_offset=self.config.experts.local_expert_offset,
+                local_num_experts=self.config.experts.local_num_experts,
+                routed_scaling_factor=routing.routed_scaling_factor or 1.0,
+                tile_tokens_dim=64,
+            )
+            topk_ids, topk_weights = routed.topk_ids, routed.topk_weights
+        else:
+            _validate_prerouted_inputs(
+                act,
+                act.num_tokens,
+                routing.top_k,
+                type(self).__name__,
+                allowed_weights_dtypes=(torch.float32, torch.bfloat16),
+                require_contiguous=True,
+            )
+            topk_ids, topk_weights = act.topk_ids, act.topk_weights
+        if act.hidden_states_q.dtype is not torch.bfloat16:
+            raise TypeError("BF16 MegaMOE FC12 requires bfloat16 activations.")
+        view = weights.get_view(self.backend_key)
+        hidden = act.hidden_states_q.shape[1]
+        num_local_experts = self.config.experts.local_num_experts or routing.num_experts
+        if self._permuted_input is None:
+            from .cute_dsl.moe_utils import get_max_num_permuted_tokens
+
+            self._allocate_workspaces(
+                get_max_num_permuted_tokens(
+                    self.config.execution.tune_max_num_tokens,
+                    routing.top_k,
+                    num_local_experts,
+                    64,
+                ),
+                hidden,
+                num_local_experts,
+            )
+        output = torch.empty_like(act.hidden_states_q)
+        # The EP RANK_MAJOR bridge represents remote picks as a valid local id
+        # with weight zero so generic runners never dereference -1.  FC12 owns
+        # its compact setup, so recover the sparse meaning before moe_sort:
+        # invalid ids are omitted from its expert histogram and permutation.
+        selected_experts = torch.where(
+            topk_weights != 0,
+            topk_ids,
+            torch.full_like(topk_ids, -1),
+        )
+        packed = [
+            act.hidden_states_q,
+            selected_experts,
+            topk_weights,
+            view["fc1_weight"],
+            view["fc2_weight"],
+            output,
+        ]
+        if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.BF16):
+            packed.extend((view["fc1_weight_sf"], view["fc2_weight_sf"]))
+        return packed
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del do_preparation, kwargs
+        self._require_built()
+        if tactic != -1 or len(inputs) not in (6, 8):
+            raise ValueError("MegaMOE FC12 expects tactic -1 and six or eight tensors.")
+        assert self._sort_buffers is not None
+        assert self._permuted_input is not None
+        assert self._permuted_output is not None
+        assert self._expert_end_offsets is not None
+        assert self._launcher is not None
+        from .cute_dsl.moe_utils import moe_permute, moe_sort, moe_unpermute
+        from .megamoe_fc12 import Bf16Fc12Inputs
+
+        hidden_states, topk_ids, topk_weights, fc1_weight, fc2_weight, output = inputs
+        routing = self.config.routing
+        result = moe_sort(
+            topk_ids,
+            topk_weights,
+            num_experts=routing.num_experts,
+            top_k=routing.top_k,
+            local_expert_offset=self.config.experts.local_expert_offset,
+            num_local_experts=self.config.experts.local_num_experts,
+            tile_tokens_dim=64,
+            **self._sort_buffers,
+        )
+        torch.cumsum(result.expert_counts, dim=0, out=self._expert_end_offsets)
+        moe_permute(
+            hidden_states,
+            self._permuted_input,
+            result.tile_idx_to_mn_limit,
+            result.permuted_idx_to_expanded_idx,
+            result.num_non_exiting_tiles,
+            self._permuted_input.shape[0],
+            routing.top_k,
+            64,
+        )
+        self._launcher.run(
+            Bf16Fc12Inputs(
+                self._permuted_input,
+                fc1_weight,
+                fc2_weight,
+                self._permuted_output,
+                self._expert_end_offsets,
+                (inputs[6] if len(inputs) > 6 else None),
+                (inputs[7] if len(inputs) > 7 else None),
+            )
+        )
+        moe_unpermute(
+            self._permuted_output,
+            output,
+            result.expanded_idx_to_permuted_idx,
+            topk_weights,
+            hidden_states.shape[0],
+            routing.top_k,
+        )
+        return output
 
 
 def __getattr__(name: str):

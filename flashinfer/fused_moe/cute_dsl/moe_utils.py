@@ -439,6 +439,47 @@ def moe_output_memset_inplace(output: torch.Tensor) -> None:
 # ============================ moe_sort ============================
 
 
+class MoESortResult(tuple):
+    """Routing maps returned by :func:`moe_sort`.
+
+    The six positional fields intentionally preserve the original unpacking
+    contract.  ``expert_counts`` is the persistent local-expert histogram used
+    by compact FC12 launches.
+    """
+
+    tile_idx_to_expert_idx: torch.Tensor
+    tile_idx_to_mn_limit: torch.Tensor
+    expanded_idx_to_permuted_idx: torch.Tensor
+    permuted_idx_to_expanded_idx: torch.Tensor
+    total_num_padded_tokens: torch.Tensor
+    num_non_exiting_tiles: torch.Tensor
+    expert_counts: torch.Tensor
+
+    def __new__(
+        cls,
+        tile_idx_to_expert_idx: torch.Tensor,
+        tile_idx_to_mn_limit: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor,
+        permuted_idx_to_expanded_idx: torch.Tensor,
+        total_num_padded_tokens: torch.Tensor,
+        num_non_exiting_tiles: torch.Tensor,
+        expert_counts: torch.Tensor,
+    ):
+        result = super().__new__(
+            cls,
+            (
+                tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                total_num_padded_tokens,
+                num_non_exiting_tiles,
+            ),
+        )
+        result.expert_counts = expert_counts
+        return result
+
+
 def allocate_moe_sort_buffers(
     num_tokens: int,
     num_experts: int,
@@ -470,6 +511,7 @@ def allocate_moe_sort_buffers(
             - out_permuted_idx_to_expanded_idx
             - out_total_num_padded_tokens
             - out_num_non_exiting_tiles
+            - out_expert_counts (2 * num_experts routing scratch/histogram)
 
     Example:
         >>> # Pre-allocate before CUDA graph capture
@@ -513,6 +555,13 @@ def allocate_moe_sort_buffers(
         "out_num_non_exiting_tiles": torch.empty(
             (1,), dtype=torch.int32, device=device
         ),
+        # The routing implementation uses 2 * E slots internally: the first
+        # E are the completed per-expert histogram and the rest are temporary
+        # tile offsets.  Keeping it caller-owned makes the histogram usable by
+        # a following compact FC12 launch without an extra routing pass.
+        "out_expert_counts": torch.empty(
+            (2 * num_experts,), dtype=torch.int32, device=device
+        ),
     }
 
 
@@ -532,14 +581,8 @@ def moe_sort(
     out_permuted_idx_to_expanded_idx: Optional[torch.Tensor] = None,
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
-) -> Tuple[
-    torch.Tensor,  # tile_idx_to_expert_idx
-    torch.Tensor,  # tile_idx_to_mn_limit
-    torch.Tensor,  # expanded_idx_to_permuted_idx
-    torch.Tensor,  # permuted_idx_to_expanded_idx
-    torch.Tensor,  # total_num_padded_tokens [1], int32 (device tensor for CUDA graph compatibility)
-    torch.Tensor,  # num_non_exiting_tiles
-]:
+    out_expert_counts: Optional[torch.Tensor] = None,
+) -> MoESortResult:
     """
     Sort tokens by expert assignment and generate mapping tensors.
 
@@ -581,6 +624,9 @@ def moe_sort(
         out_permuted_idx_to_expanded_idx: Pre-allocated buffer for permuted_idx_to_expanded_idx.
         out_total_num_padded_tokens: Pre-allocated buffer for total_num_padded_tokens.
         out_num_non_exiting_tiles: Pre-allocated buffer for num_non_exiting_tiles.
+        out_expert_counts: Pre-allocated ``2 * num_experts`` int32 routing
+            scratch. The local-expert histogram slice is exposed as
+            ``result.expert_counts``.
 
     Returns:
         tuple: A tuple of 6 elements:
@@ -596,6 +642,8 @@ def moe_sort(
             - total_num_padded_tokens: [1], int32 (device tensor)
                 Total number of padded tokens. Returned as tensor for CUDA graph compatibility.
             - num_non_exiting_tiles: [1], int32 (device tensor)
+            - expert_counts: [num_local_experts], int32 local routing histogram
+              available as an attribute without changing six-value unpacking.
                 Number of non-exiting (active) tiles.
 
     Example:
@@ -695,17 +743,20 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024).
-    # Required size: 2 * num_experts. The kernel zeros this internally via
-    # launchInitExpertCounts before reading, so no Python-side init is needed
-    # (matching trt-llm's torch::empty allocation pattern).
-    if num_tokens > 1024:
-        expert_counts = torch.empty(
-            (2 * num_experts,), dtype=torch.int32, device=device
+    # The routing implementation's first E slots contain its authoritative
+    # per-expert histogram.  Supplying this buffer for every batch size keeps
+    # compact work setup graph-safe and avoids a second histogram kernel.
+    expert_counts = (
+        out_expert_counts
+        if out_expert_counts is not None
+        else torch.empty((2 * num_experts,), dtype=torch.int32, device=device)
+    )
+    if expert_counts.dtype != torch.int32 or expert_counts.numel() < 2 * num_experts:
+        raise ValueError(
+            "out_expert_counts must be an int32 tensor with at least "
+            f"2 * num_experts ({2 * num_experts}) entries."
         )
-        expert_counts_ptr = expert_counts.data_ptr()
-    else:
-        expert_counts_ptr = 0  # Will be set to nullptr in kernel
+    expert_counts_ptr = expert_counts.data_ptr()
 
     # Get the JIT module and call the kernel
     module = _get_moe_utils_module()
@@ -740,13 +791,14 @@ def moe_sort(
 
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility
     # (avoiding .item() which causes CPU-GPU sync)
-    return (
+    return MoESortResult(
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx,
         total_num_padded_tokens_tensor,
         num_non_exiting_tiles,
+        expert_counts[local_expert_offset : local_expert_offset + num_local_experts],
     )
 
 

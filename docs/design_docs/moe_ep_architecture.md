@@ -59,12 +59,13 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 |---|---|---|---|---|---|
 | `identity` (`IdentityConfig`) | passthrough | none | dispatch tensor unchanged | any | — |
 | `fused_moe` (`FusedMoeKernelConfig`) with `TrtllmBf16Config` | BF16 | BF16 | BF16 | SM100 family | inner `MoELayer` AutoTuner: per-runner tactic search + cross-backend winner per token bucket, up to `ExecutionConfig.tune_max_num_tokens` |
+| `fused_moe` with `MegaMoeFc12Config` | BF16 or BF16×MXFP8 (E4M3 weights) | BF16 or MXFP8 | BF16 | SM100 | compact `moe_sort` → `moe_permute` → standalone FC12 → `moe_unpermute` |
 | `fused_moe` with `TrtllmFp4Config` | NVFP4 (block-16, quantized post-dispatch in the bridge) | NVFP4 (block-16) | BF16 | SM100/SM103/SM107 | same `MoELayer` AutoTuner |
 | `fused_moe` with `CuteDslConfig` | NVFP4 (W4A4), MXFP8 (W4A8), or BF16 (W4A16); W4A8 may use pre-dispatch packed payloads with `mxfp8_dispatch=True` | NVFP4/MXFP4 | BF16 | SM100/SM103 (W4A4/W4A16 also SM107) | same `MoELayer` AutoTuner |
 
-`fused_moe` accepts exactly one backend candidate per `MoEConfig` (weight
-views are prepared for the first match only). The W4A8 split kernel requires
-hidden and intermediate sizes to be multiples of 128.
+`fused_moe` materializes every compatible configured backend view, so
+`MoELayer` can tune across candidates. The W4A8 split kernel requires hidden
+and intermediate sizes to be multiples of 128.
 
 ## How tuning works
 
@@ -319,7 +320,7 @@ classDiagram
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |
 | Split kernel | `identity` | `IdentityConfig` — comm-only; `dummy_moe_weights` OK |
-| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; BF16 + W4A4/W4A8/W4A16; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
+| Split kernel | `fused_moe` | `FusedMoeKernelConfig(moe_config=...)` — bridges to `flashinfer.fused_moe`; includes MegaMOE FC12, BF16 + W4A4/W4A8/W4A16; LL EXPERT_MAJOR / RANK_MAJOR / HT FLAT |
 | Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
