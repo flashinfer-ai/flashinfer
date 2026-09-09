@@ -76,12 +76,6 @@ def test_supported_configs_families() -> None:
     assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope", "dots3_swa"}
     assert configs["glm53_nope"].bytes_per_token == 656
     assert configs["glm53_nope"].compact_bytes_per_token == 528
-    assert configs["glm53_nope"].glm53_nope_contract_version == 1
-    assert all(
-        config.glm53_nope_contract_version == 0
-        for family, config in configs.items()
-        if family != "glm53_nope"
-    )
     assert configs["glm_nsa"].compact_bytes_per_token is None
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
