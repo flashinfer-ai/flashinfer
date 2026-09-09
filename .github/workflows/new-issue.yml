@@ -18,3 +18,26 @@ jobs:
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number }}
           LABELS: needs-triage
+
+      - name: Add CI health label to DLQA filings
+        if: >-
+          ${{
+            github.event.issue.body &&
+            contains(
+              github.event.issue.body,
+              '<!-- dlqa-triage:flashinfer-ci:v1 -->'
+            )
+          }}
+        run: |
+          actor="$(gh api user --jq .login)"
+          if [[ "$actor" != "$EXPECTED_ACTOR" ]]; then
+            echo "::error::FLASHINFER_GITHUB_TOKEN belongs to $actor, expected $EXPECTED_ACTOR"
+            exit 1
+          fi
+          gh issue edit "$NUMBER" --add-label "$LABELS"
+        env:
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          LABELS: "ci: health"
+          EXPECTED_ACTOR: kangbintNV
