@@ -205,9 +205,9 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
         device=device,
         generator=generator,
     ).to(torch.float8_e4m3fn)
-    shared_tables = torch.arange(
-        num_pages, dtype=torch.int32, device=device
-    ).view(batch_size, page_slots)
+    shared_tables = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+        batch_size, page_slots
+    )
     if uses_shared_paged_kv_idx:
         block_tables = shared_tables
     else:
@@ -222,9 +222,7 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
     reference_workspace = torch.empty(64 << 20, dtype=torch.uint8, device=device)
     candidate_workspace = torch.empty_like(reference_workspace)
     reference_out = torch.empty_like(query)
-    reference_lse = torch.empty(
-        query.shape[:-1], dtype=torch.float32, device=device
-    )
+    reference_lse = torch.empty(query.shape[:-1], dtype=torch.float32, device=device)
     candidate_out = torch.empty_like(query)
     candidate_lse = torch.empty_like(reference_lse)
 
