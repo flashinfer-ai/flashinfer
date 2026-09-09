@@ -67,7 +67,7 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    assert len(manifest["artifacts"]) == 141
+    assert len(manifest["artifacts"]) == 143
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
@@ -208,7 +208,7 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
         retain_kv_l2=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
         "cake_fmha_decode_native_bf16_binding.cu",
         "cake_fmha_decode_native_bf16_jit_binding.cu",
     }
@@ -254,6 +254,11 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
         )
         assert Path(spec.sources[0]) == csrc_dir / member["sources"][manifest_arch]
         launch_override = member.get("launch_override") or {}
+        if "by_arch" in launch_override:
+            launch_override = {
+                **launch_override,
+                **launch_override["by_arch"][manifest_arch],
+            }
         expected_binding = launch_override.get(
             "binding_source", component["binding_source"]
         )
@@ -291,7 +296,13 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
     assert selected_batches == {4, 128, 256}
 
 
-def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None:
+@pytest.mark.parametrize(
+    ("target", "manifest_arch", "shared_memory_bytes"),
+    (("sm100a", "sm_100a", 178176), ("sm103a", "sm_103a", 210944)),
+)
+def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
+    target, manifest_arch, shared_memory_bytes
+) -> None:
     from flashinfer.jit import cake_fmha as cake_jit
 
     manifest = get_cake_fmha_manifest()
@@ -326,11 +337,20 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None
         "USE_SCALE_PTR": 0,
     }
 
-    sink_binding = "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu"
+    sink_binding = (
+        f"bindings/cake_fmha_decode_native_bf16_sink_peer_clc_{manifest_arch}_binding.cu"
+    )
     launch_override = sink_member["launch_override"]
-    assert launch_override["binding_source"] == sink_binding
+    arch_override = launch_override["by_arch"][manifest_arch]
+    assert arch_override["binding_source"] == sink_binding
+    assert arch_override["dynamic_shared_memory_bytes"] == shared_memory_bytes
+    body, binding = cake_jit._get_component_launch_sources(
+        "decode_native_bf16", target, selector
+    )
+    assert body == get_cake_fmha_csrc_dir() / sink_member["sources"][manifest_arch]
+    assert binding == get_cake_fmha_csrc_dir() / sink_binding
     assert (
-        launch_override["binding_sha256"]
+        arch_override["binding_sha256"]
         == manifest["artifacts"][sink_binding]["sha256"]
     )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
@@ -339,7 +359,7 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None
     assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
     assert (
         cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding)
-        == (launch_override["binding_sha256"])
+        == (arch_override["binding_sha256"])
     )
     assert cake_jit._flashinfer_bindings_sha256(get_cake_fmha_csrc_dir()) == (
         CAKE_FMHA_FLASHINFER_BINDINGS_SHA256
@@ -494,7 +514,7 @@ def test_cake_fmha_decode_native_fp16_nhd_jit_selects_one_manifest_member(
         retain_kv_l2=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
         "cake_fmha_decode_native_fp16_nhd_binding.cu",
         "cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
     }
@@ -529,7 +549,7 @@ def test_cake_fmha_decode_native_fp16_hd512_jit_selects_one_manifest_member(
         retain_kv_l2=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_has_window1_retain_kv_l20_use_scale_ptr1.cu",
+        "has_window1_retain_kv_l20_use_scale_ptr1.cu",
         "cake_fmha_decode_native_fp16_hd512_binding.cu",
         "cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     }
@@ -561,7 +581,7 @@ def test_cake_fmha_decode_quant_bf16q_jit_selects_one_manifest_member(
         32,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_page_size32.cu",
+        "page_size32.cu",
         "cake_fmha_decode_quant_bf16q_binding.cu",
         "cake_fmha_decode_quant_bf16q_jit_binding.cu",
     }
@@ -596,9 +616,9 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
         full_blocks=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_full_blocks1_page_size32.cu",
+        "full_blocks1_page_size32.cu",
         "cake_fmha_decode_quant_fp8_binding.cu",
-        "cake_default.cu",
+        "default.cu",
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
@@ -619,9 +639,9 @@ def test_cake_fmha_decode_quant_nvfp4_jit_selects_main_and_reducer(
     spec = gen_cake_fmha_decode_quant_nvfp4_module("sm103a", 2, 1, 4, 2, 32)
     assert spec.name == get_cake_fmha_decode_quant_nvfp4_uri("sm103a", 2, 1, 4, 2, 32)
     assert {Path(source).name for source in spec.sources} == {
-        "cake_page_size32.cu",
+        "page_size32.cu",
         "cake_fmha_decode_quant_nvfp4_binding.cu",
-        "cake_default.cu",
+        "default.cu",
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
@@ -665,7 +685,7 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
         enable_sink=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_enable_sink0_is_causal1_return_lse1.cu",
+        "enable_sink0_is_causal1_return_lse1.cu",
         "cake_fmha_context_bf16_binding.cu",
         "cake_fmha_context_bf16_jit_binding.cu",
     }
@@ -767,7 +787,7 @@ def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> N
         enable_sink=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "cake_enable_sink0_is_causal1_return_lse0.cu",
+        "enable_sink0_is_causal1_return_lse0.cu",
         "cake_fmha_context_fp8_binding.cu",
         "cake_fmha_context_fp8_jit_binding.cu",
     }
@@ -786,7 +806,7 @@ def test_cake_fmha_context_nvfp4_jit_selects_fused_member(
     spec = gen_cake_fmha_context_nvfp4_module("sm100a", 1, 32, 4, 8, 16, 8)
     assert spec.name == get_cake_fmha_context_nvfp4_uri("sm100a", 1, 32, 4, 8, 16, 8)
     assert {Path(source).name for source in spec.sources} == {
-        "cake_enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
+        "enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
         "cake_fmha_context_nvfp4_binding.cu",
         "cake_fmha_context_fp8_jit_binding.cu",
     }
@@ -936,7 +956,7 @@ def test_cake_fmha_tma_adapters_track_descriptor_completion(
             "fp16",
             gen_cake_fmha_context_fp16_hd256_module,
             get_cake_fmha_context_fp16_hd256_uri,
-            "cake_is_causal0.cu",
+            "is_causal0.cu",
             "cake_fmha_context_fp16_hd256_binding.cu",
             "0",
         ),
@@ -944,7 +964,7 @@ def test_cake_fmha_tma_adapters_track_descriptor_completion(
             "fp8",
             gen_cake_fmha_context_fp8_hd256_module,
             get_cake_fmha_context_fp8_hd256_uri,
-            "cake_is_causal1_output_bf161.cu",
+            "is_causal1_output_bf161.cu",
             "cake_fmha_context_fp8_hd256_binding.cu",
             "1",
         ),

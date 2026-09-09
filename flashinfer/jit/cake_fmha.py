@@ -22,7 +22,7 @@ CakeFmhaTarget = Literal["sm100a", "sm103a"]
 CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
-    "c39da7180549e633f2538776de1ed6626ffe859e79314b1f968bc8b66f68003b"
+    "49ff56a8b8f2413faea946b082740d4b7aa2d7f34bb6c8e3296ea1db42948255"
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
@@ -377,8 +377,11 @@ def _get_component_launch_sources(
     member = _get_component_member(component_name, selector, required=True)
     assert member is not None
     csrc_dir = get_cake_fmha_csrc_dir()
-    body = csrc_dir / member["sources"][_TARGET_MANIFEST_ARCH[target]]
+    arch = _TARGET_MANIFEST_ARCH[target]
+    body = csrc_dir / member["sources"][arch]
     launch_override = member.get("launch_override") or {}
+    if "by_arch" in launch_override:
+        launch_override = {**launch_override, **launch_override["by_arch"][arch]}
     launch_binding = csrc_dir / launch_override.get(
         "binding_source", component["binding_source"]
     )
