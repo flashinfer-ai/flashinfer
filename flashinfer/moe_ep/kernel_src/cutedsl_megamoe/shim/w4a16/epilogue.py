@@ -391,22 +391,44 @@ class W4A16Fc1Epilogue(SwapABFc1Epilogue):
         weight_alpha = self.optional_epi_args.fc1_alpha[work_tile_info.expert_idx]
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("fc1_epi")
-        for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
-            if subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
-                # Current run already selects the accumulator stage. Every
-                # local TMEM offset is therefore relative to that stage.
-                self._run_fc1_bf16_subtile(
-                    tmem_acc_tensor,
-                    cutlass.Int32(0),
-                    subtile_idx,
-                    real_fc1_output,
-                    work_tile_info,
-                    self.warp_idx,
-                    self.tidx,
-                    weight_alpha,
-                )
-        cute.arch.fence_view_async_tmem_load()
-        acc_pipeline.consumer_release(acc_consumer_state)
+        # Keep prior subtiles in the established loop and specialize only the
+        # final one. N64 has no prior subtile; N128 has one.
+        if cutlass.const_expr(self.subtile_cnt > 1):
+            for subtile_idx in cutlass.range(self.subtile_cnt - 1, unroll=1):
+                if subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
+                    self._run_fc1_bf16_subtile(
+                        tmem_acc_tensor,
+                        cutlass.Int32(0),
+                        subtile_idx,
+                        real_fc1_output,
+                        work_tile_info,
+                        self.warp_idx,
+                        self.tidx,
+                        weight_alpha,
+                        acc_pipeline=acc_pipeline,
+                        acc_consumer_state=acc_consumer_state,
+                        release_after_scratch=False,
+                    )
+        last_subtile_idx = cutlass.Int32(self.subtile_cnt - 1)
+        if last_subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
+            self._run_fc1_bf16_subtile(
+                tmem_acc_tensor,
+                cutlass.Int32(0),
+                last_subtile_idx,
+                real_fc1_output,
+                work_tile_info,
+                self.warp_idx,
+                self.tidx,
+                weight_alpha,
+                acc_pipeline=acc_pipeline,
+                acc_consumer_state=acc_consumer_state,
+                release_after_scratch=True,
+            )
+        else:
+            # Includes zero tokens and N128 tiles with only the first
+            # subtile valid. All earlier stores retain their original order.
+            cute.arch.fence_view_async_tmem_load()
+            acc_pipeline.consumer_release(acc_consumer_state)
 
     @cute.jit
     def _run_fc1_bf16_subtile(
@@ -419,6 +441,9 @@ class W4A16Fc1Epilogue(SwapABFc1Epilogue):
         warp_idx,
         tidx,
         weight_alpha,
+        acc_pipeline,
+        acc_consumer_state,
+        release_after_scratch: cutlass.Constexpr[bool],
     ):
         lane = tidx % 32
         # The producer maps canonical gate32/up32 to internal gate16/up16.
@@ -484,6 +509,11 @@ class W4A16Fc1Epilogue(SwapABFc1Epilogue):
             transpose.r3_store()
             transpose.r4_load_top()
             transpose.r4_load_bot()
+            if cutlass.const_expr(release_after_scratch and half == 1):
+                # Both final scratch reads now feed RMEM. The following
+                # permutation, BF16 conversion and STG do not use TMEM.
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
             transpose.r4_perm()
             # CuTe's dynamic branch may carry tensors, but not the plain
             # Python transpose helper. Resolve its output before branching.
