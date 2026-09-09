@@ -966,6 +966,24 @@ def chunk_gated_delta_rule(
                 "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
                 "compact [num_seqs, ...] tensor that would be indexed out of bounds."
             )
+        # Bounds-check the slot ids against the pool they index. An id outside
+        # [0, N_pool) makes the kernel read or write past the pool, and the
+        # caching allocator normally hides that in a neighbouring
+        # sub-allocation rather than faulting, so nothing reports it. The check
+        # runs as a device-side assert and costs no host synchronization;
+        # uniqueness stays a documented caller precondition because checking it
+        # would need one. output_final_state does not gate the final-state
+        # write, so output_state is part of the check whenever it is given.
+        indexed_pools = tuple(
+            tensor for tensor in (initial_state, output_state) if tensor is not None
+        )
+        if indexed_pools:
+            _cake_gdn_assert_state_slots(
+                state_indices,
+                min(int(tensor.shape[0]) for tensor in indexed_pools),
+                name="GDN prefill state_indices",
+                allow_minus_one=False,
+            )
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
