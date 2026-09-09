@@ -3109,6 +3109,7 @@ def test_output_state_indices(batch_size: int, state_dtype: str):
         initial_state=pool_under_test,
         initial_state_indices=read_indices,
         output_state_indices=write_indices,
+        backend="flashinfer",
     )
 
     # Reference: direct state path (gather from read slots)
@@ -3124,6 +3125,7 @@ def test_output_state_indices(batch_size: int, state_dtype: str):
         b=b,
         scale=1.0,
         use_qk_l2norm=True,
+        backend="flashinfer",
     )
 
     atol = 1e-3
@@ -3199,6 +3201,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
         use_qk_l2norm=True,
         initial_state=pool1,
         initial_state_indices=indices,
+        backend="flashinfer",
     )
 
     # With output_state_indices == initial_state_indices
@@ -3217,6 +3220,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
         initial_state=pool2,
         initial_state_indices=indices,
         output_state_indices=indices,
+        backend="flashinfer",
     )
     atol = 1e-3
     rtol = 1e-3
