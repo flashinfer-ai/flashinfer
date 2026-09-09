@@ -54,16 +54,11 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
-# nvidia-cutlass-dsl 4.8 no longer packages the examples tree.  Use the
-# Blackwell parent shipped with FlashInfer's pinned CUTLASS submodule instead.
-from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell import (
-    dense_blockscaled_gemm_persistent as _sm100_blockscaled_gemm,
-)
-
-Sm100BlockScaledPersistentDenseGemmKernel = (
-    _sm100_blockscaled_gemm.Sm100BlockScaledPersistentDenseGemmKernel
-)
-scaled_mm = _sm100_blockscaled_gemm.scaled_mm
+# Use FlashInfer's own Blackwell parent. flashinfer/data is a build-time
+# artifact and its CUTLASS package-data ships only include/** and
+# tools/util/include/**, so importing the examples tree resolves in an
+# editable checkout but not in a released wheel.
+from .dense_blockscaled_gemm_sm100 import Sm100BlockScaledPersistentDenseGemmKernel
 
 
 """
