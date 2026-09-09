@@ -1101,6 +1101,28 @@ def _run_gvr2(
     return out_indices, (out_values if return_output_values else None)
 
 
+def release_gvr2_resources(device=None) -> int:
+    """Release the ``gvr_2`` backend's lazily created per-device caches.
+
+    ``top_k_varlen(backend="gvr_2")`` keeps, per device, one default workspace
+    slab per CUDA stream it has run on (20,973,568 bytes each, at most 32 per
+    device) and one hint-free anchor table per ``top_k`` (grown by doubling).
+    They are created by eager launches and live for the process. This call
+    synchronizes ``device`` (default: the current device), drops them all and
+    returns the number of bytes released to the torch caching allocator
+    (``torch.cuda.empty_cache()`` returns that memory to the driver).
+
+    Any CUDA graph captured against a released slab or table would replay on
+    freed memory: release only when no such graph will be replayed again, and
+    re-capture after one eager ``gvr_2`` launch on the capturing stream, the
+    same warm-up rule as the first capture. Explicit ``workspace=`` buffers
+    passed by the caller are never touched.
+    """
+    from .kernels import gvr2_topk_host
+
+    return gvr2_topk_host.release_cached_resources(device)
+
+
 # ---------------------------------------------------------------------------
 # Internal: radix_cutlass (masked-radix CUTLASS) backend implementation
 # ---------------------------------------------------------------------------
@@ -1650,7 +1672,12 @@ def top_k_varlen(
             priority, so the default slabs are bounded at 32 x 21 MB per
             device (and two ``Stream`` objects may share one slab when the
             pool wraps — they also share the raw stream, so their launches
-            are ordered).
+            are ordered). The slabs and the hint-free anchor tables live for
+            the process unless released with
+            ``flashinfer.topk_varlen.release_gvr2_resources(device)``, which
+            synchronizes the device, drops them and returns the bytes freed;
+            graphs captured against them must then be re-captured after a
+            fresh eager warm-up.
 
     Returns
     -------

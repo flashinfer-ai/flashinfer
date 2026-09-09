@@ -1544,3 +1544,64 @@ def test_gvr2_route_bands_follow_sm_count():
     assert _host.route_bands(b, npad, k, 4097, 16384) == _host.route_bands(
         b, npad, k, 4097, 16384, sms=148
     )
+
+
+@requires_gvr2
+def test_gvr2_release_cached_resources():
+    """flashinfer.topk_varlen.release_gvr2_resources(): drops every default
+    workspace slab and hint-free anchor table of the device, returns the bytes
+    released (at least one slab + the tables), and the allocator's footprint
+    falls by that much; the next eager launch recreates its stream's slab and
+    the table, and a slab-using capture right after a release (no warm-up on
+    that stream) raises the documented error instead of allocating."""
+    from flashinfer.topk_varlen import release_gvr2_resources
+
+    rows, n, k = 16, 131072, 512
+    lc = _host._varlen_launcher(rows, n, k, n, 1, 1)
+    if not (lc[0] == "main" and lc[2][5] > 1):
+        pytest.skip(f"shape routes to {lc[0]} (no workspace use) on this device")
+    dev = torch.cuda.current_device()
+    gen = torch.Generator(device=_DEV).manual_seed(91)
+    logits = torch.randn(rows, n, generator=gen, device=_DEV)
+    seq = torch.randint(
+        50000, n, (rows,), generator=gen, device=_DEV, dtype=torch.int32
+    )
+    out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(
+        s
+    ):  # creates s's slab and the k=512 anchor table (hint-free)
+        _run_gvr2(logits, seq, k, None, out_indices=out)
+    torch.cuda.synchronize()
+    assert (dev, s.cuda_stream) in _host._ws_keep and (dev, k) in _host._HINT_FREE
+    slab_bytes = _host.workspace_bytes()
+    table_bytes = _host._HINT_FREE[(dev, k)].numel() * 4
+    before = torch.cuda.memory_allocated(dev)
+    freed = release_gvr2_resources()
+    assert freed >= slab_bytes + table_bytes, (freed, slab_bytes, table_bytes)
+    assert not any(key[0] == dev for key in _host._ws_keep)
+    assert not any(key[0] == dev for key in _host._HINT_FREE)
+    assert not any(t.device.index == dev for t in _host._HINT_FREE_KEEP)
+    assert before - torch.cuda.memory_allocated(dev) >= freed - 1024, (
+        before,
+        torch.cuda.memory_allocated(dev),
+        freed,
+    )
+    # capture without a fresh warm-up on s: loud, not a silent allocation
+    g = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="no slab for this stream|hint-free gvr_2"),
+        torch.cuda.stream(s),
+        torch.cuda.graph(g, stream=s),
+    ):
+        _run_gvr2(logits, seq, k, None, out_indices=out)
+    torch.cuda.synchronize()
+    # eager launch recreates both, and the result is exact
+    with torch.cuda.stream(s):
+        _run_gvr2(logits, seq, k, None, out_indices=out)
+    torch.cuda.synchronize()
+    assert (dev, s.cuda_stream) in _host._ws_keep and (dev, k) in _host._HINT_FREE
+    _check_varlen_rows(logits, out, seq.tolist(), k)
+    # releasing when nothing is cached is a no-op returning 0
+    release_gvr2_resources(torch.device(_DEV, dev))
+    assert release_gvr2_resources() == 0

@@ -1074,6 +1074,37 @@ def _reset_for_tests() -> None:
         _ws_keep.clear()
 
 
+def release_cached_resources(device=None) -> int:
+    """FlashInfer-local: release the lazily created per-device caches — every
+    default workspace slab (one per (device, stream), 20,973,568 B each) and
+    every hint-free anchor table (current and superseded) — for ``device``
+    (default: the current device). Synchronizes the device first so no
+    in-flight launch still uses them, then drops the references; the memory
+    returns to the torch caching allocator (``torch.cuda.empty_cache()``
+    hands it back to the driver). Returns the number of bytes released.
+
+    INVALIDATION: a CUDA graph captured against a released slab or table
+    replays on freed memory. Callers release only when no such graph will be
+    replayed again, and re-capture after a fresh eager warm-up on the
+    capturing stream (the same rule as the first capture)."""
+    d = torch.cuda.current_device() if device is None else torch.device(device).index
+    if d is None:
+        d = torch.cuda.current_device()
+    torch.cuda.synchronize(d)
+    freed = 0
+    with _mu:
+        for key in [k for k in _ws_keep if k[0] == d]:
+            freed += _ws_keep.pop(key).numel() * 4
+    with _HINT_FREE_LOCK:
+        for key in [k for k in _HINT_FREE if k[0] == d]:
+            freed += _HINT_FREE.pop(key).numel() * 4
+        keep = [t for t in _HINT_FREE_KEEP if t.device.index == d]
+        for t in keep:
+            freed += t.numel() * 4
+            _HINT_FREE_KEEP.remove(t)
+    return freed
+
+
 # ===========================================================================
 # ==== operator entry =======================================================
 # ===========================================================================
