@@ -57,8 +57,8 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 
 | Feature | Support |
 | --- | --- |
-| GPU | SM100a/B200 (qualified); SM103a/B300 (architecture-gated, not yet signoff-qualified) |
-| Head dimension | 128 or 256 |
+| GPU | Blackwell SM100 and SM103; see validation scope below |
+| Head dimensions | Equal QK/V: 128 or 256; separate contiguous MLA: QK=192, V=128 |
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` |
 | Q/K/V dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
@@ -70,8 +70,9 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state |
 
-Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
-admitted by the runtime architecture guard but remains to be qualified.
+The established equal-dimension paths have accuracy and performance signoff
+on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
+its B200 performance remains to be measured.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
 one. Causal attention requires `Sq <= Sk` for every request at run time. All
@@ -97,9 +98,13 @@ softmax state remain internal to the kernel.
 
 Contiguous inputs:
 
-- Fixed Q/O: `[B, Sq, Hq, D]`; K/V: `[B, Sk, Hkv, D]`.
-- Packed Q/O: `[total_q, Hq, D]`; K/V:
-  `[total_kv, Hkv, D]`.
+- Fixed Q: `[B, Sq, Hq, Dqk]`; K: `[B, Sk, Hkv, Dqk]`;
+  V: `[B, Sk, Hkv, Dv]`; O: `[B, Sq, Hq, Dv]`.
+- Packed Q: `[total_q, Hq, Dqk]`; K: `[total_kv, Hkv, Dqk]`;
+  V: `[total_kv, Hkv, Dv]`; O: `[total_q, Hq, Dv]`.
+- Supported contiguous `(Dqk, Dv)` pairs: `(128, 128)`, `(192, 128)`,
+  `(256, 256)`. The 192/128 path uses separate Q, K, and V tensors
+  with compact rows; callers do not pad the head dimension.
 - Packed metadata: compact CUDA `int32[B + 1]` `qo_indptr` and `kv_indptr`.
   Both start at zero, increase strictly, and end at the corresponding packed
   tensor extent.
@@ -135,7 +140,7 @@ for an active page indexes the physical cache.
 
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
-most `W` preceding keys. `sm_scale` defaults to `1 / sqrt(D)` and
+most `W` preceding keys. `sm_scale` defaults to `1 / sqrt(Dqk)` and
 `output_scale` defaults to 1; supplied scales must be finite, positive, and
 representable as positive `float32` values.
 
@@ -211,6 +216,22 @@ The TS graph assigns load, MMA, softmax, correction, epilogue, page-offset,
 and scheduling work to cooperating tasks. Resources own the corresponding
 SMEM/TMEM buffers and pipeline state.
 
+Non-absorbed MLA (QK=192, V=128) reuses the paired 128-row Q schedule.
+K is streamed in two 128-wide stages, with MMA restricted to the 128+64
+logical columns. Two query tiles share each K stage, and two softmax groups
+interleave with QK/PV work. The partial K descriptor has a separate task-local
+binding so it does not replace the first descriptor while that descriptor is
+still needed by the second query tile. Q is rounded only to a 128-byte TMA
+fragment in shared memory; BF16 Q therefore stores exactly 192 elements.
+For BF16 input and output, O is staged in 64-wide pieces to fit both Q tiles
+and the K/V ring. Ring depth follows the complete shared-memory footprint.
+On SM103, unmasked score tiles use LDTM.STAT to combine their TMEM load
+with the FP32 maximum reduction. DSL 4.7 uses a PTX 8.8 compatibility helper;
+DSL versions that expose the native primitive use it directly. SM100 keeps
+the software reduction, and masked tiles still apply masks before reducing.
+Single-query schedules use one O handoff stage so the next PV cannot write
+the accumulator until correction finishes, regardless of statistics storage.
+
 Paged D256 uses topology-derived page-ID staging. For a dense static domain
 that is divisible by the complete staged window and whose exact SMEM footprint
 fits the K/V cadence, each of the 32 producer lanes loads one page ID for each
@@ -259,6 +280,22 @@ wrapper.plan(
 out = wrapper.run(q, k, v)
 assert out.shape == q.shape
 ```
+
+Non-absorbed MLA with separate compact Q/K/V:
+
+```python
+q = torch.randn(1, 8192, 96, 192, device="cuda", dtype=torch.bfloat16)
+k = torch.randn(1, 8192, 1, 192, device="cuda", dtype=torch.bfloat16)
+v = torch.randn(1, 8192, 1, 128, device="cuda", dtype=torch.bfloat16)
+wrapper = BatchPrefillTSWrapper()
+wrapper.plan(q, k, v, mask_type="causal", out_dtype=torch.bfloat16)
+out = wrapper.run(q, k, v)
+assert out.shape == (1, 8192, 96, 128)
+```
+
+FP8 E4M3 uses the same shapes. For quantized operands, pass
+`sm_scale=q_descale * k_descale / sqrt(192)` and
+`output_scale=v_descale`; select the output dtype with `out_dtype`.
 
 Packed Q with a paged K/V cache:
 
@@ -320,6 +357,9 @@ runtime tensors alive until every graph using that plan is destroyed.
 
 ## Limitations
 
+- The 192/128 MLA extension requires contiguous separate Q/K/V and does not
+  support a positive left window. Paged K/V retains equal head dimensions.
+
 - Paged context accepts separate compact HND K/V pools with page size 16, 32,
   64, or 128.
 - `window_left=0` is unsupported; use `-1` to disable the window or a positive
@@ -350,6 +390,7 @@ conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and
 output state.
 
 ```bash
+pytest -q tests/attention/test_attention_ts_context_mla.py
 pytest -q tests/attention/test_attention_ts_context.py
 pytest -q tests/attention/test_attention_ts_mask.py
 ```

@@ -43,7 +43,7 @@ Feature Support Matrix:
   | Variable seqlen  | Supported through flattened tensors + `cum_seqlen_*`                                          |
   | dtype            | fp16/bf16/e4m3 Q/K/V/O, fp32 QK and PV accumulation                                           |
   | Masking          | non-causal and causal; causal left sliding window uses head-paired mode                       |
-  | head dimension   | D=128 and D=256                                                                                |
+  | head dimension   | QK/V=128/128, 192/128, and 256/256                                                                                |
   | `S_q` / `S_kv`   | Query-paired causal requires `S_q <= S_kv`; arbitrary positive tails are supported             |
   | GQA              | Must satisfy `h_q % h_kv == 0`; causal GQA can use head-paired scheduling                    |
   | Sliding window   | `mask_type="causal", window_left=N`; left window only                                        |
@@ -1633,7 +1633,7 @@ def _context_pipeline_stage_counts(
     return {name: stages for name, stages in counts.items() if stages}
 
 
-def _infer_single_instance_kv_stages(
+def _infer_context_kv_stages(
     cfg: FmhaConfig,
     *,
     is_clc_dynamic: bool,
@@ -1647,7 +1647,7 @@ def _infer_single_instance_kv_stages(
     16-byte pipeline barrier per physical stage. The task manager remains the
     authoritative check and uses the same stage-count policy below.
     """
-    q_row_bytes = (cfg.q_dtype.width * cfg.qk_mma_tiler[2] + 7) // 8
+    q_row_bytes = (cfg.q_dtype.width * cfg.smem_q_head_dim + 7) // 8
     q_row_bytes = (
         (q_row_bytes + _Q_ROW_SMEM_ALIGNMENT_BYTES - 1)
         // _Q_ROW_SMEM_ALIGNMENT_BYTES
@@ -1656,13 +1656,15 @@ def _infer_single_instance_kv_stages(
     q_tile_bytes = q_row_bytes * cfg.qk_mma_tiler[0]
 
     o_head_dim = (
-        cfg.head_dim_per_stage_kv if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
+        cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
     )
     o_stage_bytes = (cfg.epi_tile[0] * o_head_dim * cfg.o_dtype.width + 7) // 8
 
     stats_bytes = 0
     if cfg.stats_via_smem:
-        stats_rows = len(cfg.softmax0_warp_ids) * cute.arch.WARP_SIZE
+        stats_rows = (
+            cfg.num_qkv_instances * len(cfg.softmax0_warp_ids) * cute.arch.WARP_SIZE
+        )
         stats_values_per_row = 2
         stats_bytes = (
             cfg.softmax_corr_stage
@@ -1694,7 +1696,7 @@ def _infer_single_instance_kv_stages(
     )
     fixed_smem_bytes = (
         q_tile_bytes * cfg.q_stage
-        + o_stage_bytes
+        + o_stage_bytes * cfg.num_qkv_instances
         + stats_bytes
         + page_offsets_bytes
         + control_bytes
@@ -1710,7 +1712,7 @@ def _infer_single_instance_kv_stages(
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     if require_cadence and memory_fit_stages < cadence_stages:
         raise ValueError(
-            "single-instance context staging requires at least "
+            "context staging requires at least "
             f"{cadence_stages} K/V stages, but the shared-memory budget fits "
             f"only {memory_fit_stages}"
         )
@@ -1725,18 +1727,17 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
     cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
     cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
     cfg.softmax_corr_stage = 2 if cfg.stage_scoped_tmem_stats else 1
-    # SMEM-backed D256 removes the independent StatsDone credit and always
-    # writes the same physical O0 accumulator. Its MMA->Correction handoff must
-    # therefore be single-stage so PV(i+1) cannot overwrite O0 before
-    # Correction consumes PV(i). TMEM-stats schedules retain their established
-    # two-stage O + StatsDone ordering.
-    cfg.mma_corr_stage = 1 if cfg.single_qkv_instance and cfg.stats_via_smem else 2
-    if cfg.single_qkv_instance:
+    # A single Q instance always reuses one physical O accumulator. Allow only
+    # one outstanding PV result so correction finishes before the next PV.
+    # StatsDone protects statistics, and is released before O correction;
+    # it cannot protect O from a second in-flight MMA.
+    cfg.mma_corr_stage = 1 if cfg.single_qkv_instance else 2
+    if cfg.single_qkv_instance or cfg.logical_head_dim_qk == 192:
         natural_page_window_entries = cute.arch.WARP_SIZE
         cfg.page_table_window_entries = natural_page_window_entries
         candidate_page_window_entries = cfg.page_table_window_candidate_entries
         if candidate_page_window_entries > natural_page_window_entries:
-            candidate_kv_stages = _infer_single_instance_kv_stages(
+            candidate_kv_stages = _infer_context_kv_stages(
                 cfg,
                 is_clc_dynamic=is_clc_dynamic,
                 page_table_window_entries=candidate_page_window_entries,
@@ -1745,7 +1746,7 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
             cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
             if candidate_kv_stages >= cadence_stages:
                 cfg.page_table_window_entries = candidate_page_window_entries
-        cfg.kv_stage = _infer_single_instance_kv_stages(
+        cfg.kv_stage = _infer_context_kv_stages(
             cfg,
             is_clc_dynamic=is_clc_dynamic,
         )
@@ -1795,6 +1796,12 @@ def _configure_early_tile_sum_policy(
         if cfg.is_causal
         else _EARLY_TILE_SUM_DENSE_REGISTER_BUDGET
     )
+    # MLA's additional live K descriptor benefits from the reference's
+    # softmax/correction split while staying within the same register budget.
+    if cfg.logical_head_dim_qk == 192 and cfg.is_causal and cfg.q_dtype.width == 8:
+        cfg.num_regs_softmax = 184
+        cfg.num_regs_correction = 96
+        cfg.num_regs_other = 48
 
 
 def _configure_smem_shapes(cfg: FmhaConfig) -> None:
@@ -1803,11 +1810,11 @@ def _configure_smem_shapes(cfg: FmhaConfig) -> None:
         cfg.head_dim_per_stage_kv if cfg.stage_kv_by_head_dim else cfg.qk_mma_tiler[2]
     )
     o_head_dim = (
-        cfg.head_dim_per_stage_kv if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
+        cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
     )
     cfg.sQ_shape = (
         cfg.q_stage,
-        cfg.qk_mma_tiler[0] * cfg.qk_mma_tiler[2],
+        cfg.qk_mma_tiler[0] * cfg.smem_q_head_dim,
     )
     cfg.sK_shape = (
         cfg.kv_stage,
@@ -1863,23 +1870,34 @@ def _configure_single_instance_warp_layout(cfg: FmhaConfig) -> None:
 
 
 def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
-    """Split d>128 single-instance K/V/O staging into 128-wide slices."""
+    """Stage K/V in 128-wide slices and size O staging to the paired footprint."""
     cfg.head_dim_per_stage_kv = 0
     cfg.num_head_dim_stages_k = 1
     cfg.num_head_dim_stages_v = 1
     cfg.num_o_head_dim_stages = 1
     cfg.stage_kv_by_head_dim = False
     cfg.stage_o_by_head_dim = False
-    if cfg.num_qkv_instances != 1:
+    if cfg.num_qkv_instances != 1 and cfg.logical_head_dim_qk != 192:
         return
     cfg.head_dim_per_stage_kv = 128
     cfg.num_head_dim_stages_k = cfg.qk_mma_tiler[2] // cfg.head_dim_per_stage_kv
     cfg.num_head_dim_stages_v = cfg.pv_mma_tiler[1] // cfg.head_dim_per_stage_kv
-    cfg.num_o_head_dim_stages = cfg.epi_tile[1] // cfg.head_dim_per_stage_kv
+    # Two BF16 Q tiles plus three K/V stages leave room for two 64-wide
+    # output staging buffers. FP8 operands/output can retain 128-wide stores.
+    cfg.head_dim_per_stage_o = (
+        64
+        if (
+            not cfg.single_qkv_instance
+            and cfg.q_dtype.width == 16
+            and cfg.o_dtype.width == 16
+        )
+        else 128
+    )
+    cfg.num_o_head_dim_stages = cfg.epi_tile[1] // cfg.head_dim_per_stage_o
     cfg.stage_kv_by_head_dim = True
-    cfg.stage_o_by_head_dim = True
-    # Stage K, V, and O as 128-wide head-dimension slices so the d>128 K/V
-    # pipeline can run deeper without exceeding Blackwell's SMEM budget.
+    cfg.stage_o_by_head_dim = cfg.single_qkv_instance or cfg.num_o_head_dim_stages > 1
+    # K/V stays 128-wide. Smaller O stages let paired 16-bit geometry
+    # retain its K/V ring without exceeding Blackwell's SMEM budget.
 
 
 def _configure_head_paired_tilers(
@@ -1943,7 +1961,7 @@ def _configure_head_paired_tma_copy_metadata(
         )
     cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
     o_head_dim = (
-        cfg.head_dim_per_stage_kv if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
+        cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
     )
     cfg.tma_copy_o_stage_iters = o_head_dim // cfg.tma_copy_o_granu_inner
     cfg.tma_copy_o_elements = cfg.epi_tile[0] * o_head_dim
@@ -2374,7 +2392,10 @@ class FmhaTs:
     mma_tiler_mn : Tuple[int, int], optional
         MMA tile shape (M, N) (default: (128, 128)).
     d : int, optional
-        Head dimension (default: 128).
+        Q/K head dimension (default: 128).
+    d_v : int, optional
+        Value/output head dimension, defaulting to d. Asymmetric support is
+        limited to separate contiguous QK=192, V=128.
     is_persistent : bool, optional
         Use persistent scheduling (default: True).
     is_causal : bool, optional
@@ -2433,6 +2454,7 @@ class FmhaTs:
         max_kv_len: int = 1,
         causal_single_kv_tile: bool = False,
         exhaustive_deadlock_race_check: bool = True,
+        d_v: int | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -2482,9 +2504,23 @@ class FmhaTs:
         v_dtype = in_dtype or cutlass.Float16
         o_dtype = out_dtype or cutlass.Float16
 
+        d_v = d if d_v is None else d_v
+        if (d_v != d or d == 192) and (d, d_v) != (192, 128):
+            raise ValueError("asymmetric context requires QK=192 and V=128")
+        if d == 192 and (head_paired or use_paged_kv):
+            raise NotImplementedError(
+                "192/128 requires contiguous query-paired context"
+            )
+        # TMA fills the partial final Q/K slice with zeros. Global tensors
+        # retain their compact 192-element rows; only SMEM is padded.
+        padded_d = 256 if d == 192 else d
         cfg = FmhaConfig()
+        cfg.logical_head_dim_qk = d
         self.cfg = cfg
-        if d > 128:
+        # Compact Q and staged O fit two resident query tiles plus the K/V
+        # ring. Pairing overlaps the two softmax groups with MMA work.
+        paired_mla = d == 192 and not has_variable_window
+        if d > 128 and not paired_mla:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
         single_instance_persistent = (
@@ -2553,9 +2589,9 @@ class FmhaTs:
             return
 
         # MMA tiler: (M, N, K) = (128, 128, 128)
-        mma_tiler = (*mma_tiler_mn, d)
+        mma_tiler = (*mma_tiler_mn, padded_d)
         cfg.qk_mma_tiler = mma_tiler
-        cfg.pv_mma_tiler = (mma_tiler[0], mma_tiler[2], mma_tiler[1])
+        cfg.pv_mma_tiler = (mma_tiler[0], d_v, mma_tiler[1])
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         _configure_head_dim_staging(cfg)
         _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
@@ -2568,7 +2604,7 @@ class FmhaTs:
         _validate_tmem_columns(cfg)
 
         # TMA copy granularity for Q
-        qkv_tma_bits = cfg.qk_mma_tiler[2] * q_dtype.width
+        qkv_tma_bits = cfg.smem_q_head_dim * q_dtype.width
         if qkv_tma_bits % (128 * 8) != 0:
             raise ValueError(
                 "FMHA TS requires a 128-byte aligned Q/K/V inner dimension, "
@@ -2576,7 +2612,7 @@ class FmhaTs:
             )
         cfg.tma_copy_qkv_iters = qkv_tma_bits // (128 * 8)
         cfg.q_tile_m = cfg.qk_mma_tiler[0]
-        cfg.tma_copy_q_granu_inner = cfg.qk_mma_tiler[2] // cfg.tma_copy_qkv_iters
+        cfg.tma_copy_q_granu_inner = cfg.smem_q_head_dim // cfg.tma_copy_qkv_iters
         cfg.tma_copy_q_elements = cfg.sQ_shape[1]
         cfg.tma_copy_q_granu_elems = cfg.tma_copy_q_elements // cfg.tma_copy_qkv_iters
         cfg.tma_copy_q_bytes = cfg.tma_copy_q_elements * q_dtype.width // 8
@@ -2588,7 +2624,7 @@ class FmhaTs:
             if cfg.stage_kv_by_head_dim
             else cfg.qk_mma_tiler[2]
         )
-        cfg.tma_copy_kv_granu_inner = cfg.qk_mma_tiler[2] // cfg.tma_copy_qkv_iters
+        cfg.tma_copy_kv_granu_inner = cfg.tma_copy_q_granu_inner
         cfg.tma_copy_kv_elements = cfg.sK_shape[1]
         cfg.tma_copy_kv_stage_iters = kv_head_dim // cfg.tma_copy_kv_granu_inner
         cfg.tma_copy_kv_granu_elems = (
@@ -2600,7 +2636,7 @@ class FmhaTs:
         cfg.tma_copy_o_iters = (cfg.epi_tile[1] * o_dtype.width) // 1024
         cfg.tma_copy_o_granu_inner = cfg.epi_tile[1] // cfg.tma_copy_o_iters
         o_head_dim = (
-            cfg.head_dim_per_stage_kv if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
+            cfg.head_dim_per_stage_o if cfg.stage_o_by_head_dim else cfg.epi_tile[1]
         )
         cfg.tma_copy_o_stage_iters = o_head_dim // cfg.tma_copy_o_granu_inner
         cfg.tma_copy_o_elements = cfg.epi_tile[0] * o_head_dim
@@ -2716,7 +2752,7 @@ class FmhaTs:
             1,
             cfg.pv_mma_tiler[2],
             1,
-            cfg.pv_mma_tiler[1] // cfg.tma_copy_qkv_iters,
+            cfg.tma_copy_kv_granu_inner,
         )
         o_box_dims = (1, cfg.epi_tile[0], 1, cfg.tma_copy_o_granu_inner)
         stride_order = (3, 2, 1, 0)
@@ -2736,7 +2772,7 @@ class FmhaTs:
                 v_box_dims = (
                     cfg.pv_mma_tiler[2],
                     1,
-                    cfg.pv_mma_tiler[1] // cfg.tma_copy_qkv_iters,
+                    cfg.tma_copy_kv_granu_inner,
                 )
                 kv_stride_order = stride_order
         if cutlass.const_expr(cum_seqlen_q is not None):
@@ -2753,6 +2789,13 @@ class FmhaTs:
                 stride_order=stride_order,
                 swizzle=tma_qkv_swizzle,
                 l2_promotion=cuda.TensorMapL2Promotion.none,
+                # The 192-wide Q tensor has an OOB head-dimension tail.
+                # Ragged TMA's default NaN fill would poison those QK FMAs.
+                oob_fill=(
+                    cuda.TensorMapFloatOOBFill.none
+                    if cfg.logical_head_dim_qk == 192
+                    else None
+                ),
             )
         else:
             tma_q_desc = cuda.create_tensor_map_tiled_from_view(

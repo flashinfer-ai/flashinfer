@@ -698,7 +698,7 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
     monkeypatch.setattr(
         context_module,
         "_prepare_out",
-        lambda out, *, q, output_dtype: out,
+        lambda out, *, q, output_dtype, head_dim_vo=None: out,
     )
     argument_names = (
         "k",
@@ -2639,6 +2639,10 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
         context_module._dsl_supports_ldtm_stat()
         and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
     )
+    if torch.cuda.get_device_capability() == (10, 7):
+        from cutlass.experimental import primitives as prims
+
+        expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
         context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
     )
