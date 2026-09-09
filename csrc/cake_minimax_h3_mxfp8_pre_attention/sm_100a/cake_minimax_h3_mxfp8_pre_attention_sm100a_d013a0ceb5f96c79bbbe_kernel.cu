@@ -40,7 +40,9 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+#if defined(__CUDACC_RTC__)
 static_assert(alignof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128-byte aligned");
+#endif
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
