@@ -1664,7 +1664,7 @@ class SmemKVResource(MemoryResource):
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_k_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    desc_k_tail_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    desc_k_stage_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     desc_v_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
@@ -1699,10 +1699,10 @@ class SmemKVResource(MemoryResource):
             default=cutlass.Int64(0),
             docs="SMEM descriptor base for the current K tile.",
         )
-        self.desc_k_tail_base = TaskLocalVariable(
+        self.desc_k_stage_base = TaskLocalVariable(
             dtype=cutlass.Int64,
             default=cutlass.Int64(0),
-            docs="SMEM descriptor for the partial K stage retained by both Q tiles.",
+            docs="SMEM descriptor for the later K slice retained by both Q tiles.",
         )
         self.desc_v_base = TaskLocalVariable(
             dtype=cutlass.Int64,
@@ -2021,10 +2021,10 @@ class SmemKVResource(MemoryResource):
         )
         return desc_k_base
 
-    @consumer_work(returns=desc_k_tail_base)
+    @consumer_work(returns=desc_k_stage_base)
     @cute.jit
-    def k_tail_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
-        """Keep the second K descriptor live alongside the first K and V."""
+    def k_stage_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+        """Keep the later K descriptor live alongside the first K and V."""
         smem_stage_elements = self.cfg.tma_copy_kv_elements
         sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
         leading_byte_offset, stride_byte_offset = _qk_smem_desc_offsets(self.cfg)
@@ -2416,21 +2416,22 @@ class TmemSPResource(MemoryResource):
 
     @producer_work
     @cute.jit
-    def qk_mma_tail(
+    def qk_mma_stage(
         self,
         stage_info: StageInfo,
         *,
         desc_q_base: prims.Tcgen05SmemDesc,
-        desc_k_tail: prims.Tcgen05SmemDesc,
+        desc_k_stage: prims.Tcgen05SmemDesc,
         section: cutlass.Constexpr[FmhaStage],
+        head_dim_stage_idx: cutlass.Constexpr[int],
     ) -> None:
-        """Accumulate the partial K slice without replacing the live K base."""
+        """Accumulate a later K slice without replacing the first slice's binding."""
         self._qk_mma_impl(
             stage_info,
             desc_q_base=desc_q_base,
-            desc_k_base=desc_k_tail,
+            desc_k_base=desc_k_stage,
             section=section,
-            head_dim_stage_idx=1,
+            head_dim_stage_idx=head_dim_stage_idx,
         )
 
     @producer_work
@@ -2445,6 +2446,7 @@ class TmemSPResource(MemoryResource):
         head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         is_tail: cutlass.Constexpr[bool] = False,
     ) -> None:
+        """Issue one QK slice, clipping MMA phases to the logical head dimension."""
         self._qk_mma_impl(
             stage_info,
             desc_q_base=desc_q_base,

@@ -219,9 +219,9 @@ SMEM/TMEM buffers and pipeline state.
 Non-absorbed MLA (QK=192, V=128) reuses the paired 128-row Q schedule.
 K is streamed in two 128-wide stages, with MMA restricted to the 128+64
 logical columns. Two query tiles share each K stage, and two softmax groups
-interleave with QK/PV work. The partial K descriptor has a separate task-local
-binding so it does not replace the first descriptor while that descriptor is
-still needed by the second query tile. Q is rounded only to a 128-byte TMA
+interleave with QK/PV work. Separate task-local bindings retain each K
+descriptor for both query tiles. The MMA stage loops include partial slices
+without overwriting another slice's binding. Q is rounded only to a 128-byte TMA
 fragment in shared memory; BF16 Q therefore stores exactly 192 elements.
 For BF16 input and output, O is staged in 64-wide pieces to fit both Q tiles
 and the K/V ring. Ring depth follows the complete shared-memory footprint.
@@ -390,7 +390,6 @@ conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and
 output state.
 
 ```bash
-pytest -q tests/attention/test_attention_ts_context_mla.py
 pytest -q tests/attention/test_attention_ts_context.py
 pytest -q tests/attention/test_attention_ts_mask.py
 ```

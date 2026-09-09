@@ -3141,6 +3141,7 @@ def batch_prefill(
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
+        head_dim_vo=geometry.head_dim_vo,
         q_dtype=geometry.q_dtype,
         kv_dtype=geometry.q_dtype,
         out_dtype=geometry.output_dtype,

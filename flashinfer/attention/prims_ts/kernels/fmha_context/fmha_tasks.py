@@ -632,6 +632,9 @@ def create_load_task(
                             batch_coord=batch_coord,
                             cuseqlen_k=cuseqlen_k,
                             kv_tile_start=kv_tile_start,
+                            seqlen_k=seqlen_k,
+                            kv_request_begin=kv_request_begin,
+                            kv_page_idx_ub=kv_page_idx_ub,
                         )
                         skv.commit()
                 else:
@@ -644,6 +647,9 @@ def create_load_task(
                         batch_coord=batch_coord,
                         cuseqlen_k=cuseqlen_k,
                         kv_tile_start=kv_tile_start,
+                        seqlen_k=seqlen_k,
+                        kv_request_begin=kv_request_begin,
+                        kv_page_idx_ub=kv_page_idx_ub,
                     )
                     skv.commit()
                     with d.first_iter():
@@ -719,6 +725,8 @@ def create_mma_task(
     # Only paged MMA schedules read request coordinates from global metadata.
     qkv_resources = [gmem_qkv] if smem_q.cfg.use_paged_kv else []
     src = _src_resources(*qkv_resources, smem_q, smem_kv, work_queue=work_queue)
+    num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
+    num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
 
     if (
         smem_q.cfg.single_qkv_instance
@@ -728,17 +736,6 @@ def create_mma_task(
         split_src = _src_resources(
             *qkv_resources, smem_q, smem_kv, tmem_p0, work_queue=work_queue
         )
-        num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
-        num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
-        loop_carried_head_dim_stages = 2
-        if (
-            num_head_dim_stages_k != loop_carried_head_dim_stages
-            or num_head_dim_stages_v not in (1, loop_carried_head_dim_stages)
-        ):
-            raise ValueError(
-                "split S/P scheduling expects two K stages and one or two V stages"
-            )
-
         @schedule
         def mma_schedule(
             gqkv: GmemQKVResource,
@@ -802,25 +799,16 @@ def create_mma_task(
                 with domain_loop(loop_start, loop_end, loop_step):
                     if not smem_q.cfg.stats_via_smem:
                         vd0.acquire()
-                    skv.wait()
-                    desc_k_base = skv.k_desc()
-                    sp0.qk_mma(
-                        desc_q_base=desc_q0_base,
-                        desc_k_base=desc_k_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=0,
-                    )
-                    skv.release()
-
-                    skv.wait()
-                    desc_k_base = skv.k_desc()
-                    sp0.qk_mma(
-                        desc_q_base=desc_q0_base,
-                        desc_k_base=desc_k_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=1,
-                    )
-                    skv.release()
+                    for head_dim_stage_idx in range(num_head_dim_stages_k):
+                        skv.wait()
+                        desc_k_base = skv.k_desc()
+                        sp0.qk_mma(
+                            desc_q_base=desc_q0_base,
+                            desc_k_base=desc_k_base,
+                            section=FmhaStage.Loop,
+                            head_dim_stage_idx=head_dim_stage_idx,
+                        )
+                        skv.release()
                     sp0.commit()
                     if not smem_q.cfg.stats_via_smem:
                         vd0.commit()
@@ -831,37 +819,22 @@ def create_mma_task(
                     tmem_p_base = tp0.p_base()
                     to.set_p_base(tmem_p_base=tmem_p_base)
 
-                    skv.wait()
-                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
-                        desc_v_base = skv.v_desc_paged(
+                    for head_dim_stage_idx in range(num_head_dim_stages_v):
+                        skv.wait()
+                        if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
+                            desc_v_base = skv.v_desc_paged(
+                                section=FmhaStage.Loop,
+                                seqlen_k=v_seqlen_k,
+                                kv_tile_start=v_kv_tile_start,
+                            )
+                        else:
+                            desc_v_base = skv.v_desc()
+                        to.pv_mma(
+                            desc_v_base=desc_v_base,
                             section=FmhaStage.Loop,
-                            seqlen_k=v_seqlen_k,
-                            kv_tile_start=v_kv_tile_start,
+                            head_dim_stage_idx=head_dim_stage_idx,
                         )
-                    else:
-                        desc_v_base = skv.v_desc()
-                    to.pv_mma(
-                        desc_v_base=desc_v_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=0,
-                    )
-                    skv.release()
-
-                    skv.wait()
-                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
-                        desc_v_base = skv.v_desc_paged(
-                            section=FmhaStage.Loop,
-                            seqlen_k=v_seqlen_k,
-                            kv_tile_start=v_kv_tile_start,
-                        )
-                    else:
-                        desc_v_base = skv.v_desc()
-                    to.pv_mma(
-                        desc_v_base=desc_v_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=1,
-                    )
-                    skv.release()
+                        skv.release()
                     to.commit()
                     tp0.release()
 
@@ -921,8 +894,6 @@ def create_mma_task(
         )
 
     if smem_q.cfg.single_qkv_instance:
-        num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
-        num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v
 
         @schedule
         def mma_schedule(
@@ -1029,6 +1000,49 @@ def create_mma_task(
     if tmem_sp1 is None or tmem_vec_done_1 is None:
         raise ValueError("paired MMA scheduling requires peer-1 resources")
 
+    # Padded QK is at most 256 for the admitted paired geometries. Keep each
+    # 128-wide slice in its own TS binding so later slices cannot replace it.
+    # The stage loops below handle both the full and partial final slice.
+    if num_head_dim_stages_k > 2:
+        raise ValueError("paired QK staging supports at most two 128-wide slices")
+
+    def qk_mma_slice(sp, desc_q_base, desc_k, section, head_dim_stage_idx):
+        """Route a slice through its own descriptor binding to the shared QK body."""
+        if head_dim_stage_idx == 0:
+            sp.qk_mma(
+                desc_q_base=desc_q_base,
+                desc_k_base=desc_k,
+                section=section,
+                head_dim_stage_idx=head_dim_stage_idx,
+            )
+        else:
+            sp.qk_mma_stage(
+                desc_q_base=desc_q_base,
+                desc_k_stage=desc_k,
+                section=section,
+                head_dim_stage_idx=head_dim_stage_idx,
+            )
+
+    def load_k_stage(skv, head_dim_stage_idx):
+        """Retain the descriptor of each waited K slice for both query tiles."""
+        skv.wait()
+        if head_dim_stage_idx == 0:
+            return skv.k_desc()
+        return skv.k_stage_desc()
+
+    def qk_mma_stages(skv, sp, desc_q_base, section, *, descriptors=None):
+        """Issue all K slices, loading descriptors once and reusing them for Q1."""
+        stages = []
+        for head_dim_stage_idx in range(num_head_dim_stages_k):
+            desc_k = (
+                load_k_stage(skv, head_dim_stage_idx)
+                if descriptors is None
+                else descriptors[head_dim_stage_idx]
+            )
+            qk_mma_slice(sp, desc_q_base, desc_k, section, head_dim_stage_idx)
+            stages.append(desc_k)
+        return stages
+
     @schedule
     def mma_schedule(
         gqkv: GmemQKVResource,
@@ -1041,7 +1055,7 @@ def create_mma_task(
         vd1: TmemStatsDoneResource,
         wq: WorkQueue | None = None,
     ) -> None:
-        """Captured schedule for interleaved QK and PV MMA work."""
+        """Interleave paired QK/PV while retaining each K slice for both Qs."""
         sq.init_descriptor_state()
         skv.init_descriptor_state()
         sp0.init_mma_state()
@@ -1073,54 +1087,33 @@ def create_mma_task(
             # Consume Q0, K0, then QK(Q0,K0)→S0.
             sq.wait()
             desc_q0_base = sq.q0_desc(inst_idx=0)
-            skv.wait()
-            desc_k_base = skv.k_desc()
-            if not smem_q.cfg.stats_via_smem:
-                vd0.acquire()
-            sp0.acquire()
-            sp0.qk_mma(
-                desc_q_base=desc_q0_base,
-                desc_k_base=desc_k_base,
-                section=FmhaStage.Head,
-            )
-            if not smem_q.cfg.stage_kv_by_head_dim:
-                sp0.commit()
-                if not smem_q.cfg.stats_via_smem:
-                    vd0.commit()
-            # Consume Q1, then QK(Q1,K0)→S1.
-            sq.wait()
-            desc_q1_base = sq.q1_desc(inst_idx=1)
-            if not smem_q.cfg.stats_via_smem:
-                vd1.acquire()
-            sp1.acquire()
-            sp1.qk_mma(
-                desc_q_base=desc_q1_base,
-                desc_k_base=desc_k_base,
-                section=FmhaStage.Head,
-            )
-            if smem_q.cfg.stage_kv_by_head_dim:
-                # Keep both K slices until both query tiles have consumed them.
-                skv.wait()
-                desc_k_tail = skv.k_tail_desc()
-                sp0.qk_mma_tail(
-                    desc_q_base=desc_q0_base,
-                    desc_k_tail=desc_k_tail,
-                    section=FmhaStage.Head,
+            for head_dim_stage_idx in range(num_head_dim_stages_k):
+                desc_k = load_k_stage(skv, head_dim_stage_idx)
+                if head_dim_stage_idx == 0:
+                    if not smem_q.cfg.stats_via_smem:
+                        vd0.acquire()
+                    sp0.acquire()
+                qk_mma_slice(
+                    sp0, desc_q0_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
-                sp0.commit()
-                if not smem_q.cfg.stats_via_smem:
-                    vd0.commit()
-                sp1.qk_mma_tail(
-                    desc_q_base=desc_q1_base,
-                    desc_k_tail=desc_k_tail,
-                    section=FmhaStage.Head,
+                if head_dim_stage_idx == num_head_dim_stages_k - 1:
+                    sp0.commit()
+                    if not smem_q.cfg.stats_via_smem:
+                        vd0.commit()
+                if head_dim_stage_idx == 0:
+                    sq.wait()
+                    desc_q1_base = sq.q1_desc(inst_idx=1)
+                    if not smem_q.cfg.stats_via_smem:
+                        vd1.acquire()
+                    sp1.acquire()
+                qk_mma_slice(
+                    sp1, desc_q1_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
-                skv.release()
+                if head_dim_stage_idx > 0:
+                    skv.release()
             sp1.commit()
             if not smem_q.cfg.stats_via_smem:
                 vd1.commit()
-            # Q0/Q1 stay live because UMMA reads Q throughout the K-loop.
-            # Release K0 (done with QK→S0 and QK→S1), then consume V0.
             skv.release()
             skv.wait()
             if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
@@ -1138,52 +1131,22 @@ def create_mma_task(
             to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Head)
             to.commit()
 
-            # LOOP: interleave QK and PV work while preserving the previous V
-            # tile until its PV MMA has consumed it:
-            #   QK0(deferred commit) -> PV1(V_prev, release V_prev) ->
-            #   QK1(commit) -> release Ki+1 -> wait Vi+1 -> PV0(no commit)
+            # QK0 -> PV1 -> QK1 -> PV0: retain each K slice and the previous V
+            # until both peer query tiles have consumed the corresponding data.
             with domain_loop(loop_start, loop_end, loop_step):
-                skv.wait()
-                desc_k_base = skv.k_desc()
-                # QK0: QK(Q0,Ki+1) → S0 (no acquire; handle held from PV0).
-                sp0.qk_mma(
-                    desc_q_base=desc_q0_base,
-                    desc_k_base=desc_k_base,
-                    section=FmhaStage.Loop,
-                )
-                if smem_q.cfg.stage_kv_by_head_dim:
-                    skv.wait()
-                    desc_k_tail = skv.k_tail_desc()
-                    sp0.qk_mma_tail(
-                        desc_q_base=desc_q0_base,
-                        desc_k_tail=desc_k_tail,
-                        section=FmhaStage.Loop,
-                    )
+                k_descriptors = qk_mma_stages(skv, sp0, desc_q0_base, FmhaStage.Loop)
                 sp0.commit()
-                # PV1(V_prev): P1 * V_prev → O1.
                 to.acquire()
                 sp1.acquire()
                 sp1.p_read()
                 to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Loop)
                 to.commit()
-                # Release V_prev after PV1 UMMA consumed SMEM data.
                 skv.release()
-                # QK1: QK(Q1,Ki+1) → S1 (no acquire; handle held from PV1).
-                sp1.qk_mma(
-                    desc_q_base=desc_q1_base,
-                    desc_k_base=desc_k_base,
-                    section=FmhaStage.Loop,
+                qk_mma_stages(
+                    skv, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
                 )
-                if smem_q.cfg.stage_kv_by_head_dim:
-                    sp1.qk_mma_tail(
-                        desc_q_base=desc_q1_base,
-                        desc_k_tail=desc_k_tail,
-                        section=FmhaStage.Loop,
-                    )
                 sp1.commit()
-                # Release Ki+1, then wait Vi+1.
-                skv.release()
-                if smem_q.cfg.stage_kv_by_head_dim:
+                for _ in range(num_head_dim_stages_k):
                     skv.release()
                 skv.wait()
                 if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
@@ -1199,26 +1162,16 @@ def create_mma_task(
                 to.acquire()
                 sp0.acquire()
                 sp0.p_read()
-                to.pv_mma(
-                    desc_v_base=desc_v_base,
-                    section=FmhaStage.Loop,
-                    inst_idx=1,
-                )
+                to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Loop, inst_idx=1)
                 to.commit()
 
-            # TAIL: release Qs, close the deferred SP state, and run the final
-            # PV→O1 MMA.
             sq.release()
             sq.release()
             sp0.commit()
             to.acquire()
             sp1.acquire()
             sp1.p_read()
-            to.pv_mma(
-                desc_v_base=desc_v_base,
-                section=FmhaStage.Tail,
-                is_tail=True,
-            )
+            to.pv_mma(desc_v_base=desc_v_base, section=FmhaStage.Tail, is_tail=True)
             to.commit()
             skv.release()
             sp1.commit()

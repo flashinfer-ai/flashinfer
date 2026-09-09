@@ -1796,6 +1796,7 @@ def _configure_early_tile_sum_policy(
         if cfg.is_causal
         else _EARLY_TILE_SUM_DENSE_REGISTER_BUDGET
     )
+
     # MLA's additional live K descriptor benefits from the reference's
     # softmax/correction split while staying within the same register budget.
     if cfg.logical_head_dim_qk == 192 and cfg.is_causal and cfg.q_dtype.width == 8:
@@ -1882,8 +1883,9 @@ def _configure_head_dim_staging(cfg: FmhaConfig) -> None:
     cfg.head_dim_per_stage_kv = 128
     cfg.num_head_dim_stages_k = cfg.qk_mma_tiler[2] // cfg.head_dim_per_stage_kv
     cfg.num_head_dim_stages_v = cfg.pv_mma_tiler[1] // cfg.head_dim_per_stage_kv
-    # Two BF16 Q tiles plus three K/V stages leave room for two 64-wide
-    # output staging buffers. FP8 operands/output can retain 128-wide stores.
+    # K/V transfers remain 128-wide. Unlike the single-query schedule, paired
+    # 16-bit Q/O needs two 64-wide O buffers to leave room for both Q tiles
+    # and a complete K/K/V cadence. FP8 can retain 128-wide O stores.
     cfg.head_dim_per_stage_o = (
         64
         if (
@@ -2504,6 +2506,7 @@ class FmhaTs:
         v_dtype = in_dtype or cutlass.Float16
         o_dtype = out_dtype or cutlass.Float16
 
+        # Validate the logical Q/K and V head dimensions before choosing tiles.
         d_v = d if d_v is None else d_v
         if (d_v != d or d == 192) and (d, d_v) != (192, 128):
             raise ValueError("asymmetric context requires QK=192 and V=128")
@@ -2511,9 +2514,9 @@ class FmhaTs:
             raise NotImplementedError(
                 "192/128 requires contiguous query-paired context"
             )
-        # TMA fills the partial final Q/K slice with zeros. Global tensors
-        # retain their compact 192-element rows; only SMEM is padded.
-        padded_d = 256 if d == 192 else d
+        # Round the MMA extent to the next power of two, with a 64-wide minimum.
+        # Global Q/K rows stay compact; TMA zero-fills partial shared tiles.
+        padded_d = 1 << (max(d, 64) - 1).bit_length()
         cfg = FmhaConfig()
         cfg.logical_head_dim_qk = d
         self.cfg = cfg
@@ -2789,13 +2792,8 @@ class FmhaTs:
                 stride_order=stride_order,
                 swizzle=tma_qkv_swizzle,
                 l2_promotion=cuda.TensorMapL2Promotion.none,
-                # The 192-wide Q tensor has an OOB head-dimension tail.
-                # Ragged TMA's default NaN fill would poison those QK FMAs.
-                oob_fill=(
-                    cuda.TensorMapFloatOOBFill.none
-                    if cfg.logical_head_dim_qk == 192
-                    else None
-                ),
+                # Zero-fill partial Q rows and head-dimension fragments.
+                oob_fill=cuda.TensorMapFloatOOBFill.none,
             )
         else:
             tma_q_desc = cuda.create_tensor_map_tiled_from_view(

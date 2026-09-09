@@ -2783,6 +2783,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
+            head_dim_vo=head_dim_vo,
             q_dtype=q.dtype,
             kv_dtype=k.dtype,
             packed=True,
