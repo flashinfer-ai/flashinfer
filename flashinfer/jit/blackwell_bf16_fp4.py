@@ -402,9 +402,38 @@ _INTEGRATION_KERNEL_KEYS = {
     "use_pdl",
 }
 _INTEGRATION_ROW7_EXACT_SHAPE = {"M": 17, "N": 3072, "K": 3072}
+_INTEGRATION_ROW3_EXACT_SHAPE = {"M": 768, "N": 2112, "K": 2048}
+_INTEGRATION_ROW3_IR_SYMBOL = (
+    "flashinfer_blackwell_bf16_fp4_gemm_seed_v41_cute_large_m_p3_scale0_followup"
+)
 _INTEGRATION_M16_WINNER_IR_SYMBOL = (
     "flashinfer_blackwell_bf16_fp4_gemm_seed_v27_cute_m16_abi_shallow_v2"
 )
+
+
+def _row3_launch_grid() -> dict[str, Any]:
+    def constant(value: int) -> dict[str, Any]:
+        return {"op": "constant", "value": value}
+
+    def binary(op: str, lhs: dict, rhs: dict) -> dict[str, Any]:
+        return {"op": op, "lhs": lhs, "rhs": rhs}
+
+    def tiles(name: str, index: int) -> dict[str, Any]:
+        parameter = {"op": "parameter", "name": name,
+                     "host_argument_index": index, "kernel_argument_index": index}
+        return binary("floor_divide",
+                      binary("subtract", binary("add", parameter, constant(64)), constant(1)),
+                      constant(64))
+
+    return {
+        axis: {"host_argument_index": 8 + index, "expression": expression}
+        for index, (axis, expression) in enumerate(zip(
+            ("x", "y", "z"),
+            (binary("multiply", tiles("M", 5), tiles("N", 6)), constant(1), constant(1)),
+        ))
+    }
+
+
 _INTEGRATION_GRID_KINDS = {
     "two_dimensional": "generic_2d",
     "flat_overflow": "generic_flat",
@@ -893,15 +922,15 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
     ir_symbols = manifest["ir_symbols"]
     if (
         not isinstance(ir_symbols, list)
-        or len(ir_symbols) != 15
+        or len(ir_symbols) != 16
         or any(not isinstance(symbol, str) or not symbol for symbol in ir_symbols)
         or len(set(ir_symbols)) != len(ir_symbols)
     ):
         raise ValueError("Blackwell BF16 x FP4 ABI manifest has invalid IR symbols")
 
     kernels = manifest["kernels"]
-    if not isinstance(kernels, list) or len(kernels) != 75:
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest requires 75 kernels")
+    if not isinstance(kernels, list) or len(kernels) != 76:
+        raise ValueError("Blackwell BF16 x FP4 ABI manifest requires 76 kernels")
 
     kernel_symbols: set[str] = set()
     module_idents: set[str] = set()
@@ -911,6 +940,8 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
     exact_row7: list[dict[str, Any]] = []
     generic_row7: list[dict[str, Any]] = []
     winner_m16: list[dict[str, Any]] = []
+    exact_row3: list[dict[str, Any]] = []
+    generic_row3: list[dict[str, Any]] = []
 
     for kernel in kernels:
         if not isinstance(kernel, dict):
@@ -1056,6 +1087,8 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
             )
 
         exact_shape = kernel.get("exact_shape")
+        exact_tma_m64 = component == "cute_warp_mma_m64_bf16" and exact_shape is not None
+        expected_exact_shape = _INTEGRATION_ROW3_EXACT_SHAPE if exact_tma_m64 else _INTEGRATION_ROW7_EXACT_SHAPE
         if exact_shape is not None:
             if (
                 not isinstance(exact_shape, dict)
@@ -1064,16 +1097,16 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
                     type(exact_shape[name]) is not int or exact_shape[name] <= 0
                     for name in ("M", "N", "K")
                 )
-                or exact_shape != _INTEGRATION_ROW7_EXACT_SHAPE
+                or exact_shape != expected_exact_shape
             ):
                 raise ValueError(
-                    "Blackwell BF16 x FP4 integration manifest row7 exact shape "
+                    f"Blackwell BF16 x FP4 integration manifest row{3 if exact_tma_m64 else 7} exact shape "
                     "does not match schema 3"
                 )
-        if exact_shape is not None and not raw_pointer_m32:
+        if exact_shape is not None and not (raw_pointer_m32 or exact_tma_m64):
             raise ValueError(
                 "Blackwell BF16 x FP4 integration manifest exact shape is not "
-                "the row7 raw-pointer specialization"
+                "an accepted M32/M64 specialization"
             )
         if raw_pointer_m32:
             if (
@@ -1101,6 +1134,30 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
         ):
             generic_row7.append(kernel)
 
+        if exact_tma_m64:
+            if (
+                kernel["ir_symbol"] != _INTEGRATION_ROW3_IR_SYMBOL
+                or kernel["has_alpha"] is not True
+                or kernel["enable_pdl"] is not True
+                or kernel["logical_grid_mode"] != "persistent"
+                or kernel["grid_mode"] != "flat_overflow"
+                or kernel["launch_grid"] != _row3_launch_grid()
+                or kernel.get("tile_m") != 64
+                or kernel["smem_data_offset_bytes"] != 1024
+                or kernel["smem_pool_bytes"] != 72704
+            ):
+                raise ValueError(
+                    "Blackwell BF16 x FP4 integration manifest row3 exact kernel "
+                    "does not match its selected physical implementation"
+                )
+            exact_row3.append(kernel)
+        elif (
+            component == "cute_warp_mma_m64_bf16"
+            and kernel["has_alpha"] is True
+            and kernel["enable_pdl"] is True
+        ):
+            generic_row3.append(kernel)
+
     if observed_ir_symbols != set(ir_symbols):
         raise ValueError(
             "Blackwell BF16 x FP4 integration manifest IR inventory is incomplete"
@@ -1127,6 +1184,17 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
             "does not isolate the exact row7 specialization"
         )
 
+    if len(exact_row3) != 1 or len(generic_row3) != 1:
+        raise ValueError(
+            "Blackwell BF16 x FP4 integration manifest requires one exact row3 "
+            "specialization and one generic M64 fallback"
+        )
+    if sum(kernel["ir_symbol"] == exact_row3[0]["ir_symbol"] for kernel in kernels) != 1:
+        raise ValueError(
+            "Blackwell BF16 x FP4 integration manifest physical IR inventory "
+            "does not isolate the exact row3 specialization"
+        )
+
     dispatch = manifest["dispatch"]
     if not isinstance(dispatch, dict):
         raise ValueError("Blackwell BF16 x FP4 ABI manifest dispatch must be an object")
@@ -1143,37 +1211,27 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError(
             "Blackwell BF16 x FP4 ABI manifest requires 11 dispatch routes"
         )
-    m32_route_name = _COMPONENT_SPECS["cute_warp_mma_m32_bf16"][0]
-    m32_routes = [route for route in routes if route.get("route") == m32_route_name]
-    if len(m32_routes) != 1:
-        raise ValueError(
-            "Blackwell BF16 x FP4 integration manifest is missing the M32 route"
-        )
-    specializations = m32_routes[0].get("specializations")
-    exact_match = {
-        "out_dtype": "bfloat16",
-        "has_alpha": True,
-        "enable_pdl": True,
-        **_INTEGRATION_ROW7_EXACT_SHAPE,
-    }
-    generic_match = {
-        "out_dtype": "bfloat16",
-        "has_alpha": True,
-        "enable_pdl": True,
-    }
-    if (
-        not isinstance(specializations, list)
-        or len(specializations) != 5
-        or specializations[0].get("match") != exact_match
-        or not any(
-            specialization.get("match") == generic_match
-            for specialization in specializations[1:]
-        )
+    for component, shape, label in (
+        ("cute_warp_mma_m32_bf16", _INTEGRATION_ROW7_EXACT_SHAPE, "row7/M32"),
+        ("cute_warp_mma_m64_bf16", _INTEGRATION_ROW3_EXACT_SHAPE, "row3/M64"),
     ):
-        raise ValueError(
-            "Blackwell BF16 x FP4 integration manifest row7 exact route must "
-            "precede the generic M32 fallback"
-        )
+        route_name = _COMPONENT_SPECS[component][0]
+        selected_routes = [route for route in routes if route.get("route") == route_name]
+        if len(selected_routes) != 1:
+            raise ValueError(f"Blackwell BF16 x FP4 integration manifest is missing the {label} route")
+        specializations = selected_routes[0].get("specializations")
+        generic_match = {"out_dtype": "bfloat16", "has_alpha": True, "enable_pdl": True}
+        exact_match = {**generic_match, **shape}
+        if (
+            not isinstance(specializations, list)
+            or len(specializations) != 5
+            or specializations[0].get("match") != exact_match
+            or not any(item.get("match") == generic_match for item in specializations[1:])
+        ):
+            raise ValueError(
+                f"Blackwell BF16 x FP4 integration manifest {label} exact route must "
+                "precede the generic fallback"
+            )
 
 
 def _manifest_kernel_specs(manifest: dict[str, Any]) -> list[dict[str, Any]]:

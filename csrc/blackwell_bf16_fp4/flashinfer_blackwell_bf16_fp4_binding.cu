@@ -587,8 +587,10 @@ inline void LaunchWarp(const Problem& problem, const TensorView& a, const Tensor
       CeilDiv(problem.m, grid_tile_m) * CeilDiv(problem.n, 64);
   const bool exact_k1024_m16 =
       spec.raw_pointer_abi && component == Component::kTiledWarpM16Bf16;
+  const bool exact_large_m =
+      component == Component::kTiledWarpM64Bf16 && spec.exact_m != 0;
   const int64_t launch_grid =
-      exact_k1024_m16
+      (exact_k1024_m16 || exact_large_m)
           ? total_tiles
           : std::min<int64_t>(
                 total_tiles,
