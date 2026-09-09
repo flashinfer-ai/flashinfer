@@ -856,7 +856,7 @@ def test_cutlass_per_expert_activation_overrides():
                     weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
                 )
             ),
-            "QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)",
+            "weight=NVFP4, activation=NVFP4",
         ),
         (
             _config(finalize=MoEFinalizeConfig(do_finalize=False)),
@@ -888,7 +888,7 @@ def test_cutlass_runner_rejects_out_of_scope_configs(config, match):
             _config(
                 quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
             ),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             _config(
@@ -927,32 +927,32 @@ def test_cutlass_nvfp4_runner_rejects_out_of_scope_configs(config, match):
         (
             CutlassFp8PerTensorRunner,
             QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             CutlassFp8BlockRunner,
             QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             CutlassMxfp8Mxfp4Runner,
             QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             CutlassMxfp8Runner,
             QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             CutlassW4A8Runner,
             QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             CutlassHummingRunner,
             QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
-            "QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)",
+            "weight=BF16, activation=BF16",
         ),
         (
             CutlassFp8PerTensorRunner,
