@@ -79,12 +79,20 @@ def _reference(
     mrope_k,
     cache_pos,
     dtype,
+    out_dtype,
 ):
-    """What the kernel should produce, computed row by row on the host."""
+    """What the kernel should produce, computed row by row on the host.
+
+    ``dtype`` is the compute dtype and every intermediate rounds to it, exactly as
+    ``apply_norm_rope`` does. ``out_dtype`` is reached only by the final stores, which
+    is what keeps a narrowed result equal to the un-narrowed one rounded once.
+    """
     num_tokens = q.shape[0]
     state_size = state_cache.shape[1]
     comp_page = compressed_cache.shape[1]
-    q_out = torch.zeros(num_tokens, num_heads, head_dim, dtype=dtype, device=q.device)
+    q_out = torch.zeros(
+        num_tokens, num_heads, head_dim, dtype=out_dtype, device=q.device
+    )
     state = state_cache.clone()
     compressed = compressed_cache.clone()
 
@@ -101,7 +109,7 @@ def _reference(
             out = _norm_rope_row(
                 row, q_weight, table, pos, mrope_h, mrope_w, mrope_q, eps, dtype
             )
-            q_out[token, head] = out.to(dtype)
+            q_out[token, head] = out.to(out_dtype)
 
     # The compression reads the ring as the previous step left it.
     history = state_cache.clone()
@@ -166,7 +174,7 @@ def _reference(
                 out = _norm_rope_row(
                     acc, k_weight, table, pos, mrope_h, mrope_w, mrope_k, eps, dtype
                 )
-                compressed[slot // comp_page, slot % comp_page, 0] = out.to(dtype)
+                compressed[slot // comp_page, slot % comp_page, 0] = out.to(out_dtype)
 
         if work_in_request == 0:
             rows = min(query_len, state_size)
@@ -196,6 +204,7 @@ def _case(
     state_size=8,
     comp_page=4,
     dtype=torch.bfloat16,
+    out_dtype=None,
     mrope=False,
     mrope_k=None,
     cache_pos=False,
@@ -272,7 +281,12 @@ def _case(
         1, (num_requests * slots_per_request + comp_page - 1) // comp_page
     )
     compressed_cache = torch.zeros(
-        comp_blocks, comp_page, 1, head_dim, dtype=dtype, device=device
+        comp_blocks,
+        comp_page,
+        1,
+        head_dim,
+        dtype=dtype if out_dtype is None else out_dtype,
+        device=device,
     )
     compressed_slots = (
         token_to_req * slots_per_request + logical // compress_ratio
@@ -318,6 +332,7 @@ def _case(
         mrope_k=mrope_k,
         cache_pos=cache_pos,
         dtype=dtype,
+        out_dtype=dtype if out_dtype is None else out_dtype,
     )
 
 
@@ -326,7 +341,7 @@ def _run(case):
         case["q"].shape[0],
         case["num_heads"],
         case["head_dim"],
-        dtype=case["dtype"],
+        dtype=case["out_dtype"],
         device=case["q"].device,
     )
     state = case["state_cache"].clone()
@@ -357,13 +372,31 @@ def _run(case):
     return q_out, state, compressed
 
 
+def _assert_fp8_within_one_ulp(actual, expected):
+    # e4m3 is sign-magnitude, so within a sign the uint8 code order matches the value
+    # order and one ulp is one code step. The two paths' intermediates differ in the
+    # pooling accumulation order, which at denormal magnitudes (absolute grid step
+    # 2**-9) shows up as up to 2 code steps.
+    code_diff = (
+        actual.view(torch.uint8).int() - expected.view(torch.uint8).int()
+    ).abs()
+    abs_diff = (actual.float() - expected.float()).abs()
+    assert bool(((code_diff <= 1) | (abs_diff <= 2**-8)).all())
+
+
 def _assert_matches(case):
     q_out, state, compressed = _run(case)
     want_q, want_state, want_compressed = _reference(**case)
     tol = dict(rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(q_out.float(), want_q.float(), **tol)
+    if case["out_dtype"] == torch.float8_e4m3fn:
+        _assert_fp8_within_one_ulp(q_out, want_q)
+        _assert_fp8_within_one_ulp(compressed, want_compressed)
+    else:
+        torch.testing.assert_close(q_out.float(), want_q.float(), **tol)
+        torch.testing.assert_close(compressed.float(), want_compressed.float(), **tol)
+    # The raw ring is never narrowed, whatever the outputs do.
+    assert state.dtype == case["dtype"]
     torch.testing.assert_close(state.float(), want_state.float(), **tol)
-    torch.testing.assert_close(compressed.float(), want_compressed.float(), **tol)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -833,3 +866,78 @@ def test_rejects_a_compress_ratio_that_is_not_an_int32():
     case = _case(num_tokens=8)
     case["compress_ratio"] = 4294967297
     _expect_rejected(case, "fit in 32 bits")
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_narrowing_output_to_fp8(dtype, head_dim):
+    """The indexer's two outputs may narrow to e4m3 while the ring stays wide."""
+    _skip_unless_cuda()
+    _assert_matches(
+        _case(
+            num_tokens=16,
+            head_dim=head_dim,
+            dtype=dtype,
+            out_dtype=torch.float8_e4m3fn,
+        )
+    )
+
+
+def test_narrowing_leaves_the_ring_at_the_compute_dtype():
+    """A narrowed run must write the same raw ring as an un-narrowed one."""
+    _skip_unless_cuda()
+    wide = _case(num_tokens=16)
+    narrow = _case(num_tokens=16, out_dtype=torch.float8_e4m3fn)
+    _, wide_state, _ = _run(wide)
+    _, narrow_state, _ = _run(narrow)
+    assert narrow_state.dtype == torch.bfloat16
+    assert torch.equal(wide_state, narrow_state)
+
+
+def test_output_dtypes_must_agree():
+    """``q_out`` and the compressed cache are one dtype, so a split is rejected."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=8, out_dtype=torch.float8_e4m3fn)
+    case["compressed_cache"] = case["compressed_cache"].to(torch.bfloat16)
+    with pytest.raises(
+        RuntimeError, match=r"compressed_cache\.dtype\(\) == q_out\.dtype\(\)"
+    ):
+        _run(case)
+
+
+@pytest.mark.parametrize(
+    "out_dtype",
+    [torch.float16, torch.float8_e5m2, torch.float8_e4m3fnuz],
+    ids=["cross-width", "e5m2", "e4m3fnuz"],
+)
+def test_rejected_output_dtypes(out_dtype):
+    """Only the compute dtype and plain e4m3 are dispatched."""
+    _skip_unless_cuda()
+    with pytest.raises(RuntimeError, match="q_out must be .* or float8_e4m3fn"):
+        _run(_case(num_tokens=8, dtype=torch.bfloat16, out_dtype=out_dtype))
+
+
+def test_dispatch_mask_matches_the_arms():
+    """Every advertised relation is one the dispatch really runs.
+
+    Both directions of the coupling would need a second build with
+    ``FLASHINFER_ENABLE_FP8_E4M3`` off, which this suite does not produce; the guard in
+    ``sparse_pre_indexer.cu`` is what ties the missing arm to the missing bit. What is
+    checked here is the direction that can be: nothing is advertised that the dispatch
+    refuses.
+    """
+    from flashinfer.sparse_pre_indexer import (
+        QSA_PRE_INDEXER_NARROW_E4M3,
+        QSA_PRE_INDEXER_SAME_AS_COMPUTE,
+        qsa_pre_indexer_dispatch_mask,
+    )
+
+    _skip_unless_cuda()
+    mask = qsa_pre_indexer_dispatch_mask()
+    # The same-dtype arm is unconditional; e4m3 rides on the build flag, and this build
+    # has it (jit/core.py passes -DFLASHINFER_ENABLE_FP8_E4M3 to every spec).
+    assert mask & QSA_PRE_INDEXER_SAME_AS_COMPUTE
+    assert mask & QSA_PRE_INDEXER_NARROW_E4M3
+    # And each advertised relation runs rather than raising.
+    _assert_matches(_case(num_tokens=8))
+    _assert_matches(_case(num_tokens=8, out_dtype=torch.float8_e4m3fn))
