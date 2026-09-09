@@ -774,7 +774,7 @@ def _attest_exact_pr_fallback(repo_root, implementation_path):
         "merge_commit": _EXACT_PR_MERGE_COMMIT,
         "source_sha256": exact_source_sha256,
         "fallback_symbol_ast_sha256": exact_symbol_sha256,
-        "route": "backend='cute-dsl'",
+        "route": "generated selector forced to return None",
     }
 
 
