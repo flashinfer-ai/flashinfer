@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 from routines import attention as attention_routine
+from routines import gemm as gemm_routine
 from routines.flashinfer_benchmark_utils import routine_cc_to_supported_backends
 
 
@@ -99,6 +100,50 @@ def _parse_prims_ts_case(routine, extra_args):
             *extra_args,
         ]
     )
+
+
+def _parse_dual_bf16_weight_case(*extra_args):
+    return flashinfer_benchmark.parse_args(
+        [
+            "--routine",
+            "mm_bf16_dual_weight",
+            "--m",
+            "128",
+            "--n",
+            "192",
+            "--k",
+            "4096",
+            *extra_args,
+        ]
+    )
+
+
+def test_mm_bf16_dual_weight_benchmark_defaults():
+    args = _parse_dual_bf16_weight_case()
+
+    assert args.backends == ["dual-bf16"]
+    assert args.input_dtype == "bfloat16"
+    assert args.mat2_dtype == "float32"
+
+
+@pytest.mark.parametrize(
+    "dtype_args,match",
+    [
+        (("--input_dtype", "float16"), "input_dtype=bfloat16"),
+        (("--mat2_dtype", "bfloat16"), "mat2_dtype=float32"),
+    ],
+)
+def test_mm_bf16_dual_weight_benchmark_rejects_unsupported_dtypes(
+    monkeypatch, dtype_args, match
+):
+    args = _parse_dual_bf16_weight_case(*dtype_args)
+    monkeypatch.setattr(gemm_routine, "get_device", lambda _args: torch.device("cuda"))
+    monkeypatch.setattr(
+        gemm_routine.torch.cuda, "get_device_capability", lambda _device: (10, 0)
+    )
+
+    with pytest.raises(ValueError, match=match):
+        gemm_routine.testMmBf16DualWeight(args)
 
 
 def test_prims_ts_backend_alias_is_canonicalized():

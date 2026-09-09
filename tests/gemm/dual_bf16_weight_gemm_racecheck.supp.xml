@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Compute Sanitizer 2026.1 attributes tcgen05.alloc.cta_group::2's hardware
+  write-back to thread 0 and its destination operand read to the issuing warp,
+  then reports them as a shared-memory RAW hazard. Restrict the suppression to
+  CUTLASS Allocator2Sm::allocate; all other accesses in the 2SM kernel remain
+  checked. Re-test without this file when upgrading Compute Sanitizer.
+-->
+<ComputeSanitizerOutput>
+  <record>
+    <kind>Analysis</kind>
+    <level>Error</level>
+    <what>
+      <text>Race condition</text>
+      <source>
+        <direction>Write</direction>
+        <where>
+          <func>kernel</func>
+        </where>
+      </source>
+      <destination>
+        <direction>Read</direction>
+        <where>
+          <func>allocate</func>
+          <path>.*tmem_allocator_sm100.hpp</path>
+          <line>141</line>
+        </where>
+      </destination>
+      <destination>
+        <direction>Read</direction>
+        <where>
+          <func>allocate</func>
+          <path>.*tmem_allocator_sm100.hpp</path>
+          <line>141</line>
+        </where>
+      </destination>
+    </what>
+  </record>
+</ComputeSanitizerOutput>

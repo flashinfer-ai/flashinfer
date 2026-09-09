@@ -68,6 +68,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.gated_act_mxfp8",
     "flashinfer.gemm.gemm_base",
     "flashinfer.gemm.gemm_bf16_fp4",
+    "flashinfer.gemm.gemm_dual_bf16_weight",
     "flashinfer.gemm.gemm_svdquant",
     "flashinfer.gemm.kernels.grouped_gemm_masked_wrapper",
     "flashinfer.gemm.routergemm",

@@ -243,6 +243,7 @@ benchmark_apis = {
         "mm_bf16_fp4",
         "mm_mxfp8",
         "mm_bf16",
+        "mm_bf16_dual_weight",
         "bmm_bf16",
         "tinygemm_bf16",
     ],

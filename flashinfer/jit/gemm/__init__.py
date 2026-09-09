@@ -33,6 +33,7 @@ from .core import (
     gen_gemm_sm90_module,
 )
 from .deepgemm import gen_deepgemm_sm100_module
+from .dual_bf16_weight import gen_dual_bf16_weight_gemm_sm100_module
 from .fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
 
 __all__ = [
@@ -53,5 +54,6 @@ __all__ = [
     "gen_tgv_gemm_sm10x_module",
     "gen_gemm_sm90_module",
     "gen_deepgemm_sm100_module",
+    "gen_dual_bf16_weight_gemm_sm100_module",
     "gen_fp8_blockscale_gemm_sm90_module",
 ]
