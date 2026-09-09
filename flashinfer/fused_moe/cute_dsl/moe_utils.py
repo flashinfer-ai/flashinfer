@@ -476,6 +476,12 @@ class MoESortResult(tuple):
                 num_non_exiting_tiles,
             ),
         )
+        result.tile_idx_to_expert_idx = tile_idx_to_expert_idx
+        result.tile_idx_to_mn_limit = tile_idx_to_mn_limit
+        result.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
+        result.permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx
+        result.total_num_padded_tokens = total_num_padded_tokens
+        result.num_non_exiting_tiles = num_non_exiting_tiles
         result.expert_counts = expert_counts
         return result
 
