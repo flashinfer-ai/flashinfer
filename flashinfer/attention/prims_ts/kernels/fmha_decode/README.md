@@ -50,7 +50,7 @@ graph. This is not a public knob.
 | Head dimension | 64, 128, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` and `1 <= Hq/Hkv <= 32` |
+| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
 | Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |

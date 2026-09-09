@@ -114,7 +114,7 @@ uv pip install --python "${VENV}/bin/python" \
 
 # NIXL-EP runtime base library — supplied by this pip wheel; the NIXL-EP
 # plugin loads libnixl.so from it at first use. (NCCL-EP's base libnccl.so.2 +
-# libnccl_ep.so come from the nccl4py wheel installed below.)
+# libnccl_ep.so come from the nccl-extensions wheel installed below.)
 uv pip install --python "${VENV}/bin/python" --no-deps \
     "nixl-cu13>=1.0.1"
 
@@ -124,9 +124,12 @@ uv pip install --python "${VENV}/bin/python" --no-deps \
 # Why: torch 2.12's `cuda-toolkit[nvjitlink]` metapackage pin trips uv's
 # resolver during the editable `-e .` resolution (nvidia-nvjitlink METADATA
 # mismatch). Installing the leaf deps first + `--no-deps -e .` sidesteps that.
-# nccl4py>=0.3.1 = NCCL-EP (nccl.ep + bundled libnccl_ep.so); cuda-python and
-# nccl4py's cuda.core/cuda-bindings come along here. Use the project's CUDA
-# extra dependency floor for this runtime environment.
+# nccl-extensions>=0.1.0 = NCCL-EP (nccl.ep + bundled libnccl_ep.so). nccl.ep
+# moved out of nccl4py in 0.4.1, so nccl4py alone no longer provides it; we
+# still need nccl4py>=0.4.1 for nccl.core.Communicator (it comes in
+# transitively, pinned here only to exclude the 0.3.1 that also shipped
+# nccl/ep). cuda-python and cuda.core/cuda-bindings come along here. Use the
+# project's CUDA extra dependency floor for this runtime environment.
 CUDA_EXTRA_DEPENDENCY_OUTPUT="$(
     PYTHONPATH="${REPO_ROOT}" "${VENV}/bin/python" -c \
         'from build_utils import get_cuda_extra_dependency_requirements; print(*get_cuda_extra_dependency_requirements("13"), sep="\n")'
@@ -138,7 +141,8 @@ fi
 uv pip install --python "${VENV}/bin/python" \
     numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
     "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.13.0" \
-    "cuda-tile>=1.4.0" "cuda-python>=13.0" "nccl4py>=0.3.1" \
+    "cuda-tile>=1.4.0" "cuda-python>=13.0" \
+    "nccl-extensions>=0.1.0" "nccl4py>=0.4.1" \
     "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
 
 # ---- 6. FlashInfer + both EP backends -------------------------------------
@@ -170,7 +174,7 @@ rm -rf "${REPO_ROOT}/build_nvep/nixl" "${REPO_ROOT}/build_nvep/nccl"
 echo "=== building flashinfer + NIXL-EP (this is the long step) ==="
 cd "${REPO_ROOT}"
 # Build flashinfer + compile NIXL-EP from the submodule. --no-deps because all
-# runtime deps (incl. nccl4py for NCCL-EP) were installed above; this avoids the
+# runtime deps (incl. nccl-extensions for NCCL-EP) were installed above; this avoids the
 # torch/cuda-toolkit nvjitlink resolution conflict under uv.
 BUILD_NIXL_EP=1 \
     uv pip install --python "${VENV}/bin/python" \

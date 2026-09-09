@@ -27,7 +27,8 @@ DOCA / UCX-from-source / GDRCopy layers of the NIXL image are unnecessary for NC
 
 Build (`docker/install/build_flashinfer_ep_pytorch.sh` does the install): it pins the
 verified set over the base image's constraints — `nvidia-nccl-cu13==2.30.7` (via
-`PIP_CONSTRAINT=` to beat torch's 2.30.4 pin), `nccl4py[cu13]==0.3.1`, `cuda-core==1.0.1`,
+`PIP_CONSTRAINT=` to beat torch's 2.30.4 pin), `nccl-extensions[cu13]==0.1.0`,
+`nccl4py[cu13]==0.5.0`, `cuda-core==1.0.1`,
 `cuda-bindings==13.2.0` — then `BUILD_NCCL_EP=1 BUILD_NIXL_EP=0 pip install -e .`
 (the moe_ep deps are base dependencies now; no extra needed).
 
@@ -45,7 +46,7 @@ srun -N1 --container-image=nvcr.io/nvidia/pytorch:26.05-py3 \
 stack even single-node; **NCCL ≥ 2.30.7** (2.27/2.29 fail group-create at `nccl_ep.cc:1438`
 on B200) bound **first** on `LD_LIBRARY_PATH`; and **`NCCL_MNNVL_ENABLE=1` for multi-node**
 (single-node intra-tray NVLink works without it). The PyTorch image + the pinned wheels
-above satisfy these; `nccl.ep` is the `nccl4py` wheel (no in-tree NCCL build).
+above satisfy these; `nccl.ep` is the `nccl-extensions` wheel (no in-tree NCCL build).
 
 Smoke: `python -c "import nccl.ep; from flashinfer.moe_ep import available_backends; print(available_backends())"` → `['nccl_ep', ...]`.
 

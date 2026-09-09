@@ -53,3 +53,31 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
     )
+
+
+def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+    """DeepSeek-V4 NVFP4 sparse-MLA cache, prefill, and decode operators."""
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_nvfp4_sm120",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_quant.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_decode.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_prefill.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
+    """Internal NVFP4 sparse-MLA MMA-layout validation operators."""
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_nvfp4_sm120_tile",
+        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_tile.cu"],
+        extra_cuda_cflags=nvcc_flags,
+    )
