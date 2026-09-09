@@ -4438,12 +4438,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        # For NVFP4 KV, fuse q_scale and k_scale into sm_scale
+        # FA2/FA3 with a 16-bit query consumes unscaled FP8 KV values.
+        # Full-FP8 and other backends handle their scales separately.
+        apply_kv_scales = kv_cache_sf is not None or (
+            self._backend in ("fa2", "fa3") and is_float8(k) and not is_float8(q)
+        )
         if kv_cache_sf is not None:
             if q_scale is not None:
                 sm_scale *= q_scale
-            if k_scale is not None:
-                sm_scale *= k_scale
+        if apply_kv_scales and k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -4809,9 +4813,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
 
-        # Apply V scaling for NVFP4 ragged KV if v_scale is provided and not equal to 1.0
+        # Apply global V calibration after attention, without changing the LSE.
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-        if kv_cache_sf is not None and v_scale is not None and not is_float_one:
+        if apply_kv_scales and v_scale is not None and not is_float_one:
             out *= v_scale
 
         return (out, lse) if return_lse else out
@@ -5231,6 +5235,7 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    skip_all_rows_active_check: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5320,6 +5325,10 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
+    skip_all_rows_active_check : bool
+        Skip empty-row detection when the caller guarantees that every row has
+        positive query and KV lengths. Mutually exclusive with CPU length
+        mirrors. Currently only consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -5488,7 +5497,13 @@ def trtllm_ragged_attention_deepseek(
         has_inactive_rows = False
         has_active_rows = True
 
-        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if skip_all_rows_active_check:
+            if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+                raise ValueError(
+                    "skip_all_rows_active_check cannot be combined with CPU length "
+                    "mirrors"
+                )
+        elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
             if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"

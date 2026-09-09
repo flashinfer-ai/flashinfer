@@ -159,6 +159,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "nvep: requires a moe_ep-enabled install (default)"
     )
+    config.addinivalue_line("markers", "gpu: requires at least one CUDA GPU")
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")

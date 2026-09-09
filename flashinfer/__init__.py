@@ -39,6 +39,9 @@ from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
 )
+from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import autotune_v2 as autotune_v2
+from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
@@ -66,6 +69,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .decode import sm110_gqa_decode as sm110_gqa_decode
 from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
 from .cake_dcp import (
     get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
@@ -216,6 +220,9 @@ from .page import (
 )
 from .page import (
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+from .page import (
+    nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,
 )
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper

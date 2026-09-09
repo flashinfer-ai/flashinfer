@@ -246,7 +246,8 @@ class TllmGenFmhaKernel {
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
                          bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
                          int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel,
-                         bool fp16Softmax, bool usesSpcompress) const {
+                         bool fp16Softmax, bool usesSpcompress, bool fusesDsv4InvRopeFp8Quant,
+                         bool usesDsv4Ue8m0ScaleO) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -264,6 +265,8 @@ class TllmGenFmhaKernel {
                      "The sparse MLA type must fit in 2 bits.");
     FLASHINFER_CHECK(bf16QFp8KvTransformMode >= 0 && bf16QFp8KvTransformMode <= 2,
                      "The BF16Q FP8KV transform mode must fit in 2 bits.");
+    FLASHINFER_CHECK(!usesDsv4Ue8m0ScaleO || fusesDsv4InvRopeFp8Quant,
+                     "DSv4 UE8M0 output scales require the fused inverse-RoPE FP8 epilogue.");
     // The enum fields are packed tightly, so an out-of-range value would alias onto its neighbour
     // instead of producing a distinct key. Check them rather than trusting the exporter.
     uint64_t const numTokensPerPageLog2 =
@@ -303,7 +306,9 @@ class TllmGenFmhaKernel {
     // Bit 54 - 54: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
     // Bit 55 - 55: fp16Softmax.
     // Bit 56 - 56: usesSpcompress.
-    // Bit 57 - 63: unused.
+    // Bit 57 - 57: fusesDsv4InvRopeFp8Quant.
+    // Bit 58 - 58: usesDsv4Ue8m0ScaleO.
+    // Bit 59 - 63: unused.
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 2) |
            (static_cast<uint64_t>(kernelType) << 5) | (static_cast<uint64_t>(scheduler) << 8) |
            (static_cast<uint64_t>(multiCtasKvMode) << 10) |
@@ -321,7 +326,9 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(groupsTokensHeadsQ) << 53) |
            (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 54) |
            (static_cast<uint64_t>(fp16Softmax) << 55) |
-           (static_cast<uint64_t>(usesSpcompress) << 56);
+           (static_cast<uint64_t>(usesSpcompress) << 56) |
+           (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 57) |
+           (static_cast<uint64_t>(usesDsv4Ue8m0ScaleO) << 58);
   }
 
   inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
@@ -344,7 +351,8 @@ class TllmGenFmhaKernel {
         kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
         getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
                                    kernelMeta.mSeparateTransformedKv),
-        is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
+        is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress,
+        kernelMeta.mFusesDsv4InvRopeFp8Quant, kernelMeta.mUsesDsv4Ue8m0ScaleO);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -918,6 +926,24 @@ class TllmGenFmhaKernel {
   // Select the MLA generation kernel.
   void selectMlaGenerationKernel(RunnerParams const& params,
                                  SelectKernelParams& selectKernelParams) const {
+    if (params.mFusesDsv4InvRopeFp8Quant) {
+      FLASHINFER_CHECK(params.isSparseMla() && params.mHeadDimQk == 512 &&
+                           params.mHeadDimV == 512 && params.mNumHeadsQPerKv == 128,
+                       "DSv4 RopeQuant requires dynamic sparse MLA with 128 query heads and "
+                       "head dimension 512.");
+      selectKernelParams.mKernelType = FmhaKernelType::KeepsMmaAbForGeneration;
+      selectKernelParams.mTileScheduler = TileScheduler::Persistent;
+      selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+      selectKernelParams.mForceGmemReduction = true;
+      selectKernelParams.mHeadDimPerCtaV = 256;
+      selectKernelParams.mTileSizeQ = 64;
+      selectKernelParams.mTileSizeKv = 128;
+      selectKernelParams.mReuseSmemKForV = false;
+      selectKernelParams.mGroupsTokensHeadsQ = false;
+      selectKernelParams.mUses2CtaMma = true;
+      return;
+    }
+
     if (usesGroupedMlaGenerationKernel(params)) {
       selectGroupedMlaGenerationKernel(params, selectKernelParams);
       return;
@@ -1228,7 +1254,10 @@ class TllmGenFmhaKernel {
         ", bf16QFp8KvTransformMode=" +
         std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
         ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
-        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
+        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) +
+        ", fusesDsv4InvRopeFp8Quant=" +
+        std::to_string(selectKernelParams.mFusesDsv4InvRopeFp8Quant) +
+        ", usesDsv4Ue8m0ScaleO=" + std::to_string(selectKernelParams.mFusesDsv4InvRopeFp8Quant);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1247,7 +1276,8 @@ class TllmGenFmhaKernel {
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
                /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
-               selectKernelParams.mUsesSpcompress),
+               selectKernelParams.mUsesSpcompress, selectKernelParams.mFusesDsv4InvRopeFp8Quant,
+               /*usesDsv4Ue8m0ScaleO=*/selectKernelParams.mFusesDsv4InvRopeFp8Quant),
         info);
   }
 
