@@ -23,7 +23,7 @@
 extern "C" __global__ void kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110(__nv_bfloat16* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __nv_bfloat16* __restrict__ expert_scales, __nv_bfloat16* __restrict__ shared_expert_output, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ quant_out, __nv_bfloat16* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor);
 
 
-namespace cake_host_shim_26fe7925b859a24c {
+namespace cake_host_shim_bf86a1529b37dfa6 {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -266,6 +266,6 @@ void Run(TensorView arg_allreduce_in, TensorView arg_inverse_indices, TensorView
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace cake_host_shim_26fe7925b859a24c
+}  // namespace cake_host_shim_bf86a1529b37dfa6
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_26fe7925b859a24c::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_bf86a1529b37dfa6::Run);
