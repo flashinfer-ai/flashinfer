@@ -218,16 +218,17 @@ class Sm120GemmBuilder:
         self.mma, self.load_ab, self.load_sf, self.epi = mma, load_ab, load_sf, epi
         self.enable_pdl = enable_pdl
         self.union_smem = union_smem
+        self.owns_epi_smem = not union_smem and epi.smem_bytes(tile) > 0
         assert not union_smem or epi.DRAINS_SC_IN_WG, (
             f"union_smem overlays sC on A/B, which only a warpgroup-drained sC allows; "
-            f"{epi.METHOD} would leave store_empty without a counterpart"
+            f"{epi.METHOD} would leave epi_empty without a counterpart"
         )
         union_bytes = epi.smem_bytes(tile) + epi.aux_smem_bytes(tile)
         if union_smem and union_bytes > load_ab.smem_bytes():
             raise SmemUnionTooSmall(
                 f"sC plus its aux buffers are {union_bytes} B over {load_ab.smem_bytes()} B of A/B "
                 f"staging, so they reach the SF ring, which a different warp refills without waiting "
-                f"on store_empty"
+                f"on epi_empty"
             )
         assert not epi.DRAINS_SC_IN_WG or union_smem, (
             f"{epi.METHOD} writes sC in place, and store_wg's entry barrier exists only to keep "
@@ -243,10 +244,9 @@ class Sm120GemmBuilder:
             f"EpiConfig was built for {epi.mma_threads} math threads but MmaConfig gives "
             f"{self.mma_threads}; the S2G thread layout is derived from that count"
         )
-        self.store_threads = epi.num_store_threads
         self.sched_warp = num_math_warps
-        self.ab_warp = num_math_warps + 1
-        self.sf_warp = num_math_warps + 2
+        self.load_warp_0 = num_math_warps + 1
+        self.load_warp_1 = num_math_warps + 2
         self.store_warp = num_math_warps + 3
         num_producer_warps = (
             2 + self.load_sf.sf_load_warp + (1 if epi.HAS_STORE_WARP else 0)
@@ -265,7 +265,6 @@ class Sm120GemmBuilder:
         self.reg_prod = self.REG_PROD if reg_prod is None else reg_prod
         self.reg_math = self._reg_math(num_math_warps, self.WARPS_PER_WG, self.reg_prod)
         self.sched_stages = MoeSchedStages
-        self.store_stages = epi.epi_stage
         self.fields = MoeWorkTile.FIELDS
         self.num_sched_consumers = num_math_warps + num_producer_warps - 1
 

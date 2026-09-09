@@ -16,6 +16,7 @@
 import functools
 import os
 
+import cutlass
 import cutlass.cute as cute
 import torch
 
@@ -28,7 +29,7 @@ from ....tllm_enums import (
     ActivationType,
 )
 from ....utils import ceil_div
-from ._moe_utils.moe_epilogue import EpiMethod
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
 from .kernel_moe_fp8_fc1_act import (
     GRAN_K,
@@ -42,7 +43,8 @@ from ._moe_utils.heuristic import select_fc1_act_tile
 
 
 def epi_tactics(tile):
-    return (EpiMethod.DIRECT_STG,) if is_swapab(tile) else (EpiMethod.R2G_WG,)
+    candidates = (EpiMethod.DIRECT_STG,) if is_swapab(tile) else (EpiMethod.R2G_WG,)
+    return tuple(epi for epi in candidates if EPI_CONFIGS[epi].supports_tile(tile))
 
 
 def resolve_stage(tile, epi):
@@ -120,11 +122,15 @@ class CuteDslSm120GroupedFp8Fc1ActOp:
 
     @staticmethod
     def is_valid_alignment(n: int, k: int, tile) -> bool:
-        return n > 0 and k > 0 and k % tile[2] == 0 and n % GRAN_N == 0
+        return n > 0 and k > 0 and n % tile[1] == 0 and k % tile[2] == 0
 
     @classmethod
     def is_constructible(cls, tile, epi=None, activation=ActivationType.Swiglu) -> bool:
         if not dsl_targets_sm12x():
+            return False
+        if epi is not None and (
+            epi not in epi_tactics(tile) or not EPI_CONFIGS[epi].supports_tile(tile)
+        ):
             return False
         try:
             if epi is None:
@@ -149,13 +155,20 @@ class CuteDslSm120GroupedFp8Fc1ActOp:
         activation=ActivationType.Swiglu,
         epi=None,
     ) -> bool:
+        candidates = epi_tactics(tile) if epi is None else (epi,)
         return (
             cls.is_valid_dtypes(out_dtype)
             and cls.is_valid_tile(tile)
             and activation in cls.ACTIVATIONS
-            and (epi is None or epi in epi_tactics(tile))
             and cls.is_valid_alignment(n, k, tile)
-            and cls.is_constructible(tile, epi, activation)
+            and any(
+                candidate in epi_tactics(tile)
+                and EPI_CONFIGS[candidate].can_implement(
+                    tile, n, cutlass.BFloat16.width
+                )
+                and cls.is_constructible(tile, candidate, activation)
+                for candidate in candidates
+            )
         )
 
     def build(self, grid_x: int) -> CuteDslSm120MoeFp8Fc1Act:
@@ -310,7 +323,16 @@ def cute_dsl_sm12x_fc1_act_fp8(
         situ_linear_beta,
     )
     out = torch.zeros(int(a_q.shape[0]), n, dtype=out_dtype, device=a_q.device)
-    args = make_args(a_q, a_scale, b_q, b_scale, out, m_indptr.to(torch.int32))
+    args = make_args(
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        out,
+        m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
+    )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out
 
@@ -393,7 +415,16 @@ class _Fc1ActRunner(TunableRunner):
             self.situ_beta,
             self.situ_linear_beta,
         )
-        args = make_args(a_q, a_scale, b_q, b_scale, out, m_indptr.to(torch.int32))
+        args = make_args(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            out,
+            m_indptr.to(torch.int32),
+            op.cfg.epi,
+            op.cfg.TILE,
+        )
         sm_version = "sm_{}{}".format(props.major, props.minor)
         compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
 

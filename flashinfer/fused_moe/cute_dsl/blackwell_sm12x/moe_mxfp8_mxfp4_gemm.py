@@ -16,6 +16,7 @@
 import functools
 import os
 
+import cutlass
 import cutlass.cute as cute
 import torch
 
@@ -33,17 +34,20 @@ from .kernel_moe_mxfp8_mxfp4_gemm import (
     make_cfg,
 )
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
-from ._moe_utils.moe_epilogue import EpiMethod
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder
-from ._moe_utils.heuristic import select_plain_bm_64_or_128
 
 FALLBACK_TILE = (128, 128, 128)
+PLAIN_TILE_K = GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF
+PLAIN_TILE_N = 128
 
 EPI_ORDER = (EpiMethod.STAGED_R2G, EpiMethod.R2G_WG)
 
 
 def epi_tactics(tile):
-    return (EpiMethod.DIRECT_STG,) if is_swapab(tile) else EPI_ORDER
+    if is_swapab(tile):
+        return (EpiMethod.DIRECT_STG,)
+    return tuple(epi for epi in EPI_ORDER if EPI_CONFIGS[epi].supports_tile(tile))
 
 
 def resolve_stage(tile, epi):
@@ -52,9 +56,11 @@ def resolve_stage(tile, epi):
     )
 
 
-def resolve_stage_store(tile):
+def resolve_stage_store(tile, output_n):
     best = None
     for epi in epi_tactics(tile):
+        if not EPI_CONFIGS[epi].can_implement(tile, output_n, cutlass.BFloat16.width):
+            continue
         try:
             stage = resolve_stage(tile, epi)
         except (AssertionError, ValueError, DSLUserCodeError):
@@ -90,7 +96,7 @@ class CuteDslSm120GroupedMxfp8Mxfp4Op:
         self.n, self.k, self.tile, self.out_dtype = n, k, tuple(tile), out_dtype
         self.enable_pdl = enable_pdl
         if epi is None:
-            self.ab_stage, self.epi = resolve_stage_store(self.tile)
+            self.ab_stage, self.epi = resolve_stage_store(self.tile, n)
         else:
             self.ab_stage, self.epi = resolve_stage(self.tile, epi), epi
         self.tactic = (self.tile[0], self.tile[1], self.epi)
@@ -112,15 +118,18 @@ class CuteDslSm120GroupedMxfp8Mxfp4Op:
 
     @staticmethod
     def is_valid_alignment(n: int, k: int, tile) -> bool:
-        return n > 0 and k > 0 and k % tile[2] == 0
+        return n > 0 and k > 0 and n % tile[1] == 0 and k % tile[2] == 0
 
     @classmethod
     def is_constructible(cls, tile, epi=None) -> bool:
+        if epi is None:
+            return any(
+                cls.is_constructible(tile, candidate) for candidate in epi_tactics(tile)
+            )
         try:
-            if epi is None:
-                stage, epi = resolve_stage_store(tuple(tile))
-            else:
-                stage = resolve_stage(tuple(tile), epi)
+            if not EPI_CONFIGS[epi].supports_tile(tile):
+                return False
+            stage = resolve_stage(tuple(tile), epi)
             CuteDslSm120MoeMxfp8Mxfp4Grouped(make_cfg(tuple(tile), stage, epi=epi), 1)
         except (AssertionError, ValueError, DSLUserCodeError):
             return False
@@ -128,11 +137,19 @@ class CuteDslSm120GroupedMxfp8Mxfp4Op:
 
     @classmethod
     def can_implement(cls, *, n: int, k: int, tile, out_dtype, epi=None) -> bool:
+        candidates = epi_tactics(tile) if epi is None else (epi,)
         return (
             cls.is_valid_dtypes(out_dtype)
             and cls.is_valid_tile(tile)
             and cls.is_valid_alignment(n, k, tile)
-            and cls.is_constructible(tile, epi)
+            and any(
+                candidate in epi_tactics(tile)
+                and EPI_CONFIGS[candidate].can_implement(
+                    tile, n, cutlass.BFloat16.width
+                )
+                and cls.is_constructible(tile, candidate)
+                for candidate in candidates
+            )
         )
 
     def build(self, grid_x: int) -> CuteDslSm120MoeMxfp8Mxfp4Grouped:
@@ -142,13 +159,30 @@ class CuteDslSm120GroupedMxfp8Mxfp4Op:
 TACTICS = tuple(
     (bm, bn, epi)
     for bm, bn in CuteDslSm120GroupedMxfp8Mxfp4Op.TILES
-    for epi in epi_tactics((bm, bn, GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF))
+    for epi in epi_tactics((bm, bn, PLAIN_TILE_K))
 )
 
 
 def split_tactic(tactic):
     bm, bn, epi = tactic
-    return (bm, bn, GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF), epi
+    return (bm, bn, PLAIN_TILE_K), epi
+
+
+def _select_mxfp8_mxfp4_bm_64_or_128(
+    *, m_per_expert: int, n: int, k: int, num_experts: int, num_sms: int
+) -> int:
+    n_tiles = ceil_div(n, PLAIN_TILE_N)
+    k_tiles = ceil_div(k, PLAIN_TILE_K)
+
+    def score(bm: int):
+        m_tiles = num_experts * ceil_div(m_per_expert, bm)
+        total_tiles = m_tiles * n_tiles * k_tiles
+        waves = ceil_div(total_tiles, num_sms)
+        residual = total_tiles - (waves - 1) * num_sms
+        tail_slack = num_sms - residual if waves > 1 else num_sms - total_tiles
+        return (waves, tail_slack, total_tiles, bm)
+
+    return 64 if score(64) < score(128) else 128
 
 
 @functools.lru_cache(maxsize=None)
@@ -184,9 +218,15 @@ def select_tile(*, total_rows: int, n: int, k: int, num_experts: int, num_sms: i
     elif m_per_expert <= 32:
         bm = 32
     else:
-        bm = select_plain_bm_64_or_128(m_per_expert, n, num_experts, num_sms)
+        bm = _select_mxfp8_mxfp4_bm_64_or_128(
+            m_per_expert=m_per_expert,
+            n=n,
+            k=k,
+            num_experts=num_experts,
+            num_sms=num_sms,
+        )
     bm = max(bm, smallest)
-    return (bm, by_bm[bm], GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF)
+    return (bm, by_bm[bm], PLAIN_TILE_K)
 
 
 def _check_a_scale_granularity(a_scale, k: int) -> None:
@@ -245,7 +285,16 @@ def cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
         )
     op = _op(n, k, tuple(tile), out_dtype, epi, enable_pdl)
     out = torch.zeros(int(a_q.shape[0]), n, dtype=out_dtype, device=a_q.device)
-    args = make_args(a_q, a_scale, b_q, b_scale, out, m_indptr.to(torch.int32))
+    args = make_args(
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        out,
+        m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
+    )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out
 
@@ -311,7 +360,16 @@ class _Mxfp8Mxfp4Runner(TunableRunner):
         else:
             tile, epi = split_tactic(tactic)
         op = _op(n, k, tuple(tile), self.out_dtype, epi, self.enable_pdl)
-        args = make_args(a_q, a_scale, b_q, b_scale, out, m_indptr.to(torch.int32))
+        args = make_args(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            out,
+            m_indptr.to(torch.int32),
+            op.cfg.epi,
+            op.cfg.TILE,
+        )
         sm_version = "sm_{}{}".format(props.major, props.minor)
         compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
 
