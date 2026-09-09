@@ -1251,3 +1251,221 @@ rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
     reference=_rope_quantize_fp8_append_paged_kv_cache_reference,
     init=_rope_quantize_fp8_append_paged_kv_cache_init,
 )
+
+
+# ── HY3 Q/K RMSNorm + RoPE + paged KV store (B200 decode fast path) ─────────
+
+
+def _qk_rmsnorm_rope_store_hy3_fp8_decode_init(
+    *,
+    batch_size: int,
+    batch_plus_one: int = 0,
+    pages_per_request: int = 1,
+    num_pages: int = 0,
+    max_position: int = 4096,
+    packed_width: int = 0,
+    num_q_heads: int = 64,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 64,
+    scale_count: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build the validated uniform one-row decode shape for B200."""
+    del batch_plus_one  # derived from batch_size
+    if (num_q_heads, num_kv_heads, head_dim, scale_count) != (64, 8, 128, 1):
+        raise ValueError("HY3 B200 trace requires 64Q/8KV/D128 and one scale")
+    expected_width = (num_q_heads + 2 * num_kv_heads) * head_dim
+    if packed_width not in (0, expected_width):
+        raise ValueError(f"packed_width must be 0 or {expected_width}")
+    if pages_per_request <= 0 or page_size <= 0:
+        raise ValueError("pages_per_request and page_size must be positive")
+    num_pages = max(num_pages, batch_size * pages_per_request)
+    torch.manual_seed(seed)
+    packed_qkv = torch.randn(
+        batch_size, expected_width, dtype=torch.bfloat16, device=device
+    )
+    cos_sin_cache = make_rope_cos_sin_cache(max_position, head_dim, device=device)
+    sequence_lengths = (
+        torch.arange(batch_size, dtype=torch.int32, device=device) % page_size + 1
+    )
+    q_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    block_table = torch.arange(
+        batch_size * pages_per_request, dtype=torch.int32, device=device
+    ).reshape(batch_size, pages_per_request)
+    cache_shape = (num_pages, page_size, num_kv_heads, head_dim)
+    key_cache = torch.zeros(cache_shape, dtype=torch.float8_e4m3fn, device=device)
+    value_cache = torch.zeros_like(key_cache)
+    return {
+        "packed_qkv": packed_qkv,
+        "cos_sin_cache": cos_sin_cache,
+        "sequence_lengths": sequence_lengths,
+        "q_indptr": q_indptr,
+        "block_table": block_table,
+        "paged_kv_cache": (key_cache, value_cache),
+        "is_prefill": False,
+        "q_norm_weight": torch.linspace(0.75, 1.25, head_dim, device=device),
+        "k_norm_weight": torch.linspace(1.25, 0.75, head_dim, device=device),
+        "norm_policy": 2,
+        "quant_policy": 1,
+        "k_scale": torch.tensor([0.5], dtype=torch.float32, device=device),
+        "v_scale": torch.tensor([0.25], dtype=torch.float32, device=device),
+        "out_q": torch.empty(
+            batch_size,
+            num_q_heads,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        "out_q_scale": torch.empty(
+            batch_size, num_q_heads, dtype=torch.float32, device=device
+        ),
+        "split_k_flag": torch.empty(
+            batch_size, num_kv_heads, dtype=torch.int32, device=device
+        ),
+        "uniform_one_token_decode": True,
+    }
+
+
+qk_rmsnorm_rope_store_hy3_fp8_decode_trace = TraceTemplate(
+    op_type="rope",
+    name_prefix="qk_rmsnorm_rope_append_paged_kv_cache_hy3_fp8_decode",
+    description=(
+        "B200 uniform one-row decode specialization that fuses Q/K RMSNorm, "
+        "NeoX RoPE, dynamic FP8 Q quantization, and NHD paged K/V storage. "
+        "The paged cache tuple is updated in place. Prefill, BF16, static-FP8, "
+        "and redirected K/V outputs are intentionally outside this trace variant."
+    ),
+    axes={
+        "batch_size": Var(),
+        "batch_plus_one": Var(),
+        "pages_per_request": Var(),
+        "num_pages": Var(),
+        "max_position": Var(),
+        "packed_width": Const(abbrev=""),
+        "num_q_heads": Const(value=64, abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "page_size": Const(abbrev="ps"),
+        "scale_count": Const(value=1, abbrev=""),
+    },
+    inputs={
+        "packed_qkv": Tensor(["batch_size", "packed_width"], dtype="bfloat16"),
+        "cos_sin_cache": Tensor(["max_position", "head_dim"], dtype="float32"),
+        "sequence_lengths": Tensor(["batch_size"], dtype="int32"),
+        "q_indptr": Tensor(["batch_plus_one"], dtype="int32"),
+        "block_table": Tensor(["batch_size", "pages_per_request"], dtype="int32"),
+        "k_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=0,
+            dtype="float8_e4m3fn",
+            description="NHD key cache updated in place.",
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "page_size", "num_kv_heads", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=1,
+            dtype="float8_e4m3fn",
+            description="NHD value cache updated in place.",
+        ),
+        "is_prefill": Scalar("int32"),
+        "q_norm_weight": Tensor(["head_dim"], dtype="float32"),
+        "k_norm_weight": Tensor(["head_dim"], dtype="float32"),
+        "norm_policy": Scalar("int32"),
+        "quant_policy": Scalar("int32"),
+        "k_scale": Tensor(["scale_count"], dtype="float32"),
+        "v_scale": Tensor(["scale_count"], dtype="float32"),
+        "max_sequence_length": Scalar("int32", optional=True),
+        "fp8_upper_bound": Scalar("float32", optional=True),
+        "out_q": Tensor(
+            ["batch_size", "num_q_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            optional=True,
+        ),
+        "out_q_scale": Tensor(
+            ["batch_size", "num_q_heads"], dtype="float32", optional=True
+        ),
+        "split_k_flag": Tensor(
+            ["batch_size", "num_kv_heads"], dtype="int32", optional=True
+        ),
+        "uniform_one_token_decode": Scalar("int32"),
+    },
+    outputs={
+        "out_q": Tensor(
+            ["batch_size", "num_q_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            param="out_q",
+        ),
+        "out_q_scale": Tensor(
+            ["batch_size", "num_q_heads"],
+            dtype="float32",
+            param="out_q_scale",
+        ),
+        "split_k_flag": Tensor(
+            ["batch_size", "num_kv_heads"],
+            dtype="int32",
+            param="split_k_flag",
+        ),
+    },
+    constraints=[
+        "batch_plus_one == batch_size + 1",
+        "packed_width == (64 + 2 * num_kv_heads) * head_dim",
+        "head_dim == 128",
+        "num_kv_heads == 8",
+        "num_pages >= batch_size * pages_per_request",
+    ],
+    tags=["status:experimental", "fused", "quantize:fp8", "arch:sm100"],
+    init=_qk_rmsnorm_rope_store_hy3_fp8_decode_init,
+)
+
+
+def qk_rmsnorm_rope_store_hy3_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Trace only the validated SM100 uniform dynamic-FP8 decode shape."""
+    del save_dir, name
+    if "packed_qkv" not in kwargs and "batch_size" in kwargs:
+        return qk_rmsnorm_rope_store_hy3_fp8_decode_trace
+    packed_qkv = kwargs.get("packed_qkv")
+    paged_kv_cache = kwargs.get("paged_kv_cache")
+    if (
+        not isinstance(packed_qkv, torch.Tensor)
+        or packed_qkv.ndim != 2
+        or not isinstance(paged_kv_cache, (tuple, list))
+        or len(paged_kv_cache) != 2
+    ):
+        return None
+    key_cache, value_cache = paged_kv_cache
+    if (
+        not isinstance(key_cache, torch.Tensor)
+        or not isinstance(value_cache, torch.Tensor)
+        or key_cache.ndim != 4
+        or value_cache.shape != key_cache.shape
+        or key_cache.dtype != torch.float8_e4m3fn
+        or value_cache.dtype != torch.float8_e4m3fn
+    ):
+        return None
+    num_kv_heads, head_dim = key_cache.shape[2:]
+    num_q_heads = packed_qkv.shape[1] // head_dim - 2 * num_kv_heads
+    quant_policy = kwargs.get("quant_policy")
+    if (
+        bool(kwargs.get("is_prefill"))
+        or int(kwargs.get("norm_policy", 0)) != 2
+        or quant_policy not in (None, 1)
+        or not bool(kwargs.get("uniform_one_token_decode"))
+        or (num_q_heads, num_kv_heads, head_dim) != (64, 8, 128)
+        or kwargs.get("q_norm_weight") is None
+        or kwargs.get("k_norm_weight") is None
+        or kwargs.get("k_scale") is None
+        or kwargs.get("v_scale") is None
+        or kwargs.get("q_scale_inverse") is not None
+        or kwargs.get("out_k") is not None
+        or kwargs.get("out_v") is not None
+    ):
+        return None
+    return qk_rmsnorm_rope_store_hy3_fp8_decode_trace
+
+
+qk_rmsnorm_rope_store_hy3_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    qk_rmsnorm_rope_store_hy3_fp8_decode_trace,
+)
