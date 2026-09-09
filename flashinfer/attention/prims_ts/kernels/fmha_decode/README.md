@@ -63,6 +63,27 @@ skips change the effective domain; persistent Q-dependent causal plans do the
 same while recycling the task graph. This kernel mode is independent of
 whether the plan or run owns the length vector.
 
+## Shared decode wrapper
+
+`flashinfer.BatchDecodeWithPagedKVCacheWrapper(..., backend="prims-ts")`
+adapts the shared CSR planning API to the native fixed-table interface.
+Optional `seq_lens` accepts `uint32`, `int32`, or `int64` CPU/CUDA tensors;
+planning copies validated lengths into owned int32 CUDA storage. Call `plan()`
+again to change these lengths. An explicit `block_tables` must be an int32 or
+uint32 CUDA tensor on the wrapper device, with unit inner stride and
+non-overlapping rows. The adapter retains int32 tables directly and uses an
+int32 view of uint32 tables, preserving storage and subsequent caller updates.
+Active page IDs must fit in signed int32 and index the physical cache;
+inactive entries are ignored. When omitted, the table is derived from the CSR
+inputs during planning.
+
+This backend requires `kv_layout="HND"` and does not support the shared
+wrapper's `use_cuda_graph=True` replanning flow. Manual capture of `run()` is
+supported after planning, but binds to that completed plan. Keep the wrapper
+and captured tensors alive, and recapture after re-planning. Page IDs may
+change between completed replays while the captured storage and layout stay
+fixed; plan-owned sequence lengths may not.
+
 ## Supported contract
 
 | Feature | Support |
