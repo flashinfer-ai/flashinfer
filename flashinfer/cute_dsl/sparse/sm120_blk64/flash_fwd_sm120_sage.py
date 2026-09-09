@@ -461,7 +461,9 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
         Q_pipeline.consumer_release(Q_consumer_state)
         Q_consumer_state.advance()
 
-        n_tile_idx = gIndices[num_n_tiles - 1]
+        n_tile_idx = cutlass.Int32(0)
+        if num_n_tiles > 0:
+            n_tile_idx = gIndices[num_n_tiles - 1]
         for load_count in cutlass.range(0, num_n_tiles, 1, unroll=1):
             if cutlass.const_expr(self.has_block_sizes):
                 varblk = gBSZ[n_tile_idx]

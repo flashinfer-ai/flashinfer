@@ -25,15 +25,13 @@ from flashinfer.cute_dsl.sparse.bsa_utils.sage_quant_sm120 import (
     quantize_sage_q_sm120,
     quantize_sage_qkv_sm120,
 )
-from flashinfer.utils import is_sm12x_supported
-
 # ---------------------------------------------------------------------------
 # Hardware gate
 # ---------------------------------------------------------------------------
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")),
-    reason="sm120_blk64 Sage backend requires SM120/SM121 GPU with cc==(12, 0)",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
+    reason="sm120_blk64 Sage backend requires SM120 (compute capability 12.0)",
 )
 
 BLOCK = 64
