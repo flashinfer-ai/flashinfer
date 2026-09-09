@@ -28,7 +28,6 @@ from ....tllm_enums import (
     DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA,
     ActivationType,
 )
-from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN
 from ....utils import ceil_div
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
