@@ -73,8 +73,15 @@ class MoeGemmBackend(Enum):
     PRIMS_TS = "prims_ts"
 
 
+def _weight_layout_or_major_k(weight_processing):
+    # Main's valid-dims tests pass None; that means default TRT-LLM MajorK.
+    if not weight_processing:
+        return WeightLayout.MajorK
+    return weight_processing.get("layout", WeightLayout.MajorK)
+
+
 def _default_block_major_k_bytes_for_prims_ts(args, weight_processing, quant_mode):
-    if weight_processing.get("layout") != WeightLayout.BlockMajorK:
+    if _weight_layout_or_major_k(weight_processing) != WeightLayout.BlockMajorK:
         return 128, 128
     if weight_processing.get("moe_gemm_backend") != MoeGemmBackend.PRIMS_TS:
         return 128, 128
@@ -673,7 +680,7 @@ class FP4Moe(Moe):
                     .contiguous()
                 )
 
-        weight_layout = weight_processing["layout"]
+        weight_layout = _weight_layout_or_major_k(weight_processing)
         if weight_layout == WeightLayout.BlockMajorK:
             block_k1, block_k2 = _default_block_major_k_bytes_for_prims_ts(
                 args, weight_processing, self.quant_mode
