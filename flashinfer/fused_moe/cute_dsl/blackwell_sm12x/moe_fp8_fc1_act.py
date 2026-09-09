@@ -33,7 +33,6 @@ from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from .kernel_moe_fp8_fc1_act import (
     GRAN_K,
-    GRAN_N,
     CuteDslSm120MoeFp8Fc1Act,
     is_swapab,
     make_args,
