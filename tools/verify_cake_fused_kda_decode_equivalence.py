@@ -31,6 +31,14 @@ from pathlib import Path
 
 _SCHEMA = "cake-fused-kda-decode-equivalence-v1"
 _PREDECESSOR_COMMIT = "00a9d35a9d2ec1870a2068d9f970a7c15a9fa92a"
+_PREDECESSOR_ALIGNMENT_ASSERT = (
+    "static_assert(alignof(CUtensorMap) == 128, "
+    '"CUtensorMap CUDA ABI must be 128-byte aligned");'
+)
+_CURRENT_ALIGNMENT_ASSERT = (
+    "static_assert(alignof(FlashInferTensorMap) == 128, "
+    '"kernel tensor-map ABI must be 128-byte aligned");'
+)
 _HEAD_DIM = 128
 _FULL_DOMAIN_HEADS = (12, 24, 32, 48, 96)
 _FULL_DOMAIN_TAIL_ROWS = (384, 512, 768, 1024, 1536, 2048, 4096)
@@ -165,6 +173,16 @@ def _normalize_kernel_symbol(payload, symbol, description):
             f"{description} contains {occurrences} occurrences of {symbol!r}"
         )
     return payload.replace(symbol, "CAKE_FUSED_KDA_KERNEL_SYMBOL")
+
+
+def _normalize_predecessor_kernel_source(payload):
+    occurrences = payload.count(_PREDECESSOR_ALIGNMENT_ASSERT)
+    if occurrences != 1:
+        raise RuntimeError(
+            "predecessor source contains "
+            f"{occurrences} legacy tensor-map alignment assertions"
+        )
+    return payload.replace(_PREDECESSOR_ALIGNMENT_ASSERT, _CURRENT_ALIGNMENT_ASSERT, 1)
 
 
 def _normalize_predecessor_binding(source):
@@ -597,10 +615,22 @@ def _worker(args):
             f"[{args.side}] {index + 1}/44 fresh-JIT and execute {variant.name}",
             flush=True,
         )
-        spec = api["spec"](variant.name, variant.target)
-        if spec.is_aot:
-            raise RuntimeError(f"equivalence proof refuses AOT cache hit: {spec.name}")
-        module = spec.build_and_load()
+        predecessor_source = None
+        if args.side == "predecessor":
+            predecessor_source = variant.body_path.read_text()
+            variant.body_path.write_text(
+                _normalize_predecessor_kernel_source(predecessor_source)
+            )
+        try:
+            spec = api["spec"](variant.name, variant.target)
+            if spec.is_aot:
+                raise RuntimeError(
+                    f"equivalence proof refuses AOT cache hit: {spec.name}"
+                )
+            module = spec.build_and_load()
+        finally:
+            if predecessor_source is not None:
+                variant.body_path.write_text(predecessor_source)
         library = spec.jit_library_path.resolve()
         if not library.is_file():
             raise RuntimeError(f"JIT library is missing: {library}")
@@ -951,7 +981,9 @@ def _orchestrator(args):
         ).read_text()
         new_source = (current_csrc / new["body"]).read_text()
         old_normalized = _normalize_kernel_symbol(
-            old_source, old["kernel_symbol"], f"predecessor {name}"
+            _normalize_predecessor_kernel_source(old_source),
+            old["kernel_symbol"],
+            f"predecessor {name}",
         )
         new_normalized = _normalize_kernel_symbol(
             new_source, new["kernel_symbol"], f"current {name}"
@@ -1005,6 +1037,7 @@ def _orchestrator(args):
                 "predecessor_execution_sha256": old["execution_sha256"],
                 "current_execution_sha256": new["execution_sha256"],
                 "source_transform_exact": True,
+                "predecessor_alignment_assert_normalized": True,
                 "abi_equal": True,
                 "compile_flags_equal": True,
                 "launch_equal": True,
