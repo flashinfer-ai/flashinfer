@@ -82,6 +82,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 from dataclasses import dataclass
 from importlib.metadata import version
@@ -833,6 +834,7 @@ def _run_distributed_iterations(
     dist,
     device,
     profile_label,
+    num_tokens,
 ):
     for _ in range(args.warmup):
         run_once()
@@ -858,6 +860,7 @@ def _run_distributed_iterations(
 
         # The utility fixes iteration counts across ranks and reduces each
         # activity span with MAX. Its flush is outside the measured region.
+        wall_start = time.perf_counter() if args.log_timing_samples else None
         samples = bench_gpu_time(
             run_once,
             dry_run_iters=0,
@@ -867,28 +870,61 @@ def _run_distributed_iterations(
             cold_l2_cache=True,
             aggregate_op=max,
         )
-        return float(np.median(samples))
+    else:
+        wall_start = time.perf_counter() if args.log_timing_samples else None
+        if args.cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_once()
+            run_once = graph.replay
+            torch.cuda.synchronize()
+            dist.barrier()
 
-    if args.cuda_graph:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        samples = []
+        for _ in range(args.iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            e2e_start = torch.cuda.Event(enable_timing=True)
+            e2e_end = torch.cuda.Event(enable_timing=True)
+            e2e_start.record()
             run_once()
-        run_once = graph.replay
-        torch.cuda.synchronize()
-        dist.barrier()
-
-    samples = []
-    for _ in range(args.iters):
-        l2_flush.zero_()
-        torch.cuda.synchronize()
-        dist.barrier()
-        e2e_start = torch.cuda.Event(enable_timing=True)
-        e2e_end = torch.cuda.Event(enable_timing=True)
-        e2e_start.record()
-        run_once()
-        e2e_end.record()
-        e2e_end.synchronize()
-        samples.append(_max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device))
+            e2e_end.record()
+            e2e_end.synchronize()
+            samples.append(
+                _max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device)
+            )
+    if args.log_timing_samples:
+        wall_seconds = time.perf_counter() - wall_start
+        if dist.get_rank() == 0:
+            print(
+                "DISTRIBUTED_TIMING_SAMPLES_JSON,"
+                + json.dumps(
+                    {
+                        "profile_label": profile_label,
+                        "global_tokens": num_tokens,
+                        "rank": 0,
+                        "world_size": dist.get_world_size(),
+                        "timer": args.timing,
+                        "warmup_iters": args.warmup,
+                        "repeat_iters": args.iters,
+                        "sample_count": len(samples),
+                        "cuda_graph": args.cuda_graph,
+                        "cold_l2_cache": True,
+                        "sample_aggregation": "per_iteration_rank_max",
+                        "samples_ms": [float(sample) for sample in samples],
+                        "wall_seconds": wall_seconds,
+                        "wall_scope": (
+                            "bench_gpu_time"
+                            if args.timing == "cupti"
+                            else "cuda_event_capture_and_sampling"
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
     return float(np.median(samples))
 
 
@@ -1107,6 +1143,7 @@ def _benchmark_distributed_ep(
         dist,
         device,
         f"ep::{variant.name}",
+        num_tokens,
     )
 
 
@@ -1250,6 +1287,7 @@ def _benchmark_distributed_megamoe(
             dist,
             device,
             "ep::w4a16_megamoe",
+            num_tokens,
         )
     finally:
         layer.destroy()
@@ -1599,6 +1637,7 @@ def _benchmark_distributed_tp(
             dist,
             device,
             f"tp::{variant.name}",
+            num_tokens,
         )
     finally:
         workspace.destroy()
@@ -1852,6 +1891,14 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--log-timing-samples",
+        action="store_true",
+        help=(
+            "Log rank-MAX samples and rank-zero timer wall time after each "
+            "benchmark measurement; does not change iterations or timing."
+        ),
+    )
     parser.add_argument(
         "--variants",
         default="w4a4,w4a16",
