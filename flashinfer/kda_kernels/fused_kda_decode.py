@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Fused Kimi KDA decode kernel for SM100.
+Fused Kimi KDA decode kernel for SM100 and SM103.
 
 The kernel combines the width-four depthwise causal convolution, SiLU,
 per-key-dimension gated delta-rule recurrence, and gated RMSNorm into one
@@ -633,8 +633,15 @@ def _select_cake_variant(
     lower_bound,
     norm_eps,
 ) -> CakeFusedKDADecodeVariant | None:
-    variants = get_cake_fused_kda_decode_variants()
-    if not variants or get_compute_capability(x.device) != (10, 0):
+    capability = get_compute_capability(x.device)
+    if capability == (10, 0):
+        target = "sm100a"
+    elif capability == (10, 3):
+        target = "sm103a"
+    else:
+        return None
+    variants = get_cake_fused_kda_decode_variants(target)
+    if not variants:
         return None
     if not math.isfinite(float(norm_eps)) or (
         lower_bound is not None and not math.isfinite(float(lower_bound))
@@ -656,7 +663,7 @@ def _select_cake_variant(
     num_heads = int(x.shape[1]) // (3 * _HEAD_DIM)
     state_dtype = "bfloat16" if state.dtype == torch.bfloat16 else "float32"
     return select_cake_fused_kda_decode_variant(
-        target="sm100a",
+        target=target,
         num_heads=num_heads,
         num_rows=num_rows,
         num_slots=int(conv_state.shape[0]),

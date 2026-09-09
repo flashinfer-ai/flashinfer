@@ -13,10 +13,14 @@
 # limitations under the License.
 
 import importlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+from flashinfer.jit import cake_fused_kda_decode as cake_jit
+from flashinfer.jit import core as jit_core
 
 
 fused = importlib.import_module("flashinfer.kda_kernels.fused_kda_decode")
@@ -91,12 +95,23 @@ def _fake_inputs():
     }
 
 
-def test_cake_selector_uses_only_explicit_mode_and_tensor_metadata(monkeypatch):
+@pytest.mark.parametrize(
+    ("capability", "target"), (((10, 0), "sm100a"), ((10, 3), "sm103a"))
+)
+def test_cake_selector_uses_only_explicit_mode_and_tensor_metadata(
+    monkeypatch, capability, target
+):
     inputs = _fake_inputs()
     variant = object()
     calls = []
-    monkeypatch.setattr(fused, "get_cake_fused_kda_decode_variants", lambda: (variant,))
-    monkeypatch.setattr(fused, "get_compute_capability", lambda device: (10, 0))
+    registry_targets = []
+
+    def get_variants(requested_target):
+        registry_targets.append(requested_target)
+        return (variant,)
+
+    monkeypatch.setattr(fused, "get_cake_fused_kda_decode_variants", get_variants)
+    monkeypatch.setattr(fused, "get_compute_capability", lambda device: capability)
 
     def select_variant(**kwargs):
         calls.append(kwargs)
@@ -116,9 +131,10 @@ def test_cake_selector_uses_only_explicit_mode_and_tensor_metadata(monkeypatch):
     )
 
     assert selected is variant
+    assert registry_targets == [target]
     assert calls == [
         {
-            "target": "sm100a",
+            "target": target,
             "num_heads": 12,
             "num_rows": 4,
             "num_slots": 5,
@@ -136,6 +152,99 @@ def test_cake_selector_uses_only_explicit_mode_and_tensor_metadata(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("capability", ((9, 0), (10, 1), (10, 2), (12, 0)))
+def test_cake_selector_rejects_unregistered_architectures(monkeypatch, capability):
+    inputs = _fake_inputs()
+    monkeypatch.setattr(fused, "get_compute_capability", lambda device: capability)
+    monkeypatch.setattr(
+        fused,
+        "get_cake_fused_kda_decode_variants",
+        lambda target: pytest.fail(
+            "unsupported architectures must not load a registry"
+        ),
+    )
+
+    assert (
+        fused._select_cake_variant(
+            x=inputs["x"],
+            conv_state=inputs["conv_state"],
+            raw_beta=inputs["raw_beta"],
+            state=inputs["state"],
+            output_gate=inputs["output_gate"],
+            output=inputs["output"],
+            state_indices_mode="positive_unique",
+            lower_bound=-5.0,
+            norm_eps=1e-5,
+        )
+        is None
+    )
+
+
+def test_cake_targets_share_sources_but_have_distinct_build_identities():
+    sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
+    sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
+    assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
+    assert len(sm100_variants) == len(sm103_variants) == 44
+    for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
+        assert replace(sm100, target="sm103a") == sm103
+        assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
+        sm100_uri = cake_jit.get_cake_fused_kda_decode_uri(sm100.name, "sm100a")
+        sm103_uri = cake_jit.get_cake_fused_kda_decode_uri(sm103.name, "sm103a")
+        assert sm100_uri != sm103_uri
+        assert sm100_uri.endswith("_sm100a")
+        assert sm103_uri.endswith("_sm103a")
+    sm100_identity = cake_jit.get_cake_fused_kda_decode_program_identity()
+    assert sm100_identity == cake_jit.get_cake_fused_kda_decode_program_identity(
+        "sm100a"
+    )
+    assert sm100_identity != cake_jit.get_cake_fused_kda_decode_program_identity(
+        "sm103a"
+    )
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_selector_resolves_requested_target_registry(target):
+    variant = cake_jit.select_cake_fused_kda_decode_variant(
+        target=target,
+        num_heads=12,
+        num_rows=4,
+        num_slots=5,
+        state_dtype="float32",
+        state_indices_mode="unique_or_null",
+        lower_bound=-5.0,
+        norm_eps=1e-5,
+        x_row_stride=4625,
+        conv_slot_stride=13824,
+        beta_row_stride=13,
+        state_slot_stride=196608,
+        output_gate_row_stride=1543,
+    )
+    assert variant is not None
+    assert variant.target == target
+    assert variant in cake_jit.get_cake_fused_kda_decode_variants(target)
+
+
+@pytest.mark.parametrize(("target", "minor"), (("sm100a", 0), ("sm103a", 3)))
+def test_cake_jit_spec_uses_exact_target_flags(monkeypatch, tmp_path, target, minor):
+    monkeypatch.setattr(
+        jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, f"{minor}a")}
+    )
+    monkeypatch.setattr(cake_jit.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
+    cake_jit.gen_cake_fused_kda_decode_module.cache_clear()
+    variant = cake_jit.get_cake_fused_kda_decode_variants(target)[0]
+    spec = cake_jit.gen_cake_fused_kda_decode_module(variant.name, target)
+    assert spec.name == cake_jit.get_cake_fused_kda_decode_uri(variant.name, target)
+    assert spec.sources[0] == variant.body_path
+    assert [
+        flag for flag in spec.extra_cuda_cflags if flag.startswith("-gencode=")
+    ] == [f"-gencode=arch=compute_10{minor}a,code=sm_10{minor}a"]
+    assert (
+        f"-DFLASHINFER_CAKE_FUSED_KDA_DECODE_TARGET_MINOR={minor}"
+        in spec.extra_cuda_cflags
+    )
+    cake_jit.gen_cake_fused_kda_decode_module.cache_clear()
+
+
 @pytest.mark.parametrize(
     ("name", "data_ptr"),
     (("conv_state", 0x100004), ("state", 0x100010), ("output", 0x100004)),
@@ -151,7 +260,7 @@ def test_cake_selector_rejects_misaligned_mutable_buffers(monkeypatch, name, dat
         data_ptr=data_ptr,
     )
     monkeypatch.setattr(
-        fused, "get_cake_fused_kda_decode_variants", lambda: (object(),)
+        fused, "get_cake_fused_kda_decode_variants", lambda target: (object(),)
     )
     monkeypatch.setattr(fused, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(

@@ -30,10 +30,10 @@ from ._kda_jit_common import (
     get_flashinfer_include_dir,
     get_kda_csrc_dir,
 )
-from .core import JitSpec, logger, sm100a_nvcc_flags
+from .core import JitSpec, logger, sm100a_nvcc_flags, sm103a_nvcc_flags
 from .utils import write_if_different
 
-CakeFusedKDADecodeTarget = Literal["sm100a"]
+CakeFusedKDADecodeTarget = Literal["sm100a", "sm103a"]
 CakeFusedKDADecodeStateIndicesMode = Literal[
     "positive_unique",
     "unique_or_null",
@@ -41,13 +41,20 @@ CakeFusedKDADecodeStateIndicesMode = Literal[
 ]
 
 _BINDING_HEADER = "cake_fused_kda_decode_binding.cuh"
-_TARGETS: tuple[CakeFusedKDADecodeTarget, ...] = ("sm100a",)
+_TARGETS: tuple[CakeFusedKDADecodeTarget, ...] = ("sm100a", "sm103a")
 _STATE_INDICES_MODES: tuple[CakeFusedKDADecodeStateIndicesMode, ...] = (
     "positive_unique",
     "unique_or_null",
     "repeated_positive",
 )
-_TARGET_DEFINE = "-DFLASHINFER_CAKE_FUSED_KDA_DECODE_TARGET_MINOR=0"
+_TARGET_DEFINES = {
+    "sm100a": "-DFLASHINFER_CAKE_FUSED_KDA_DECODE_TARGET_MINOR=0",
+    "sm103a": "-DFLASHINFER_CAKE_FUSED_KDA_DECODE_TARGET_MINOR=3",
+}
+_TARGET_NVCC_FLAGS = {
+    "sm100a": sm100a_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
+}
 
 _COMMON_BUFFER_ABI: tuple[tuple[str, str, str], ...] = (
     ("buffer", "x", "bfloat16"),
@@ -126,6 +133,8 @@ class CakeFusedKDADecodeVariant:
 
 # Target-owned static registration. There is deliberately no runtime generated
 # manifest: the JIT loader is the source of truth for its checked-in closure.
+# The SM100a source and launch records are shared with explicit SM103a builds;
+# compilation flags and executable identities remain target-specific.
 _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "repeated_safe_f32_wide_slot_offsets",
@@ -3589,15 +3598,18 @@ def _values_or_any(value: object) -> tuple[Any, ...] | None:
 
 
 @functools.cache
-def get_cake_fused_kda_decode_variants() -> tuple[CakeFusedKDADecodeVariant, ...]:
-    """Resolve and verify the explicitly registered checked-in device sources."""
+def get_cake_fused_kda_decode_variants(
+    target: CakeFusedKDADecodeTarget = "sm100a",
+) -> tuple[CakeFusedKDADecodeVariant, ...]:
+    """Resolve the shared source registry for one explicit compilation target."""
 
+    if target not in _TARGETS:
+        raise ValueError(f"unsupported Cake fused KDA target: {target}")
     csrc_dir = get_kda_csrc_dir().resolve()
     result: list[CakeFusedKDADecodeVariant] = []
     observed: set[tuple[str, str]] = set()
     for item in _VARIANT_SPECS:
         name = item["name"]
-        target = item["target"]
         key = (name, target)
         if key in observed:
             raise ValueError(f"duplicate Cake fused KDA variant {name}/{target}")
@@ -3664,8 +3676,8 @@ def _variant_build_identity_payload(
         "arg_plan_sha256": _ARG_PLAN_SHA256[variant.abi_kind],
         "state_dtype": variant.state_dtype,
         "slot_offset_bits": variant.slot_offset_bits,
-        "target_nvcc_flags": sm100a_nvcc_flags,
-        "target_define": _TARGET_DEFINE,
+        "target_nvcc_flags": _TARGET_NVCC_FLAGS[variant.target],
+        "target_define": _TARGET_DEFINES[variant.target],
         "extra_cuda_cflags": variant.extra_cuda_cflags,
         "threads": variant.threads,
         "dynamic_smem_bytes": variant.dynamic_smem_bytes,
@@ -3700,10 +3712,12 @@ def _variant_build_identity(variant: CakeFusedKDADecodeVariant) -> str:
     ).hexdigest()
 
 
-def get_cake_fused_kda_decode_program_identity() -> str:
-    """Return a stable identity for the registered executable closure."""
+def get_cake_fused_kda_decode_program_identity(
+    target: CakeFusedKDADecodeTarget = "sm100a",
+) -> str:
+    """Return a stable identity for one target's registered executable closure."""
 
-    variants = get_cake_fused_kda_decode_variants()
+    variants = get_cake_fused_kda_decode_variants(target)
     payload = {
         "schema": "cake.fused_kda_decode.program.v1",
         "variants": [_variant_build_identity_payload(variant) for variant in variants],
@@ -3803,7 +3817,9 @@ def select_cake_fused_kda_decode_variant(
         else 32
     )
     available = (
-        get_cake_fused_kda_decode_variants() if variants is None else tuple(variants)
+        get_cake_fused_kda_decode_variants(target)
+        if variants is None
+        else tuple(variants)
     )
     for variant in available:
         if (
@@ -3837,7 +3853,7 @@ def cake_fused_kda_decode_is_available() -> bool:
 def get_cake_fused_kda_decode_variant(
     name: str, target: CakeFusedKDADecodeTarget
 ) -> CakeFusedKDADecodeVariant:
-    for variant in get_cake_fused_kda_decode_variants():
+    for variant in get_cake_fused_kda_decode_variants(target):
         if variant.name == name and variant.target == target:
             return variant
     raise RuntimeError(f"Cake fused KDA source is unavailable for {name}/{target}")
@@ -3937,7 +3953,7 @@ def gen_cake_fused_kda_decode_module(
         name=uri,
         sources=[variant.body_path, binding],
         target=target,
-        target_define=_TARGET_DEFINE,
+        target_define=_TARGET_DEFINES[target],
         csrc_dir=csrc_dir,
         include_dir=get_flashinfer_include_dir(),
         extra_cuda_cflags=variant.extra_cuda_cflags,

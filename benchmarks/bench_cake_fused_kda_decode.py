@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict paired benchmark for the Cake fused KDA decode backend on B200."""
+"""Strict paired Cake fused KDA decode benchmark on B200 or B300 (official21)."""
 
 import argparse
 import ast
@@ -174,14 +174,21 @@ def _make_inputs(num_heads, num_rows, seed=42):
     }
 
 
-def _require_b200_and_cupti():
+def _require_gpu_and_cupti(*, allow_b300=False):
     if not torch.cuda.is_available():
         raise RuntimeError("this benchmark requires CUDA")
     device = torch.device("cuda")
-    if get_compute_capability(device) != (10, 0):
-        raise RuntimeError("this benchmark requires an NVIDIA B200 (SM100a)")
-    if "B200" not in torch.cuda.get_device_name(device).upper():
-        raise RuntimeError("this benchmark requires an NVIDIA B200")
+    capability = get_compute_capability(device)
+    gpu_name = torch.cuda.get_device_name(device).upper()
+    if capability == (10, 0) and "B200" in gpu_name:
+        target = "sm100a"
+    elif allow_b300 and capability == (10, 3) and "B300" in gpu_name:
+        target = "sm103a"
+    else:
+        supported = "NVIDIA B200 (SM100a)"
+        if allow_b300:
+            supported += " or B300 (SM103a)"
+        raise RuntimeError(f"this benchmark requires an {supported}")
     try:
         importlib.import_module("cupti")
         cupti_version = importlib.metadata.version("cupti-python")
@@ -191,6 +198,12 @@ def _require_b200_and_cupti():
         raise RuntimeError(f"cupti-python >= 13 is required, found {cupti_version}")
     if not cake_fused_kda_decode_is_available():
         raise RuntimeError("the Cake fused KDA source registry is not complete")
+    return cupti_version, target
+
+
+def _require_b200_and_cupti():
+    # Full-domain timing and historical inheritance remain B200-only.
+    cupti_version, _ = _require_gpu_and_cupti()
     return cupti_version
 
 
@@ -218,8 +231,8 @@ def _query_single_visible_gpu_identity():
     return fields[0], fields[1]
 
 
-def _cake_program_record(repo_root):
-    variants = get_cake_fused_kda_decode_variants()
+def _cake_program_record(repo_root, target="sm100a"):
+    variants = get_cake_fused_kda_decode_variants(target)
     records = []
     for variant in variants:
         body_path = variant.body_path.resolve()
@@ -269,13 +282,13 @@ def _cake_program_record(repo_root):
             }
         )
     return {
-        "identity_sha256": get_cake_fused_kda_decode_program_identity(),
+        "identity_sha256": get_cake_fused_kda_decode_program_identity(target),
         "variants": records,
     }
 
 
 def _run_worker(args):
-    _require_b200_and_cupti()
+    _require_gpu_and_cupti(allow_b300=True)
     inputs = _make_inputs(args.worker_heads, args.worker_rows)
     variant_name = None
 
@@ -564,7 +577,7 @@ def _benchmark_payload(*, status, identity, measurement_config, rows, summary=No
 
 
 def _run_paired_benchmark(args):
-    cupti_version = _require_b200_and_cupti()
+    cupti_version, target = _require_gpu_and_cupti(allow_b300=True)
     repo_root = Path(__file__).resolve().parents[1]
     output_path = Path(args.output_json).resolve()
     try:
@@ -573,7 +586,7 @@ def _run_paired_benchmark(args):
         pass
     else:
         raise RuntimeError("--output-json must be outside the source repository")
-    program = _cake_program_record(repo_root)
+    program = _cake_program_record(repo_root, target)
     for description, source_path in (
         ("benchmark", Path(__file__).resolve()),
         ("fused KDA implementation", Path(_impl.__file__).resolve()),

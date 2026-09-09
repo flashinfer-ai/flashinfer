@@ -165,8 +165,8 @@ _VARIANT_CASES = (
 def _require_cake_fused_kda_decode():
     if not torch.cuda.is_available():
         pytest.skip("Cake fused KDA decode requires CUDA")
-    if get_compute_capability(torch.device("cuda")) != (10, 0):
-        pytest.skip("Cake fused KDA decode requires an SM100a GPU")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake fused KDA decode requires an SM100a or SM103a GPU")
     if not _FUSED_KDA_DECODE_AVAILABLE:
         pytest.skip("fused KDA decode dependencies are unavailable")
     assert cake_fused_kda_decode_is_available(), (
@@ -436,6 +436,13 @@ def _run_and_check_cake(
     original_run = _impl._run_cake_variant
 
     def record_cake_route(variant, **kwargs):
+        assert (
+            variant.target
+            == {
+                (10, 0): "sm100a",
+                (10, 3): "sm103a",
+            }[get_compute_capability(inputs["x"].device)]
+        )
         routed_variants.append(variant.name)
         return original_run(variant, **kwargs)
 

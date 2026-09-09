@@ -439,7 +439,8 @@ def fused_kda_decode(
             FlashInfer implementation. ``"cake"`` strictly selects an
             exported Cake kernel and raises when no registered route matches.
             ``"auto"`` selects Cake only when ``state_indices_mode`` is
-            supplied and a route matches, otherwise preserving CuTe DSL.
+            supplied and a route matches on SM100a or SM103a, otherwise
+            preserving CuTe DSL. Each architecture uses its own compiled module.
             Default: ``"cute-dsl"``.
         state_indices_mode:
             Host-known assertion about ``state_indices`` used only by the Cake
