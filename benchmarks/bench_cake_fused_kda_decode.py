@@ -1358,6 +1358,20 @@ def _normalize_predecessor_binding(source):
     )
 
 
+def _normalize_predecessor_kernel_source(source):
+    predecessor_assert = (
+        b"static_assert(alignof(CUtensorMap) == 128, "
+        b'"CUtensorMap CUDA ABI must be 128-byte aligned");'
+    )
+    current_assert = (
+        b"static_assert(alignof(FlashInferTensorMap) == 128, "
+        b'"kernel tensor-map ABI must be 128-byte aligned");'
+    )
+    if source.count(predecessor_assert) != 1:
+        raise RuntimeError("predecessor tensor-map alignment assertion is invalid")
+    return source.replace(predecessor_assert, current_assert, 1)
+
+
 def _legacy_eligibility(variant):
     result = []
     for rule in variant.get("eligibility", []):
@@ -1585,7 +1599,7 @@ def _validate_equivalence_receipt(
         ):
             raise RuntimeError(f"source identity changed for {name!r}")
         predecessor_normalized = _normalize_kernel_symbol(
-            predecessor_source,
+            _normalize_predecessor_kernel_source(predecessor_source),
             predecessor_variant["kernel_symbol"],
             f"predecessor {name}",
         )
