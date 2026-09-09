@@ -1,9 +1,10 @@
-"""cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4: wiring smoke test (shape/dtype/no-NaN)."""
+"""SM12x MXFP8 x MXFP4 internal MoE ops against pure-Torch references."""
 
 import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.utils import is_sm120a_supported
@@ -22,6 +23,12 @@ def skip_if_not_sm120():
         pytest.skip("requires an SM120a device")
 
 
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denom = (x * x + y * y).sum().item()
+    return 0.0 if denom == 0 else 1.0 - 2.0 * (x * y).sum().item() / denom
+
+
 def compute_padded_offset(offset: int, problem_idx: int) -> int:
     return (offset + problem_idx * (SF_M_ALIGN - 1)) // SF_M_ALIGN * SF_M_ALIGN
 
@@ -34,6 +41,7 @@ def ceil_to_ue8m0(sf):
 
 
 def mxfp8_act_quantize(x, gran_k=128):
+    """Per-token E4M3 with a per-gran_k-block UE8M0 scale; sf is [M, K/gran_k]."""
     m, k = x.shape
     blocks = k // gran_k
     xf = x.float().reshape(m, blocks, gran_k)
@@ -95,7 +103,39 @@ def pack_mxfp4_moe_sfb(w_sf_list):
     return torch.stack(packed).view(torch.uint8)
 
 
-def make_inputs(m_per_expert_list, n, k):
+def dequant_e2m1_codes(codes):
+    values = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=codes.device,
+        dtype=torch.float32,
+    )
+    idx = (codes & 0x07).to(torch.long)
+    sign = ((codes & 0x08) != 0) & (idx != 0)
+    val = values[idx]
+    return torch.where(sign, -val, val)
+
+
+def ref_moe_gemm(a_q, a_sf, b_q, b_sf, offsets, out_dtype=torch.bfloat16):
+    """Pure-torch truth from the natural (unpacked) scales, not the kernel-ABI packed ones."""
+    m, k = a_q.shape
+    a_deq = (a_q.float().reshape(m, k // 128, 128) * a_sf[:, :, None]).reshape(m, k)
+    out = torch.zeros(m, b_q.shape[1], device=a_q.device, dtype=torch.float32)
+    off = offsets.tolist()
+    for e in range(len(off) - 1):
+        s, en = off[e], off[e + 1]
+        if s < en:
+            n, _kh = b_q[e].shape
+            codes = torch.zeros(n, k, dtype=torch.uint8, device=a_q.device)
+            codes[:, 0::2] = b_q[e] & 0x0F
+            codes[:, 1::2] = (b_q[e] >> 4) & 0x0F
+            b_deq = (
+                dequant_e2m1_codes(codes).reshape(n, k // 32, 32) * b_sf[e][:, :, None]
+            ).reshape(n, k)
+            out[s:en] = a_deq[s:en] @ b_deq.t()
+    return out.to(out_dtype)
+
+
+def make_inputs(m_per_expert_list, n, k, ref_dtype=torch.bfloat16):
     torch.random.manual_seed(0)
     num_experts = len(m_per_expert_list)
     offsets = [0]
@@ -118,22 +158,50 @@ def make_inputs(m_per_expert_list, n, k):
         sfs.append(sf)
     b_q = torch.stack(qs)
     b_scale = pack_mxfp4_moe_sfb(sfs)
-    return a_q, a_scale, b_q, b_scale, m_indptr
+
+    ref = ref_moe_gemm(a_q, a_sf, b_q, sfs, m_indptr, ref_dtype)
+    return a_q, a_scale, b_q, b_scale, m_indptr, ref
+
+
+def test_cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4_matches_reference():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4
+
+    a_q, a_scale, b_q, b_scale, m_indptr, ref = make_inputs([64, 64, 64, 64], 512, 512)
+    out = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(a_q, a_scale, b_q, b_scale, m_indptr)
+    diff = calc_diff(out.float(), ref.float())
+    assert diff < 5e-3, f"calc_diff={diff:.6e}"
+
+
+def make_gated_inputs(m_per_expert_list, n, k):
+    a, a_sf, b, b_sf, offsets, ref2n = make_inputs(
+        m_per_expert_list, 2 * n, k, torch.float32
+    )
+    return a, a_sf, b, b_sf, offsets, (F.silu(ref2n[:, n:]) * ref2n[:, :n]).to(torch.bfloat16)
+
+
+def test_cute_dsl_sm12x_fc1_act_mxfp8_mxfp4_matches_reference():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_mxfp8_mxfp4
+    a, a_sf, b, b_sf, offsets, ref = make_gated_inputs([64] * 4, 512, 512)
+    out = cute_dsl_sm12x_fc1_act_mxfp8_mxfp4(a, a_sf, b, b_sf, offsets)
+    assert calc_diff(out.float(), ref.float()) < 8e-3
+
+
+def test_cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4_smoke():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4
+    a, a_sf, b, b_sf, offsets, _ = make_gated_inputs([64] * 4, 512, 512)
+    q, sf = cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(a, a_sf, b, b_sf, offsets)
+    assert not torch.isnan(q.float()).any() and sf.numel() > 0
 
 
 def test_cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4_smoke():
     skip_if_not_sm120()
     from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
-
-    num_experts, m_per_expert, hidden = 4, 64, 512
-    a_q, a_scale, b_q, b_scale, m_indptr = make_inputs(
-        [m_per_expert] * num_experts, hidden, hidden
-    )
-    num_tokens = num_experts * m_per_expert
-    tok = torch.randint(0, num_tokens, (num_tokens,), device="cuda", dtype=torch.int32)
-    scales = torch.rand(num_tokens, device="cuda", dtype=torch.float32)
+    a, a_sf, b, b_sf, offsets, _ = make_inputs([64] * 4, 512, 512)
+    rows = a.shape[0]
+    tok = torch.randint(0, rows, (rows,), device="cuda", dtype=torch.int32)
     out = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
-        a_q, a_scale, b_q, b_scale, m_indptr, tok, scales, num_tokens
-    )
-    assert out.shape == (num_tokens, hidden)
-    assert not torch.isnan(out.float()).any()
+        a, a_sf, b, b_sf, offsets, tok, torch.rand(rows, device="cuda"), rows)
+    assert out.shape == (rows, 512) and not torch.isnan(out.float()).any()
