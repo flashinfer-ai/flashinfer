@@ -35,6 +35,7 @@ import tvm_ffi  # noqa: F401 -- TVM FFI is required for kernel dispatch
 
 from ..jit.cake_fused_kda_decode import (
     CakeFusedKDADecodeStateIndicesMode,
+    CakeFusedKDADecodeTarget,
     CakeFusedKDADecodeVariant,
     get_cake_fused_kda_decode_variants,
     load_cake_fused_kda_decode_module,
@@ -634,6 +635,7 @@ def _select_cake_variant(
     norm_eps,
 ) -> CakeFusedKDADecodeVariant | None:
     capability = get_compute_capability(x.device)
+    target: CakeFusedKDADecodeTarget
     if capability == (10, 0):
         target = "sm100a"
     elif capability == (10, 3):
