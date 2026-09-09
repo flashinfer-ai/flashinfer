@@ -21,6 +21,17 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 
     RecurrentKDAPrefillWrapper
 
+.. note::
+
+    ``RecurrentKDAPrefillWrapper`` is **experimental**. Calling ``plan`` or
+    ``run`` is itself the opt-in and needs no environment variable; each warns
+    once per process. It is limited to compute capability 10.0 and 10.3, is
+    specific to the CuTe DSL backend, and fixes the sequence count and packed
+    token extent after the first warmup run. Its planning implementation lives
+    in ``flashinfer.experimental.kda_prefill_wrapper`` and is JIT-only. See
+    `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for the
+    graduation plan.
+
 Backend selection
 -----------------
 
