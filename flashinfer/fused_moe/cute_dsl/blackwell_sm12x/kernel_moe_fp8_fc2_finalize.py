@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, MmaConfig, LoadABConfig
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigFp8,
     copy_scale_s2r,
@@ -58,7 +58,7 @@ def make_cfg(tile, ab_stage, epi=EpiMethod.WG_SCATTER, enable_pdl=False):
     )
     assert bm >= ATOM_MNK[0], "the fused scatter reads sC, and a swapped tile has none"
     union = EPI_CONFIGS[epi].DRAINS_SC_IN_WG
-    return Sm120GemmBuilder(
+    return Sm12xGemmConfig(
         MmaConfig(warp_mma.MmaFP8Op(e4m3, f32, ATOM_MNK), tile[:2], num_math_warps),
         LoadABConfig(tile, ab_stage, e4m3, e4m3),
         Sm120SfConfigFp8(GRAN_M, GRAN_N, GRAN_K),

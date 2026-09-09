@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, MmaConfig, LoadABConfig
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigFp8,
     copy_scale_s2r,
@@ -72,7 +72,7 @@ def make_cfg(tile, ab_stage, epi=EpiMethod.STAGED_R2G, enable_pdl=False):
         gran_m, gran_n = GRAN_M, GRAN_N
     tile = (bm, bn, bk)
     union = epi is EpiMethod.R2G_WG
-    return Sm120GemmBuilder(
+    return Sm12xGemmConfig(
         MmaConfig(
             warp_mma.MmaFP8Op(e4m3, f32, ATOM_MNK),
             tile[:2],
