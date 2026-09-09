@@ -388,9 +388,9 @@ class W4A16Fc1Epilogue(SwapABFc1Epilogue):
         real_fc1_output, _ = self.sched_ext.get_gmem_tensor(
             "c", self.fc1_output, work_tile_info
         )
+        weight_alpha = self.optional_epi_args.fc1_alpha[work_tile_info.expert_idx]
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("fc1_epi")
-        weight_alpha = self.optional_epi_args.fc1_alpha[work_tile_info.expert_idx]
         for subtile_idx in cutlass.range(self.subtile_cnt, unroll=1):
             if subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
                 # Current run already selects the accumulator stage. Every
