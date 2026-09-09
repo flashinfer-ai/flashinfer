@@ -44,7 +44,7 @@ from __future__ import annotations
 import enum
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TypeVar
 
 import torch
 
@@ -53,6 +53,8 @@ from . import _sparse_mla_sm120_cpb as _cpb
 from ._sparse_mla_sm120_cpb import CalibrationError
 
 logger = logging.getLogger(__name__)
+
+_VariantT = TypeVar("_VariantT")
 
 # Kernel-side constants. Mirrored from
 # include/flashinfer/attention/sparse_mla_sm120/{arch,model}/*.cuh.
@@ -240,6 +242,33 @@ class PlannedCall:
 
     variant: KernelVariant
     cpb: int  # decode only; -1 selects the C++ heuristic
+
+
+def _select_calibrated_variant(
+    *,
+    decode_eligible: bool,
+    decode_variant: _VariantT,
+    prefill_variant: Optional[_VariantT],
+    decode_preferred: Optional[bool],
+) -> Optional[_VariantT]:
+    """Shared decode/prefill crossover policy.
+
+    ``decode_eligible`` is an implementation envelope, not a performance
+    threshold.  When both implementations can serve the call, the caller
+    converts its independently keyed calibration record into
+    ``decode_preferred``.  Missing calibration deliberately retains the safe
+    historical decode-first fallback.
+
+    The helper is format agnostic: FP8 and NVFP4 share this policy while
+    looking up independently keyed measurements.
+    """
+    if not decode_eligible:
+        return prefill_variant
+    if prefill_variant is None:
+        return decode_variant
+    if decode_preferred is None or decode_preferred:
+        return decode_variant
+    return prefill_variant
 
 
 # ── Envelopes (single source of truth; C++ re-checks them defensively) ────
@@ -641,15 +670,14 @@ def _decide(
     pf = prefill_variant(
         model_type, num_heads, topk, page_block_size, has_extra, prefill_impl_pref
     )
-    if not decode_splitk_eligible(
-        model_type, num_heads, topk, page_block_size, has_extra, num_tokens
-    ):
-        return pf
-    if pf is None:
-        return KernelVariant.DECODE_SPLITK
     crossover = _cpb.get_decode_max_tokens(
         device, _MODEL_TYPE_TO_FAMILY[model_type], num_heads, topk
     )
-    if crossover is None or num_tokens <= crossover:
-        return KernelVariant.DECODE_SPLITK
-    return pf
+    return _select_calibrated_variant(
+        decode_eligible=decode_splitk_eligible(
+            model_type, num_heads, topk, page_block_size, has_extra, num_tokens
+        ),
+        decode_variant=KernelVariant.DECODE_SPLITK,
+        prefill_variant=pf,
+        decode_preferred=(None if crossover is None else num_tokens <= crossover),
+    )

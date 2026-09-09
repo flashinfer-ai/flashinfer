@@ -593,6 +593,34 @@ def _mm_bf16_fp4_cute_dsl_reference(a, b, b_descale, alpha=None, block_size=16):
     return _bf16_fp4_matmul(a, lut[codes] * sf, alpha)
 
 
+def _mm_bf16_fp4_cute_dsl_sm100_reference(a, b, b_descale, alpha=None, block_size=16):
+    """Reference for the SM100/103 cute-DSL-prepared layout.
+
+    b: [N, K//2] uint8 -- the canonical nvfp4 weight, passed through unchanged.
+    b_descale: (32, 4, N//128, 4, K_sf//4, 1) uint8 -- the strided view
+    ``convert_sf_to_mma_layout`` builds over the canonical 128x4-swizzled
+    FP8-E4M3 buffer, whose physical order is (groups, n_tiles, k_tiles, 32, 4,
+    4); permuting back to that order recovers the buffer to unswizzle.
+    """
+    n, k_half = b.shape
+    k = k_half * 2
+    sf_buffer = b_descale.permute(5, 2, 4, 0, 1, 3).reshape(-1)
+    sf_bytes = _unswizzle_sf_128x4(sf_buffer, n, k // block_size).contiguous()
+    sf = sf_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=b.device)
+    b_int = b.to(torch.int64)
+    codes = torch.stack([b_int & 0xF, (b_int >> 4) & 0xF], dim=-1).reshape(n, k)
+    sf = sf.repeat_interleave(block_size, dim=1)
+    return _bf16_fp4_matmul(a, (lut[codes] * sf).T, alpha)
+
+
+cast(Any, _mm_bf16_fp4_cute_dsl_sm100_reference)._trace_reference_dependencies = (
+    _bf16_fp4_matmul,
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
 def _mm_bf16_fp4_cudnn_init(
     *,
     M: int,
@@ -658,7 +686,7 @@ def _mm_bf16_fp4_cute_dsl_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cute-DSL backend).
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cute-DSL backend, SM12x).
 
     Sourced from ``tests/gemm/test_mm_bf16_fp4.py``: quantize a randn
     bf16 weight via ``flashinfer.nvfp4_quantize`` (layout_128x4), then
@@ -678,6 +706,66 @@ def _mm_bf16_fp4_cute_dsl_init(
     major, minor = torch.cuda.get_device_capability(torch.device(device))
     if not mm_bf16_fp4.is_backend_supported("cute-dsl", major * 10 + minor):
         raise NotImplementedError(f"mm_bf16_fp4 is not supported on SM{major}{minor}")
+    if (major, minor) in ((10, 0), (10, 3)):
+        raise NotImplementedError(
+            f"SM{major}{minor} prepares a different cute-dsl layout; use "
+            "mm_bf16_fp4_cute_dsl_sm100_trace"
+        )
+
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = (448.0 * 6.0) / w.float().abs().nan_to_num().max()
+    b_fp4, b_sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    alpha = torch.tensor([1.0 / g_w.item()], dtype=torch.float32, device=device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4, b_sf, alpha, backend="cute-dsl", block_size=block_size
+    )
+    return {
+        "a": a,
+        "b": b_p,
+        "b_descale": sf_p,
+        "alpha": alpha_p,
+        "backend": "cute-dsl",
+        "block_size": int(block_size),
+    }
+
+
+def _mm_bf16_fp4_cute_dsl_sm100_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_div_2: int = 0,  # derived
+    N_div_128: int = 0,  # derived
+    K_sf_div_4: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16_fp4`` (cute-DSL backend, SM100/103).
+
+    Same quantization as the SM12x init, but ``prepare_bf16_fp4_weights``
+    keeps the weight in its canonical ``(N, K//2)`` layout and returns the
+    scales as the 6-D strided MMA view the SM100 TMA descriptor consumes.
+    """
+    del K_div_2, N_div_128, K_sf_div_4
+    from flashinfer import (  # noqa: PLC0415
+        nvfp4_quantize,
+        prepare_bf16_fp4_weights,
+    )
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("mm_bf16_fp4 init requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability(torch.device(device))
+    if (major, minor) not in ((10, 0), (10, 3)):
+        raise NotImplementedError(
+            f"this template describes the SM100/103 cute-dsl layout; got "
+            f"SM{major}{minor}"
+        )
 
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -782,17 +870,69 @@ mm_bf16_fp4_cute_dsl_trace = TraceTemplate(
     init=_mm_bf16_fp4_cute_dsl_init,
 )
 
+mm_bf16_fp4_cute_dsl_sm100_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="mm_bf16_fp4_cute_dsl_sm100",
+    description=(
+        "bf16 x fp4 GEMM C = (A @ dequant(B).T) * alpha, cute-DSL-prepared weights "
+        "for SM100/103.  A is bf16; B is the canonical fp4 (e2m1fn_x2 packed as "
+        "uint8) [N, K//2] weight with fp8-e4m3 per-block scales kept in the "
+        "128x4-swizzled layout, viewed as the 6-D MMA layout the TMA descriptor "
+        "consumes."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "block_size": Const(description="FP4 quantization block size (16 for nvfp4)."),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a", description="Activation, bfloat16."),
+        "B": Tensor(
+            ["N", "K_div_2"],
+            param="b",
+            description="Weight, fp4 e2m1fn_x2 packed as uint8, [N, K//2].",
+        ),
+        "b_descale": Tensor(
+            ["32", "4", "N_div_128", "4", "K_sf_div_4", "num_groups"],
+            description=(
+                "Per-block scales, fp8-e4m3 bytes as uint8, as the 6-D strided "
+                "view (32, 4, N//128, 4, K//block_size//4, 1) over the canonical "
+                "128x4-swizzled buffer."
+            ),
+        ),
+        "alpha": Tensor(
+            ["1"],
+            optional=True,
+            description="Optional global scale, float32, shape (1,).",
+        ),
+        "block_size": Scalar("int32", description="FP4 block size (always 16)."),
+    },
+    outputs={
+        "C": Tensor(["M", "N"], dtype_from="a"),
+    },
+    tags=["status:verified", "quantization:fp4"],
+    reference=_mm_bf16_fp4_cute_dsl_sm100_reference,
+    check=_fp4_gemm_check,
+    init=_mm_bf16_fp4_cute_dsl_sm100_init,
+)
+
 
 def mm_bf16_fp4_trace_dispatch(**kwargs):
     """Return the TraceTemplate for an ``mm_bf16_fp4`` call by backend.
 
-    The prepared weight layout differs per backend (int32 -> cute-dsl,
-    uint8 -> cudnn), so each gets its own template.  Pass as
+    ``prepare_bf16_fp4_weights`` produces three distinct layouts: cute-dsl on
+    SM12x tile-packs the weight into int32, cute-dsl on SM100/103 keeps the
+    canonical uint8 weight but hands back a 6-D scale view, and cudnn keeps the
+    canonical weight with linear 2-D scales.  Pass as
     ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
     b = kwargs.get("b")
     if b is not None and b.dtype == torch.int32:
         return mm_bf16_fp4_cute_dsl_trace
+    b_descale = kwargs.get("b_descale")
+    if b_descale is not None and b_descale.dim() == 6:
+        return mm_bf16_fp4_cute_dsl_sm100_trace
     return mm_bf16_fp4_cudnn_trace
 
 
@@ -801,6 +941,7 @@ def mm_bf16_fp4_trace_dispatch(**kwargs):
 mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
     mm_bf16_fp4_cudnn_trace,
     mm_bf16_fp4_cute_dsl_trace,
+    mm_bf16_fp4_cute_dsl_sm100_trace,
 ]
 
 

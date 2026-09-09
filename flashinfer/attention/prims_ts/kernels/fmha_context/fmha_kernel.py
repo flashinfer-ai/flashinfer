@@ -2366,6 +2366,11 @@ class FmhaTs:
         grouped-query attention with an even repeat count.
     enable_skip_correction : bool, optional
         Enable skip-correction for softmax rescaling (default: True).
+    uses_ldtm_stat : bool, optional
+        Use ``tcgen05.ld.red.max`` (LDTM.STAT) to fuse the per-chunk row_max
+        into the TMEM S load on the non-masked path (default: False). The
+        context runner enables this by default on SM103 (B300) and SM107
+        (Rubin).
     causal_single_kv_tile : bool, optional
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
@@ -2389,6 +2394,7 @@ class FmhaTs:
         has_variable_window: bool = False,
         h_r: int = 1,
         enable_skip_correction: bool = True,
+        uses_ldtm_stat: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
         max_num_pages_per_seq_kv: int = 1,
@@ -2470,6 +2476,7 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
+        cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 

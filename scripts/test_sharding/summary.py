@@ -705,6 +705,7 @@ def _runtime_version_line() -> str:
         ("cuda-tile", _package_version("cuda-tile")),
         ("cuDNN-frontend", _package_version("nvidia-cudnn-frontend")),
         ("triton", _package_version("triton")),
+        ("nccl-extensions", _package_version("nccl-extensions")),
         ("nccl4py", _package_version("nccl4py")),
     ]
     return " ".join(f"{name}={version}" for name, version in versions)
