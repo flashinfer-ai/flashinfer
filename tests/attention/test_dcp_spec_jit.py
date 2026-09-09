@@ -69,9 +69,9 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
         v4 = jit_dcp.gen_dcp_spec_module("v4", "sm100a", 1, 1, 64, 8, 1, 16)
         fp8 = jit_dcp.gen_dcp_spec_fp8_module("sm103a", 64, 3, 64, 8, 4, 3, 1)
 
-        assert Path(v1.sources[0]).name == "retain_kv_l21.cu"
-        assert Path(v4.sources[0]).name == "num_split16.cu"
-        assert Path(fp8.sources[0]).name == "num_split3_retain_kv_l21.cu"
+        assert Path(v1.sources[0]).name == "cake_retain_kv_l21.cu"
+        assert Path(v4.sources[0]).name == "cake_num_split16.cu"
+        assert Path(fp8.sources[0]).name == "cake_num_split3_retain_kv_l21.cu"
         assert Path(fp8.sources[1]).name == (
             "cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu"
         )

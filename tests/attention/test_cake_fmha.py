@@ -208,7 +208,7 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
         retain_kv_l2=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "cake_has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
         "cake_fmha_decode_native_bf16_binding.cu",
         "cake_fmha_decode_native_bf16_jit_binding.cu",
     }
@@ -494,7 +494,7 @@ def test_cake_fmha_decode_native_fp16_nhd_jit_selects_one_manifest_member(
         retain_kv_l2=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+        "cake_has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
         "cake_fmha_decode_native_fp16_nhd_binding.cu",
         "cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
     }
@@ -529,7 +529,7 @@ def test_cake_fmha_decode_native_fp16_hd512_jit_selects_one_manifest_member(
         retain_kv_l2=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "has_window1_retain_kv_l20_use_scale_ptr1.cu",
+        "cake_has_window1_retain_kv_l20_use_scale_ptr1.cu",
         "cake_fmha_decode_native_fp16_hd512_binding.cu",
         "cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     }
@@ -561,7 +561,7 @@ def test_cake_fmha_decode_quant_bf16q_jit_selects_one_manifest_member(
         32,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "page_size32.cu",
+        "cake_page_size32.cu",
         "cake_fmha_decode_quant_bf16q_binding.cu",
         "cake_fmha_decode_quant_bf16q_jit_binding.cu",
     }
@@ -596,9 +596,9 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
         full_blocks=True,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "full_blocks1_page_size32.cu",
+        "cake_full_blocks1_page_size32.cu",
         "cake_fmha_decode_quant_fp8_binding.cu",
-        "default.cu",
+        "cake_default.cu",
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
@@ -619,9 +619,9 @@ def test_cake_fmha_decode_quant_nvfp4_jit_selects_main_and_reducer(
     spec = gen_cake_fmha_decode_quant_nvfp4_module("sm103a", 2, 1, 4, 2, 32)
     assert spec.name == get_cake_fmha_decode_quant_nvfp4_uri("sm103a", 2, 1, 4, 2, 32)
     assert {Path(source).name for source in spec.sources} == {
-        "page_size32.cu",
+        "cake_page_size32.cu",
         "cake_fmha_decode_quant_nvfp4_binding.cu",
-        "default.cu",
+        "cake_default.cu",
         "cake_fmha_decode_quant_fp8_reduce_binding.cu",
         "cake_fmha_decode_quant_fp8_jit_binding.cu",
     }
@@ -665,7 +665,7 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
         enable_sink=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "enable_sink0_is_causal1_return_lse1.cu",
+        "cake_enable_sink0_is_causal1_return_lse1.cu",
         "cake_fmha_context_bf16_binding.cu",
         "cake_fmha_context_bf16_jit_binding.cu",
     }
@@ -767,7 +767,7 @@ def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> N
         enable_sink=False,
     )
     assert {Path(source).name for source in spec.sources} == {
-        "enable_sink0_is_causal1_return_lse0.cu",
+        "cake_enable_sink0_is_causal1_return_lse0.cu",
         "cake_fmha_context_fp8_binding.cu",
         "cake_fmha_context_fp8_jit_binding.cu",
     }
@@ -786,7 +786,7 @@ def test_cake_fmha_context_nvfp4_jit_selects_fused_member(
     spec = gen_cake_fmha_context_nvfp4_module("sm100a", 1, 32, 4, 8, 16, 8)
     assert spec.name == get_cake_fmha_context_nvfp4_uri("sm100a", 1, 32, 4, 8, 16, 8)
     assert {Path(source).name for source in spec.sources} == {
-        "enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
+        "cake_enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
         "cake_fmha_context_nvfp4_binding.cu",
         "cake_fmha_context_fp8_jit_binding.cu",
     }
@@ -936,7 +936,7 @@ def test_cake_fmha_tma_adapters_track_descriptor_completion(
             "fp16",
             gen_cake_fmha_context_fp16_hd256_module,
             get_cake_fmha_context_fp16_hd256_uri,
-            "is_causal0.cu",
+            "cake_is_causal0.cu",
             "cake_fmha_context_fp16_hd256_binding.cu",
             "0",
         ),
@@ -944,7 +944,7 @@ def test_cake_fmha_tma_adapters_track_descriptor_completion(
             "fp8",
             gen_cake_fmha_context_fp8_hd256_module,
             get_cake_fmha_context_fp8_hd256_uri,
-            "is_causal1_output_bf161.cu",
+            "cake_is_causal1_output_bf161.cu",
             "cake_fmha_context_fp8_hd256_binding.cu",
             "1",
         ),
