@@ -2677,7 +2677,7 @@ def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
             cum_seqlen_k=None,
             num_kv_tiles=2,
             q_offset=0,
-            g_page_idx_kv=None,
+            g_block_tables=None,
             g_seq_lens_kv=None,
             max_seq_len_kv=256,
             is_persistent=True,
