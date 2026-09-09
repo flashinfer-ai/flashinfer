@@ -22,7 +22,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.attention import (
     gqa_paged_decode_trace,
     gqa_paged_decode_plan_trace,
@@ -168,6 +168,53 @@ def __getattr__(name: str):
 
 def __dir__():
     return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+
+
+@flashinfer_experimental_api(feature="SM110 GQA decode")
+def sm110_gqa_decode(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    q_scale: float = 1.0,
+) -> torch.Tensor:
+    r"""Decode one token with the exact-SM110 FP16 GQA specialization.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Contiguous FP16 query tensor with shape ``[batch, 32, 128]``.
+    kv : torch.Tensor
+        Contiguous FP16 stacked KV tensor with shape
+        ``[batch, 2, 8, capacity, 128]``. Index 0 contains K and index 1
+        contains V.
+    sequence_lengths : torch.Tensor
+        Contiguous CUDA int32 tensor with shape ``[batch]``. Each entry selects
+        the valid KV prefix for that request and must be in ``[1, capacity]``.
+    out : Optional[torch.Tensor]
+        Optional caller-owned contiguous FP16 output with the same shape and
+        device as ``q``. It must not alias ``q``.
+    q_scale : float
+        Additional query scale applied before the standard ``1 / sqrt(128)``
+        attention scale.
+
+    Returns
+    -------
+    torch.Tensor
+        The decoded output in ``out`` when supplied, otherwise a newly
+        allocated tensor.
+    """
+
+    from .experimental.sm110_gqa_decode import decode
+
+    return decode(
+        q,
+        kv,
+        sequence_lengths,
+        out=out,
+        q_scale=q_scale,
+    )
 
 
 @functools.cache
