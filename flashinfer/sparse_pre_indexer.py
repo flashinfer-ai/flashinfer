@@ -27,6 +27,28 @@ def get_sparse_pre_indexer_module():
     return gen_sparse_pre_indexer_module().build_and_load()
 
 
+# Which (compute, output) relations a build dispatches. Bit 0 is "the output is the
+# compute dtype", bit 1 is "the output narrows to e4m3".
+QSA_PRE_INDEXER_SAME_AS_COMPUTE = 1 << 0
+QSA_PRE_INDEXER_NARROW_E4M3 = 1 << 1
+# A build predating the query only ever wrote the compute dtype.
+_QSA_PRE_INDEXER_LEGACY_MASK = QSA_PRE_INDEXER_SAME_AS_COMPUTE
+
+
+def qsa_pre_indexer_dispatch_mask() -> int:
+    """Which output dtypes the built pre-indexer actually instantiates.
+
+    Read off the compiled module rather than a constant here: a cached build can lag
+    this source, and only the binary knows what it was compiled with. A module without
+    the query is one of those older builds, and wrote the compute dtype alone.
+    """
+    module = get_sparse_pre_indexer_module()
+    query = getattr(module, "qsa_pre_indexer_dispatch_mask", None)
+    if query is None:
+        return _QSA_PRE_INDEXER_LEGACY_MASK
+    return int(query())
+
+
 @register_custom_op(
     "flashinfer::qsa_pre_indexer",
     mutates_args=("q_out", "state_cache", "compressed_cache"),

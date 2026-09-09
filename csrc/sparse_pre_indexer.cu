@@ -30,7 +30,36 @@ int32_t shift_of(int64_t v) {
   return sh;
 }
 
+// Carries an output type into the generic lambda that launches with it.
+template <typename T>
+struct type_tag {
+  using type = T;
+};
+
 }  // namespace
+
+// The narrowing arm and the bit that advertises it are the same decision, so they come
+// from one guard: a build without e4m3 has neither.
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
+#define QSA_PRE_INDEXER_NARROWING_ARM()                  \
+  if (q_out.dtype() == dl_float8_e4m3fn) {               \
+    return launch_with(type_tag<__nv_fp8_e4m3>{});       \
+  }
+#define QSA_PRE_INDEXER_NARROW_E4M3_BIT (int64_t{1} << 1)
+#else
+#define QSA_PRE_INDEXER_NARROWING_ARM()
+#define QSA_PRE_INDEXER_NARROW_E4M3_BIT int64_t{0}
+#endif
+
+#define QSA_PRE_INDEXER_SAME_AS_COMPUTE_BIT (int64_t{1} << 0)
+
+// Which (compute, output) relations this build dispatches. Bit 0 is "output is the
+// compute dtype", bit 1 is "output narrows to e4m3". Reported as the relation rather
+// than a list of dtypes so no dtype encoding has to cross the FFI boundary and agree
+// with the switch above.
+int64_t qsa_pre_indexer_dispatch_mask() {
+  return QSA_PRE_INDEXER_SAME_AS_COMPUTE_BIT | QSA_PRE_INDEXER_NARROW_E4M3_BIT;
+}
 
 void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorView cos_sin_cache,
                      TensorView q_norm_weight, TensorView k_norm_weight, double eps,
@@ -142,9 +171,14 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   TVM_FFI_ICHECK_EQ(cos_sin_cache.dtype(), q.dtype());
   TVM_FFI_ICHECK_EQ(q_norm_weight.dtype(), q.dtype());
   TVM_FFI_ICHECK_EQ(k_norm_weight.dtype(), q.dtype());
-  TVM_FFI_ICHECK_EQ(q_out.dtype(), q.dtype());
+  // The raw ring is never quantized: it feeds the compression read path.
   TVM_FFI_ICHECK_EQ(state_cache.dtype(), q.dtype());
-  TVM_FFI_ICHECK_EQ(compressed_cache.dtype(), q.dtype());
+  // The two indexer outputs are one dtype, the caller's indexer_kv_dtype.
+  TVM_FFI_ICHECK_EQ(compressed_cache.dtype(), q_out.dtype());
+  // Either no narrowing at all, or plain e4m3. A bf16 compute with an f16 output is
+  // not a combination anything asks for and is not built.
+  TVM_FFI_ICHECK(q_out.dtype() == q.dtype() || q_out.dtype() == dl_float8_e4m3fn)
+      << "q_out must be " << q.dtype() << " or float8_e4m3fn, got " << q_out.dtype();
   TVM_FFI_ICHECK_EQ(positions.dtype(), dl_int64) << "positions must be int64";
   TVM_FFI_ICHECK_EQ(state_slots.dtype(), dl_int64) << "state_slots must be int64";
   TVM_FFI_ICHECK_EQ(compressed_slots.dtype(), dl_int64) << "compressed_slots must be int64";
@@ -161,7 +195,9 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
-    QSAPreIndexerParams<c_type> p{};
+    auto launch_with = [&](auto out_tag) -> bool {
+    using OutDType = typename decltype(out_tag)::type;
+    QSAPreIndexerParams<c_type, OutDType> p{};
     p.q = static_cast<const c_type*>(q.data_ptr());
     p.q_stride_token = q.stride(0);
     p.k = static_cast<const c_type*>(k.data_ptr());
@@ -176,7 +212,7 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
     p.q_norm_weight = static_cast<const c_type*>(q_norm_weight.data_ptr());
     p.k_norm_weight = static_cast<const c_type*>(k_norm_weight.data_ptr());
     p.eps = static_cast<float>(eps);
-    p.q_out = static_cast<c_type*>(q_out.data_ptr());
+    p.q_out = static_cast<OutDType*>(q_out.data_ptr());
     p.q_out_stride_token = q_out.stride(0);
     p.q_out_stride_head = q_out.stride(1);
     p.state_cache = static_cast<c_type*>(state_cache.data_ptr());
@@ -189,7 +225,7 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
     p.logical_positions = static_cast<const int64_t*>(logical_positions.data_ptr());
     p.compressed_slots = static_cast<const int64_t*>(compressed_slots.data_ptr());
     p.work_metadata = static_cast<const int32_t*>(work_metadata.data_ptr());
-    p.compressed_cache = static_cast<c_type*>(compressed_cache.data_ptr());
+    p.compressed_cache = static_cast<OutDType*>(compressed_cache.data_ptr());
     p.compressed_stride_block = compressed_cache.stride(0);
     p.compressed_stride_token = compressed_cache.stride(1);
     p.num_tokens = static_cast<int32_t>(num_tokens);
@@ -210,12 +246,25 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
 
     const cudaError_t status =
         head_dim == 128
-            ? QSAPreIndexer<128, c_type>(p, is_k_mrope, pos_2d, cache_has_rope_pos, stream)
-            : QSAPreIndexer<256, c_type>(p, is_k_mrope, pos_2d, cache_has_rope_pos, stream);
+            ? QSAPreIndexer<128, c_type, OutDType>(p, is_k_mrope, pos_2d, cache_has_rope_pos,
+                                                   stream)
+            : QSAPreIndexer<256, c_type, OutDType>(p, is_k_mrope, pos_2d, cache_has_rope_pos,
+                                                   stream);
     TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
         << "qsa_pre_indexer: unsupported rotary configuration (three-axis positions need a "
            "three-axis key)";
     TVM_FFI_ICHECK(status == cudaSuccess) << "QSAPreIndexer failed: " << cudaGetErrorString(status);
     return true;
+    };
+
+    if (q_out.dtype() == q.dtype()) {
+      return launch_with(type_tag<c_type>{});
+    }
+    QSA_PRE_INDEXER_NARROWING_ARM()
+    // Reachable: with FLASHINFER_ENABLE_FP8_E4M3 off the arm above expands to nothing
+    // and an e4m3 q_out, admitted by the dtype check, arrives here.
+    TVM_FFI_ICHECK(false) << "q_out dtype " << q_out.dtype()
+                          << " is not enabled in this build of the pre-indexer";
+    return false;
   });
 }
