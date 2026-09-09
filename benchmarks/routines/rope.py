@@ -878,8 +878,9 @@ def testApplyRopeWithCosSinCache(args):
     # Precomputed cos_sin_cache: (max_seq_len, rotary_dim)
     # First half is cos, second half is sin
     max_seq_len = seq_len
+    # API requires FP32 cache regardless of Q/K dtype (#5025).
     cos_sin_cache = torch.randn(
-        max_seq_len, rotary_dim, dtype=input_dtype, device=device
+        max_seq_len, rotary_dim, dtype=torch.float32, device=device
     )
 
     # positions: (total_tokens,)
@@ -936,7 +937,7 @@ def testApplyRopeWithCosSinCache(args):
                 * num_kv_heads
                 * head_dim
                 * input_dtype.itemsize  # k read
-                + max_seq_len * rotary_dim * input_dtype.itemsize  # cos_sin_cache read
+                + max_seq_len * rotary_dim * 4  # cos_sin_cache read (float32)
                 + total_tokens * 8  # positions read (int64)
                 + total_tokens
                 * num_qo_heads
