@@ -8,8 +8,8 @@
 #define FLASHINFER_BLACKWELL_BF16_FP4_SOURCE_READY 1
 #define FLASHINFER_BLACKWELL_BF16_FP4_ABI_VERSION 3
 #define FLASHINFER_BLACKWELL_BF16_FP4_TARGET_SM 103
-#define FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256 "ea49c4b06b7488974097e55b85b890ef14843e3e639ff4451d93fbe54ad38172"
-#define FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256 "c8ac21d7d653d96b09e4dafeb0445cedf4207a80571b806a7fd73e8fab879c76"
+#define FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256 "47c40122cb43215ad0ea216b3d348fa06b8dba6fc2a6c289cc50ace5ecf6b643"
+#define FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256 "d9eeb2e81bc812b0281549f2e9f761e15ab59ea78b492e06df9e1c00f462fa48"
 #include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -349,8 +349,22 @@ __device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c)
     *(unsigned long long*)a = r;
 }
 
+__device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, float2 c) {
+    unsigned long long r;
+    asm("fma.rn.f32x2 %0, %1, %2, %3;"
+        : "=l"(r)
+        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
+          "l"(*(unsigned long long*)&c));
+    *(unsigned long long*)a = r;
+}
+
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
     asm("mul.rn.ftz.f32x2 %0, %0, %1;"
+        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
+}
+
+__device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
+    asm("mul.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
@@ -359,8 +373,18 @@ __device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
+__device__ __forceinline__ void add_f32x2_noftz_inplace(float2* a, float2 b) {
+    asm("add.f32x2 %0, %0, %1;"
+        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
+}
+
 __device__ __forceinline__ void sub_f32x2_inplace(float2* a, float2 b) {
     asm("sub.rn.ftz.f32x2 %0, %0, %1;"
+        : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
+}
+
+__device__ __forceinline__ void sub_f32x2_noftz_inplace(float2* a, float2 b) {
+    asm("sub.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
@@ -372,9 +396,25 @@ __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     return r;
 }
 
+__device__ __forceinline__ float2 add_f32x2_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
 __device__ __forceinline__ float2 sub_f32x2(float2 a, float2 b) {
     float2 r;
     asm("sub.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("sub.f32x2 %0, %1, %2;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -429,6 +469,14 @@ __device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
 __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
     float2 r;
     asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.f32x2 %0, %1, %2;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -861,6 +909,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d(FlashInferTensorMap con
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -950,7 +999,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_grid2d(FlashInferTensorMap con
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -1546,6 +1594,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d(FlashInferTensorMap con
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -1635,7 +1684,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_grid2d(FlashInferTensorMap con
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -2240,6 +2288,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d(FlashInferTensorMap con
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -2329,7 +2378,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_grid2d(FlashInferTensorMap con
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -2928,6 +2976,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d(FlashInferTensorMap con
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -3017,7 +3066,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_grid2d(FlashInferTensorMap con
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -3625,6 +3673,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat(FlashInferTensorMap c
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -3714,7 +3763,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl0_gridflat(FlashInferTensorMap c
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -4324,6 +4372,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat(FlashInferTensorMap c
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -4413,7 +4462,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a0_pdl1_gridflat(FlashInferTensorMap c
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -5032,6 +5080,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat(FlashInferTensorMap c
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -5121,7 +5170,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl0_gridflat(FlashInferTensorMap c
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -5734,6 +5782,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat(FlashInferTensorMap c
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -5823,7 +5872,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_bf16_a1_pdl1_gridflat(FlashInferTensorMap c
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -6445,6 +6493,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d(FlashInferTensorMap cons
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -6534,7 +6583,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_grid2d(FlashInferTensorMap cons
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -7130,6 +7178,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d(FlashInferTensorMap cons
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -7219,7 +7268,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_grid2d(FlashInferTensorMap cons
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -7824,6 +7872,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d(FlashInferTensorMap cons
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -7913,7 +7962,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_grid2d(FlashInferTensorMap cons
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -8512,6 +8560,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d(FlashInferTensorMap cons
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -8601,7 +8650,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_grid2d(FlashInferTensorMap cons
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -9209,6 +9257,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -9298,7 +9347,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl0_gridflat(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -9908,6 +9956,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -9997,7 +10046,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a0_pdl1_gridflat(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -10616,6 +10664,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -10705,7 +10754,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl0_gridflat(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -11318,6 +11366,7 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -11407,7 +11456,6 @@ kernel_flashinfer_bf16_fp4_cudnn_tma_f16_a1_pdl1_gridflat(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -12029,6 +12077,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d(FlashInferTensorMa
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -12116,7 +12165,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_grid2d(FlashInferTensorMa
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -12806,6 +12854,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d(FlashInferTensorMa
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -12893,7 +12942,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_grid2d(FlashInferTensorMa
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -13592,6 +13640,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d(FlashInferTensorMa
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -13679,7 +13728,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_grid2d(FlashInferTensorMa
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -14372,6 +14420,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d(FlashInferTensorMa
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -14459,7 +14508,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_grid2d(FlashInferTensorMa
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -15161,6 +15209,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat(FlashInferTensor
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -15248,7 +15297,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl0_gridflat(FlashInferTensor
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -15952,6 +16000,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat(FlashInferTensor
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -16039,7 +16088,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a0_pdl1_gridflat(FlashInferTensor
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -16752,6 +16800,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat(FlashInferTensor
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -16839,7 +16888,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl0_gridflat(FlashInferTensor
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -17546,6 +17594,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat(FlashInferTensor
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -17633,7 +17682,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_bf16_a1_pdl1_gridflat(FlashInferTensor
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -18349,6 +18397,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d(FlashInferTensorMap
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -18436,7 +18485,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_grid2d(FlashInferTensorMap
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -19126,6 +19174,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d(FlashInferTensorMap
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -19213,7 +19262,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_grid2d(FlashInferTensorMap
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -19912,6 +19960,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d(FlashInferTensorMap
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -19999,7 +20048,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_grid2d(FlashInferTensorMap
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -20692,6 +20740,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d(FlashInferTensorMap
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -20779,7 +20828,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_grid2d(FlashInferTensorMap
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -21481,6 +21529,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat(FlashInferTensorM
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -21568,7 +21617,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl0_gridflat(FlashInferTensorM
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -22272,6 +22320,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat(FlashInferTensorM
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -22359,7 +22408,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a0_pdl1_gridflat(FlashInferTensorM
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -23072,6 +23120,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat(FlashInferTensorM
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -23159,7 +23208,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl0_gridflat(FlashInferTensorM
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -23866,6 +23914,7 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat(FlashInferTensorM
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
     }
@@ -23953,7 +24002,6 @@ kernel_flashinfer_bf16_fp4_cudnn_cp_async_f16_a1_pdl1_gridflat(FlashInferTensorM
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -24669,6 +24717,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -24758,7 +24807,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_grid2d(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -25373,6 +25421,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -25462,7 +25511,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_grid2d(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -26086,6 +26134,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -26175,7 +26224,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_grid2d(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -26793,6 +26841,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -26882,7 +26931,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_grid2d(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -27509,6 +27557,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat(FlashInferTensorMap const*
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -27598,7 +27647,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl0_gridflat(FlashInferTensorMap const*
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -28227,6 +28275,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat(FlashInferTensorMap const*
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -28316,7 +28365,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a0_pdl1_gridflat(FlashInferTensorMap const*
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -28954,6 +29002,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat(FlashInferTensorMap const*
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -29043,7 +29092,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl0_gridflat(FlashInferTensorMap const*
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -29675,6 +29723,7 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat(FlashInferTensorMap const*
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -29764,7 +29813,6 @@ kernel_flashinfer_bf16_fp4_cute_bf16_a1_pdl1_gridflat(FlashInferTensorMap const*
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -30404,6 +30452,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -30475,7 +30524,6 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl0(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (warp == 0) {
         int _tmem_hold = smem + 248;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
@@ -31986,6 +32034,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -32057,7 +32106,6 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a0_pdl1(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (warp == 0) {
         int _tmem_hold = smem + 248;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
@@ -33577,6 +33625,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -33648,7 +33697,6 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl0(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (warp == 0) {
         int _tmem_hold = smem + 248;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
@@ -35162,6 +35210,7 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1(FlashInferTensorMap const* A
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -35233,7 +35282,6 @@ kernel_flashinfer_bf16_fp4_cudnn_group_m128_a1_pdl1(FlashInferTensorMap const* A
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     if (warp == 0) {
         int _tmem_hold = smem + 248;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
@@ -36756,6 +36804,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -36845,7 +36894,6 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl0(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -37456,6 +37504,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -37545,7 +37594,6 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a0_pdl1(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -38165,6 +38213,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -38254,7 +38303,6 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl0(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
@@ -38868,6 +38916,7 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1(FlashInferTensorMap co
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
@@ -38957,7 +39006,6 @@ kernel_flashinfer_bf16_fp4_cudnn_split_k2_partial_a1_pdl1(FlashInferTensorMap co
     __syncwarp();
 
     // TMEM alloc (32 columns, 32 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 392);
     if (warp == 0) {
         int _tmem_hold = smem + 392;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(32) : "memory");
