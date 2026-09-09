@@ -56,14 +56,21 @@ template <ModelType MT>
 __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
                                                            uint64_t* mbar, int io_tid,
+                                                           size_t stride_kv_block,
                                                            uint64_t cache_policy) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
   static_assert(BI <= IO_THREADS, "per-thread index staging assumes one candidate per IO thread");
+  static_assert(STRIDE <= SPARSE_MLA_ZERO_ROW_BYTES);
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * STRIDE);
   if (io_tid >= BI) return;
 
-  const uint8_t* src = kv_ptr + (size_t)(idx >= 0 ? idx : 0) * STRIDE;
+  // The smem row packs the payload only (KV_STRIDE); the gmem row advance is
+  // the runtime stride, which may be wider than the payload (a legacy 656B
+  // vLLM pool serving a 528B GLM53_NOPE payload). swapAB is only eligible at
+  // page_block_size 64, so the advance is stride_kv_block / 64.
+  const uint8_t* src = idx >= 0 ? kv_ptr + (size_t)idx * inline_row_advance(stride_kv_block, 64)
+                                : sparse_mla_zero_row;
   cp_async_bulk_g2s_l2hint(dst + io_tid * STRIDE, src, STRIDE, mbar, cache_policy);
 }
 
@@ -72,10 +79,12 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx
 template <ModelType MT>
 __device__ __forceinline__ void io_bulk_prefetch_l2_swapab(int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
-                                                           int io_tid, uint64_t cache_policy) {
+                                                           int io_tid, size_t stride_kv_block,
+                                                           uint64_t cache_policy) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
   if (io_tid >= BI || idx < 0) return;
-  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * STRIDE, STRIDE, cache_policy);
+  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * inline_row_advance(stride_kv_block, 64),
+                                 STRIDE, cache_policy);
 }
 
 template <ModelType MT, int NUM_HEADS>
@@ -131,7 +140,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     // `pf` (tile ti+1) warms L2 after the gather issue: this pipeline is one
     // tile deep, so the prefetch must not delay the gather the math waits on.
     auto ld_idx = [&](int t) -> int {
-      return (t < actual_ni && io_tid < BI) ? __ldg(idx_base + t * BI + io_tid) : -1;
+      // Bound by topk_len: the last tile is partial and caller padding past
+      // topk_len may be stale; a garbage index would gather a wild address.
+      return (t < actual_ni && io_tid < BI && t * BI + io_tid < topk_len)
+                 ? __ldg(idx_base + t * BI + io_tid)
+                 : -1;
     };
     int staged = ld_idx(0);
     int pf = ld_idx(1);
@@ -142,8 +155,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       const int next = ld_idx(ti + 2);
       mbarrier_wait_parity(sm.mbar_wr + buf, wr_phase);
       io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
-                                     kv_l2_policy);
-      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, kv_l2_policy);
+                                     cold.stride_kv_block, kv_l2_policy);
+      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, cold.stride_kv_block, kv_l2_policy);
       staged = pf;
       pf = next;
       if (buf == 1) wr_phase ^= 1;

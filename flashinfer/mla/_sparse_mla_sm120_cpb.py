@@ -86,7 +86,7 @@ _HPB = 16  # head tile per block
 _SCHEMA_VERSION = 1
 # Only current-schema files load; any other version counts as absent and the
 # families recalibrate on the next tuning-mode pass.
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
+_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
 # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its

@@ -93,41 +93,71 @@ inline int d_v_for(ModelType mt) { return mt == ModelType::DOTS3_SWA ? 1024 : 51
 struct PagedKVLayout {
   int page_block_size;
   size_t stride_kv_block;
+  // Per-token advance in bytes. Equals bytes_per_token for a packed cache, but
+  // may be larger when the caller pads rows (e.g. a legacy 656B vLLM pool
+  // serving a 528B GLM53_NOPE payload). The payload always sits at the row
+  // start, so only the advance changes.
+  size_t stride_kv_row;
 };
 
-inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const char* name) {
+// inline_scale: the model stores scales inside the row (DSV3_2 / GLM_NSA /
+// GLM53_NOPE). Inline rows may be padded (advance >= width >= bpt); footer
+// models address scale data relative to packed rows and must stay exact.
+inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool inline_scale,
+                                           const char* name) {
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
   if (kv.ndim() == 2) {
     const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
     TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
         << name << " 2D block width " << block_bytes
         << " is not divisible by bytes_per_token=" << bpt;
-    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes};
+    // A flat 2D block carries no row padding to infer, so the row advance is
+    // exactly bytes_per_token.
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes,
+            static_cast<size_t>(bpt)};
   }
+  auto row_advance = [&](int64_t token_axis) {
+    TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
+    const size_t bytes = static_cast<size_t>(kv.size(-1)) * elem_bytes;
+    if (inline_scale) {
+      TVM_FFI_ICHECK_GE(bytes, static_cast<size_t>(bpt))
+          << name << " row width " << bytes << " is smaller than bytes_per_token=" << bpt;
+    } else {
+      TVM_FFI_ICHECK_EQ(bytes, static_cast<size_t>(bpt))
+          << name << " row width " << bytes << " must equal bytes_per_token=" << bpt
+          << " (footer-scale rows must stay packed)";
+    }
+    // The per-token advance is the token axis's real stride: a caller slicing
+    // the last dim of a wider buffer (padded rows) changes the size but not
+    // the stride, and the kernel must step by the stride.
+    const size_t advance = static_cast<size_t>(kv.stride(token_axis)) * elem_bytes;
+    TVM_FFI_ICHECK_GE(advance, bytes)
+        << name << " token-axis stride " << advance << " is smaller than the row width " << bytes;
+    if (inline_scale) {
+      TVM_FFI_ICHECK_EQ(advance % 16, 0) << name << " token-axis stride " << advance
+                                         << " is not 16B-aligned (cp.async.bulk requirement)";
+    }
+    return advance;
+  };
   if (kv.ndim() == 3) {
-    TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
-        << name << " 3D form must be [num_pages, page_block_size, " << bpt
-        << "]; prefill requires tightly packed rows — padded-row KV caches are "
-           "decode-only (the decode-v32 kernel honors stride_kv_row)";
-    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes,
+            row_advance(1)};
   }
   TVM_FFI_ICHECK_EQ(kv.ndim(), 4) << name << " must be 2D [num_pages, page_bytes], 3D "
                                   << "[num_pages, page_block_size, bytes_per_token], HND "
                                   << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
                                   << "[num_pages, page_block_size, 1, bytes_per_token]";
-  TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
-      << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1)
-      << "; prefill requires tightly packed rows — padded-row KV caches are "
-         "decode-only (the decode-v32 kernel honors stride_kv_row)";
   if (kv.size(1) == 1) {
-    return {static_cast<int>(kv.size(2)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+    return {static_cast<int>(kv.size(2)), static_cast<size_t>(kv.stride(0)) * elem_bytes,
+            row_advance(2)};
   }
   if (kv.size(2) == 1) {
-    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes,
+            row_advance(1)};
   }
   TVM_FFI_ICHECK(false) << name << " 4D form must have singleton KV-head axis at dim 1 "
                         << "(HND) or dim 2 (NHD)";
-  return {0, 0};
+  return {0, 0, 0};
 }
 
 inline int check_dense_indices_2d_or_s_q_3d(const TensorView& idx, const char* name,
@@ -184,25 +214,30 @@ void SparseMlaSm120PagedAttention(
   const int d_qk = static_cast<int>(q.size(2));
   const int topk = check_dense_indices_2d_or_s_q_3d(indices, "indices", num_tokens);
   const ModelType mt = resolve_model_type(d_qk, model_type);
-  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
+  const bool inline_scale =
+      (mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA || mt == ModelType::GLM53_NOPE);
+  const PagedKVLayout kv_layout =
+      parse_paged_kv_layout(kv_cache, bytes_per_token(mt), inline_scale, "kv_cache");
   const int page_block_size = kv_layout.page_block_size;
   // Inline-scale models (DSV3_2 / GLM_NSA / GLM53_NOPE) are addressed by the
-  // prefill kernels as a flat token array (prefill_kv_entry_base), so a
-  // padded block stride would be silently misread; only footer-scale models
-  // honor stride_kv_block. Padded strides remain a decode-path capability.
-  if (mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA || mt == ModelType::GLM53_NOPE) {
+  // prefill kernels as a flat token array with a runtime row advance
+  // (prefill_kv_entry_base), so rows may be padded but blocks must stay
+  // contiguous; only footer-scale models honor a padded stride_kv_block.
+  if (inline_scale) {
     TVM_FFI_ICHECK_EQ(kv_layout.stride_kv_block,
-                      static_cast<size_t>(page_block_size) * bytes_per_token(mt))
-        << "prefill for inline-scale KV caches (DSv3.2/GLM) requires densely packed blocks "
-           "(stride_kv_block == page_block_size * bytes_per_token); padded block strides are "
-           "decode-only";
+                      static_cast<size_t>(page_block_size) * kv_layout.stride_kv_row)
+        << "prefill for inline-scale KV caches (DSv3.2/GLM) requires contiguous blocks "
+           "(stride_kv_block == page_block_size * row stride); the row stride itself may "
+           "exceed bytes_per_token for padded-row pools";
   }
 
   TVM_FFI_ICHECK_GT(num_heads, 0);
   TVM_FFI_ICHECK_LE(num_heads, 128);
   TVM_FFI_ICHECK_GT(topk, 0);
-  // The prefill kernels issue whole BI=64-wide index tiles (the tail tile is
-  // not masked), so the indices row width must be a multiple of 64.
+  // The prefill kernels stage whole index tiles through the math warps, so
+  // the indices row width must be a multiple of 64. (The gather itself is
+  // masked at topk_len granularity; this requirement is about the allocation
+  // width, not the runtime length.)
   TVM_FFI_ICHECK_EQ(topk % 64, 0)
       << "sparse-MLA SM120 prefill requires topk % 64 == 0 (BI=64: index tiles "
          "are issued whole, the tail tile is not masked); got topk="
@@ -263,7 +298,7 @@ void SparseMlaSm120PagedAttention(
     CHECK_INPUT_TYPE(ekv, dl_uint8);
     CHECK_INPUT_AND_TYPE(eidx, dl_int32);
     const PagedKVLayout extra_layout =
-        parse_paged_kv_layout(ekv, bytes_per_token(mt), "extra_kv_cache");
+        parse_paged_kv_layout(ekv, bytes_per_token(mt), inline_scale, "extra_kv_cache");
     extra_page_block_size = extra_layout.page_block_size;
     extra_stride_kv_block = extra_layout.stride_kv_block;
     extra_topk = check_dense_indices_2d_or_s_q_3d(eidx, "extra_indices", num_tokens);
