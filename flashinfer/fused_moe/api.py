@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
 from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
 
@@ -128,7 +128,7 @@ class RoutingConfig:
         return f"RoutingConfig({', '.join(parts)})"
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class QuantConfig:
     """Quantization scheme: MMA weight/activation formats plus the result format.
 
@@ -158,29 +158,13 @@ class QuantConfig:
         ``None`` → backend default.
     """
 
-    weight: QuantFormat
-    activation: QuantFormat
-    output: QuantFormat
-    swizzled_scale_factors: Optional[bool]
-    per_token_scale: Optional[bool]
-
-    def __init__(
-        self,
-        weight: QuantFormat = QuantFormat.BF16,
-        activation: QuantFormat = QuantFormat.BF16,
-        output: QuantFormat = QuantFormat.BF16,
-        *,
-        swizzled_scale_factors: Optional[bool] = None,
-        per_token_scale: Optional[bool] = None,
-    ) -> None:
-        # The three axes stay positional; the remaining knobs are keyword-only.
-        set_ = object.__setattr__
-        set_(self, "weight", weight)
-        set_(self, "activation", activation)
-        set_(self, "output", output)
-        set_(self, "swizzled_scale_factors", swizzled_scale_factors)
-        set_(self, "per_token_scale", per_token_scale)
-        self.__post_init__()
+    weight: QuantFormat = QuantFormat.BF16
+    activation: QuantFormat = QuantFormat.BF16
+    output: QuantFormat = QuantFormat.BF16
+    # The three axes stay positional; the remaining knobs are keyword-only.
+    _: KW_ONLY
+    swizzled_scale_factors: Optional[bool] = None
+    per_token_scale: Optional[bool] = None
 
     def __post_init__(self) -> None:
         for name in ("weight", "activation", "output"):
