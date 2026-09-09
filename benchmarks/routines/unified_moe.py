@@ -36,7 +36,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     ReLU,
     ReLU2,
     RoutingConfig,
@@ -335,16 +335,16 @@ def _reference_activation(
 
 
 def _config_for_backend(args, activation, backend_config) -> MoEConfig:
-    quant_variant = {
-        "bf16": QuantVariant.BF16,
-        "nvfp4": QuantVariant.NVFP4,
-        "nvfp4_w4a16": QuantVariant.W4A16,
-        "mxfp4": QuantVariant.MXFP4,
-        "mxfp4_w4a16": QuantVariant.W4A16,
+    weight_format, activation_format = {
+        "bf16": (QuantFormat.BF16, QuantFormat.BF16),
+        "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        "nvfp4_w4a16": (QuantFormat.NVFP4, QuantFormat.BF16),
+        "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
+        "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
     }[args.quant_variant]
     return MoEConfig(
         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
-        quant=QuantConfig(variant=quant_variant),
+        quant=QuantConfig(weight=weight_format, activation=activation_format),
         experts=ExpertConfig(intermediate_size=args.intermediate_size),
         activation=activation,
         backend=BackendOptions((backend_config,)),

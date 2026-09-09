@@ -17,10 +17,28 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prims_ts_batch_decode_with_kv_cache` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
-| MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_decode_mla_with_paged_kv_cache`, `get_prims_ts_batch_decode_mla_workspace_size`, `prims_ts_batch_decode_with_kv_cache_mla` |
+| MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size`, `prims_ts_batch_mla_decode_with_kv_cache` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
+
+The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
+reusable static state from per-run request state. `plan()` compiles a static
+capacity, shape, dtype, and storage-mode specialization without retaining
+request tensors or metadata. Paged context plans may additionally freeze
+explicit exact-uniform-length, zero-causal-offset, or zeroed-V-tail promises.
+Context `run()` receives current packed offsets or fixed-table paged metadata;
+per-token variable-window bounds for fixed-shape inputs are also per-run, with
+optional caller-precomputed per-CTA start minima. Both context wrappers own
+their default scale tensors. Contiguous variable-window plans additionally own
+mutable fallback scratch that derives CTA minima only when the caller omits
+them, while paged context owns no other workspace. With `validate=False`,
+supplying CTA minima avoids that repeated preprocessing and leaves all
+variable-window metadata caller-owned. Runtime validation is enabled by
+default; callers that have already validated their inputs may use
+`validate=False` for steady-state timing or CUDA Graph capture and then own
+every dtype, device, shape, stride, alignment, value, aliasing, and lifetime
+obligation.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
@@ -60,6 +78,22 @@ Qualified Q64/coarse-KV profiles retain KV256 routes for page sizes 64 and
 128. Optional `kv_valid_bits` is a `torch.uint32` per-request bitset with shape
 `[B, ceil(max_seq_len_kv / 32)]` over logical KV tokens; it is shared by all KV
 heads and independent of the physical page mapping.
+
+For contiguous block-sparse attention, both `BlockSparseTSWrapper.plan` and
+the `block_sparse_attention` one-shot API can opt into
+`sparse_format="bitmask"` and/or `use_proxy_routes=True`. BSR and packed
+exact-block bitmaps are alternative frontends; both are prepared into the same
+route stream before attention. The bitmask one-shot uses the full structural
+KV-block count as its temporary plan capacity, while reusable plans accept a
+tighter caller-provided bound. Proxy routes are supported across the existing
+contiguous block-sparse profiles and preserve the profile's Q tile, KV route,
+and KeepsAB/SWAPAB geometry. Proxy routes currently require
+`mask_type="dense"`; paged K/V proxy execution remains unsupported. Route rows
+are owned by `(batch, KV head, Q block)`, so all Q heads in one GQA/MQA group
+share sparsity. A proxy run supplies one K arithmetic mean and one V sum per
+semantic KV block. The final partial block uses only its structural tokens.
+Optional `kv_valid_bits` filters exact K/V tokens only and does not change
+proxy summaries or their represented mass.
 
 ## Validation
 

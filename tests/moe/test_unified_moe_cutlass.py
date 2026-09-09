@@ -48,6 +48,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     RoutingInputMode,
@@ -171,7 +172,7 @@ def test_moe_runner_enforces_lifecycle_order():
     events = []
 
     class Runner(MoERunner):
-        supported_quant_variants = (QuantVariant.BF16,)
+        supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
         supported_activation_classes = (SwiGLU,)
 
         def _check_support(self):
@@ -207,7 +208,7 @@ def test_moe_runner_enforces_lifecycle_order():
 
 def test_failed_support_check_does_not_authorize_build():
     class Runner(MoERunner):
-        supported_quant_variants = (QuantVariant.NVFP4,)
+        supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
 
         def get_valid_tactics(self, inputs, profile):
             return [-1]
@@ -1131,9 +1132,17 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     events = []
 
     class RecordingRunner:
-        supported_quant_variants = (QuantVariant.BF16,)
+        supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+        supported_output_formats = (QuantFormat.BF16,)
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
         backend_key = "recording"
+
+        @classmethod
+        def supports_quant(cls, quant):
+            return (
+                quant.pair in cls.supported_quant_variants
+                and quant.output in cls.supported_output_formats
+            )
 
         def __init__(self, config, device):
             events.append("init")
@@ -1608,7 +1617,7 @@ def _make_w4a16_case(num_tokens: int = 16, activation=None):
     ).to(torch.int32)
     topk_weights = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.W4A16),
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassW4A16Config(),)),
         activation=activation,
@@ -2501,6 +2510,8 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_scale = CutlassFp8PerTensorConfig.prepare_activations(x)
+    assert x_q.dtype is torch.float8_e4m3fn
+    assert x_scale.dtype is torch.float32 and x_scale.ndim == 0
     view = CutlassFp8PerTensorConfig.prepare_weights(
         w1,
         w2,
@@ -2524,6 +2535,10 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_per_tensor", view)
     layer = MoELayer(config)
+    # Keep the public ``prepare_activations`` contract coupled to the actual
+    # runner boundary, rather than only checking the numerical launch below.
+    packed_inputs = layer.runners[0].pack_inputs(act, weights)
+    assert packed_inputs[-1] is x_scale
     _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
     flat = _run_flat_cutlass_independently(
@@ -2721,6 +2736,26 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
         x_sf.cpu().view(torch.uint8).reshape(-1),
         True,
     ).to(device=device, dtype=torch.bfloat16)
+    w1_dq = torch.stack(
+        [
+            mxfp8_dequantize_host(
+                view["fc1_expert_weights"][i].cpu().view(torch.uint8),
+                view["fc1_expert_scales"][i].cpu().view(torch.uint8).reshape(-1),
+                True,
+            )
+            for i in range(num_experts)
+        ]
+    ).to(device=device, dtype=torch.bfloat16)
+    w2_dq = torch.stack(
+        [
+            mxfp8_dequantize_host(
+                view["fc2_expert_weights"][i].cpu().view(torch.uint8),
+                view["fc2_expert_scales"][i].cpu().view(torch.uint8).reshape(-1),
+                True,
+            )
+            for i in range(num_experts)
+        ]
+    ).to(device=device, dtype=torch.bfloat16)
     config = _config(
         quant=QuantConfig(variant=QuantVariant.MxFp8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
@@ -2739,8 +2774,8 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     )
     expected = _reference(
         MoEActivationPack(x_dq, None, topk_ids, topk_weights),
-        w1,
-        w2,
+        w1_dq,
+        w2_dq,
         activation,
     )
     assert layer.winner_backend == "cutlass_mxfp8"

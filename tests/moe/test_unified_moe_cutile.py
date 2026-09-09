@@ -31,7 +31,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     ReLU,
     ReLU2,
     RoutingConfig,
@@ -153,7 +153,7 @@ def _config(
 ) -> MoEConfig:
     values = dict(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions((CuTileBf16Config(),)),
@@ -709,7 +709,7 @@ def _nvfp4_config(
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation or SwiGLU(),
         backend=BackendOptions((CuTileNvfp4Config(),)),
@@ -1115,7 +1115,7 @@ def _make_nvfp4_case(
 
 def _fp4_config(
     config_type,
-    variant: QuantVariant,
+    quant_pair: tuple[QuantFormat, QuantFormat],
     *,
     num_experts: int,
     top_k: int,
@@ -1125,7 +1125,7 @@ def _fp4_config(
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig(*quant_pair),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((config_type(),)),
@@ -1211,12 +1211,12 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
             (
                 CuTileNvfp4Config,
                 CuTileNvfp4Runner,
-                QuantVariant.NVFP4,
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
             ),
             (
                 CuTileNvfp4Bf16Config,
                 CuTileNvfp4Bf16Runner,
-                QuantVariant.W4A16,
+                (QuantFormat.NVFP4, QuantFormat.BF16),
             ),
         )
     else:
@@ -1225,12 +1225,12 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
             (
                 CuTileMxfp4Config,
                 CuTileMxfp4Runner,
-                QuantVariant.MXFP4,
+                (QuantFormat.MXFP4, QuantFormat.MXFP4),
             ),
             (
                 CuTileMxfp4Bf16Config,
                 CuTileMxfp4Bf16Runner,
-                QuantVariant.W4A16,
+                (QuantFormat.MXFP4, QuantFormat.BF16),
             ),
         )
 
@@ -1238,10 +1238,10 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
     if not supported_modes:
         pytest.skip(f"cuTile {weight_format} does not support SM{arch}")
     packed_weight_ids = set()
-    for config_type, runner_type, variant in supported_modes:
+    for config_type, runner_type, quant_pair in supported_modes:
         config = _fp4_config(
             config_type,
-            variant,
+            quant_pair,
             num_experts=4,
             top_k=2,
             intermediate_size=128,
@@ -1255,7 +1255,7 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
         packed_weight_ids.add(tuple(id(tensor) for tensor in inputs[4:]))
         fuse_gemm1 = int(not activation.is_gated)
         tactic = (32, fuse_gemm1, 128, 128, 2, 128, 128, 2)
-        if variant is QuantVariant.W4A16:
+        if quant_pair[1] is QuantFormat.BF16:
             tactic = runner._fp4_fallback_tactic(inputs)
             assert tactic[1] == fuse_gemm1
         output = runner.forward(
@@ -1263,7 +1263,7 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
             tactic=tactic,
         ).clone()
         torch.testing.assert_close(output, expected, rtol=0.25, atol=1.0)
-        if variant is QuantVariant.W4A16:
+        if quant_pair[1] is QuantFormat.BF16:
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -1289,17 +1289,21 @@ def test_cutile_mxfp4_supports_dimensions_divisible_by_32():
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    for config_type, runner_type, variant in (
-        (CuTileMxfp4Config, CuTileMxfp4Runner, QuantVariant.MXFP4),
+    for config_type, runner_type, quant_pair in (
+        (
+            CuTileMxfp4Config,
+            CuTileMxfp4Runner,
+            (QuantFormat.MXFP4, QuantFormat.MXFP4),
+        ),
         (
             CuTileMxfp4Bf16Config,
             CuTileMxfp4Bf16Runner,
-            QuantVariant.W4A16,
+            (QuantFormat.MXFP4, QuantFormat.BF16),
         ),
     ):
         config = _fp4_config(
             config_type,
-            variant,
+            quant_pair,
             num_experts=4,
             top_k=2,
             intermediate_size=intermediate_size,
@@ -1527,7 +1531,7 @@ def test_cutile_nvfp4_supports_dimensions_divisible_by_64(activation, fuse_gemm1
     )
     a16_config = _fp4_config(
         CuTileNvfp4Bf16Config,
-        QuantVariant.W4A16,
+        (QuantFormat.NVFP4, QuantFormat.BF16),
         num_experts=num_experts,
         top_k=top_k,
         intermediate_size=intermediate_size,
