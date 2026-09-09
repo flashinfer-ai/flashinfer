@@ -5,12 +5,17 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 """
 
-from dataclasses import dataclass, field
-from typing import Literal, Optional
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields
+from functools import wraps
+from typing import Any, Callable, Iterator, Literal, Optional, TypeVar, cast
 
 import torch
 
 from ._contracts import MLAPlanMetadata, MLAStructuralInputKind
+
+
+_PlanResultT = TypeVar("_PlanResultT")
 
 
 @dataclass(frozen=True)
@@ -571,8 +576,12 @@ class _MLAPlanArguments:
     )
     output_dtype: torch.dtype = torch.float16
     output_scale: Literal["none", "per-tensor"] = "none"
-    scale_mode: Literal["default", "kv-per-tensor"] = "default"
+    scale_mode: Literal["default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"] = (
+        "default"
+    )
     skip_softmax: bool = False
+    enable_pdl: Optional[bool] = None
+    use_sinks: bool = False
     use_profiler: bool = False
     legacy_flat_csr: bool = False
     _float_workspace_buffer: torch.Tensor = field(repr=False, compare=False)
@@ -587,6 +596,26 @@ class _MLAPlanArguments:
     _metadata_resolver: _MLAPlanMetadataResolver = field(
         init=False, repr=False, compare=False
     )
+    _native_device_dense: Optional[_DensePlanMetadata] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+    _audited_public_arguments: Optional[frozenset[str]] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+    _accessed_public_arguments: Optional[set[str]] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+
+    def __getattribute__(self, name: str):
+        value = object.__getattribute__(self, name)
+        audited_arguments = object.__getattribute__(self, "_audited_public_arguments")
+        if audited_arguments is not None and name in audited_arguments:
+            accessed_arguments = object.__getattribute__(
+                self, "_accessed_public_arguments"
+            )
+            assert accessed_arguments is not None
+            accessed_arguments.add(name)
+        return value
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, MLAPlanMetadata):
@@ -603,12 +632,21 @@ class _MLAPlanArguments:
             raise ValueError(f"unsupported lse_mode {self.lse_mode!r}.")
         if self.output_scale not in ("none", "per-tensor"):
             raise ValueError(f"unsupported output_scale {self.output_scale!r}.")
-        if self.scale_mode not in ("default", "kv-per-tensor"):
+        if self.scale_mode not in (
+            "default",
+            "kv-per-tensor",
+            "bmm-scalar",
+            "bmm-tensor",
+        ):
             raise ValueError(f"unsupported scale_mode {self.scale_mode!r}.")
         if not isinstance(self.output_dtype, torch.dtype):
             raise TypeError("output_dtype must be a torch.dtype.")
         if not isinstance(self.skip_softmax, bool):
             raise TypeError("skip_softmax must be a bool.")
+        if self.enable_pdl is not None and not isinstance(self.enable_pdl, bool):
+            raise TypeError("enable_pdl must be a bool or None.")
+        if not isinstance(self.use_sinks, bool):
+            raise TypeError("use_sinks must be a bool.")
         object.__setattr__(
             self,
             "_metadata_resolver",
@@ -620,13 +658,79 @@ class _MLAPlanArguments:
             ),
         )
 
+    @contextmanager
+    def audit_public_argument_access(self, backend_name: str) -> Iterator[None]:
+        """Assert that a successful backend planner acknowledges every public input."""
+
+        if self._audited_public_arguments is not None:
+            raise RuntimeError("nested MLA plan-argument access audits are unsupported")
+
+        audited_arguments = frozenset(
+            plan_field.name
+            for plan_field in fields(self)
+            if not plan_field.name.startswith("_")
+        )
+        accessed_arguments: set[str] = set()
+        object.__setattr__(self, "_audited_public_arguments", audited_arguments)
+        object.__setattr__(self, "_accessed_public_arguments", accessed_arguments)
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            unconsumed_arguments = audited_arguments - accessed_arguments
+            if unconsumed_arguments:
+                raise AssertionError(
+                    f"{backend_name} plan_from_wrapper did not consume public "
+                    "arguments: "
+                    f"{', '.join(sorted(unconsumed_arguments))}"
+                )
+        finally:
+            object.__setattr__(self, "_audited_public_arguments", None)
+            object.__setattr__(self, "_accessed_public_arguments", None)
+
+    def _record_metadata_argument_access(self) -> None:
+        accessed_arguments = self._accessed_public_arguments
+        if accessed_arguments is not None:
+            accessed_arguments.update(("metadata", "legacy_flat_csr"))
+
     def csr(self) -> _CSRPlanMetadata:
+        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_csr()
 
     def dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_dense(
             table_width_alignment=table_width_alignment
         )
 
     def native_dense(self) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_native_dense()
+
+    def native_device_dense(self) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
+        if self._native_device_dense is None:
+            object.__setattr__(
+                self,
+                "_native_device_dense",
+                self._metadata_resolver.resolve_native_device_dense(),
+            )
+        assert self._native_device_dense is not None
+        return self._native_device_dense
+
+
+def _audit_plan_from_wrapper_arguments(
+    plan_from_wrapper: Callable[..., _PlanResultT],
+) -> Callable[..., _PlanResultT]:
+    """Audit successful concrete backend planners without affecting test doubles."""
+
+    @wraps(plan_from_wrapper)
+    def audited_plan_from_wrapper(
+        cls: type[object], args: _MLAPlanArguments
+    ) -> _PlanResultT:
+        with args.audit_public_argument_access(cls.__name__):
+            return plan_from_wrapper(cls, args)
+
+    cast(Any, audited_plan_from_wrapper)._audits_public_plan_arguments = True
+    return audited_plan_from_wrapper
