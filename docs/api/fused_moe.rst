@@ -28,6 +28,30 @@ both the TRT-LLM and CuteDSL MoE paths.
 
 .. currentmodule:: flashinfer.fused_moe
 
+Unified MoE API
+---------------
+
+Backend-agnostic configuration and layer types. ``QuantConfig`` carries the MMA
+weight / activation formats and the layer output format as ``QuantFormat`` axes;
+``QuantVariant`` is a deprecated preset that expands to a ``(weight, activation)``
+pair.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoELayer
+    MoEConfig
+    RoutingConfig
+    QuantConfig
+    QuantFormat
+    QuantVariant
+    ExpertConfig
+    ExecutionConfig
+    MoEFinalizeConfig
+    BackendOptions
+    MoEActivationPack
+    MoEWeightPack
+
 Utility Functions
 -----------------
 
@@ -144,7 +168,7 @@ registered for both backend keys without copying::
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions((cake,)),
