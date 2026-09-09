@@ -19,7 +19,6 @@ from typing import Any, Optional
 
 import torch
 
-from ...api_logging import flashinfer_api
 from ...tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA, ActivationType
 from ...utils import supported_compute_capability
 from .blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1 import (
@@ -92,7 +91,6 @@ def _validate(
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api
 def cute_dsl_sm12x_fused_moe_mxfp8_mxfp4(
     x: torch.Tensor,
     token_selected_experts: torch.Tensor,
