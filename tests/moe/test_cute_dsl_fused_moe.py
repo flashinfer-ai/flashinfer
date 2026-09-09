@@ -3248,3 +3248,158 @@ class TestMoeOutputMemsetInplaceContract:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestRubinMultiCtaTacticRejected:
+    """A Rubin tactic with ``cluster_shape_m > 1`` must be refused.
+
+    ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
+    uninitialized. A multi-CTA cluster would require the tile count handed to
+    the kernel to be rounded up to a multiple of ``cluster_shape_m`` so every
+    cluster reaches its barrier uniformly, which widens the kernels' bounds
+    check past what routing wrote. Neither the rounding nor the matching
+    buffer initialization is implemented.
+
+    ``get_valid_tactics`` filters these out during autotuning, but that path
+    is bypassed by an explicitly supplied or cache-restored tactic, so
+    ``_moe_core_impl`` refuses them too. Both paths are covered here, and the
+    rejection is asserted to happen *before* routing runs.
+    """
+
+    pytestmark = _requires_dsl_arch
+
+    @staticmethod
+    def _rubin_tactic_params(gemm1_cluster_m: int, gemm2_cluster_m: int):
+        """Synthetic Rubin tactic parameters, optionally multi-CTA."""
+        return dict(
+            gemm1_mma_tiler=(128, 128, 256),
+            gemm1_mma_inst_shape=(128, 128, 128),
+            gemm1_cluster_shape_mn=(gemm1_cluster_m, 1),
+            gemm2_mma_tiler=(128, 128, 256),
+            gemm2_mma_inst_shape=(128, 128, 128),
+            gemm2_cluster_shape_mn=(gemm2_cluster_m, 1),
+        )
+
+    @pytest.mark.parametrize(
+        "gemm1_cluster_m,gemm2_cluster_m", [(2, 1), (1, 2), (2, 2)]
+    )
+    def test_rejected_before_routing(
+        self, monkeypatch, gemm1_cluster_m: int, gemm2_cluster_m: int
+    ):
+        """Rejection must precede ``moe_sort`` and any GEMM launch."""
+        import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        routing_calls = []
+
+        def _tripwire(*args, **kwargs):
+            routing_calls.append(1)
+            raise AssertionError(
+                "moe_sort ran before the multi-CTA tactic was rejected"
+            )
+
+        monkeypatch.setattr(fused_moe_mod, "moe_sort", _tripwire)
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=64,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        with pytest.raises(NotImplementedError, match="cluster_shape_m"):
+            _moe_core_impl(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                output_dtype=torch.bfloat16,
+                **self._rubin_tactic_params(gemm1_cluster_m, gemm2_cluster_m),
+            )
+
+        assert not routing_calls, "routing ran despite an unsupported tactic"
+
+    def test_single_cta_rubin_tactic_is_not_rejected(self, monkeypatch):
+        """Guard against the check rejecting every Rubin tactic.
+
+        Without this, a predicate inverted to ``>= 1`` would still pass the
+        rejection cases above while disabling Rubin entirely.
+        """
+        import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_mod
+        from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
+
+        class _Reached(Exception):
+            pass
+
+        def _tripwire(*args, **kwargs):
+            raise _Reached
+
+        monkeypatch.setattr(fused_moe_mod, "moe_sort", _tripwire)
+
+        num_experts, top_k = 256, 8
+        tensors = create_moe_tensors(
+            num_tokens=64,
+            hidden_size=256,
+            intermediate_size=512,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+
+        # Reaching moe_sort means the tactic was accepted, which is the point.
+        with pytest.raises(_Reached):
+            _moe_core_impl(
+                x=tensors["x"],
+                x_sf=tensors["x_sf"],
+                token_selected_experts=tensors["token_selected_experts"],
+                token_final_scales=tensors["token_final_scales"],
+                w1_weight=tensors["w1_weight"],
+                w1_weight_sf=tensors["w1_weight_sf"],
+                w1_alpha=tensors["w1_alpha"],
+                fc2_input_scale=tensors["fc2_input_scale"],
+                w2_weight=tensors["w2_weight"],
+                w2_weight_sf=tensors["w2_weight_sf"],
+                w2_alpha=tensors["w2_alpha"],
+                num_experts=num_experts,
+                top_k=top_k,
+                num_local_experts=num_experts,
+                output_dtype=torch.bfloat16,
+                **self._rubin_tactic_params(1, 1),
+            )
+
+    def test_autotuner_filters_multi_cta_tactics(self):
+        """``_tactic_ok`` must drop synthetic multi-CTA Rubin tactics.
+
+        Complements the runtime backstop above: this is the primary
+        rejection, applied while the autotuner enumerates candidates.
+        """
+        from flashinfer.fused_moe.cute_dsl.tuner import (
+            ALL_RUBIN_MOE_TACTICS,
+            _is_rubin_tactic,
+        )
+
+        assert ALL_RUBIN_MOE_TACTICS
+        base_tile, base_gemm1, base_gemm2 = ALL_RUBIN_MOE_TACTICS[0]
+        mma_tiler, mma_inst_shape, _, raster = base_gemm1
+        synthetic = (
+            base_tile,
+            (mma_tiler, mma_inst_shape, (2, 1), raster),
+            base_gemm2,
+        )
+        assert _is_rubin_tactic(synthetic), "synthetic tactic is not Rubin-shaped"
+        assert synthetic not in ALL_RUBIN_MOE_TACTICS, (
+            "a multi-CTA tactic is present in the enumerated Rubin list"
+        )
