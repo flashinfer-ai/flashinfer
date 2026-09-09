@@ -564,6 +564,11 @@ def cute_dsl_fmha_ragged_prefill(
             None,  # skip_softmax_count
             None,  # total_softmax_count
             enable_pdl,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
     else:
         # CuTe native ABI: convert to cute tensors and pass with explicit stream.
@@ -646,4 +651,9 @@ def cute_dsl_fmha_ragged_prefill(
             None,  # total_softmax_count
             stream,
             enable_pdl,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
