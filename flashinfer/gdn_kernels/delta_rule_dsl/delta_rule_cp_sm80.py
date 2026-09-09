@@ -124,6 +124,7 @@ _LOAD_ALIGN_BYTES = 16
 
 @functools.cache
 def _sm80_cp_compile_options(device):
+    """The compile options every CP stage shares: the device's SM8x arch."""
     return sm8x_compile_options(device)
 
 
@@ -229,6 +230,10 @@ def _ptr_factory(_ctx, device, _stream, promises):
     _check_ptr_abi(device, _stream, *promises)
 
     def mk(dtype, tensor, align, name):
+        """Make one gmem pointer for a tensor, at the alignment the layout claims.
+
+        Closed over the context so repeated entries share one checked pointer
+        per (address, dtype, alignment) instead of rebuilding it per stage."""
         return cute.runtime.make_ptr(
             dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
         )
@@ -280,6 +285,7 @@ def _check_ptr_abi(device, stream, *promises):
 
 
 def _cp_workspace(name, shape, dtype, device):
+    """A cached device buffer of this shape, viewed as the requested dtype."""
     nbytes = math.prod(shape) * dtype.itemsize
     return _get_cache_buf(name, nbytes, device)[:nbytes].view(dtype).view(shape)
 
@@ -862,6 +868,7 @@ class CPDeltaRuleMNPrecomputeSm80(KeyedCompileMixin):
         chunk_len: cutlass.Int32,
         tid: cutlass.Int32,
     ):
+        """Zero the alpha channels a block does not own, so the tile reads whole."""
         lane = tid % 32
         if tid < cutlass.Int32(32):
             sAlpha_stage = sAlpha[None, None, stage]
@@ -949,6 +956,7 @@ class CPDeltaRuleMNPrecomputeSm80(KeyedCompileMixin):
 
     @cute.jit
     def _scale_acc(self, tCrC: cute.Tensor, coeff: cutlass.Float32):
+        """Scale an accumulator in place by one runtime coefficient."""
         for i in cutlass.range(cute.size(tCrC), unroll_full=True):
             tCrC[i] = cutlass.Float32(tCrC[i]) * coeff
 
@@ -1101,6 +1109,7 @@ class CPDeltaRuleMNPrecomputeSm80(KeyedCompileMixin):
 
     @cute.jit
     def _math_order_init(self, wg_idx: cutlass.Int32):
+        """Open the two-warp-group handshake: WG1 lets WG0 start."""
         if wg_idx == cutlass.Int32(1):
             cute.arch.barrier_arrive(
                 barrier_id=NamedBarrier.MATH_WG0, number_of_threads=THREADS_MN
@@ -1108,6 +1117,7 @@ class CPDeltaRuleMNPrecomputeSm80(KeyedCompileMixin):
 
     @cute.jit
     def _math_order_wait(self, wg_idx: cutlass.Int32):
+        """Wait for the other warp group's turn on the shared buffer."""
         if wg_idx == cutlass.Int32(0):
             cute.arch.barrier(
                 barrier_id=NamedBarrier.MATH_WG0, number_of_threads=THREADS_MN
@@ -1119,6 +1129,7 @@ class CPDeltaRuleMNPrecomputeSm80(KeyedCompileMixin):
 
     @cute.jit
     def _math_order_notify(self, wg_idx: cutlass.Int32):
+        """Hand the shared buffer to the other warp group."""
         if wg_idx == cutlass.Int32(0):
             cute.arch.barrier_arrive(
                 barrier_id=NamedBarrier.MATH_WG1, number_of_threads=THREADS_MN
@@ -2068,6 +2079,7 @@ __all__ = [
 
 
 def _get_cp_workspace(name, shape, dtype, device):
+    """A cached device buffer of this shape, viewed as the requested dtype."""
     nbytes = math.prod(shape) * dtype.itemsize
     return _get_cache_buf(name, nbytes, device)[:nbytes].view(dtype).view(shape)
 
@@ -2127,6 +2139,7 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
         gInitialState: cute.Tensor,
         col: cutlass.Int32,
     ) -> cutlass.Int32:
+        """Seed the running state tile from the caller's state, or from zero."""
         start = cutlass.Int32(0)
         if cutlass.const_expr(self.needs_initial_state):
             for i in cutlass.range_constexpr(self.rows_per_cta):
@@ -2147,6 +2160,7 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
         chunk_idx: cutlass.Int32,
         k_tile: cutlass.Int32,
     ):
+        """Read one chunk's transfer matrix into registers."""
         for j in cutlass.range_constexpr(16):
             rM[j] = gTransferTile[(j, chunk_idx), (k_tile, 0)]
 
@@ -2158,6 +2172,7 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
         chunk_idx: cutlass.Int32,
         col: cutlass.Int32,
     ):
+        """Read one chunk's local state contribution into registers."""
         for i in cutlass.range_constexpr(self.rows_per_cta):
             rAcc[i] = gLocalState[i, col, chunk_idx]
 
@@ -2169,6 +2184,7 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
         rM: cute.Tensor,
         k: cutlass.Int32,
     ):
+        """Fold one chunk into the running state: `acc + state @ M`."""
         for i in cutlass.range_constexpr(self.rows_per_cta):
             for j in cutlass.range_constexpr(16):
                 rAcc[i] = rAcc[i] + sState[i, k + cutlass.Int32(j)] * rM[j]
@@ -2184,6 +2200,11 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
         col: cutlass.Int32,
         start: cutlass.Int32,
     ):
+        """Scan a sequence's chunks in order, carrying the state forward.
+
+        The one serial stage, and serial over chunks rather than tokens: each
+        step folds a chunk's local contribution into the running state and
+        writes the absolute state that chunk's prefill will read."""
         rAcc = cute.make_rmem_tensor(self.rows_per_cta, cutlass.Float32)
         rM = cute.make_rmem_tensor(16, cutlass.Float32)
         rM_next = cute.make_rmem_tensor(16, cutlass.Float32)
@@ -2248,6 +2269,11 @@ class CPDeltaRuleFixupSimtSm80(KeyedCompileMixin):
         gap_len: cutlass.Int32,
         col: cutlass.Int32,
     ):
+        """Zero the state rows no sequence owns.
+
+        A zero-length sequence and the gap a ragged pack leaves both produce
+        slots nothing writes, and a reader cannot tell an unwritten slot from
+        a written zero."""
         for slot in cutlass.range(0, gap_len, unroll=1):
             for i in cutlass.range_constexpr(self.rows_per_cta):
                 gFixedState[i, col, slot] = cutlass.Float32(0.0)
