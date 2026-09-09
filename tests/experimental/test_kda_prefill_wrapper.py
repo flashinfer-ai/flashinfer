@@ -16,7 +16,8 @@
 
 Numerics for the kernels the wrapper hands off to are covered by the stable
 lane in ``tests/kda/test_recurrent_kda_prefill.py``; these cover the wrapper's
-own contract -- the plan metadata it builds and the buffers it forwards.
+own contract -- that ``plan`` stages offsets without reading them on the host,
+and that ``run`` forwards the planned buffers.
 """
 
 import importlib
@@ -38,40 +39,33 @@ def cuda_device():
     return torch.device("cuda")
 
 
-def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
+def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device, monkeypatch):
     wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    wrapper.plan(torch.tensor([0, 0, 7, 7, 12], device=cuda_device))
+    offsets = torch.tensor([0, 0, 7, 7, 12], device=cuda_device)
+    original_to = torch.Tensor.to
+
+    def reject_device_to_host(self, *args, **kwargs):
+        if args and torch.device(args[0]).type == "cpu" and self.is_cuda:
+            pytest.fail("wrapper plan must not read CUDA offsets on the host")
+        return original_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", reject_device_to_host)
+    wrapper.plan(offsets)
 
     cu_seqlens_ptr = wrapper._cu_seqlens_buf.data_ptr()
     seq_order_ptr = wrapper._seq_order_buf.data_ptr()
     cu_chunks_ptr = wrapper._cu_chunks_buf.data_ptr()
     assert wrapper._cu_seqlens_buf.dtype == torch.int64
     assert wrapper._cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
-    assert wrapper._seq_order_buf.tolist() == [1, 3, 0, 2]
-    assert wrapper._cu_chunks_buf.tolist() == [0, 0, 1, 1, 2]
-    assert wrapper._workspace._cute_dsl_total_chunks == 2
+    assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
 
     wrapper.plan(torch.tensor([0, 0, 2, 2, 12], device=cuda_device))
     assert wrapper._cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
     assert wrapper._seq_order_buf.data_ptr() == seq_order_ptr
     assert wrapper._cu_chunks_buf.data_ptr() == cu_chunks_ptr
-    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
-
-    with pytest.raises(ValueError, match="total token count is fixed"):
-        wrapper.plan(torch.tensor([0, 0, 2, 2, 13], device=cuda_device))
 
     with pytest.raises(ValueError, match="number of sequences is fixed"):
         wrapper.plan(torch.tensor([0, 2, 12], device=cuda_device))
-
-    chunk_wrapper = RecurrentKDAPrefillWrapper(cuda_device)
-    chunk_wrapper.plan(torch.tensor([0, 16, 16, 32], device=cuda_device))
-    with pytest.raises(ValueError, match="chunk count is fixed"):
-        chunk_wrapper.plan(torch.tensor([0, 1, 17, 32], device=cuda_device))
-
-    with pytest.raises(ValueError, match="non-decreasing"):
-        RecurrentKDAPrefillWrapper(cuda_device).plan(
-            torch.tensor([0, 2, 1, 12], device=cuda_device)
-        )
 
 
 def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
@@ -96,4 +90,4 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
     assert calls[0]["prefill_workspace"] is wrapper._workspace
     assert calls[0]["backend"] == "cute-dsl"
     assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
-    assert wrapper._workspace._cute_dsl_total_chunks == 2
+    assert wrapper._workspace._cute_dsl_generate_planned_metadata is True

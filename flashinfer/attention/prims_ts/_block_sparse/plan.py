@@ -207,14 +207,6 @@ def _build_block_sparse_plan_state(
             static.kv_block_size,
         )
         max_row_route_capacity += ceil_div(num_summaries, static.kv_route_size)
-    route_layout = _BlockSparseRouteLayout.create(
-        kv_route_size=static.kv_route_size,
-        kv_block_size=static.kv_block_size,
-        page_size=static.page_size,
-        has_token_bits=static.use_kv_valid_bits or use_proxy_routes,
-        route_metadata_capacity=num_rows * max_row_route_capacity,
-        num_rows=num_rows,
-    )
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
             device_index=device_index,
@@ -238,6 +230,14 @@ def _build_block_sparse_plan_state(
         policy = (
             *spec.policy,
             ("max_blocks_per_row", static.max_blocks_per_row),
+        )
+        route_layout = _BlockSparseRouteLayout.create(
+            kv_route_size=static.kv_route_size,
+            kv_block_size=static.kv_block_size,
+            page_size=static.page_size,
+            has_token_bits=spec.prepares_score_words,
+            route_metadata_capacity=num_rows * max_row_route_capacity,
+            num_rows=num_rows,
         )
         compiled = _get_compiled_block_sparse(spec.compile_key)
         dummy_kv_valid_bits = (
