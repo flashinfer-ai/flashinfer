@@ -253,6 +253,10 @@ def test_gvr2_default_workspace_capture_needs_eager_launch_on_stream():
         logits, seq, k, pre_idx=pre, out_indices=outs[0], backend="gvr_2"
     )
     torch.cuda.synchronize()
+    # torch.cuda.Stream() recycles 32 pooled raw streams: establish 'no slab
+    # for this handle' explicitly instead of assuming the stream is new
+    with _host._mu:
+        _host._ws_keep.pop((torch.cuda.current_device(), fresh.cuda_stream), None)
     g = torch.cuda.CUDAGraph()
     with (
         pytest.raises(RuntimeError, match="default workspace: no slab for this stream"),

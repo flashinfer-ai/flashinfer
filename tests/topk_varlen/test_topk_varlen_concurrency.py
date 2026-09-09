@@ -18,20 +18,32 @@ they cannot see the class of defect that review round 1 of PR #4986 found:
 lazily created resources shared across launches that may overlap (the gvr_2
 SPLIT workspace slab and the hint-free anchor table). Every test here drives
 the API the way a serving engine does — several host threads, several CUDA
-streams, CUDA graphs captured and replayed while other work is in flight —
-and asserts exactness per row, so a race shows up as a wrong result rather
-than as a note in a docstring.
+streams, CUDA graphs replayed while other work is in flight — and asserts the
+invariant directly (exactness per row, or the contents of the shared object),
+so a race shows up as a wrong result rather than as a note in a docstring.
+
+Ground rules the tests themselves obey (each was a review finding):
+
+* CUDA-graph captures are serialized — PyTorch allows one capture per process
+  at a time; only the REPLAYS are concurrent;
+* GPU-side overlap comes from graph replays and single-thread multi-stream
+  issue; Python threads serialize on the GIL and exercise host thread-safety;
+* every host write to a buffer a stream will read is issued on that stream or
+  ordered before it with a synchronize;
+* ``torch.cuda.Stream()`` hands out one of 32 pooled raw streams, so a "fresh"
+  stream may carry a slab cached by an earlier test — the tests clear the
+  cache entry for that raw handle before relying on its absence;
+* every test carries ``pytest.mark.timeout(300, method="thread")`` (the
+  repository's pytest-timeout convention): a hang dumps every thread's stack
+  and terminates the process instead of stalling the suite. Healthy runs take
+  1-6 s per test on every part measured.
 
 Inputs are chosen so gvr_2 lands on the streaming ``main`` family with a
 multi-CTA SPLIT (the only family that touches the slab); tests skip on parts
 that route the shape elsewhere.
 """
 
-import faulthandler
-import functools
-import sys
 import threading
-import time
 
 import pytest
 import torch
@@ -45,10 +57,15 @@ try:
 except ImportError:
     _FLASHINFER_AVAILABLE = False
 
-pytestmark = pytest.mark.skipif(
-    not (_FLASHINFER_AVAILABLE and torch.cuda.is_available()),
-    reason="flashinfer + CUDA required",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not (_FLASHINFER_AVAILABLE and torch.cuda.is_available()),
+        reason="flashinfer + CUDA required",
+    ),
+    # > cold-cache JIT compile + the longest test by 50x; a real hang is
+    # immediate. "thread" mode dumps all stacks and terminates the process.
+    pytest.mark.timeout(300, method="thread"),
+]
 _DEV = "cuda"
 
 
@@ -61,9 +78,24 @@ def _barrier(parties):
 def _forget_table(k):
     """Drop the cached hint-free anchor table for k (cold start for a test)."""
     key = (torch.cuda.current_device(), k)
-    lock = getattr(_host, "_HINT_FREE_LOCK", None) or threading.Lock()
-    with lock:
+    # getattr: lets the file run against a host without the growth lock (the
+    # teeth check runs these tests on the pre-fix tree)
+    with getattr(_host, "_HINT_FREE_LOCK", None) or threading.Lock():
         _host._HINT_FREE.pop(key, None)
+
+
+def _slab_key(stream):
+    return (torch.cuda.current_device(), stream.cuda_stream)
+
+
+def _forget_slab(stream):
+    """Drop the cached default workspace slab of ``stream``'s RAW handle.
+    torch.cuda.Stream() recycles 32 pooled streams, so a stream object that is
+    new to this test may map to a handle an earlier test already gave a slab;
+    the tests below establish 'no slab yet' explicitly instead of assuming it."""
+    torch.cuda.synchronize()
+    with _host._mu:
+        _host._ws_keep.pop(_slab_key(stream), None)
 
 
 def _cc() -> int:
@@ -77,80 +109,6 @@ requires_gvr2 = pytest.mark.skipif(
     or not flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()),
     reason="gvr_2 unsupported on this device",
 )
-
-
-# ---------------------------------------------------------------------------
-# deadline: a hung concurrency test must fail, not stall the suite
-# ---------------------------------------------------------------------------
-
-_CALIBRATION = {}
-
-
-def _per_launch_seconds():
-    """Wall time of one eager slab-family launch + sync on this device (warm),
-    measured once per process; the deadline budgets scale with it so a slow
-    part or a cold JIT cache does not produce false timeouts."""
-    if "t" not in _CALIBRATION:
-        rows, n, k = 16, 131072, 512
-        gen = torch.Generator(device=_DEV).manual_seed(999)
-        logits = torch.randn(rows, n, generator=gen, device=_DEV)
-        seq = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
-        pre = torch.full((rows, k), -1, dtype=torch.int32, device=_DEV)
-        out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
-        for _ in range(3):  # compile + warm
-            flashinfer.top_k_varlen(
-                logits, seq, k, pre_idx=pre, out_indices=out, backend="gvr_2"
-            )
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(20):
-            flashinfer.top_k_varlen(
-                logits, seq, k, pre_idx=pre, out_indices=out, backend="gvr_2"
-            )
-        torch.cuda.synchronize()
-        _CALIBRATION["t"] = max((time.perf_counter() - t0) / 20, 1e-4)
-    return _CALIBRATION["t"]
-
-
-def _deadline(launches, slack_s=60.0, factor=200.0):
-    """Run the test body in a worker thread and fail if it exceeds
-    ``slack_s + factor * launches * per_launch_seconds`` — generous enough
-    (200x the measured eager launch cost per launch, plus a minute for JIT,
-    checks and graph capture) that a healthy run never trips it, small enough
-    that a deadlock surfaces as a failure with every thread's stack printed.
-    The body runs in a thread so the main thread can enforce the budget; CUDA
-    graph capture is per-thread and unaffected."""
-
-    def wrap(fn):
-        @functools.wraps(fn)
-        def run(*args, **kwargs):
-            budget = slack_s + factor * launches * _per_launch_seconds()
-            result = {}
-
-            def body():
-                try:
-                    fn(*args, **kwargs)
-                except BaseException as e:  # noqa: BLE001
-                    result["error"] = e
-
-            t = threading.Thread(target=body, name=f"{fn.__name__}-body", daemon=True)
-            t.start()
-            t.join(budget)
-            if t.is_alive():
-                sys.stderr.write(
-                    f"\n=== {fn.__name__}: deadline {budget:.0f}s exceeded; thread stacks: ===\n"
-                )
-                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-                pytest.fail(
-                    f"{fn.__name__} exceeded its deadline of {budget:.0f}s "
-                    f"({launches} launches x {_per_launch_seconds() * 1e3:.2f} ms + {slack_s:.0f}s slack): probable hang"
-                )
-            if "error" in result:
-                raise result["error"]
-
-        return run
-
-    return wrap
 
 
 def _exact(logits, seq, out, k, who=""):
@@ -197,13 +155,12 @@ def _launch(w, k, hint=True, out=None, workspace=None):
 
 
 # ---------------------------------------------------------------------------
-# 1. eager launches overlapping across streams and host threads
+# 1. launches overlapping across streams (and host threads)
 # ---------------------------------------------------------------------------
 
 
 @requires_gvr2
 @pytest.mark.parametrize("hint", [True, False], ids=["hinted", "hint_free"])
-@_deadline(launches=328)
 def test_gvr2_eager_slab_launches_overlap_across_threads_and_streams(hint):
     """Eight host threads, each on its own stream, hammer the SPLIT family with
     workspace=None for 40 launches each while the others do the same: the
@@ -242,23 +199,22 @@ def test_gvr2_eager_slab_launches_overlap_across_threads_and_streams(hint):
 
 
 @requires_gvr2
-@_deadline(launches=524)
 def test_gvr2_graph_replay_races_eager_launches_on_other_streams():
     """Four graphs (eight slab-using launches each, one output buffer per
-    launch) captured on streams A..D are replayed back to back while stream E
-    receives eight eager slab-using launches (default workspace), all issued
-    from ONE host thread with no synchronization until the round ends —
-    captured decode steps overlapping with eager work. Issuing from one thread
-    is what produces real GPU-side overlap (Python threads serialize on the
-    GIL); the four-graph replay is the pattern that measured 2-17 corrupted
-    rows per run through a device-wide slab. Each stream owns a slab, so
-    every replayed and eager result stays exact."""
+    launch) captured one after another on streams A..D are replayed back to
+    back while stream E receives eight eager slab-using launches (default
+    workspace), all issued from ONE host thread with no synchronization until
+    the round ends — captured decode steps overlapping with eager work.
+    Issuing from one thread is what produces real GPU-side overlap (Python
+    threads serialize on the GIL); the four-graph replay is the pattern that
+    measured 2-17 corrupted rows per run through a device-wide slab. Each
+    stream owns a slab, so every replayed and eager result stays exact."""
     n_graphs, launches, rounds = 4, 8, 12
     k, work = _split_inputs(n_graphs + 1, seed=21)
     streams = [torch.cuda.Stream() for _ in range(n_graphs + 1)]
     outs = [[torch.full_like(w[3], -7) for _ in range(launches)] for w in work]
     graphs = []
-    for i in range(n_graphs):
+    for i in range(n_graphs):  # captures are serialized (one per process at a time)
         with torch.cuda.stream(streams[i]):
             _launch(work[i], k)
         torch.cuda.synchronize()
@@ -275,7 +231,7 @@ def test_gvr2_graph_replay_races_eager_launches_on_other_streams():
         for os_ in outs:
             for o in os_:
                 o.fill_(-7)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()  # fills ordered before every stream's work
         for i in range(n_graphs):
             with torch.cuda.stream(streams[i]):
                 graphs[i].replay()
@@ -290,48 +246,26 @@ def test_gvr2_graph_replay_races_eager_launches_on_other_streams():
 
 
 @requires_gvr2
-@_deadline(launches=84)
-def test_gvr2_graphs_captured_concurrently_from_threads_replay_exact():
-    """Four threads capture graphs on four streams at the same time (a serving
-    engine capturing per-batch-size graphs in parallel), after a per-stream
-    eager warm-up; every graph replays exact, including when all four replay
-    together."""
+def test_gvr2_graphs_captured_sequentially_replay_concurrently_exact():
+    """A serving engine captures its per-batch-size graphs one at a time (only
+    one CUDA-graph capture may be underway per process) and later replays them
+    concurrently on their streams. Four graphs, each captured on its own
+    stream after a per-stream eager warm-up, replay together for several
+    rounds; every result stays exact."""
     k, work = _split_inputs(4, seed=31)
     streams = [torch.cuda.Stream() for _ in range(4)]
+    graphs = []
     for i in range(4):
         with torch.cuda.stream(streams[i]):
             _launch(work[i], k)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(streams[i]), torch.cuda.graph(g, stream=streams[i]):
+            for _ in range(4):
+                _launch(work[i], k)
+        graphs.append(g)
     torch.cuda.synchronize()
-    graphs = [None] * 4
-    barrier = _barrier(4)
-    errors = []
-
-    def capture(i):
-        try:
-            g = torch.cuda.CUDAGraph()
-            barrier.wait()
-            # thread-local capture mode: other threads' CUDA calls must not
-            # invalidate this thread's capture (the default "global" mode does)
-            with (
-                torch.cuda.stream(streams[i]),
-                torch.cuda.graph(
-                    g, stream=streams[i], capture_error_mode="thread_local"
-                ),
-            ):
-                for _ in range(4):
-                    _launch(work[i], k)
-            graphs[i] = g
-        except Exception as e:  # noqa: BLE001
-            errors.append(e)
-
-    ts = [threading.Thread(target=capture, args=(i,)) for i in range(4)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    torch.cuda.synchronize()
-    assert not errors, errors
-    for _ in range(4):
+    for _ in range(6):
         for w in work:
             w[3].fill_(-7)
         torch.cuda.synchronize()
@@ -344,7 +278,6 @@ def test_gvr2_graphs_captured_concurrently_from_threads_replay_exact():
 
 
 @requires_gvr2
-@_deadline(launches=58)
 def test_gvr2_same_stream_graphs_share_a_slab_and_replay_sequentially():
     """Two graphs captured on the SAME stream share that stream's slab. That is
     the documented allowed pattern as long as they replay in stream order —
@@ -380,7 +313,6 @@ def test_gvr2_same_stream_graphs_share_a_slab_and_replay_sequentially():
 
 
 @requires_gvr2
-@_deadline(launches=8)
 def test_gvr2_hint_free_graph_survives_table_growth_by_others():
     """A hint-free graph captured against the anchor table at capacity C keeps
     replaying exactly after other callers grow the table past C (the graph
@@ -402,7 +334,7 @@ def test_gvr2_hint_free_graph_survives_table_growth_by_others():
         _launch((logits, seq, None, out), k, hint=False)
     torch.cuda.synchronize()
     # grow the table well past the captured capacity, several times, from
-    # another stream, and scribble over freshly grown tables' *views*
+    # another stream
     big_logits = torch.randn(1024, n, generator=gen, device=_DEV)
     big_seq = torch.full((1024,), n, dtype=torch.int32, device=_DEV)
     big_out = torch.empty(1024, k, dtype=torch.int32, device=_DEV)
@@ -412,56 +344,104 @@ def test_gvr2_hint_free_graph_survives_table_growth_by_others():
             _launch((big_logits[:b], big_seq[:b], None, big_out[:b]), k, hint=False)
     torch.cuda.synchronize()
     assert _host._HINT_FREE[key] is not old and _host._HINT_FREE[key].shape[0] >= 1024
-    assert old in _host._HINT_FREE_KEEP
+    assert any(t is old for t in _host._HINT_FREE_KEEP), (
+        "superseded table not kept alive"
+    )
     assert bool((old == torch.arange(k, dtype=torch.int32, device=_DEV)).all())
     for _ in range(3):
-        out.fill_(-7)
-        with torch.cuda.stream(s):
+        with torch.cuda.stream(s):  # the fill is ordered before the replay on s
+            out.fill_(-7)
             g.replay()
         torch.cuda.synchronize()
         _exact(logits, seq, out, k, who="graph on the superseded table")
 
 
 @requires_gvr2
-@_deadline(launches=3)
-def test_gvr2_hint_free_table_grown_on_one_stream_used_at_once_on_another():
-    """Grow the table on stream A and, without any host synchronization,
-    launch hint-free on stream B at the new capacity from another thread; the
-    published table must already be complete (the producer stream is
-    synchronized before publication)."""
+def test_gvr2_hint_free_table_grown_on_one_stream_is_complete_when_published():
+    """Publication ordering of the anchor table: the producer on stream A queues
+    a long busy-wait kernel and then grows the table (the arange fill sits
+    behind the busy-wait in A's queue); the consumer on stream B, without any
+    synchronization with A, snapshots the published table the moment the
+    pointer is visible. The snapshot must equal arange(k): the host must
+    synchronize the producing stream before publishing. (Exactness of the
+    consumer's top-k is NOT the observable — gvr_2 is exact for any hint
+    contents — so the table itself is compared.) Fails on a host that
+    publishes before the fill completes."""
     k, n = 1024, 8192
-    _forget_table(k)
+    key = (torch.cuda.current_device(), k)
     gen = torch.Generator(device=_DEV).manual_seed(61)
     logits = torch.randn(512, n, generator=gen, device=_DEV)
     seq = torch.full((512,), n, dtype=torch.int32, device=_DEV)
     outs = [torch.full((512, k), -7, dtype=torch.int32, device=_DEV) for _ in range(2)]
     a, b = torch.cuda.Stream(), torch.cuda.Stream()
-    with torch.cuda.stream(
-        b
-    ):  # compile the launcher for 512 rows on B, hinted (table untouched)
+    with torch.cuda.stream(b):  # compile the launcher for 512 rows on B, hinted
         _launch(
             (logits, seq, torch.zeros(512, k, dtype=torch.int32, device=_DEV), outs[1]),
             k,
         )
     torch.cuda.synchronize()
-    _forget_table(k)
+    _forget_table(k)  # the hinted call pre-sized it; go cold again
+    # the freed table's block would be handed back by the caching allocator
+    # with arange(k) still in it, which would mask a publish-before-fill bug:
+    # release cached blocks, then poison a same-sized block ON STREAM A (the
+    # allocator reuses blocks per stream) so the new table's memory does not
+    # start out holding the right answer
+    torch.cuda.empty_cache()
+    with torch.cuda.stream(a):
+        # Walk the growth's exact allocation path once on stream A and free the
+        # result, so the real growth reuses cached blocks: any cudaMalloc
+        # inside the growth would block the host behind the busy-wait and make
+        # even a publish-before-fill host look ordered (measured). The block
+        # is left holding -1, so a table published before its fill reads -1.
+        warm = (
+            torch.arange(k, dtype=torch.int32, device=_DEV)
+            .unsqueeze(0)
+            .expand(512, k)
+            .contiguous()
+        )
+        warm.fill_(-1)
+    torch.cuda.synchronize()
+    del warm
+    ref = torch.arange(k, dtype=torch.int32, device=_DEV)
     grown = threading.Event()
+    snapshot = {}
     errors = []
+
+    orig_arange = torch.arange
+
+    def slow_arange(*args, **kwargs):
+        # The growth builds the table as arange(k).expand(...).contiguous():
+        # queue a ~2 s GPU busy-wait on the producing stream right AFTER the
+        # arange and BEFORE the expand/contiguous copy, so the fill sits behind
+        # the busy-wait in stream A's queue. (Queuing the busy-wait before the
+        # growth does not work: torch.arange itself blocks the host until the
+        # stream drains, which closes the window even on a publish-early host.)
+        t = orig_arange(*args, **kwargs)
+        torch.cuda._sleep(4_000_000_000)
+        return t
 
     def producer():
         try:
             with torch.cuda.stream(a):
-                _host._hint_free_pre_idx(512, k, torch.device(_DEV))  # grows 0 -> 512
+                torch.arange = slow_arange
+                try:
+                    _host._hint_free_pre_idx(
+                        512, k, torch.device(_DEV)
+                    )  # grows 0 -> 512
+                finally:
+                    torch.arange = orig_arange
                 grown.set()
                 _launch((logits, seq, None, outs[0]), k, hint=False)
         except Exception as e:  # noqa: BLE001
             errors.append(e)
+            grown.set()
 
     def consumer():
         try:
             grown.wait()
-            with torch.cuda.stream(b):
-                _launch((logits, seq, None, outs[1]), k, hint=False)  # no sync with A
+            with torch.cuda.stream(b):  # no synchronization with A
+                snapshot["table"] = _host._HINT_FREE[key].clone()
+                _launch((logits, seq, None, outs[1]), k, hint=False)
         except Exception as e:  # noqa: BLE001
             errors.append(e)
 
@@ -472,12 +452,16 @@ def test_gvr2_hint_free_table_grown_on_one_stream_used_at_once_on_another():
         t.join()
     torch.cuda.synchronize()
     assert not errors, errors
+    snap = snapshot["table"]
+    bad_rows = int((snap != ref).any(dim=1).sum())
+    assert bad_rows == 0, (
+        f"{bad_rows}/{snap.shape[0]} table rows were not arange(k) when published"
+    )
     _exact(logits, seq, outs[0], k, who="producer stream")
     _exact(logits, seq, outs[1], k, who="consumer stream")
 
 
 @requires_gvr2
-@_deadline(launches=12)
 def test_gvr2_hint_free_tables_for_different_k_grow_independently():
     """Interleaved growth of the k=512 and k=2048 tables from two threads keeps
     each table's rows equal to arange(k) and its capacity monotonic."""
@@ -518,28 +502,31 @@ def test_gvr2_hint_free_tables_for_different_k_grow_independently():
 
 
 @requires_gvr2
-@_deadline(launches=8)
 def test_gvr2_warmup_varlen_on_stream_enables_capture_on_that_stream_only():
     """warmup_varlen run on stream A creates A's slab and sizes the anchor
     table; a hint-free slab-using capture on A then succeeds, while the same
-    capture on a stream that never saw an eager launch raises (never allocates
-    from the graph pool)."""
+    capture on a stream with no slab raises (never allocates from the graph
+    pool). The 'no slab' precondition is established explicitly, since
+    stream B's pooled raw handle may have been given a slab by an earlier
+    test."""
     k, work = _split_inputs(1, seed=71)
     logits, seq, _, out = work[0]
     rows, n = logits.shape
     a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    assert a.cuda_stream != b.cuda_stream
     with torch.cuda.stream(a):
         _host.warmup_varlen(k, n, num_rows_list=(rows,))
     torch.cuda.synchronize()
+    assert _slab_key(a) in _host._ws_keep, "warmup_varlen did not create A's slab"
     g = torch.cuda.CUDAGraph()
     with torch.cuda.stream(a), torch.cuda.graph(g, stream=a):
         _launch((logits, seq, None, out), k, hint=False)
-    out.fill_(-7)
-    torch.cuda.synchronize()
     with torch.cuda.stream(a):
+        out.fill_(-7)
         g.replay()
     torch.cuda.synchronize()
     _exact(logits, seq, out, k, who="captured after warmup on A")
+    _forget_slab(b)
     g2 = torch.cuda.CUDAGraph()
     with (
         pytest.raises(RuntimeError, match="no slab for this stream"),
@@ -548,14 +535,17 @@ def test_gvr2_warmup_varlen_on_stream_enables_capture_on_that_stream_only():
     ):
         _launch((logits, seq, None, out), k, hint=False)
     torch.cuda.synchronize()
+    assert _slab_key(b) not in _host._ws_keep, "a failed capture must not leave a slab"
 
 
 @requires_gvr2
-@_deadline(launches=5)
 def test_gvr2_register_family_capture_needs_no_slab_on_a_fresh_stream():
     """The rule is scoped to slab-using plans: a register-family shape warmed
-    on the default stream captures on a fresh stream without any eager launch
-    there (hinted or hint-free) and replays exact."""
+    on the default stream captures on a stream WITHOUT a slab (cleared
+    explicitly) with no eager launch there, hinted or hint-free, replays
+    exact, and the capture does not create a slab for that stream — so a
+    regression that made register plans consult the workspace would fail
+    here instead of being masked by a slab cached on a recycled stream."""
     k, n, rows = 512, 8192, 4
     lc = _host._varlen_launcher(rows, n, k, n, 1, 1)
     assert lc[0] in ("reg", "reg_clus"), lc[0]
@@ -568,12 +558,16 @@ def test_gvr2_register_family_capture_needs_no_slab_on_a_fresh_stream():
     torch.cuda.synchronize()
     for hint in (True, False):
         fresh = torch.cuda.Stream()
+        _forget_slab(fresh)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.stream(fresh), torch.cuda.graph(g, stream=fresh):
             _launch((logits, seq, pre, out), k, hint=hint)
-        out.fill_(-7)
-        torch.cuda.synchronize()
+        assert _slab_key(fresh) not in _host._ws_keep, (
+            "a register-family capture must not touch the workspace slab"
+        )
         with torch.cuda.stream(fresh):
+            out.fill_(-7)
             g.replay()
         torch.cuda.synchronize()
         _exact(logits, seq, out, k, who=f"register family, hint={hint}")
+        assert _slab_key(fresh) not in _host._ws_keep

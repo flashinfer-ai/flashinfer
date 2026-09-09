@@ -1645,6 +1645,12 @@ def top_k_varlen(
             the graph pool. Graphs captured on the SAME stream share that
             stream's slab and must not be replayed concurrently with each
             other; pass a private ``"gvr2_workspace"`` for that pattern.
+            Slabs are keyed by the raw CUDA stream handle, and PyTorch hands
+            out ``torch.cuda.Stream()`` objects from a pool of 32 per
+            priority, so the default slabs are bounded at 32 x 21 MB per
+            device (and two ``Stream`` objects may share one slab when the
+            pool wraps — they also share the raw stream, so their launches
+            are ordered).
 
     Returns
     -------
