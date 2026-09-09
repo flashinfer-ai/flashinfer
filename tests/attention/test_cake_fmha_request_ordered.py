@@ -125,7 +125,7 @@ def test_request_order_plan_uses_graph_safe_fallback_for_other_lengths(
 
 def test_decode_api_exposes_order_pointer_and_host_plan_at_the_end() -> None:
     parameters = list(
-        inspect.signature(flashinfer.trtllm_batch_decode_with_kv_cache).parameters
+        inspect.signature(flashinfer.decode.trtllm_batch_decode_with_kv_cache).parameters
     )
     assert parameters[-2:] == ["request_order", "request_order_plan"]
 
@@ -133,7 +133,7 @@ def test_decode_api_exposes_order_pointer_and_host_plan_at_the_end() -> None:
 def test_request_order_requires_explicit_cake_backend() -> None:
     tensor = torch.empty(1)
     with pytest.raises(ValueError, match="explicit backend='cake'"):
-        flashinfer.trtllm_batch_decode_with_kv_cache(
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             tensor,
             tensor,
             tensor,
@@ -156,7 +156,7 @@ def test_host_plan_requires_device_order_tensor() -> None:
         write_lse=False,
     )
     with pytest.raises(ValueError, match="requires a device request_order"):
-        flashinfer.trtllm_batch_decode_with_kv_cache(
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             tensor,
             tensor,
             tensor,
@@ -241,7 +241,7 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
         "return_lse": True,
         "bmm1_scale_log2": bmm1_scale_log2,
     }
-    flashinfer.trtllm_batch_decode_with_kv_cache(
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
         workspace_buffer=reference_workspace,
         out=reference_out,
         lse=reference_lse,
@@ -256,7 +256,7 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
     request_order = torch.arange(batch_size, dtype=torch.int32, device=device)
 
     def run_candidate() -> None:
-        flashinfer.trtllm_batch_decode_with_kv_cache(
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             workspace_buffer=candidate_workspace,
             out=candidate_out,
             lse=candidate_lse,
@@ -283,7 +283,7 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
             block_tables=block_tables[physical_order],
             seq_lens=seq_lens[physical_order],
         )
-        flashinfer.trtllm_batch_decode_with_kv_cache(
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             workspace_buffer=reference_workspace,
             out=reference_out,
             lse=reference_lse,
