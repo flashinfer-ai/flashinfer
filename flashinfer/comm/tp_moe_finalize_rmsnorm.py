@@ -936,7 +936,7 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         group = dist.group.WORLD
     _WS.group = group
     world_size = dist.get_world_size(group)
-    if world_size not in (2, 4, 8):
+    if world_size <= 1 or K_EXPERTS % world_size != 0:
         _WS.initialized = True
         return False
 
