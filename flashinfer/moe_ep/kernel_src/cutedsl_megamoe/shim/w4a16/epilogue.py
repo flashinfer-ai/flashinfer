@@ -4,9 +4,8 @@
 """W4A16 adaptation of the current swapped MegaMoE epilogue.
 
 FC1 changes: internal gate16/up16 accumulators receive FP32 expert
-alphas and SwiGLU, then store BF16 directly. Canonical prepared weights keep
-gate32/up32; the established W4A16 producer row composition converts that
-ordering while decoding packed weights and scales into operand-A TMEM.
+alphas and SwiGLU, then store BF16 directly. Prepared weights share W4A4's
+gate16/up16 ordering and decode directly into operand-A TMEM.
 The current FC2 process pipeline, BF16 return router, and phase-aware
 completion tracker are reused. Its non-overlap subtiles are statically unrolled.
 No activation quantization, scale-factor output, or epilogue SMEM is used.
@@ -446,8 +445,8 @@ class W4A16Fc1Epilogue(SwapABFc1Epilogue):
         release_after_scratch: cutlass.Constexpr[bool],
     ):
         lane = tidx % 32
-        # The producer maps canonical gate32/up32 to internal gate16/up16.
-        # TCGEN05 restricts each warp to its own32 TMEM datapaths; both
+        # Prepared gate16/up16 rows keep both operands within one warp.
+        # TCGEN05 restricts each warp to its own 32 TMEM datapaths; both
         # activation operands must therefore stay inside that warp's band.
         gate_feature = warp_idx * 32
         up_feature = gate_feature + 16

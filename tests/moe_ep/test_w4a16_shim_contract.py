@@ -294,7 +294,14 @@ def test_buffer_geometry_rejects_mismatched_mma_instruction_group(symm_factory, 
         )
 
 
-def test_frontend_validates_native_flat_scale_storage_before_compile():
+@pytest.mark.parametrize("scale_dtype", (torch.float8_e4m3fn, torch.uint8))
+@pytest.mark.parametrize(
+    "weight_dtype",
+    (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8)),
+)
+def test_frontend_validates_shared_nvfp4_layout_before_compile(
+    weight_dtype, scale_dtype
+):
     pytest.importorskip("cutlass")
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.frontend import (
         MegaMoEW4A16Config,
@@ -318,24 +325,35 @@ def test_frontend_validates_native_flat_scale_storage_before_compile():
         result.dtype = dtype
         result.is_cuda = True
         result.is_contiguous.return_value = True
+        result.transpose.return_value.is_contiguous.return_value = True
         return result
 
     inputs = MegaMoEW4A16Inputs(
         tensor((4, 64), torch.bfloat16),
         tensor((4, 2), torch.int64),
         tensor((4, 2), torch.float32),
-        tensor((4, 128, 32), torch.uint8),
-        tensor((2048,), torch.float8_e4m3fn),
+        tensor((4, 32, 128), weight_dtype),
+        tensor((4, 512), scale_dtype),
         tensor((4,), torch.float32),
-        tensor((4, 64, 32), torch.uint8),
-        tensor((2048,), torch.float8_e4m3fn),
+        tensor((4, 32, 64), weight_dtype),
+        tensor((4, 512), scale_dtype),
         tensor((4,), torch.float32),
         tensor((4, 2, 64), torch.bfloat16),
     )
     frontend = MegaMoEW4A16Frontend(config)
     frontend._validate(inputs, 1)
-    inputs.fc2_weight_sf.shape = (4, 64, 4)
-    with pytest.raises(ValueError, match="native flat E4M3"):
+    # The old flattened layout and unswizzled scale planes are not prepared SF.
+    for invalid_shape in ((2048,), (4, 64, 4)):
+        inputs.fc2_weight_sf.shape = invalid_shape
+        with pytest.raises(ValueError, match="native per-expert E4M3"):
+            frontend._validate(inputs, 1)
+    inputs.fc2_weight_sf.shape = (4, 512)
+    inputs.fc2_weight.transpose.return_value.is_contiguous.return_value = False
+    with pytest.raises(ValueError, match="K-major backing"):
+        frontend._validate(inputs, 1)
+    inputs.fc2_weight.transpose.return_value.is_contiguous.return_value = True
+    inputs.fc2_weight_sf.is_contiguous.return_value = False
+    with pytest.raises(ValueError, match="contiguous CUDA"):
         frontend._validate(inputs, 1)
 
 

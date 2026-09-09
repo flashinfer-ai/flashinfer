@@ -595,8 +595,8 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
     ):
         e, gateup, h = self.static_expert_shape
         i = gateup // 2
-        # Packed uint8 ABI becomes logical FP4 A without copying. Both stages
-        # expose prepared feature order; the transform permutes gate/up below.
+        # The shared NVFP4 [E, K/2, N] views retain K-major backing. Reinterpret
+        # packed bytes as logical FP4 A; FC1 already has gate16/up16 row order.
         a1 = cute.make_tensor(
             cute.recast_ptr(fc1_weight.iterator, dtype=cutlass.Float4E2M1FN),
             cute.make_layout((gateup, h, e), stride=(h, 1, gateup * h)),
@@ -605,14 +605,14 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cute.recast_ptr(fc2_weight.iterator, dtype=cutlass.Float4E2M1FN),
             cute.make_layout((h, i, e), stride=(i, 1, h * i)),
         )
-        # Weight preparation with block_scale_interleave() changes only internal
-        # scale layout. These arguments point to those flat E4M3 buffers.
+        # Native SF planes are [E, padded_size], also shared with W4A4. Accept
+        # either the E4M3 view or its uint8 alias without changing the bytes.
         s1 = cute.make_tensor(
-            fc1_weight_sf.iterator,
+            cute.recast_ptr(fc1_weight_sf.iterator, dtype=cutlass.Float8E4M3FN),
             blockscaled_utils.tile_atom_to_shape_SF(a1.shape, 16),
         )
         s2 = cute.make_tensor(
-            fc2_weight_sf.iterator,
+            cute.recast_ptr(fc2_weight_sf.iterator, dtype=cutlass.Float8E4M3FN),
             blockscaled_utils.tile_atom_to_shape_SF(a2.shape, 16),
         )
         b1 = cute.make_tensor(
@@ -1172,10 +1172,9 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             transform_local_tidx = tidx - 32 * (
                 self.transform_warp_id[0] + transform_group_idx * 4
             )
-            # Mirror local W4A16's gated transform view: the public prepared
-            # weights remain gate32/up32, but each MMA/epilogue warp owns a
-            # gate16/up16 TMEM band. Permute packed A and SF identically,
-            # before the existing BF16 transform; never fold global alpha.
+            # Shared NVFP4 gate16/up16 rows already match each MMA/epilogue
+            # warp's TMEM band. Decode the packed weights and SF directly;
+            # expert global alpha remains separate from BF16 weight decoding.
             accumulators = cute.make_tensor(
                 tmem.retrieve_ptr(cutlass.Float32), acc_fake.layout
             )
@@ -1186,19 +1185,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 tcgen05.St32x32bOp(tcgen05.Repetition(8), tcgen05.Unpack.NONE),
                 cutlass.BFloat16,
             )
-            gated_rows = cute.make_layout(((16, 2), (2, 2)), stride=((1, 32), (16, 64)))
-            fc1_raw = cute.composition(s_raw, ((gated_rows, None), None, None, None))
-            fc1_sf = cute.composition(s_sf, ((gated_rows, None), None, None))
-            sf_fc1_transform = mma.get_slice(0).partition_A(fc1_sf)
             sf_for_transform = mma.get_slice(0).partition_A(s_sf)
             parts_fc1 = self.mixed_fc1._setup_transform_partitions(
                 mma,
                 copy_in,
                 copy_out,
-                fc1_raw,
+                s_raw,
                 transform_layout,
                 None,
-                sf_fc1_transform,
+                sf_for_transform,
                 accumulators,
                 transform_local_tidx,
                 transform_group_idx,

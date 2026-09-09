@@ -369,8 +369,8 @@ class MegaMoEW4A16Frontend:
             (c.num_tokens_per_rank, c.hidden),
             (c.num_tokens_per_rank, c.num_topk),
             (c.num_tokens_per_rank, c.num_topk),
-            (c.num_experts_per_rank, 2 * c.intermediate, c.hidden // 2),
-            (c.num_experts_per_rank, c.hidden, c.intermediate // 2),
+            (c.num_experts_per_rank, c.hidden // 2, 2 * c.intermediate),
+            (c.num_experts_per_rank, c.intermediate // 2, c.hidden),
         )
         tensors = (
             inputs.activation,
@@ -394,28 +394,30 @@ class MegaMoEW4A16Frontend:
             or inputs.topk_weights.dtype != torch.float32
         ):
             raise ValueError("topk_idx/topk_weights must be int64/float32.")
-        if (
-            inputs.fc1_weight.dtype != torch.uint8
-            or inputs.fc2_weight.dtype != torch.uint8
-        ):
-            raise ValueError("W4A16 packed weights must be uint8.")
+        packed_dtypes = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", None))
         for weight, scale, alpha in (
             (inputs.fc1_weight, inputs.fc1_weight_sf, inputs.fc1_alpha),
             (inputs.fc2_weight, inputs.fc2_weight_sf, inputs.fc2_alpha),
         ):
-            padded_rows = ((weight.shape[1] + 127) // 128) * 128
-            padded_columns = ((weight.shape[2] // 8 + 3) // 4) * 4
-            expected_sf = (weight.shape[0] * padded_rows * padded_columns,)
-            if scale.shape != expected_sf or scale.dtype != torch.float8_e4m3fn:
+            if weight.dtype not in packed_dtypes:
+                raise ValueError("W4A16 packed weights must be FP4-x2 or uint8.")
+            if not weight.transpose(1, 2).is_contiguous():
+                raise ValueError("W4A16 packed weights must have K-major backing.")
+            padded_rows = ((weight.shape[2] + 127) // 128) * 128
+            padded_columns = ((weight.shape[1] // 8 + 3) // 4) * 4
+            expected_sf = (weight.shape[0], padded_rows * padded_columns)
+            if scale.shape != expected_sf or scale.dtype not in (
+                torch.float8_e4m3fn,
+                torch.uint8,
+            ):
                 raise ValueError(
-                    f"weight scales must be native flat E4M3 with shape {expected_sf}."
+                    "weight scales must be native per-expert E4M3 bytes "
+                    f"with shape {expected_sf}."
                 )
             if alpha.shape != (c.num_experts_per_rank,) or alpha.dtype != torch.float32:
                 raise ValueError("weight global scales must be FP32 per expert.")
-            if not all(t.is_cuda and t.is_contiguous() for t in (weight, scale, alpha)):
-                raise ValueError(
-                    "weight data and scales must be contiguous CUDA tensors."
-                )
+            if not all(t.is_cuda and t.is_contiguous() for t in (scale, alpha)):
+                raise ValueError("weight scales must be contiguous CUDA tensors.")
         topk_dim = 1 if c.in_kernel_fc2_reduce else c.num_topk
         if inputs.combine_output.shape != (c.num_tokens_per_rank, topk_dim, c.hidden):
             raise ValueError("combine_output has an invalid shape.")

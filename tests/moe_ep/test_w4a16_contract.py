@@ -64,7 +64,7 @@ def native_scale_interleave():
         yield interleave
 
 
-def _pack():
+def _pack(experts=_E, hidden=_H, intermediate=_I):
     def packed(shape):
         rows = torch.arange(shape[0] * shape[1]).reshape(*shape[:2], 1)
         columns = torch.arange(shape[2]).reshape(1, 1, -1)
@@ -75,10 +75,10 @@ def _pack():
         return ((values % 7 + 1).float() / 8).to(torch.float8_e4m3fn)
 
     return PrequantizedMoEWeights(
-        w13=packed((_E, 2 * _I, _H // 2)),
-        w2=packed((_E, _H, _I // 2)),
-        w13_scale=scales((_E, 2 * _I, _H // 16)),
-        w2_scale=scales((_E, _H, _I // 16)),
+        w13=packed((experts, 2 * intermediate, hidden // 2)),
+        w2=packed((experts, hidden, intermediate // 2)),
+        w13_scale=scales((experts, 2 * intermediate, hidden // 16)),
+        w2_scale=scales((experts, hidden, intermediate // 16)),
     )
 
 
@@ -250,34 +250,43 @@ def test_preparation_preserves_packed_weights_and_separate_fp32_globals(
     rows = torch.cat(
         [
             part
-            for start in range(0, _I, 32)
+            for start in range(0, _I, 16)
             for part in (
-                torch.arange(start, start + 32),
-                torch.arange(_I + start, _I + start + 32),
+                torch.arange(start, start + 16),
+                torch.arange(_I + start, _I + start + 16),
             )
         ]
     )
-    torch.testing.assert_close(prepared[0][0], source.w13[:, rows], rtol=0, atol=0)
     assert torch.equal(
-        prepared[0][1].view(torch.uint8),
+        prepared[0][0].transpose(1, 2).view(torch.uint8), source.w13[:, rows]
+    )
+    assert torch.equal(
+        prepared[0][1].view(torch.uint8).view(-1),
         _native_sf_bytes(source.w13_scale.view(torch.uint8)[:, rows]),
     )
-    assert torch.equal(prepared[1][0], source.w2)
+    assert torch.equal(prepared[1][0].transpose(1, 2).view(torch.uint8), source.w2)
     assert torch.equal(
-        prepared[1][1].view(torch.uint8), _native_sf_bytes(source.w2_scale)
+        prepared[1][1].view(torch.uint8).view(-1), _native_sf_bytes(source.w2_scale)
     )
     assert native_scale_interleave.call_count == 4  # Two legs, two preparations.
     for default_leg, scaled_leg, alpha in zip(
         plain, prepared, (alpha13, alpha2), strict=True
     ):
-        assert torch.equal(default_leg[0], scaled_leg[0])
+        assert torch.equal(
+            default_leg[0].view(torch.uint8), scaled_leg[0].view(torch.uint8)
+        )
         assert torch.equal(
             default_leg[1].view(torch.uint8), scaled_leg[1].view(torch.uint8)
         )
         torch.testing.assert_close(default_leg[2], torch.ones(_E), rtol=0, atol=0)
         torch.testing.assert_close(scaled_leg[2], alpha, rtol=0, atol=0)
         assert scaled_leg[2].dtype == torch.float32
-        assert all(tensor.is_contiguous() for tensor in scaled_leg)
+        assert scaled_leg[0].dtype == torch.float4_e2m1fn_x2
+        assert scaled_leg[0].transpose(1, 2).is_contiguous()
+        assert scaled_leg[0].stride(1) == 1
+        assert scaled_leg[1].dtype == torch.float8_e4m3fn
+        assert scaled_leg[1].shape[0] == _E
+        assert scaled_leg[1].is_contiguous() and scaled_leg[2].is_contiguous()
 
 
 def test_pretransformed_weights_do_not_require_a_source_pack():
@@ -383,11 +392,190 @@ def test_native_sf_preparation_and_pretransformed_validation_with_tails(
         intermediate_size=intermediate, hidden_size=hidden, world_size=1, num_experts=_E
     )
     validate_transformed_mega_weights(prepared, **kwargs)
-    # A caller supplying pretransformed weights must pass native flat scales,
-    # including padded N rows and K/16 columns, rather than the canonical plane.
+    # Prepared scales have one native padded row per expert, including N-row
+    # and K/16-column padding, rather than the canonical linear scale plane.
     bad_fc2 = (prepared[1][0], pack.w2_scale, prepared[1][2])
-    with pytest.raises(ValueError, match="native flat E4M3"):
+    with pytest.raises(ValueError, match="native per-expert E4M3/uint8"):
         validate_transformed_mega_weights((prepared[0], bad_fc2), **kwargs)
-    truncated = (prepared[1][0], prepared[1][1][:-1], prepared[1][2])
-    with pytest.raises(ValueError, match="native flat E4M3"):
+    truncated = (prepared[1][0], prepared[1][1][:, :-1], prepared[1][2])
+    with pytest.raises(ValueError, match="native per-expert E4M3/uint8"):
         validate_transformed_mega_weights((prepared[0], truncated), **kwargs)
+
+
+@pytest.mark.parametrize("experts,hidden,intermediate", [(2, 64, 64), (3, 288, 448)])
+@pytest.mark.parametrize("packed_dtype", [torch.uint8, torch.float4_e2m1fn_x2])
+def test_prepared_weight_and_sf_bytes_match_w4a4(
+    experts, hidden, intermediate, packed_dtype
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.weights import (
+        validate_transformed_mega_weights,
+    )
+
+    source = _pack(experts, hidden, intermediate)
+    # Include every scale-byte code, including encodings that must not undergo
+    # an FP8 numeric conversion while rows and native padding are rearranged.
+    source = dataclasses.replace(
+        source,
+        w13=source.w13.view(packed_dtype),
+        w2=source.w2.view(packed_dtype),
+        w13_scale=torch.arange(source.w13_scale.numel())
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(source.w13_scale.shape)
+        .view(torch.float8_e4m3fn),
+        w2_scale=torch.arange(source.w2_scale.numel())
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(source.w2_scale.shape)
+        .view(torch.float8_e4m3fn),
+    )
+    kwargs = dict(intermediate_size=intermediate, hidden_size=hidden)
+    w4a4 = moe_ep.preprocess_nvfp4_cutedsl_mega_weights(source, **kwargs)
+    w4a16 = preprocess_w4a16_cutedsl_mega_weights(source, **kwargs)
+    for pair, triple in zip(w4a4, w4a16, strict=True):
+        for previous, current in zip(pair, triple[:2], strict=True):
+            assert previous.dtype == current.dtype
+            assert previous.shape == current.shape
+            assert previous.stride() == current.stride()
+            assert torch.equal(previous.view(torch.uint8), current.view(torch.uint8))
+        assert triple[0].transpose(1, 2).is_contiguous()
+        assert triple[0].stride(1) == 1
+        assert triple[1].is_contiguous()
+
+    # W4A4's actual prepared tensors are already usable without copying. The
+    # accepted uint8 views share the exact storage and preserve the K-major
+    # strides; W4A16 alpha metadata remains a separate argument in each triple.
+    shared = tuple((q, sf, torch.ones(experts)) for q, sf in w4a4)
+    byte_views = tuple(
+        (
+            q.transpose(1, 2).view(torch.uint8).transpose(1, 2),
+            sf.view(torch.uint8),
+            alpha,
+        )
+        for q, sf, alpha in shared
+    )
+    for prepared in (shared, byte_views):
+        validate_transformed_mega_weights(
+            prepared, world_size=1, num_experts=experts, **kwargs
+        )
+        for pair, triple in zip(w4a4, prepared, strict=True):
+            assert pair[0].data_ptr() == triple[0].data_ptr()
+            assert pair[1].data_ptr() == triple[1].data_ptr()
+            assert pair[0].stride() == triple[0].stride()
+    scaled = dataclasses.replace(source, w13_global_scale=torch.ones(experts))
+    with pytest.raises(ValueError, match="does not support global weight scales"):
+        moe_ep.preprocess_nvfp4_cutedsl_mega_weights(scaled, **kwargs)
+
+
+def test_pretransformed_rejects_materialized_weight_transpose_and_old_sf_shape():
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.weights import (
+        validate_transformed_mega_weights,
+    )
+
+    prepared = _prepare(_pack())
+    kwargs = dict(intermediate_size=_I, hidden_size=_H, world_size=1, num_experts=_E)
+    q, sf, alpha = prepared[0]
+    with pytest.raises(ValueError, match="K-major transpose view"):
+        validate_transformed_mega_weights(
+            ((q.view(torch.uint8).contiguous(), sf, alpha), prepared[1]), **kwargs
+        )
+    with pytest.raises(ValueError, match="native per-expert"):
+        validate_transformed_mega_weights(
+            ((q, sf.view(-1), alpha), prepared[1]), **kwargs
+        )
+    # The former W4A16 [E,N,K/2] uint8 / flat-SF representation is unsupported;
+    # no layout is inferred from raw byte values and no legacy fallback exists.
+    with pytest.raises(ValueError, match="packed weights"):
+        validate_transformed_mega_weights(
+            ((q.transpose(1, 2).view(torch.uint8), sf.view(-1), alpha), prepared[1]),
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_unquantized_preparation_flattens_only_quantizer_rows(dtype):
+    hidden, intermediate = 288, 448
+    quantized = _pack(2, hidden, intermediate)
+    source = UnquantizedMoEWeights(
+        torch.arange(2 * 2 * intermediate * hidden)
+        .reshape(2, 2 * intermediate, hidden)
+        .to(dtype),
+        torch.arange(2 * hidden * intermediate)
+        .reshape(2, hidden, intermediate)
+        .to(dtype),
+    )
+    expected_inputs = (source.w13, source.w2)
+    outputs = ((quantized.w13, quantized.w13_scale), (quantized.w2, quantized.w2_scale))
+    calls = []
+
+    def quantize(tensor, norm_const):
+        index = len(calls)
+        expected = expected_inputs[index].float().reshape(-1, tensor.shape[-1])
+        assert tensor.ndim == 2 and tensor.dtype == torch.float32
+        assert norm_const == 1.0
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+        calls.append(tuple(tensor.shape))
+        q, sf = outputs[index]
+        return q.reshape(-1, q.shape[-1]), sf.reshape(-1, sf.shape[-1])
+
+    kwargs = dict(intermediate_size=intermediate, hidden_size=hidden)
+    with mock.patch(
+        "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.nvfp4_quantize_per_block_16",
+        side_effect=quantize,
+    ):
+        prepared = preprocess_w4a16_cutedsl_mega_weights(source, **kwargs)
+    assert calls == [(2 * 2 * intermediate, hidden), (2 * hidden, intermediate)]
+    expected = preprocess_w4a16_cutedsl_mega_weights(quantized, **kwargs)
+    for actual_leg, expected_leg in zip(prepared, expected, strict=True):
+        for actual, wanted in zip(actual_leg, expected_leg, strict=True):
+            assert torch.equal(actual.view(torch.uint8), wanted.view(torch.uint8))
+
+
+@pytest.mark.parametrize("intermediate", [16, 64])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [torch.uint8, torch.float8_e4m3fn, torch.float4_e2m1fn_x2]
+)
+def test_gate_up_16_interleave_preserves_bytes_and_independent_storage(
+    intermediate, strided, dtype
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+        _interleave_gate_up_16,
+    )
+
+    source = torch.arange(2 * 4 * intermediate * 14).remainder(256).to(torch.uint8)
+    source = source.reshape(2, 4 * intermediate, 14)
+    source = (
+        source[:, ::2, ::2]
+        if strided
+        else source[:, : 2 * intermediate, :7].contiguous()
+    )
+    rows = torch.tensor(
+        [
+            row
+            for start in range(0, intermediate, 16)
+            for offset in (0, intermediate)
+            for row in range(start + offset, start + offset + 16)
+        ]
+    )
+    source = source.view(dtype)
+    actual = _interleave_gate_up_16(source, intermediate_size=intermediate)
+    assert actual.dtype == source.dtype
+    assert torch.equal(actual.view(torch.uint8), source.view(torch.uint8)[:, rows])
+    assert actual.is_contiguous()
+    assert actual.data_ptr() != source.data_ptr()
+
+
+@pytest.mark.parametrize("packed_dtype", [torch.uint8, torch.float4_e2m1fn_x2])
+def test_preparation_accepts_strided_packed_weight_bytes(packed_dtype):
+    source = _pack()
+    strided = dataclasses.replace(
+        source,
+        w13=source.w13.transpose(1, 2).contiguous().transpose(1, 2).view(packed_dtype),
+        w2=source.w2.transpose(1, 2).contiguous().transpose(1, 2).view(packed_dtype),
+    )
+    expected, actual = _prepare(source), _prepare(strided)
+    for before, after in zip(expected, actual, strict=True):
+        for a, b in zip(before, after, strict=True):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+        assert after[0].transpose(1, 2).is_contiguous()

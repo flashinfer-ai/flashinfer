@@ -368,6 +368,159 @@ def test_w4a16_mega_two_rank(check):
 
 
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("byte_views_first", (False, True))
+def test_w4a16_mega_reuses_w4a4_weights_and_dtype_aliases(byte_views_first):
+    from flashinfer.moe_ep import (
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        preprocess_nvfp4_cutedsl_mega_weights,
+        preprocess_w4a16_cutedsl_mega_weights,
+    )
+
+    bootstrap = _bootstrap(1)
+    hidden, intermediate = 288, 448
+    weights = _weights(hidden=hidden, intermediate=intermediate)
+    kwargs = dict(hidden_size=hidden, intermediate_size=intermediate)
+    pairs = preprocess_nvfp4_cutedsl_mega_weights(
+        dataclasses.replace(weights, w13_global_scale=None, w2_global_scale=None),
+        **kwargs,
+    )
+    prepared = preprocess_w4a16_cutedsl_mega_weights(weights, **kwargs)
+    shared = tuple(
+        (*pair, alpha)
+        for pair, alpha in zip(
+            pairs, (weights.w13_global_scale, weights.w2_global_scale), strict=True
+        )
+    )
+    for pair, triple in zip(pairs, prepared, strict=True):
+        for shared_tensor, own_tensor in zip(pair, triple[:2], strict=True):
+            assert shared_tensor.dtype == own_tensor.dtype
+            assert shared_tensor.shape == own_tensor.shape
+            assert shared_tensor.stride() == own_tensor.stride()
+            assert torch.equal(
+                shared_tensor.view(torch.uint8), own_tensor.view(torch.uint8)
+            )
+
+    # A new backing allocation forces fresh launch arguments on the existing
+    # compiled frontend. Same-pointer aliases alone could reuse cached args.
+    byte_views = tuple(
+        (
+            q.transpose(1, 2).view(torch.uint8).clone().transpose(1, 2),
+            sf.view(torch.uint8).clone(),
+            alpha,
+        )
+        for q, sf, alpha in shared
+    )
+    initial, alternate = (
+        (byte_views, shared) if byte_views_first else (shared, byte_views)
+    )
+    layer = MoEEpLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=_EXPERTS,
+            max_tokens_per_rank=_CAPACITY,
+            token_hidden_size=hidden,
+        ),
+        weights=None,
+        backend=MegaConfig(
+            megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=intermediate,
+                top_k=_TOP_K,
+                knobs={
+                    "mma_tiler_mnk": (256, 64, 256),
+                    "cluster_shape_mnk": (2, 1, 1),
+                    "use_2cta_instrs": True,
+                    "num_sched_stages": 2,
+                    "group_hint": 512,
+                    "flag_batch": 4,
+                    "epi_flag_batch": (2, 4),
+                    "load_balance_mode": "atomic_counter",
+                    "token_back_mode": "epi_warps",
+                },
+            ),
+            preprocess_weights=False,
+            transformed_weights=initial,
+        ),
+    )
+    tensors = _inputs(bootstrap.rank, 17, hidden=hidden)
+    graph = None
+    try:
+        layer.warmup()
+        eager = layer.forward(tensors).clone()
+        _barrier()
+        _assert_mega_oracle_term_band_close(
+            eager, _reference_terms(tensors, weights), ikr=False, label="shared NVFP4"
+        )
+        frontend = layer._workspace._frontend
+        compiled = frontend._mega.compiled
+        layer._transformed = alternate
+        actual = layer.forward(tensors)
+        _barrier()
+        assert frontend._mega.compiled is compiled
+        torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = layer.forward(tensors)
+        graph.replay()
+        _barrier()
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+        tensors.hidden_states.mul_(0.5)
+        tensors.topk_ids.copy_(tensors.topk_ids.roll(1, dims=0))
+        tensors.topk_weights.mul_(0.71013)
+        graph.replay()
+        _barrier()
+        replay = captured.clone()
+        actual = layer.forward(tensors)
+        _barrier()
+        torch.testing.assert_close(replay, actual, rtol=0, atol=0)
+        _assert_mega_oracle_term_band_close(
+            actual,
+            _reference_terms(tensors, weights),
+            ikr=False,
+            label="shared NVFP4 changed-input graph",
+        )
+    finally:
+        if graph is not None:
+            graph.reset()
+        layer.destroy()
+        _barrier()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float32))
+def test_w4a16_unquantized_preparation_matches_w4a4(dtype):
+    from flashinfer.moe_ep import (
+        UnquantizedMoEWeights,
+        preprocess_nvfp4_cutedsl_mega_weights,
+        preprocess_w4a16_cutedsl_mega_weights,
+    )
+
+    _bootstrap(1)
+    generator = torch.Generator(device="cuda").manual_seed(20260909)
+    weights = UnquantizedMoEWeights(
+        *(
+            torch.randn(shape, device="cuda", dtype=dtype, generator=generator)
+            for shape in ((3, 896, 288), (3, 288, 448))
+        )
+    )
+    kwargs = dict(hidden_size=288, intermediate_size=448)
+    pairs = preprocess_nvfp4_cutedsl_mega_weights(weights, **kwargs)
+    triples = preprocess_w4a16_cutedsl_mega_weights(weights, **kwargs)
+    for pair, triple in zip(pairs, triples, strict=True):
+        for reference, actual in zip(pair, triple[:2], strict=True):
+            assert reference.dtype == actual.dtype
+            assert reference.shape == actual.shape
+            assert reference.stride() == actual.stride()
+            assert torch.equal(reference.view(torch.uint8), actual.view(torch.uint8))
+        torch.testing.assert_close(
+            triple[2], torch.ones(3, device="cuda"), rtol=0, atol=0
+        )
+
+
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("hidden", "intermediate", "num_tokens", "normalize_fc1"),
     (
