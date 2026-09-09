@@ -3956,15 +3956,24 @@ class TestOddTileCountBoundsContract:
         )
 
     def test_cuda_graph_replay_with_changed_routing(self):
-        """Replay twice at odd tile counts, changing routing in between.
+        """Replay at a shrinking odd tile count so a stale tail is present.
 
-        The second replay runs with tail entries left over from the first, so
-        a consumer reading past the active count would diverge from the eager
-        reference for that routing.
+        Order matters: replaying 11 active tiles and then 9 leaves entries
+        9-10 holding what the previous replay wrote. Replaying 9 then 11
+        would grow the active prefix and overwrite those entries, so the
+        stale-tail condition would never arise and the test would pass
+        without exercising anything.
+
+        The realized count is asserted after each replay, and the stale
+        entries are checked to have actually survived, so the setup cannot
+        silently stop reproducing the condition.
         """
+        from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers
+
         num_tokens, top_k = 64, 8
         hidden_size, intermediate_size = 256, 512
         num_experts = 256
+        high, low = 11, 9
 
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -3974,40 +3983,29 @@ class TestOddTileCountBoundsContract:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        routing_slot = tensors["token_selected_experts"]
+        routing_high = self._routing_for_tile_count(num_tokens, top_k, high)
+        routing_low = self._routing_for_tile_count(num_tokens, top_k, low)
 
-        routing_a = self._routing_for_tile_count(num_tokens, top_k, 9)
-        routing_b = self._routing_for_tile_count(num_tokens, top_k, 11)
-
-        from flashinfer import CuteDslMoEWrapper
-
-        moe = CuteDslMoEWrapper(
+        tactic_kwargs = self._default_tactic_kwargs()
+        tile_size = tactic_kwargs.get("tile_size", self.TILE_SIZE)
+        # Pre-allocated buffers are required for CUDA graph capture, and they
+        # are also what makes the active count and the tail observable here.
+        buffers = allocate_moe_sort_buffers(
+            num_tokens=num_tokens,
             num_experts=num_experts,
             top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            use_cuda_graph=True,
-            max_num_tokens=num_tokens,
-            activation_type=ActivationType.Swiglu,
+            num_local_experts=num_experts,
+            tile_tokens_dim=tile_size,
+            device="cuda",
         )
-
-        routing_slot = tensors["token_selected_experts"]
-        routing_slot.copy_(routing_a)
+        for buf in buffers.values():
+            buf.fill_(self.POISON)
 
         def _run():
-            return moe.run(
-                x=tensors["x"],
-                x_sf=tensors["x_sf"],
-                token_selected_experts=routing_slot,
-                token_final_scales=tensors["token_final_scales"],
-                w1_weight=tensors["w1_weight"],
-                w1_weight_sf=tensors["w1_weight_sf"],
-                w1_alpha=tensors["w1_alpha"],
-                fc2_input_scale=tensors["fc2_input_scale"],
-                w2_weight=tensors["w2_weight"],
-                w2_weight_sf=tensors["w2_weight_sf"],
-                w2_alpha=tensors["w2_alpha"],
-            )
+            return self._run_eager(tensors, buffers, num_experts, top_k, tactic_kwargs)
 
+        routing_slot.copy_(routing_high)
         for _ in range(3):
             _run()
         torch.cuda.synchronize()
@@ -4017,12 +4015,35 @@ class TestOddTileCountBoundsContract:
             output = _run()
         torch.cuda.synchronize()
 
-        for routing, label in ((routing_a, "A"), (routing_b, "B")):
-            # In-place so the captured graph sees the new routing, and any
-            # tail values written by the previous replay stay put.
+        expert_map = buffers["out_tile_idx_to_expert_idx"]
+        stale_from_high = None
+
+        for routing, expected, label in (
+            (routing_high, high, "high"),
+            (routing_low, low, "low"),
+        ):
+            # In place, so the captured graph reads the new routing and the
+            # previous replay's tail values stay where they are.
             routing_slot.copy_(routing)
             g.replay()
             torch.cuda.synchronize()
+
+            active = int(buffers["out_num_non_exiting_tiles"][0].item())
+            assert active == expected, (
+                f"replay {label}: expected {expected} active tiles, got "
+                f"{active}; this test no longer exercises the intended counts"
+            )
+
+            if label == "high":
+                stale_from_high = expert_map[low:high].clone()
+            else:
+                # The shrunk prefix must have left the previous replay's
+                # entries untouched -- that is the stale tail whose being
+                # ignored is the property under test.
+                assert torch.equal(expert_map[low:high], stale_from_high), (
+                    "entries beyond the active count were rewritten, so no "
+                    "stale tail survived and this test proves nothing"
+                )
 
             assert not torch.isnan(output).any(), f"NaN after replay {label}"
             assert not torch.isinf(output).any(), f"Inf after replay {label}"
@@ -4046,7 +4067,8 @@ class TestOddTileCountBoundsContract:
             )
             passed, percent_within, atol = check_accuracy(output, ref_output)
             assert passed, (
-                f"replay {label}: only {percent_within * 100:.2f}% within "
-                f"tolerance (atol={atol:.4f}) -- stale tile-map tail from the "
+                f"replay {label} ({expected} active tiles): only "
+                f"{percent_within * 100:.2f}% within tolerance "
+                f"(atol={atol:.4f}) -- a stale tile-map entry from the "
                 f"previous replay leaked into this one"
             )
