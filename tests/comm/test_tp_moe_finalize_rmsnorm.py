@@ -15,7 +15,6 @@ from flashinfer.comm import (
     tp_moe_finalize_rmsnorm,
 )
 
-WORLD_SIZE = 4
 TOPK = 8
 HIDDEN_SIZE = 4096
 HIDDEN_SIZE_PADDED = HIDDEN_SIZE + 32
@@ -142,12 +141,12 @@ def _make_permuted(
     return gemm2_permuted, physical_rows.to(torch.int32).view(num_tokens, TOPK)
 
 
-def _worker(local_rank: int, master_port: int) -> None:
+def _worker(local_rank: int, master_port: int, world_size: int) -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
         "nccl",
         rank=local_rank,
-        world_size=WORLD_SIZE,
+        world_size=world_size,
         init_method=f"tcp://127.0.0.1:{master_port}",
     )
     device = torch.device("cuda", local_rank)
@@ -302,17 +301,17 @@ def _worker(local_rank: int, master_port: int) -> None:
                     ),
                 )
 
-                gathered = [torch.empty_like(output) for _ in range(WORLD_SIZE)]
+                gathered = [torch.empty_like(output) for _ in range(world_size)]
                 dist.all_gather(gathered, output)
                 assert all(
                     torch.equal(gathered[0], rank_output) for rank_output in gathered
                 )
 
     other_stream = torch.cuda.Stream(device=device)
-    with (
-        torch.cuda.stream(other_stream),
-        pytest.raises(RuntimeError, match="same CUDA stream"),
-    ):
+    # Ordered eager calls may reuse the workspace from a different stream.
+    other_stream.wait_stream(execution_stream)
+    with torch.cuda.stream(other_stream):
+        output.fill_(float("nan"))
         tp_moe_finalize_rmsnorm(
             gemm2_permuted,
             expert_weights,
@@ -323,6 +322,8 @@ def _worker(local_rank: int, master_port: int) -> None:
             gain_center=1.0,
             weight_before_norm=True,
         )
+    execution_stream.wait_stream(other_stream)
+    _assert_model_close(output, expected)
 
     # Invalid entries must contribute zero without touching row zero or another
     # padded row, both of which intentionally contain NaNs.
@@ -527,7 +528,7 @@ def _worker(local_rank: int, master_port: int) -> None:
     with torch.cuda.graph(graph):
         assert torch.cuda.is_current_stream_capturing()
         capture_stream_handle = int(torch._C._cuda_getCurrentRawStream(local_rank))
-        assert capture_stream_handle != finalize_module._WS.stream_handle
+        assert capture_stream_handle != execution_stream.cuda_stream
         tp_moe_finalize_rmsnorm(
             graph_gemm2,
             graph_weights,
@@ -539,6 +540,9 @@ def _worker(local_rank: int, master_port: int) -> None:
             weight_before_norm=True,
         )
     for iteration in range(4):
+        replay_stream = (other_stream, execution_stream)[iteration % 2]
+        replay_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(replay_stream)
         replay_generator = torch.Generator(device=device).manual_seed(
             8000 + 10 * iteration + local_rank
         )
@@ -566,7 +570,9 @@ def _worker(local_rank: int, master_port: int) -> None:
         graph.replay()
         _assert_model_close(graph_output, expected)
 
-    # Graph capture must not replace the execution stream pinned by eager warmup.
+    execution_stream.wait_stream(torch.cuda.current_stream())
+    torch.cuda.set_stream(execution_stream)
+    # Eager execution can resume after ordered graph replays on either stream.
     tp_moe_finalize_rmsnorm(
         graph_gemm2,
         graph_weights,
@@ -581,12 +587,14 @@ def _worker(local_rank: int, master_port: int) -> None:
     dist.destroy_process_group()
 
 
-def _allocation_failure_worker(local_rank: int, master_port: int) -> None:
+def _allocation_failure_worker(
+    local_rank: int, master_port: int, world_size: int
+) -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
         "nccl",
         rank=local_rank,
-        world_size=WORLD_SIZE,
+        world_size=world_size,
         init_method=f"tcp://127.0.0.1:{master_port}",
     )
     import torch.distributed._symmetric_memory as symm_mem
@@ -606,18 +614,24 @@ def _allocation_failure_worker(local_rank: int, master_port: int) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph() -> None:
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("TP MoE finalize requires SM103")
-    if torch.cuda.device_count() < WORLD_SIZE:
-        pytest.skip("Four GPUs are required")
-    mp.spawn(_worker, args=(_free_port(),), nprocs=WORLD_SIZE)
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_tp_moe_finalize_rmsnorm_eager_and_cudagraph(world_size: int) -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} GPUs are required")
+    mp.spawn(_worker, args=(_free_port(), world_size), nprocs=world_size)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent() -> None:
-    if torch.cuda.get_device_capability() != (10, 3):
-        pytest.skip("TP MoE finalize requires SM103")
-    if torch.cuda.device_count() < WORLD_SIZE:
-        pytest.skip("Four GPUs are required")
-    mp.spawn(_allocation_failure_worker, args=(_free_port(),), nprocs=WORLD_SIZE)
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_tp_moe_finalize_rmsnorm_allocation_failure_is_rank_consistent(
+    world_size: int,
+) -> None:
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("TP MoE finalize requires SM100 or SM103")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"{world_size} GPUs are required")
+    mp.spawn(
+        _allocation_failure_worker, args=(_free_port(), world_size), nprocs=world_size
+    )

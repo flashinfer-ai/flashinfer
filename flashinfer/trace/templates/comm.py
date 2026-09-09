@@ -61,7 +61,7 @@ tp_moe_finalize_rmsnorm_trace = TraceTemplate(
     op_type="tp_moe_finalize_rmsnorm",
     name_prefix="tp_moe_finalize_rmsnorm",
     description=(
-        "Gather raw permuted GEMM2 rows, reduce them across TP4, apply "
+        "Gather raw permuted GEMM2 rows, reduce them across TP ranks, apply "
         "per-expert RMSNorm, and perform the BF16- or FP32-routing-weighted "
         "finalize. The trace reference treats the gathered rows as already "
         "TP-reduced."

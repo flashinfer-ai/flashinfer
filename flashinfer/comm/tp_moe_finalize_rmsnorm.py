@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""TP4 MoE finalize and post-expert RMSNorm for generic TP4 on B300.
+"""TP2/4/8 MoE finalize and post-expert RMSNorm on SM100/SM103.
 
 One candidate-owned kernel, no framework collective.  The input is the raw
 permuted GEMM2 buffer plus its expanded-to-permuted row map; resolving that map
 inside the kernel avoids materializing the logical [T,K,H] partial-row tensor.
-The cross-rank sum is expert-sharded instead of replicated, which is what makes
-it cheap: the naive one-shot all-gather forces every rank to *receive* three
-full copies of that logical tensor (four with a multicast push, because the
+The cross-rank sum is expert-sharded instead of replicated. For TP4, the naive
+one-shot all-gather forces every rank to *receive* three full copies of that
+logical tensor (four with a multicast push, because the
 switch loops the sender's own copy back), even though the only thing anybody
 needs out of it is the [T,H] finalized row.  Sharding the experts moves the
-fabric cost onto the small tensor:
+fabric cost onto the small tensor. The following example describes TP4;
+TP2 and TP8 assign four and one expert slots per rank, respectively:
 
   phase 1 (scatter by expert owner): rank r owns experts [2r, 2r+1].  Every
       rank pushes the six expert rows it does *not* own straight from registers
@@ -48,7 +49,7 @@ entry and advanced at exit, so a captured graph replays correctly.
 
 Decomposition: a token is owned by a thread-block *cluster* of ``S`` CTAs that
 split the H axis; every CTA pushes, polls, normalizes and writes only its own H
-band.  The single piece of cross-CTA state is the two per-expert sums of
+band.  The single piece of cross-CTA state is the per-expert sums of
 squares, exchanged through distributed shared memory with one cluster barrier.
 ``S`` is a launch parameter: small token counts leave most of the machine idle
 with one CTA per token, so S grows until the grid covers the SM array.
@@ -96,6 +97,7 @@ def _cur_stream(dev_ord, h=None):
 
 
 K_EXPERTS = 8
+_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 H_DIM = 4096
 VEC = 8
 NSLOT = 256  # >= max CTAs in the grid; one Lamport slot per CTA
@@ -580,7 +582,7 @@ def _make_program(
 
             # ---- phase 1: unicast every non-owned expert row to its owner.
             # One store per expert row; nothing is broadcast, so the rank's
-            # fabric egress here is exactly 3/4 of its payload.
+            # fabric egress here is (ws - 1) / ws of its payload.
             for k in cutlass.range_constexpr(K_EXPERTS):
                 o = k // KO
                 if cutlass.const_expr(o != my_rank):
@@ -883,7 +885,6 @@ class _Ws:
     nsm = 148
     dev_ord = 0
     group = None
-    stream_handle: int | None = None
 
 
 _WS = _Ws()
@@ -916,9 +917,9 @@ def _group_all(
 
 
 def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
-    """Collectively initialize the process-wide TP4 multicast workspace.
+    """Collectively initialize the process-wide TP2/4/8 multicast workspace.
 
-    ``group`` is the exact four-rank tensor-parallel process group. The default
+    ``group`` is the exact 2-, 4-, or 8-rank tensor-parallel group. The default
     process group is used when it is omitted. Availability is reduced across
     the group, so every rank returns the same verdict.
     """
@@ -935,18 +936,18 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
         group = dist.group.WORLD
     _WS.group = group
     world_size = dist.get_world_size(group)
-    if world_size != 4:
+    if world_size not in (2, 4, 8):
         _WS.initialized = True
         return False
 
     device = torch.device("cuda", torch.accelerator.current_device_index())
     props = torch.cuda.get_device_properties(device)
-    local_supported = (props.major, props.minor) == (10, 3)
+    local_supported = (props.major, props.minor) in _COMPUTE_CAPABILITIES
     local_supported = local_supported and props.multi_processor_count <= NSLOT
     if not _group_all(local_supported, device, group):
         if not local_supported:
             logger.warning(
-                "TP MoE finalize requires SM103 and at most %d SMs; got SM%d%d "
+                "TP MoE finalize requires SM100/SM103 and at most %d SMs; got SM%d%d "
                 "with %d SMs.",
                 NSLOT,
                 props.major,
@@ -965,7 +966,6 @@ def init_tp_moe_finalize_rmsnorm(group=None) -> bool:
     _WS.dev_ord = torch.cuda.current_device()
     _WS.ws = world_size
     _WS.rank = dist.get_rank(group)
-    _WS.stream_handle = None
     _WS.addrs = {"lam_uc": 0, "lam_mc": 0, "lam_peers": [], "gen": 0}
 
     import torch.distributed._symmetric_memory as symm_mem
@@ -1128,17 +1128,8 @@ def _run(
         float(eps),
         float(gain_center),
     )
-    stream_handle = int(torch._C._cuda_getCurrentRawStream(_WS.dev_ord))
     capturing = torch.cuda.is_current_stream_capturing()
-    if not capturing:
-        if _WS.stream_handle is None:
-            _WS.stream_handle = stream_handle
-        elif stream_handle != _WS.stream_handle:
-            raise RuntimeError(
-                "TP MoE finalize uses a process-wide Lamport workspace and must be "
-                "invoked on the same CUDA stream for its lifetime"
-            )
-    stream = _cur_stream(_WS.dev_ord, stream_handle)
+    stream = _cur_stream(_WS.dev_ord)
     prog = _PROGRAMS.get(key)
     if capturing and prog is None:
         raise RuntimeError(
@@ -1176,9 +1167,9 @@ def run(
     weight_before_norm,
     output,
 ):
-    """Direct entry point used by focused kernel tests and benchmarks."""
+    """Direct entry point with the same ordering contract as the public API."""
     if not init_tp_moe_finalize_rmsnorm():
-        raise RuntimeError("TP4 multicast finalize is unavailable")
+        raise RuntimeError("TP multicast finalize is unavailable")
     if not supports_tp_moe_finalize_rmsnorm(
         gemm2_permuted,
         expert_weights,
@@ -1206,7 +1197,7 @@ def supports_tp_moe_finalize_rmsnorm(
     norm_weight: torch.Tensor,
     output: torch.Tensor,
 ) -> bool:
-    """Return whether tensors satisfy the TP4 SM103 kernel contract."""
+    """Return whether tensors satisfy the TP2/4/8 SM100/SM103 kernel contract."""
     if (
         not _WS.available
         or gemm2_permuted.ndim != 2
@@ -1321,7 +1312,7 @@ def tp_moe_finalize_rmsnorm(
     gain_center: float,
     weight_before_norm: bool,
 ) -> None:
-    """Gather and finalize TP4 expert rows, then apply per-expert RMSNorm.
+    """Gather and finalize TP expert rows, then apply per-expert RMSNorm.
 
     ``gemm2_permuted`` contains the raw, unweighted GEMM2 rows in physical
     expert order. ``expanded_idx_to_permuted_idx[t, k]`` selects the physical
@@ -1333,11 +1324,12 @@ def tp_moe_finalize_rmsnorm(
 
     Initialize the workspace collectively with
     :func:`init_tp_moe_finalize_rmsnorm` before the first invocation. The
-    operation writes its BF16 result to ``output``. The process-wide Lamport
-    workspace is a single-stream resource: each rank must use one fixed execution
-    stream, with the same call sequence on every rank, for the workspace lifetime.
-    CUDA graph capture may use a separate capture stream after every specialization
-    has been warmed up; replay must be enqueued on the fixed execution stream.
+    operation writes its BF16 result to ``output``. All invocations share one
+    process-wide Lamport workspace and must not overlap, including CUDA graph
+    replays. Every rank must issue the same call sequence. When switching streams,
+    the caller must order their work with synchronization or event dependencies;
+    this operation does not insert synchronization between streams. Warm up every
+    specialization outside CUDA graph capture before capturing it.
     """
     _tp_moe_finalize_impl(
         gemm2_permuted,
