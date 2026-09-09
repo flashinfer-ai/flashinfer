@@ -1045,10 +1045,11 @@ capabilities: `supported_quant_variants` plus `supported_output_formats`.
 `QuantVariant` remains a deprecated preset that expands every member except
 `W4A16`, which must be spelled as `weight=QuantFormat.MXFP4` or
 `weight=QuantFormat.NVFP4` with `activation=QuantFormat.BF16`, or expanded via
-`QuantConfig.from_variant(W4A16, w4a16_weight=...)`. An omitted axis is BF16
-(unquantized): `QuantConfig()` is BF16×BF16 and `QuantConfig(weight=MXFP4)` is
-MXFP4×BF16; MXFP4×MXFP8 needs both axes. Axes describe the MMA numeric format,
-not the dtype of the tensor that crosses the Python API.
+`QuantConfig.from_variant(QuantVariant.W4A16, w4a16_weight=...)`. An omitted
+axis is BF16 (unquantized): `QuantConfig()` is BF16×BF16 and
+`QuantConfig(weight=QuantFormat.MXFP4)` is MXFP4×BF16; MXFP4×MXFP8 needs both
+axes. Axes describe the MMA numeric format, not the dtype of the tensor that
+crosses the Python API.
 
 ### Explicit Non-Goals For This MVP
 
