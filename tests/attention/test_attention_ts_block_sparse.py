@@ -1850,6 +1850,7 @@ def test_decode_schedule_revalidates_mutable_paged_staging_config(
             )
         )
         cfg.num_tokens_per_page = 32
+        cfg.storage_tokens_per_page = 32
         message = "atom size must not exceed page size"
 
     with pytest.raises(ValueError, match=message):
