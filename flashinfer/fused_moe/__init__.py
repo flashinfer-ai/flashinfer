@@ -60,6 +60,7 @@ from .api import (  # noqa: F401
     QuantConfig,
     QuantFormat,
     RoutingConfig,
+    SM12xMxfp8Mxfp4Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -91,6 +92,7 @@ from .runners import (  # noqa: F401
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    SM12xMxfp8Mxfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -224,7 +226,6 @@ try:
         cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
         cute_dsl_sm12x_fc2_finalize_fp8,
         cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
-        cute_dsl_sm12x_fused_moe_mxfp8_mxfp4,
     )
 
     _cute_dsl_available = True
@@ -325,6 +326,8 @@ __all__ = [
     "QuantConfig",
     "QuantFormat",
     "RoutingConfig",
+    "SM12xMxfp8Mxfp4Config",
+    "SM12xMxfp8Mxfp4Runner",
     "TrtllmBf16Config",
     "TrtllmFp4Config",
     "TrtllmFp8BlockConfig",
@@ -409,5 +412,4 @@ if _cute_dsl_available:
         "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
         "cute_dsl_sm12x_fc2_finalize_fp8",
         "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
-        "cute_dsl_sm12x_fused_moe_mxfp8_mxfp4",
     ]

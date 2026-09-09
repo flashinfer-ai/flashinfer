@@ -24,7 +24,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import FC1ActBuilder, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import Sm12xGatedGemmConfig, MmaConfig, LoadABConfig
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigFp8,
     copy_scale_s2r,
@@ -81,7 +81,7 @@ def make_cfg(
         assert epi is EpiMethod.R2G_WG, f"{epi} is not implemented here; sC aliases A/B"
         gran_m, gran_n = GRAN_M, GRAN_N
     tile = (bm, bn, bk)
-    return FC1ActBuilder(
+    return Sm12xGatedGemmConfig(
         MmaConfig(
             warp_mma.MmaFP8Op(e4m3, f32, ATOM_MNK),
             tile[:2],
@@ -96,10 +96,9 @@ def make_cfg(
         epi_bar_id=3,
         union_smem=not swap,
         reg_prod=REG_PROD_BY_TACTIC[(*ptile, epi)],
-        activation=moe_activation.resolve_activation_fn(
-            activation, situ_beta, situ_linear_beta
+        activation=moe_activation.make_gated_activation(
+            activation, fastmath, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta
         ),
-        fastmath=fastmath,
         enable_pdl=enable_pdl,
     )
 
@@ -285,7 +284,6 @@ def mma(
     mma_cfg,
     sf_cfg,
     activation,
-    fastmath,
     sA,
     sB,
     sB_g,
@@ -371,7 +369,7 @@ def mma(
             read_stage = i32(0)
             ab_phase ^= 1
 
-    activation(acc_u, acc_g, fastmath)
+    activation(acc_u, acc_g)
     return acc_u, read_stage, ab_phase
 
 
@@ -563,7 +561,6 @@ def mma_swap(
     mma_cfg,
     sf_cfg,
     activation,
-    fastmath,
     sA,
     sA_g,
     sB,
@@ -649,7 +646,7 @@ def mma_swap(
             read_stage = i32(0)
             ab_phase ^= 1
 
-    activation(acc_u, acc_g, fastmath)
+    activation(acc_u, acc_g)
     return acc_u, read_stage, ab_phase
 
 
@@ -1047,7 +1044,6 @@ class CuteDslSm120MoeFp8Fc1Act:
                         cfg.mma,
                         cfg.load_sf,
                         cfg.activation,
-                        cfg.fastmath,
                         sA,
                         sBg,
                         sB,
@@ -1077,7 +1073,6 @@ class CuteDslSm120MoeFp8Fc1Act:
                         cfg.mma,
                         cfg.load_sf,
                         cfg.activation,
-                        cfg.fastmath,
                         sA,
                         sB,
                         sBg,

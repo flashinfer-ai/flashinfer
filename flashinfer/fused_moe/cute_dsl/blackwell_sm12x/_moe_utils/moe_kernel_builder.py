@@ -196,7 +196,7 @@ class SmemUnionTooSmall(AssertionError):
     pass
 
 
-class Sm120GemmBuilder:
+class Sm12xGemmConfig:
     ACC = cutlass.Float32
     I64, I32, I16, I8 = cutlass.Int64, cutlass.Int32, cutlass.Int16, cutlass.Int8
 
@@ -327,9 +327,9 @@ class Sm120GemmBuilder:
         return warp_idx >= self.num_math_warps
 
 
-class FC1ActBuilder(Sm120GemmBuilder):
+class Sm12xGatedGemmConfig(Sm12xGemmConfig):
     gated = True
 
-    def __init__(self, *args, activation, fastmath=False, **kwargs):
+    def __init__(self, *args, activation, **kwargs):
         super().__init__(*args, **kwargs)
-        self.activation, self.fastmath = activation, fastmath
+        self.activation = activation

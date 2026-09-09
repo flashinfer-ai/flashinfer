@@ -25,7 +25,7 @@ from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN
 from ....utils import ceil_div
 from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from .kernel_moe_fp8_fc1_act_q1 import (
     GRAN_K,
     GRAN_N,
@@ -43,7 +43,7 @@ DEFAULT_EPI = EpiMethod.WG_S2R_QUANT
 
 
 def resolve_stage(tile, epi=DEFAULT_EPI):
-    return Sm120GemmBuilder.max_ab_stage(
+    return Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi, activation=ActivationType.Swiglu),
         tuple(tile),
     )

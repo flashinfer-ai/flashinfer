@@ -13,52 +13,70 @@
 # limitations under the License.
 """Gated activation, the epilogue step every fc1_act arm runs on its two accumulators."""
 
-import functools
-
 import cutlass
 import cutlass.cute as cute
 
-from .....tllm_enums import ActivationType
+from .....tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA, ActivationType
 
 
-@cute.jit
-def _sigmoid(x, fastmath: cutlass.Constexpr):
-    return cute.arch.rcp_approx(1.0 + cute.math.exp(-x, fastmath=fastmath))
+class SwiGLUActivation:
+    def __init__(self, fastmath=False, swiglu_limit=None):
+        self.fastmath = fastmath
+        self.swiglu_limit = swiglu_limit
+
+    @cute.jit
+    def __call__(self, acc_u, acc_g):
+        for i in cutlass.range_constexpr(cute.size(acc_u)):
+            g, u = acc_g[i], acc_u[i]
+            if cutlass.const_expr(self.swiglu_limit is not None):
+                g = cute.math.min(g, self.swiglu_limit)
+                u = cute.math.max(
+                    -self.swiglu_limit, cute.math.min(u, self.swiglu_limit)
+                )
+            sigmoid = cute.arch.rcp_approx(
+                1.0 + cute.math.exp(-g, fastmath=self.fastmath)
+            )
+            acc_u[i] = g * sigmoid * u
+        return acc_u
 
 
-@cute.jit
-def apply_silu(acc_u, acc_g, fastmath: cutlass.Constexpr):
-    for i in cutlass.range_constexpr(cute.size(acc_u)):
-        g = acc_g[i]
-        acc_u[i] = g * _sigmoid(g, fastmath) * acc_u[i]
-    return acc_u
+class SiTUActivation:
+    def __init__(
+        self,
+        fastmath=False,
+        beta=DEFAULT_SITU_BETA,
+        linear_beta=DEFAULT_SITU_LINEAR_BETA,
+    ):
+        self.fastmath = fastmath
+        self.beta = beta
+        self.linear_beta = linear_beta
+
+    @cute.jit
+    def __call__(self, acc_u, acc_g):
+        inv_beta = 1.0 / self.beta
+        inv_linear_beta = 1.0 / self.linear_beta
+        for i in cutlass.range_constexpr(cute.size(acc_u)):
+            g, u = acc_g[i], acc_u[i]
+            soft_g = self.beta * cute.math.tanh(g * inv_beta, approx=False)
+            soft_u = self.linear_beta * cute.math.tanh(
+                u * inv_linear_beta, approx=False
+            )
+            sigmoid = cute.arch.rcp_approx(
+                1.0 + cute.math.exp(-g, fastmath=self.fastmath)
+            )
+            acc_u[i] = soft_g * sigmoid * soft_u
+        return acc_u
 
 
-@cute.jit
-def apply_situ(
-    acc_u,
-    acc_g,
-    fastmath: cutlass.Constexpr,
-    situ_beta: cutlass.Constexpr,
-    situ_linear_beta: cutlass.Constexpr,
+def make_gated_activation(
+    activation,
+    fastmath=False,
+    swiglu_limit=None,
+    situ_beta=DEFAULT_SITU_BETA,
+    situ_linear_beta=DEFAULT_SITU_LINEAR_BETA,
 ):
-    inv_beta = 1.0 / situ_beta
-    inv_linear_beta = 1.0 / situ_linear_beta
-    for i in cutlass.range_constexpr(cute.size(acc_u)):
-        g, u = acc_g[i], acc_u[i]
-        soft_g = situ_beta * cute.math.tanh(g * inv_beta, approx=False)
-        soft_u = situ_linear_beta * cute.math.tanh(u * inv_linear_beta, approx=False)
-        acc_u[i] = soft_g * _sigmoid(g, fastmath) * soft_u
-    return acc_u
-
-
-ACTIVATION_FNS = {ActivationType.Swiglu: apply_silu, ActivationType.Situ: apply_situ}
-
-
-def resolve_activation_fn(activation, situ_beta, situ_linear_beta):
-    fn = ACTIVATION_FNS[activation]
+    if activation is ActivationType.Swiglu:
+        return SwiGLUActivation(fastmath, swiglu_limit)
     if activation is ActivationType.Situ:
-        fn = functools.partial(
-            fn, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta
-        )
-    return fn
+        return SiTUActivation(fastmath, situ_beta, situ_linear_beta)
+    raise ValueError(f"unsupported gated activation {activation!r}")

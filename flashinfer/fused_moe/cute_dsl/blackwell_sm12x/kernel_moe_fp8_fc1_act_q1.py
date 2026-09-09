@@ -32,7 +32,7 @@ from ._moe_utils.moe_epilogue import (
     store_wg_q1_after_s2r,
     store_wg_q1_before_r2s,
 )
-from ._moe_utils.moe_kernel_builder import FC1ActBuilder, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import Sm12xGatedGemmConfig, MmaConfig, LoadABConfig
 from ._moe_utils.sm12x_blockscaled_layout import (
     Sm120SfConfigFp8,
     copy_scale_s2r,
@@ -90,7 +90,7 @@ def make_cfg(
         if swap
         else num_math_warps * 32
     )
-    return FC1ActBuilder(
+    return Sm12xGatedGemmConfig(
         MmaConfig(
             warp_mma.MmaFP8Op(e4m3, f32, ATOM_MNK),
             tile[:2],
@@ -105,8 +105,7 @@ def make_cfg(
         epi_bar_id=3,
         union_smem=not swap,
         reg_prod=REG_PROD_BY_TACTIC[(*ptile, epi)],
-        activation=moe_activation.ACTIVATION_FNS[activation],
-        fastmath=fastmath,
+        activation=moe_activation.make_gated_activation(activation, fastmath),
         enable_pdl=enable_pdl,
     )
 
@@ -292,7 +291,6 @@ def mma(
     mma_cfg,
     sf_cfg,
     activation,
-    fastmath,
     sA,
     sB,
     sB_g,
@@ -378,7 +376,7 @@ def mma(
             read_stage = i32(0)
             ab_phase ^= 1
 
-    activation(acc_u, acc_g, fastmath)
+    activation(acc_u, acc_g)
     return acc_u, read_stage, ab_phase
 
 
@@ -570,7 +568,6 @@ def mma_swap(
     mma_cfg,
     sf_cfg,
     activation,
-    fastmath,
     sA,
     sA_g,
     sB,
@@ -656,7 +653,7 @@ def mma_swap(
             read_stage = i32(0)
             ab_phase ^= 1
 
-    activation(acc_u, acc_g, fastmath)
+    activation(acc_u, acc_g)
     return acc_u, read_stage, ab_phase
 
 
@@ -1095,7 +1092,6 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                         cfg.mma,
                         cfg.load_sf,
                         cfg.activation,
-                        cfg.fastmath,
                         sA,
                         sBg,
                         sB,
@@ -1141,7 +1137,6 @@ class CuteDslSm120MoeFp8Fc1ActQ1:
                         cfg.mma,
                         cfg.load_sf,
                         cfg.activation,
-                        cfg.fastmath,
                         sA,
                         sB,
                         sBg,
