@@ -21,7 +21,7 @@ normalize_provider_tag() {
 }
 
 resolve_cuda_config() {
-    local config_values config_version config_pytorch_index config_arch_list
+    local config_values config_version config_pytorch_index config_provider_archs
     local configured_cuda_version=${CUDA_VERSION:-}
     local configured_docker_image=${DOCKER_IMAGE:-}
     local default_platform_tag="manylinux_2_28_${ARCH}"
@@ -43,16 +43,21 @@ except StopIteration:
     labels = ", ".join(item["label"] for item in entries)
     raise SystemExit(f"Unknown JIT-cache CUDA label {label!r}; expected one of: {labels}")
 
-arch_field = f"{machine}_arch_list"
+arch_field = f"{machine}_provider_architectures"
 try:
-    arch_list = entry[arch_field]
+    provider_architectures = entry[arch_field]
 except KeyError:
     raise SystemExit(f"Unsupported provider CPU architecture {machine!r}") from None
 
-print(entry["version"], entry["pytorch_index"], arch_list, sep="\t")
+print(
+    entry["version"],
+    entry["pytorch_index"],
+    " ".join(provider_architectures),
+    sep="\t",
+)
 PY
     )
-    IFS=$'\t' read -r config_version config_pytorch_index config_arch_list \
+    IFS=$'\t' read -r config_version config_pytorch_index config_provider_archs \
         <<< "${config_values}"
 
     if [ -n "${configured_cuda_version}" ] && \
@@ -65,7 +70,7 @@ PY
     export CUDA_MAJOR="${config_version%%.*}"
     export CUDA_MINOR="${config_version#*.}"
     export PYTORCH_INDEX="${config_pytorch_index}"
-    export FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS="${config_arch_list}"
+    export FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="${config_provider_archs}"
 
     if [ -z "${configured_docker_image}" ]; then
         case "${ARCH}" in
@@ -110,7 +115,7 @@ print_config() {
     echo "cpu_arch=${ARCH}"
     echo "container=${DOCKER_IMAGE}"
     echo "provider_platform_tag=${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-native}"
-    echo "monolithic_arch_list=${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}"
+    echo "configured_provider_architectures=${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS}"
 }
 
 validate_provider_platform_tag() {
@@ -299,7 +304,6 @@ run_in_container() {
         "${REPO_ROOT}/flashinfer-jit-cache-provider"
 
     echo "Building one-provider shim..."
-    FLASHINFER_JIT_CACHE_WHEEL_KIND=shim \
     FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}" \
         "${python}" -m build --wheel --outdir "${output_dir}" \
         "${REPO_ROOT}/flashinfer-jit-cache"

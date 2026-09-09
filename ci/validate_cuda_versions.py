@@ -16,7 +16,6 @@ VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 PYTORCH_INDEX_PATTERN = re.compile(r"^(?:nightly/)?cu[0-9]+$")
 IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9._-]*$")
 CUDNN_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
-ARCH_LIST_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[a-z]?(?: [0-9]+\.[0-9]+[a-z]?)*$")
 ARCHITECTURE_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[af]?$")
 DEPENDENCY_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEPENDENCY_VERSION_PATTERN = re.compile(
@@ -341,11 +340,6 @@ def _validate_devcontainer(
 def validate_cuda_config(config: Any, repo_root: Path) -> None:
     """Validate matrix syntax, safe values, and cross-file consistency."""
     config = _mapping(config, "CUDA configuration")
-    wheel_format = config.get("jit_cache_wheel_format")
-    if wheel_format not in ("legacy", "providers"):
-        raise ConfigError(
-            "jit_cache_wheel_format must be either 'legacy' or 'providers'"
-        )
     runtime_entries = _entries(config, "runtime")
     jit_entries = _entries(config, "jit_cache")
 
@@ -366,8 +360,6 @@ def validate_cuda_config(config: Any, repo_root: Path) -> None:
         label, _, _ = _validate_identity(entry, context)
         if label in jit_by_label:
             raise ConfigError(f"duplicate JIT-cache label: {label}")
-        _string(entry, "x86_64_arch_list", context, ARCH_LIST_PATTERN)
-        _string(entry, "aarch64_arch_list", context, ARCH_LIST_PATTERN)
         _architecture_array(entry, "x86_64_provider_architectures", context)
         _architecture_array(entry, "aarch64_provider_architectures", context)
         jit_by_label[label] = entry

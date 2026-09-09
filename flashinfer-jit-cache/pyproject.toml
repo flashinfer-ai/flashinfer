@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "wheel", "tqdm", "torch", "ninja", "requests", "numpy", "nvidia-ml-py", "apache-tvm-ffi>=0.1,<0.2"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "build_backend"
 backend-path = ["."]
 
@@ -7,7 +7,7 @@ backend-path = ["."]
 name = "flashinfer-jit-cache"
 dynamic = ["version", "dependencies"]
 description = "JIT cache provider shim for FlashInfer"
-readme = {text = "This package discovers compatible pre-compiled FlashInfer JIT cache providers. Legacy builds may also contain the shared libraries directly.", content-type = "text/plain"}
+readme = {text = "This package installs and discovers compatible pre-compiled FlashInfer JIT cache providers.", content-type = "text/plain"}
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
 authors = [
@@ -41,6 +41,3 @@ include-package-data = true
 [tool.setuptools.dynamic]
 version = {attr = "flashinfer_jit_cache.__version__"}
 dependencies = {file = ["flashinfer_jit_cache/_provider_requirements.txt"]}
-
-[tool.setuptools.package-data]
-flashinfer_jit_cache = ["jit_cache/**/*.so"]

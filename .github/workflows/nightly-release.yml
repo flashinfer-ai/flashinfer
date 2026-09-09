@@ -13,15 +13,6 @@ on:
         description: 'Date suffix for dev version (YYYYMMDD, leave empty for today)'
         required: false
         type: string
-      jit_cache_wheel_format:
-        description: 'JIT-cache artifact format (configured uses ci/cuda-versions.json)'
-        required: false
-        default: configured
-        type: choice
-        options:
-          - configured
-          - legacy
-          - providers
 
 jobs:
   setup:
@@ -30,10 +21,8 @@ jobs:
       dev_suffix: ${{ steps.set-suffix.outputs.dev_suffix }}
       release_tag: ${{ steps.set-suffix.outputs.release_tag }}
       version: ${{ steps.set-suffix.outputs.version }}
-      jit_cache_cuda_matrix: ${{ steps.cuda-versions.outputs.jit_cache }}
       jit_cache_provider_matrix: ${{ steps.cuda-versions.outputs.providers }}
       jit_cache_shim_matrix: ${{ steps.cuda-versions.outputs.shims }}
-      jit_cache_wheel_format: ${{ steps.cuda-versions.outputs.wheel_format }}
       runtime_cuda_matrix: ${{ steps.cuda-versions.outputs.runtime }}
     steps:
       - name: Checkout code
@@ -83,18 +72,9 @@ jobs:
 
       - name: Load CUDA wheel matrix
         id: cuda-versions
-        env:
-          REQUESTED_WHEEL_FORMAT: ${{ inputs.jit_cache_wheel_format }}
         run: |
-          CONFIGURED_WHEEL_FORMAT=$(jq -r '.jit_cache_wheel_format' ci/cuda-versions.json)
-          WHEEL_FORMAT=${REQUESTED_WHEEL_FORMAT:-configured}
-          if [ "${WHEEL_FORMAT}" = "configured" ]; then
-            WHEEL_FORMAT=${CONFIGURED_WHEEL_FORMAT}
-          fi
-          echo "jit_cache=$(jq -c '.jit_cache' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
           echo "providers=$(python3 ci/validate_cuda_versions.py --matrix providers)" >> "$GITHUB_OUTPUT"
           echo "shims=$(python3 ci/validate_cuda_versions.py --matrix shims)" >> "$GITHUB_OUTPUT"
-          echo "wheel_format=${WHEEL_FORMAT}" >> "$GITHUB_OUTPUT"
           echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
   build-flashinfer-python:
@@ -171,165 +151,9 @@ jobs:
           path: dist/*.whl
           retention-days: 7
 
-  build-flashinfer-jit-cache:
-    name: JIT cache (${{ matrix.cuda.label }}, ${{ matrix.arch }})
-    needs: setup
-    if: needs.setup.outputs.jit_cache_wheel_format == 'legacy'
-    strategy:
-      fail-fast: false
-      matrix:
-        cuda: ${{ fromJSON(needs.setup.outputs.jit_cache_cuda_matrix) }}
-        arch: ['x86_64', 'aarch64']
-
-    runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
-
-    steps:
-      - name: Cleanup
-        run: |
-          docker stop $(docker ps -q) 2>/dev/null || true
-          docker rm $(docker ps -aq) 2>/dev/null || true
-          sudo rm -rf ${{ github.workspace }}/* || true
-          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
-          docker system prune -f || true
-
-      - name: Display Machine Information
-        run: |
-          echo "CPU: $(nproc) cores, $(lscpu | grep 'Model name' | cut -d':' -f2 | xargs)"
-          echo "RAM: $(free -h | awk '/^Mem:/ {print $7 " available out of " $2}')"
-          echo "Disk: $(df -h / | awk 'NR==2 {print $4 " available out of " $2}')"
-          echo "Architecture: $(uname -m)"
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Build patched sccache (${{ matrix.arch }})
-        if: ${{ matrix.cuda.label == 'cu134' }}
-        env:
-          CUDA_VERSION: ${{ matrix.cuda.version }}
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
-          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.arch }}/sccache
-        run: |
-          mkdir -p "${GITHUB_WORKSPACE}/ci-cache"
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
-            -e CUDA_VERSION \
-            -e SCCACHE_PATCHED_BINARY_PATH \
-            -w /workspace \
-            "${DOCKER_IMAGE}" \
-            bash /workspace/scripts/build_patched_sccache.sh
-        timeout-minutes: 30
-
-      - name: Build wheel in container
-        env:
-          ARCH: ${{ matrix.arch }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          CUDA_VERSION: ${{ matrix.cuda.version }}
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
-          # Keep size-constrained architecture coverage centralized in
-          # ci/cuda-versions.json so release and nightly wheels stay aligned.
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch == 'aarch64' && matrix.cuda.aarch64_arch_list || matrix.cuda.x86_64_arch_list }}
-          FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
-          FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda.label }}
-          PYTORCH_INDEX: ${{ matrix.cuda.pytorch_index }}
-          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
-          SCCACHE_PATCHED_BINARY_PATH: /ci-cache/sccache-cu134/${{ matrix.arch }}/sccache
-          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
-        run: |
-          # Extract CUDA major and minor versions
-          IFS=. read -r CUDA_MAJOR CUDA_MINOR <<< "${CUDA_VERSION}"
-          export CUDA_MAJOR
-          export CUDA_MINOR
-
-          mkdir -p "${GITHUB_WORKSPACE}/ci-cache" "${GITHUB_WORKSPACE}/sccache-stats"
-
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
-            -e FLASHINFER_CI_CACHE=/ci-cache \
-            -e CUDA_VERSION \
-            -e CUDA_MAJOR="$CUDA_MAJOR" \
-            -e CUDA_MINOR="$CUDA_MINOR" \
-            -e PYTORCH_INDEX \
-            -e FLASHINFER_LOCAL_VERSION \
-            -e FLASHINFER_DEV_RELEASE_SUFFIX \
-            -e ARCH \
-            -e FLASHINFER_CUDA_ARCH_LIST \
-            -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
-            -e SCCACHE_BUCKET \
-            -e SCCACHE_PATCHED_BINARY_PATH \
-            -e AWS_ACCESS_KEY_ID \
-            -e AWS_SECRET_ACCESS_KEY \
-            -e SCCACHE_REGION \
-            -e SCCACHE_STATS_DIR=/workspace/sccache-stats \
-            -w /workspace \
-            "${DOCKER_IMAGE}" \
-            bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
-        timeout-minutes: 360
-
-      - name: Display sccache stats
-        if: always()
-        run: |
-          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
-          if [ -s "${STATS_FILE}" ]; then
-            cat "${STATS_FILE}"
-          else
-            echo "::warning::sccache stats were not produced"
-          fi
-
-      - name: Record sccache job metadata
-        if: always()
-        env:
-          MATRIX_ARCH: ${{ matrix.arch }}
-          MATRIX_CUDA_LABEL: ${{ matrix.cuda.label }}
-          MATRIX_CUDA_VERSION: ${{ matrix.cuda.version }}
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
-        run: |
-          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
-          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
-          {
-            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
-            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
-            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
-            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA_VERSION}"
-            printf 'matrix_cuda_label=%s\n' "${MATRIX_CUDA_LABEL}"
-            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
-          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
-
-      - name: Upload sccache stats
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sccache-stats-${{ matrix.cuda.label }}-${{ matrix.arch }}
-          path: sccache-stats/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Display wheel size
-        run: du -h flashinfer-jit-cache/dist/*
-
-      - name: Create artifact name
-        id: artifact-name
-        env:
-          MATRIX_ARCH: ${{ matrix.arch }}
-          MATRIX_CUDA_LABEL: ${{ matrix.cuda.label }}
-        run: |
-          echo "name=jit-cache-${MATRIX_CUDA_LABEL}-${MATRIX_ARCH}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload flashinfer-jit-cache artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.artifact-name.outputs.name }}
-          path: flashinfer-jit-cache/dist/*.whl
-          retention-days: 7
-
   build-flashinfer-jit-cache-provider-sccache:
     name: Provider sccache (cu134, ${{ matrix.cpu_architecture }})
     needs: setup
-    if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
     strategy:
       matrix:
         cpu_architecture: [x86_64, aarch64]
@@ -372,7 +196,6 @@ jobs:
   build-flashinfer-jit-cache-provider:
     name: JIT cache provider (${{ matrix.cuda_label }}, ${{ matrix.cpu_architecture }}, ${{ matrix.provider_tag }})
     needs: [setup, build-flashinfer-jit-cache-provider-sccache]
-    if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
     strategy:
       fail-fast: false
       matrix:
@@ -431,7 +254,6 @@ jobs:
   build-flashinfer-jit-cache-shim:
     name: JIT cache shim (${{ matrix.cuda_label }}, ${{ matrix.cpu_architecture }})
     needs: setup
-    if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
     strategy:
       fail-fast: false
       matrix:
@@ -475,7 +297,6 @@ jobs:
   validate-flashinfer-jit-cache-providers:
     name: Validate provider set (${{ matrix.cuda_label }}, ${{ matrix.cpu_architecture }})
     needs: [setup, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim]
-    if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
     strategy:
       fail-fast: false
       matrix:
@@ -513,7 +334,7 @@ jobs:
             --install-smoke
 
   create-release:
-    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim, validate-flashinfer-jit-cache-providers]
+    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim, validate-flashinfer-jit-cache-providers]
     # Publish only from main: a workflow_dispatch on any other branch runs the
     # builds and tests as a dry run without touching the nightly release/index.
     if: >-
@@ -521,12 +342,9 @@ jobs:
       needs.setup.result == 'success' &&
       needs.build-flashinfer-python.result == 'success' &&
       needs.build-flashinfer-cubin.result == 'success' &&
-      ((needs.setup.outputs.jit_cache_wheel_format == 'legacy' &&
-        needs.build-flashinfer-jit-cache.result == 'success') ||
-       (needs.setup.outputs.jit_cache_wheel_format == 'providers' &&
-        needs.build-flashinfer-jit-cache-provider.result == 'success' &&
-        needs.build-flashinfer-jit-cache-shim.result == 'success' &&
-        needs.validate-flashinfer-jit-cache-providers.result == 'success'))
+      needs.build-flashinfer-jit-cache-provider.result == 'success' &&
+      needs.build-flashinfer-jit-cache-shim.result == 'success' &&
+      needs.validate-flashinfer-jit-cache-providers.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -589,49 +407,7 @@ jobs:
             --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
             --clobber
 
-      - name: Upload flashinfer-jit-cache wheels to wheel release (one at a time to avoid OOM)
-        if: needs.setup.outputs.jit_cache_wheel_format == 'legacy'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
-        run: |
-          # Upload jit-cache wheels one at a time to avoid OOM
-          # Each wheel can be several GB, so we download, upload, delete, repeat
-          mkdir -p dist-jit-cache
-
-          mapfile -t CUDA_LABELS < <(jq -r '.jit_cache[].label' ci/cuda-versions.json)
-          for cuda_label in "${CUDA_LABELS[@]}"; do
-            for arch in x86_64 aarch64; do
-              ARTIFACT_NAME="jit-cache-${cuda_label}-${arch}"
-              echo "Processing ${ARTIFACT_NAME}..."
-
-              # Download this specific artifact
-              if ! gh run download "${GITHUB_RUN_ID}" -n "${ARTIFACT_NAME}" -D dist-jit-cache/; then
-                echo "::error::Failed to download required artifact ${ARTIFACT_NAME}"
-                exit 1
-              fi
-
-              shopt -s nullglob
-              WHEELS=(dist-jit-cache/*.whl)
-              shopt -u nullglob
-              if [ "${#WHEELS[@]}" -eq 0 ]; then
-                echo "::error::Required artifact ${ARTIFACT_NAME} contained no wheel"
-                exit 1
-              fi
-
-              GH_TOKEN="${WHL_TOKEN}" gh release upload "${RELEASE_TAG}" "${WHEELS[@]}" \
-                --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
-                --clobber
-              echo "✅ Uploaded ${ARTIFACT_NAME} to wheel release repository"
-
-              # Clean up to save disk space before next iteration
-              rm -f -- "${WHEELS[@]}"
-            done
-          done
-
       - name: Upload provider and shim wheels to wheel release
-        if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
         env:
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
@@ -657,17 +433,14 @@ jobs:
           done
 
   test-nightly-build:
-    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim, validate-flashinfer-jit-cache-providers]
+    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim, validate-flashinfer-jit-cache-providers]
     if: >-
       always() && needs.setup.result == 'success' &&
       needs.build-flashinfer-python.result == 'success' &&
       needs.build-flashinfer-cubin.result == 'success' &&
-      ((needs.setup.outputs.jit_cache_wheel_format == 'legacy' &&
-        needs.build-flashinfer-jit-cache.result == 'success') ||
-       (needs.setup.outputs.jit_cache_wheel_format == 'providers' &&
-        needs.build-flashinfer-jit-cache-provider.result == 'success' &&
-        needs.build-flashinfer-jit-cache-shim.result == 'success' &&
-        needs.validate-flashinfer-jit-cache-providers.result == 'success'))
+      needs.build-flashinfer-jit-cache-provider.result == 'success' &&
+      needs.build-flashinfer-jit-cache-shim.result == 'success' &&
+      needs.validate-flashinfer-jit-cache-providers.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -708,15 +481,7 @@ jobs:
           name: flashinfer-cubin-wheel
           path: dist-cubin/
 
-      - name: Download flashinfer-jit-cache artifact
-        if: needs.setup.outputs.jit_cache_wheel_format == 'legacy'
-        uses: actions/download-artifact@v4
-        with:
-          name: jit-cache-${{ matrix.cuda.label }}-x86_64
-          path: dist-jit-cache/
-
       - name: Download flashinfer-jit-cache provider artifacts
-        if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
         uses: actions/download-artifact@v4
         with:
           pattern: jit-cache-provider-${{ matrix.cuda.label }}-x86_64-*
@@ -724,7 +489,6 @@ jobs:
           merge-multiple: true
 
       - name: Download flashinfer-jit-cache shim artifact
-        if: needs.setup.outputs.jit_cache_wheel_format == 'providers'
         uses: actions/download-artifact@v4
         with:
           name: jit-cache-shim-${{ matrix.cuda.label }}-x86_64

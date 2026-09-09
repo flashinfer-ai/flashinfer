@@ -2,13 +2,10 @@
 
 ## Status
 
-This document describes an experimental replacement for the monolithic
-`flashinfer-jit-cache` wheel. The runtime discovery contract, provider build,
-and gated release/nightly paths are implemented. This rollout branch sets
-`ci/cuda-versions.json` to `providers` so pull request and release dry runs
-exercise the split build, assembly, and validation paths. The explicit workflow
-override can still select `legacy` for comparison or rollback; publication
-remains protected by the existing main and tag gates.
+This document describes the provider-based `flashinfer-jit-cache` layout. The
+runtime discovery contract and provider release/nightly paths are implemented.
+This final-state variant removes monolithic wheel production; the complete
+provider inventory must still be validated before deploying it in production.
 
 ## Problem
 
@@ -87,8 +84,7 @@ The module list is generated from the packaged files, rather than maintained by
 hand. Runtime accepts a provider only when its FlashInfer version matches, its
 manifest contains the requested module, and its architecture set covers every
 target in the active compilation context. If no provider matches, normal JIT
-compilation remains the fallback. The legacy monolithic directory is checked
-first while both formats are supported.
+compilation remains the fallback.
 
 ### Target Compatibility Policy
 
@@ -192,10 +188,7 @@ Relevant CUDA compatibility references:
 - [CUDA C Programming Guide: Binary Compatibility](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#binary-compatibility)
 - [Blackwell Compatibility Guide](https://docs.nvidia.com/cuda/blackwell-compatibility-guide/index.html)
 
-## Prototype Builds
-
-The existing project remains a legacy monolithic build unless explicitly put in
-shim mode. This keeps release jobs unchanged during fork testing.
+## Provider Builds
 
 Build one provider from `flashinfer-jit-cache-provider`:
 
@@ -214,7 +207,6 @@ Build a shim whose default dependencies include the tested provider set:
 
 ```bash
 # sm80 is an independent provider in this explicit all-provider set.
-FLASHINFER_JIT_CACHE_WHEEL_KIND=shim \
 FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="8.0 9.0a 12.0f" \
 FLASHINFER_LOCAL_VERSION=cu130 \
 python -m build --wheel flashinfer-jit-cache
@@ -258,8 +250,7 @@ scripts/build_jit_cache_provider_wheelhouse.sh
 ```
 
 `--print-config` resolves and prints this configuration without starting Docker.
-The selected provider may intentionally be absent from the monolithic matrix
-architecture list; sm121a is one such size-driven exception.
+The selected provider inventory is explicit for each CUDA and CPU platform.
 
 The build does not require a GPU. Its final validation checks distribution and
 version metadata, the shim's exact provider pin, provider entry-point discovery,
@@ -286,16 +277,9 @@ wheelhouse measurement before release integration.
 
 ## Release Rollout
 
-`ci/cuda-versions.json` owns both the rollout switch and the provider inventory:
-
-- `jit_cache_wheel_format` is `legacy` or `providers`.
-- `<cpu>_arch_list` remains the aggregate-wheel compilation policy.
-- `<cpu>_provider_architectures` is the literal standalone-provider policy and
-  is never inferred from the aggregate list.
-
-Release and nightly workflow dispatches accept `configured`, `legacy`, or
-`providers`. The explicit override permits a provider dry run from a branch
-without changing the scheduled default. Provider mode performs three stages:
+`ci/cuda-versions.json` owns the literal `<cpu>_provider_architectures`
+inventory for each CUDA and CPU platform. Release and nightly workflows always
+perform three provider stages:
 
 1. Build every CUDA/CPU/provider matrix entry and reject foreign cubins or PTX.
 2. Build one platform-specific shim per CUDA/CPU entry whose exact dependencies
@@ -308,14 +292,12 @@ JIT disabled. Its SM86 runner is why SM86 appears explicitly in the provider
 inventory; exact provider matching does not treat SM80 as covering SM86.
 
 Provider publication and wheel-index updates occur only after the complete set
-passes. The configured `providers` value activates the split path for this
-validation pull request. An explicit `legacy` workflow override retains the
-aggregate-wheel build, and the runtime fallback remains available during the
-rollout.
+passes. Rollback after this stage requires reverting the release workflow to a
+revision that still builds monolithic wheels.
 
 ## Validation Gates
 
-Before changing release workflows or making shim mode the default:
+Before deploying the provider-only release workflow:
 
 1. Build each CUDA and CPU matrix entry on the fork and record compressed size,
    uncompressed size, module count, and build time per provider.
@@ -336,11 +318,9 @@ Before changing release workflows or making shim mode the default:
    sm121a versus future SM12x targets. Keep baseline and family providers exact
    until broader coverage is represented explicitly and validated module by
    module.
-8. Exercise the gated release and nightly matrices from the fork, including
-   wheel-index generation. Keep publication limited to the existing main and tag
-   gates while the provider inventories are reviewed, then decide whether to
-   retain `providers` as the production default. Decide stale-provider uninstall
-   behavior before declaring minimal installation stable.
+8. Exercise the release and nightly matrices from the fork, including
+   wheel-index generation. Decide stale-provider uninstall behavior before
+   declaring minimal installation stable.
 
 ## Open Decisions
 
@@ -351,7 +331,5 @@ Before changing release workflows or making shim mode the default:
   providers as a size optimization.
 - Whether provider manifests should include hashes and per-module code targets,
   rather than the provider-wide target list used by the prototype.
-- Which architectures removed from aggregate wheels for size, including sm75
-  and sm121a, should remain in each platform's default provider set.
-- How long to retain legacy monolithic wheel production after the shim becomes
-  the default.
+- Which architectures, including sm75 and sm121a, should remain in each
+  platform's default provider set.

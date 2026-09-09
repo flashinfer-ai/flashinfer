@@ -405,7 +405,7 @@ def test_native_provider_cuda_inspection_rejects_ptx(
 
 
 def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     sm80_root = tmp_path / "sm80"
     sm90_root = tmp_path / "sm90a"
     expected = _create_aot_module(sm90_root, "attention_module")
@@ -429,7 +429,7 @@ def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
             modules=frozenset({"attention_module"}),
         ),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", providers)
     monkeypatch.setattr(
         jit_env, "_target_cuda_architectures", lambda: frozenset({"sm90a"})
@@ -452,7 +452,7 @@ def test_get_aot_path_does_not_infer_provider_compatibility(
     provider_architecture,
     target_architecture,
 ):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / provider_architecture
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
@@ -463,7 +463,7 @@ def test_get_aot_path_does_not_infer_provider_compatibility(
         cuda_architectures=frozenset({provider_architecture}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(
         jit_env,
@@ -472,12 +472,12 @@ def test_get_aot_path_does_not_infer_provider_compatibility(
     )
 
     assert jit_env.get_aot_path("attention_module") == (
-        legacy_root / "attention_module" / "attention_module.so"
+        fallback_root / "attention_module" / "attention_module.so"
     )
 
 
 def test_get_aot_path_requires_provider_to_cover_all_targets(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm90a"
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
@@ -488,7 +488,7 @@ def test_get_aot_path_requires_provider_to_cover_all_targets(monkeypatch, tmp_pa
         cuda_architectures=frozenset({"sm90a"}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(
         jit_env,
@@ -497,12 +497,12 @@ def test_get_aot_path_requires_provider_to_cover_all_targets(monkeypatch, tmp_pa
     )
 
     assert jit_env.get_aot_path("attention_module") == (
-        legacy_root / "attention_module" / "attention_module.so"
+        fallback_root / "attention_module" / "attention_module.so"
     )
 
 
 def test_get_aot_path_does_not_guess_when_target_is_unknown(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm80"
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
@@ -513,19 +513,19 @@ def test_get_aot_path_does_not_guess_when_target_is_unknown(monkeypatch, tmp_pat
         cuda_architectures=frozenset({"sm80"}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(jit_env, "_target_cuda_architectures", lambda: frozenset())
 
     assert jit_env.get_aot_path("attention_module") == (
-        legacy_root / "attention_module" / "attention_module.so"
+        fallback_root / "attention_module" / "attention_module.so"
     )
 
 
-def test_get_aot_path_prefers_legacy_monolithic_wheel(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+def test_get_aot_path_prefers_bundled_package_module(monkeypatch, tmp_path):
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm80"
-    expected = _create_aot_module(legacy_root, "attention_module")
+    expected = _create_aot_module(fallback_root, "attention_module")
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
         provider_id="sm80",
@@ -535,7 +535,7 @@ def test_get_aot_path_prefers_legacy_monolithic_wheel(monkeypatch, tmp_path):
         cuda_architectures=frozenset({"sm80"}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(
         jit_env, "_target_cuda_architectures", lambda: frozenset({"sm80"})

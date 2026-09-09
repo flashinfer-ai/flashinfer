@@ -64,7 +64,7 @@ def test_provider_release_matrices_are_explicit(cuda_config_module):
     provider_matrix = cuda_config_module.build_jit_cache_provider_matrix(config)
     shim_matrix = cuda_config_module.build_jit_cache_shim_matrix(config)
 
-    assert config["jit_cache_wheel_format"] == "providers"
+    assert "jit_cache_wheel_format" not in config
     assert len(provider_matrix) == 48
     assert len(shim_matrix) == 6
     assert all(entry["provider_tag"].startswith("sm") for entry in provider_matrix)

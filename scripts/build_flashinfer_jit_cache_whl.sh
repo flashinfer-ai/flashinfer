@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Build a legacy cache wheel, one provider wheel, or a provider shim wheel.
+# Build one provider wheel or a provider shim wheel.
 # This script should be run inside the flashinfer container
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -25,12 +25,8 @@ if [[ ! "${PYTHON_VERSION}" =~ ^3\.[0-9]+$ ]]; then
 fi
 PYTHON_ABI="cp${PYTHON_VERSION//./}"
 
-BUILD_TARGET=${FLASHINFER_JIT_CACHE_BUILD_TARGET:-legacy}
+BUILD_TARGET=${FLASHINFER_JIT_CACHE_BUILD_TARGET:-}
 case "${BUILD_TARGET}" in
-  legacy)
-    PACKAGE_DIR=flashinfer-jit-cache
-    export FLASHINFER_JIT_CACHE_WHEEL_KIND=legacy
-    ;;
   provider)
     : "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH:?provider builds require FLASHINFER_JIT_CACHE_PROVIDER_ARCH}"
     PACKAGE_DIR=flashinfer-jit-cache-provider
@@ -39,10 +35,9 @@ case "${BUILD_TARGET}" in
   shim)
     : "${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS:?shim builds require FLASHINFER_JIT_CACHE_PROVIDER_ARCHS}"
     PACKAGE_DIR=flashinfer-jit-cache
-    export FLASHINFER_JIT_CACHE_WHEEL_KIND=shim
     ;;
   *)
-    echo "Invalid FLASHINFER_JIT_CACHE_BUILD_TARGET=${BUILD_TARGET}; expected legacy, provider, or shim" >&2
+    echo "Invalid FLASHINFER_JIT_CACHE_BUILD_TARGET=${BUILD_TARGET}; expected provider or shim" >&2
     exit 2
     ;;
 esac
@@ -62,7 +57,6 @@ echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
 echo "PyTorch Index: ${PYTORCH_INDEX}"
 echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
-echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST:-}"
 echo "Provider Architecture: ${FLASHINFER_JIT_CACHE_PROVIDER_ARCH:-}"
 echo "Shim Provider Architectures: ${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS:-}"
 echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX:-}"

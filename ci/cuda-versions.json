@@ -9,7 +9,6 @@
       }
     }
   },
-  "jit_cache_wheel_format": "providers",
   "runtime": [
     {
       "label": "cu129",
@@ -31,8 +30,6 @@
       "label": "cu129",
       "version": "12.9",
       "pytorch_index": "cu129",
-      "x86_64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 12.0f",
-      "aarch64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 12.0f",
       "x86_64_provider_architectures": [
         "8.0",
         "8.6",
@@ -56,8 +53,6 @@
       "label": "cu130",
       "version": "13.0",
       "pytorch_index": "cu130",
-      "x86_64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 12.0f",
-      "aarch64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f",
       "x86_64_provider_architectures": [
         "8.0",
         "8.6",
@@ -83,8 +78,6 @@
       "label": "cu134",
       "version": "13.4",
       "pytorch_index": "nightly/cu134",
-      "x86_64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 10.7a 12.0f",
-      "aarch64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f",
       "x86_64_provider_architectures": [
         "8.0",
         "8.6",

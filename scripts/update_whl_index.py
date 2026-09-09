@@ -75,7 +75,7 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
             "cuda": cuda_ver,
         }
 
-    # Try flashinfer-jit-cache shim or legacy pattern (has CUDA suffix in version)
+    # Try the flashinfer-jit-cache shim pattern (has CUDA suffix in version).
     # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]+cuXXX
     match = re.match(
         r"flashinfer_jit_cache-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?\+cu\d+)-",
