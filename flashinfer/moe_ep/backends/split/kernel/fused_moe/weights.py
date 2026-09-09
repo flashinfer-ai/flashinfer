@@ -73,6 +73,7 @@ def materialize_fused_moe_weights(
     """Convert canonical :class:`MoEWeightPack` into a fused_moe weight pack."""
     from ......fused_moe.api import (
         CuteDslConfig,
+        MegaMoeFc12Config,
         MoEWeightPack as FusedMoEWeightPack,
         QuantFormat,
         TrtllmBf16Config,
@@ -100,7 +101,6 @@ def materialize_fused_moe_weights(
                     "gemm2_weights": g2,
                 },
             )
-            return pack
 
         if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4) and isinstance(
             backend_cfg, TrtllmFp4Config
@@ -115,7 +115,6 @@ def materialize_fused_moe_weights(
                 device=weights.w13.device,
             )
             pack.prepare_for("trtllm_fp4_routed", view)
-            return pack
 
         if quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -133,9 +132,27 @@ def materialize_fused_moe_weights(
                 device=weights.w13.device,
             )
             pack.prepare_for("cute_dsl", view)
-            return pack
 
-    raise ValueError(
-        f"No fused_moe backend in MoEConfig matches quant {quant!r}. "
-        f"Configured backends: {[type(c).__name__ for c in moe_config.backend]}"
-    )
+        if quant.pair in (
+            (QuantFormat.BF16, QuantFormat.BF16),
+            (QuantFormat.MXFP8, QuantFormat.BF16),
+        ) and isinstance(backend_cfg, MegaMoeFc12Config):
+            view = MegaMoeFc12Config.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("megamoe_fc12", view)
+
+    if not pack.native_views:
+        raise ValueError(
+            f"No fused_moe backend in MoEConfig matches quant pair "
+            f"weight={quant.pair[0].name}, activation={quant.pair[1].name}. "
+            f"Configured backends: {[type(c).__name__ for c in moe_config.backend]}"
+        )
+    return pack
