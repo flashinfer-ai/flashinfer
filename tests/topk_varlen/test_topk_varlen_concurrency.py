@@ -138,6 +138,7 @@ def _split_inputs(copies, rows=16, n=131072, k=512, seed=0):
         pre = torch.full((rows, k), -1, dtype=torch.int32, device=_DEV)
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         work.append((logits, seq, pre, out))
+    torch.cuda.synchronize()  # inputs are consumed on side streams: complete them first
     return k, work
 
 
@@ -173,6 +174,7 @@ def test_gvr2_eager_slab_launches_overlap_across_threads_and_streams(hint):
     outs = [
         [torch.full_like(w[3], -7) for _ in range(launches)] for w in work
     ]  # one buffer per launch so every result is checked
+    torch.cuda.synchronize()  # the -7 fills complete before any side stream writes
     barrier = _barrier(threads_n)
     errors = []
 
@@ -213,6 +215,7 @@ def test_gvr2_graph_replay_races_eager_launches_on_other_streams():
     k, work = _split_inputs(n_graphs + 1, seed=21)
     streams = [torch.cuda.Stream() for _ in range(n_graphs + 1)]
     outs = [[torch.full_like(w[3], -7) for _ in range(launches)] for w in work]
+    torch.cuda.synchronize()  # the -7 fills complete before any side stream writes
     graphs = []
     for i in range(n_graphs):  # captures are serialized (one per process at a time)
         with torch.cuda.stream(streams[i]):
@@ -324,6 +327,7 @@ def test_gvr2_hint_free_graph_survives_table_growth_by_others():
     logits = torch.randn(8, n, generator=gen, device=_DEV)
     seq = torch.randint(600, n, (8,), generator=gen, device=_DEV, dtype=torch.int32)
     out = torch.full((8, k), -7, dtype=torch.int32, device=_DEV)
+    torch.cuda.synchronize()  # default-stream initialisation before the side-stream launch
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         _launch((logits, seq, None, out), k, hint=False)
@@ -338,6 +342,7 @@ def test_gvr2_hint_free_graph_survives_table_growth_by_others():
     big_logits = torch.randn(1024, n, generator=gen, device=_DEV)
     big_seq = torch.full((1024,), n, dtype=torch.int32, device=_DEV)
     big_out = torch.empty(1024, k, dtype=torch.int32, device=_DEV)
+    torch.cuda.synchronize()  # default-stream initialisation before the side-stream launches
     other = torch.cuda.Stream()
     for b in (100, 300, 1024):
         with torch.cuda.stream(other):
@@ -373,6 +378,7 @@ def test_gvr2_hint_free_table_grown_on_one_stream_is_complete_when_published():
     logits = torch.randn(512, n, generator=gen, device=_DEV)
     seq = torch.full((512,), n, dtype=torch.int32, device=_DEV)
     outs = [torch.full((512, k), -7, dtype=torch.int32, device=_DEV) for _ in range(2)]
+    torch.cuda.synchronize()  # default-stream initialisation before the side-stream launch
     a, b = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(b):  # compile the launcher for 512 rows on B, hinted
         _launch(

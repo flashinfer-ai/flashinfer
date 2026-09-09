@@ -168,8 +168,11 @@ def _concurrent_graph_replays(private_workspace, streams=4, launches=8, rounds=6
         )
 
     # compile eagerly before capture, on the stream that will capture: the
-    # eager call also creates that stream's default workspace slab
+    # eager call also creates that stream's default workspace slab. The
+    # inputs were initialised on the default stream, so each side stream
+    # waits for it first.
     for s, w in enumerate(work):
+        cuda_streams[s].wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cuda_streams[s]):
             launch(w, w[3][0])
     torch.cuda.synchronize()
