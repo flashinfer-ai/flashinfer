@@ -206,10 +206,10 @@ class QuantConfig:
     Parameters
     ----------
     weight, activation : QuantFormat
-        MMA weight and activation formats. Give both or neither: omitting both
-        selects BF16×BF16, giving exactly one raises ``ValueError``. There is
-        no implicit default for the other operand, so ``weight=MXFP4`` cannot
-        silently become W4A16.
+        MMA weight and activation formats. An omitted axis is BF16, i.e.
+        unquantized: ``QuantConfig()`` is BF16×BF16 and ``QuantConfig(weight=MXFP4)``
+        is MXFP4 weights with BF16 activations (W4A16). MXFP4×MXFP8 must be
+        spelled with both axes.
     output : QuantFormat
         Layer output format. Default BF16. Pass ``QuantFormat.FP16``, not
         ``torch.float16``.
@@ -243,15 +243,18 @@ class QuantConfig:
 
     def __init__(
         self,
-        weight: Optional[QuantFormat] = None,
-        activation: Optional[QuantFormat] = None,
+        weight: QuantFormat = QuantFormat.BF16,
+        activation: QuantFormat = QuantFormat.BF16,
         output: QuantFormat = QuantFormat.BF16,
+        *,
         variant: Optional[QuantVariant] = None,
         swizzled_scale_factors: Optional[bool] = None,
         per_token_scale: Optional[bool] = None,
     ) -> None:
-        # Hand-written so the constructor can tell "not given" from BF16 while
-        # the stored fields are always QuantFormat.
+        # Hand-written because ``variant`` is accepted here but stored as an
+        # init=False field, so dataclasses.replace() never replays the derived
+        # value. The three axes stay positional; the remaining knobs are
+        # keyword-only.
         set_ = object.__setattr__
         set_(self, "weight", weight)
         set_(self, "activation", activation)
@@ -279,8 +282,6 @@ class QuantConfig:
             )
         for name in ("weight", "activation", "output"):
             value = getattr(self, name)
-            if value is None and name != "output":
-                continue
             if not isinstance(value, QuantFormat):
                 raise TypeError(
                     f"QuantConfig.{name} must be a QuantFormat, got {value!r}. "
@@ -294,7 +295,7 @@ class QuantConfig:
                     f"QuantConfig cannot expand {self.variant!r}."
                 ) from exc
             given = (self.weight, self.activation)
-            if given != (None, None) and given != pair:
+            if given != (QuantFormat.BF16, QuantFormat.BF16) and given != pair:
                 raise ValueError(
                     f"QuantConfig(variant={self.variant!r}) expands to "
                     f"weight={pair[0]!r}, activation={pair[1]!r}, which conflicts "
@@ -304,15 +305,6 @@ class QuantConfig:
             object.__setattr__(self, "weight", pair[0])
             object.__setattr__(self, "activation", pair[1])
             return
-        if self.weight is None and self.activation is None:
-            object.__setattr__(self, "weight", QuantFormat.BF16)
-            object.__setattr__(self, "activation", QuantFormat.BF16)
-        elif self.weight is None or self.activation is None:
-            raise ValueError(
-                "QuantConfig needs both weight and activation (or neither for "
-                f"BF16×BF16); got weight={self.weight!r}, "
-                f"activation={self.activation!r}."
-            )
         mapped = QUANT_PAIR_TO_VARIANT.get((self.weight, self.activation))
         object.__setattr__(self, "variant", mapped)
 

@@ -543,9 +543,25 @@ class TestQuantConfig:
         "kwargs",
         [{"weight": QuantFormat.MXFP4}, {"activation": QuantFormat.BF16}],
     )
-    def test_single_axis_is_rejected(self, kwargs):
-        with pytest.raises(ValueError, match="both weight and activation"):
-            QuantConfig(**kwargs)
+    def test_omitted_axis_defaults_to_bf16(self, kwargs):
+        cfg = QuantConfig(**kwargs)
+        expected = (
+            kwargs.get("weight", QuantFormat.BF16),
+            kwargs.get("activation", QuantFormat.BF16),
+        )
+        assert cfg.pair == expected
+        assert cfg.output is QuantFormat.BF16
+
+    def test_weight_only_mxfp4_is_w4a16(self):
+        cfg = QuantConfig(weight=QuantFormat.MXFP4)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.BF16)
+        assert cfg.variant is QuantVariant.W4A16
+
+    def test_knobs_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            QuantConfig(QuantFormat.MXFP4, QuantFormat.MXFP8, QuantFormat.BF16, None)
+        cfg = QuantConfig(QuantFormat.MXFP4, QuantFormat.MXFP8, QuantFormat.BF16)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
 
     def test_explicit_pair_with_default_output(self):
         cfg = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
@@ -569,7 +585,6 @@ class TestQuantConfig:
         "kwargs",
         [
             {"weight": QuantFormat.MXFP4, "activation": QuantFormat.MXFP8},
-            {"weight": QuantFormat.BF16, "activation": QuantFormat.BF16},
             {"weight": QuantFormat.NVFP4},
         ],
     )
