@@ -488,3 +488,107 @@ def test_get_checksums_keys_by_full_path(monkeypatch, tmp_path):
         safe_urljoin("pin-a/", shared_name): "aaaa1111",
         safe_urljoin("pin-b/", shared_name): "bbbb2222",
     }
+
+
+def _dsl_fmha_manifest_env(monkeypatch, tmp_path, manifest: bytes, served):
+    """Pin the DSL FMHA manifest to *manifest*, serve *served* over the wire.
+
+    Pass the same bytes for both to model an honest mirror, different bytes to
+    model a manifest that does not match its pin, and None to model a fetch that
+    fails. Returns (fmha module, cpu_arch, gpu_arch).
+    """
+    import hashlib
+    import pathlib
+
+    fmha = pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
+    from flashinfer import artifacts
+    from flashinfer.jit import cubin_loader, env
+
+    cpu_arch = fmha._get_cpu_arch()
+    gpu_arch = "sm_100a"
+
+    monkeypatch.delenv("FLASHINFER_NO_DOWNLOAD", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
+    monkeypatch.setattr(fmha, "_checksums_cache", {})
+    # Both spellings: the cache dir is read through jit.env by some callers and
+    # through the name cubin_loader imported by others. Redirecting only one of
+    # them lets a test write into the developer's real ~/.cache/flashinfer.
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(env, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setitem(
+        artifacts.CheckSumHash.DSL_FMHA_CHECKSUMS,
+        cpu_arch,
+        {gpu_arch: hashlib.sha256(manifest).hexdigest()},
+    )
+
+    body = served
+
+    def _serve(source, destination, **kwargs):
+        if body is None:
+            return False
+        pathlib.Path(destination).write_bytes(body)
+        return True
+
+    monkeypatch.setattr(cubin_loader, "download_file", _serve)
+    return fmha, cpu_arch, gpu_arch
+
+
+def test_dsl_fmha_manifest_matching_its_pin_is_parsed(monkeypatch, tmp_path):
+    """The honest path: a manifest that matches its pin is fetched and parsed."""
+    manifest = b"aaaa1111  fmha_variant_x.so\nbbbb2222  fmha_variant_y.so\n"
+    fmha, _, gpu_arch = _dsl_fmha_manifest_env(
+        monkeypatch, tmp_path, manifest, manifest
+    )
+
+    assert fmha._get_checksums(gpu_arch) == {
+        "fmha_variant_x": "aaaa1111",
+        "fmha_variant_y": "bbbb2222",
+    }
+
+
+def test_dsl_fmha_manifest_is_verified_against_its_pin(monkeypatch, tmp_path):
+    """A manifest that does not match its pin must not be believed.
+
+    The hashes parsed out of this manifest are the ones get_artifact() then
+    checks the .so kernels against, so accepting an unpinned manifest makes that
+    verification circular: whoever serves the manifest also picks the hashes it
+    is judged by. CheckSumHash.DSL_FMHA_CHECKSUMS exists precisely to pin it.
+    """
+    manifest = b"aaaa1111  fmha_variant_x.so\n"
+    tampered = b"deadbeef  fmha_variant_x.so\n"
+    fmha, cpu_arch, gpu_arch = _dsl_fmha_manifest_env(
+        monkeypatch, tmp_path, manifest, tampered
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        fmha._get_checksums(gpu_arch)
+    assert f"{cpu_arch}/{gpu_arch}" in str(excinfo.value)
+
+
+def test_dsl_fmha_unreachable_manifest_raises(monkeypatch, tmp_path):
+    """An unfetchable manifest must fail loudly, not as a bare FileNotFoundError.
+
+    Same diagnosis path as test_get_checksums_unreachable_pin_raises: a bare
+    FileNotFoundError on a local cache path reads like a corrupt cache rather
+    than an unreachable pin.
+    """
+    manifest = b"aaaa1111  fmha_variant_x.so\n"
+    fmha, cpu_arch, gpu_arch = _dsl_fmha_manifest_env(
+        monkeypatch, tmp_path, manifest, None
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        fmha._get_checksums(gpu_arch)
+    assert f"{cpu_arch}/{gpu_arch}" in str(excinfo.value)
+
+
+def test_dsl_fmha_unpinned_arch_raises(monkeypatch, tmp_path):
+    """An arch with no pinned manifest must say so instead of fetching blind."""
+    manifest = b"aaaa1111  fmha_variant_x.so\n"
+    fmha, cpu_arch, _ = _dsl_fmha_manifest_env(
+        monkeypatch, tmp_path, manifest, manifest
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        fmha._get_checksums("sm_999a")
+    assert "No pinned checksum manifest" in str(excinfo.value)
