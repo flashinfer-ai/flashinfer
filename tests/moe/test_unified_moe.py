@@ -592,6 +592,17 @@ class TestQuantConfig:
         with pytest.raises(ValueError, match="conflicts"):
             QuantConfig(variant=QuantVariant.NVFP4, **kwargs)
 
+    def test_variant_with_default_bf16_pair_is_overridden(self):
+        # BF16×BF16 is indistinguishable from the omitted default, so the
+        # deprecated preset wins (documented exception).
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            cfg = QuantConfig(
+                variant=QuantVariant.NVFP4,
+                weight=QuantFormat.BF16,
+                activation=QuantFormat.BF16,
+            )
+        assert cfg.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+
     def test_variant_emits_deprecation_warning(self):
         with pytest.warns(DeprecationWarning, match="deprecated"):
             QuantConfig(variant=QuantVariant.NVFP4)
