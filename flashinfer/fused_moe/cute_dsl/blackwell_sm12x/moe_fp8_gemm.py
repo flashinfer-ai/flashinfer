@@ -25,7 +25,7 @@ from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig
 from .kernel_moe_fp8_gemm import (
     GRAN_K,
     GRAN_N,
@@ -48,7 +48,7 @@ def epi_tactics(tile):
 
 
 def resolve_stage(tile, epi):
-    return Sm120GemmBuilder.max_ab_stage(
+    return Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi), tuple(tile)
     )
 

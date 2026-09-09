@@ -30,7 +30,7 @@ from ....tllm_enums import (
 )
 from ....utils import ceil_div
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from .kernel_moe_fp8_fc1_act import (
     GRAN_K,
     GRAN_N,
@@ -48,7 +48,7 @@ def epi_tactics(tile):
 
 
 def resolve_stage(tile, epi):
-    return Sm120GemmBuilder.max_ab_stage(
+    return Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi, activation=ActivationType.Swiglu),
         tuple(tile),
     )

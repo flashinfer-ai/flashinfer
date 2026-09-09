@@ -14,6 +14,7 @@
 """mx fc1_gate_up + SiLU + mxfp8 quant on CuteDSL: what one compiled kernel is specialized on."""
 
 import functools
+import math
 import os
 
 import cutlass
@@ -33,7 +34,7 @@ from ....utils import ceil_div
 from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from .kernel_moe_mxfp8_mxfp4_fc1_act_q1 import (
     GRANK_A,
     GRANK_B,
@@ -51,7 +52,7 @@ DEFAULT_EPI = EpiMethod.WG_S2R_QUANT
 
 
 def resolve_stage(tile, epi=DEFAULT_EPI):
-    return Sm120GemmBuilder.max_ab_stage(
+    return Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi, activation=ActivationType.Swiglu),
         tuple(tile),
     )
@@ -77,6 +78,7 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
         activation: ActivationType,
         epi: EpiMethod = DEFAULT_EPI,
         enable_pdl=False,
+        swiglu_limit=None,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     ):
@@ -89,6 +91,7 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
             )
         self.n, self.k, self.tile, self.out_dtype = n, k, tuple(tile), out_dtype
         self.activation, self.epi, self.enable_pdl = activation, epi, enable_pdl
+        self.swiglu_limit = swiglu_limit
         self.situ_beta, self.situ_linear_beta = situ_beta, situ_linear_beta
         self.ab_stage = resolve_stage(self.tile, epi)
         self.tactic = (self.tile[0], self.tile[1], epi)
@@ -98,6 +101,7 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
             epi=epi,
             activation=activation,
             enable_pdl=enable_pdl,
+            swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
         )
@@ -183,6 +187,7 @@ def _op(
     activation,
     epi,
     enable_pdl=False,
+    swiglu_limit=None,
     situ_beta=SITU_BETA,
     situ_linear_beta=SITU_LINEAR_BETA,
 ) -> CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
@@ -194,6 +199,7 @@ def _op(
         activation=activation,
         epi=epi,
         enable_pdl=enable_pdl,
+        swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
@@ -208,6 +214,7 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.activation,
         op.out_dtype,
         op.enable_pdl,
+        op.swiglu_limit,
         op.situ_beta,
         op.situ_linear_beta,
         grid_x,
@@ -248,6 +255,17 @@ def _check_b_scale_granularity(b_scale, k: int) -> None:
         raise ValueError(f"b_scale K extent {got} != {want} implied by k={k}")
 
 
+def _normalize_swiglu_limit(activation: ActivationType, swiglu_limit):
+    if swiglu_limit is None:
+        return None
+    if activation is not ActivationType.Swiglu:
+        raise ValueError("swiglu_limit is valid only for SwiGLU")
+    swiglu_limit = float(swiglu_limit)
+    if not math.isfinite(swiglu_limit) or swiglu_limit <= 0:
+        raise ValueError("swiglu_limit must be finite and positive")
+    return swiglu_limit
+
+
 def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
     a_q,
     a_scale,
@@ -261,11 +279,13 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
     enable_pdl: bool = False,
     *,
     activation: ActivationType = ActivationType.Swiglu,
+    swiglu_limit: float | None = None,
     situ_beta: float = SITU_BETA,
     situ_linear_beta: float = SITU_LINEAR_BETA,
     out_q: torch.Tensor | None = None,
     out_sf: torch.Tensor | None = None,
 ):
+    swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
     m, n, k = int(a_q.shape[0]), int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
     assert not enable_pdl or (out_q is not None and out_sf is not None), (
         "PDL requires caller-owned out_q and out_sf"
@@ -286,6 +306,7 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
                             out_dtype,
                             activation,
                             enable_pdl,
+                            swiglu_limit,
                             situ_beta,
                             situ_linear_beta,
                         )
@@ -311,6 +332,7 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
         activation,
         epi,
         enable_pdl,
+        swiglu_limit,
         situ_beta,
         situ_linear_beta,
     )
@@ -361,12 +383,14 @@ class _Fc1ActQ1Runner(TunableRunner):
         out_dtype,
         activation,
         enable_pdl=False,
+        swiglu_limit=None,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     ):
         self.out_dtype = out_dtype
         self._out = None
         self.activation, self.enable_pdl = activation, enable_pdl
+        self.swiglu_limit = swiglu_limit
         self.situ_beta, self.situ_linear_beta = situ_beta, situ_linear_beta
 
     def __hash__(self) -> int:
@@ -439,6 +463,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             self.activation,
             epi,
             self.enable_pdl,
+            self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
         )
@@ -466,6 +491,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             str(self.out_dtype),
             self.activation,
             self.enable_pdl,
+            self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
             torch.cuda.get_device_capability(),

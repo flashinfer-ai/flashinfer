@@ -1425,6 +1425,28 @@ class CuteDslConfig:
 
 
 @dataclass(frozen=True)
+class SM12xMxfp8Mxfp4Config:
+    """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (120, 121)
+
+    @staticmethod
+    def prepare_weights(w1_weight, w1_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native SM12x weight view from packed checkpoint tensors."""
+        return {
+            "w1_weight": w1_weight,
+            "w1_weight_sf": w1_weight_sf,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+        }
+
+    def __repr__(self) -> str:
+        return "SM12xMxfp8Mxfp4Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -1528,6 +1550,7 @@ BackendConfigType = Union[
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    SM12xMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -1551,6 +1574,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    SM12xMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )
@@ -1767,6 +1791,8 @@ class MoEActivationPack:
     * MXFP4×MXFP8 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
       ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale bytes, matching
       the TRTLLM FP4 launcher ABI.
+    * MXFP4 x MXFP8 with ``SM12xMxfp8Mxfp4Config``: raw ``bfloat16 [M, H]``
+      values without an activation scale; K128 MXFP8 quantization runs internally.
     * MXFP4×BF16 (TRTLLM W4A16): raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the MXFP4 preparation contract.
     * NVFP4×BF16 (CuTe-DSL / b12x W4A16): raw ``bfloat16 [M, H]`` values with no

@@ -32,7 +32,7 @@ from ._moe_utils.moe_epilogue import (
     store_wg_q1_after_s2r,
     store_wg_q1_before_r2s,
 )
-from ._moe_utils.moe_kernel_builder import FC1ActBuilder, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import Sm12xGatedGemmConfig, MmaConfig, LoadABConfig
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ....tllm_enums import (
     DEFAULT_SITU_BETA as SITU_BETA,
@@ -71,6 +71,7 @@ def make_cfg(
     activation,
     fastmath=False,
     enable_pdl=False,
+    swiglu_limit=None,
     situ_beta=SITU_BETA,
     situ_linear_beta=SITU_LINEAR_BETA,
 ):
@@ -104,7 +105,7 @@ def make_cfg(
         if swap
         else num_math_warps * 32
     )
-    return FC1ActBuilder(
+    return Sm12xGatedGemmConfig(
         MmaConfig(
             warp_mma.MmaMXF8F6F4Op(a_dtype, b_dtype, f32, ue8m0),
             tile[:2],
@@ -119,10 +120,9 @@ def make_cfg(
         epi_bar_id=3,
         union_smem=not swap,
         reg_prod=REG_PROD_BY_TACTIC[tactic],
-        activation=moe_activation.resolve_activation_fn(
-            activation, situ_beta, situ_linear_beta
+        activation=moe_activation.make_gated_activation(
+            activation, fastmath, swiglu_limit, situ_beta, situ_linear_beta
         ),
-        fastmath=fastmath,
         enable_pdl=enable_pdl,
     )
 
@@ -493,7 +493,6 @@ def mma(
     mma_cfg,
     sf_cfg,
     activation,
-    fastmath,
     sA,
     sU,
     sG,
@@ -612,7 +611,7 @@ def mma(
                     a_phase ^= 1
                     b_phase ^= 1
 
-    activation(acc_u, acc_g, fastmath)
+    activation(acc_u, acc_g)
     return acc_u, a_phase, b_phase
 
 
@@ -622,7 +621,6 @@ def mma_swap(
     mma_cfg,
     sf_cfg,
     activation,
-    fastmath,
     sU,
     sG,
     sB,
@@ -740,7 +738,7 @@ def mma_swap(
                     a_phase ^= 1
                     b_phase ^= 1
 
-    activation(acc_u, acc_g, fastmath)
+    activation(acc_u, acc_g)
     return acc_u, a_phase, b_phase
 
 
@@ -1258,7 +1256,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         self.mma,
                         self.sf,
                         cfg.activation,
-                        cfg.fastmath,
                         sU,
                         sG,
                         sA,
@@ -1289,7 +1286,6 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                         self.mma,
                         self.sf,
                         cfg.activation,
-                        cfg.fastmath,
                         sA,
                         sU,
                         sG,

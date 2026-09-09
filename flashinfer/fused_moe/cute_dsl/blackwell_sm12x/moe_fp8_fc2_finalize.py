@@ -22,7 +22,7 @@ from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from .kernel_moe_fp8_fc2_finalize import (
     GRAN_K,
     GRAN_N,
@@ -40,7 +40,7 @@ DEFAULT_EPI = EpiMethod.WG_SCATTER
 
 
 def resolve_stage(tile, epi=DEFAULT_EPI):
-    return Sm120GemmBuilder.max_ab_stage(
+    return Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi), tuple(tile)
     )
 

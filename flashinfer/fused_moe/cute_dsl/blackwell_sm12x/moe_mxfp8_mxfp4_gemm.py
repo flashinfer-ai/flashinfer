@@ -35,7 +35,7 @@ from .kernel_moe_mxfp8_mxfp4_gemm import (
 )
 from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder
+from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig
 
 FALLBACK_TILE = (128, 128, 128)
 PLAIN_TILE_K = GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF
@@ -51,7 +51,7 @@ def epi_tactics(tile):
 
 
 def resolve_stage(tile, epi):
-    return Sm120GemmBuilder.max_ab_stage(
+    return Sm12xGemmConfig.max_ab_stage(
         functools.partial(make_cfg, epi=epi), tuple(tile)
     )
 
