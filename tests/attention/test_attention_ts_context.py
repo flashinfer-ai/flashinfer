@@ -62,12 +62,6 @@ _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
     reason="PrimTS context attention requires SM100 or SM103",
 )
 
-_REQUIRES_LDTM_STAT = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not context_module._default_uses_ldtm_stat(torch.cuda.current_device()),
-    reason="requires _default_uses_ldtm_stat",
-)
-
 _HEAD_DIM = 128
 _FP8 = torch.float8_e4m3fn
 
@@ -2650,19 +2644,24 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
     )
 
 
-@_REQUIRES_LDTM_STAT
-def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
-    """uses_ldtm_stat=True still builds the non-masked FMHA task graph."""
+@pytest.mark.parametrize("uses_ldtm_stat", (False, True))
+@pytest.mark.parametrize("head_dim", (128, 256))
+@pytest.mark.parametrize("input_dtype", (Float8E4M3FN, BFloat16), ids=("fp8", "bf16"))
+def test_attention_ts_context_uses_ldtm_stat_schedule_builds(
+    uses_ldtm_stat, head_dim, input_dtype
+):
+    """Contiguous task graphs build with either statistics path, without JIT."""
     kernel = FmhaTs(
+        in_dtype=input_dtype,
         qk_acc_dtype=Float32,
         pv_acc_dtype=Float32,
-        d=128,
+        d=head_dim,
         is_persistent=True,
         is_causal=False,
         is_clc_dynamic=False,
-        uses_ldtm_stat=True,
+        uses_ldtm_stat=uses_ldtm_stat,
     )
-    assert kernel.cfg.uses_ldtm_stat is True
+    assert kernel.cfg.uses_ldtm_stat is uses_ldtm_stat
     cfg = kernel.cfg
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
