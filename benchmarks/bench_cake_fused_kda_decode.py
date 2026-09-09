@@ -1524,6 +1524,7 @@ def _validate_equivalence_receipt(
         "predecessor_execution_sha256",
         "current_execution_sha256",
         "source_transform_exact",
+        "predecessor_alignment_assert_normalized",
         "abi_equal",
         "compile_flags_equal",
         "launch_equal",
@@ -1627,6 +1628,7 @@ def _validate_equivalence_receipt(
                 proof[name] is not True
                 for name in (
                     "source_transform_exact",
+                    "predecessor_alignment_assert_normalized",
                     "abi_equal",
                     "compile_flags_equal",
                     "launch_equal",
