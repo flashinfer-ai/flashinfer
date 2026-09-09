@@ -49,6 +49,7 @@ linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
+minimax_h3_mxfp8_pre_attention_p8_hdst7_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
@@ -136,6 +137,7 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
+from flashinfer.minimax_h3 import MiniMaxH3Mxfp8PreAttention
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
@@ -152,6 +154,34 @@ from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# MiniMax-H3 uses a prepared, caller-owned API. Emit its definition from meta
+# tensors so generating the trace fixture does not compile all exact-shape CUDA
+# stages or allocate the 115 MiB prepacked weight on the current GPU.
+_mh_M, _mh_P = 1, 8
+MiniMaxH3Mxfp8PreAttention.run.fi_trace(
+    save_dir=SAVE_DIR,
+    x=torch.empty((_mh_M, 5376), dtype=torch.bfloat16, device="meta"),
+    x_norm_weight=torch.empty((5376,), dtype=torch.bfloat16, device="meta"),
+    adaln_scale=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
+    adaln_shift=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
+    adaln_index=torch.empty((_mh_M,), dtype=torch.int32, device="meta"),
+    qkv_weight_q=torch.empty(
+        (21504, 5376), dtype=torch.float8_e4m3fn, device="meta"
+    ),
+    qkv_weight_sf=torch.empty(
+        (21504 * (5376 // 32),), dtype=torch.uint8, device="meta"
+    ),
+    q_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
+    k_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
+    rope_cos_sin=torch.empty((_mh_M, 96), dtype=torch.bfloat16, device="meta"),
+    out_q=torch.empty(
+        (_mh_P, _mh_M, 56 // _mh_P, 3, 128),
+        dtype=torch.float8_e4m3fn,
+        device="meta",
+    ),
+    out_sf=torch.empty((_mh_P, 512), dtype=torch.uint8, device="meta"),
+)
 
 print(f"\nAuto-dumping fi_trace JSON files to {SAVE_DIR}/\n")
 

@@ -139,6 +139,10 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
+from .jit.minimax_h3_mxfp8 import (
+    MiniMaxH3Mxfp8Target,
+    gen_minimax_h3_mxfp8_aot_modules,
+)
 from .jit.mla import (
     gen_mla_module,
     gen_sparse_mla_nvfp4_sm120_module,
@@ -593,6 +597,14 @@ def gen_all_modules(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
+
+    minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_target, enabled in minimax_h3_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
