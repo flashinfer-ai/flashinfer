@@ -44,6 +44,39 @@ def _get_glibcxx_abi_build_flags() -> List[str]:
     return glibcxx_abi_cflags
 
 
+def _cuda_lib_dirs(cuda_home: str) -> List[str]:
+    """Return existing CUDA library directory names under ``cuda_home``.
+
+    System toolkits ship ``lib64/``; pip ``nvidia-cuda-*`` cu13 wheels ship
+    ``lib/`` only. Hardcoding ``lib64`` makes every JIT link fail with
+    ``cannot find -lcudart`` against a wheel-only toolkit (#5064).
+    """
+    return [name for name in ("lib64", "lib") if (Path(cuda_home) / name).is_dir()]
+
+
+def _cuda_shared_lib_flag(cuda_home: str, libdirs: List[str], stem: str) -> str:
+    """Return an ``ld`` flag that resolves ``lib{stem}`` under ``cuda_home``.
+
+    Pip CUDA wheels often ship only a versioned soname (``libcudart.so.13``)
+    without an unversioned ``libcudart.so`` symlink. Plain ``-lcudart`` then
+    fails even when ``-L`` points at the right directory; ``-l:libcudart.so.13``
+    links by exact filename instead.
+    """
+    candidates: List[Path] = []
+    for name in libdirs:
+        lib_dir = Path(cuda_home) / name
+        unversioned = lib_dir / f"lib{stem}.so"
+        if unversioned.exists():
+            return f"-l{stem}"
+        candidates.extend(sorted(lib_dir.glob(f"lib{stem}.so.*")))
+    if not candidates:
+        # Keep the conventional flag so the linker error still names the library.
+        return f"-l{stem}"
+    # Prefer the shortest versioned soname (libcudart.so.13 over .so.13.0.96).
+    chosen = min(candidates, key=lambda path: (len(path.name), path.name))
+    return f"-l:{chosen.name}"
+
+
 @functools.cache
 def get_cuda_path() -> str:
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
@@ -252,11 +285,22 @@ def generate_ninja_build_for_op(
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
 
-    ldflags = [
-        "-shared",
-        "-L$cuda_home/lib64",
-        "-L$cuda_home/lib64/stubs",
-        "-lcudart",
+    libdirs = _cuda_lib_dirs(cuda_home)
+    if not libdirs:
+        raise RuntimeError(
+            f"No CUDA library directory found under {cuda_home!r} "
+            f"(expected lib64/ or lib/). pip nvidia-cuda-* cu13 wheels use lib/; "
+            f"system toolkits typically use lib64/ (#5064)."
+        )
+
+    ldflags = ["-shared"]
+    for libdir in libdirs:
+        ldflags.append(f"-L$cuda_home/{libdir}")
+        stubs = Path(cuda_home) / libdir / "stubs"
+        if stubs.is_dir():
+            ldflags.append(f"-L$cuda_home/{libdir}/stubs")
+    ldflags += [
+        _cuda_shared_lib_flag(cuda_home, libdirs, "cudart"),
         "-lcuda",
     ]
 
@@ -266,6 +310,16 @@ def generate_ninja_build_for_op(
 
     if extra_ldflags is not None:
         ldflags += extra_ldflags
+
+    # Rewrite -lcudart / -lnvrtc from callers/env so pip wheels without
+    # unversioned .so symlinks still link (#5064).
+    resolved = []
+    for flag in ldflags:
+        if flag in ("-lcudart", "-lnvrtc"):
+            resolved.append(_cuda_shared_lib_flag(cuda_home, libdirs, flag[2:]))
+        else:
+            resolved.append(flag)
+    ldflags = resolved
 
     cxx = os.environ.get("CXX", "c++")
     nvcc = os.environ.get("FLASHINFER_NVCC", "$cuda_home/bin/nvcc")
