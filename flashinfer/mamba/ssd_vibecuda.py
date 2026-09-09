@@ -188,7 +188,7 @@ class VibeCUDASSDCombined:
         check("C", C, B.shape, (torch.bfloat16,))
         check("z", z, x.shape, (torch.bfloat16,))
         check("dt_bias", dt_bias, (nheads,), (dt.dtype,))
-        if D is not None and self._has_d:
+        if D is not None:
             if tuple(D.shape) not in ((nheads,), (nheads, _HEADDIM)):
                 raise ValueError("D must have shape (nheads,) or (nheads, headdim)")
             check("D", D, D.shape, (torch.bfloat16,))
@@ -295,7 +295,7 @@ class VibeCUDASSDCombined:
         B_c = self._contiguous(B)
         C_c = self._contiguous(C)
         z_c = self._contiguous(z) if z is not None else None
-        d_c = self._contiguous(D) if self._has_d else None
+        d_c = self._contiguous(D)
         dt_bias_c = self._contiguous(dt_bias)
         initial_c = self._contiguous(initial_states) if self._has_init_states else None
         seq_idx_c = self._contiguous(seq_idx)

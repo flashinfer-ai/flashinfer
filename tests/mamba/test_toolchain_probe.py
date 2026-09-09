@@ -5,7 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from triton.backends.nvidia import compiler
+
+compiler = pytest.importorskip("triton.backends.nvidia.compiler")
 
 
 @pytest.mark.parametrize("supported", [True, False])

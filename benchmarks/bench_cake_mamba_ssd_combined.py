@@ -51,6 +51,17 @@ def _diagnostic(
     }
 
 
+def _candidate_error_comparison(report: dict) -> dict:
+    return {
+        component: all(
+            report[f"vibecuda_truth_{component}"][metric]
+            <= report[f"cake_truth_{component}"][metric]
+            for metric in ("max_abs", "max_rel")
+        )
+        for component in ("out", "final_states")
+    }
+
+
 def _validate_report(report: dict, *, require_qualified_row: bool) -> None:
     if not report["out"]["tolerance_passed"]:
         raise AssertionError("Cake output failed BF16 parity")
@@ -465,6 +476,8 @@ def run_workload(args) -> dict:
             "out": report["vibecuda_truth_out"]["tolerance_passed"],
             "final_states": report["vibecuda_truth_final_states"]["tolerance_passed"],
         }
+        # Compare measured error magnitudes independently of tolerance passes.
+        report["candidate_no_worse_than_cake"] = _candidate_error_comparison(report)
         # The candidate must independently beat the fixed fast-baseline
         # allclose:6e-2,6e-2 contract against ground truth. Cake's own truth
         # diagnostics are reported (not asserted):

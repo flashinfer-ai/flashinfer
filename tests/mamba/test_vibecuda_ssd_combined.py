@@ -435,25 +435,50 @@ def test_vibecuda_runtime_z_and_optional_d(has_d):
         seq_idx=None,
     )
     constructor["has_z"] = False
+    constructor["has_d"] = False
     actual = SSDCombined(**constructor, backend="vibecuda").run(*tensors, **arguments)
     _assert_parity(actual, expected)
 
 
 @pytest.mark.parametrize(
-    "operand", ["dt", "A", "B", "C", "z", "dt_bias", "initial_states", "out"]
+    "operand",
+    [
+        "x",
+        "dt",
+        "A",
+        "B",
+        "C",
+        "D",
+        "z",
+        "dt_bias",
+        "initial_states",
+        "out",
+        "seq_idx",
+        "chunk_indices",
+        "chunk_offsets",
+        "seq_chunk_cumsum",
+    ],
 )
 @pytest.mark.parametrize("defect", ["shape", "dtype", "device"])
 def test_vibecuda_rejects_invalid_operands(operand, defect):
     from flashinfer.mamba.ssd_vibecuda import VibeCUDASSDCombined
 
-    constructor, tensors, arguments = _case()
+    constructor, tensors, arguments = _case(varlen=True)
+    constructor["has_d"] = False
     runner = VibeCUDASSDCombined(**constructor)
     values = dict(zip(("x", "dt", "A", "B", "C"), tensors, strict=True))
     values.update(arguments)
-    values["out"] = torch.empty((2, 8, 64, 1, 128), dtype=torch.bfloat16, device="cuda")
+    values["out"] = torch.empty((1, 8, 64, 2, 128), dtype=torch.bfloat16, device="cuda")
+    values["chunk_indices"] = torch.zeros(2, dtype=torch.int32, device="cuda")
+    values["chunk_offsets"] = torch.zeros(2, dtype=torch.int32, device="cuda")
+    values["seq_chunk_cumsum"] = torch.zeros(3, dtype=torch.int32, device="cuda")
     tensor = values[operand]
     if defect == "shape":
-        values[operand] = tensor[..., :-1]
+        values[operand] = (
+            tensor.unsqueeze(0)
+            if operand in ("chunk_indices", "chunk_offsets")
+            else tensor[..., :-1]
+        )
     elif defect == "dtype":
         values[operand] = tensor.to(torch.int8)
     else:

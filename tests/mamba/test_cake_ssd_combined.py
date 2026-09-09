@@ -37,6 +37,30 @@ def _load_cake_benchmark_module():
     return module
 
 
+@pytest.mark.parametrize("metric", ["max_abs", "max_rel"])
+def test_candidate_error_comparison_uses_observed_errors(metric):
+    module = _load_cake_benchmark_module()
+    report = {
+        f"{backend}_truth_{component}": {
+            "max_abs": 0.01,
+            "max_rel": 0.01,
+            "tolerance_passed": True,
+        }
+        for backend in ("cake", "vibecuda")
+        for component in ("out", "final_states")
+    }
+    assert module._candidate_error_comparison(report) == {
+        "out": True,
+        "final_states": True,
+    }
+    report["vibecuda_truth_out"][metric] = 0.02
+    report["vibecuda_truth_final_states"][metric] = 0.005
+    assert module._candidate_error_comparison(report) == {
+        "out": False,
+        "final_states": True,
+    }
+
+
 def _assert_cute_parity(actual, expected, *, nheads, ngroups):
     torch.testing.assert_close(actual[0], expected[0], atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(actual[1], expected[1], atol=1e-2, rtol=1e-2)
