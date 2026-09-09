@@ -124,6 +124,7 @@ def _skip_if_cp_unsupported(*stages):
 
 
 def _seed_all(seed):
+    """Seed every generator this file draws from, so a failure repeats."""
     random.seed(seed)
     torch.random.manual_seed(seed)
     torch.manual_seed(seed)
@@ -133,10 +134,12 @@ def _seed_all(seed):
 
 
 def _make_cu_seqlens(seq_lens, device):
+    """The int64 offsets the kernels index sequences by."""
     return torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64, device=device)
 
 
 def _make_gates(total_seqlen, num_heads, baseline, device):
+    """Gates in `[baseline, 1)`: a decay near 1 keeps the recurrence long."""
     return (
         baseline
         + (1.0 - baseline)
@@ -158,6 +161,7 @@ def _run_cp_kernel_chain(
     scale,
     initial_state=None,
 ):
+    """Compose the four CP stages by hand, the way the wrapper does."""
     t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
     )
@@ -321,6 +325,7 @@ def test_cp_delta_rule_t_precompute_varlen_tail_is_projected(
     qkv_factory,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """A tail shorter than a chunk still gets its own inverse, not the next chunk's."""
     _skip_if_cp_unsupported("cp_delta_rule_t_precompute_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -378,6 +383,7 @@ def test_cp_delta_rule_mn_precompute(
     ptr_abi,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """Each chunk's local state and output term against a per-chunk reference."""
     _skip_if_cp_unsupported("cp_delta_rule_mn_precompute_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -471,6 +477,7 @@ def test_cp_delta_rule_fixup(
     kernel_kind,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """The serial scan turns local states into absolute ones, over ragged packs."""
     _skip_if_cp_unsupported("cp_delta_rule_fixup_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -577,6 +584,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """Stage 4 against the fused kernel on the same inputs."""
     _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -687,6 +695,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
     num_v_heads,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """The same, with the four head counts distinct so an argument shift shows."""
     _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -804,6 +813,7 @@ def test_cp_delta_rule_kernel_chain_long_small_bh_matches_non_cp_prefill(
     scale,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """The shape CP exists for: one long sequence at few heads."""
     _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -844,6 +854,7 @@ def test_cp_delta_rule_e2e_with_initial_state(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """The chain carries a caller's initial state through all four stages."""
     _skip_if_cp_unsupported("cp_delta_rule_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -917,6 +928,7 @@ def test_cp_delta_rule_e2e(
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """The chain from nothing, against the fused kernel."""
     _skip_if_cp_unsupported("cp_delta_rule_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -1011,6 +1023,7 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """Reached through `chunk_gated_delta_rule`, so the wiring is covered too."""
     _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
     _seed_all(seed)
     device = torch.device("cuda")
@@ -1052,6 +1065,7 @@ def test_cp_delta_rule_external_state_dtype(
     seq_lens,
     seed=int(os.environ.get("SEED", "0")),
 ):
+    """A caller's state dtype other than the accumulator's."""
     _skip_if_cp_unsupported("cp_delta_rule_dsl")
     device = torch.device("cuda")
     _seed_all(seed)
@@ -1392,6 +1406,7 @@ def test_cp_prefill_checkpoints_land_in_sequence_order(qkv_factory):
 
 
 def _sm80_t_entry():
+    """The SM80 T-precompute entry, or a skip if this is not an SM80 device."""
     if get_compute_capability(torch.device("cuda"))[0] != 8:
         pytest.skip("the pointer entry is SM80-only")
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm80 import (
@@ -1402,6 +1417,7 @@ def _sm80_t_entry():
 
 
 def _t_inputs(seq_lens, h_qk, h_v, dtype, device, seed=11):
+    """K, beta and the offsets the T stage reads, on a fixed seed."""
     torch.manual_seed(seed)
     total = max(sum(seq_lens), 1)
     k = (
@@ -1613,6 +1629,7 @@ def test_pointer_abi_checks_survive_skip_check(stage):
 
 
 def _sm80_mn_entry():
+    """The SM80 MN-precompute entry, or a skip off SM80."""
     if get_compute_capability(torch.device("cuda"))[0] != 8:
         pytest.skip("the pointer entry is SM80-only")
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm80 import (
@@ -1623,6 +1640,7 @@ def _sm80_mn_entry():
 
 
 def _mn_inputs(seq_lens, h_qk, h_v, dtype, device, seed=11):
+    """`_t_inputs` plus the V the MN stage needs."""
     k, beta, cu, total, mx = _t_inputs(seq_lens, h_qk, h_v, dtype, device, seed)
     h = max(h_qk, h_v)
     v = (
@@ -1707,6 +1725,7 @@ def test_mn_precompute_pointer_abi_writes_the_same_blocks():
 
 @torch.inference_mode()
 def test_mn_precompute_pointer_abi_refuses_misaligned_and_a_stream():
+    """The pointer entry rejects a misaligned pointer instead of reading it."""
     entry = _sm80_mn_entry()
     import cuda.bindings.driver as cuda_driver
 
@@ -1753,6 +1772,7 @@ def test_mn_precompute_pointer_abi_refuses_misaligned_and_a_stream():
 
 
 def _sm80_fixup_entry():
+    """The SM80 fixup entry, or a skip off SM80."""
     if get_compute_capability(torch.device("cuda"))[0] != 8:
         pytest.skip("the pointer entry is SM80-only")
     from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm80 import (
@@ -1857,6 +1877,7 @@ def test_fixup_pointer_abi_matches_tensor_abi(
 
 @torch.inference_mode()
 def test_fixup_pointer_abi_writes_the_same_blocks():
+    """The two argument interfaces write the same bytes, not merely close ones."""
     entry = _sm80_fixup_entry()
     device = torch.device("cuda")
     seq_lens, heads = [2048, 1024, 0, 3000], 4

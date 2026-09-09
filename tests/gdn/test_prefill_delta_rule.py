@@ -1074,6 +1074,7 @@ def test_fp8_state_rejected_without_fp8_convert(state_dtype):
     seq_len = 64
 
     def run():
+        """One call with the parametrized shape, returning what it wrote."""
         return chunk_gated_delta_rule(
             torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
             torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device),
@@ -1325,6 +1326,7 @@ def test_prefill_kernel_state_dtype(
     use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    """A caller state dtype other than the accumulator's."""
     _skip_if_fp8_state_unsupported(state_dtype)
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
     _test_prefill_kernel_state_dtype(
