@@ -388,9 +388,9 @@ def test_w4a16_mega_geometry(
     # The skew sends every token to experts 0 and 1. 257 rows cross both the
     # 128-token tiles; EP2 also leaves one rank without local expert work.
     # The feature tails exercise FC1 and FC2 stores. H1024/I512 gives four/two
-    # K256 tiles and multiple work tiles wrap the two-stage operand pipelines.
-    # H9472/I64 fits four raw stages at default M256/N128. Its 37 FC1 K256
-    # tiles repeatedly wrap that ring alongside the one-tile FC2 tail.
+    # K256 tiles and multiple work tiles exercise the operand pipelines.
+    # H9472/I64 exercises the resource-fitted raw ring at default M256/N128.
+    # Its 37 FC1 K256 tiles wrap that ring alongside the one-tile FC2 tail.
     # Only that large-fan-in fixture scales FC1 globals by 1/sqrt(H).
     _check_numerical(
         expected_world_size,
@@ -438,4 +438,59 @@ def test_w4a16_mega_clamp(expected_world_size):
         intermediate=448,
         num_tokens=257,
         knobs={"gate_up_clamp": 1.5},
+    )
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("token_back_mode", ("epi_warps", "reuse_dispatch_warps"))
+@pytest.mark.parametrize(
+    ("tile_n", "expected_world_size"),
+    (
+        pytest.param(64, 1, id="n64-ep1"),
+        pytest.param(64, 2, id="n64-ep2", marks=pytest.mark.gpu_2),
+        pytest.param(128, 2, id="n128-ep2", marks=pytest.mark.gpu_2),
+    ),
+)
+def test_w4a16_mega_pipeline_wrap(tile_n, expected_world_size, token_back_mode):
+    # Both FC phases wrap the operand rings within one work tile: 29/9 K256
+    # tiles with 32/64-element tails. N64 and N128 fit different raw depths.
+    _check_numerical(
+        expected_world_size,
+        hidden=7200,
+        intermediate=2112,
+        num_tokens=257,
+        normalize_fc1=True,
+        knobs={
+            "mma_tiler_mnk": (256, tile_n, 256),
+            "cluster_shape_mnk": (2, 1, 1),
+            "use_2cta_instrs": True,
+            "group_hint": 512,
+            "flag_batch": 4,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": "atomic_counter",
+        },
+    )
+
+
+@pytest.mark.arch_blackwell
+def test_w4a16_mega_activation_fallback():
+    # At N64, this hidden size requires the two-stage activation fallback.
+    # The 72 FC1 K tiles include a 96-value tail; FC2 has a 64-value tail.
+    _check_numerical(
+        1,
+        hidden=18272,
+        intermediate=64,
+        num_tokens=257,
+        normalize_fc1=True,
+        knobs={
+            "mma_tiler_mnk": (256, 64, 256),
+            "cluster_shape_mnk": (2, 1, 1),
+            "use_2cta_instrs": True,
+            "group_hint": 512,
+            "flag_batch": 4,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": "epi_warps",
+            "load_balance_mode": "atomic_counter",
+        },
     )

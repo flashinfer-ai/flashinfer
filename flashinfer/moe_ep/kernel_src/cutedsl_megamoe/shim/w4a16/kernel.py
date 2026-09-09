@@ -243,7 +243,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
     def name(self):
         return "w4a16_" + super().name()
 
-    def _make_mixed(self, fragment_size, output_tensor, raw_stages):
+    def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
         mixed = _MegaMixedInput(
             acc_dtype=cutlass.Float32,
             use_2cta_instrs=self.use_2cta_instrs,
@@ -272,9 +272,8 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         mixed.transform_warp_id = self.transform_warp_id
         mixed._raw_stage_count = raw_stages
         mixed._setup_attributes()
-        # Only packed A+SF use the fitted depth. The inherited layout helper
-        # shares a load count for A and B; recover its original two-stage B
-        # layout explicitly, leaving activation and both TMEM rings unchanged.
+        # The inherited layout helper shares a load count for A and B.
+        # Rebuild B with its selected depth, independent of the raw and TMEM rings.
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             mixed.mma_dtype,
             mixed.a_major_mode,
@@ -289,20 +288,24 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             mixed.mma_tiler,
             mixed.a_dtype,
             mixed.b_dtype,
-            2,
+            activation_stages,
             mixed.num_trans2mma_stage,
         )
         return mixed
 
     @staticmethod
-    def _make_shared_storage(sched_storage_cls, raw_stages, transform_stages):
+    def _make_shared_storage(
+        sched_storage_cls, raw_stages, transform_stages, activation_stages
+    ):
         @cute.struct
         class SharedStorage:
             raw_barriers: cute.struct.MemRange[cutlass.Int64, 2 * raw_stages]
             transform_barriers: cute.struct.MemRange[
                 cutlass.Int64, 2 * transform_stages
             ]
-            activation_barriers: cute.struct.MemRange[cutlass.Int64, 4]
+            activation_barriers: cute.struct.MemRange[
+                cutlass.Int64, 2 * activation_stages
+            ]
             acc_barriers: cute.struct.MemRange[cutlass.Int64, 4]
             sched_storage: sched_storage_cls  # type: ignore[valid-type]
             tmem_dealloc: cutlass.Int64
@@ -333,13 +336,21 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         # CuTe's 227KiB per-block capacity already excludes CUDA's 1KiB
         # reservation from the SM's 228KiB. All user storage is counted below.
         capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        for raw_stages in range(5, 1, -1):
-            mixed = self._make_mixed(128, output_tensor, raw_stages)
-            storage_cls = self._make_shared_storage(
-                sched_storage_cls, raw_stages, mixed.num_trans2mma_stage
-            )
-            if self._smem_size(storage_cls, comm_storage_cls, mixed) <= capacity:
-                return mixed, storage_cls
+        # Prefer three activation stages; preserve the two-stage fallback for
+        # geometries where three cannot coexist with the minimum raw ring.
+        for activation_stages in (3, 2):
+            for raw_stages in range(5, 1, -1):
+                mixed = self._make_mixed(
+                    128, output_tensor, raw_stages, activation_stages
+                )
+                storage_cls = self._make_shared_storage(
+                    sched_storage_cls,
+                    raw_stages,
+                    mixed.num_trans2mma_stage,
+                    activation_stages,
+                )
+                if self._smem_size(storage_cls, comm_storage_cls, mixed) <= capacity:
+                    return mixed, storage_cls, activation_stages
         raise ValueError("W4A16 MegaMoE cannot fit two raw stages in shared memory.")
 
     @cute.jit
@@ -617,7 +628,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cute.make_layout((i, fc1_output.shape[0], 1), stride=(1, i, 0)),
         )
         # The minimum-depth layout establishes the scheduler's CTA geometry.
-        mix = self._make_mixed(128, c_layout_view, 2)
+        mix = self._make_mixed(128, c_layout_view, 2, 2)
         self.cta_tile_shape_mnk = mix.cta_tile_shape_mnk
         counter_ptr = None
         if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
@@ -637,11 +648,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             expert_token_prefix_sum=None,
             expert_token_sizes=expert_token_sizes,
         )
-        self.mixed_fc1, self.shared_storage_cls = self._fit_raw_stages(
-            c_layout_view, sched
-        )
+        (
+            self.mixed_fc1,
+            self.shared_storage_cls,
+            self.num_activation_stages,
+        ) = self._fit_raw_stages(c_layout_view, sched)
         mix = self.mixed_fc1
-        self.mixed_fc2 = self._make_mixed(32, c_layout_view, mix.num_load2trans_stage)
+        self.mixed_fc2 = self._make_mixed(
+            32, c_layout_view, mix.num_load2trans_stage, self.num_activation_stages
+        )
         self.cluster_layout_vmnk = mix.cluster_layout_vmnk
         self.num_acc_stage = self.num_acc_pipeline_stages = 2
         self.num_tmem_alloc_cols = 512
@@ -970,7 +985,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         )
         activation_pipe = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.activation_barriers.data_ptr(),
-            num_stages=2,
+            num_stages=self.num_activation_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, mix.num_mcast_ctas_b
@@ -1101,7 +1116,9 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             raw_pipe.producer_tail(state)
 
         if warp == 6:
-            state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
+            state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_activation_stages
+            )
             work = consumer.consume_work()
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
@@ -1241,7 +1258,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 pipeline.PipelineUserType.Consumer, mix.num_trans2mma_stage
             )
             b_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, 2
+                pipeline.PipelineUserType.Consumer, self.num_activation_stages
             )
             acc_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, 2
