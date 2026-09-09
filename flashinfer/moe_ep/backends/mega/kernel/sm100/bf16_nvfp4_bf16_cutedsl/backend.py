@@ -18,7 +18,7 @@ from ......core.validation.common import (
     validate_mega_forward_inputs,
 )
 from ......weights import MoEWeightPack
-from ..bf16_bf16_bf16_cutedsl.staging import stage_mega_moe_inputs
+from .staging import stage_mega_moe_inputs
 from .config import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .weights import (
     TransformedMegaWeights,
