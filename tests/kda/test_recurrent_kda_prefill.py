@@ -20,7 +20,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 from packaging.version import Version
 
 import flashinfer
@@ -28,7 +27,14 @@ from flashinfer.kda import RecurrentKDAPrefillWrapper, recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
-from tests.test_helpers.kda_prefill import cpu_route_tensors
+from tests.test_helpers.kda_prefill import (
+    _chunk16_debug_reference,
+    _h12_bf16_residual_carriers,
+    _make_inputs,
+    _reference,
+    _strict_prefill_kwargs,
+    cpu_route_tensors,
+)
 
 kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
@@ -880,76 +886,6 @@ def test_cute_dsl_engine_workspace_query_does_not_read_device_offsets(monkeypatc
     assert kernel_module.workspace_size(cu_seqlens, heads=64) == 0
 
 
-def _strict_prefill_kwargs(inputs, *, lower_bound=-5.0):
-    return {
-        **inputs,
-        "use_qk_l2norm_in_kernel": True,
-        "use_gate_in_kernel": True,
-        "lower_bound": lower_bound,
-        "beta_is_logit": True,
-    }
-
-
-def _make_inputs(
-    *,
-    seq_lens,
-    num_heads: int,
-    packed: bool,
-    initial_state: bool = False,
-    state_dtype: torch.dtype = torch.bfloat16,
-    seed: int = 0,
-):
-    torch.manual_seed(seed)
-    if packed:
-        batch_size = 1
-        seq_len = sum(seq_lens)
-    else:
-        if len(set(seq_lens)) != 1:
-            raise ValueError("fixed test inputs require equal sequence lengths")
-        batch_size = len(seq_lens)
-        seq_len = seq_lens[0]
-    shape = (batch_size, seq_len, num_heads, 128)
-    q = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
-    g = (0.1 * torch.randn(shape, dtype=torch.float32, device="cuda")).to(
-        torch.bfloat16
-    )
-    beta = torch.randn(
-        (batch_size, seq_len, num_heads),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    A_log = 0.1 * torch.randn(num_heads, dtype=torch.float32, device="cuda")
-    dt_bias = 0.1 * torch.randn((num_heads, 128), dtype=torch.float32, device="cuda")
-    offsets = [0]
-    for length in seq_lens:
-        offsets.append(offsets[-1] + length)
-    state = None
-    if initial_state:
-        state = (
-            0.1
-            * torch.randn(
-                (len(seq_lens), num_heads, 128, 128),
-                dtype=torch.float32,
-                device="cuda",
-            )
-        ).to(state_dtype)
-    return {
-        "q": q,
-        "k": k,
-        "v": v,
-        "g": g,
-        "beta": beta,
-        "A_log": A_log,
-        "dt_bias": dt_bias,
-        "initial_state": state,
-        "cu_seqlens": (
-            torch.tensor(offsets, dtype=torch.int64, device="cuda") if packed else None
-        ),
-    }
-
-
 @pytest.mark.parametrize(
     ("valid_tokens", "physical_gate_tokens"),
     [(26, 28), (68, 80), (502, 512), (1495, 1536)],
@@ -1340,80 +1276,6 @@ def test_public_prefill_auto_falls_back_for_non_tensor_arguments(
     assert recurrent_kda(**kwargs) is sentinel
 
 
-def _reference(inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0):
-    q = inputs["q"]
-    batch_size, seq_len, num_heads, head_dim = q.shape
-    scale = head_dim**-0.5 if scale is None else scale
-    q_flat = F.normalize(q.float(), dim=-1).reshape(-1, num_heads, head_dim)
-    k_flat = F.normalize(inputs["k"].float(), dim=-1).reshape(-1, num_heads, head_dim)
-    v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
-    g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
-    beta_flat = torch.sigmoid(inputs["beta"].float().reshape(-1, num_heads))
-    gate_input = g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim)
-    if lower_bound is None:
-        gate = -torch.exp(inputs["A_log"]).reshape(1, num_heads, 1) * F.softplus(
-            gate_input
-        )
-    else:
-        gate = lower_bound * torch.sigmoid(
-            torch.exp(inputs["A_log"]).reshape(1, num_heads, 1) * gate_input
-        )
-    decay = torch.exp(gate)
-    if inputs["cu_seqlens"] is None:
-        offsets = [index * seq_len for index in range(batch_size + 1)]
-    else:
-        offsets = [int(value) for value in inputs["cu_seqlens"].tolist()]
-    if inputs["initial_state"] is None:
-        state = torch.zeros(
-            (len(offsets) - 1, num_heads, head_dim, head_dim),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-    else:
-        state = inputs["initial_state"].clone()
-    out = torch.empty_like(q_flat)
-    checkpoints = []
-    for sequence in range(len(offsets) - 1):
-        if checkpoint_every_n_tokens:
-            checkpoints.append(state[sequence].clone())
-        sequence_length = offsets[sequence + 1] - offsets[sequence]
-        for local_token, token in enumerate(
-            range(offsets[sequence], offsets[sequence + 1]), start=1
-        ):
-            state_f32 = state[sequence].float()
-            decayed = state_f32 * decay[token].unsqueeze(1)
-            predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
-            residual = beta_flat[token].unsqueeze(-1) * (v_flat[token] - predicted)
-            updated = decayed + residual.unsqueeze(-1) * k_flat[token].unsqueeze(1)
-            state[sequence] = updated.to(torch.bfloat16)
-            projected = torch.einsum(
-                "hk,hvk->hv", q_flat[token], state[sequence].float()
-            )
-            out[token] = (scale * projected).to(torch.bfloat16)
-            if (
-                checkpoint_every_n_tokens
-                and local_token % checkpoint_every_n_tokens == 0
-                and local_token < sequence_length
-            ):
-                checkpoints.append(state[sequence].clone())
-    result = (out.reshape_as(q), state)
-    if checkpoint_every_n_tokens:
-        return (*result, torch.stack(checkpoints))
-    return result
-
-
-def _h12_bf16_residual_carriers(torch, *, value, prediction, beta_logit):
-    """Apply the four BF16 residual carriers selected by the public H12 ABI."""
-
-    prediction_carrier = prediction.to(torch.bfloat16).float()
-    delta_carrier = (value - prediction_carrier).to(torch.bfloat16).float()
-    beta_carrier = torch.sigmoid(beta_logit).to(torch.bfloat16).float()
-    update_carrier = (
-        (beta_carrier.unsqueeze(-1) * delta_carrier).to(torch.bfloat16).float()
-    )
-    return prediction_carrier, delta_carrier, beta_carrier, update_carrier
-
-
 def test_h12_smoke_reference_residual_carriers_round_every_boundary_on_cpu():
     prediction = torch.tensor(
         [[-15.22768497, -1.95509577, 3.25501537, 0.3333]],
@@ -1449,81 +1311,6 @@ def test_h12_smoke_reference_residual_carriers_round_every_boundary_on_cpu():
     assert not torch.equal(delta_carrier, unrounded_delta)
     assert not torch.equal(beta_carrier, unrounded_beta)
     assert not torch.equal(update_carrier, unrounded_update)
-
-
-def _chunk16_debug_reference(
-    inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0
-):
-    """Clean-room H12 smoke reference for focused numerical diagnostics.
-
-    The recurrent state carrier stays in FP32 within each 16-token chunk, but
-    the state/K prediction, V-minus-prediction delta, sigmoid beta, and
-    post-beta update carrier each round through BF16.  A BF16 state snapshot
-    becomes the next chunk's carrier, while each output projects the unrounded
-    FP32 state for its token.  The public benchmark separately compares output
-    and complete final state against the pinned FlashKDA implementation.
-    """
-
-    q = inputs["q"]
-    batch_size, seq_len, num_heads, head_dim = q.shape
-    scale = head_dim**-0.5 if scale is None else scale
-    q_flat = F.normalize(q.float(), dim=-1).reshape(-1, num_heads, head_dim)
-    k_flat = F.normalize(inputs["k"].float(), dim=-1).reshape(-1, num_heads, head_dim)
-    v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
-    g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
-    beta_logits_flat = inputs["beta"].float().reshape(-1, num_heads)
-    gate = lower_bound * torch.sigmoid(
-        torch.exp(inputs["A_log"]).reshape(1, num_heads, 1)
-        * (g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim))
-    )
-    decay = torch.exp(gate)
-    if inputs["cu_seqlens"] is None:
-        offsets = [index * seq_len for index in range(batch_size + 1)]
-    else:
-        offsets = [int(value) for value in inputs["cu_seqlens"].tolist()]
-    if inputs["initial_state"] is None:
-        state = torch.zeros(
-            (len(offsets) - 1, num_heads, head_dim, head_dim),
-            dtype=torch.bfloat16,
-            device=q.device,
-        )
-    else:
-        state = inputs["initial_state"].clone()
-    out = torch.empty_like(q_flat)
-    checkpoints = []
-    for sequence in range(len(offsets) - 1):
-        if checkpoint_every_n_tokens:
-            checkpoints.append(state[sequence].clone())
-        carrier = state[sequence].float()
-        sequence_length = offsets[sequence + 1] - offsets[sequence]
-        for local_token, token in enumerate(
-            range(offsets[sequence], offsets[sequence + 1]), start=1
-        ):
-            decayed = carrier * decay[token].unsqueeze(1)
-            predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
-            _, _, _, update_carrier = _h12_bf16_residual_carriers(
-                torch,
-                value=v_flat[token],
-                prediction=predicted,
-                beta_logit=beta_logits_flat[token],
-            )
-            updated = decayed + update_carrier.unsqueeze(-1) * k_flat[token].unsqueeze(
-                1
-            )
-            state[sequence] = updated.to(torch.bfloat16)
-            projected = torch.einsum("hk,hvk->hv", q_flat[token], updated)
-            out[token] = (scale * projected).to(torch.bfloat16)
-            carrier = state[sequence].float() if local_token % 16 == 0 else updated
-            if (
-                checkpoint_every_n_tokens
-                and local_token % checkpoint_every_n_tokens == 0
-                and local_token < sequence_length
-            ):
-                checkpoints.append(state[sequence].clone())
-    result = (out.reshape_as(q), state)
-    if checkpoint_every_n_tokens:
-        return (*result, torch.stack(checkpoints))
-    return result
 
 
 @pytest.fixture
@@ -6088,12 +5875,7 @@ def test_cute_dsl_checkpoints_match_cake(
             "checkpoint_cu_starts": checkpoint_cu_starts,
             "checkpoint_every_n_tokens": interval,
         }
-        if backend == "cute-dsl" and packed:
-            wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
-            wrapper.plan(run_kwargs.pop("cu_seqlens"))
-            results[backend] = wrapper.run(**run_kwargs)
-        else:
-            results[backend] = recurrent_kda(**run_kwargs, backend=backend)
+        results[backend] = recurrent_kda(**run_kwargs, backend=backend)
 
     for cute_value, cake_value in zip(
         results["cute-dsl"], results["cake"], strict=True
@@ -6195,12 +5977,7 @@ def test_cute_dsl_padded_indexed_state_matches_cake(
             "output_final_state": True,
             "ssm_state_indices": state_indices,
         }
-        if backend == "cute-dsl" and packed:
-            wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
-            wrapper.plan(run_kwargs.pop("cu_seqlens"))
-            results[backend] = wrapper.run(**run_kwargs)
-        else:
-            results[backend] = recurrent_kda(**run_kwargs, backend=backend)
+        results[backend] = recurrent_kda(**run_kwargs, backend=backend)
 
     for cute_value, cake_value in zip(
         results["cute-dsl"], results["cake"], strict=True
@@ -6569,290 +6346,6 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
             atol=1e-2,
             rtol=1e-2,
         )
-
-
-@pytest.mark.parametrize("num_heads", [12, 64])
-def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
-    flash_kda_device, num_heads
-):
-    inputs = _make_inputs(
-        seq_lens=[0, 17, 0, 33],
-        num_heads=num_heads,
-        packed=True,
-        initial_state=True,
-        seed=2040 + num_heads,
-    )
-    initial_state_seed = inputs["initial_state"].clone()
-    reference_inputs = {
-        **inputs,
-        "initial_state": initial_state_seed.clone(),
-    }
-    reference = _chunk16_debug_reference if num_heads == 12 else _reference
-    expected_output, expected_state = reference(reference_inputs)
-
-    wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
-    wrapper.plan(inputs["cu_seqlens"])
-    output = torch.empty_like(inputs["q"])
-    run_kwargs = {
-        **_strict_prefill_kwargs(inputs),
-        "output": output,
-        "output_final_state": True,
-    }
-    run_kwargs.pop("cu_seqlens")
-
-    capture_stream = torch.cuda.Stream(device=flash_kda_device)
-    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
-    with torch.cuda.stream(capture_stream):
-        wrapper.run(**run_kwargs)
-        inputs["initial_state"].copy_(initial_state_seed)
-        output.zero_()
-    capture_stream.synchronize()
-    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
-    if num_heads == 12:
-        assert wrapper._cu_chunks_buf.tolist() == [0, 0, 2, 2, 5]
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        captured_output, captured_state = wrapper.run(**run_kwargs)
-
-    with torch.cuda.stream(capture_stream):
-        inputs["initial_state"].copy_(initial_state_seed)
-        output.fill_(float("nan"))
-    capture_stream.synchronize()
-    graph.replay()
-    torch.cuda.synchronize()
-
-    assert captured_output.data_ptr() == output.data_ptr()
-    assert captured_state is inputs["initial_state"]
-    assert wrapper._workspace._captured
-    torch.testing.assert_close(
-        captured_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        captured_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
-    )
-
-    # Reuse the captured graph with different device-resident offsets.  The
-    # graph's metadata prepass must refresh both scheduling buffers without a
-    # data-dependent host read or a changed launch geometry.
-    replay_seq_lens = [8, 0, 25, 17]
-    replay_offsets = torch.tensor(
-        [0, 8, 8, 33, 50], dtype=torch.int64, device=flash_kda_device
-    )
-    replay_inputs = {**inputs, "cu_seqlens": replay_offsets}
-    expected_replay_output, expected_replay_state = reference(
-        {**replay_inputs, "initial_state": initial_state_seed.clone()}
-    )
-    with torch.cuda.stream(capture_stream):
-        wrapper.plan(replay_offsets)
-        inputs["initial_state"].copy_(initial_state_seed)
-        output.fill_(float("nan"))
-        graph.replay()
-    capture_stream.synchronize()
-
-    assert wrapper._seq_order_buf.tolist() == [2, 3, 0, 1]
-    if num_heads == 12:
-        assert wrapper._cu_chunks_buf.tolist() == [0, 1, 1, 3, 5]
-    assert sum(replay_seq_lens) == output.shape[1]
-    torch.testing.assert_close(
-        captured_output.float(),
-        expected_replay_output.float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        captured_state.float(),
-        expected_replay_state.float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
-
-def test_cute_dsl_cuda_graph_replay_updates_offsets_and_indexed_checkpoints(
-    flash_kda_device,
-):
-    inputs = _make_inputs(
-        seq_lens=[64, 131],
-        num_heads=12,
-        packed=True,
-        initial_state=True,
-        seed=4898,
-    )
-    initial_states = inputs["initial_state"].clone()
-
-    def eager_control(offsets, state_indices, checkpoint_starts, checkpoint_indices):
-        state_pool = torch.zeros(
-            (4, 12, 128, 128),
-            dtype=initial_states.dtype,
-            device=flash_kda_device,
-        )
-        state_pool[state_indices.long()] = initial_states
-        checkpoint_pool = torch.full(
-            (6, 12, 128, 128),
-            torch.nan,
-            dtype=initial_states.dtype,
-            device=flash_kda_device,
-        )
-        output, returned_state, returned_checkpoints = recurrent_kda(
-            **_strict_prefill_kwargs(
-                {
-                    **inputs,
-                    "cu_seqlens": offsets,
-                    "initial_state": state_pool,
-                }
-            ),
-            output=torch.empty_like(inputs["q"]),
-            output_final_state=True,
-            ssm_state_indices=state_indices,
-            state_checkpoints=checkpoint_pool,
-            checkpoint_cu_starts=checkpoint_starts,
-            checkpoint_state_indices=checkpoint_indices,
-            checkpoint_every_n_tokens=64,
-            backend="cute-dsl",
-        )
-        assert returned_state is state_pool
-        assert returned_checkpoints is checkpoint_pool
-        return (
-            output.clone(),
-            state_pool[state_indices.long()].clone(),
-            checkpoint_pool[checkpoint_indices.long()].clone(),
-        )
-
-    offsets = inputs["cu_seqlens"]
-    state_indices = torch.tensor([0, 2], dtype=torch.int32, device=flash_kda_device)
-    checkpoint_starts = torch.tensor(
-        [0, 1, 3], dtype=torch.int64, device=flash_kda_device
-    )
-    checkpoint_indices = torch.tensor(
-        [5, 1, 4], dtype=torch.int32, device=flash_kda_device
-    )
-    expected = eager_control(
-        offsets, state_indices, checkpoint_starts, checkpoint_indices
-    )
-
-    state_pool = torch.zeros(
-        (4, 12, 128, 128),
-        dtype=initial_states.dtype,
-        device=flash_kda_device,
-    )
-    checkpoint_pool = torch.full(
-        (6, 12, 128, 128),
-        torch.nan,
-        dtype=initial_states.dtype,
-        device=flash_kda_device,
-    )
-    output = torch.empty_like(inputs["q"])
-    wrapper = RecurrentKDAPrefillWrapper(flash_kda_device)
-    wrapper.plan(offsets)
-    run_kwargs = {
-        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
-        "output": output,
-        "output_final_state": True,
-        "ssm_state_indices": state_indices,
-        "state_checkpoints": checkpoint_pool,
-        "checkpoint_cu_starts": checkpoint_starts,
-        "checkpoint_state_indices": checkpoint_indices,
-        "checkpoint_every_n_tokens": 64,
-    }
-    run_kwargs.pop("cu_seqlens")
-
-    capture_stream = torch.cuda.Stream(device=flash_kda_device)
-    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
-    with torch.cuda.stream(capture_stream):
-        state_pool[state_indices.long()] = initial_states
-        wrapper.run(**run_kwargs)
-        state_pool.zero_()
-        state_pool[state_indices.long()] = initial_states
-        checkpoint_pool.fill_(float("nan"))
-        output.fill_(float("nan"))
-    capture_stream.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        captured_output, captured_state, captured_checkpoints = wrapper.run(
-            **run_kwargs
-        )
-
-    with torch.cuda.stream(capture_stream):
-        state_pool.zero_()
-        state_pool[state_indices.long()] = initial_states
-        checkpoint_pool.fill_(float("nan"))
-        output.fill_(float("nan"))
-        graph.replay()
-    capture_stream.synchronize()
-
-    assert captured_output is output
-    assert captured_state is state_pool
-    assert captured_checkpoints is checkpoint_pool
-    torch.testing.assert_close(
-        output.float(), expected[0].float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        state_pool[state_indices.long()].float(),
-        expected[1].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        checkpoint_pool[checkpoint_indices.long()].float(),
-        expected[2].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    assert torch.count_nonzero(state_pool[[1, 3]]) == 0
-    assert torch.isnan(checkpoint_pool[[0, 2, 3]]).all()
-
-    # Keep all captured addresses fixed while changing the sequence split,
-    # initial-state slots, checkpoint prefix, and checkpoint destinations.
-    replay_offsets = torch.tensor(
-        [0, 129, 195], dtype=torch.int64, device=flash_kda_device
-    )
-    replay_state_indices = torch.tensor(
-        [3, 1], dtype=torch.int32, device=flash_kda_device
-    )
-    replay_checkpoint_starts = torch.tensor(
-        [0, 2, 3], dtype=torch.int64, device=flash_kda_device
-    )
-    replay_checkpoint_indices = torch.tensor(
-        [0, 3, 2], dtype=torch.int32, device=flash_kda_device
-    )
-    expected_replay = eager_control(
-        replay_offsets,
-        replay_state_indices,
-        replay_checkpoint_starts,
-        replay_checkpoint_indices,
-    )
-    with torch.cuda.stream(capture_stream):
-        wrapper.plan(replay_offsets)
-        state_indices.copy_(replay_state_indices)
-        checkpoint_starts.copy_(replay_checkpoint_starts)
-        checkpoint_indices.copy_(replay_checkpoint_indices)
-        state_pool.zero_()
-        state_pool[replay_state_indices.long()] = initial_states
-        checkpoint_pool.fill_(float("nan"))
-        output.fill_(float("nan"))
-        graph.replay()
-    capture_stream.synchronize()
-
-    assert wrapper._seq_order_buf.tolist() == [0, 1]
-    assert wrapper._cu_chunks_buf.tolist() == [0, 9, 14]
-    torch.testing.assert_close(
-        output.float(), expected_replay[0].float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        state_pool[replay_state_indices.long()].float(),
-        expected_replay[1].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        checkpoint_pool[replay_checkpoint_indices.long()].float(),
-        expected_replay[2].float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    assert torch.count_nonzero(state_pool[[0, 2]]) == 0
-    assert torch.isnan(checkpoint_pool[[1, 4, 5]]).all()
 
 
 @pytest.mark.parametrize("num_heads", [6, 12])

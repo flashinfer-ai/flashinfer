@@ -28,7 +28,10 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
     once per process. It is limited to compute capability 10.0 and 10.3, is
     specific to the CuTe DSL backend, and fixes the sequence count and packed
     token extent after the first warmup run. Its planning implementation lives
-    in ``flashinfer.experimental.kda_prefill_wrapper`` and is JIT-only. See
+    in ``flashinfer.experimental.kda_prefill_wrapper``; it contains no kernels
+    of its own, and the kernels it dispatches to are the stable AOT-registered
+    ones. ``examples/experimental/kda_prefill_wrapper.py`` is a runnable
+    plan-and-run example. See
     `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for the
     graduation plan.
 
