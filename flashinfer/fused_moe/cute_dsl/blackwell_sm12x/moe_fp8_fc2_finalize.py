@@ -15,12 +15,13 @@
 
 import functools
 
+import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
-from ._moe_utils.moe_epilogue import EpiMethod, scatter_supports
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder, dsl_targets_sm12x
 from .kernel_moe_fp8_fc2_finalize import (
     GRAN_K,
@@ -70,6 +71,8 @@ class CuteDslSm120GroupedFp8Fc2FinalizeOp:
     def is_constructible(cls, tile, epi: EpiMethod = DEFAULT_EPI) -> bool:
         if not dsl_targets_sm12x():
             return False
+        if epi not in EPIS or not EPI_CONFIGS[epi].supports_tile(tile):
+            return False
         try:
             CuteDslSm120MoeFp8Fc2Finalize(
                 make_cfg(tuple(tile), resolve_stage(tuple(tile), epi), epi=epi), 1
@@ -83,16 +86,13 @@ class CuteDslSm120GroupedFp8Fc2FinalizeOp:
         cls, *, n: int, k: int, tile, epi: EpiMethod = DEFAULT_EPI
     ) -> bool:
         t = tuple(tile)
-        if (
-            t[:2] not in cls.TILES
-            or t[2] != BK
-            or epi not in EPIS
-            or not scatter_supports(n)
-        ):
+        if t[:2] not in cls.TILES or t[2] != BK or epi not in EPIS:
             return False
-        if n <= 0 or k <= 0 or k % t[2] != 0:
+        if n <= 0 or k <= 0 or n % t[1] != 0 or k % t[2] != 0:
             return False
-        return cls.is_constructible(t, epi)
+        return EPI_CONFIGS[epi].can_implement(
+            t, n, cutlass.BFloat16.width
+        ) and cls.is_constructible(t, epi)
 
     def build(self, grid_x: int):
         return CuteDslSm120MoeFp8Fc2Finalize(self.cfg, grid_x)
@@ -166,8 +166,6 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
     tile=None,
     epi: EpiMethod = DEFAULT_EPI,
     enable_pdl: bool = False,
-    *,
-    out: torch.Tensor | None = None,
 ):
     n, k = int(b_q.shape[1]), int(b_q.shape[2])
     _check_a_scale_granularity(a_scale, k)
@@ -182,10 +180,7 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
             num_sms=grid_x,
         )
     op = CuteDslSm120GroupedFp8Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
-    if out is None:
-        out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
-    else:
-        out.zero_()
+    out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
     args = make_args(
         a_q,
         a_scale,
@@ -195,6 +190,8 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
         src_token.to(torch.int32),
         pair_scales.to(torch.float32),
         m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
     )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out

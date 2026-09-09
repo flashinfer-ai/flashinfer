@@ -16,6 +16,7 @@
 import functools
 import os
 
+import cutlass
 import cutlass.cute as cute
 import torch
 
@@ -23,7 +24,7 @@ from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
-from ._moe_utils.moe_epilogue import EpiMethod
+from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm120GemmBuilder
 from .kernel_moe_fp8_gemm import (
     GRAN_K,
@@ -41,7 +42,9 @@ EPI_ORDER = (EpiMethod.R2G_WG, EpiMethod.STAGED_R2G)
 
 
 def epi_tactics(tile):
-    return (EpiMethod.DIRECT_STG,) if is_swapab(tile) else EPI_ORDER
+    if is_swapab(tile):
+        return (EpiMethod.DIRECT_STG,)
+    return tuple(epi for epi in EPI_ORDER if EPI_CONFIGS[epi].supports_tile(tile))
 
 
 def resolve_stage(tile, epi):
@@ -50,9 +53,11 @@ def resolve_stage(tile, epi):
     )
 
 
-def resolve_stage_store(tile):
+def resolve_stage_store(tile, output_n):
     best = None
     for epi in epi_tactics(tile):
+        if not EPI_CONFIGS[epi].can_implement(tile, output_n, cutlass.BFloat16.width):
+            continue
         try:
             stage = resolve_stage(tile, epi)
         except (AssertionError, ValueError, DSLUserCodeError):
@@ -88,7 +93,7 @@ class CuteDslSm120GroupedFp8Op:
         self.n, self.k, self.tile, self.out_dtype = n, k, tuple(tile), out_dtype
         self.enable_pdl = enable_pdl
         if epi is None:
-            self.ab_stage, self.epi = resolve_stage_store(self.tile)
+            self.ab_stage, self.epi = resolve_stage_store(self.tile, n)
         else:
             self.ab_stage, self.epi = resolve_stage(self.tile, epi), epi
         self.tactic = (self.tile[0], self.tile[1], self.epi)
@@ -107,15 +112,18 @@ class CuteDslSm120GroupedFp8Op:
 
     @staticmethod
     def is_valid_alignment(n: int, k: int, tile) -> bool:
-        return n > 0 and k > 0 and k % tile[2] == 0
+        return n > 0 and k > 0 and n % tile[1] == 0 and k % tile[2] == 0
 
     @classmethod
     def is_constructible(cls, tile, epi=None) -> bool:
+        if epi is None:
+            return any(
+                cls.is_constructible(tile, candidate) for candidate in epi_tactics(tile)
+            )
         try:
-            if epi is None:
-                stage, epi = resolve_stage_store(tuple(tile))
-            else:
-                stage = resolve_stage(tuple(tile), epi)
+            if not EPI_CONFIGS[epi].supports_tile(tile):
+                return False
+            stage = resolve_stage(tuple(tile), epi)
             CuteDslSm120MoeFp8Grouped(make_cfg(tuple(tile), stage, epi=epi), 1)
         except (AssertionError, ValueError, DSLUserCodeError):
             return False
@@ -123,11 +131,19 @@ class CuteDslSm120GroupedFp8Op:
 
     @classmethod
     def can_implement(cls, *, n: int, k: int, tile, out_dtype, epi=None) -> bool:
+        candidates = epi_tactics(tile) if epi is None else (epi,)
         return (
             cls.is_valid_dtypes(out_dtype)
             and cls.is_valid_tile(tile)
             and cls.is_valid_alignment(n, k, tile)
-            and cls.is_constructible(tile, epi)
+            and any(
+                candidate in epi_tactics(tile)
+                and EPI_CONFIGS[candidate].can_implement(
+                    tile, n, cutlass.BFloat16.width
+                )
+                and cls.is_constructible(tile, candidate)
+                for candidate in candidates
+            )
         )
 
     def build(self, grid_x: int) -> CuteDslSm120MoeFp8Grouped:
@@ -248,7 +264,16 @@ def cute_dsl_sm12x_moe_gemm_fp8(
         )
     op = _op(n, k, tuple(tile), out_dtype, epi, enable_pdl)
     out = torch.zeros(int(a_q.shape[0]), n, dtype=out_dtype, device=a_q.device)
-    args = make_args(a_q, a_scale, b_q, b_scale, out, m_indptr.to(torch.int32))
+    args = make_args(
+        a_q,
+        a_scale,
+        b_q,
+        b_scale,
+        out,
+        m_indptr.to(torch.int32),
+        op.cfg.epi,
+        op.cfg.TILE,
+    )
     compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
     return out
 
@@ -314,7 +339,16 @@ class _Fp8Runner(TunableRunner):
         else:
             tile, epi = split_tactic(tactic)
         op = _op(n, k, tuple(tile), self.out_dtype, epi, self.enable_pdl)
-        args = make_args(a_q, a_scale, b_q, b_scale, out, m_indptr.to(torch.int32))
+        args = make_args(
+            a_q,
+            a_scale,
+            b_q,
+            b_scale,
+            out,
+            m_indptr.to(torch.int32),
+            op.cfg.epi,
+            op.cfg.TILE,
+        )
         sm_version = "sm_{}{}".format(props.major, props.minor)
         compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
 
