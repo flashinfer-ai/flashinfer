@@ -586,6 +586,8 @@ def chunk_gated_delta_rule(
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
+    _cp_chunk_len: Optional[int] = None,
+    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
     # The longest sequence in this batch, from the caller's host-side data.
     # Private, and not a performance hint: it feeds `max_t_blocks_per_seq` and
     # `max_cp_chunks_per_seq`, so a value below the real maximum under-sizes
@@ -598,8 +600,6 @@ def chunk_gated_delta_rule(
     # device and reading it here would synchronise -- but vLLM's metadata
     # builder already holds `prefill_query_start_loc_cpu`.
     _max_seq_len: Optional[int] = None,
-    _cp_chunk_len: Optional[int] = None,
-    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -710,6 +710,18 @@ def chunk_gated_delta_rule(
     backend : {"auto", "flashinfer", "cake_gdn"}
         ``auto`` selects GDN non-CP only for an exact frozen non-CP manifest row;
         explicit ``cake_gdn`` requests fail closed.
+
+    _max_seq_len : int, optional
+        The longest sequence in this batch, from the caller's host-side data.
+        Internal, and not a performance hint: it sizes ``max_t_blocks_per_seq``
+        and ``max_cp_chunks_per_seq``, and the SM8x dispatch rules read it, so a
+        value below the real maximum under-sizes per-sequence indexing. Caller
+        precondition: if given it must equal ``max(seq_lens)`` for this batch.
+        Only type and range are checked -- verifying the value would need a
+        device synchronization, which is the cost this argument exists to
+        avoid. ``None`` (default) means the SM8x rules that need an exact
+        maximum decline, and ``total_seq_len`` is used where a safe
+        over-estimate is enough.
 
     Returns
     -------

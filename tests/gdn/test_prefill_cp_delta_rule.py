@@ -227,6 +227,11 @@ def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=N
         dtype=torch.float32,
         device=q.device,
     )
+    # Keywords past `scale`: the two bare `True`s here were
+    # `output_final_state` and `use_qk_l2norm_in_kernel`, and the second one is
+    # not what this reference wants -- no GDN prefill entry on any
+    # architecture reads that flag, so it was accepted and dropped, and a
+    # reader had to count positions to find that out.
     chunk_gated_delta_rule(
         q,
         k,
@@ -234,10 +239,9 @@ def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=N
         alpha,
         beta,
         scale,
-        initial_state,
-        True,
-        cu_seqlens,
-        True,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -2069,7 +2073,11 @@ def test_prefill_pointer_abi_matches_tensor_abi(
     )
     ckpt = starts = None
     if checkpoint:
-        per = [max(-(-length // 512), 0) for length in seq_lens]
+        # Floor, not ceiling: the kernel writes a checkpoint only when
+        # `block_end % checkpoint_every_n_tokens == 0`, so a 3000-token
+        # sequence writes five slots and a ceiling allocates a sixth
+        # that nothing fills.
+        per = [length // 512 for length in seq_lens]
         starts = torch.tensor(
             [0, *torch.tensor(per).cumsum(0).tolist()],
             dtype=torch.int64,

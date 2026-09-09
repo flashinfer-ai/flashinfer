@@ -23,8 +23,10 @@ the kernel's own checkpoints, against 2.9e-03 once transposed.
 
 **Name the axis in the identifier.** A workspace tensor is `state_KV` or
 `state_VK`, never `state`. A stage that takes one and returns the other says so
-in both names. `cp_compose_proof.py` in the measurement harness transposes at exactly one place
--- the boundary between the reference stages and the op -- and says why there.
+in both names. Transpose at exactly one place -- the boundary between the
+stages and their reference -- and say why there. Two transposes that cancel
+read as no transpose at all, and the axis a workspace holds is not recoverable
+from its shape when both axes are the head size.
 
 ## 2. `cp_delta_rule_fixup` returns (final, per-chunk), in that order
 
@@ -90,16 +92,20 @@ so chunk states go to a workspace with one row per chunk, and the sequence's
 final state is gathered from its last chunk. Several chunks writing the
 sequence's row would be blocks racing for it.
 
-Proven bit-exact against the fused kernel over fourteen cases, including ragged
-packs and a zero-length sequence: `logs/cp_compose/RESULT.md` in the
-measurement harness.
+Checked bit-exact against the fused kernel over ragged packs and a
+zero-length sequence by `test_prefill_cp_delta_rule.py`, which composes the
+four stages and compares the result with the fused path's.
 
 ## Probes
 
-`PROBE_RULES.md` in the measurement harness. Read it before writing one,
-not after. Every
-convention on this page was found by a probe, and five probes in the session
-that found them returned answers about themselves instead.
+Every convention on this page was found by a probe, and the probes are the
+reason the page exists: five of them, in the session that found these, returned
+answers about themselves rather than about the kernel. A probe that changes
+what it measures -- an extra argument that shifts a signature, a flag the
+kernel does not read, a substitution the compiler folds away -- confirms
+whatever it was written to confirm. Before trusting one, check that the thing
+it claims to have changed is visible in the compiled kernel, and that the
+unchanged half of the comparison still reads the same as it did.
 
 ## Checking a stage against the references
 
