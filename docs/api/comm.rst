@@ -257,6 +257,59 @@ depth rather than a grid size.
     probe_pcie_ipc_rank_topology
     resolve_pcie_ipc_profile
 
+PCIe IPC AllGather and ReduceScatter
+------------------------------------
+
+These standalone workspaces support BF16, FP16, and FP32 tensors at world sizes
+2, 4, and 8. ``max_numel`` sizes one rank's shard: the AllGather input or the
+ReduceScatter output. Tensors must be contiguous, rank-2, 16-byte aligned, and
+contain complete 16-byte packs.
+
+As with :class:`PcieIpcAllReduceWorkspace`, construction, calls, and destruction
+are collective. Every rank must issue the same sequence and configuration, and
+one workspace belongs to one ordered CUDA stream. Keep the workspace alive
+until every captured CUDA graph replay has completed.
+
+AllGather copies opaque 16-byte packs. ReduceScatter accumulates in FP32 and
+converts to the requested output dtype; its TP8 schedule converts one four-rank
+partial before the final accumulation, so bitwise agreement with NCCL is not
+part of the contract.
+
+The TP8 CopyEngine AllGather and topology ReduceScatter schedules require live
+UUID/NVML evidence that logical ranks ``0..3`` and ``4..7`` form the expected
+two-island placement. AllGather falls back to recursive doubling when that
+proof is unavailable; TP8 ReduceScatter reports the input as unsupported.
+
+.. code-block:: python
+
+    import flashinfer.comm as comm
+
+    ag = comm.PcieIpcAllGatherWorkspace(group, max_local_rows * hidden, dtype=x.dtype)
+    rs = comm.PcieIpcReduceScatterWorkspace(group, max_local_rows * hidden, dtype=x.dtype)
+
+    gathered = ag.all_gather(x)            # [world_size * local_rows, hidden]
+    shard = rs.reduce_scatter(reduced_input)  # [local_rows, hidden]
+
+    ag.destroy()
+    rs.destroy()
+
+``launch_config()`` returns a conservative seed. ``tune([hidden, ...])`` checks
+every candidate against NCCL, minimizes the maximum latency across ranks, and
+persists exact-shape results. The cache key includes the collective, world size,
+fabric and rank-placement fingerprints, workspace limits, dtype, and shape.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PcieIpcAllGatherWorkspace
+    PcieIpcAllGatherLaunchConfig
+    PcieIpcAllGatherVariant
+    get_pcie_ipc_all_gather_launch_config
+    PcieIpcReduceScatterWorkspace
+    PcieIpcReduceScatterLaunchConfig
+    PcieIpcReduceScatterVariant
+    get_pcie_ipc_reduce_scatter_launch_config
+
 Ulysses Context-Parallel All-to-All
 -----------------------------------
 

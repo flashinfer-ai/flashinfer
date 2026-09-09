@@ -43,6 +43,30 @@ from .pcie_ipc_ar import (
 )
 from .pcie_ipc_ar import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
 from .pcie_ipc_ar import get_pcie_ipc_comm_module as get_pcie_ipc_comm_module
+from .pcie_ipc_ag import (
+    PcieIpcAllGatherWorkspace as PcieIpcAllGatherWorkspace,
+)
+from .pcie_ipc_ag_policy import (
+    PcieIpcAllGatherLaunchConfig as PcieIpcAllGatherLaunchConfig,
+)
+from .pcie_ipc_ag_policy import (
+    PcieIpcAllGatherVariant as PcieIpcAllGatherVariant,
+)
+from .pcie_ipc_ag_policy import (
+    get_pcie_ipc_all_gather_launch_config as get_pcie_ipc_all_gather_launch_config,
+)
+from .pcie_ipc_rs import (
+    PcieIpcReduceScatterWorkspace as PcieIpcReduceScatterWorkspace,
+)
+from .pcie_ipc_rs_policy import (
+    PcieIpcReduceScatterLaunchConfig as PcieIpcReduceScatterLaunchConfig,
+)
+from .pcie_ipc_rs_policy import (
+    PcieIpcReduceScatterVariant as PcieIpcReduceScatterVariant,
+)
+from .pcie_ipc_rs_policy import (
+    get_pcie_ipc_reduce_scatter_launch_config as get_pcie_ipc_reduce_scatter_launch_config,
+)
 from .pcie_ipc_policy import IpcLaunchConfig as PcieIpcLaunchConfig
 from .pcie_ipc_policy import IpcVariant as PcieIpcVariant
 from .pcie_ipc_tuning import PCIE_IPC_CUSTOM_OP as PCIE_IPC_CUSTOM_OP

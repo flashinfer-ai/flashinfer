@@ -271,6 +271,17 @@ def gen_pcie_ipc_comm_module() -> JitSpec:
     )
 
 
+def gen_pcie_ipc_ag_rs_module() -> JitSpec:
+    """Build the standalone PCIe IPC AllGather and ReduceScatter ops."""
+    return gen_jit_spec(
+        "pcie_ipc_ag_rs",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_gather.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_reduce_scatter.cu",
+        ],
+    )
+
+
 def gen_ulysses_a2a_module() -> JitSpec:
     return gen_jit_spec(
         "ulysses_a2a",
