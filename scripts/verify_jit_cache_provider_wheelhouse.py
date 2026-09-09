@@ -159,12 +159,57 @@ def parse_args() -> argparse.Namespace:
         help="Fail on non-provider cubins, or retain them in the inventory report",
     )
     parser.add_argument("--install-smoke", action="store_true")
+    parser.add_argument(
+        "--provider-only",
+        action="store_true",
+        help="Validate a single provider artifact without a shim or Python wheel",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     wheel_paths = sorted(args.wheelhouse.glob("*.whl"))
+    if args.provider_only:
+        require(
+            not args.install_smoke,
+            "--install-smoke requires a shim and cannot be used with --provider-only",
+        )
+        require(len(wheel_paths) == 1, f"Expected one wheel, found {len(wheel_paths)}")
+        provider_wheel = Wheel.open(wheel_paths[0])
+        wheels = {
+            canonicalize_distribution(provider_wheel.distribution): provider_wheel
+        }
+        manifest, module_paths = validate_provider(
+            provider_wheel,
+            args.provider,
+            args.version,
+            args.provider_platform_tag or None,
+        )
+        module_architectures: dict[str, list[str]] = {}
+        ptx_modules: list[str] = []
+        if args.cuobjdump is not None:
+            module_architectures, ptx_modules = inspect_cuda_architectures(
+                provider_wheel,
+                module_paths,
+                args.provider,
+                args.cuobjdump,
+                strict=args.cuda_architecture_policy == "strict",
+            )
+        write_report(
+            args.wheelhouse,
+            wheels,
+            args.provider,
+            manifest,
+            module_architectures,
+            ptx_modules,
+        )
+        print(
+            f"Validated {args.provider}: {len(module_paths)} modules, "
+            f"{len(ptx_modules)} PTX modules, one provider wheel"
+        )
+        return 0
+
     require(len(wheel_paths) == 3, f"Expected three wheels, found {len(wheel_paths)}")
     opened_wheels = [Wheel.open(path) for path in wheel_paths]
     wheels = {

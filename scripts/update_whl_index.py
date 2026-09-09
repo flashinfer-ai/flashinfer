@@ -5,6 +5,7 @@ This script generates PEP 503 compatible simple repository index pages for:
 - flashinfer-python (no CUDA suffix in version)
 - flashinfer-cubin (no CUDA suffix in version)
 - flashinfer-jit-cache (has CUDA suffix like +cu134)
+- flashinfer-jit-cache-smXX providers (same CUDA suffix as the shim)
 
 The index is organized by CUDA version for jit-cache, and flat for others.
 """
@@ -58,7 +59,23 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
             "cuda": None,
         }
 
-    # Try flashinfer-jit-cache pattern (has CUDA suffix in version)
+    # Try architecture-specific flashinfer-jit-cache provider pattern.
+    # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]+cuXXX
+    match = re.match(
+        r"flashinfer_jit_cache_(sm[0-9]+[af]?)-"
+        r"([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?\+cu\d+)-",
+        wheel_name,
+    )
+    if match:
+        provider, version = match.groups()
+        cuda_ver = get_cuda_version(wheel_name)
+        return {
+            "package": f"flashinfer-jit-cache-{provider}",
+            "version": version,
+            "cuda": cuda_ver,
+        }
+
+    # Try flashinfer-jit-cache shim or legacy pattern (has CUDA suffix in version)
     # Supports PEP 440: base_version[{a|b|rc}N][.postN][.devN]+cuXXX
     match = re.match(
         r"flashinfer_jit_cache-([0-9.]+(?:(?:a|b|rc)\d+)?(?:\.post\d+)?(?:\.dev\d+)?\+cu\d+)-",

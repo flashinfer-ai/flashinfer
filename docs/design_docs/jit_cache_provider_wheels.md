@@ -3,10 +3,10 @@
 ## Status
 
 This document describes an experimental replacement for the monolithic
-`flashinfer-jit-cache` wheel. The runtime discovery contract and a single-arch
-provider build prototype are implemented, but release workflows still build the
-legacy wheel by default. The provider inventory must be validated on the fork
-before this becomes the release format.
+`flashinfer-jit-cache` wheel. The runtime discovery contract, provider build,
+and gated release/nightly paths are implemented, but
+`ci/cuda-versions.json` keeps the legacy wheel as the configured default. The
+provider inventory must be validated on the fork before changing that switch.
 
 ## Problem
 
@@ -282,6 +282,33 @@ steps with seven concurrent jobs. The installed provider resolved and launched
 measurements; current module pruning and compression flags require a fresh
 wheelhouse measurement before release integration.
 
+## Release Rollout
+
+`ci/cuda-versions.json` owns both the rollout switch and the provider inventory:
+
+- `jit_cache_wheel_format` is `legacy` or `providers`.
+- `<cpu>_arch_list` remains the aggregate-wheel compilation policy.
+- `<cpu>_provider_architectures` is the literal standalone-provider policy and
+  is never inferred from the aggregate list.
+
+Release and nightly workflow dispatches accept `configured`, `legacy`, or
+`providers`. The explicit override permits a provider dry run from a branch
+without changing the scheduled default. Provider mode performs three stages:
+
+1. Build every CUDA/CPU/provider matrix entry and reject foreign cubins or PTX.
+2. Build one platform-specific shim per CUDA/CPU entry whose exact dependencies
+   name every provider in that entry's configured inventory.
+3. Assemble each set and exercise both dependency-driven default installation
+   and a one-provider, no-dependencies minimal installation before publication.
+
+The existing nightly GPU test then installs the assembled x86_64 wheel set with
+JIT disabled. Its SM86 runner is why SM86 appears explicitly in the provider
+inventory; exact provider matching does not treat SM80 as covering SM86.
+
+Provider publication and wheel-index updates occur only after the complete set
+passes. Changing `jit_cache_wheel_format` to `providers` activates the split
+format while retaining the legacy build and runtime fallback as a rollback path.
+
 ## Validation Gates
 
 Before changing release workflows or making shim mode the default:
@@ -305,11 +332,10 @@ Before changing release workflows or making shim mode the default:
    sm121a versus future SM12x targets. Keep baseline and family providers exact
    until broader coverage is represented explicitly and validated module by
    module.
-8. Update release and nightly matrices, wheel-index parsing, documentation, and
-   stale-provider uninstall behavior only after the inventories pass. Keep the
-   CUDA version and PyTorch index in `ci/cuda-versions.json`, and add explicit
-   provider coverage fields rather than inferring them from size-pruned
-   monolithic architecture lists.
+8. Exercise the gated release and nightly matrices from the fork, including
+   wheel-index generation. Change the configured format only after the
+   inventories pass. Decide stale-provider uninstall behavior before declaring
+   minimal installation stable.
 
 ## Open Decisions
 
