@@ -437,6 +437,9 @@ def test_bf16_state_name_varies_with_every_key_component(variant):
     baseline = _bf16_state_kernel_name(variant, key)
     # The last component is the compile target, whose device index intentionally
     # does not name an artifact (see test_kernel_names_ignore_the_device_index).
+    assert key[-1] == (0, "sm100a"), (
+        f"the skipped component is no longer the compile target: {key[-1]!r}"
+    )
     for i in range(len(key) - 1):
         perturbed = key[:i] + (_perturb(key[i]),) + key[i + 1 :]
         assert _bf16_state_kernel_name(variant, perturbed) != baseline, (
@@ -452,8 +455,8 @@ def test_bf16_state_name_varies_with_every_key_component(variant):
 def test_kernel_names_ignore_the_device_index():
     """Two devices of one arch must share an artifact, not fragment the cache.
 
-    The device index is in the in-process key because an artifact binds to the
-    device it first ran on; the exported ``.o`` depends only on the arch.
+    The device index is in the in-process key to separate the device-resident
+    defaults an entry holds; the exported ``.o`` depends only on the arch.
     """
     named = {
         "nontranspose": (_nontranspose_kernel_name, NONTRANSPOSE_BASELINE),

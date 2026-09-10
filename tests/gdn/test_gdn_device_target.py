@@ -36,9 +36,9 @@ class _FakeProps:
 
 @pytest.fixture
 def fake_devices(monkeypatch):
-    """Two devices with different arch, SM count, and packed-FMA support."""
-    caps = {0: (9, 0), 1: (10, 0)}
-    sms = {0: 132, 1: 148}
+    """Three devices: two architectures, with cuda:0 and cuda:2 sharing one."""
+    caps = {0: (9, 0), 1: (10, 0), 2: (9, 0)}
+    sms = {0: 132, 1: 148, 2: 114}
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: caps[i])
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda i: _FakeProps(sms[i])
@@ -61,12 +61,13 @@ def test_device_target_reads_the_requested_device(fake_devices):
     assert (d1.arch, d1.num_sms, d1.use_packed_fma) == ("sm_100a", 148, True)
 
 
-def test_compile_key_separates_devices(fake_devices):
-    """A compiled artifact is pinned to the device it first ran on, so two devices
-    must not share a cache entry even when they are the same architecture."""
-    assert dt.gdn_device_target("cuda:0").compile_key != (
-        dt.gdn_device_target("cuda:1").compile_key
-    )
+def test_compile_key_separates_same_arch_devices(fake_devices):
+    """Cache entries hold device-resident default tensors, so same-arch devices
+    must not share one -- the arch alone cannot tell them apart."""
+    first, second = dt.gdn_device_target("cuda:0"), dt.gdn_device_target("cuda:2")
+
+    assert first.arch == second.arch
+    assert first.compile_key != second.compile_key
 
 
 def test_index_less_device_follows_current_device(fake_devices, monkeypatch):
@@ -128,8 +129,38 @@ def _is_cute_compile(func: ast.expr) -> bool:
     return isinstance(owner, ast.Attribute) and owner.attr == "cute"
 
 
+def _device_target_options(tree: ast.AST) -> set:
+    """Names bound to a ``gdn_compile_options(...)`` result in this module."""
+    return {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "gdn_compile_options"
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+
+def _pins_a_device_target(subscript: ast.expr, bound: set) -> bool:
+    if isinstance(subscript, ast.Call):
+        return (
+            isinstance(subscript.func, ast.Name)
+            and subscript.func.id == "gdn_compile_options"
+        )
+    return isinstance(subscript, ast.Name) and subscript.id in bound
+
+
+# delta_rule_dsl/ and blackwell/gdn_cp_prefill.py compile through this shim, which
+# takes already-pinned options from its callers. Those callers pin an arch of their
+# own but key nothing by device; that is the rest of GDN-H3 (#4214).
+OPTIONS_FROM_CALLER = ("custom_compile_cache.py",)
+
+
 def test_every_gdn_cute_compile_pins_an_explicit_target():
-    """Un-subscripted ``cute.compile`` targets whatever the DSL picks (device 0).
+    """Un-subscripted ``cute.compile`` targets whatever the DSL picks (device 0),
+    and a subscript carrying no ``GPUArch`` is no better.
 
     A string ``options=`` kwarg is equally unsafe: the DSL replaces subscripted
     options wholesale when one is present, silently dropping the ``GPUArch``.
@@ -137,11 +168,15 @@ def test_every_gdn_cute_compile_pins_an_explicit_target():
     unpinned, string_options = [], []
     for path in sorted(GDN_KERNELS_DIR.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
+        bound = _device_target_options(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not _is_cute_compile(node.func):
                 continue
             where = f"{path.name}:{node.lineno}"
-            if not isinstance(node.func, ast.Subscript):
+            if path.name not in OPTIONS_FROM_CALLER and not (
+                isinstance(node.func, ast.Subscript)
+                and _pins_a_device_target(node.func.slice, bound)
+            ):
                 unpinned.append(where)
             if any(
                 kw.arg == "options" and isinstance(kw.value, ast.Constant)
@@ -152,6 +187,68 @@ def test_every_gdn_cute_compile_pins_an_explicit_target():
     assert not unpinned and not string_options, (
         "call cute.compile[gdn_compile_options(device, ...)](...) instead; "
         f"unpinned={unpinned} string_options={string_options}"
+    )
+
+
+# Queries that answer for the ambient device instead of the operand's. Dispatch
+# makes the operand's device current today, so a bare call agrees by luck until
+# something invokes the kernel from anywhere else.
+AMBIENT_DEVICE_READS = (
+    "current_device",
+    "current_stream",
+    "gdn_compile_options",
+    "gdn_device_target",
+    "get_device_capability",
+    "get_device_properties",
+    "get_num_sm",
+)
+
+
+def _call_name(node: ast.Call) -> str:
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return func.id if isinstance(func, ast.Name) else ""
+
+
+def _ambient_device_reads(path: pathlib.Path) -> list:
+    """Device queries naming no device, or a hardcoded one."""
+    found = []
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for node in ast.walk(tree):
+        name = _call_name(node) if isinstance(node, ast.Call) else ""
+        if name not in AMBIENT_DEVICE_READS:
+            continue
+        if (not node.args and not node.keywords) or (
+            node.args and isinstance(node.args[0], ast.Constant)
+        ):
+            found.append(f"{path.name}:{node.lineno} {name}")
+    return found
+
+
+def test_device_target_adopters_read_policy_off_the_operand():
+    """Launch policy and streams must follow the operand's device.
+
+    ``num_sms`` and ``use_packed_fma`` choose tile shapes and codegen, so taking
+    them from device 0 mistunes -- or miscompiles -- every other device, and a
+    stream from the ambient device launches somewhere else entirely. Both are
+    invisible on a single-GPU box, so guard them by AST: no GPU needed.
+    """
+    adopters = [
+        path
+        for path in sorted(GDN_KERNELS_DIR.rglob("*.py"))
+        if path.name != "device_target.py" and "gdn_compile_options" in path.read_text()
+    ]
+    assert adopters, "nothing imports gdn_compile_options; did the helper move?"
+    offenders = {
+        name: reads
+        for path in adopters
+        for name, reads in [(path.name, _ambient_device_reads(path))]
+        if reads
+    }
+    assert not offenders, (
+        f"name the operand's device: {offenders}. Launch policy comes from "
+        "gdn_device_target(q.device), streams from current_stream(q.device)."
     )
 
 
@@ -209,23 +306,14 @@ def _gdn_capable_devices() -> list[int]:
     return max(by_capability.values(), key=len, default=[])
 
 
-def test_decode_agrees_across_devices():
-    """The same decode must give the same answer on every device in one process.
+B, H, HV, K, V = 2, 4, 4, 128, 128
+SCALE = 1.0 / math.sqrt(K)
 
-    A compiled CuTe-DSL artifact is pinned to the device it first ran on, so before
-    the device index entered the compile key the second device silently reused the
-    first device's artifact.
-    """
-    devices = _gdn_capable_devices()
-    if len(devices) < 2:
-        pytest.skip("needs two GDN-capable CUDA devices of the same architecture")
-    first, second = devices[0], devices[1]
 
-    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
-
-    B, T, H, HV, K, V = 2, 1, 4, 4, 128, 128
+def _cross_device_inputs(T: int, index: int) -> dict:
+    """Identical operands on ``index``, seeded so every device gets the same bits."""
     torch.manual_seed(0)
-    cpu_inputs = {
+    cpu = {
         "q": torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1,
         "k": torch.randn(B, T, H, K, dtype=torch.bfloat16) * 0.1,
         "v": torch.randn(B, T, HV, V, dtype=torch.bfloat16) * 0.1,
@@ -235,16 +323,71 @@ def test_decode_agrees_across_devices():
         "dt_bias": torch.randn(HV, dtype=torch.float32) * 0.1,
         "state": torch.randn(B, HV, V, K, dtype=torch.bfloat16) * 0.1,
     }
+    return {name: tensor.cuda(index) for name, tensor in cpu.items()}
 
-    def run_on(index):
-        # The DSL binds an artifact to the current device, so make it the operand's.
-        with torch.cuda.device(index):
-            args = {k: v.cuda(index) for k, v in cpu_inputs.items()}
-            out, _ = gated_delta_rule_decode_pretranspose(
-                **args, scale=1.0 / math.sqrt(K), use_qk_l2norm=True
-            )
-            torch.cuda.synchronize(index)
-            return out.float().cpu()
+
+def _pretranspose_on(index: int) -> torch.Tensor:
+    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+    with torch.cuda.device(index):
+        args = _cross_device_inputs(T=1, index=index)
+        out, _ = gated_delta_rule_decode_pretranspose(
+            **args, scale=SCALE, use_qk_l2norm=True
+        )
+        torch.cuda.synchronize(index)
+        return out.float().cpu()
+
+
+def _bf16_state_mtp_on(index: int) -> torch.Tensor:
+    """The bf16-state MTP entry, whose cache value holds per-B default tensors.
+
+    ``accepted_steps`` is one of them, built on ``q.device`` and dereferenced by
+    the kernel, so an entry shared across devices hands the second device a
+    pointer into the first device's memory.
+    """
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule_mtp
+
+    with torch.cuda.device(index):
+        args = _cross_device_inputs(T=2, index=index)
+        out = gated_delta_rule_mtp(
+            A_log=args["A_log"],
+            a=args["a"],
+            dt_bias=args["dt_bias"],
+            q=args["q"],
+            k=args["k"],
+            v=args["v"],
+            b=args["b"],
+            initial_state_source=args["state"],
+            initial_state_indices=torch.arange(
+                B, dtype=torch.int32, device=f"cuda:{index}"
+            ),
+            use_qk_l2norm_in_kernel=True,
+            scale=SCALE,
+        )
+        torch.cuda.synchronize(index)
+        return out.float().cpu()
+
+
+CROSS_DEVICE_ENTRIES = {
+    "pretranspose": _pretranspose_on,
+    "bf16_state_mtp": _bf16_state_mtp_on,
+}
+
+
+@pytest.mark.parametrize("entry", sorted(CROSS_DEVICE_ENTRIES))
+def test_decode_agrees_across_devices(entry):
+    """The same decode must give the same answer on every device in one process.
+
+    Before the device index entered the compile key, the second device reused the
+    first's cache entry -- and with it the device-resident default tensors that
+    entry holds. ``bf16_state_mtp`` is the arm that can actually fail: pretranspose
+    keys its own per-device auxiliaries, so it is a sanity check, not a guard.
+    """
+    devices = _gdn_capable_devices()
+    if len(devices) < 2:
+        pytest.skip("needs two GDN-capable CUDA devices of the same architecture")
+    first, second = devices[0], devices[1]
+    run_on = CROSS_DEVICE_ENTRIES[entry]
 
     original_device = torch.cuda.current_device()
     try:
