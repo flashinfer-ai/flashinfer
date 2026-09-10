@@ -280,6 +280,43 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
+def gen_ulysses_lowp_module() -> JitSpec:
+    # Byte-parity contract: the golden reference (SageAttention fork) compiles
+    # with --use_fast_math (the gen_jit_spec default, do NOT override) and
+    # targets sm_120a.  The explicit 120a gencode matters: the default
+    # compilation context normalizes SM 12.0 to compute_120f, whose FMA
+    # semantics can drift from the anchored sm_120a golden by ULPs.
+    #
+    # SM89 (Ada L40S / RTX 4090) uses the same Q_GROUP=32 / K_GROUP=64 tile
+    # sizes as SM120 (both are HMMA warp-level per_warp_int8), so the same
+    # source file covers both architectures.  We emit a fat binary with both
+    # gencodes so UlyssesLowpSageLayout.is_supported() returns True on either.
+    from .core import sm120a_nvcc_flags
+
+    sm89_gencode = "-gencode=arch=compute_89,code=sm_89"
+    return gen_jit_spec(
+        "ulysses_lowp",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp.cu",
+        ],
+        extra_cuda_cflags=[sm89_gencode] + sm120a_nvcc_flags,
+    )
+
+
+def gen_ulysses_lowp_sm90_module() -> JitSpec:
+    # SM90 (Hopper H100/H200) variant: Q_GROUP=16, K_GROUP=128 to match
+    # SageAttention2's WGMMA-based SM90 kernel tile sizes.
+    from .core import sm90a_nvcc_flags
+
+    return gen_jit_spec(
+        "ulysses_lowp_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "ulysses_lowp_sm90.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags,
+    )
+
+
 def gen_moe_alltoall_module() -> JitSpec:
     return gen_jit_spec(
         "mnnvl_moe_alltoall",

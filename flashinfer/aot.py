@@ -797,10 +797,22 @@ def gen_all_modules(
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
+            gen_ulysses_lowp_module,
+            gen_ulysses_lowp_sm90_module,
             gen_vllm_comm_module,
         )
 
         jit_specs.append(gen_comm_alltoall_module())
+        if has_sm120:
+            # ulysses_lowp: byte-anchored against its SageAttention golden under
+            # sm_120a only (the generator pins -gencode sm_120a; see
+            # gen_ulysses_lowp_module), so it is prebuilt for that target alone.
+            jit_specs.append(gen_ulysses_lowp_module())
+        if has_sm90:
+            # The SM90 grid (16/128) lives in its own translation unit pinned to
+            # -gencode sm_90a, so it needs its own prebuild; without this every
+            # Hopper caller JIT-compiles ulysses_lowp_sm90.cu on first use.
+            jit_specs.append(gen_ulysses_lowp_sm90_module())
         if (
             has_sm90
             or has_sm100
