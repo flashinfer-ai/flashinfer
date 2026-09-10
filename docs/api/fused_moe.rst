@@ -28,6 +28,30 @@ both the TRT-LLM and CuteDSL MoE paths.
 
 .. currentmodule:: flashinfer.fused_moe
 
+Unified MoE API
+---------------
+
+Backend-agnostic configuration and layer types. ``QuantConfig`` carries the MMA
+weight / activation formats and the layer output format as ``QuantFormat`` axes;
+``QuantVariant`` is a deprecated preset that expands to a ``(weight, activation)``
+pair.
+
+.. autosummary::
+    :toctree: ../generated
+
+    MoELayer
+    MoEConfig
+    RoutingConfig
+    QuantConfig
+    QuantFormat
+    QuantVariant
+    ExpertConfig
+    ExecutionConfig
+    MoEFinalizeConfig
+    BackendOptions
+    MoEActivationPack
+    MoEWeightPack
+
 Utility Functions
 -----------------
 
@@ -101,38 +125,51 @@ TensorRT-LLM Fused MoE
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 
-Cake NVFP4 Warp Decode (SM103)
-------------------------------
+Cake NVFP4 Warp Decode (SM100/SM103)
+------------------------------------
 
 The Cake warp-decode runner is an explicit unified-MoE backend for exact
-SM103. Select it with ``CakeWarpDecodeConfig(backend="cake")``; it is not in
-the default backend list. The current generated portfolio fails closed outside
-these contracts:
+SM100 and exact SM103. Select it with
+``CakeWarpDecodeConfig(backend="cake")``; it is not in the default backend
+list. Each device loads only its exact generated target. The current generated
+portfolio fails closed outside these contracts:
 
-* ``(hidden_size, intermediate_size, num_experts, top_k)`` is exactly
-  ``(2048, 512, 512, 10)`` or ``(2048, 1536, 60, 4)``;
+* ``(activation, hidden_size, intermediate_size, num_experts, top_k)`` is
+  exactly ``(SwiGLU(), 2048, 512, 512, 10)``,
+  ``(SwiGLU(), 2048, 1536, 60, 4)``, or
+  ``(SiLU(), 6144, 1536, 192, 4)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
-  int32 expert IDs and BF16 routing weights, and the activation is the default
-  ``SwiGLU()``;
+  int32 expert IDs and BF16 routing weights;
 * quantization is NVFP4, finalization and PDL are enabled, and expert
   parallelism, fused shared experts, bias, and LoRA are disabled.
 
 The backend reuses the physical weight and activation layouts prepared by
-``TrtllmFp4Config``. One prepared weight dictionary can therefore be
-registered for both backend keys without copying::
+``TrtllmFp4Config``. Logical GEMM1 weights have
+``intermediate_size * (2 if activation.is_gated else 1)`` rows: SwiGLU uses
+``2 * intermediate_size`` gate/up rows while standalone SiLU uses
+``intermediate_size`` rows. The packed E2M1 weights use the production
+``MajorK`` 32-row MMA shuffle: physical row ``p`` is restored at logical row
+``(p & ~31) + ((p & 7) << 2) + ((p & 31) >> 3)``. Their E4M3 block scales use
+the production ``R128c4`` layout. A SwiGLU weight dictionary can therefore be
+registered for both backend keys without copying. Standalone SiLU has no
+supported TRT-LLM routed-MoE peer and its dictionary must be registered only
+for ``"cake"``::
 
     cake = CakeWarpDecodeConfig(backend="cake")
+    activation = SwiGLU()  # Or SiLU() for H6144/I1536/E192/top-k 4.
     view = cake.prepare_weights(
         w1_bf16,
         w2_bf16,
         num_local_experts=num_experts,
-        hidden_size=2048,
+        hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
     )
 
     weights = MoEWeightPack()
     weights.prepare_for("cake", view)
-    weights.prepare_for("trtllm_fp4_routed", view)
+    if activation == SwiGLU():
+        weights.prepare_for("trtllm_fp4_routed", view)
 
     x_q, x_scale = cake.prepare_activations(x_bf16)
     activations = MoEActivationPack(
@@ -144,9 +181,9 @@ registered for both backend keys without copying::
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
-        activation=SwiGLU(),
+        activation=activation,
         backend=BackendOptions((cake,)),
         execution=ExecutionConfig(enable_pdl=True),
     )
@@ -182,7 +219,9 @@ if retirement cannot prove completion, the storage remains quarantined until
 process exit rather than returning to PyTorch's allocator. The 4096-address
 event pool is likewise process-lifetime and requires a process restart after
 exhaustion.
-The module is also registered in SM103 AOT builds when MoE kernels are enabled.
+The matching module is also registered in exact SM100 and SM103 AOT builds when
+MoE kernels are enabled. SM100 does not load or fall back to the SM103 module,
+and other compute capabilities are rejected.
 
 .. autosummary::
     :toctree: ../generated
