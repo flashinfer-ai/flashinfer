@@ -164,12 +164,17 @@ def should_use_cp_sm80_host(
     )
 
 
-#: The V32 fused specialization's validated contract. Everything here was
-#: measured on `1x8192 gva4x16`: above 1.00x against Triton on all four items
-#: -- bare and with the shipped norm, at the backend and integration
-#: boundaries -- in three independent processes, with the caller handing its
-#: bf16 state pool rows in directly. Nothing outside it has been measured, so
-#: nothing outside it is selected.
+#: The V32 fused specialization's measured contract. Everything here was
+#: measured on `1x8192 gva4x16`, in three independent processes, with the
+#: caller handing its bf16 state pool rows in directly. Against the shipped
+#: V64 fused path it is 1.067x-1.094x on all four items -- bare and with the
+#: shipped norm, at the backend and integration boundaries -- which is why it
+#: is selected here. Against Triton it is ahead at the bare backend boundary
+#: (1.010x-1.025x), at parity at the normalized backend boundary
+#: (0.993x-1.007x), and behind at both integration boundaries
+#: (0.975x-0.991x): it narrows the fused path's gap rather than closing it.
+#: Nothing outside this contract has been measured, so nothing outside it is
+#: selected.
 V32_SM80_MAX_SEQ_LEN = 8192
 V32_SM80_NUM_SEQS = 1
 V32_SM80_NUM_Q_HEADS = 4
