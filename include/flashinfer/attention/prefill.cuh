@@ -628,7 +628,7 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
         if constexpr (IS_FP4) {
           smem.template load_64b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
         } else {
-          smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+          smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
         }
         *smem_offset = smem.template advance_offset_by_column<4>(*smem_offset, j);
         *gptr += (IS_FP4 ? 2 : 4) * upcast_size<DTypeKV>();
@@ -679,9 +679,9 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
         if constexpr (IS_FP4) {
           // Load 64b from packed GMEM into lower 64b of 128b SMEM slot (upper 64b zeroed)
-          smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+          smem.template load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
         } else {
-          smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+          smem.template load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
         }
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         // FP4: GMEM row is HEAD_DIM/2 bytes wide (packed), so advance by half
@@ -703,9 +703,9 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (4 / sizeof(DType)); ++j) {
         if constexpr (IS_FP4) {
-          smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+          smem.template load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
         } else {
-          smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+          smem.template load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
         }
         *smem_offset = smem.template advance_offset_by_column<4>(*smem_offset, j);
         gptr += (IS_FP4 ? 2 : 4) * upcast_size<DType>();
