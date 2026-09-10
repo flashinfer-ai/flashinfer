@@ -1329,10 +1329,36 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
     assert len(packed_weight_ids) == 1
 
 
-@cutile_mxfp4_required
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_cuda_tile_available(),
+    reason="requires a working cuTile toolchain",
+)
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 @pytest.mark.parametrize("num_tokens", (4, 33))
-def test_cutile_mxfp4_supports_dimensions_divisible_by_32(activation, num_tokens):
+@pytest.mark.parametrize(
+    "config_type,runner_type,quant_pair",
+    (
+        pytest.param(
+            CuTileMxfp4Config,
+            CuTileMxfp4Runner,
+            (QuantFormat.MXFP4, QuantFormat.MXFP4),
+            id="w4a4",
+        ),
+        pytest.param(
+            CuTileMxfp4Bf16Config,
+            CuTileMxfp4Bf16Runner,
+            (QuantFormat.MXFP4, QuantFormat.BF16),
+            id="w4a16",
+        ),
+    ),
+)
+def test_cutile_mxfp4_supports_dimensions_divisible_by_32(
+    activation, num_tokens, config_type, runner_type, quant_pair
+):
+    major, minor = torch.cuda.get_device_capability()
+    arch = major * 10 + minor
+    if not config_type.supported(arch):
+        pytest.skip(f"{config_type.__name__} does not support SM{arch}")
     hidden_size, intermediate_size = 160, 160
     activations, weights, expected = _make_mxfp4_case(
         activation,
@@ -1340,35 +1366,23 @@ def test_cutile_mxfp4_supports_dimensions_divisible_by_32(activation, num_tokens
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    for config_type, runner_type, quant_pair in (
-        (
-            CuTileMxfp4Config,
-            CuTileMxfp4Runner,
-            (QuantFormat.MXFP4, QuantFormat.MXFP4),
-        ),
-        (
-            CuTileMxfp4Bf16Config,
-            CuTileMxfp4Bf16Runner,
-            (QuantFormat.MXFP4, QuantFormat.BF16),
-        ),
-    ):
-        config = _fp4_config(
-            config_type,
-            quant_pair,
-            num_experts=4,
-            top_k=2,
-            intermediate_size=intermediate_size,
-            activation=activation,
-            max_num_tokens=128,
-        )
-        runner = runner_type(config, torch.device("cuda"))
-        runner.check_support()
-        runner.build()
-        inputs = runner.pack_inputs(activations, weights)
-        output = runner.forward(
-            inputs, tactic=(32, int(not activation.is_gated), 128, 128, 2, 128, 128, 2)
-        ).clone()
-        torch.testing.assert_close(output, expected, rtol=0.25, atol=1.0)
+    config = _fp4_config(
+        config_type,
+        quant_pair,
+        num_experts=4,
+        top_k=2,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        max_num_tokens=128,
+    )
+    runner = runner_type(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    output = runner.forward(
+        inputs, tactic=(32, int(not activation.is_gated), 128, 128, 2, 128, 128, 2)
+    ).clone()
+    torch.testing.assert_close(output, expected, rtol=0.25, atol=1.0)
 
 
 @cutile_mxfp4_required
