@@ -83,9 +83,11 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 # Only current-schema files load; any other version counts as absent and the
-# families recalibrate on the next tuning-mode pass.
+# families recalibrate on the next tuning-mode pass. v2: glm53_nope rows went
+# 656B -> 528B, halving the persisted bytes_per_chunk; a stale v1 entry would
+# silently overstate the L2 footprint in the cpb guard.
 _BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
