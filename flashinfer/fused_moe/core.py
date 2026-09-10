@@ -5446,14 +5446,15 @@ def _validate_bf16_gemm1_activation_params(
 def _validate_routing_replay_out(
     routing_replay_out: Optional[torch.Tensor],
     top_k: int,
+    num_tokens: int,
     num_fused_shared_experts: int = 0,
-    num_tokens: Optional[int] = None,
 ) -> None:
     """Validate routing_replay_out tensor properties before passing to C++ kernels.
 
     ``num_tokens`` bounds dim0 from below: the routing kernels write one replay row per
     token unconditionally, so a shorter buffer is written past its end. Oversized buffers
-    stay legal for CUDA-graph capture at a fixed maximum batch size.
+    stay legal for CUDA-graph capture at a fixed maximum batch size. It is required rather
+    than defaulted so that a new entry point cannot silently opt out of the bound.
     """
     if routing_replay_out is None:
         return
@@ -5474,7 +5475,7 @@ def _validate_routing_replay_out(
         raise ValueError(
             f"routing_replay_out dim1 must equal top_k={top_k}, got {routing_replay_out.shape[1]}"
         )
-    if num_tokens is not None and routing_replay_out.shape[0] < num_tokens:
+    if routing_replay_out.shape[0] < num_tokens:
         raise ValueError(
             f"routing_replay_out dim0 must be >= num_tokens={num_tokens}, "
             f"got {routing_replay_out.shape[0]}; the routing kernel writes one replay "
@@ -6684,7 +6685,10 @@ def trtllm_fp8_block_scale_moe(
             f"with DeepSeekV3 routing; got routing_method_type={routing_method_type}."
         )
     _validate_routing_replay_out(
-        routing_replay_out, top_k, nfse, num_tokens=hidden_states.shape[0]
+        routing_replay_out,
+        top_k,
+        num_tokens=hidden_states.shape[0],
+        num_fused_shared_experts=nfse,
     )
     _validate_fp8_block_scale_gemm1_activation_params(
         fp8_quantization_type,
@@ -7199,7 +7203,10 @@ def trtllm_fp4_block_scale_moe(
             f"with DeepSeekV3 routing; got routing_method_type={routing_method_type}."
         )
     _validate_routing_replay_out(
-        routing_replay_out, top_k, nsfe, num_tokens=hidden_states.shape[0]
+        routing_replay_out,
+        top_k,
+        num_tokens=hidden_states.shape[0],
+        num_fused_shared_experts=nsfe,
     )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
