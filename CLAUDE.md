@@ -183,6 +183,9 @@ median_time, std_time = bench_gpu_time(
 For contiguous grouped FP8 GEMM, `python benchmarks/bench_grouped_fp8.py
 --production-shapes` compares DeepGEMM and CuTe-DSL with preallocated outputs;
 `--cache-probe` measures first-call and new-token-count compilation separately.
+Compiled grouped CuTe-DSL kernels are reused across token counts with the same
+128-row alignment class, with at most two variants per device and weight shape.
+Concurrent misses share one compilation; warm hits do not acquire the compile lock.
 The CuTe-DSL API's optional `validate_indices=True` checks expert-index values
 and synchronizes with the CPU. Validate new routing data before CUDA graph
 capture; the default path assumes valid indices and performs metadata checks only.

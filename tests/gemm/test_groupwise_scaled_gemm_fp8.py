@@ -406,12 +406,17 @@ def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k, use_ou
     _assert_fp8_groupwise_group_cute_dsl(group_counts, n, k, use_out=use_out)
 
 
-def _grouped_cute_dsl_inputs(m=256, n=128, k=128, device="cuda"):
-    """Small inputs with two experts and unit scales for integration tests."""
+def _require_grouped_cute_dsl(device="cuda"):
+    """Skip unsupported environments before importing the optional kernel."""
     if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3)]:
         pytest.skip("Requires SM100 or SM103")
     if not is_cute_dsl_available():
         pytest.skip("nvidia-cutlass-dsl is not available")
+
+
+def _grouped_cute_dsl_inputs(m=256, n=128, k=128, device="cuda"):
+    """Small inputs with two experts and unit scales for integration tests."""
+    _require_grouped_cute_dsl(device)
     a = torch.randn(m, k, device=device).to(torch.float8_e4m3fn)
     b = torch.randn(2, n, k, device=device).to(torch.float8_e4m3fn)
     a_scale = torch.ones(m, k // 128, device=device)
@@ -571,12 +576,12 @@ def test_grouped_cute_dsl_graph():
 @pytest.mark.parametrize("k", [128, 4096])
 def test_grouped_cute_dsl_launch_stream(monkeypatch, k):
     """Observe the actual DSL launch stream after warming compilation."""
+    inputs = _grouped_cute_dsl_inputs(k=k)
     import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
 
-    inputs = _grouped_cute_dsl_inputs(k=k)
     group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
     torch.cuda.synchronize()
-    key = (inputs[0].device.index, 256, 128, k, 2)
+    key = (inputs[0].device.index, True, 128, k, 2)
     compiled = mod._COMPILED[key]
     launched = []
 
@@ -602,14 +607,14 @@ def test_grouped_cute_dsl_launch_stream(monkeypatch, k):
 
 def test_grouped_cute_dsl_noncurrent_device(monkeypatch):
     """Compile and launch on the input device, preserving the caller's context."""
-    import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
-
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA devices")
     initial = torch.cuda.current_device()
     target = (initial + 1) % torch.cuda.device_count()
     inputs = _grouped_cute_dsl_inputs(m=257, device=f"cuda:{target}")
-    key = (target, 257, 128, 128, 2)
+    import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
+
+    key = (target, False, 128, 128, 2)
     monkeypatch.delitem(mod._COMPILED, key, raising=False)
     compiled_on = []
     compile_fn = mod.cute.compile
@@ -631,6 +636,107 @@ def test_grouped_cute_dsl_noncurrent_device(monkeypatch):
         ]
     ).bfloat16()
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("n,k", [(128, 128), (256, 128), (128, 384), (256, 4096)])
+@pytest.mark.parametrize("groups", [1, 2])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_grouped_cute_dsl_reuses_m_specializations(monkeypatch, n, k, groups, reverse):
+    """Reuse aligned/tail artifacts across growth, shrinkage and singleton M."""
+    _require_grouped_cute_dsl()
+    import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
+
+    monkeypatch.setattr(mod, "_COMPILED", {})
+    compile_fn = mod.cute.compile
+    builds = []
+
+    def record_compile(kernel, *args, **kwargs):
+        if isinstance(kernel, mod.BlockwiseContiguousGroupedGemmKernel):
+            builds.append(kernel)
+        return compile_fn(kernel, *args, **kwargs)
+
+    monkeypatch.setattr(mod.cute, "compile", record_compile)
+    sizes = [1, 65, 129, 257, 513, 128, 256, 384, 512, 127, 1, 256]
+    if reverse:
+        sizes.reverse()
+    for m in sizes:
+        inputs = list(_grouped_cute_dsl_inputs(m=m, n=n, k=k))
+        if groups == 1:
+            inputs[1] = inputs[1][:1]
+            inputs[3] = inputs[3][:1]
+            inputs[4].zero_()
+        out = group_deepgemm_fp8_nt_groupwise(
+            *inputs, backend="cute_dsl", validate_indices=True
+        )
+        if groups == 1:
+            ref = (inputs[0].float() @ inputs[1][0].float().T).bfloat16()
+        else:
+            ref = torch.cat(
+                [
+                    inputs[0][:128].float() @ inputs[1][0].float().T,
+                    inputs[0][128:].float() @ inputs[1][1].float().T,
+                ]
+            ).bfloat16()
+        torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+    assert len(builds) == 2
+    assert len(mod._COMPILED) == 2
+
+
+@pytest.mark.parametrize("k", [128, 4096])
+def test_grouped_cute_dsl_concurrent_cache_miss(monkeypatch, k):
+    """Two callers observing the same cold key compile once and both run correctly."""
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    inputs = _grouped_cute_dsl_inputs(k=k)
+    import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
+
+    producer = torch.cuda.current_stream()
+    initial_lookups = threading.Barrier(2, timeout=60)
+    local = threading.local()
+
+    class ConcurrentMissCache(dict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            if not getattr(local, "looked_up", False):
+                local.looked_up = True
+                # Both callers see the missing entry before either can compile.
+                initial_lookups.wait()
+            return value
+
+    monkeypatch.setattr(mod, "_COMPILED", ConcurrentMissCache())
+    compile_fn = mod.cute.compile
+    builds = []
+
+    def record_compile(kernel, *args, **kwargs):
+        if isinstance(kernel, mod.BlockwiseContiguousGroupedGemmKernel):
+            builds.append(kernel)
+        return compile_fn(kernel, *args, **kwargs)
+
+    monkeypatch.setattr(mod.cute, "compile", record_compile)
+
+    def call():
+        with torch.cuda.device(inputs[0].device):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(producer)
+            with torch.cuda.stream(stream):
+                out = group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+            stream.synchronize()
+            return out
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(call) for _ in range(2)]
+        outputs = [future.result(timeout=120) for future in futures]
+    ref = torch.cat(
+        [
+            inputs[0][:128].float() @ inputs[1][0].float().T,
+            inputs[0][128:].float() @ inputs[1][1].float().T,
+        ]
+    ).bfloat16()
+    for out in outputs:
+        torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+    assert len(builds) == 1
+    assert len(mod._COMPILED) == 1
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])

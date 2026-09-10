@@ -1,4 +1,4 @@
-"""Reproduce grouped FP8 GEMM throughput and exact-M compile-cache costs.
+"""Reproduce grouped FP8 GEMM throughput and compile-cache reuse across M.
 
 Run from a FlashInfer checkout with SM100/SM103 and nvidia-cutlass-dsl installed:
     python benchmarks/bench_grouped_fp8.py --cache-probe
@@ -47,9 +47,7 @@ def environment():
 
 def make_inputs(m, n, k, groups):
     """Build aligned expert blocks, allowing a partial final expert."""
-    rows = ((m // groups) // 128) * 128
-    if groups > 1 and rows == 0:
-        raise ValueError("Use at least 128 rows per non-final expert")
+    rows = max(128, ((m // groups) // 128) * 128)
     a = torch.randn(m, k, device="cuda").to(torch.float8_e4m3fn)
     b = torch.randn(groups, n, k, device="cuda").to(torch.float8_e4m3fn)
     sa = torch.ones(m, k // 128, device="cuda")
@@ -76,7 +74,7 @@ def cache_probe():
     # Fresh benchmark process is required: do not clear a caller's live cache.
     if mod._COMPILED:
         raise ValueError("Run --cache-probe in a fresh process")
-    for m in (256, 384, 512):
+    for m in (256, 384, 512, 129, 257, 513):
         # Match the review's two-expert boundary at row 128 for every M.
         inputs = list(make_inputs(m, 128, 128, 2))
         inputs[-1] = (torch.arange(m, device="cuda") >= 128).to(torch.int32)

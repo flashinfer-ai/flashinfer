@@ -30,6 +30,7 @@
 
 import functools
 import math
+import threading
 from typing import Callable, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -3224,7 +3225,8 @@ class BlockwiseContiguousGroupedGemmKernel:
 
 _FP8 = cutlass.Float8E4M3FN
 
-_COMPILED: dict[Tuple[Optional[int], int, int, int, int], Callable] = {}
+_COMPILED: dict[Tuple[Optional[int], bool, int, int, int], Callable] = {}
+_COMPILE_LOCK = threading.Lock()
 
 
 @functools.cache
@@ -3371,42 +3373,48 @@ def grouped_gemm_fp8_nt_groupwise_contiguous_sm100(
 
         stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
 
-        key = (a.device.index, m, n, k, num_groups)
+        # Layouts carry M at runtime; only tail predication specializes on M.
+        key = (a.device.index, m % 128 == 0, n, k, num_groups)
         fn = _COMPILED.get(key)
         if fn is None:
-            cfg = _pick_config(m, n, k, num_groups)
-            if not BlockwiseContiguousGroupedGemmKernel.can_implement(
-                _FP8,
-                cutlass.Float32,
-                cutlass.BFloat16,
-                cfg[0],
-                cfg[1],
-                cfg[2],
-                m,
-                n,
-                k,
-                num_groups,
-                "k",
-                "k",
-                "n",
-            ):
-                raise ValueError(
-                    "The selected contiguous grouped GEMM configuration is unsupported"
-                )
-            gemm = _build(m, n, k, num_groups, cfg)
-            mac = _max_active_clusters(a.device.index, cfg[2][0] * cfg[2][1])
-            fn = cute.compile(
-                gemm,
-                a_c,
-                b_c,
-                c_c,
-                sfa_c,
-                sfb_c,
-                gidx_c,
-                mac,
-                stream,
-                options=f"--opt-level {_opt_level()}",
-            )
-            _COMPILED[key] = fn
+            # CuTe compilation is expensive: concurrent first calls share one build.
+            # Keep hits and launches outside the lock.
+            with _COMPILE_LOCK:
+                fn = _COMPILED.get(key)
+                if fn is None:
+                    cfg = _pick_config(m, n, k, num_groups)
+                    if not BlockwiseContiguousGroupedGemmKernel.can_implement(
+                        _FP8,
+                        cutlass.Float32,
+                        cutlass.BFloat16,
+                        cfg[0],
+                        cfg[1],
+                        cfg[2],
+                        m,
+                        n,
+                        k,
+                        num_groups,
+                        "k",
+                        "k",
+                        "n",
+                    ):
+                        raise ValueError(
+                            "The selected contiguous grouped GEMM configuration is unsupported"
+                        )
+                    gemm = _build(m, n, k, num_groups, cfg)
+                    mac = _max_active_clusters(a.device.index, cfg[2][0] * cfg[2][1])
+                    fn = cute.compile(
+                        gemm,
+                        a_c,
+                        b_c,
+                        c_c,
+                        sfa_c,
+                        sfb_c,
+                        gidx_c,
+                        mac,
+                        stream,
+                        options=f"--opt-level {_opt_level()}",
+                    )
+                    _COMPILED[key] = fn
 
         fn(a_c, b_c, c_c, sfa_c, sfb_c, gidx_c, stream)
