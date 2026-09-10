@@ -51,6 +51,8 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(kv_indptr, dl_dtype_for<IdType>());
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -112,6 +114,8 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
                                       Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                       int64_t layout, int64_t window_left,
                                       bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(kv_indptr, dl_dtype_for<IdType>());
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -245,6 +249,11 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                      int64_t layout, int64_t window_left,
                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(paged_kv_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(paged_kv_indices, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_dtype_for<IdType>());
+
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
