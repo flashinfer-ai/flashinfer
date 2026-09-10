@@ -339,6 +339,43 @@ def _make_fixed_inputs(
     }
 
 
+def _make_c16_causality_inputs():
+    batch_size, seq_len, num_heads, head_dim = 1, 16, 8, 128
+    shape = (batch_size, seq_len, num_heads, head_dim)
+    q = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    for token in range(seq_len):
+        q[:, token, :, token] = 1
+        k[:, token, :, token] = 1
+
+    # A[15, 0] is nonzero. A transposed intra-chunk multiply would therefore
+    # leak V[15] into O[0], while the causal lower triangle keeps O[:15] zero.
+    q[:, 15].zero_()
+    q[:, 15, :, 0] = 1
+    v = torch.zeros_like(q)
+    v[:, 15, :, 0] = 1
+    return {
+        "q": q,
+        "k": k,
+        "v": v,
+        "g": torch.full_like(q, -6),
+        "beta": torch.zeros(
+            (batch_size, seq_len, num_heads),
+            device="cuda",
+            dtype=torch.bfloat16,
+        ),
+        "A_log": torch.zeros((num_heads,), device="cuda", dtype=torch.float32),
+        "dt_bias": torch.zeros(
+            (num_heads, head_dim), device="cuda", dtype=torch.float32
+        ),
+        "initial_state": torch.zeros(
+            (batch_size, num_heads, head_dim, head_dim),
+            device="cuda",
+            dtype=torch.float32,
+        ),
+    }
+
+
 @pytest.mark.arch_blackwell
 def test_packed_forward_validates_trusted_cpu_cu_seqlens():
     _require_blackwell()
@@ -487,6 +524,63 @@ def _assert_training_matches_fla(inputs, expected_route):
 def test_training_forward_context_backward_matches_fla():
     _require_blackwell()
     _assert_training_matches_fla(_make_inputs(), "c16")
+
+
+@pytest.mark.arch_blackwell
+def test_c16_forward_does_not_read_future_values(monkeypatch):
+    _require_blackwell()
+    inputs = _make_c16_causality_inputs()
+    monkeypatch.setattr(
+        kda_training_impl,
+        "_select_training_route",
+        lambda *_args, **_kwargs: kda_training_impl._TrainingRouteSpec(
+            "c16", "checkpoint_recurrent_c16", False
+        ),
+    )
+
+    output, _, context = recurrent_kda_training_forward(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["initial_state"],
+    )
+
+    assert context._route.tag == "c16"
+    assert torch.count_nonzero(output[:, :15]).item() == 0
+
+    # Make the K Gram matrix lower triangular and non-diagonal, while choosing
+    # Q as a dual basis so the causal output matrix A stays diagonal. V[0]
+    # must then reach O[1] through the lower-triangular solve U = T^-1 Y. A
+    # transposed T^-1 operand would instead leave U[1], and therefore O[1], zero.
+    solve_inputs = _make_c16_causality_inputs()
+    solve_inputs["q"].zero_()
+    solve_inputs["k"].zero_()
+    solve_inputs["v"].zero_()
+    for token in range(16):
+        solve_inputs["q"][:, token, :, token] = 1
+        solve_inputs["k"][:, token, :, token] = 1
+    diagonal = torch.tensor(2**-0.5, device="cuda", dtype=torch.bfloat16)
+    solve_inputs["q"][:, 0, :, 0] = diagonal
+    solve_inputs["q"][:, 0, :, 1] = -diagonal
+    solve_inputs["k"][:, 1, :, 0] = diagonal
+    solve_inputs["k"][:, 1, :, 1] = diagonal
+    solve_inputs["v"][:, 0, :, 0] = 1
+
+    solve_output, _, _ = recurrent_kda_training_forward(
+        solve_inputs["q"],
+        solve_inputs["k"],
+        solve_inputs["v"],
+        solve_inputs["g"],
+        solve_inputs["beta"],
+        solve_inputs["A_log"],
+        solve_inputs["dt_bias"],
+        solve_inputs["initial_state"],
+    )
+    assert torch.count_nonzero(solve_output[:, 1]).item() > 0
 
 
 @pytest.mark.arch_blackwell

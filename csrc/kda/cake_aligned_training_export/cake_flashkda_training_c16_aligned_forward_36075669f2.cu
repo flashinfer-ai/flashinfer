@@ -2873,7 +2873,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_flashkda_forward_checkpoin
           mbarrier_wait(y_inp_ready_addr, state_phase_tcgen);
           int _mma_b_lo_3 = make_warp_uniform(((((smem_tinv_mn_addr) >> 4) & 0x3FFF) | 0x200000) +
                                               (intermediate_stage_tcgen) * 64);
-          mma_ts_step(tmem_tmem_u_acc, tmem_tmem_y_inp, _mma_b_lo_3, 0xC0004010, 134546576, 0);
+          mma_ts_step(tmem_tmem_u_acc, tmem_tmem_y_inp, _mma_b_lo_3, 0xC0004010, 134481040, 0);
           elect_commit2(tinv_done_addr + (intermediate_stage_tcgen) * 8, u_acc_ready_addr);
           mbarrier_wait(u_inp_ready_addr, state_phase_tcgen);
           int _mma_b_lo_4 = make_warp_uniform(
@@ -2885,7 +2885,7 @@ __global__ __launch_bounds__(512, 1) void kernel_cake_flashkda_forward_checkpoin
           int _mma_b_lo_5 = make_warp_uniform(((((smem_a_mn_addr) >> 4) & 0x3FFF) | 0x200000) +
                                               (intermediate_stage_tcgen) * 64);
           mma_ts_step((tmem_tmem_q_state + ((int)o_stage_tcgen * 16)), tmem_tmem_u_inp, _mma_b_lo_5,
-                      0xC0004010, 134546576, 1);
+                      0xC0004010, 134481040, 1);
           elect_commit2(o_acc_ready_addr, a_done_addr + (intermediate_stage_tcgen) * 8);
         }
         cumulative_chunk_tcgen += chunks_tcgen;
