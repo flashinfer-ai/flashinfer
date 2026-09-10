@@ -104,6 +104,7 @@ def _combine_partials(
     split_counts: torch.Tensor,  # [total_q, Hkv] int32
     group_size: int,
     out_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
     lse_out: Optional[torch.Tensor] = None,
     out_scale: float = 1.0,
     lse_t_partial: Optional[torch.Tensor] = None,
@@ -111,9 +112,12 @@ def _combine_partials(
 ) -> torch.Tensor:
     """Fused CuTe-DSL LSE-weighted reduction over each query's split slots."""
     topk, total_q, num_qo_heads, head_dim = o_partial.shape
-    out = torch.empty(
-        (total_q, num_qo_heads, head_dim), dtype=out_dtype, device=o_partial.device
-    )
+    if out is None:
+        out = torch.empty(
+            (total_q, num_qo_heads, head_dim),
+            dtype=out_dtype,
+            device=o_partial.device,
+        )
     has_lse_out = lse_out is not None
     has_lse_t = lse_t_out is not None
     dev = o_partial.device
@@ -194,6 +198,7 @@ def msa_sparse_decode_attention(
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
 
@@ -215,8 +220,9 @@ def msa_sparse_decode_attention(
         On the paged path, ``k``/``v`` may also be views split from a cache
         that packs K and V in one ``2 * head_dim`` content dim per token
         on SM120/SM121 (see ``supports_packed_kv``). Compute capability
-        10.0/10.3 requires separate contiguous K and V tensors and never
-        copies packed views implicitly.
+        10.0/10.3 also accepts exact HND views split from a contiguous
+        ``(num_pages, num_kv_heads, 128, 256)`` FP8 cache on the paged causal
+        uniform-FP8 Q/K/V route; no packed views are copied implicitly.
     q2k_indices : torch.Tensor
         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
         ``-1`` tail-padded (the format produced by
@@ -270,6 +276,11 @@ def msa_sparse_decode_attention(
         capability 10.0/10.3. Warm the workspace eagerly with the exact
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
+    out : torch.Tensor, optional
+        Caller-provided contiguous output tensor. It must have shape
+        ``(batch_size * seqlen_q, num_qo_heads, 128)``, reside on the same
+        device as ``q``, and use the result dtype (BF16 for uniform FP8 Q/K/V,
+        otherwise the query's compute dtype).
 
     Returns
     -------
@@ -299,6 +310,7 @@ def msa_sparse_decode_attention(
             partial_dtype=partial_dtype,
             force_fused=force_fused,
             workspace=workspace,
+            out=out,
         )
     if workspace is not None:
         raise ValueError(
@@ -332,6 +344,20 @@ def msa_sparse_decode_attention(
     if head_dim != 128:
         raise ValueError(f"head_dim must be 128, got {head_dim}")
     batch_size = total_q // seqlen_q
+    if out is not None:
+        expected_shape = (total_q, num_qo_heads, head_dim)
+        if not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor")
+        if (
+            tuple(out.shape) != expected_shape
+            or out.dtype != compute_dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                f"out must be contiguous {compute_dtype} with shape "
+                f"{expected_shape} on {q.device}"
+            )
     num_kv_heads = k.shape[1]
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be a multiple of num_kv_heads")
@@ -458,8 +484,12 @@ def msa_sparse_decode_attention(
 
     if fused:
         # The split-path partial buffers collapse to dummies.
-        out_buf = torch.empty(
-            (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
+        out_buf = (
+            out
+            if out is not None
+            else torch.empty(
+                (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
+            )
         )
         lse_buf = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
         # topk (shape[0]) and head_dim (shape[3]) are static in the compiled
@@ -610,6 +640,7 @@ def msa_sparse_decode_attention(
         split_counts,
         group_size,
         compute_dtype,
+        out=out,
         lse_out=lse_out,
         out_scale=float(v_global_scale) if v_global_scale is not None else 1.0,
     )
