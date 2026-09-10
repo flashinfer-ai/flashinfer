@@ -212,9 +212,3 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 .sqsh_build_logs/
 *.sqsh
 .fi_workspace/
-
-# Profiler captures. Nsight Systems records the profiled process's whole
-# environment inside the .nsys-rep, and the container cannot be scrubbed, so a
-# capture is never a tracked artifact.
-*.nsys-rep
-*.sqlite

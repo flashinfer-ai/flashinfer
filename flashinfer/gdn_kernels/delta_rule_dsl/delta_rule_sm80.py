@@ -918,6 +918,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
         beta_pipeline,
         beta_producer_state,
         blk: cutlass.Int32,
+        t_block_start: cutlass.Int32,
         tok_start,
         tok_end: cutlass.Int32,
         scale: cutlass.Float32,
@@ -996,6 +997,52 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
             alpha_pipeline.producer_commit(alpha_producer_state)
             alpha_producer_state.advance()
 
+        beta_producer_state = self.issue_beta_stage(
+            sBeta,
+            g_beta,
+            beta_pipeline,
+            beta_producer_state,
+            blk,
+            t_block_start,
+            tok_start,
+            tok_end,
+            sab_head_idx,
+            num_sab_heads,
+            tid,
+            warp_idx,
+        )
+
+        return (
+            q_producer_state,
+            k_producer_state,
+            v_producer_state,
+            alpha_producer_state,
+            beta_producer_state,
+        )
+
+    @cute.jit
+    def issue_beta_stage(
+        self,
+        sBeta: cute.Tensor,
+        g_beta: cute.Tensor,
+        beta_pipeline,
+        beta_producer_state,
+        blk: cutlass.Int32,
+        t_block_start: cutlass.Int32,
+        tok_start,
+        tok_end: cutlass.Int32,
+        sab_head_idx: cutlass.Int32,
+        num_sab_heads: cutlass.Int32,
+        tid: cutlass.Int32,
+        warp_idx: cutlass.Int32,
+    ):
+        """What the fifth stage carries for one block. Here that is beta.
+
+        The only part of the issuer `CPDeltaRulePrefillSm80` replaces: it puts
+        a T tile in this stage, which stage 1 has already folded beta into.
+        `t_block_start` and `tid` are on the signature for that override, the
+        way `sBeta` and `g_beta` are already carried when `needs_beta` is off.
+        """
         if cutlass.const_expr(self.needs_beta):
             beta_pipeline.producer_acquire(beta_producer_state)
             if warp_idx == cutlass.Int32(1):
@@ -1011,14 +1058,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
                 )
             beta_pipeline.producer_commit(beta_producer_state)
             beta_producer_state.advance()
-
-        return (
-            q_producer_state,
-            k_producer_state,
-            v_producer_state,
-            alpha_producer_state,
-            beta_producer_state,
-        )
+        return beta_producer_state
 
     # ─── load_alpha ───────────────────────────────────────────────────────────
     # Translates FlatMainloopTmaWarpSpecializedDeltaRule::load_alpha (scalar load).
@@ -1841,6 +1881,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
                 beta_pipeline,
                 beta_producer_state,
                 cutlass.Int32(0),
+                cutlass.Int32(0),
                 work_desc.tok_offset,
                 tok_end,
                 scale,
@@ -1926,6 +1967,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
                 alpha_producer_state,
                 beta_pipeline,
                 beta_producer_state,
+                cutlass.Int32(0),
                 cutlass.Int32(0),
                 work_desc.tok_offset,
                 tok_end,
@@ -2030,6 +2072,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
                 beta_pipeline,
                 beta_producer_state,
                 blk,
+                cutlass.Int32(0),
                 work_desc.tok_offset,
                 tok_end,
                 scale,
@@ -2133,6 +2176,7 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
                 beta_pipeline,
                 beta_producer_state,
                 last_blk,
+                cutlass.Int32(0),
                 work_desc.tok_offset,
                 tok_end,
                 scale,
