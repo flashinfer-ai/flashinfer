@@ -28,10 +28,11 @@ Output:  o [B,T,HV,V]
 Supports GQA (H != HV), cu_seqlens for variable-length batches, and
 compile-time gate modes (pre-computed, softplus, lower_bound * sigmoid).
 
-The host wrapper makes one architecture decision. Single-token workloads below a
-head-dimension-specific sequence-head cutoff use the latency-efficient one-warp
-kernel; larger grids use grouped-CTA. All multi-token workloads use grouped-CTA,
-which amortizes token preprocessing across its V-column tile.
+The host wrapper makes one architecture decision. Single-token workloads use
+grouped-CTA at small grids and one-warp at larger grids; Blackwell D128 returns to
+grouped-CTA at 4,096 sequence-heads. Multi-token workloads generally use
+grouped-CTA, except non-GQA T=3 gated and T=4 ungated workloads in their measured
+one-warp ranges.
 """
 
 import functools
@@ -66,6 +67,7 @@ DOT_REDUCTION_DUAL_ACCUM = 1
 # Conservative fallback for architectures without a tuned dispatch heuristic.
 GROUPED_MIN_SEQUENCE_HEADS = {64: 7680, 128: 1920}
 TUNED_DISPATCH_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+BLACKWELL_D128_GROUPED_MIN_SEQUENCE_HEADS = 4096
 
 
 def _use_one_warp(
@@ -83,7 +85,11 @@ def _use_one_warp(
 
     if num_tokens == 1:
         grouped_max = 256 if head_dim == 64 else 128
-        return sequence_heads > grouped_max
+        if sequence_heads <= grouped_max:
+            return False
+        if head_dim == 128:
+            return sequence_heads < BLACKWELL_D128_GROUPED_MIN_SEQUENCE_HEADS
+        return True
     if num_tokens == 4 and query_heads == value_heads and not use_gate:
         return sequence_heads < 4096
     if num_tokens == 3 and query_heads == value_heads and use_gate:
@@ -1551,7 +1557,9 @@ def run_recurrent_kda(
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also be
             set). Indexed standard decode pages the selected caller-owned slots
             directly; when omitted, standard decode uses a dense identity
-            mapping. The wrapper flattens 2D speculative indices before launch.
+            mapping. In standard decode, ``-1`` marks an inactive row that
+            produces zero output and does not update state. The wrapper flattens
+            2D speculative indices before launch.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in a single
             fused kernel launch. If ``cu_seqlens`` is provided, requires 2D
@@ -1596,9 +1604,10 @@ def run_recurrent_kda(
               ``cu_seqlens``). Padded sequence positions are zero-filled
               in spec mode.
             - state: Updated state if ``output_final_state=True``, else
-              ``None``. Indexed standard decode returns the compact
-              ``[B, HV, V, K]`` view while updating the full caller-owned pool
-              in place. For batched spec decode without ``cu_seqlens``, this is
+              ``None``. Indexed standard decode returns a gathered compact
+              ``[B, HV, V, K]`` copy while updating the full caller-owned pool
+              in place; edits to the returned tensor do not update that pool.
+              For batched spec decode without ``cu_seqlens``, this is
               the packed checkpoint state pool used by the shim.
 
     Note:
@@ -1861,7 +1870,9 @@ def run_recurrent_kda(
                 )
             ssi = ssm_state_indices.to(torch.int32).contiguous()
         if initial_state is None:
-            max_idx = int(ssi.max().item()) + 1
+            # Dense decode needs exactly one state slot per batch row. Avoid
+            # inspecting the identity indices so this path remains capturable.
+            max_idx = B if ssm_state_indices is None else int(ssi.max().item()) + 1
             state = torch.zeros(
                 max(B, max_idx), HV, V, K, device=device, dtype=torch.bfloat16
             )
@@ -1870,6 +1881,7 @@ def run_recurrent_kda(
             # both kernel architectures. Keeping the indices on device avoids
             # full-state gather and scatter launches around the recurrence.
             state = initial_state
+        zero_inactive_output = use_one_warp and ssm_state_indices is not None
         if (
             output is not None
             and output.shape == (B, 1, HV, V)
@@ -1877,8 +1889,14 @@ def run_recurrent_kda(
             and output.device == device
         ):
             out_buf = output
+            if zero_inactive_output:
+                out_buf.zero_()
         else:
-            out_buf = torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
+            out_buf = (
+                torch.zeros(B, 1, HV, V, device=device, dtype=q.dtype)
+                if zero_inactive_output
+                else torch.empty(B, 1, HV, V, device=device, dtype=q.dtype)
+            )
 
     # With no packed tokens there is no safe address for predicated loads and
     # no recurrent update to perform. Output initialization above defines the

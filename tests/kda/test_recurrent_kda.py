@@ -660,6 +660,100 @@ def test_standard_decode_state_indices_cuda_graph():
         )
 
 
+@pytest.mark.parametrize(
+    ("B", "H"),
+    [
+        pytest.param(4, 32, id="grouped"),
+        pytest.param(8, 32, id="one-warp"),
+    ],
+)
+def test_standard_decode_dense_auto_state_cuda_graph(B, H):
+    """Dense decode can capture while allocating its identity-mapped state."""
+    torch.manual_seed(45)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    D = 128
+
+    q = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    k = torch.rand_like(q)
+    v = torch.rand_like(q)
+    g = F.logsigmoid(torch.randn_like(q, dtype=torch.float32)).to(dtype)
+    beta = torch.rand(B, 1, H, dtype=dtype, device=device).sigmoid()
+
+    expected_output, expected_state = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        output_final_state=True,
+    )
+
+    capture_stream = torch.cuda.Stream(device=device)
+    capture_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(q=q, k=k, v=v, g=g, beta=beta, output_final_state=True)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            output_final_state=True,
+        )
+
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert_close("graph output", expected_output.float(), captured_output.float())
+        assert_close("graph state", expected_state.float(), captured_state.float())
+
+
+@pytest.mark.parametrize(
+    ("B", "H"),
+    [
+        pytest.param(4, 32, id="grouped"),
+        pytest.param(8, 32, id="one-warp"),
+    ],
+)
+def test_standard_decode_negative_state_index_zero_fills_output(B, H):
+    """An inactive indexed row is safe and produces defined zero output."""
+    torch.manual_seed(46)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    D = 128
+
+    q = torch.rand(B, 1, H, D, dtype=dtype, device=device)
+    k = torch.rand_like(q)
+    v = torch.rand_like(q)
+    g = F.logsigmoid(torch.randn_like(q, dtype=torch.float32)).to(dtype)
+    beta = torch.rand(B, 1, H, dtype=dtype, device=device).sigmoid()
+    state = torch.randn(B + 1, H, D, D, dtype=dtype, device=device) * 0.01
+    untouched = state[B].clone()
+    state_indices = torch.arange(B, dtype=torch.int32, device=device)
+    state_indices[-1] = -1
+    output = torch.full((B, 1, H, D), float("nan"), dtype=dtype, device=device)
+
+    actual, _ = recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=state,
+        ssm_state_indices=state_indices,
+        output=output,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(actual[-1], torch.zeros_like(actual[-1]))
+    torch.testing.assert_close(state[B], untouched)
+
+
 # ==============================================================================
 # vLLM CUDA graph padding tests
 # ==============================================================================
@@ -1383,6 +1477,10 @@ _BACKEND_SELECTION_CASES = [
     (128, 4, 256, 16, 32, False, (10, 0), False, "SM100-T4-GQA-grouped"),
     (128, 1, 128, 16, 16, False, (10, 3), False, "SM103-D128-T1-grouped-edge"),
     (128, 1, 129, 16, 16, False, (10, 3), True, "SM103-D128-T1-one-warp-edge"),
+    (128, 1, 4095, 16, 16, True, (10, 0), True, "SM100-D128-T1-upper-minus-one"),
+    (128, 1, 4096, 16, 16, True, (10, 0), False, "SM100-D128-T1-upper-edge"),
+    (128, 1, 4095, 16, 16, True, (10, 3), True, "SM103-D128-T1-upper-minus-one"),
+    (128, 1, 4096, 16, 16, True, (10, 3), False, "SM103-D128-T1-upper-edge"),
     (128, 3, 256, 16, 16, True, (10, 3), True, "SM103-T3-gated-one-warp-edge"),
     (128, 1, 1919, 16, 16, False, (9, 0), True, "fallback-D128-cutoff-minus-one"),
     (128, 1, 1920, 16, 16, False, (9, 0), False, "fallback-D128-cutoff"),
