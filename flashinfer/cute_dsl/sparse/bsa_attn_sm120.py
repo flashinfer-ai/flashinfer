@@ -538,6 +538,7 @@ def bsa_attn_sm120_blk64_sage_fwd(
     block_sparse_num: int,
     block_sizes: Optional[torch.Tensor] = None,
     q2k_block_nums: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
     *,
     out: Optional[torch.Tensor] = None,
     tma_descriptor_workspace: Optional[torch.Tensor] = None,
@@ -771,13 +772,27 @@ def bsa_attn_sm120_blk64_sage_fwd(
     q_cute = to_cute_tensor(q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
     k_cute = to_cute_tensor(k_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
     v_cute = to_cute_tensor(v_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
-    out_cute = to_cute_tensor(out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
-    q_scale_cute = to_cute_tensor(q_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False)
-    k_scale_cute = to_cute_tensor(k_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False)
-    v_scale_cute = to_cute_tensor(v_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False)
-    q2k_cute = to_cute_tensor(q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
-    q2k_nums_cute = to_cute_tensor(q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
-    block_sizes_cute = to_cute_tensor(block_sizes_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False)
+    out_cute = to_cute_tensor(
+        out_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False
+    )
+    q_scale_cute = to_cute_tensor(
+        q_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    k_scale_cute = to_cute_tensor(
+        k_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    v_scale_cute = to_cute_tensor(
+        v_scale_t, assumed_align=4, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_cute = to_cute_tensor(
+        q2k_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    q2k_nums_cute = to_cute_tensor(
+        q2k_nums_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
+    block_sizes_cute = to_cute_tensor(
+        block_sizes_t, assumed_align=None, leading_dim=0, enable_tvm_ffi=False
+    )
 
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
