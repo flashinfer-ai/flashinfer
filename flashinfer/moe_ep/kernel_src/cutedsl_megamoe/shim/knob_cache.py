@@ -172,7 +172,11 @@ def lookup_knobs(
     ]
     if not matches:
         return None
-    # We use IKR to break ties. If IKR is not allowed, that will be filtered out when constructing matches
+    # Key of `(tokens, ~ikr)` causes the IKR config to be selected by min()
+    # An IKR entry may not exist if
+    #  1. the offline autotuner ran with IKR disabled
+    #  2. the fastest config is IKR disabled
+    #  3. `enable_in_kernel_fc2_reduce` is False and was filtered out above
     at_or_above = [e for e in matches if e["max_tokens"] >= max_tokens]
     if at_or_above:
         best = min(

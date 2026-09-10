@@ -1106,8 +1106,9 @@ def get_symm_buffer_for_mega_moe(
     )
     cfg = with_knobs(cfg, knobs)
     # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
-    #   despite the entire design of the autotuner being to allow it to disable ikr if it would be faster
-    #   We have enabled varying the knobs here, revisit this if we see unexpected behavior
+    #   despite the autotuner supporting disabling ikr if it would be faster.
+    #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine
+    #   We have now enabled varying the knobs here, revisit this if we see unexpected behavior
     assert not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce, (
         "in_kernel_fc2_reduce must be disabled if enable_in_kernel_fc2_reduce is False"
     )
