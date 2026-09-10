@@ -1079,16 +1079,16 @@ def build_context_task_manager(
         else:
             work_queue = WorkQueue(**work_queue_kwargs)
 
-    # Skip softmax publishes one Int32 vote per softmax warp for every S/P
-    # stage of each instance. The MMA task reads the four words of an instance
-    # after the matching P-ready wait.
+    # Skip softmax packs the votes of the four softmax warps of every S/P stage
+    # of each instance into one Int32 word, one byte per warp. The MMA task
+    # reads the word after the matching P-ready wait.
     skip_softmax_vote_alloc: SmemAllocation | None = None
     if cfg.enable_skip_softmax:
         skip_softmax_vote_alloc = SmemAllocation(
             "smem_skip_softmax_vote",
             dtype=cutlass.Int32,
             count=cfg.skip_softmax_vote_words,
-            alignment=16,
+            alignment=4,
         )
 
     tmem_sp0 = TmemSPResource(
