@@ -63,9 +63,9 @@ HEURISTIC_CONFIGS = {
     "per_tensor": {
         8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
         16: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1)),
-        32: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(1, 1, 1)),
-        64: _config(swap_ab=True, pingpong=False, tile=(128, 64, 128), cga=(1, 2, 1)),
-        128: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1)),
+        32: _config(swap_ab=True, pingpong=False, tile=(256, 8, 128), cga=(2, 1, 1)),
+        64: _config(swap_ab=True, pingpong=False, tile=(128, 8, 128), cga=(1, 2, 1)),
+        128: _config(swap_ab=True, pingpong=True, tile=(128, 8, 128), cga=(1, 2, 1)),
         256: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1)),
         512: _config(swap_ab=True, pingpong=False, tile=(256, 64, 128), cga=(1, 1, 1)),
         1024: _config(swap_ab=True, pingpong=True, tile=(128, 64, 128), cga=(1, 2, 1)),
@@ -91,6 +91,17 @@ HEURISTIC_CONFIGS = {
     # (2026-09-02, fold layout): each +3..+4% over the ping-pong twin the
     # 2026-08-19 table selected, consistent across three interleaved runs on
     # two H200 nodes.
+    # Swap-AB token tile N=8 (2026-09-10, wgmma m64n8k32, same-node
+    # interleaved A/B x2 vs the N>=16 rows, 1830 MHz): per_tensor 64 basic
+    # M128N8 +13.5% (16 tokens/expert fill two N=8 tiles instead of one N=64
+    # tile that is 3/4 padding) and per_tensor 128 ping-pong M128N8 +4.6%.
+    # per_tensor 32 moved from non-swap M64N256 to cooperative swap M256N8
+    # CGA2x1 (+5.7% / +6.4% e2e over two rounds, compute +7%; the ping-pong
+    # swap M128N8 twin only ties the non-swap tile).  Not switched: per_tensor
+    # 16 (+1.8%) and blockwise 64 (+1.7..+2.9%) -- measurable but judged too
+    # small to move the table; pt8 / bw8 / bw16 / bw32 (+0.2..+1.2%, within
+    # the +-1% run noise); bw128 / bw256 / pt256 (-15..-42%: twice the tile
+    # count outweighs the padding win once every N>=16 tile is full).
     # blockwise non-swap 512-32768: cooperative M64N256 (two epilogue WGs on
     # one tile), 2026-09-02 4x H200 under the fold_producer_warps layout:
     # +11..+30% over both the basic M64N128 tile and its ping-pong twin at the

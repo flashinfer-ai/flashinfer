@@ -47,7 +47,10 @@ CORRECTNESS_KNOBS: Dict[str, Tuple[Any, ...]] = {
 }
 
 _NONSWAP_TILES = ((64, 128, 128), (64, 256, 128))
-_SWAPAB_TILES = tuple((m, n, 128) for m in (128, 256) for n in (16, 32, 64, 128))
+# Keep in sync with hopper_fp8._SWAPAB_TILE_N_CHOICES (N=8 admitted 2026-09-10).
+_SWAPAB_TILES = tuple(
+    (m, n, 128) for m in (128, 256) for n in (8, 16, 32, 64, 128)
+)
 _CLUSTER_SHAPES = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
 
 PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
@@ -128,7 +131,7 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
     in_kernel = knobs.get("in_kernel_fc2_reduce", False)
 
     if swap_ab:
-        if m not in (128, 256) or n not in (16, 32, 64, 128):
+        if m not in (128, 256) or n not in (8, 16, 32, 64, 128):
             return False
         if pingpong and m != 128:
             return False

@@ -186,6 +186,15 @@ def _parse_args() -> argparse.Namespace:
         help="override the mma tile (M,N; K fixed at 128). Default: the "
         "shim's per-layout default (non-swap 64,128 / swap-AB 256,32).",
     )
+    p.add_argument(
+        "--cga",
+        type=str,
+        default=None,
+        metavar="M,N",
+        help="manual-order only: cluster shape (M,N; K fixed at 1) for the "
+        "explicit --swap-ab/--no-swap-ab layouts. Default: the shim's manual "
+        "default (1,1).",
+    )
     p.add_argument("--top-k", type=int, default=6)
     # TOTAL experts across all EP ranks (DSV4-Pro: 384), fixed regardless of
     # world size -- each rank owns num_experts // world_size local experts
@@ -293,6 +302,14 @@ def _parse_args() -> argparse.Namespace:
         "doubled tile (N256 / M256, no pingpong). Cluster "
         "shape / accum / token-back stay the bucket's; buckets already in "
         "the requested mode run unchanged (that no-op is the A/B sanity gate).",
+    )
+    p.add_argument(
+        "--swap-token-tile",
+        type=int,
+        default=None,
+        help="heuristic-order only: on swap-AB buckets replace the token tile "
+        "(mma N) with this value, keeping the bucket's M / pingpong / cluster "
+        "shape / token-back (e.g. 8 to probe the experimental N=8 tile).",
     )
     p.add_argument(
         "--pingpong",
@@ -482,7 +499,10 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         swap_ab = None
         mma_tiler_mnk = None
         epi_mode = getattr(args, "epi_mode", "auto")
-        if (pingpong is not None or epi_mode != "auto") and tokens is not None:
+        swap_token_tile = getattr(args, "swap_token_tile", None)
+        if (
+            pingpong is not None or epi_mode != "auto" or swap_token_tile is not None
+        ) and tokens is not None:
             # A pingpong override alone would flip the shim into its
             # manual-geometry branch (default tiles).  Resolve the bucket's
             # heuristic config here and pass the full geometry with only
@@ -522,22 +542,34 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
                         (per_wg_tile, n, k) if c.swap_ab else (m, per_wg_tile, k)
                     )
                     pingpong = epi_mode == "pingpong"
-            if pingpong and not c.pingpong and not _pingpong_tile_ok(
-                type("T", (), {"mma_tiler_mnk": mma_tiler_mnk, "swap_ab": c.swap_ab})
+            if swap_token_tile is not None and c.swap_ab:
+                m, _n, k = mma_tiler_mnk
+                mma_tiler_mnk = (m, swap_token_tile, k)
+                if pingpong is None:
+                    pingpong = c.pingpong
+            if (
+                pingpong
+                and not c.pingpong
+                and not _pingpong_tile_ok(
+                    type(
+                        "T", (), {"mma_tiler_mnk": mma_tiler_mnk, "swap_ab": c.swap_ab}
+                    )
+                )
             ):
                 pingpong = c.pingpong  # bucket tile can't run ping-pong
     else:
         swap_ab = operand_order == "swap_ab"
         mma_tiler_mnk = (tile[0], tile[1], 128)
+        if getattr(args, "cga", None):
+            cm, cn = (int(v) for v in args.cga.split(","))
+            cluster_shape_mnk = (cm, cn, 1)
     return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=args.intermediate,
         top_k=args.top_k,
         kind=args.kind,
         fp8_scale_mode=scale_mode,
         fp8_accum_mode=(
-            args.fp8_accum_mode
-            if args.fp8_accum_mode is not None
-            else accum_override
+            args.fp8_accum_mode if args.fp8_accum_mode is not None else accum_override
         ),
         swap_ab=swap_ab,
         mma_tiler_mnk=mma_tiler_mnk,

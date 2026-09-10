@@ -377,14 +377,22 @@ def _megakernel_config(
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
-    fold_producer_warps: bool = False,
+    fold_producer_warps: bool | None = None,
     mma_tiler_mnk=None,
     pingpong=None,
     cluster_shape_mnk=None,
 ):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
+    # fold_producer_warps None -> the config's default (True); the fold and
+    # old-layout tests pin it explicitly.
+    fold_kw = (
+        {}
+        if fold_producer_warps is None
+        else {"fold_producer_warps": fold_producer_warps}
+    )
     return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+        **fold_kw,
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         kind=problem["kind"],
@@ -400,7 +408,6 @@ def _megakernel_config(
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
-        fold_producer_warps=fold_producer_warps,
         mma_tiler_mnk=mma_tiler_mnk,
         pingpong=pingpong,
         cluster_shape_mnk=cluster_shape_mnk,
@@ -424,7 +431,7 @@ def _run_mega_layer(
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
-    fold_producer_warps: bool = False,
+    fold_producer_warps: bool | None = None,
     mma_tiler_mnk=None,
     pingpong=None,
     cluster_shape_mnk=None,
@@ -584,6 +591,17 @@ def _run_mega_layer(
             torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
         mega.destroy()
         return rank
+    except BaseException:
+        # Print the real failure before finalize: a kernel fault poisons the
+        # CUDA context and nvshmem finalize then segfaults, which would
+        # otherwise swallow this traceback.
+        import sys
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
     finally:
         finalize_moe_ep_runtime(runtime)
 
@@ -843,12 +861,50 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_blockwise_coop_n256(cluster_shape_mnk):
         # heuristic rows re-calibrated on 2026-09-02/03 (see TUNING.md).
         ("per_tensor", True, (256, 16, 128), False, (2, 1, 1), "epi_warps", 8),
         ("per_tensor", True, (128, 64, 128), False, (1, 2, 1), "epi_warps", 64),
-        ("blockwise", False, (64, 256, 128), False, (2, 2, 1), "reuse_dispatch_warps", 2048),
-        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "reuse_dispatch_warps", 2048),
-        ("blockwise", False, (64, 256, 128), False, (1, 2, 1), "reuse_dispatch_warps", 2048),
+        # N=8 rows adopted 2026-09-10 (same-node interleaved A/B vs the N>=16
+        # rows: pt64 +13.5%, pt128 +4.6%; pt32 moved from non-swap M64N256 to
+        # cooperative swap M256N8, +6%).
+        ("per_tensor", True, (256, 8, 128), False, (2, 1, 1), "epi_warps", 32),
+        ("per_tensor", True, (128, 8, 128), False, (1, 2, 1), "epi_warps", 64),
+        ("per_tensor", True, (128, 8, 128), True, (1, 2, 1), "epi_warps", 128),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (2, 2, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (2, 1, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (1, 2, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
     ],
-    ids=["pt8_coop_M256N16", "pt64_basic_M128N64", "bw_coop_N256_cga22_reuse",
-         "bw_coop_N256_cga21_reuse", "bw_coop_N256_cga12_reuse"],
+    ids=[
+        "pt8_coop_M256N16",
+        "pt64_basic_M128N64",
+        "pt32_coop_M256N8",
+        "pt64_basic_M128N8",
+        "pt128_pp_M128N8",
+        "bw_coop_N256_cga22_reuse",
+        "bw_coop_N256_cga21_reuse",
+        "bw_coop_N256_cga12_reuse",
+    ],
 )
 def test_moe_ep_sm90_pull_fp8_mega_layer_recalibrated_heuristic_rows(case):
     """Bit-exact check of every heuristic row changed by the fold re-calibration.
@@ -879,6 +935,52 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_recalibrated_heuristic_rows(case):
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"(recalibrated row {scale} swap={swap_ab} tile={tile} pp={pingpong} "
         f"cga={cga} tb={token_back} tokens={num_tokens}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("per_tensor", (128, 8, 128), True, (2, 1, 1)),
+        ("per_tensor", (256, 8, 128), False, (2, 1, 1)),
+        # cga (2,1): B multicast splits the (8 x 4 fp32) token-scale box into
+        # 64 B sub-boxes, which the kernel now loads non-multicast (TMA needs a
+        # 128 B-aligned smem destination).  cga (1,1): the same tile without
+        # any cluster split.
+        ("blockwise", (256, 8, 128), False, (2, 1, 1)),
+        ("blockwise", (256, 8, 128), False, (1, 1, 1)),
+        ("blockwise", (128, 8, 128), True, (1, 2, 1)),
+    ],
+    ids=[
+        "pt_pp_M128N8",
+        "pt_coop_M256N8",
+        "bw_coop_M256N8",
+        "bw_coop_M256N8_cga1",
+        "bw_pp_M128N8",
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_swapab_token_tile_8(case):
+    """Experimental swap-AB token tile N=8 (wgmma m64n8k32) bit-exact check."""
+    scale, tile, pingpong, cga = case
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=scale,
+        swap_ab=True,
+        num_tokens=16,
+        mma_tiler_mnk=tile,
+        pingpong=pingpong,
+        cluster_shape_mnk=cga,
+    )
+    print(
+        f"rank {rank}: swap-AB token tile 8 ({scale} tile={tile} pp={pingpong} cga={cga}) matches reference"
     )
 
 

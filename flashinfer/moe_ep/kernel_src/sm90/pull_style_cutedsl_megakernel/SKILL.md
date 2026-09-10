@@ -64,6 +64,22 @@ not picked them up):
   bucket's epilogue mode for twin sweeps (basic: one WG, per-WG-size tile;
   pingpong: two WGs, per-WG-size tiles alternating; cooperative: two WGs,
   one doubled tile — the tile is derived from the bucket's entry).  The drop tree has none of this yet.
+- Swap-AB token tile N=8 (2026-09-09/10): `SwapABTokenTileNChoices` / shim
+  `_SWAPAB_TILE_N_CHOICES` / `shim/tuner.py` `_SWAPAB_TILES` + `is_valid`
+  admit 8, bench `--swap-token-tile N`, test `test_..._swapab_token_tile_8`;
+  `heuristic_config.py` per_tensor 32/64/128 now use N=8 (same-node
+  interleaved A/B, see TUNING.md; pt32 moved from non-swap to cooperative
+  swap; pt16 / bw64 gains of ~2% were judged too small), with bit-exact rows in
+  `test_..._recalibrated_heuristic_rows`; bench gained `--cga M,N` for
+  manual-order runs.  Needed a
+  kernel fix: the blockwise token-scale TMA box (n×4 fp32) rode B's cluster-M
+  multicast, and its per-CTA sub-box (n/cluster_m · 16 B = 64 B at n=8)
+  violates TMA's 128 B smem-destination alignment.  `is_sf_mcast` /
+  `num_mcast_ctas_sf` in `kernel_fp8_glu_fc12_swapab.py` now drop the
+  multicast for that box only when the sub-box is not a 128 B multiple, and
+  `_tma_load_b_with_activation_sf_task_tile` in `kernel_fp8_glu_fc12.py`
+  takes the sf box's own CTA coord / layout / mask.  n≥16 configs are
+  byte-for-byte the same TMA traffic as before.  Not in the drop tree.
 - `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
   (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
   barrier / pull / reuse token-back all follow it; barrier and grid-sync

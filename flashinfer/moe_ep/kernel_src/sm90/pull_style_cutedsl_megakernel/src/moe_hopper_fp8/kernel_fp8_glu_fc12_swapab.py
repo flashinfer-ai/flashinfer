@@ -396,6 +396,16 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.num_mcast_ctas_b = self.cluster_shape_mn[0]
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
+        # The activation-scale box (token_tile_n x 4 fp32 = n*16 B per stage) rides
+        # the B multicast: tma_partition splits it across the cluster-M CTAs, so each
+        # CTA lands a (n / cluster_m) x 16 B sub-box at its own smem offset.  TMA
+        # requires a 128 B-aligned smem destination, so multicast the box only when
+        # that sub-box is a 128 B multiple; otherwise (n=8 with a 2-CTA cluster ->
+        # 64 B) every CTA loads the full box itself -- same bytes arrive per CTA, so
+        # the ab_pipeline transaction count is unchanged.
+        sf_sub_box_bytes = (self.token_tile_size // self.num_mcast_ctas_b) * 4 * 4
+        self.is_sf_mcast = self.is_b_mcast and sf_sub_box_bytes % 128 == 0
+        self.num_mcast_ctas_sf = self.num_mcast_ctas_b if self.is_sf_mcast else 1
 
         # Epilogue is autonomous: it owns acc stage, subtile dispatch, TMA
         # commit/drain, and piggyback red.add decisions.
@@ -940,9 +950,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 (None, None, 0),
             )
             activation_sf_tiler = (self.token_tile_size, 4)
+            # Non-multicast when the per-CTA sub-box would be < 128 B (see
+            # is_sf_mcast in _setup_attributes).
             activation_sf_op = (
                 cpasync.CopyBulkTensorTileG2SMulticastOp()
-                if self.is_b_mcast
+                if self.is_sf_mcast
                 else cpasync.CopyBulkTensorTileG2SOp()
             )
             (
@@ -953,7 +965,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 activation_sf_gemm,
                 activation_sf_smem_layout,
                 activation_sf_tiler,
-                num_multicast=self.num_mcast_ctas_b,
+                num_multicast=self.num_mcast_ctas_sf,
             )
             (
                 tma_atom_fc2_activation_sf,
@@ -963,7 +975,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 fc1_output_sf_gemm,
                 activation_sf_smem_layout,
                 activation_sf_tiler,
-                num_multicast=self.num_mcast_ctas_b,
+                num_multicast=self.num_mcast_ctas_sf,
             )
         else:
             # Compile-time placeholders; the per-tensor kernel removes all SF
@@ -1225,6 +1237,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         )
         a_cta_coord = cluster_coord_mnk[1]
         b_cta_coord = cluster_coord_mnk[0]
+        # Activation-scale box follows B's multicast split only when its per-CTA
+        # sub-box stays 128 B aligned; otherwise each CTA issues the full box.
+        sf_cta_layout = b_cta_layout if self.is_sf_mcast else cute.make_layout(1)
+        sf_cta_coord = b_cta_coord if self.is_sf_mcast else 0
+        sf_mcast_mask = b_mcast_mask if self.is_sf_mcast else 0
         epilogue_group_idx = warp_idx // cutlass.Int32(
             self.epilogue_warps_per_warpgroup
         )
@@ -1707,6 +1724,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                                 tma_cta_coord=b_cta_coord,
                                 tma_cta_layout=b_cta_layout,
                                 mcast_mask=b_mcast_mask,
+                                sf_tma_cta_coord=sf_cta_coord,
+                                sf_tma_cta_layout=sf_cta_layout,
+                                sf_mcast_mask=sf_mcast_mask,
                                 _iket_active=_iket_tma_b_active,
                             )
                         )
@@ -1780,6 +1800,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                                 tma_cta_coord=b_cta_coord,
                                 tma_cta_layout=b_cta_layout,
                                 mcast_mask=b_mcast_mask,
+                                sf_tma_cta_coord=sf_cta_coord,
+                                sf_tma_cta_layout=sf_cta_layout,
+                                sf_mcast_mask=sf_mcast_mask,
                                 _iket_active=_iket_tma_b_active,
                             )
                         )

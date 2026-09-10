@@ -70,7 +70,7 @@ _FP8_DISPATCH_SCALE_ATOM_K = 128  # Fp8DispatchScaleAtomK = 4 * Fp8E8M0SfVecSize
 _NONSWAP_TILE_M_CHOICES = (64,)
 _NONSWAP_TILE_N_CHOICES = (128, 256)
 _SWAPAB_TILE_M_CHOICES = (128, 256)
-_SWAPAB_TILE_N_CHOICES = (16, 32, 64, 128)
+_SWAPAB_TILE_N_CHOICES = (8, 16, 32, 64, 128)
 
 # CGA shapes accepted by the drop's _validate_mma_tiler_and_cluster_shape
 # (both geometries).  Cluster K must stay 1; peers only cooperate through

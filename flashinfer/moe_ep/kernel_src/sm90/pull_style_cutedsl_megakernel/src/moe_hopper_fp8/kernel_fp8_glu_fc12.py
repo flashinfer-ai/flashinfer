@@ -1935,7 +1935,15 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        sf_tma_cta_coord,
+        sf_tma_cta_layout,
+        sf_mcast_mask,
     ):
+        # The activation-scale box may use a different (non-)multicast split than
+        # B: a (n / cluster_m) x 16 B sub-box is misaligned for TMA when n=8, so
+        # the caller passes the sf box's own CTA coord / layout / mask (equal to
+        # B's when the sf box rides B's multicast).  No Python-level fallback here:
+        # a `None` check inside the jit body is traced as a dynamic branch.
         gB_nkl = cute.local_tile(
             real_b,
             cute.slice_(self.mma_tiler, (0, None, None)),
@@ -1958,8 +1966,8 @@ class Sm90SwigluFp8Fc12Kernel:
         )
         tBsActivationSf, tBgActivationSf = cpasync.tma_partition(
             tma_atom_activation_sf,
-            tma_cta_coord,
-            tma_cta_layout,
+            sf_tma_cta_coord,
+            sf_tma_cta_layout,
             cute.group_modes(sActivationSf, 0, 2),
             cute.group_modes(gActivationSf, 0, 2),
         )
@@ -2000,7 +2008,7 @@ class Sm90SwigluFp8Fc12Kernel:
                 tBgActivationSf_slice[(None, scale_group_tile)],
                 tBsActivationSf[(None, handle.index)],
                 tma_bar_ptr=handle.barrier,
-                mcast_mask=mcast_mask,
+                mcast_mask=sf_mcast_mask,
             )
             if _iket_active:
                 iket.range_pop()
