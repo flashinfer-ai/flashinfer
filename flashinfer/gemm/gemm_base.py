@@ -735,11 +735,11 @@ def mm_bf16(
         explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
-        with at most 64 K tiles), and cluster Split-K otherwise. With
-        autotuning, one call profiles the low-M kernels on the M <= 32
-        buckets and the cuBLASLt fallback on the larger ones, so a single
-        large-M warm-up tunes both ranges; with bias the direct kernel is
-        excluded.
+        with at most 64 K tiles; requires CuTe DSL >= 4.7), and cluster Split-K
+        otherwise. With autotuning, one call profiles the available low-M
+        kernels on the M <= 32 buckets and the cuBLASLt fallback on the larger
+        ones, so a single large-M warm-up tunes both ranges; with bias the
+        direct kernel is excluded.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -1869,8 +1869,8 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
 def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
-    Every runner is listed whatever the real M, so that one autotune call
-    profiles the low-M kernels on the buckets M <= 32 and the cuBLASLt
+    Every available runner is listed whatever the real M, so that one autotune
+    call profiles the low-M kernels on the buckets M <= 32 and the cuBLASLt
     fallback on the buckets above (custom ``tuning_buckets`` are assigned the
     same way). ``[0]`` is the no-autotune default and the autotuner's
     fallback, so it must serve the real inputs: cuBLASLt above 32; below, the
@@ -1880,6 +1880,7 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     cannot serve the real inputs (bias, N, K) are dropped: they serve no
     bucket either.
     """
+    from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
 
     a, b, *_ = inputs
@@ -1888,12 +1889,21 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     major, minor = torch.cuda.get_device_capability(a.device)
     compute_capability = major * 10 + minor
     direct = _cute_dsl_direct_bf16_gemm_runner(compute_capability)
-    warp_splitk = _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability)
+    # Older DSLs lack cutlass.experimental but can use the other runners.
+    warp_splitk = (
+        _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability)
+        if is_cute_dsl_experimental_available()
+        else None
+    )
     cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
     fallback = _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability)
 
     if m > _CUTE_DSL_BF16_MAX_M:
-        return [fallback, warp_splitk, cluster_splitk, direct]
+        return [
+            runner
+            for runner in (fallback, warp_splitk, cluster_splitk, direct)
+            if runner is not None
+        ]
     prefer_direct = direct.supports_inputs(inputs) and prefer_direct_bf16_gemm_sm100(
         m, n, k
     )
@@ -1902,7 +1912,11 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
         if prefer_direct
         else (warp_splitk, cluster_splitk, direct)
     )
-    return [runner for runner in kernels if runner.supports_inputs(inputs)] + [fallback]
+    return [
+        runner
+        for runner in kernels
+        if runner is not None and runner.supports_inputs(inputs)
+    ] + [fallback]
 
 
 def bf16_gemm_sm100(
