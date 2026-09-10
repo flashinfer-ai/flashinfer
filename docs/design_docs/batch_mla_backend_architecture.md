@@ -480,11 +480,12 @@ device, and backend-specific option checks.
 
 ## Backend contracts
 
-| Backend | Native metadata | Kernel input | LSE | Output scale | CUDA Graph replan |
+| Backend | Native metadata | Kernel input | LSE | Output scale | CUDA Graph update |
 | --- | --- | --- | --- | --- | --- |
-| FA2 | CSR | Split | None, base 2, or base e | None | Supported with reserved metadata buffers |
-| FA3 | CSR | Split | None, base 2, or base e | None | Supported with reserved metadata buffers |
-| CUTLASS | Dense | Packed | None | None or per-tensor FP8 | Rejected |
+| FA2 | CSR | Split | None, base 2, or base e | None | Supported after an initial graph plan |
+| FA3 | CSR | Split | None, base 2, or base e | None | Supported after an initial graph plan |
+| CUTLASS | Dense | Packed | None | None or per-tensor FP8 | Unsupported |
+| cuTile | Dense | Packed or split | None | None | Unsupported |
 
 ### FA2 and FA3
 
@@ -557,6 +558,71 @@ do not have an equivalent reserved-buffer protocol. An initial CUTLASS plan may
 be used, but callers must construct another wrapper to change that plan in
 CUDA Graph mode.
 
+### Public CUDA Graph plan-update lifecycle
+
+The additive public lifecycle for dynamic FA2/FA3 replay metadata is:
+
+1. Construct the wrapper with `use_cuda_graph=True`,
+   `enable_cuda_graph_plan_update=True`, and caller-reserved graph metadata
+   buffers. The update flag is a temporary compatibility opt-in; it prevents
+   legacy graph callers from retaining unused state and may become the default
+   after the private replanning bridge is retired.
+2. Complete one public `plan()` to fix the generated backend, captured tensor
+   identities and capacities, run contract, `plan_info`, launch geometry, and
+   staged integer-workspace size.
+3. Capture `run()` using those stable pointers.
+4. Outside active capture, call
+   `update_cuda_graph_plan(metadata=MLAPlanMetadata.csr(...))` on the current
+   stream of the wrapper device, then execute the corresponding replay on that
+   same stream.
+
+The first call that passes the wrapper's lifecycle, capability, and capture
+checks binds the stream, even if backend delegation later fails. Later
+cross-stream updates and concurrent updates on one wrapper are rejected when
+detectable. Cross-stream replay is unsupported: replay is external to the
+wrapper, so its stream cannot be observed or validated and same-stream ordering
+is a caller obligation. `run()` performs no update work.
+Successful `plan()` resets the stream binding for the new plan; failed
+replanning preserves the old binding. Before switching streams through a full
+replan, finish the old updates and graph replays, then recapture `run()` for the
+new plan.
+
+The three host control tensors, `qo_indptr`, `kv_indptr`, and `kv_len_arr`, must
+be contiguous CPU `torch.int32` tensors. `kv_indices` must be contiguous
+`torch.int32` on the wrapper device, must not overlap any capture-reserved
+wrapper buffer, and must remain alive until its queued publication completes.
+The resolver never reads page-index contents back to the host. Publication reads
+the external device source directly and copies only the addressed prefix, so
+the unused reserved tail remains unchanged.
+
+Each successful opted-in generated-FA graph plan retains one device candidate
+schedule/control image, two fixed pinned-host planner/control staging slots, and
+already-created CUDA events. Normally the candidate schedule occupies the
+second staged-prefix region of the backend's existing device integer workspace,
+while the two planner slots occupy the first two staged-prefix regions of its
+existing pinned planner workspace. Capacity checks retain the standalone
+allocation fallback for an unusually large schedule; only a missing region is
+allocated. The small control tensors remain separate. No committed schedule
+image and no device or pinned page-index shadow is retained. An update queries
+the slot events without waiting. If both slots are still in flight, the call
+fails deterministically instead of allocating or synchronizing; a slot whose
+event cannot be recorded is poisoned rather than guessed safe. If both slots
+are poisoned, the caller must run `plan()` again to create fresh update state.
+After warm-up, the update path performs no device or pinned-host allocation,
+D2H copy, or host synchronization.
+
+The non-alias source contract keeps the live captured plan untouched until the
+single native publication launch. Host validation, scheduling, invariant, and
+staging failures therefore preserve the preceding runnable plan without a
+committed rollback image. Once publication has been submitted, asynchronous
+CUDA execution or context failures discovered later are outside this no-sync
+guarantee by design.
+
+CUDA graph plan-update support is capability-gated rather than inferred from a
+backend name. FA2 and FA3 opt in together. CUTLASS, cuTile, and every backend
+that keeps the default-false capability are unsupported and fail before update
+dispatch.
+
 ## Planned run hot path
 
 After a backend is published, a normal `run()` is launch-oriented. It may:
@@ -599,6 +665,25 @@ canonical replacement:
   persistent plan state. It may concatenate independently split query or
   KV-cache tensors. It warns and is the only wrapper path that intentionally
   permits those copies.
+- Older SGLang fast-plan call sites may still read `_cached_module` and the
+  mirrored integer/pinned workspace attributes, use the legacy flat/CSR
+  `plan()` forms, and call the unchanged native planner bridge. The mirrors
+  retain their values, object identities, external setter/mutation behavior,
+  and instance-dictionary storage.
+
+The private fast-plan bridge is deprecated in documentation only in this
+release. It emits no runtime warning because untouched older SGLang reads
+`_cached_module` and may promote `DeprecationWarning` to an exception. The
+public `plan()` / `update_cuda_graph_plan()` / `run()` lifecycle is the
+replacement. No compatibility attribute is removed in this release; removal
+requires a separate future proposal and evidence that the applicable support
+policy no longer includes consumers that use the bridge.
+
+The private fast-plan bridge is unsupported on wrappers constructed with
+`enable_cuda_graph_plan_update=True`. Its CPU planner rewrites the pinned
+workspace prefix that can still source an in-flight public update. Sharing a
+CUDA stream does not order those CPU writes against the pending H2D transfer.
+Use separate, default-off wrappers for legacy private planning.
 
 Trace and Trace Apply integration preserve the public wrapper identity and
 plan-owned metadata capture. The MLA trace template normalizes structural

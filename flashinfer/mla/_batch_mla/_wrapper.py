@@ -72,6 +72,10 @@ _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "cutile": _BatchMLAPagedAttentionCutileBackend,
 }
 
+# Documentation-only deprecated compatibility mirrors retained for old SGLang
+# fast-plan callers. Do not warn at runtime: supported old SGLang accesses
+# _cached_module under warnings-as-errors. Keep values, identity, and mutability
+# intact until support policy permits a separately specified removal.
 _MIRRORED_BACKEND_ATTRS = (
     "_cached_module",
     "_int_workspace_buffer",
@@ -228,6 +232,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_indices: Optional[torch.Tensor] = None,
         kv_len_arr: Optional[torch.Tensor] = None,
         backend: str = "auto",
+        enable_cuda_graph_plan_update: bool = False,
     ) -> None:
         r"""Construct a planned MLA wrapper.
 
@@ -258,10 +263,23 @@ class BatchMLAPagedAttentionWrapper:
             Explicit cuTile callers should plan packed or split FP16/BF16
             DeepSeek MLA decode inputs with canonical dense or CSR metadata.
             cuTile is not selected automatically.
+        enable_cuda_graph_plan_update : bool, optional
+            Preallocate the bounded state required by
+            :meth:`update_cuda_graph_plan`. This temporary opt-in keeps legacy
+            CUDA-graph callers from paying for update state they do not use. It
+            requires ``use_cuda_graph=True`` and may become the default after
+            legacy private replanning callers are no longer supported.
         """
+        if not isinstance(enable_cuda_graph_plan_update, bool):
+            raise TypeError("enable_cuda_graph_plan_update must be a bool.")
+        if enable_cuda_graph_plan_update and not use_cuda_graph:
+            raise ValueError(
+                "enable_cuda_graph_plan_update=True requires use_cuda_graph=True."
+            )
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._use_cuda_graph = use_cuda_graph
+        self._enable_cuda_graph_plan_update = enable_cuda_graph_plan_update
         self._qo_indptr_buf = qo_indptr
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
@@ -286,6 +304,7 @@ class BatchMLAPagedAttentionWrapper:
         self._warned_legacy_tensor_arguments = False
         self._legacy_flat_csr_plan = False
         self._warned_legacy_dynamic_lse = False
+        self._cuda_graph_plan_update_in_progress = False
 
     # Preferred canonical metadata form.
     @overload
@@ -601,6 +620,7 @@ class BatchMLAPagedAttentionWrapper:
             legacy_flat_csr=legacy_flat_csr,
             _float_workspace_buffer=self._float_workspace_buffer,
             _use_cuda_graph=self._use_cuda_graph,
+            _enable_cuda_graph_plan_update=self._enable_cuda_graph_plan_update,
             _qo_indptr_buf=self._qo_indptr_buf,
             _kv_indptr_buf=self._kv_indptr_buf,
             _kv_indices_buf=self._kv_indices_buf,
@@ -632,6 +652,7 @@ class BatchMLAPagedAttentionWrapper:
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
         graph_workspace_snapshot = None
+        graph_metadata_snapshots: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
         if graph_plan_int_workspace_buffer is not None:
             prior_plan_workspace_bytes = int(
                 getattr(previous_backend, "_staged_int_workspace_bytes", 0)
@@ -648,6 +669,20 @@ class BatchMLAPagedAttentionWrapper:
             graph_workspace_snapshot = graph_plan_int_workspace_buffer[
                 :prior_plan_workspace_bytes
             ].clone()
+            if self._enable_cuda_graph_plan_update:
+                # Update-state initialization can fail after backend.plan()
+                # overwrites the shared CSR. Keep the entire replan atomic,
+                # including the index reservation's previously live prefix.
+                graph_metadata_snapshots = tuple(
+                    (tensor, tensor.clone())
+                    for tensor in (
+                        self._qo_indptr_buf,
+                        self._kv_indptr_buf,
+                        self._kv_indices_buf,
+                        self._kv_len_arr_buf,
+                    )
+                    if tensor is not None
+                )
         try:
             planned_backend = backend_type.plan_from_wrapper(plan_args)
         except Exception:
@@ -655,6 +690,8 @@ class BatchMLAPagedAttentionWrapper:
                 graph_plan_int_workspace_buffer[
                     : graph_workspace_snapshot.numel()
                 ].copy_(graph_workspace_snapshot)
+            for tensor, snapshot in graph_metadata_snapshots:
+                tensor.copy_(snapshot)
             raise
 
         # ---------------------------------------------------------------------------
@@ -686,6 +723,122 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
         self._plan_info = getattr(planned_backend, "_plan_info", None)
+        self._cuda_graph_plan_update_stream = None
+
+    def _update_cuda_graph_plan_on_current_device(
+        self,
+        *,
+        planned_backend: object,
+        metadata: MLAPlanMetadata,
+        current_stream: torch.cuda.Stream,
+    ) -> None:
+        """Dispatch one update while the wrapper device is current."""
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "update_cuda_graph_plan() cannot run during CUDA graph capture."
+            )
+        if getattr(self, "_cuda_graph_plan_update_in_progress", False):
+            raise RuntimeError("update_cuda_graph_plan() is already in progress.")
+
+        self._cuda_graph_plan_update_in_progress = True
+        try:
+            current_stream_pointer = current_stream.cuda_stream
+            bound_stream = getattr(self, "_cuda_graph_plan_update_stream", None)
+            if bound_stream is None:
+                self._cuda_graph_plan_update_stream = current_stream_pointer
+            elif bound_stream != current_stream_pointer:
+                raise RuntimeError(
+                    "update_cuda_graph_plan() must use the initially bound CUDA stream."
+                )
+            update_hook_name = "update_cuda_graph_plan_from_wrapper"
+            if not hasattr(planned_backend, update_hook_name):
+                raise RuntimeError(
+                    "the planned backend does not implement CUDA graph plan updates."
+                )
+            getattr(planned_backend, update_hook_name)(metadata=metadata)
+        finally:
+            self._cuda_graph_plan_update_in_progress = False
+
+    @flashinfer_api
+    def update_cuda_graph_plan(self, *, metadata: MLAPlanMetadata) -> None:
+        r"""Update dynamic CSR metadata for a captured MLA plan.
+
+        Construct with ``use_cuda_graph=True`` and
+        ``enable_cuda_graph_plan_update=True``, then call :meth:`plan`
+        successfully before capture. Call this method outside capture before
+        replay. The first call that passes the wrapper's lifecycle, capability,
+        and capture checks binds the current CUDA stream on the wrapper device,
+        even if backend delegation later fails. The corresponding graph replay
+        must execute on that same stream. Cross-stream replay is unsupported;
+        the wrapper cannot observe or validate an external replay stream.
+        A successful :meth:`plan` resets the binding; a failed plan preserves
+        it. Before replanning on another stream, finish the old updates and
+        replays, then recapture :meth:`run` for the new plan.
+
+        Do not use the private fast-plan bridge on an opted-in wrapper. Its
+        CPU planner can overwrite pinned staging still read by a pending
+        update, even on the same CUDA stream. Use separate default-off
+        wrappers for legacy private planning.
+
+        ``metadata`` must be a complete CSR :class:`MLAPlanMetadata` value.
+        ``qo_indptr``, ``kv_indptr``, and ``kv_len_arr`` must be contiguous
+        CPU ``torch.int32`` tensors. ``kv_indices`` must be a contiguous
+        ``torch.int32`` tensor on the wrapper device, must not overlap any
+        capture-reserved wrapper buffer, and must remain alive until its queued
+        publication has completed. Its values are never copied to the host for
+        validation.
+
+        FA2 and FA3 support this operation. CUTLASS, cuTile, and backends whose
+        capability defaults to unsupported reject it. The captured backend,
+        tensor identities and capacities, launch contract, and ``plan_info``
+        remain frozen; only the live CSR values and derived schedule may
+        change. Updates use one device candidate schedule and two preallocated
+        planner/control staging slots. If neither slot's event has completed,
+        the call fails instead of allocating or waiting. If event recording
+        poisons both slots, call :meth:`plan` again before updating.
+
+        Validation, planning, staging, and failures before native publication
+        submission leave the preceding live plan untouched. Once publication
+        has been submitted, asynchronous CUDA execution or context failures are
+        outside this synchronization-free guarantee.
+
+        Parameters
+        ----------
+        metadata : MLAPlanMetadata
+            Complete CSR metadata for the next same-stream graph replay.
+        """
+
+        if not isinstance(metadata, MLAPlanMetadata):
+            raise TypeError("metadata must be an MLAPlanMetadata instance.")
+        if not self._use_cuda_graph:
+            raise RuntimeError("update_cuda_graph_plan() requires use_cuda_graph=True.")
+        if not getattr(self, "_enable_cuda_graph_plan_update", False):
+            raise RuntimeError(
+                "update_cuda_graph_plan() requires enable_cuda_graph_plan_update=True."
+            )
+        planned_backend = getattr(self, "_planned_backend", None)
+        if planned_backend is None:
+            raise RuntimeError("update_cuda_graph_plan() called before plan().")
+        capabilities = getattr(planned_backend, "_plan_capabilities", None)
+        if not getattr(capabilities, "supports_cuda_graph_plan_update", False):
+            raise RuntimeError(
+                "the planned backend does not support CUDA graph plan updates."
+            )
+        current_stream = torch.cuda.current_stream()
+        if current_stream.device == self.device:
+            self._update_cuda_graph_plan_on_current_device(
+                planned_backend=planned_backend,
+                metadata=metadata,
+                current_stream=current_stream,
+            )
+            return
+        with torch.cuda.device(self.device):
+            self._update_cuda_graph_plan_on_current_device(
+                planned_backend=planned_backend,
+                metadata=metadata,
+                current_stream=torch.cuda.current_stream(self.device),
+            )
 
     # Output-only form -- ``return_lse=False`` returns the output tensor.
     # Preferred structural-input form.

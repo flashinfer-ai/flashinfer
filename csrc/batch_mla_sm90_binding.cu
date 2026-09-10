@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "batch_mla_plan_update.cuh"
 #include "batch_mla_sm90_config.inc"
 #include "tvm/ffi/container/array.h"
 #include "tvm/ffi/container/tuple.h"
@@ -38,3 +39,4 @@ void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionSM90Plan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchMLAPagedAttentionSM90Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(commit_cuda_graph_plan_update, CommitBatchMLACudaGraphPlanUpdate);
