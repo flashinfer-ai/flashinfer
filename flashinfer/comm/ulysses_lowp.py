@@ -1544,12 +1544,15 @@ def stats_protocol_for(local_sequence: int, world_size: int) -> str:
 _LEGACY_INT_PROTOCOL = {3: ALIGNED, 2: BOUNDARY_MERGE}
 
 
-def required_alignment(world_size: int, stats_protocol) -> int:
+def required_alignment(world_size: int, stats_protocol, k_group: int = K_GROUP) -> int:
     """Recommended multiple for padding the packed GLOBAL sequence.
 
     ``128 * world_size`` for the aligned path (every shard a whole number of
-    128-token blocks); ``64`` for the boundary-merge path (keeps whole global
-    K groups, tail padding < 64).
+    128-token blocks, on both grids); ``k_group`` for the boundary-merge path,
+    which is what keeps whole global K groups -- 64 on the SM89/SM120 grid,
+    128 on SM90.  Returning 64 for an SM90 payload would leave a global
+    sequence that still splits a K group, so pass ``K_GROUP_SM90`` (or use
+    :meth:`UlyssesLowpSageLayoutSM90.required_alignment`) on Hopper.
 
     Accepts either the string constants :data:`ALIGNED` / :data:`BOUNDARY_MERGE`
     or their legacy integer IDs (3 = ALIGNED, 2 = BOUNDARY_MERGE)."""
@@ -1559,7 +1562,7 @@ def required_alignment(world_size: int, stats_protocol) -> int:
     if stats_protocol == ALIGNED:
         return 128 * world_size
     if stats_protocol == BOUNDARY_MERGE:
-        return 64
+        return k_group
     raise ValueError(
         f"stats_protocol must be one of {SUPPORTED_STATS_PROTOCOLS}, "
         f"got {stats_protocol!r}"
@@ -2145,7 +2148,8 @@ class UlyssesLowpSageLayoutSM90:
         return stats_protocol_for(local_sequence, world_size)
 
     def required_alignment(self, world_size: int, stats_protocol: str) -> int:
-        return required_alignment(world_size, stats_protocol)
+        """Recommended global-sequence padding multiple on this layout's grid."""
+        return required_alignment(world_size, stats_protocol, k_group=self.K_GROUP)
 
     def aligned_length(self, n_tokens: int, world_size: int, stats_protocol: str) -> int:
         return aligned_length(n_tokens, world_size, stats_protocol)
