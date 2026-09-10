@@ -473,7 +473,7 @@ def test_batch_prefill_lazy_stride_router_plan_reuse(
         causal=True,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
-        fixed_split_size=None if disable_split_kv else 64,
+        fixed_split_size=None if disable_split_kv else 2,
         disable_split_kv=disable_split_kv,
     )
     plan_info = tuple(wrapper._plan_info)
