@@ -384,8 +384,13 @@ struct KernelTraits {
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
 
   static constexpr SwizzleMode SWIZZLE_MODE_Q = SwizzleMode::k128B;
+  // FP8 rows with a 64-byte tail need 64B swizzling to keep each row's columns in bounds.
   static constexpr SwizzleMode SWIZZLE_MODE_KV =
-      (sizeof(DTypeKV_) == 1 && HEAD_DIM_VO == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
+      (sizeof(DTypeKV_) == 1 &&
+       (HEAD_DIM_VO == 64 ||
+        (!is_fp4_type_v<DTypeKV_> && (HEAD_DIM_QK % 128 != 0 || HEAD_DIM_VO % 128 != 0))))
+          ? SwizzleMode::k64B
+          : SwizzleMode::k128B;
   static constexpr uint32_t KV_THR_LAYOUT_ROW = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 8;
   static constexpr uint32_t KV_THR_LAYOUT_COL = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 8 : 4;
   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
@@ -575,7 +580,6 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
                                            uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
                                            const uint32_t stride_n, const uint32_t kv_idx_base,
                                            const uint32_t kv_len, const dim3 tid = threadIdx) {
-  // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr bool IS_FP4 = is_fp4_type_v<DTypeKV>;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
@@ -618,16 +622,23 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
     static_assert(NUM_MMA_KV * 2 % NUM_WARPS_Q == 0);
 #pragma unroll
     for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
-      // FP4 GMEM rows are packed 2x denser; load 64b (upper 64b of smem slot zeroed).
-      if constexpr (IS_FP4) {
-        smem.template load_64b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
-      } else {
-        smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+#pragma unroll
+      for (uint32_t j = 0; j < NUM_MMA_D / (4 / sizeof(DTypeKV)); ++j) {
+        // FP4 GMEM rows are packed 2x denser; load 64b (upper 64b of smem slot zeroed).
+        if constexpr (IS_FP4) {
+          smem.template load_64b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        } else {
+          smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        }
+        *smem_offset = smem.template advance_offset_by_column<4>(*smem_offset, j);
+        *gptr += (IS_FP4 ? 2 : 4) * upcast_size<DTypeKV>();
       }
       *smem_offset =
-          smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset);
+          smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset) -
+          sizeof(DTypeKV) * NUM_MMA_D;
       kv_idx += NUM_WARPS * 8;
-      *gptr += NUM_WARPS * 8 * stride_n;
+      *gptr += NUM_WARPS * 8 * stride_n -
+               (IS_FP4 ? 2 : 4) * upcast_size<DTypeKV>() * (NUM_MMA_D / (4 / sizeof(DTypeKV)));
     }
     *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_STRIDE;
   }
@@ -640,7 +651,6 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
                                                 const size_t* thr_local_kv_offset,
                                                 const uint32_t kv_len, const uint32_t warp_idx,
                                                 const uint32_t lane_idx) {
-  // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
   smem_t<KTraits::SWIZZLE_MODE_KV> smem(
       (produce_v && !KTraits::USE_KV_SHARED_SMEM) ? smem_storage->v_smem : smem_storage->k_smem);
@@ -690,14 +700,20 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
 #pragma unroll
     for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
       DType* gptr = kv_ptr + thr_local_kv_offset[i];
-      if constexpr (IS_FP4) {
-        smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
-      } else {
-        smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+#pragma unroll
+      for (uint32_t j = 0; j < NUM_MMA_D / (4 / sizeof(DType)); ++j) {
+        if constexpr (IS_FP4) {
+          smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        } else {
+          smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        }
+        *smem_offset = smem.template advance_offset_by_column<4>(*smem_offset, j);
+        gptr += (IS_FP4 ? 2 : 4) * upcast_size<DType>();
       }
       kv_idx += NUM_WARPS * 8;
       *smem_offset =
-          smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset);
+          smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_STRIDE>(*smem_offset) -
+          sizeof(DType) * NUM_MMA_D;
     }
     *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_STRIDE;
   }
@@ -784,14 +800,20 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
       DType* gptr = kv_ptr + get_paged_kv_offset_for_logical_row<produce_v, KTraits>(
                                  paged_kv, packed_page_iter_base, last_indptr, kv_head_idx,
                                  logical_row, lane_idx);
-      if constexpr (IS_FP4) {
-        smem.template load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
-      } else {
-        smem.template load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+#pragma unroll
+      for (uint32_t j = 0; j < NUM_MMA_D / (4 / sizeof(DType)); ++j) {
+        if constexpr (IS_FP4) {
+          smem.template load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        } else {
+          smem.template load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        }
+        *smem_offset = smem.template advance_offset_by_column<4>(*smem_offset, j);
+        gptr += (IS_FP4 ? 2 : 4) * upcast_size<DType>();
       }
       kv_idx += NUM_WARPS * ROWS_PER_ITER;
       *smem_offset = smem.template advance_offset_by_row<NUM_WARPS * ROWS_PER_ITER, UPCAST_STRIDE>(
-          *smem_offset);
+                         *smem_offset) -
+                     sizeof(DType) * NUM_MMA_D;
     }
     *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_STRIDE;
   }
@@ -1250,7 +1272,7 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
 }
 
 // Dequantize one FP8 K or V tile from its packed smem buffer into a BF16/FP16
-// staging buffer, laid out exactly as a native 16-bit tile (same k128B swizzle).
+// staging buffer, laid out as a native 16-bit tile with the same KV swizzle.
 // Shuffle-free, vectorized: each thread reads packed 16-byte (b128) chunks of 16
 // FP8 elements and writes two 16-byte chunks of 8 BF16 elements. Afterwards the
 // QK/PV MMAs use the standard 16-bit ldmatrix path (no per-fragment cross-lane
@@ -2527,8 +2549,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       // has no staging buffer to spend in the first place.
       constexpr bool kRepackActive = KTraits::USE_KV_REPACK && is_fp4_type_v<DTypeKV>;
       // One-byte-KV repack path: 16-bit staging buffers + their (16-bit-strided) read offsets.
-      // Guard the offsets so the stride-8 get_permuted_offset isn't instantiated for the k64B
-      // swizzle (HEAD_DIM_VO == 64), which requires stride==4.
+      // Only initialize staging offsets when the repack buffer is present.
       smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack_ptr()),
           v_smem_bf16(smem_storage.kv_smem_repack_ptr());
       uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
@@ -3257,7 +3278,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       constexpr bool kRepackActive = KTraits::USE_KV_REPACK;
       // One-byte KV repack path: 16-bit staging buffers + their (16-bit-strided) read offsets.
       // Guard offsets by USE_KV_REPACK so the stride-8 get_permuted_offset isn't
-      // instantiated for the k64B swizzle (HEAD_DIM_VO == 64), which requires stride==4.
+      // instantiated for the k64B swizzle (HEAD_DIM_VO == 64), which does not use the repack
+      // buffer.
       smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack_ptr()),
           v_smem_bf16(smem_storage.kv_smem_repack_ptr());
       uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
