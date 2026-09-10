@@ -481,7 +481,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         num_sched_stages: int,
         cluster_pipeline,
         producer_state,
-        sched_storage=None,
     ):
         # Per-expert token range data source lives on ``params``: either
         # ``params.expert_token_sizes`` (sizes-mode, e.g. zero-copy view of
@@ -503,12 +502,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         self._num_sched_stages = num_sched_stages
         self._cluster_pipeline = cluster_pipeline
         self._producer_state = producer_state
-        # Python-only reference to the SMEM scheduler storage struct.  Held
-        # only so that ``internal_init`` can reach
-        # ``sched_storage.cluster_pipeline_mbar`` /
-        # ``sched_storage.cluster_broadcast_slot`` to build the
-        # cluster_pipeline (atomic_counter mode); does NOT serialize.
-        self._sched_storage = sched_storage
         # Codegen-time Python attribute (NOT MLIR-serialized).  Set to True
         # by ``internal_init`` to mark "scheduler state has been greedily
         # advanced one step (atomic_add cached for atomic_counter mode /
@@ -701,15 +694,21 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             pipeline.PipelineUserType.Producer, num_stages
         )
 
-        # Atomic-counter dynamic load-balance state.  cluster_pipeline is
-        # left as None here and constructed lazily inside ``internal_init``
-        # (it must be created BEFORE ``pipeline_init_arrive`` so all warps
-        # participate in the cluster mbarrier init; ``create`` runs from
-        # the kernel prologue, which already satisfies that).  ``atomic_res``
-        # starts at 0; ``internal_init`` overwrites it with the first claimed
-        # cluster-linear tile id.
+        # Build the broadcast pipeline with the other scheduler pipelines.
+        # internal_init still claims the first atomic tile before common init.
+        cluster_pipeline = None
         dynamic_state: Optional[_DynamicLoadBalanceState] = None
         if const_expr(params.load_balance_mode == "atomic_counter"):
+            cluster_size = params.cluster_shape_mn[0] * params.cluster_shape_mn[1]
+            cluster_pipeline = pipeline.PipelineAsync.create(
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 32 * cluster_size
+                ),
+                barrier_storage=sched_storage.cluster_pipeline_mbar.data_ptr(),
+                defer_sync=True,
+            )
             is_leader_cta = (
                 cta_id_in_cluster[0] + cta_id_in_cluster[1] + cta_id_in_cluster[2]
             ) == Int32(0)
@@ -741,9 +740,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             sched_pipeline=sched_pipeline,
             smem_buf_tensor=smem_buf_tensor,
             num_sched_stages=num_stages,
-            cluster_pipeline=None,
+            cluster_pipeline=cluster_pipeline,
             producer_state=producer_state,
-            sched_storage=sched_storage,
         )
 
     # -------------------------------------------------------------------------
@@ -762,21 +760,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
     ) -> None:
         """Claim/decode the first work tile during kernel prologue."""
         if const_expr(self.params.load_balance_mode == "atomic_counter"):
-            cluster_size = (
-                self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1]
-            )
-
-            # Cluster-wide broadcast pipeline for the leader CTA's atom.add.
-            self._cluster_pipeline = pipeline.PipelineAsync.create(
-                num_stages=1,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-                consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * cluster_size
-                ),
-                barrier_storage=self._sched_storage.cluster_pipeline_mbar.data_ptr(),
-                defer_sync=True,
-            )
-
             # Pre-claim and broadcast first dynamic tile id.
             if warp_idx == sched_warp_id:
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
@@ -1450,6 +1433,5 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         result._cluster_pipeline = self._cluster_pipeline
         result._producer_state = new_producer_state
         # Python-only attrs: copy from prototype, not MLIR values.
-        result._sched_storage = self._sched_storage
         result._first_advance_pending = self._first_advance_pending
         return result
