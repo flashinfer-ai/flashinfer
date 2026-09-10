@@ -1142,6 +1142,7 @@ def _build_decode_gen_schedule(
         k_scale_ptr=k_scale_ptr,
         k_scale_head_stride=k_scale_head_stride,
         sync_barrier_id=1,
+        score_seed_owner=tmem_s0,
         name="tmemS1",
     )
     # Packed persistent QK derives the descriptor from Q's just-waited
@@ -3049,7 +3050,7 @@ def fmha_decode_launch(
     tma_box0_q = min(128 // cfg.q_dtype_bytes, cfg.headdim)
     tma_box0_kv = min(128 // cfg.kv_dtype_bytes, cfg.headdim)
     tma_swizzle = cuda.TensorMapSwizzle.s128b
-    if cutlass.const_expr(cfg.use_fp8_qkv and cfg.headdim == 64):
+    if cutlass.const_expr(cfg.use_8bit_qkv and cfg.headdim == 64):
         tma_swizzle = cuda.TensorMapSwizzle.s64b
     if cutlass.const_expr(cfg.tile_size_kv == 256):
         # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.
@@ -3368,7 +3369,7 @@ def fmha_block_sparse_launch(
         )
         v_desc_primary = create_tensor_map_tiled(
             global_address=v_iter.toint(),
-            dtype=cfg.kv_dtype,
+            dtype=cfg.value_dtype,
             global_dims=kv_dims,
             global_strides=kv_strides,
             box_dims=(tma_box0, primary_kv_box_size, 1, 1),
@@ -3389,7 +3390,7 @@ def fmha_block_sparse_launch(
             )
             v_desc_atom = create_tensor_map_tiled(
                 global_address=v_iter.toint(),
-                dtype=cfg.kv_dtype,
+                dtype=cfg.value_dtype,
                 global_dims=kv_dims,
                 global_strides=kv_strides,
                 box_dims=(tma_box0, kv_atom_size, 1, 1),
@@ -3420,7 +3421,7 @@ def fmha_block_sparse_launch(
             )
             v_desc_summary_primary = create_tensor_map_tiled(
                 global_address=v_summary_iter.toint(),
-                dtype=cfg.kv_dtype,
+                dtype=cfg.value_dtype,
                 global_dims=summary_dims,
                 global_strides=summary_kv_strides,
                 box_dims=(tma_box0, primary_kv_box_size, 1, 1),
@@ -3439,7 +3440,7 @@ def fmha_block_sparse_launch(
                 )
                 v_desc_summary_atom = create_tensor_map_tiled(
                     global_address=v_summary_iter.toint(),
-                    dtype=cfg.kv_dtype,
+                    dtype=cfg.value_dtype,
                     global_dims=summary_dims,
                     global_strides=summary_kv_strides,
                     box_dims=(tma_box0, kv_atom_size, 1, 1),

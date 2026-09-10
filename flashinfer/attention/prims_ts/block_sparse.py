@@ -162,6 +162,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
         sage: SageAttentionParams | None = None,
+        v_data_type: torch.dtype | None = None,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -221,12 +222,17 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ordered on one stream or externally synchronized. Unordered concurrent
         runs require distinct wrappers.
 
+        ``kv_data_type`` is the K dtype and defaults to ``q_data_type``;
+        ``v_data_type`` defaults to ``kv_data_type``.
+
         ``sage`` enables Sage attention in both modes when the block sizes
-        select a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
-        ``torch.float8_e4m3fn`` with the per-block scales of
+        select a Keeps profile (Q64/KV256 or Q128/KV128): Q and K share
+        ``torch.float8_e4m3fn`` or ``torch.int8`` with the per-block scales of
         :class:`SageAttentionParams`, V is ``torch.float8_e4m3fn`` with
-        per-channel scales, and the output is ``torch.bfloat16`` (the default)
-        or ``torch.float16``. Block-sparse proxy routes additionally require
+        per-channel scales (the INT8 recipe therefore passes
+        ``v_data_type=torch.float8_e4m3fn``), and the output is
+        ``torch.bfloat16`` (the default) or ``torch.float16``. Block-sparse
+        proxy routes additionally require
         ``k_summary_scale`` for the quantized K summaries. The scale block
         sizes are compile-time; the scale tensors are bound to the plan and
         validated again by every ``run()``.
@@ -262,6 +268,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             mask_type=mask_type,
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
+            v_dtype=v_data_type,
             output_dtype=o_data_type,
             max_blocks_per_row=(
                 max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
@@ -337,9 +344,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         structural tokens (the final partial block averages only the tokens it
         covers); a proxy block stands for that many identical tokens, so its
         probability carries the block's token mass. With Sage attention the
-        summaries are E4M3: K summaries are dequantized with
-        ``k_summary_scale`` and V summaries share ``v_scale`` (built from
-        ``V - v_mean`` when a mean is used).
+        K summaries use the K dtype and are dequantized with
+        ``k_summary_scale``; the V summaries are E4M3 and share ``v_scale``
+        (built from ``V - v_mean`` when a mean is used).
 
         Every row must fit the planned semantic-block capacity. Reusable runs
         trust routing values. CuTe DSL assertions can diagnose violations when

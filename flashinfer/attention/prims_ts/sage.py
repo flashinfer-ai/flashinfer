@@ -14,8 +14,9 @@
 
 """Sage attention inputs for the PrimTS decode kernels.
 
-Sage attention runs ``QK^T`` on 8-bit Q/K with one dequantization scale per
-token block and ``PV`` on E4M3 P/V with one scale per V channel. The scale
+Sage attention runs ``QK^T`` on 8-bit Q/K (INT8 with INT32 scores, or E4M3
+with FP32 scores) with one dequantization scale per token block and ``PV`` on
+E4M3 P/V with one scale per V channel. The scale
 tensors follow the trtllm-gen flat layout produced by TensorRT-LLM's
 ``sageQuant``: per head, sequence ``b`` starts at ``b * S // blk + b`` and token
 ``t`` uses slot ``t // blk`` inside it, so ``ceil(B * S / blk) + B - 1`` slots
@@ -31,7 +32,7 @@ import torch
 from flashinfer.utils import ceil_div
 
 SAGE_K_BLOCK_SIZES = (16, 32, 64, 128, 256)
-SAGE_QK_DTYPES = (torch.float8_e4m3fn,)
+SAGE_QK_DTYPES = (torch.int8, torch.float8_e4m3fn)
 SAGE_V_DTYPE = torch.float8_e4m3fn
 SAGE_OUTPUT_DTYPES = (torch.bfloat16, torch.float16)
 
@@ -127,17 +128,18 @@ def _validate_block_sizes(params: SageAttentionParams, tile_size_q: int) -> None
 
 
 def _validate_dtypes(
-    q_dtype: torch.dtype, kv_dtype: torch.dtype, out_dtype: torch.dtype
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    out_dtype: torch.dtype,
 ) -> None:
-    if q_dtype == torch.int8:
-        raise NotImplementedError("INT8 Q/K Sage attention is not supported yet")
     if q_dtype != kv_dtype or q_dtype not in SAGE_QK_DTYPES:
         raise ValueError(
             "Sage attention requires Q and K in one dtype from "
             f"{SAGE_QK_DTYPES}, got Q {q_dtype} and K {kv_dtype}"
         )
-    if kv_dtype != SAGE_V_DTYPE:
-        raise ValueError(f"Sage attention requires V in {SAGE_V_DTYPE}, got {kv_dtype}")
+    if v_dtype != SAGE_V_DTYPE:
+        raise ValueError(f"Sage attention requires V in {SAGE_V_DTYPE}, got {v_dtype}")
     if out_dtype not in SAGE_OUTPUT_DTYPES:
         raise ValueError(
             f"Sage attention requires an output dtype from {SAGE_OUTPUT_DTYPES}, "
@@ -183,9 +185,12 @@ def validate_sage_params(
     out_dtype: torch.dtype,
     device: torch.device | None = None,
     summary_seq_len: int | None = None,
+    v_dtype: torch.dtype | None = None,
 ) -> None:
     """Validate the block sizes, dtypes and scale tensors of one call.
 
+    ``kv_dtype`` is the K dtype; ``v_dtype`` defaults to it, so E4M3 callers
+    name one dtype while the INT8 recipe names its E4M3 V explicitly.
     ``summary_seq_len`` is the number of KV blocks when block-sparse proxy
     routes are enabled; ``k_summary_scale`` must then cover that summary
     sequence in the flat layout and must be absent otherwise.
@@ -194,7 +199,9 @@ def validate_sage_params(
     if not isinstance(params, SageAttentionParams):
         raise TypeError("sage must be a SageAttentionParams instance")
     _validate_block_sizes(params, tile_size_q)
-    _validate_dtypes(q_dtype, kv_dtype, out_dtype)
+    _validate_dtypes(
+        q_dtype, kv_dtype, kv_dtype if v_dtype is None else v_dtype, out_dtype
+    )
     if summary_seq_len is None:
         if params.k_summary_scale is not None:
             raise ValueError(
