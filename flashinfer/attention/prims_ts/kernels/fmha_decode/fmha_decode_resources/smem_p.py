@@ -42,7 +42,10 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..fmha_decode_constants import FP8_P_QUANT_LOG2_SCALE
+from ..fmha_decode_constants import (
+    FP8_P_QUANT_LOG2_SCALE,
+    INT32_SCORE_BIAS,
+)
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     Constexpr,
@@ -331,13 +334,14 @@ class SmemPResource(DecodeGenResourceBase):
         - ``-c * max`` anchors the row; a fully masked row carries the
           ``-FLT_MAX`` sentinel as its maximum and anchors on zero instead,
           so its masked scores exponentiate to zero rather than NaN.
-        - FP8 P adds ``log2(448)``, the static quantization scale that the
-          row sums follow and the epilogue divides back out.
+        - Byte-wide P adds ``log2(448)``, the static FP8 quantization scale
+          that the row sums follow and the epilogue divides back out.
         - A proxy route adds ``log2`` of its block mass, so every summary
           probability carries the tokens it stands for; the max pass raised
           the row maximum by the same mass and shifted the ragged final
           summary's score by its shortfall.
         """
+        cfg = self.cfg
         safe_new_max = new_max
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
@@ -347,9 +351,9 @@ class SmemPResource(DecodeGenResourceBase):
         addend = Float32(-self.scale_softmax_log2 * safe_new_max)
         if cutlass.const_expr(self.cfg.use_fp8_qkv or self.cfg.v_dtype_bytes == 1):
             addend += Float32(FP8_P_QUANT_LOG2_SCALE)
-        if cutlass.const_expr(self.cfg.use_block_sparse_proxy_routes):
+        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             if route_is_proxy:
-                addend += Float32(self.cfg.proxy_log2_block_mass)
+                addend += Float32(cfg.proxy_log2_block_mass)
         return addend
 
     @producer_work
@@ -446,8 +450,8 @@ class SmemPResource(DecodeGenResourceBase):
         TMEM, so the reload needs no mask or route logic of its own beyond the
         route-uniform proxy addend. Sage attention only changes the exponent
         multipliers, ``c * sfQ * sfK_g`` per scale group, which the
-        ``sage_k_scales`` strategy hands over one fragment at a time; the
-        addend already uses the dequantized maximum.
+        ``sage_k_scales`` strategy hands over one fragment at a time; biased
+        INT32 scores only change the per-group addends.
         """
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
@@ -494,11 +498,11 @@ class SmemPResource(DecodeGenResourceBase):
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = loaded[score_idx]
 
-            group_multipliers = self._fragment_exponent_multipliers(
-                fragment_multipliers
+            group_multipliers, group_addends = self._fragment_exponent_terms(
+                fragment_multipliers, exponent_addend
             )
             local_sum = self._exponentiate_fragment_pairs(
-                s_arr, exponent_addend, group_multipliers
+                s_arr, group_addends, group_multipliers
             )
 
             if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
@@ -535,32 +539,53 @@ class SmemPResource(DecodeGenResourceBase):
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
 
     @cute.jit
-    def _fragment_exponent_multipliers(
-        self, fragment_multipliers: cutlass.Array | None
-    ) -> cutlass.Array:
-        """Return one fragment's exponent multipliers, one per scale group.
+    def _fragment_exponent_terms(
+        self,
+        fragment_multipliers: cutlass.Array | None,
+        exponent_addend: Float32,
+    ) -> tuple[cutlass.Array, cutlass.Array]:
+        """Return one fragment's exponent multipliers and addends per scale group.
 
         Sage attention takes the fragment's ``c * sfQ * sfK_g`` multipliers
         from the scale strategy (``fragment_multipliers``); without Sage the
-        single group holds the softmax scale.
+        single group holds the softmax scale. Every group starts from the
+        row's addend; biased INT32 scores subtract ``bias * multiplier`` per
+        group.
         """
         cfg = self.cfg
         groups = cfg.sage_k_groups_per_fragment
         group_multipliers = cutlass.Array(
             Float32, groups, space=cutlass.AddressSpace.rmem
         )
+        group_addends = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
         if cutlass.const_expr(cfg.use_sage_attention):
             for group_idx in cutlass.range_constexpr(groups):
                 group_multipliers[group_idx] = Float32(fragment_multipliers[group_idx])
         else:
             group_multipliers[0] = self.scale_softmax_log2
-        return group_multipliers
+        for group_idx in cutlass.range_constexpr(groups):
+            group_addends[group_idx] = exponent_addend
+            if cutlass.const_expr(cfg.uses_int32_scores):
+                # Every biased score carries ``INT32_SCORE_BIAS``, so the
+                # addend removes ``bias * multiplier`` for its group: one
+                # rounding of the addend per group instead of one conversion
+                # per element. The rounding is at most half an ulp of
+                # ``bias * multiplier``, below one quantized score unit and far
+                # below the INT8 quantization noise.
+                group_addends[group_idx] = Float32(
+                    cute.math.fma(
+                        Float32(-INT32_SCORE_BIAS),
+                        Float32(group_multipliers[group_idx]),
+                        exponent_addend,
+                    )
+                )
+        return group_multipliers, group_addends
 
     @cute.jit
     def _exponentiate_fragment_pairs(
         self,
         s_arr: cutlass.Array,
-        exponent_addend: Float32,
+        group_addends: cutlass.Array,
         group_multipliers: cutlass.Array,
     ) -> Float32:
         """Turn one fragment of scaled scores into probabilities in place.
@@ -568,8 +593,9 @@ class SmemPResource(DecodeGenResourceBase):
         Returns the fragment's probability sum. Eight independent chains keep
         the denominator update off one long dependency chain, and a configurable
         subset of pairs runs its exponentials on the FMA pipe. Each score pair
-        uses the exponent multiplier of its compile-time scale group; without
-        Sage attention there is one group holding the softmax scale.
+        uses the exponent multiplier and addend of its compile-time scale
+        group; without Sage attention there is one group holding the softmax
+        scale.
         """
         pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
         pairs_per_group = pairs_per_fragment // self.cfg.sage_k_groups_per_fragment
@@ -579,10 +605,11 @@ class SmemPResource(DecodeGenResourceBase):
         for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
             multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
+            addend = Float32(group_addends[pair_idx // pairs_per_group])
             p0, p1 = cute.arch.fma_packed_f32x2(
                 (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
                 (multiplier, multiplier),
-                (exponent_addend, exponent_addend),
+                (addend, addend),
             )
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)

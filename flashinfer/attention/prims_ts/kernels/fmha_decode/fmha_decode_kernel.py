@@ -518,9 +518,12 @@ def _build_decode_gen_schedule(
     use_paged_kv = cfg.use_paged_kv
     use_dense_page_offsets = use_paged_kv and not cfg.use_block_sparse
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
-    # Mixed K/V dtypes take the split-resource paths with one K ring and one V
-    # ring, each shared by both K/V instances.
-    use_shared_inst_kv_rings = cfg.k_dtype != cfg.v_dtype and cfg.tile_size_kv != 256
+    # K and V of different byte widths take the split-resource paths with one
+    # K ring and one V ring, each shared by both K/V instances; equal widths
+    # (including Int8 K with E4M3 V) share one ring.
+    use_shared_inst_kv_rings = (
+        cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
+    )
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
     one_inst_kv_stages = cfg.num_head_dim_stages_kv if use_one_inst_qkv else 1
     use_distributed_split_kv_stages = not use_one_inst_qkv
@@ -1216,6 +1219,7 @@ def _build_decode_gen_schedule(
         h_k_idx=h_k_idx,
         b_idx=b_idx,
         sync_barrier_id=1,
+        score_seed_owner=tmem_s0,
         sage_k_scales=sage_k_scales1,
         name="tmemS1",
         **sage_qk_scale_sources,
@@ -2110,6 +2114,9 @@ def _build_decode_gen_schedule(
         # Streamed TMEM P operands use one-way per-fragment ready barriers.
         # Initialize them beside correction's manually managed SMEM state.
         eager_init_resources.extend([smem_p0, smem_p1])
+    if cfg.uses_int32_scores:
+        # The score-seed operand tile is written once by its owning instance.
+        eager_init_resources.append(tmem_s0)
 
     return (
         task_list,

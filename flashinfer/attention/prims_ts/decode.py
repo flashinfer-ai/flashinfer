@@ -663,13 +663,14 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
+        torch.int8: "int8",
     }
     try:
         return keys[dtype]
     except KeyError as error:
         raise NotImplementedError(
             "attention-ts decode supports torch.float16, torch.bfloat16, "
-            f"and torch.float8_e4m3fn; got {dtype}"
+            f"torch.float8_e4m3fn, and torch.int8; got {dtype}"
         ) from error
 
 
@@ -682,6 +683,7 @@ def _cutlass_dtype(dtype_key: str):
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "int8": cutlass.Int8,
     }[dtype_key]
 
 
@@ -724,14 +726,19 @@ def _validate_dtype_pair(
         )
     )
     if not supported:
+        supported_pairs = "attention-ts decode supports FP16->FP16, BF16->BF16, " + (
+            "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
+            if allow_fp8_bf16_output
+            else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
+        )
+        int8_hint = (
+            "INT8 Q/K are supported only with Sage scales through "
+            "BlockSparseTSWrapper; "
+            if torch.int8 in (q_dtype, k_dtype)
+            else ""
+        )
         raise NotImplementedError(
-            "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; got "
-                if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; got "
-            )
-            + f"{q_dtype}->{output_dtype}"
+            f"{supported_pairs}{int8_hint}got {q_dtype}->{output_dtype}"
         )
 
 

@@ -160,7 +160,12 @@ def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
 
 
 def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family for the QK GEMM."""
+    """Select the tcgen05 MMA kind of the QK GEMM from the Q/K dtype.
+
+    Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
+    """
+    if cfg.uses_int32_scores:
+        return prims.Tcgen05MMAKind.INT8
     if cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1:
         return prims.Tcgen05MMAKind.F8F6F4
     return prims.Tcgen05MMAKind.F16
@@ -172,7 +177,7 @@ def _mma_k_step_qk(cfg: FmhaDecodeConfig) -> int:
 
 
 def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family for the PV GEMM."""
+    """Select the tcgen05 MMA kind of the PV GEMM from the V (and hence P) dtype."""
     if cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1:
         return prims.Tcgen05MMAKind.F8F6F4
     return prims.Tcgen05MMAKind.F16
@@ -181,6 +186,15 @@ def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
 def _mma_k_step_pv(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one PV-GEMM MMA instruction."""
     return 32 if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1) else 16
+
+
+def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
+    """Return the type the QK GEMM accumulates one score as: Int32 for Int8 Q/K.
+
+    INT32 scores are accumulated on top of ``INT32_SCORE_BIAS``, so the
+    softmax reads every score tile as FP32.
+    """
+    return Int32 if cfg.uses_int32_scores else Float32
 
 
 @cute.jit
@@ -401,7 +415,7 @@ def _pack_float2_to_bf16(v0: Float32, v1: Float32) -> Int32:
 
 def _qkv_smem_swizzle(cfg: FmhaDecodeConfig) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for staged Q/K/V tiles."""
-    if cfg.use_fp8_qkv and cfg.headdim == 64:
+    if cfg.use_8bit_qkv and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 

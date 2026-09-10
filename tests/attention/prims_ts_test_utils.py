@@ -102,6 +102,7 @@ def make_sage_decode_config(
     tile_size_q: int,
     tile_size_kv: int,
     qkv_dtype=None,
+    v_dtype=None,
     o_dtype=None,
     sage_args: dict[str, object] | None = None,
     mask_type: str = "dense",
@@ -141,7 +142,9 @@ def make_sage_decode_config(
         batch_size=2,
         num_heads_q=8,
         num_heads_kv=8 // heads_q_per_kv,
-        qkv_dtype=Float8E4M3FN if qkv_dtype is None else qkv_dtype,
+        q_dtype=Float8E4M3FN if qkv_dtype is None else qkv_dtype,
+        k_dtype=Float8E4M3FN if qkv_dtype is None else qkv_dtype,
+        v_dtype=v_dtype,
         o_dtype=BFloat16 if o_dtype is None else o_dtype,
         qkv_layout=qkv_layout,
         num_tokens_per_page=num_tokens_per_page,
@@ -295,7 +298,7 @@ def make_block_sparse_compile_key(**overrides: object) -> _BlockSparseCompileKey
 
     The defaults describe a dense-masked BSR plan without token mask, proxy
     routes or parallel sparse loads; ``overrides`` replace any field of the
-    key. The output dtype key follows ``dtype_key`` unless overridden.
+    key. The output and V dtype keys follow ``dtype_key`` unless overridden.
     """
 
     from flashinfer.attention.prims_ts._block_sparse.config import (
@@ -321,6 +324,7 @@ def make_block_sparse_compile_key(**overrides: object) -> _BlockSparseCompileKey
     }
     fields.update(overrides)
     fields.setdefault("out_dtype_key", fields["dtype_key"])
+    fields.setdefault("v_dtype_key", fields["dtype_key"])
     return _BlockSparseCompileKey(**fields)
 
 

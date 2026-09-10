@@ -3579,7 +3579,7 @@ def test_attention_ts_decode_kv256_fp8_ring_stages_fit_smem_budget() -> None:
     """FP8 KV256 stages one byte per element and keeps the 16-bit ring depth."""
 
     cfg = _make_contiguous_kv256_config(dtype=Float8E4M3FN)
-    assert cfg.use_fp8_qkv
+    assert cfg.use_8bit_qkv
     assert cfg.smem_kv_tile_bytes == cfg.tile_size_kv * cfg.headdim
     assert cfg.kv_stages == KV_TILE_256_SHARED_FIFO_STAGES
     pipeline_smem_bytes = (
@@ -3602,7 +3602,7 @@ def test_attention_ts_decode_kv256_fp8_ring_stages_fit_smem_budget() -> None:
 def test_attention_ts_decode_kv256_fp8_rejects_attention_sinks() -> None:
     """FP8 KV256 follows the FP8 Keeps recipes and excludes attention sinks."""
 
-    assert _make_contiguous_kv256_config(dtype=Float8E4M3FN).use_fp8_qkv
+    assert _make_contiguous_kv256_config(dtype=Float8E4M3FN).use_8bit_qkv
     with pytest.raises(ValueError, match="KV256 supports only"):
         _make_contiguous_kv256_config(
             dtype=Float8E4M3FN,
@@ -3638,7 +3638,7 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert kv256.defers_softmax_anchor_updates
 
     kv256_fp8 = _make_contiguous_kv256_config(dtype=Float8E4M3FN, persistent=persistent)
-    assert kv256_fp8.use_fp8_qkv
+    assert kv256_fp8.use_8bit_qkv
     assert kv256_fp8.streams_tmem_p_fragments
     assert kv256_fp8.softmax_score_fragment_regs == 32
     assert kv256_fp8.num_softmax_score_fragments == 4
@@ -3671,6 +3671,107 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert not q128_fp8_sparse.defers_softmax_anchor_updates
 
 
+@pytest.mark.parametrize("tile_size_q", (64, 128))
+@pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
+def test_attention_ts_decode_sage_profile_accepts_int8_qk_with_e4m3_v(
+    tile_size_q: int, o_dtype
+) -> None:
+    """INT8 Q/K keeps the byte-wide data path and switches BMM1 to INT32 scores."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_common import (
+        _mma_kind_for_pv,
+        _mma_kind_for_qk,
+    )
+    from cutlass.experimental.primitives import Tcgen05MMAKind
+
+    cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q,
+        tile_size_kv=256 if tile_size_q == 64 else 128,
+        qkv_dtype=Int8,
+        v_dtype=Float8E4M3FN,
+        o_dtype=o_dtype,
+    )
+    assert cfg.use_sage_attention and cfg.uses_int32_scores
+    assert cfg.q_dtype == cfg.k_dtype == Int8
+    assert cfg.v_dtype == Float8E4M3FN
+    assert cfg.use_8bit_qkv
+    assert cfg.q_dtype_bytes == cfg.kv_dtype_bytes == 1
+    assert cfg.streams_tmem_p_fragments
+    assert cfg.fragment_p_packed_cols == 8
+    assert cfg.pv_mma_steps_per_fragment == 1
+    assert not cfg.defers_softmax_anchor_updates
+    assert _mma_kind_for_qk(cfg) == Tcgen05MMAKind.INT8
+    assert _mma_kind_for_pv(cfg) == Tcgen05MMAKind.F8F6F4
+
+    fp8_cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q, tile_size_kv=256 if tile_size_q == 64 else 128
+    )
+    assert fp8_cfg.v_dtype == Float8E4M3FN
+    assert fp8_cfg.use_8bit_qkv
+    assert not fp8_cfg.uses_int32_scores
+    assert _mma_kind_for_qk(fp8_cfg) == Tcgen05MMAKind.F8F6F4
+    assert _mma_kind_for_pv(fp8_cfg) == Tcgen05MMAKind.F8F6F4
+
+    bf16_cfg = _make_contiguous_kv256_config()
+    assert bf16_cfg.v_dtype == bf16_cfg.k_dtype == BFloat16
+    assert not bf16_cfg.use_8bit_qkv
+    assert _mma_kind_for_qk(bf16_cfg) == Tcgen05MMAKind.F16
+    assert _mma_kind_for_pv(bf16_cfg) == Tcgen05MMAKind.F16
+
+
+def test_attention_ts_decode_v_dtype_follows_the_probe_dtype_flip() -> None:
+    """The grouped-Q selector scores BF16 Q64 as its FP16 twin; V flips with K.
+
+    A V dtype left at BF16 would fail the K/V rule inside the selector's probe
+    and silently drop the Q64 candidate, so BF16 would never select Q64/KV256.
+    """
+
+    for shape in (
+        dict(
+            seq_len_q=4, seq_len_kv=4096, batch_size=1, num_heads_q=64, num_heads_kv=1
+        ),
+        dict(
+            seq_len_q=8, seq_len_kv=32768, batch_size=64, num_heads_q=16, num_heads_kv=1
+        ),
+    ):
+        cfg = make_decode_config(
+            headdim=128,
+            q_dtype=BFloat16,
+            k_dtype=BFloat16,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            mask_type="causal",
+            **shape,
+        )
+        assert (cfg.tile_size_q, cfg.tile_size_kv) == (64, 256)
+        assert cfg.v_dtype == cfg.k_dtype == BFloat16
+
+
+def test_attention_ts_decode_v_follows_k_unless_given() -> None:
+    """An unset V dtype follows K; an explicit V dtype is kept."""
+
+    shape = dict(
+        seq_len_q=1, seq_len_kv=4096, batch_size=1, num_heads_q=8, num_heads_kv=8
+    )
+    cfg = make_decode_config(
+        headdim=128,
+        q_dtype=Float8E4M3FN,
+        k_dtype=Float8E4M3FN,
+        o_dtype=BFloat16,
+        **shape,
+    )
+    assert cfg.v_dtype == Float8E4M3FN
+    cfg = make_decode_config(
+        headdim=128,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=Float8E4M3FN,
+        o_dtype=BFloat16,
+        **shape,
+    )
+    assert (cfg.k_dtype, cfg.v_dtype) == (BFloat16, Float8E4M3FN)
+
+
 # Dense Sage grids: both streamed Keeps profiles qualify for the static and the
 # persistent scheduler.
 _DENSE_SAGE_GRIDS = ((64, False), (64, True), (128, False), (128, True))
@@ -3699,7 +3800,7 @@ def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
     assert cfg.use_sage_attention
     assert cfg.use_persistent_scheduler is persistent
     assert cfg.streams_tmem_p_fragments
-    assert cfg.use_fp8_qkv
+    assert cfg.use_8bit_qkv and not cfg.uses_int32_scores
     assert cfg.out_dtype == o_dtype
     assert not cfg.defers_softmax_anchor_updates
 
@@ -3708,11 +3809,31 @@ def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
     ("overrides", "match"),
     (
         pytest.param(
-            {"qkv_dtype": Float16, "o_dtype": Float16},
-            "Float8E4M3FN Q, K and V",
-            id="16-bit-qkv",
+            {
+                "qkv_dtype": Int8,
+                "v_dtype": Float8E4M3FN,
+                "sage_args": {"sage_k_block_size": 0, "sage_q_block_size": 0},
+            },
+            "Int8 Q/K requires Sage attention",
+            id="int8-without-sage",
         ),
-        pytest.param({"qkv_dtype": Int8}, "Unsupported q_dtype", id="int8-qk"),
+        pytest.param(
+            {"qkv_dtype": Int8},
+            "Int8 Q/K requires Float8E4M3FN V",
+            id="int8-v-defaults-to-k",
+        ),
+        pytest.param(
+            {"qkv_dtype": Int8, "v_dtype": Int8},
+            "Int8 Q/K requires Float8E4M3FN V",
+            id="int8-v",
+        ),
+        pytest.param({"v_dtype": Float16}, "v_dtype", id="fp8-k-16-bit-v"),
+        pytest.param({"v_dtype": Int8}, "v_dtype: Int8", id="fp8-k-int8-v"),
+        pytest.param(
+            {"qkv_dtype": Float16, "o_dtype": Float16},
+            "Float8E4M3FN or Int8 Q and K",
+            id="16-bit-qk",
+        ),
         pytest.param(
             {
                 "sage_args": {"use_split_kv": True, "splits_kv": 2, "max_splits_kv": 2},
@@ -3756,8 +3877,8 @@ def test_attention_ts_decode_sage_profile_rejects_unsupported_dtypes_and_recipes
 ) -> None:
     """The Sage profile rejects dtypes and recipes outside its contract.
 
-    It takes E4M3 Q, K and V, a 16-bit output, contiguous single-split K/V
-    and the documented scale block sizes.
+    It takes 8-bit Q/K (E4M3 V with INT8 Q/K, otherwise V follows K), a 16-bit
+    output, contiguous single-split K/V and the documented scale block sizes.
     """
 
     with pytest.raises(ValueError, match=match):

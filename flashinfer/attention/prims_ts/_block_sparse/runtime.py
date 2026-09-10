@@ -384,12 +384,15 @@ def validate_block_sparse_run(
                 state.num_kv_heads,
                 state.head_dim,
             )
-            for tensor, name in ((k_summary, "k_summary"), (v_summary, "v_summary")):
+            for tensor, name, dtype in (
+                (k_summary, "k_summary", state.kv_dtype),
+                (v_summary, "v_summary", state.v_dtype),
+            ):
                 _validate_bshd_tensor(
                     tensor,
                     name,
                     expected_shape=summary_shape,
-                    expected_dtype=state.kv_dtype,
+                    expected_dtype=dtype,
                     expected_device=state.device,
                 )
         elif k_summary is not None or v_summary is not None:
@@ -422,12 +425,15 @@ def validate_block_sparse_run(
             state.num_kv_heads,
             state.head_dim,
         )
-        for tensor, name in ((kv_storage.k, "k"), (kv_storage.v, "v")):
+        for tensor, name, dtype in (
+            (kv_storage.k, "k", state.kv_dtype),
+            (kv_storage.v, "v", state.v_dtype),
+        ):
             _validate_bshd_tensor(
                 tensor,
                 name,
                 expected_shape=kv_shape,
-                expected_dtype=state.kv_dtype,
+                expected_dtype=dtype,
                 expected_device=state.device,
             )
         k = kv_storage.k
@@ -465,19 +471,8 @@ def validate_block_sparse_run(
             "rejected by a plan without Sage attention"
         )
     if sage is not None:
-        assert state.sage is not None
-        validate_sage_params(
-            sage,
-            state.sage,
-            batch_size=state.batch_size,
-            seq_len_q=state.seq_len_q,
-            seq_len_kv=state.seq_len_kv,
-            num_qo_heads=state.num_qo_heads,
-            num_kv_heads=state.num_kv_heads,
-            head_dim=state.head_dim,
-            device=state.device,
-            summary_seq_len=num_kv_blocks if use_proxy_routes else None,
-        )
+        assert state.sage_scale_shapes is not None
+        validate_sage_params(sage, state.sage_scale_shapes, device=state.device)
 
     effective_scale = (
         1.0 / math.sqrt(state.head_dim)

@@ -609,7 +609,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         partial_scale = Float32(1.0)
         if cutlass.const_expr(cfg.use_separate_reduction_kernel):
             partial_scale = self._separate_partial_norm_scale(denominator)
-        elif cutlass.const_expr(cfg.use_fp8_qkv):
+        elif cutlass.const_expr(cfg.use_8bit_qkv):
             partial_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
         return partial_scale
 
@@ -2987,7 +2987,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
 
         if cutlass.const_expr(
-            cfg.use_fp8_qkv
+            cfg.use_8bit_qkv
             and cfg.use_fp8_output
             and cfg.tile_size_q == 128
             and cfg.headdim == 128
@@ -3061,11 +3061,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.num_insts_kv == 1):
                 base_addr1 = base_addr0
             partial_dst_col_offset = col_base * Int32(2)
-            partial_norm_scale = Float32(1.0)
-            if cutlass.const_expr(cfg.use_separate_reduction_kernel):
-                partial_norm_scale = self._separate_partial_norm_scale(reduced_sum_0)
-            elif cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
-                partial_norm_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
+            partial_norm_scale = self._split_partial_scale(reduced_sum_0)
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             partial_o_row_base = self._gmem_partial_row_offset(
                 logical_kv_idx,
