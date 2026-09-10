@@ -34,6 +34,7 @@ from .sm100_blk64.dispatch_helpers import (
     torch2cute_dtype_map,
     validate_sm100_blk64_int32_bounds,
     sm100_blk64_requires_int64_kv_strides,
+    sm100_blk64_has_partial_kv_tail,
     dynamic_tensors_compile_key,
     sm100_blk64_auto_kv_splits,
     sm100_blk64_auto_fp8_kv_splits,
@@ -199,7 +200,8 @@ def bsa_attn_sm100_blk64_fwd(
     assert q2k_block_index.shape[:3] == (batch_size, num_head, num_q_blocks)
     q2k_block_index = maybe_contiguous(q2k_block_index)
 
-    has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    user_provided_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    has_block_sizes = user_provided_block_sizes
     if has_block_sizes:
         block_sizes = maybe_contiguous(block_sizes)
         assert block_sizes.dtype == torch.int32
@@ -233,10 +235,31 @@ def bsa_attn_sm100_blk64_fwd(
     # last real block.  Phantom blocks are only masked correctly when
     # HasBlockSizes=True.  Passing a full-block sizes tensor (all 64)
     # activates that path and ensures phantom blocks are zeroed in softmax.
-    if block_sizes is None and has_variable_block_nums:
+    if not user_provided_block_sizes and has_variable_block_nums:
         block_sizes = torch.full(
             (num_kv_blocks,), 64, dtype=torch.int32, device=q_bhsd.device
         )
+        has_block_sizes = True
+
+    # Partial KV tail masking: when seqlen_k is not divisible by 64, the last
+    # KV block has fewer than 64 valid tokens. Without masking, the kernel
+    # computes attention scores for out-of-bounds positions. K=0 (from TMA
+    # zero-fill) gives score=0 → exp(0)=1 weight, which corrupts softmax.
+    #
+    # Fix: set block_sizes[-1] = seqlen_k % 64 so apply_block_size_mask_64
+    # sets out-of-bounds scores to -inf, giving them zero softmax weight.
+    #
+    # Applied when: BF16 path (FP8 rejects non-64-multiple seqlen_k), and
+    # only when the user did not explicitly provide block_sizes (trust theirs).
+    # Also updates auto-generated block_sizes (phantom masking above) so both
+    # corrections are in effect simultaneously.
+    kv_tail_size = seqlen_k % 64
+    if kv_tail_size != 0 and not is_sage_fp8 and not user_provided_block_sizes:
+        if block_sizes is None:
+            block_sizes = torch.full(
+                (num_kv_blocks,), 64, dtype=torch.int32, device=q_bhsd.device
+            )
+        block_sizes[-1] = kv_tail_size
         has_block_sizes = True
 
     validate_sm100_blk64_int32_bounds(
@@ -249,6 +272,20 @@ def bsa_attn_sm100_blk64_fwd(
         q2k_block_nums,
     )
     use_int64_kv_strides = sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
+    # Partial KV tail TMA safety: seqlen_k not divisible by 64. The packed
+    # rank-6 Int32 TMA view rounds up to ceil_div(seqlen_k, 64) full blocks,
+    # causing TMA to read beyond the actual buffer for the last partial block.
+    # Exact-boundary layout uses true seqlen_k so TMA zero-fills out-of-bounds
+    # positions rather than reading garbage. Combined with the block_sizes
+    # masking above (which sets those scores to -inf), this ensures both
+    # memory safety and numerical correctness.
+    # Not applicable to Sage FP8 (D-major layout; seqlen_k % 64 != 0 is
+    # rejected by validate_sm100_blk64_fp8_sage above).
+    use_exact_kv_layout = (
+        not is_sage_fp8
+        and not use_int64_kv_strides
+        and sm100_blk64_has_partial_kv_tail(k_bhsd, v_bhsd)
+    )
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
@@ -364,6 +401,7 @@ def bsa_attn_sm100_blk64_fwd(
             use_clc_scheduler,
             "bhsd_native",
             use_int64_kv_strides,
+            use_exact_kv_layout,
             is_sage_fp8,
             "tvm_ffi_env_stream_v1",
         ),
@@ -418,6 +456,7 @@ def bsa_attn_sm100_blk64_fwd(
             has_block_sizes=has_block_sizes,
             num_splits=kv_splits_i,
             use_int64_kv_strides=use_int64_kv_strides,
+            use_exact_kv_layout=use_exact_kv_layout,
         )
 
         with constexpr_tvm_ffi_converter_patched():

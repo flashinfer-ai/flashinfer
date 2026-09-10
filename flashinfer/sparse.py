@@ -212,6 +212,7 @@ def _vsa_common_checks(
     causal: bool,
     pos_encoding_mode: str,
     logits_soft_cap,
+    require_n_aligned: bool = True,
 ) -> None:
     """Validate the arguments that are identical across all VSA backends."""
     if num_qo_heads % num_kv_heads != 0:
@@ -220,7 +221,7 @@ def _vsa_common_checks(
         )
     if M % R != 0:
         raise ValueError(f"M={M} must be divisible by block size R={R}")
-    if N % C != 0:
+    if require_n_aligned and N % C != 0:
         raise ValueError(f"N={N} must be divisible by block size C={C}")
     if mask is not None or packed_mask is not None:
         raise ValueError(
@@ -999,10 +1000,11 @@ class BlockSparseAttentionWrapper:
                 causal,
                 pos_encoding_mode,
                 logits_soft_cap,
+                require_n_aligned=False,  # blk64 supports partial last KV block
             )
 
             MB = M // R
-            NB = N // C
+            NB = (N + C - 1) // C
             H = num_qo_heads
 
             if block_mask is not None:
