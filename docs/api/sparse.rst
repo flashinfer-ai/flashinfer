@@ -63,6 +63,17 @@ Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
 kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
 BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
 producer and deterministic reduction once the query reaches 8192 tokens.
+The NVFP4 paged-KV prefill route on compute capability 10.0/10.3 is bitwise
+reproducible run to run up to a 16,384-token context, and is not guaranteed to
+be above it. The per-tile block union is consumed in ascending hash-slot order;
+at or below 128 blocks per request the slot is a permutation of the selected
+set, so no two selected ids collide, the insert is a commutative ``atomicOr``
+and repeated calls return identical bits. Above that width the insert falls
+back to linear probing under ``atomicCAS``, colliding ids land in whatever
+order the atomics resolve in, and the accumulation order -- and so the last
+bits of the output -- may differ between runs. Every result is correct either
+way. ``msa_prefill_nvfp4_specialized_stats()`` reports the bound as
+``run_to_run_bitwise_reproducible_up_to_context``.
 Call :func:`flashinfer.msa_ops.supports_packed_kv` with the active device when
 integrating a cache manager across these architectures; the legacy aggregate
 ``SUPPORTS_PACKED_KV`` flag describes the SM120/SM121 backend.

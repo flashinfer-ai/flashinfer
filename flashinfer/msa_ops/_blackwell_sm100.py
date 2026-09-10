@@ -375,8 +375,23 @@ def _validate_scale_arguments(
     k_global_scale,
     v_global_scale,
     allow_uniform_fp8: bool,
+    nvfp4_decline_reason: Optional[str] = None,
 ) -> tuple[float, float]:
     if k.dtype == torch.uint8:
+        # THE BLANKET MESSAGE IS FALSE WHENEVER THE ROUTE COMPUTED A REASON.
+        # NVFP4 K/V *is* supported on this architecture; one axis of this
+        # particular call is not, and the guard already knows which. Discarding
+        # that turns a diagnosable configuration error into an undiagnosable
+        # crash, mid-serve, with nothing to fall back to. The original text is
+        # kept as the default for a decline that carries no reason.
+        if nvfp4_decline_reason:
+            raise NotImplementedError(
+                "NVFP4 K/V MSA on compute capability 10.0/10.3 declined this "
+                f"call: {nvfp4_decline_reason}. NVFP4 K/V IS supported on this "
+                "architecture -- this shape is not, and there is no other "
+                "implementation of this operation over an NVFP4 cache, so the "
+                "call cannot be served at any speed."
+            )
         raise NotImplementedError(
             "NVFP4 K/V is not supported by MSA on compute capability 10.0/10.3"
         )
@@ -1985,6 +2000,181 @@ def _run_decode_module(
     _record_successful_launch(workspace, signature, capturing=capturing)
 
 
+# Query tokens per CTA row tile: the 128-row MMA tile is 8 query tokens x the
+# 16 GQA siblings of one KV head.
+_NVFP4_PREFILL_TOKENS_PER_TILE = 8
+
+
+def _nvfp4_prefill_tiles(total_q: int, batch_size: int) -> int:
+    """CTA tiles per KV head, mirroring the kernel's own enumeration.
+
+    The launch grid is an upper bound rather than an exact tile count: each
+    request rounds its own query length up to the 8-token tile, so the extent
+    over-covers by up to ``batch_size`` tiles and the surplus CTAs exit as soon
+    as they fail to find a request. Restated here only so the capture signature
+    pins the grid; the kernel derives it independently from the same two
+    numbers.
+    """
+    tokens = _NVFP4_PREFILL_TOKENS_PER_TILE
+    return -(-total_q // tokens) + batch_size
+
+
+def _try_nvfp4_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    *,
+    cu_seqlens_k,
+    causal: bool,
+    softmax_scale,
+    page_table,
+    seqused_k,
+    return_softmax_lse: bool,
+    return_temperature_lse: bool,
+    lse_temperature_scale: float,
+    k_scale,
+    v_scale,
+    k_global_scale,
+    v_global_scale,
+    q_offset,
+    workspace: Optional[MSASparseAttentionWorkspace],
+) -> Optional[torch.Tensor]:
+    """Serve NVFP4 paged K/V prefill, or return ``None`` to fall through.
+
+    Compute capability 10.0/10.3 has no NVFP4 MSA prefill route otherwise: the
+    checks below this call reject packed uint8 K/V and tensor K/V scales
+    outright, and that rejection is what falling through restores. This hook
+    sits above them so that the shared tensor-validation and layout-preparation
+    helpers, which sparse decode also uses, stay untouched.
+
+    The guard constrains the model geometry the kernel body is built from, the
+    KV page layout and the two semantics the kernel cannot express (causal-only,
+    no LSE); batch size, per-request query length, per-request KV length, total
+    query count and block-table width are parametric. The width in particular is
+    NOT narrowed here: the kernel's union is a hash table sized by
+    ``queries_per_tile * topk``, not a bitmap indexed by block id, so a
+    2048-wide block table costs it nothing over a 128-wide one.
+    """
+
+    from . import _nvfp4_prefill_sm100 as nvfp4
+
+    reason = nvfp4.check_surface(
+        q=q,
+        k=k,
+        v=v,
+        q2k_indices=q2k_indices,
+        cu_seqlens_q=cu_seqlens_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cu_seqlens_k=cu_seqlens_k,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=return_temperature_lse,
+        lse_temperature_scale=lse_temperature_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+    )
+    if reason is not None:
+        # CARRIED, not discarded. The fall-through raises, there is no other
+        # implementation of this operation over an NVFP4 cache, and the axis
+        # that declined is the only thing that makes that raise actionable.
+        return None, reason
+    # A splitter that returns the block-scale regions as float8_e4m3fn views
+    # hands the kernel the same bytes; this is a reinterpret, not a copy, so the
+    # base pointers the guard just proved are unchanged.
+    k_scale = nvfp4.as_scale_bytes(k_scale)
+    v_scale = nvfp4.as_scale_bytes(v_scale)
+
+    total_q = int(q.shape[0])
+    batch_size = int(cu_seqlens_q.shape[0]) - 1
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and workspace is None:
+        raise RuntimeError(
+            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+            "requires an explicit MSASparseAttentionWorkspace warmed with the "
+            "exact tensors and capture stream"
+        )
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
+    if not capturing:
+        # A serving engine's profile run precedes graph capture; this is the
+        # hook that keeps every build out of a capture region.
+        nvfp4.warm(q.device)
+
+    stream_ptr = _stream_ptr(q.device)
+    context = workspace._lock if workspace is not None else nullcontext()
+    with context:
+        if workspace is not None:
+            _bind_workspace(
+                workspace,
+                device=q.device,
+                stream_ptr=stream_ptr,
+                capturing=capturing,
+            )
+        scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
+        if not math.isfinite(scale):
+            raise ValueError("softmax_scale must be finite")
+        # The output is the only buffer this route needs. There is no dequant
+        # scratch: the kernel dequantizes into shared memory, so nothing here
+        # is proportional to the block-table width or to the batch.
+        out = _workspace_buffer(
+            workspace,
+            "prefill_nvfp4_out",
+            tuple(q.shape),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        tiles = _nvfp4_prefill_tiles(total_q, batch_size)
+        signature = _launch_signature(
+            variant="prefill_nvfp4_kv_paged",
+            target=_select_target(q.device),
+            tensors=(
+                q,
+                k,
+                v,
+                k_scale,
+                v_scale,
+                q2k_indices,
+                cu_seqlens_q,
+                page_table,
+                seqused_k,
+                out,
+            ),
+            scalars=(
+                scale,
+                float(k_global_scale),
+                float(v_global_scale),
+                total_q,
+                batch_size,
+                int(page_table.shape[1]),
+            ),
+            grid=(tiles, int(k.shape[1]), 1),
+        )
+        _check_warmed_launch(workspace, signature, capturing=capturing)
+        nvfp4.run(
+            q=q,
+            k=k,
+            v=v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q2k_indices=q2k_indices,
+            cu_seqlens_q=cu_seqlens_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            out=out,
+            softmax_scale=scale,
+            k_global_scale=float(k_global_scale),
+            v_global_scale=float(v_global_scale),
+        )
+        _record_successful_launch(workspace, signature, capturing=capturing)
+    return out, None
+
+
 def blackwell_msa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2008,6 +2198,29 @@ def blackwell_msa_sparse_attention(
 ):
     """Run sparse prefill on compute capability 10.0 or 10.3."""
 
+    specialized, nvfp4_decline_reason = _try_nvfp4_prefill(
+        q,
+        k,
+        v,
+        q2k_indices,
+        cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        return_softmax_lse=return_softmax_lse,
+        return_temperature_lse=return_temperature_lse,
+        lse_temperature_scale=lse_temperature_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+        workspace=workspace,
+    )
+    if specialized is not None:
+        return specialized
     _validate_scale_arguments(
         q=q,
         k=k,
@@ -2017,6 +2230,7 @@ def blackwell_msa_sparse_attention(
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
         allow_uniform_fp8=False,
+        nvfp4_decline_reason=nvfp4_decline_reason,
     )
     total_q, num_q_heads, num_kv_heads, group_size = _validate_attention_tensors(
         q, k, v, q2k_indices
@@ -2320,6 +2534,194 @@ def blackwell_msa_sparse_attention(
     return out
 
 
+def _try_nvfp4_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    *,
+    page_table,
+    seqused_k,
+    cu_seqlens_k,
+    seqlen_q: int,
+    causal: bool,
+    softmax_scale,
+    return_softmax_lse: bool,
+    k_scale,
+    v_scale,
+    k_global_scale,
+    v_global_scale,
+    q_offset,
+    force_fused,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Serve NVFP4 paged K/V decode, or return ``None`` to fall through.
+
+    Compute capability 10.0/10.3 has no NVFP4 MSA route otherwise: the checks
+    below this call reject packed uint8 K/V and tensor K/V scales outright, and
+    that rejection is what falling through restores. This hook sits above them
+    so that the shared tensor-validation and layout-preparation helpers, which
+    sparse prefill also uses, stay untouched.
+
+    The guard constrains the model geometry the kernel body is built from and
+    the KV page layout; batch size, per-request KV length, block-table width,
+    query length and causality are parametric.
+
+    ``out``, when the caller supplies one, is handed to the kernel as its
+    destination instead of a buffer allocated here. The kernel already took a
+    destination -- ``run(..., out=...)`` -- so this is a plumbing change and
+    not a kernel change; what it removes is the caller's ``out.copy_(...)``,
+    which on the serving route is one 512 KiB device-to-device CUDA-graph node
+    per attention layer per decode step.
+    """
+
+    from . import _nvfp4_decode_sm100 as nvfp4
+
+    reason = nvfp4.check_surface(
+        q=q,
+        k=k,
+        v=v,
+        q2k_indices=q2k_indices,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cu_seqlens_k=cu_seqlens_k,
+        seqlen_q=seqlen_q,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+        force_fused=force_fused,
+    )
+    if reason is not None:
+        # CARRIED, not discarded. The fall-through raises, there is no other
+        # implementation of this operation over an NVFP4 cache, and the axis
+        # that declined is the only thing that makes that raise actionable.
+        return None, reason
+    # vLLM's splitter returns the block-scale regions as float8_e4m3fn views;
+    # the kernel reads them as bytes. This is a reinterpret, not a copy, so the
+    # base pointers the guard just proved are unchanged.
+    k_scale = nvfp4.as_scale_bytes(k_scale)
+    v_scale = nvfp4.as_scale_bytes(v_scale)
+
+    total_q = int(q.shape[0])
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and workspace is None and nvfp4.capture_requires_workspace():
+        raise RuntimeError(
+            "CUDA graph capture of MSA on compute capability 10.0/10.3 "
+            "requires an explicit MSASparseAttentionWorkspace warmed with the "
+            "exact tensors and capture stream"
+        )
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
+    if not capturing:
+        # vLLM's profile run precedes graph capture; this is the hook that
+        # builds the module and takes the one eager launch capture needs.
+        nvfp4.warm(q.device)
+
+    stream_ptr = _stream_ptr(q.device)
+    context = workspace._lock if workspace is not None else nullcontext()
+    with context:
+        if workspace is not None:
+            _bind_workspace(
+                workspace,
+                device=q.device,
+                stream_ptr=stream_ptr,
+                capturing=capturing,
+            )
+        scale = _HEAD_DIM**-0.5 if softmax_scale is None else float(softmax_scale)
+        if not math.isfinite(scale):
+            raise ValueError("softmax_scale must be finite")
+        if out is None:
+            out = _workspace_buffer(
+                workspace,
+                "decode_out",
+                tuple(q.shape),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+        else:
+            # The same invariants _workspace_buffer establishes for the buffer
+            # it hands out, asserted on the caller's tensor instead. Checked
+            # here rather than left to the kernel binding because the two
+            # implementations behind run() do not check identically, and
+            # because a wrong `out` must raise -- never be quietly copied into,
+            # which would put back the copy this parameter removes.
+            if not isinstance(out, torch.Tensor):
+                raise TypeError("out must be a torch.Tensor")
+            if out.device != q.device:
+                raise ValueError("out must be on the same device as q")
+            if out.dtype != torch.bfloat16:
+                raise ValueError(f"out must be bfloat16, got {out.dtype}")
+            if tuple(out.shape) != tuple(q.shape):
+                raise ValueError(
+                    f"out must have q's shape {tuple(q.shape)}, got {tuple(out.shape)}"
+                )
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous")
+        num_kv_heads = int(k.shape[1])
+        # The warm-vs-capture identity is the workspace's contract, so it is
+        # built only when a workspace is in play. Without one there is nothing
+        # to compare against and nothing to protect: this route's whole
+        # pre-launch path is host-side arithmetic over shapes, strides and
+        # dtypes ending in one kernel launch, so a graph replays exactly what
+        # it captured (see nvfp4.capture_requires_workspace).
+        #
+        # One task per (query token, kv head). The cluster width the kernel
+        # launches with is a deterministic function of that task count, so it
+        # is not restated here: the identity this signature establishes already
+        # implies it.
+        signature = None
+        if workspace is not None:
+            signature = _launch_signature(
+                variant="decode_nvfp4_kv_paged",
+                target=_select_target(q.device),
+                tensors=(
+                    q,
+                    k,
+                    v,
+                    k_scale,
+                    v_scale,
+                    q2k_indices,
+                    page_table,
+                    seqused_k,
+                    out,
+                ),
+                scalars=(
+                    scale,
+                    float(k_global_scale),
+                    float(v_global_scale),
+                    total_q,
+                    int(seqlen_q),
+                    bool(causal),
+                    int(page_table.shape[1]),
+                ),
+                grid=(total_q, num_kv_heads, 1),
+            )
+            _check_warmed_launch(workspace, signature, capturing=capturing)
+        nvfp4.run(
+            q=q,
+            k=k,
+            v=v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            q2k_indices=q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            out=out,
+            seqlen_q=int(seqlen_q),
+            causal=bool(causal),
+            softmax_scale=scale,
+            k_global_scale=float(k_global_scale),
+            v_global_scale=float(v_global_scale),
+        )
+        _record_successful_launch(workspace, signature, capturing=capturing)
+    return out, None
+
+
 def blackwell_msa_sparse_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2341,10 +2743,42 @@ def blackwell_msa_sparse_decode_attention(
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """Run sparse decode on compute capability 10.0 or 10.3."""
 
     del partial_dtype
+    specialized, nvfp4_decline_reason = _try_nvfp4_decode(
+        q,
+        k,
+        v,
+        q2k_indices,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        cu_seqlens_k=cu_seqlens_k,
+        seqlen_q=seqlen_q,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        return_softmax_lse=return_softmax_lse,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        k_global_scale=k_global_scale,
+        v_global_scale=v_global_scale,
+        q_offset=q_offset,
+        force_fused=force_fused,
+        workspace=workspace,
+        out=out,
+    )
+    if specialized is not None:
+        return specialized
+    if out is not None:
+        # The NVFP4 route declined this call and the general SM100 path below
+        # allocates its own output. Say so instead of falling through: a caller
+        # that passed `out` is relying on the result landing there.
+        raise NotImplementedError(
+            "out= is implemented by the packed-NVFP4 paged-KV decode route on "
+            "compute capability 10.0/10.3, and that route declined this call"
+        )
     k_global_multiplier, output_scale = _validate_scale_arguments(
         q=q,
         k=k,
@@ -2354,6 +2788,7 @@ def blackwell_msa_sparse_decode_attention(
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
         allow_uniform_fp8=True,
+        nvfp4_decline_reason=nvfp4_decline_reason,
     )
     total_q, num_q_heads, num_kv_heads, _ = _validate_attention_tensors(
         q, k, v, q2k_indices

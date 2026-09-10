@@ -64,6 +64,12 @@ from .jit.blackwell_msa import (
     BlackwellMSATarget,
     gen_blackwell_msa_module,
 )
+from .jit.msa_decode_nvfp4_specialized import (
+    gen_msa_decode_nvfp4_specialized_module,
+)
+from .jit.msa_prefill_nvfp4_specialized import (
+    gen_msa_prefill_nvfp4_specialized_module,
+)
 from .jit.cake_kda import (
     CAKE_KDA_AFFINE_ROLES,
     CakeKDATarget,
@@ -592,6 +598,19 @@ def gen_all_modules(
             jit_specs.extend(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
+            )
+            # Specialized NVFP4 paged-KV decode. Precompiled so that a serving
+            # engine capturing every decode shape never has to build inside a
+            # CUDA graph capture region.
+            jit_specs.append(
+                gen_msa_decode_nvfp4_specialized_module(blackwell_msa_target)
+            )
+            # Specialized NVFP4 paged-KV prefill. Precompiled rather than left
+            # to JIT because it is the only NVFP4 MSA prefill implementation on
+            # these parts, so a first call that has to compile is a first call
+            # that stalls a request.
+            jit_specs.append(
+                gen_msa_prefill_nvfp4_specialized_module(blackwell_msa_target)
             )
 
     minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
