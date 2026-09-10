@@ -653,11 +653,14 @@ class SmemKvTileResource(DecodeGenResourceBase):
 
     @cute.jit
     def _local_tile_idx(
-        self, stage_info: StageInfo, section: Constexpr[FmhaStage]
+        self,
+        stage_info: StageInfo,
+        inst_id: Constexpr[int],
+        section: Constexpr[FmhaStage],
     ) -> Int32:
         """Map the schedule phase to the local K or V tile index."""
         return _local_kv_tile_idx_for_section(
-            self.cfg, stage_info, self.inst_id, self.kv_kind, section
+            self.cfg, stage_info, inst_id, self.kv_kind, section
         )
 
     @cute.jit
@@ -714,6 +717,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
     def _producer_load(
         self,
         stage_info: StageInfo,
+        inst_id: Constexpr[int],
         section: Constexpr[FmhaStage],
         head_dim_stage_idx: Constexpr[int],
     ) -> None:
@@ -721,7 +725,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
         cfg = self.cfg
         # Resolve the schedule-local K/V tile, logical head/batch coordinates,
         # and descriptor kind before selecting paged or dense addressing.
-        local_tile_idx = self._local_tile_idx(stage_info, section)
+        local_tile_idx = self._local_tile_idx(stage_info, inst_id, section)
         logical_h_k_idx, logical_b_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
@@ -1100,7 +1104,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
         """Produce the first split K tile for this schedule phase."""
         # ProdWork: K0 uses inst slot 0; the section selects HEAD/LOOP/TAIL
         # tile numbering and head_dim_stage_idx selects the H256 slice.
-        self._producer_load(stage_info, section, head_dim_stage_idx)
+        self._producer_load(stage_info, KV_INST0, section, head_dim_stage_idx)
 
     @producer_work
     @cute.jit
@@ -1114,7 +1118,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
         """Produce the second split K tile for this schedule phase."""
         # ProdWork: K1 uses inst slot 1 but otherwise shares the same staged
         # K/V TMA path as K0.
-        self._producer_load(stage_info, section, head_dim_stage_idx)
+        self._producer_load(stage_info, KV_INST1, section, head_dim_stage_idx)
 
     @producer_work
     @cute.jit
@@ -1128,7 +1132,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
         """Produce the first split V tile for this schedule phase."""
         # ProdWork: V0 publishes the first V descriptor stream consumed by the
         # corresponding PV MMA call.
-        self._producer_load(stage_info, section, head_dim_stage_idx)
+        self._producer_load(stage_info, KV_INST0, section, head_dim_stage_idx)
 
     @producer_work
     @cute.jit
@@ -1142,7 +1146,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
         """Produce the second split V tile for this schedule phase."""
         # ProdWork: V1 publishes the second V descriptor stream consumed by the
         # corresponding PV MMA call.
-        self._producer_load(stage_info, section, head_dim_stage_idx)
+        self._producer_load(stage_info, KV_INST1, section, head_dim_stage_idx)
 
     @cute.jit
     def _build_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
