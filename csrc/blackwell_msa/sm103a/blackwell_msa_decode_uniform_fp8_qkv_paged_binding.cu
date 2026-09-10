@@ -82,13 +82,21 @@ inline bool IsPackedHndKvPair(const TensorView& k, const TensorView& v) {
     }
   }
   const int64_t num_kv_heads = k.size(1);
-  const int64_t packed_width = 256;
+  const int64_t block_size = k.size(2);
+  const int64_t head_dim = k.size(3);
+  const int64_t packed_width = 2 * head_dim;
+  const int64_t element_bits =
+      static_cast<int64_t>(k.dtype().bits) * static_cast<int64_t>(k.dtype().lanes);
+  if (element_bits % CHAR_BIT != 0) {
+    return false;
+  }
+  const int64_t element_size_bytes = element_bits / CHAR_BIT;
   const uintptr_t k_ptr = reinterpret_cast<uintptr_t>(k.data_ptr());
   const uintptr_t v_ptr = reinterpret_cast<uintptr_t>(v.data_ptr());
-  return k.size(2) == 128 && k.size(3) == 128 && k.stride(3) == 1 &&
-         k.stride(2) == packed_width && k.stride(1) == 128 * packed_width &&
-         k.stride(0) == num_kv_heads * 128 * packed_width && v_ptr >= k_ptr &&
-         v_ptr - k_ptr == 128;
+  return block_size == 128 && head_dim == 128 && k.stride(3) == 1 &&
+         k.stride(2) == packed_width && k.stride(1) == block_size * packed_width &&
+         k.stride(0) == num_kv_heads * block_size * packed_width && v_ptr >= k_ptr &&
+         v_ptr - k_ptr == head_dim * element_size_bytes;
 }
 
 inline void CheckContiguousOrPackedHndKvPair(const TensorView& k, const TensorView& v) {
