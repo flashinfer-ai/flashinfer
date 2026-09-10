@@ -62,7 +62,10 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
-    _get_cache_alibi_slopes_buf,
+    _check_alibi_slopes,
+    _check_alibi_slopes_backend,
+    _resolve_alibi_slopes,
+    _stage_alibi_slopes,
     _get_cache_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -1152,6 +1155,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> torch.Tensor: ...
 
 
@@ -1180,6 +1184,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1208,6 +1213,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1292,6 +1298,14 @@ def single_prefill_with_kv_cache(
         The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[Union[float, torch.Tensor]]
         The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+    alibi_slopes : Optional[torch.Tensor]
+        Caller-supplied ALiBi slopes, one ``float32`` value per query head,
+        shape: ``[num_qo_heads]``, contiguous, on the same device as ``q``. Only
+        valid with ``pos_encoding_mode="ALIBI"`` and only supported by the
+        ``fa2`` backend. ``None`` (default) uses the slopes
+        :func:`flashinfer.utils.get_alibi_slopes` computes for ``num_qo_heads``
+        heads. Under tensor parallelism pass this rank's slice of the slopes
+        computed for the global head count.
 
     Returns
     -------
@@ -1348,6 +1362,11 @@ def single_prefill_with_kv_cache(
         logits_soft_cap = 0.0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
+    alibi_slopes = _check_alibi_slopes(
+        alibi_slopes, q.shape[1], q.device, pos_encoding_mode
+    )
+    if backend != "auto":
+        _check_alibi_slopes_backend(alibi_slopes, backend, None)
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
@@ -1406,6 +1425,10 @@ def single_prefill_with_kv_cache(
             head_dim_qk=q.shape[-1],
             head_dim_vo=out_head_dim,
         )
+    _check_alibi_slopes_backend(alibi_slopes, backend, None)
+    kernel_alibi_slopes = alibi_slopes
+    if kernel_alibi_slopes is None and pos_encoding_mode == "ALIBI":
+        kernel_alibi_slopes = get_alibi_slopes(q.shape[1], device=q.device)
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -1444,9 +1467,7 @@ def single_prefill_with_kv_cache(
         TensorLayout[kv_layout].value,
         window_left,
         packed_custom_mask,
-        get_alibi_slopes(q.shape[1], device=q.device)
-        if pos_encoding_mode == "ALIBI"
-        else None,
+        kernel_alibi_slopes,
         logits_soft_cap,
         sm_scale,
         scale_q,
@@ -1889,6 +1910,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        self._alibi_slopes: Optional[torch.Tensor] = None
+        self._alibi_slopes_buf: Optional[torch.Tensor] = None
         self._plan_info = None
         self._cached_module = None
         self._seq_lens_kv = None
@@ -2247,6 +2270,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        alibi_slopes: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2317,6 +2341,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``1.0``.
         rope_theta : Optional[float]
             The theta used in RoPE, if not provided, will be set to ``1e4``.
+        alibi_slopes : Optional[torch.Tensor]
+            Caller-supplied ALiBi slopes, one ``float32`` value per query head,
+            shape: ``[num_qo_heads]``, contiguous, on the wrapper's device. Only
+            valid with ``pos_encoding_mode="ALIBI"`` and only supported by the
+            ``fa2`` backend; a custom JIT module receives the tensor as its
+            ``maybe_alibi_slopes`` input regardless of ``pos_encoding_mode`` and
+            must declare it. ``None`` (default) uses the slopes
+            :func:`flashinfer.utils.get_alibi_slopes` computes for
+            ``num_qo_heads`` heads. Under tensor parallelism pass this rank's
+            slice of the slopes computed for the global head count. The values
+            are copied into a wrapper-owned buffer, so the tensor may be freed or
+            reused afterwards and a later :meth:`plan` with new slopes also
+            updates a captured CUDA graph.
         q_data_type : Union[str, torch.dtype]
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
@@ -2391,6 +2428,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        jit_tensor_names = (
+            self._jit_additional_tensor_names if self._jit_module is not None else None
+        )
+        alibi_slopes = _check_alibi_slopes(
+            alibi_slopes,
+            num_qo_heads,
+            self.device,
+            pos_encoding_mode,
+            require_alibi_mode=jit_tensor_names is None,
+        )
+        _check_alibi_slopes_backend(alibi_slopes, self._backend, jit_tensor_names)
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -2661,6 +2709,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
                 )
+            _check_alibi_slopes_backend(alibi_slopes, self._backend, None)
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -2751,6 +2800,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._alibi_slopes, self._alibi_slopes_buf = _stage_alibi_slopes(
+            alibi_slopes, self._alibi_slopes_buf
+        )
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
@@ -3228,8 +3280,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     {
                         "maybe_custom_mask": self._custom_mask_buf,
                         "maybe_mask_indptr": self._mask_indptr_buf,
-                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                            q.shape[1], q.device
+                        "maybe_alibi_slopes": lambda: _resolve_alibi_slopes(
+                            self._alibi_slopes, q.shape[1], q.device
                         ),
                         "maybe_prefix_len_ptr": self._prefix_len_ptr,
                         "maybe_token_pos_in_items_ptr": self._token_pos_in_items_ptr,
@@ -3287,7 +3339,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 run_args += [
                     self._custom_mask_buf,
                     self._mask_indptr_buf,
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    _resolve_alibi_slopes(self._alibi_slopes, q.shape[1], q.device),
                     self._prefix_len_ptr,
                     self._token_pos_in_items_ptr,
                     self._max_item_len_ptr,
@@ -3650,6 +3702,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        self._alibi_slopes: Optional[torch.Tensor] = None
+        self._alibi_slopes_buf: Optional[torch.Tensor] = None
         self._cached_module = None
 
     @property
@@ -3715,6 +3769,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        alibi_slopes: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -3782,6 +3837,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``1.0``.
         rope_theta : Optional[float]
             The theta used in RoPE, if not provided, will be set to ``1e4``.
+        alibi_slopes : Optional[torch.Tensor]
+            Caller-supplied ALiBi slopes, one ``float32`` value per query head,
+            shape: ``[num_qo_heads]``, contiguous, on the wrapper's device. Only
+            valid with ``pos_encoding_mode="ALIBI"`` and only supported by the
+            ``fa2`` backend; a custom JIT module receives the tensor as its
+            ``maybe_alibi_slopes`` input regardless of ``pos_encoding_mode`` and
+            must declare it. ``None`` (default) uses the slopes
+            :func:`flashinfer.utils.get_alibi_slopes` computes for
+            ``num_qo_heads`` heads. Under tensor parallelism pass this rank's
+            slice of the slopes computed for the global head count. The values
+            are copied into a wrapper-owned buffer, so the tensor may be freed or
+            reused afterwards and a later :meth:`plan` with new slopes also
+            updates a captured CUDA graph.
         q_data_type : Union[str, torch.dtype]
             The data type of the query tensor, defaults to torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
@@ -3851,6 +3919,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        jit_tensor_names = (
+            self._jit_additional_tensor_names if self._jit_module is not None else None
+        )
+        alibi_slopes = _check_alibi_slopes(
+            alibi_slopes,
+            num_qo_heads,
+            self.device,
+            pos_encoding_mode,
+            require_alibi_mode=jit_tensor_names is None,
+        )
+        _check_alibi_slopes_backend(alibi_slopes, self._backend, jit_tensor_names)
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
@@ -4194,6 +4273,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 ):
                     self._backend = "fmha_v2"
 
+            _check_alibi_slopes_backend(alibi_slopes, self._backend, None)
             get_module_args = (
                 q_data_type,
                 kv_data_type,
@@ -4284,6 +4364,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._alibi_slopes, self._alibi_slopes_buf = _stage_alibi_slopes(
+            alibi_slopes, self._alibi_slopes_buf
+        )
 
     begin_forward = plan
 
@@ -4783,8 +4866,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     {
                         "maybe_custom_mask": self._custom_mask_buf,
                         "maybe_mask_indptr": self._mask_indptr_buf,
-                        "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                            q.shape[1], self.device
+                        "maybe_alibi_slopes": lambda: _resolve_alibi_slopes(
+                            self._alibi_slopes, q.shape[1], self.device
                         ),
                     },
                     args,
@@ -4794,7 +4877,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             run_args += [
                 self._custom_mask_buf,
                 self._mask_indptr_buf,
-                _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+                _resolve_alibi_slopes(self._alibi_slopes, q.shape[1], self.device),
                 self._prefix_len_ptr,
                 self._token_pos_in_items_ptr,
                 self._max_item_len_ptr,

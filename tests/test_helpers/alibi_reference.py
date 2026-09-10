@@ -59,18 +59,24 @@ def get_slopes(n_heads: int):
 
 
 @torch.no_grad()
-def get_alibi_biases(n_heads: int, mask: torch.Tensor):
+def get_alibi_biases(
+    n_heads: int, mask: torch.Tensor, slopes: Optional[torch.Tensor] = None
+):
     """
     ## Calculate the attention biases matrix
 
     * `n_heads` is the number of heads in the attention layer
     * `mask` is the attention mask of shape `[seq_len_q, seq_len_k]`
+    * `slopes` optionally overrides the per-head slopes, shape `[n_heads]`
 
     This returns a matrix of shape `[seq_len_q, seq_len_k, n_heads, ]` with ALiBi attention biases.
     """
 
     # Get slopes $m$ for each head
-    m = get_slopes(n_heads).to(mask.device)
+    if slopes is None:
+        m = get_slopes(n_heads).to(mask.device)
+    else:
+        m = slopes.to(device=mask.device, dtype=torch.float32)
 
     # Calculate distances $[0, 1, \dots, N]$
     # Here we calculate the distances using the mask.
@@ -89,12 +95,14 @@ def alibi_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    slopes: Optional[torch.Tensor] = None,
 ):
     """
     query: [q_len, num_heads, head_dim]
     key: [kv_len, num_heads, head_dim]
     value: [kv_len, num_heads, head_dim]
     mask: [q_len, kv_len]
+    slopes: optional per-head slopes, [num_heads]; defaults to the standard ALiBi slopes
     """
     q_len, num_heads, head_dim = query.shape
 
@@ -103,7 +111,7 @@ def alibi_attention(
     scores *= 1.0 / math.sqrt(head_dim)
 
     # Create AliBi biases if it's not cached
-    alibi_biases = get_alibi_biases(num_heads, mask)
+    alibi_biases = get_alibi_biases(num_heads, mask, slopes)
 
     # Add AliBi biases to attention scores.
     # ALiBi biases has shape `[seq_len, seq_len, n_heads]`

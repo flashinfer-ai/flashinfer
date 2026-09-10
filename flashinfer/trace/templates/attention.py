@@ -314,6 +314,7 @@ gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
         "fixed_split_size": Scalar("int32", optional=True),
         "disable_split_kv": Scalar("bool", optional=True),
         "seq_lens": Tensor(["batch_size"], dtype="int32", optional=True),
+        "alibi_slopes": Tensor(["num_qo_heads"], dtype="float32", optional=True),
         "block_tables": Tensor(
             ["batch_size", "max_num_blocks_per_seq"],
             dtype="int32",
