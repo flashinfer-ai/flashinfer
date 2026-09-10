@@ -329,9 +329,22 @@ class Sm100W4A16MegaMoEKernel:
             fc2_features = (self.hidden + cluster_features - 1) // cluster_features
             self._clc_fc1_features = fc1_features
             self._clc_fc2_features = fc2_features
-            self._clc_queue_offset, words, self._clc_grid_bundles = clc.workspace_shape(
-                row_bound, fc1_features, fc2_features, self._clc_bundle_size
+            self._clc_queue_offset, words, self._clc_capacity_bundles = (
+                clc.workspace_shape(
+                    row_bound, fc1_features, fc2_features, self._clc_bundle_size
+                )
             )
+            # Bound logical rows for balanced routing, without allocator slack.
+            # Full skew capacity above still sizes the bitmap, queue and fallback.
+            balanced_routes = self.max_tokens_per_rank * self.num_topk
+            nonempty_experts = min(self.num_experts_per_rank, balanced_routes)
+            balanced_rows = (
+                nonempty_experts
+                + (balanced_routes - nonempty_experts) // self.cluster_tile_tokens
+            )
+            self._clc_balanced_bundles = (
+                balanced_rows * fc1_features + self._clc_bundle_size - 1
+            ) // self._clc_bundle_size
             # All queue state stays in the existing reset prefix. Only the
             # final fixed transport launch clears it after every late CTA.
             pos = next(
@@ -899,7 +912,11 @@ class Sm100W4A16MegaMoEKernel:
         )
         if cutlass.const_expr(self.use_clc_scheduler):
             grid = clc.launch_grid(
-                max(self._clc_grid_bundles, max_active_clusters), self.cluster_shape_mn
+                min(
+                    max(self._clc_capacity_bundles, max_active_clusters),
+                    max(self._clc_balanced_bundles, max_active_clusters),
+                ),
+                self.cluster_shape_mn,
             )
         else:
             grid = sched.get_grid_shape(max_active_clusters)
