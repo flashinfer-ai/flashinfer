@@ -109,7 +109,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 ### Single Test Run
 A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <routine_name> <flags>`.
 
-The unified MoE comparison runs both backends from the same routing, activation,
+The unified MoE comparison runs the selected backends from the same routing, activation,
 and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
 `nvfp4_w4a16`, `mxfp4`, and `mxfp4_w4a16`. This example uses the
 Nemotron-3.5-Lightning MoE shape:
@@ -122,6 +122,9 @@ CUDA graph timing is enabled by default and captures one MoE invocation per
 graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
 timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotuned
 results use `cutlass_autotune` and `cutile_autotune`.
+On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
+and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
+`--autotune` does not expand its search space. MXFP4 is not supported by b12x.
 
 Representative Qwen3.6 and Nemotron cases are in `samples/sample_testlist.txt`.
 

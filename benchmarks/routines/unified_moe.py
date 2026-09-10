@@ -1,4 +1,4 @@
-"""Apples-to-apples benchmarks for unified CUTLASS and cuTile MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, and b12x MoE runners."""
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     ActivationConfig,
     BackendOptions,
+    B12xNvfp4Config,
+    B12xW4A16Config,
     CutlassBf16Config,
     CutlassNvfp4Config,
     CutlassW4A16Config,
@@ -45,7 +47,10 @@ from flashinfer.fused_moe import (
     SwiGLU,
     SwiGLUStep,
 )
-from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
+from flashinfer.fused_moe.prepare import (
+    _quantize_mxfp4_linear,
+    _swizzle_cutile_fp4_scales,
+)
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
@@ -67,7 +72,9 @@ _BACKEND_CONFIGS = {
     ("bf16", "cutile"): CuTileBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
+    ("nvfp4", "b12x"): B12xNvfp4Config,
     ("nvfp4_w4a16", "cutile"): CuTileNvfp4Bf16Config,
+    ("nvfp4_w4a16", "b12x"): B12xW4A16Config,
     ("mxfp4", "cutile"): CuTileMxfp4Config,
     ("mxfp4_w4a16", "cutlass"): CutlassW4A16Config,
     ("mxfp4_w4a16", "cutile"): CuTileMxfp4Bf16Config,
@@ -94,7 +101,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile"),
+        choices=("cutlass", "cutile", "b12x"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -255,6 +262,36 @@ def _prepare_weight_view(
     if quant_variant.startswith("nvfp4"):
         w1_q, w1_scale, w1_global = _quantize_cutile_nvfp4_source(w1)
         w2_q, w2_scale, w2_global = _quantize_cutile_nvfp4_source(w2)
+        if backend == "b12x":
+            # b12x consumes swizzled scales with padding per expert, not
+            # cuTile's logical checkpoint scales (notably for ragged N).
+            w1_scale = _swizzle_cutile_fp4_scales(w1_scale, scale_block_size=16)
+            w2_scale = _swizzle_cutile_fp4_scales(w2_scale, scale_block_size=16)
+            if quant_variant == "nvfp4":
+                from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+                return {
+                    "w1_weight": w1_q,
+                    "w1_weight_sf": convert_sf_to_mma_layout(
+                        w1_scale,
+                        m=w1.shape[1],
+                        k=w1.shape[2],
+                        num_groups=args.num_experts,
+                        sf_vec_size=16,
+                    ),
+                    "w1_alpha": w1_global,
+                    "w2_weight": w2_q,
+                    "w2_weight_sf": convert_sf_to_mma_layout(
+                        w2_scale,
+                        m=w2.shape[1],
+                        k=w2.shape[2],
+                        num_groups=args.num_experts,
+                        sf_vec_size=16,
+                    ),
+                    "w2_alpha": w2_global,
+                    "fc2_input_scale": torch.ones(1, device=device),
+                }
+            common = {"activation": activation}
         return config_type.prepare_weights(
             w1_q,
             w1_scale,
