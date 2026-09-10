@@ -323,9 +323,7 @@ def test_cake_jit_spec_uses_exact_target_flags(
         f"-DFLASHINFER_CAKE_FUSED_KDA_DECODE_TARGET_MINOR={minor}"
         in spec.extra_cuda_cflags
     )
-    expected_occupancy_flags = (
-        ["-Xptxas=--minnctapersm=3"] if min_blocks else []
-    )
+    expected_occupancy_flags = ["-Xptxas=--minnctapersm=3"] if min_blocks else []
     assert [
         flag
         for flag in spec.extra_cuda_cflags

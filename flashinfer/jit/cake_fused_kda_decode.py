@@ -3865,12 +3865,14 @@ def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
     if 2 * sm_count < work_items <= 3 * sm_count:
         return ("compact_async_pr_eval_h96_f32", "compact_async_positive_f32")
     partial_wave = work_items % (2 * sm_count)
-    high_work = (num_heads == 32 and num_rows >= 32) or (
-        work_items >= 8 * sm_count
-    ) or (
-        work_items > 4 * sm_count
-        and 0 < partial_wave <= sm_count // 2
-        and (num_heads != 12 or partial_wave >= num_heads)
+    high_work = (
+        (num_heads == 32 and num_rows >= 32)
+        or (work_items >= 8 * sm_count)
+        or (
+            work_items > 4 * sm_count
+            and 0 < partial_wave <= sm_count // 2
+            and (num_heads != 12 or partial_wave >= num_heads)
+        )
     )
     if high_work:
         return (
