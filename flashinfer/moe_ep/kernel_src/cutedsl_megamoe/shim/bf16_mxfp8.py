@@ -92,9 +92,7 @@ class MegaMoEBf16Mxfp8Config:
             )
         if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
             raise ValueError(
-                "in_kernel_fc2_reduce is tuner-owned and needs the session's "
-                "permission: pass enable_in_kernel_fc2_reduce=True (it makes the "
-                "combine accumulation order nondeterministic)."
+                "in_kernel_fc2_reduce knob selected without enable_in_kernel_fc2_reduce."
             )
         if self.load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("unsupported load_balance_mode.")
