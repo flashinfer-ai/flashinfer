@@ -7,7 +7,6 @@ The local W4A16 helpers load packed weights and block scales, then decode
 BF16 tiles directly into the TMEM operand pipeline. Both GEMMs use
 dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
 Static and atomic schedulers fuse BF16 dispatch, both GEMMs, and combine.
-CLC uses separate dispatch and finish launches around fused FC1/FC2 compute.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,8 +40,7 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
 )
 
 from .epilogue import W4A16Epilogue, W4A16EpiArgs
-from . import dynamic_mainloop, clc
-from .clc_transport import ClcTransport
+from . import dynamic_mainloop
 
 # Communication ABI: one packed i64 provenance record and two signal slots.
 _TokenMetadataBytes = TokenSrcMetadata.nbytes
@@ -142,7 +140,6 @@ class Sm100W4A16MegaMoEKernel:
         hidden,
         load_balance_mode="static",
         force_static_sched=True,
-        clc_bundle_size=None,
         num_sched_stages=None,
         ab_dtype=cutlass.BFloat16,
         acc_dtype=cutlass.Float32,
@@ -160,14 +157,8 @@ class Sm100W4A16MegaMoEKernel:
     ):
         if not force_static_sched or scenario != "2Dx3D":
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
-        if load_balance_mode not in ("static", "atomic_counter", "clc"):
+        if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("Unsupported W4A16 load_balance_mode.")
-        self.use_clc_scheduler = load_balance_mode == "clc"
-        self._clc_bundle_size = 1 if clc_bundle_size is None else clc_bundle_size
-        if self.use_clc_scheduler and (
-            type(self._clc_bundle_size) is not int or self._clc_bundle_size < 1
-        ):
-            raise ValueError("clc_bundle_size must be a positive integer.")
         if fc2_in_kernel_topk_reduce or in_kernel_fc2_reduce or apply_topk_in_fc1:
             raise ValueError("W4A16 MegaMoE uses external post-FC2 routing.")
         if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
@@ -222,15 +213,11 @@ class Sm100W4A16MegaMoEKernel:
         )
         self.static_expert_shape = static_expert_shape
         self.force_static_sched = force_static_sched
-        self.clc_bundle_size = clc_bundle_size
         self.num_sched_stages = num_sched_stages or 3
         self.group_hint = group_hint
         self.token_padding_block = token_padding_block
         self.sf_padding_block = 1
-        # CLC uses the same publication records, but owns its task generator.
-        self.load_balance_mode = (
-            "atomic_counter" if self.use_clc_scheduler else load_balance_mode
-        )
+        self.load_balance_mode = load_balance_mode
         self.scenario = scenario
         self.arch = get_cutedsl_target_arch()
         self.ab_dtype = self.fc2_output_dtype = cutlass.BFloat16
@@ -316,45 +303,6 @@ class Sm100W4A16MegaMoEKernel:
             token_back_schedule_mode=self.token_back_schedule_mode,
         )
         self._local_region_specs = self._build_local_region_specs()
-        if self.use_clc_scheduler:
-            self._clc_transport = ClcTransport(self.token_comm)
-            row_bound = (
-                self.pool_token_capacity + self.mma_tiler[1] - 1
-            ) // self.mma_tiler[1] + self.num_experts_per_rank
-            cta_features = self.mma_tiler[0] // (2 if self.use_2cta_instrs else 1)
-            cluster_features = cta_features * self.cluster_shape_mn[0]
-            fc1_features = (
-                self.intermediate_gateup + cluster_features - 1
-            ) // cluster_features
-            fc2_features = (self.hidden + cluster_features - 1) // cluster_features
-            self._clc_fc1_features = fc1_features
-            self._clc_fc2_features = fc2_features
-            self._clc_queue_offset, words, self._clc_capacity_bundles = (
-                clc.workspace_shape(
-                    row_bound, fc1_features, fc2_features, self._clc_bundle_size
-                )
-            )
-            # Bound logical rows for balanced routing, without allocator slack.
-            # Full skew capacity above still sizes the bitmap, queue and fallback.
-            balanced_routes = self.max_tokens_per_rank * self.num_topk
-            nonempty_experts = min(self.num_experts_per_rank, balanced_routes)
-            balanced_rows = (
-                nonempty_experts
-                + (balanced_routes - nonempty_experts) // self.cluster_tile_tokens
-            )
-            self._clc_balanced_bundles = (
-                balanced_rows * fc1_features + self._clc_bundle_size - 1
-            ) // self._clc_bundle_size
-            # All queue state stays in the existing reset prefix. Only the
-            # final fixed transport launch clears it after every late CTA.
-            pos = next(
-                i
-                for i, r in enumerate(self._local_region_specs)
-                if r.name == "l1_token_buffer"
-            )
-            self._local_region_specs.insert(
-                pos, _RegionSpec("clc_workspace", cutlass.Int32, (words,), 16)
-            )
         self._shared_region_specs = self._build_shared_region_specs()
         self._local_offsets, self._local_total = _layout_regions(
             self._local_region_specs
@@ -373,11 +321,10 @@ class Sm100W4A16MegaMoEKernel:
     def name(self):
         m, n, k = self.mma_tiler
         cm, cn = self.cluster_shape_mn
-        mode = "clc" if self.use_clc_scheduler else self.load_balance_mode
         return (
-            f"megamoe_w4a16_{m}x{n}x{k}_cluster{cm}x{cn}_{mode}"
+            f"megamoe_w4a16_{m}x{n}x{k}_cluster{cm}x{cn}_{self.load_balance_mode}"
             f"_expert{self.static_expert_shape}_group{self.group_hint}"
-            f"_stages{self.num_sched_stages}_bundle{self.clc_bundle_size}"
+            f"_stages{self.num_sched_stages}"
             f"_return{self.token_back_mode}_epiflag{self.epi_flag_batch}"
             f"_clamp{self.gate_up_clamp}_ep{self.world_size}_topk{self.num_topk}"
             f"_tokens{self.max_tokens_per_rank}_flag{self.flag_batch}"
@@ -469,12 +416,9 @@ class Sm100W4A16MegaMoEKernel:
         return size
 
     def _fit_raw_stages(self, output_tensor, sched_params):
-        if self.use_clc_scheduler:
-            sched_storage_cls = clc.make_storage(sched_params, W4A16Fc12SchedExtension)
-        else:
-            sched_storage_cls = sched_params.get_scheduler_type().make_storage_struct(
-                sched_params, W4A16Fc12SchedExtension, num_drain_warps=0
-            )
+        sched_storage_cls = sched_params.get_scheduler_type().make_storage_struct(
+            sched_params, W4A16Fc12SchedExtension, num_drain_warps=0
+        )
         comm_storage_cls = self.token_comm.extra_smem_storage_class()
         # CuTe's 227KiB per-block capacity already excludes CUDA's 1KiB
         # reservation from the SM's 228KiB. All user storage is counted below.
@@ -695,19 +639,6 @@ class Sm100W4A16MegaMoEKernel:
         )
 
         token_comm_args = _ScaledTokenCommArgs(token_comm_args, fc2_alpha)
-        clc_workspace = None
-        if cutlass.const_expr(self.use_clc_scheduler):
-            clc_workspace = clc.Workspace(
-                self._view_local(local_workspace, "clc_workspace"),
-                self._clc_queue_offset,
-                self._clc_fc2_features,
-            )
-            self._clc_transport.dispatch(
-                token_comm_args,
-                grid=(*self.cluster_shape_mn, max_active_clusters),
-                cluster=(*self.cluster_shape_mn, 1),
-                stream=stream,
-            )
         self._launch_fc12(
             activation=l1_token_buffer_bf16,
             fc1_weight=fc1_weight,
@@ -726,15 +657,7 @@ class Sm100W4A16MegaMoEKernel:
             load_balance_counter=load_balance_counter,
             expert_token_sizes=expert_token_sizes,
             token_comm_args=token_comm_args,
-            clc_workspace=clc_workspace,
         )
-        if cutlass.const_expr(self.use_clc_scheduler):
-            self._clc_transport.finish(
-                token_comm_args,
-                grid=(*self.cluster_shape_mn, max_active_clusters),
-                cluster=(*self.cluster_shape_mn, 1),
-                stream=stream,
-            )
 
     @cute.jit
     def _launch_fc12(
@@ -756,7 +679,6 @@ class Sm100W4A16MegaMoEKernel:
         expert_token_sizes,
         token_comm_args,
         fc1_c=None,
-        clc_workspace=None,
     ):
         e, gateup, h = self.static_expert_shape
         i = gateup // 2
@@ -840,11 +762,6 @@ class Sm100W4A16MegaMoEKernel:
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
         )
-        if cutlass.const_expr(self.use_clc_scheduler):
-            # Queue readiness/local drain requires immediate completion events;
-            # keep actual helper metadata consistent with the CLC branch.
-            self.epilogue.fc1_epi_flag_batch = 1
-            self.epilogue.fc2_epi_flag_batch = 1
         assert self.epilogue.acc_tmem_cols * self.num_acc_stage == mix.num_acc_tmem_cols
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             cutlass.BFloat16,
@@ -910,16 +827,7 @@ class Sm100W4A16MegaMoEKernel:
         self.b_tx_bytes = cute.size_in_bytes(cutlass.BFloat16, b_stage) * cute.size(
             tiled_mma.thr_id.shape
         )
-        if cutlass.const_expr(self.use_clc_scheduler):
-            grid = clc.launch_grid(
-                min(
-                    max(self._clc_capacity_bundles, max_active_clusters),
-                    max(self._clc_balanced_bundles, max_active_clusters),
-                ),
-                self.cluster_shape_mn,
-            )
-        else:
-            grid = sched.get_grid_shape(max_active_clusters)
+        grid = sched.get_grid_shape(max_active_clusters)
         self.kernel(
             tiled_mma,
             wa1,
@@ -946,8 +854,6 @@ class Sm100W4A16MegaMoEKernel:
             mix.smem_layout_b,
             mix.smem_layout_a_transform,
             token_comm_args,
-            clc_workspace,
-            max_active_clusters,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -1117,105 +1023,6 @@ class Sm100W4A16MegaMoEKernel:
         activation_layout,
         transform_layout,
         token_comm_args,
-        clc_workspace,
-        max_active_clusters: cutlass.Constexpr,
-    ):
-        if cutlass.const_expr(self.use_clc_scheduler):
-            if clc.active_cluster(
-                sched_params,
-                self._clc_fc1_features,
-                self._clc_fc2_features,
-                self._clc_bundle_size,
-                max_active_clusters,
-                self.cluster_shape_mn[0],
-            ):
-                self._compute_body(
-                    mma,
-                    wa1,
-                    wt1,
-                    sa1,
-                    st1,
-                    ba1,
-                    bt1,
-                    wa2,
-                    wt2,
-                    sa2,
-                    st2,
-                    ba2,
-                    bt2,
-                    fc1_output,
-                    fc2_output,
-                    fc1_alpha,
-                    fc1_done,
-                    sched_params,
-                    cluster_layout,
-                    raw_layout,
-                    scale_layout,
-                    scale_tma_layout,
-                    activation_layout,
-                    transform_layout,
-                    token_comm_args,
-                    clc_workspace,
-                )
-        else:
-            self._compute_body(
-                mma,
-                wa1,
-                wt1,
-                sa1,
-                st1,
-                ba1,
-                bt1,
-                wa2,
-                wt2,
-                sa2,
-                st2,
-                ba2,
-                bt2,
-                fc1_output,
-                fc2_output,
-                fc1_alpha,
-                fc1_done,
-                sched_params,
-                cluster_layout,
-                raw_layout,
-                scale_layout,
-                scale_tma_layout,
-                activation_layout,
-                transform_layout,
-                token_comm_args,
-                clc_workspace,
-            )
-
-    @cute.jit
-    def _compute_body(
-        self,
-        mma,
-        wa1,
-        wt1,
-        sa1,
-        st1,
-        ba1,
-        bt1,
-        wa2,
-        wt2,
-        sa2,
-        st2,
-        ba2,
-        bt2,
-        fc1_output,
-        fc2_output,
-        fc1_alpha,
-        fc1_done,
-        sched_params,
-        cluster_layout,
-        raw_layout,
-        scale_layout,
-        scale_tma_layout,
-        activation_layout,
-        transform_layout,
-        token_comm_args,
-        clc_workspace,
     ):
         mix = self.mixed_fc1
         tidx = cute.arch.thread_idx()[0]
@@ -1307,31 +1114,7 @@ class Sm100W4A16MegaMoEKernel:
         )
         consumer = scheduler.make_consumer()
         early_init = self.load_balance_mode == "atomic_counter"
-        clc_pipe = None
-        clc_claim_pipe = None
-        clc_completed = None
-        if cutlass.const_expr(self.use_clc_scheduler):
-            clc.initialize(scheduler, storage.sched_storage)
-            clc_completed = storage.sched_storage.completed.ptr
-            clc_pipe = pipeline.PipelineClcFetchAsync.create(
-                barrier_storage=storage.sched_storage.clc_mbar.data_ptr(),
-                num_stages=1,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-                consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * cute.size(self.cluster_shape_mn)
-                ),
-                tx_count=16,
-                cta_layout_vmnk=cluster_layout,
-                defer_sync=True,
-            )
-            clc_claim_pipe = pipeline.PipelineAsync.create(
-                barrier_storage=storage.sched_storage.claim_mbar.data_ptr(),
-                num_stages=2,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
-                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
-                defer_sync=True,
-            )
-        elif cutlass.const_expr(early_init):
+        if cutlass.const_expr(early_init):
             scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         s_raw = smem.allocate_tensor(
@@ -1366,19 +1149,16 @@ class Sm100W4A16MegaMoEKernel:
             cute.arch.setmaxregister_decrease(80)
 
         if warp == 7:
-            if cutlass.const_expr(self.use_clc_scheduler):
-                clc.schedule(scheduler, storage.sched_storage, clc_claim_pipe)
-            else:
-                self.token_comm.sched_warp_pre_init_wait(token_comm_args)
-                if cutlass.const_expr(not early_init):
-                    scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
-                scheduler.gen_next_work()
-                while scheduler.current_work.is_valid_tile:
-                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
-                    scheduler.publish_work()
-                    scheduler.gen_next_work()
+            self.token_comm.sched_warp_pre_init_wait(token_comm_args)
+            if cutlass.const_expr(not early_init):
+                scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
+            scheduler.gen_next_work()
+            while scheduler.current_work.is_valid_tile:
+                ext.prefetch_for_expert(scheduler.current_work.expert_idx)
                 scheduler.publish_work()
-                scheduler.produce_tail()
+                scheduler.gen_next_work()
+            scheduler.publish_work()
+            scheduler.produce_tail()
 
         if warp == 5:
             state = pipeline.make_pipeline_state(
@@ -1430,10 +1210,7 @@ class Sm100W4A16MegaMoEKernel:
             work = consumer.consume_work()
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
-                    if cutlass.const_expr(not self.use_clc_scheduler):
-                        self.token_comm.fc1_tma_b_predispatch_spin(
-                            token_comm_args, work
-                        )
+                    self.token_comm.fc1_tma_b_predispatch_spin(token_comm_args, work)
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1448,15 +1225,14 @@ class Sm100W4A16MegaMoEKernel:
                         self._fc1_k_tiles,
                     )
                 else:
-                    if cutlass.const_expr(not self.use_clc_scheduler):
-                        if not work.peek_ready:
-                            spin_wait(
-                                fc1_done.iterator
-                                + work.cumulative_token_block_count
-                                + work.tile_n_idx,
-                                lambda v: v >= fc2_threshold,
-                                fail_sleep_cycles=500,
-                            )
+                    if not work.peek_ready:
+                        spin_wait(
+                            fc1_done.iterator
+                            + work.cumulative_token_block_count
+                            + work.tile_n_idx,
+                            lambda v: v >= fc2_threshold,
+                            fail_sleep_cycles=500,
+                        )
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1620,8 +1396,6 @@ class Sm100W4A16MegaMoEKernel:
                     topk_scores=None,
                 ),
                 token_comm_args=token_comm_args,
-                clc_workspace=clc_workspace,
-                clc_completed=clc_completed,
             )
             cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()
@@ -1629,33 +1403,16 @@ class Sm100W4A16MegaMoEKernel:
 
         if warp >= 8 and warp < 12:
             cute.arch.setmaxregister_decrease(64)
-            if cutlass.const_expr(self.use_clc_scheduler):
-                if warp == 8:
-                    clc.run(
-                        scheduler,
-                        storage.sched_storage,
-                        clc_workspace,
-                        clc_pipe,
-                        clc_claim_pipe,
-                        self.cluster_shape_mn[0],
-                        self._clc_bundle_size,
-                    )
-            else:
-                self.token_comm.dispatch_warp_body(
-                    token_comm_args,
-                    comm_storage,
-                    warp_idx=warp,
-                    lane_idx=cute.arch.lane_idx(),
-                    tidx=tidx,
-                )
-        if cutlass.const_expr(self.use_clc_scheduler):
-            pipeline.NamedBarrier(
-                barrier_id=8, num_threads=self.threads_per_cta
-            ).arrive_and_wait()
-        else:
-            self.token_comm.kernel_tail(
-                token_comm_args, warp_idx=warp, lane_idx=cute.arch.lane_idx(), tidx=tidx
+            self.token_comm.dispatch_warp_body(
+                token_comm_args,
+                comm_storage,
+                warp_idx=warp,
+                lane_idx=cute.arch.lane_idx(),
+                tidx=tidx,
             )
+        self.token_comm.kernel_tail(
+            token_comm_args, warp_idx=warp, lane_idx=cute.arch.lane_idx(), tidx=tidx
+        )
 
     def _pool_shapes(self) -> Tuple[int, int, int]:
         """Worst-case pool sizes.

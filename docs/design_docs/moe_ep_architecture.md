@@ -90,8 +90,8 @@ An explicit knob dictionary, including `{}`, preserves the existing manual
 configuration behavior instead of merging these defaults. `knobs="auto"`
 collectively tunes eight tactics on the first forward before graph capture:
 N64/N128, flag batches 4/8, and epilogue/reused-dispatch token return, all with
-two scheduler stages. Explicit configurations also support M128 and CLC;
-these are outside the default autotune catalog.
+two scheduler stages. Explicit configurations also support M128 outside the
+default autotune catalog.
 
 ```python
 from flashinfer.moe_ep import (
@@ -130,9 +130,9 @@ prequantized activation fields (`scales`, `fc1_alpha`, `fc2_alpha`, and
 `fc1_norm_const`). Routing IDs are int32/int64, and routing scores are FP32
 and applied after the BF16 FC2 result. The initial backend supports SwiGLU,
 hidden sizes divisible by 32, intermediate sizes divisible by 64, and
-`top_k <= min(32, num_experts)`. Its final top-k reduction is separate from the MegaMoE launches. Static and
-atomic scheduling fuse dispatch, both GEMMs, and combine; CLC uses separate
-dispatch and finish launches around fused FC1/FC2 compute.
+`top_k <= min(32, num_experts)`. Static and atomic-counter scheduling fuse
+dispatch, both GEMMs, and combine in one MegaMoE launch. The final top-k
+reduction is separate.
 
 `PrequantizedMoEWeights` global scales are optional keyword-only additions.
 The W4A16 backend applies them after FP32 accumulation. For numerical tests

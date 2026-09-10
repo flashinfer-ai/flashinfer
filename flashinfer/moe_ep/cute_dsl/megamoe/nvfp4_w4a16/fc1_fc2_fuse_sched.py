@@ -275,7 +275,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         group_hint: int,
         token_padding_block: int,
         sf_padding_block: int,
-        load_balance_mode: Literal["static", "atomic_counter", "clc"] = "static",
+        load_balance_mode: Literal["static", "atomic_counter"] = "static",
         load_balance_counter_ptr=None,
         override_num_stages: Optional[int] = None,
         is_swap_ab: bool = True,
@@ -291,9 +291,9 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         """Create fused fc12 scheduler params."""
         if scenario != "2Dx3D":
             raise ValueError(f"fused fc1+fc2 only supports 2Dx3D, got {scenario!r}")
-        if load_balance_mode not in ("static", "atomic_counter", "clc"):
+        if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError(
-                f"load_balance_mode must be one of 'static' / 'atomic_counter' / 'clc', "
+                f"load_balance_mode must be one of 'static' / 'atomic_counter', "
                 f"got {load_balance_mode!r}"
             )
         if load_balance_mode == "atomic_counter" and load_balance_counter_ptr is None:
@@ -525,12 +525,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ext=_DEFAULT_SCHED_EXT,
         **kwargs,
     ) -> type:
-        if params.load_balance_mode == "clc":
-            raise NotImplementedError(
-                "load_balance_mode='clc' is reserved; CLC path is in"
-                " MoEDynamicPersistentTileScheduler, not the mega scheduler"
-            )
-
         num_tile_stages = params.num_sched_stages
         fields_per_stage = ext.WorkTileInfo.TotalFields
 
@@ -576,12 +570,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             raise ValueError(
                 f"num_consumer_threads must be positive, got {num_consumer_threads}"
             )
-        if params.load_balance_mode == "clc":
-            raise NotImplementedError(
-                "load_balance_mode='clc' is reserved; CLC path is in"
-                " MoEDynamicPersistentTileScheduler, not the mega scheduler"
-            )
-
         num_stages = params.num_sched_stages
         fields_per_stage = ext.WorkTileInfo.TotalFields
 
@@ -810,7 +798,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 self._dynamic_state = self._dynamic_state  # DSL carry
             else:
                 self._dynamic_state = self._dynamic_state  # balance scf.if yield
-        elif const_expr(self.params.load_balance_mode == "static"):
+        else:
             # Static mode eagerly decodes the first tile.
             if warp_idx == sched_warp_id:
                 cluster_linear_tile_idx = self._advance_work_linear_tile_idx_static(
@@ -822,11 +810,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             else:
                 self._fused_state = self._fused_state  # balance scf.if yield
                 self.current_work = self.current_work
-        else:
-            raise NotImplementedError(
-                "load_balance_mode='clc' is reserved; CLC scheduler is "
-                "MoEDynamicPersistentTileScheduler, not the mega scheduler"
-            )
 
         # Codegen-time signal: gen_next_work's first trace site sees
         # this True and emits the first-tile-finalize path; second trace
@@ -1395,14 +1378,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 cluster_linear_tile_idx = self._advance_work_linear_tile_idx_dynamic(
                     loc=loc, ip=ip
                 )
-            elif const_expr(self.params.load_balance_mode == "static"):
+            else:
                 cluster_linear_tile_idx = self._advance_work_linear_tile_idx_static(
                     loc=loc, ip=ip
-                )
-            else:  # "clc"
-                raise NotImplementedError(
-                    "load_balance_mode='clc' is reserved; CLC scheduler is "
-                    "MoEDynamicPersistentTileScheduler, not the mega scheduler"
                 )
             self._gen_work_from_cluster_idx(cluster_linear_tile_idx, loc=loc, ip=ip)
 

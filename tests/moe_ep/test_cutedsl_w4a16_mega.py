@@ -580,41 +580,6 @@ def test_w4a16_mega_reference_schedule(expected_world_size, token_back_mode):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("token_back_mode", ("epi_warps", "reuse_dispatch_warps"))
-@pytest.mark.parametrize(
-    ("tile_m", "tile_n", "cluster_m", "bundle", "expected_world_size"),
-    (
-        pytest.param(256, 64, 2, 1, 2, id="n64-c2-b1-ep2", marks=pytest.mark.gpu_2),
-        pytest.param(256, 128, 2, 3, 2, id="n128-c2-b3-ep2", marks=pytest.mark.gpu_2),
-        pytest.param(128, 64, 1, 1, 1, id="m128-n64-c1-b1-ep1"),
-    ),
-)
-def test_w4a16_mega_clc_reference_schedule(
-    tile_m, tile_n, cluster_m, bundle, expected_world_size, token_back_mode
-):
-    # Reuse the exact numerical/scale/graph oracles. Bundle 3 crosses row
-    # boundaries and includes partial bundles; skewed EP2 leaves an empty rank.
-    knobs = {
-        "mma_tiler_mnk": (tile_m, tile_n, 256),
-        "cluster_shape_mnk": (cluster_m, 1, 1),
-        "use_2cta_instrs": tile_m == 256,
-        "group_hint": 512,
-        "load_balance_mode": "clc",
-        "clc_bundle_size": bundle,
-        "num_sched_stages": 2,
-        "flag_batch": 4,
-        "epi_flag_batch": (2, 4),
-        "token_back_mode": token_back_mode,
-    }
-    _check_numerical(expected_world_size, knobs=knobs)
-    _check_numerical(
-        expected_world_size, hidden=288, intermediate=448, num_tokens=257, knobs=knobs
-    )
-    _check_scale_and_routing_contract(expected_world_size, knobs=knobs)
-    _check_graph_replay(expected_world_size, knobs=knobs)
-
-
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "expected_world_size",
     (pytest.param(1, id="ep1"), pytest.param(2, id="ep2", marks=pytest.mark.gpu_2)),

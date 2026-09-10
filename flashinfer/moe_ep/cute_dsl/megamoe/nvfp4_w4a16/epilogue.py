@@ -19,7 +19,6 @@ import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import Int64
 from cutlass.cute.nvgpu import tcgen05
 
-from . import clc
 from .fc1_fc2_fuse_sched import BlockPhase
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import iket
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fmin, fmax
@@ -149,8 +148,6 @@ class W4A16Epilogue:
         tidx: cutlass.Int32,
         optional_epi_args: W4A16EpiArgs = None,  # Epilogue optinal runtime arguments.
         token_comm_args=None,  # Only valid when enable token communication
-        clc_workspace=None,
-        clc_completed=None,
     ):
         if cutlass.const_expr(optional_epi_args is None):
             optional_epi_args = W4A16EpiArgs(
@@ -234,65 +231,25 @@ class W4A16Epilogue:
             if cutlass.const_expr(self.overlapping_accum):
                 is_odd_turn = cutlass.Int32(1) - is_odd_turn
 
-            if cutlass.const_expr(clc_workspace is not None):
-                # Ready work can only be published after all stores are visible.
-                # Acknowledge BEFORE asking for NEXT: the scheduler may be
-                # draining this very tile before it can publish its terminal.
-                if cur_was_linear1:
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                wait_only_named_barrier.arrive_and_wait()
-                if tidx % (32 * self._EpilogueWarpCnt) == 0:
-                    if cur_was_linear1:
-                        in_bound = (
-                            prev_work_tile_info.tile_m_idx
-                            * self._EpilogueFc1IntermediateDownTileSize
-                            < fc1_output.shape[1]
-                        )
-                        clc.complete_fc1(
-                            clc_workspace,
-                            fc1_done_counter,
-                            prev_work_tile_info,
-                            cute.ceil_div(self.static_expert_shape[1], self.cta_tile_m),
-                            in_bound,
-                        )
-                    elif cutlass.const_expr(self.token_back_by_dispatch):
-                        # Preserve inherited FC2 counting, including padded
-                        # feature CTAs. Return expects ceil(H/cluster-M)*C;
-                        # FC1 instead masks padded feature contributions.
-                        cute.arch.atomic_add(
-                            token_comm_args.fc2_done_counter.iterator
-                            + prev_work_tile_info.expert_idx,
-                            cutlass.Int32(1),
-                            sem="release",
-                            scope="gpu",
-                        )
-                    cute.arch.atomic_add(
-                        clc_completed, cutlass.Int32(1), sem="release", scope="cta"
-                    )
-                work_tile_info = sched_consumer.consume_work()
+            work_tile_info = sched_consumer.consume_work()
+
+            # Drain pending FC1 stores before publishing the fc1-done counter.
+            if cur_was_linear1:
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            # _fence_rel_gpu()
+            wait_only_named_barrier.arrive_and_wait()
+
+            # Publish completion for the work tile snapshotted above.
+            if cur_was_linear1:
+                flag_tracker = fc1_epi.signal_fc1_done(
+                    prev_work_tile_info, work_tile_info, flag_tracker
+                )
             else:
-                work_tile_info = sched_consumer.consume_work()
-
-                # Drain pending FC1 stores before publishing the fc1-done counter.
-                if cur_was_linear1:
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                # _fence_rel_gpu()
-                wait_only_named_barrier.arrive_and_wait()
-
-                # Publish completion for the work tile snapshotted above.
-                if cur_was_linear1:
-                    flag_tracker = fc1_epi.signal_fc1_done(
-                        prev_work_tile_info, work_tile_info, flag_tracker
-                    )
-                else:
-                    flag_tracker = fc2_epi.signal_fc2_done(
-                        prev_work_tile_info, work_tile_info, flag_tracker
-                    )
-        if cutlass.const_expr(clc_workspace is None):
-            # Original static/atomic tail flush; CLC publishes immediate flags.
-            flag_tracker.fire()
+                flag_tracker = fc2_epi.signal_fc2_done(
+                    prev_work_tile_info, work_tile_info, flag_tracker
+                )
+        flag_tracker.fire()
 
 
 class W4A16Fc2Epilogue(EpilogueContext):

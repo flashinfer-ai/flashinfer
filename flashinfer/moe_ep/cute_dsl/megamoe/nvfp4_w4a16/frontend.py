@@ -34,10 +34,9 @@ class MegaMoEW4A16Config:
     mma_tiler_mnk: Tuple[int, int, int] = (256, 128, 256)
     cluster_shape_mnk: Tuple[int, int, int] = (2, 1, 1)
     use_2cta_instrs: bool = True
-    load_balance_mode: Literal["static", "atomic_counter", "clc"] = "static"
+    load_balance_mode: Literal["static", "atomic_counter"] = "static"
     group_hint: Optional[int] = None
     force_static_sched: bool = True
-    clc_bundle_size: Optional[int] = None
     num_sched_stages: Optional[int] = None
     flag_batch: int = 1
     epi_flag_batch: Tuple[int, int] = (1, 1)
@@ -53,13 +52,10 @@ class MegaMoEW4A16Config:
         # Geometry knobs also arrive as JSON arrays from the benchmark.
         object.__setattr__(self, "mma_tiler_mnk", tuple(self.mma_tiler_mnk))
         object.__setattr__(self, "cluster_shape_mnk", tuple(self.cluster_shape_mnk))
-        if self.load_balance_mode not in ("static", "atomic_counter", "clc"):
+        if self.load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError(
                 f"Unsupported load_balance_mode={self.load_balance_mode!r}."
             )
-        if self.load_balance_mode == "clc" and self.clc_bundle_size is not None:
-            if type(self.clc_bundle_size) is not int or self.clc_bundle_size < 1:
-                raise ValueError("clc_bundle_size must be a positive integer.")
         if self.apply_topk_in_fc1 or self.in_kernel_fc2_reduce:
             raise ValueError("W4A16 routing scores are applied after FC2.")
         if self.token_back_mode == "standalone_warps":
@@ -201,7 +197,6 @@ class MegaMoEW4A16Frontend:
             c.load_balance_mode,
             c.group_hint,
             c.force_static_sched,
-            c.clc_bundle_size,
             c.num_sched_stages,
             c.flag_batch,
             c.epi_flag_batch,
@@ -241,7 +236,6 @@ class MegaMoEW4A16Frontend:
                 c.hidden,
             ),
             force_static_sched=c.force_static_sched,
-            clc_bundle_size=c.clc_bundle_size,
             num_sched_stages=c.num_sched_stages,
             ab_dtype=cutlass.BFloat16,
             world_size=c.world_size,
