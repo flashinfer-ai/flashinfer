@@ -153,6 +153,12 @@ def _run_pdl_ordering_worker(
 
         # use_oneshot True and False select the two kernels that read
         # residual_in ahead of the grid dependency sync.
+        #
+        # A failure is recorded rather than raised here: the race can be lost on
+        # one rank and not another, and leaving the loop early would strand the
+        # passing rank on a barrier nobody else reaches, turning the regression
+        # into a hang instead of a failure.
+        failures = []
         for use_oneshot in (True, False):
             stale = 0
             for _ in range(TEST_LOOP):
@@ -194,12 +200,14 @@ def _run_pdl_ordering_worker(
                 ):
                     stale += 1
 
-            assert stale == 0, (
-                f"rank {rank}: residual_in was read before the PDL grid "
-                f"dependency sync in {stale}/{TEST_LOOP} iterations "
-                f"(use_oneshot={use_oneshot}, launch_with_pdl={launch_with_pdl})"
-            )
+            if stale:
+                failures.append(f"use_oneshot={use_oneshot}: {stale}/{TEST_LOOP}")
             dist.barrier(group=group)
+
+        assert not failures, (
+            f"rank {rank}: residual_in was read before the PDL grid dependency "
+            f"sync (launch_with_pdl={launch_with_pdl}) in " + ", ".join(failures)
+        )
     finally:
         dist.barrier(group=group)
         comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
