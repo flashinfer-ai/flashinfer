@@ -535,18 +535,12 @@ def bf16_mega_moe(
     )
     if in_kernel_reduce:
         out = result[:, 0]
-    elif y is not None:
-        # Reduce straight into the caller's buffer: one fewer (n, hidden)
-        # write than routing through reduced_output.  bf16 in / bf16 out sums
-        # in fp32 (torch's acc_type), matching the old result.sum(dim=1).
-        out = y
-        torch.sum(result, dim=1, out=y)
+        if y is not None:
+            y.copy_(out)
     else:
-        out = symm_buffer.reduced_output[:n, 0]
+        # Reduce straight into the caller's buffer
+        out = y if y is not None else symm_buffer.reduced_output[:n, 0]
         torch.sum(result, dim=1, out=out)
-
-    if y is not None and out is not y:
-        y.copy_(out)
 
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
