@@ -53,14 +53,20 @@ struct PagedKVLayout {
   int stride_kv_row;
 };
 
-// inline_scale: the model stores scales inside the row (DSV3_2 / GLM_NSA /
-// GLM53_NOPE) and gathers whole rows with cp.async.bulk, so the row advance
-// must be 16B-aligned. Footer-scale models (DSV4 / DOTS3_SWA) address data
-// rows by the packed data stride and skip the check (584 % 16 != 0 is legal
-// there).
+// Inline-scale rows may be padded, with a 16B-aligned row advance.
+// Footer-scale caches must keep data and scale sections packed. Their data
+// rows use an aligned stride (e.g. 576B for DSV4), separate from the total
+// payload per token (584B including footer scales). Both families require
+// 16B-aligned cache origins and block strides for cp.async.bulk.
 inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool inline_scale,
                                            const char* name) {
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
+  TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(kv.data_ptr()) % 16, 0)
+      << name << " data pointer must be 16B-aligned (cp.async.bulk requirement)";
+  const size_t block_stride = static_cast<size_t>(kv.stride(0)) * elem_bytes;
+  TVM_FFI_ICHECK_EQ(block_stride % 16, 0)
+      << name << " block stride must be 16B-aligned (cp.async.bulk requirement)";
   if (kv.ndim() == 2) {
     const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
     TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
@@ -68,10 +74,11 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool i
         << " is not divisible by bytes_per_token=" << bpt;
     // A flat 2D block carries no row padding to infer, so the row advance is
     // exactly bytes_per_token.
-    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes, bpt};
+    TVM_FFI_ICHECK_GE(block_stride, block_bytes)
+        << name << " block stride is smaller than the packed block width";
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_stride, bpt};
   }
   auto row_advance = [&](int64_t token_axis) {
-    TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
     const size_t bytes = static_cast<size_t>(kv.size(-1)) * elem_bytes;
     TVM_FFI_ICHECK_GE(bytes, static_cast<size_t>(bpt))
         << name << " row width " << bytes << " is smaller than bytes_per_token=" << bpt;

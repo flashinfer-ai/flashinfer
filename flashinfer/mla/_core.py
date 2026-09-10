@@ -697,12 +697,13 @@ def _check_sm120_sparse_v32_kv_cache(
             "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
             f"got {kv_cache.dtype}"
         )
-    # v32/GLM_NSA rows are exactly 656B. GLM-5.3 NoPE has a 528B payload and
-    # the kernels take the row advance as a runtime stride, so padded rows
-    # (e.g. a legacy 656B vLLM pool) are accepted as long as the row starts
-    # with the 528B payload.
+    # Inline-scale caches may pad rows beyond the model's payload. GLM NoPE
+    # stores 512 FP8 values and four FP32 scales (528B); v32/GLM_NSA also
+    # stores 128B of RoPE. The binding validates the actual row stride.
     min_row_bytes = 528 if glm53_nope else 656
-    layout_desc = ">=528 (528B payload, padded rows allowed)" if glm53_nope else "656"
+    layout_desc = (
+        f">={min_row_bytes} ({min_row_bytes}B payload, 16B-aligned padded rows allowed)"
+    )
     if kv_cache.ndim == 3:
         if kv_cache.size(-1) < min_row_bytes:
             raise ValueError(

@@ -86,8 +86,9 @@ _HPB = 16  # head tile per block
 _SCHEMA_VERSION = 2
 # Only current-schema files load; any other version counts as absent and the
 # families recalibrate on the next tuning-mode pass. v2: glm53_nope rows went
-# 656B -> 528B, halving the persisted bytes_per_chunk; a stale v1 entry would
-# silently overstate the L2 footprint in the cpb guard.
+# 656B -> 528B — constants and measured overrides can otherwise retain the old
+# 656B footprint, and a stale entry would silently overstate the L2 footprint
+# in the cpb guard.
 _BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
@@ -984,10 +985,12 @@ def _maybe_load_disk() -> None:
         return
     try:
         payload = json.loads(path.read_text())
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != _SCHEMA_VERSION
-        ):
+        if not isinstance(payload, dict):
+            return
+        if payload.get("schema_version") != _SCHEMA_VERSION:
+            # This file version cannot supply entries. Retry only after it
+            # changes, rather than reparsing stale tuning on every lookup.
+            _cache_mtime = mtime
             return
         devices = payload["devices"]
         if not isinstance(devices, dict):

@@ -827,7 +827,11 @@ def _sparse_mla_sm120_paged_attention(
         (DSv3.2 / GLM) caches take the row advance as a runtime stride, so
         padded rows (a wider last dim, e.g. a legacy 656B pool serving the
         528B GLM53_NOPE payload) work in both decode and prefill as long as
-        blocks pack rows contiguously.
+        blocks pack rows contiguously. Cache origins and block strides must
+        be 16-byte aligned; inline-scale row strides must also be aligned.
+        Footer-scale rows must remain packed. Flat 2D GLM53_NOPE caches use
+        528 bytes per token; expose the token axis in a 3D/4D view to use
+        an existing 656-byte pool without repacking.
     indices : torch.Tensor
         Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
         ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
