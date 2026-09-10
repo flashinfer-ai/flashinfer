@@ -24,7 +24,7 @@ schedule before the repeated K/V tile loop, LOOP is the repeated K/V tile body,
 and TAIL is the one-time cleanup and drain after LOOP exits.
 """
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,6 +51,7 @@ from .fmha_resources import (
     SmemOResource,
     SmemPageOffsetsKvResource,
     SmemQResource,
+    SmemSkipVoteResource,
     TmemOResource,
     TmemPResource,
     TmemSPResource,
@@ -118,6 +119,28 @@ def _schedule_with_work_queue(
     if work_queue is None:
         return schedule(*resources)
     return schedule(*resources, work_queue)
+
+
+def _present_resources(*resources: MemoryResource | None) -> list[MemoryResource]:
+    """Return the optional resources that exist, in declaration order."""
+    return [resource for resource in resources if resource is not None]
+
+
+def _optional_schedule_resources(
+    proxies: Sequence[object], *resources: MemoryResource | None
+) -> tuple[object | None, ...]:
+    """Bind the trailing optional arguments of a captured schedule.
+
+    ``@schedule`` passes resource proxies positionally, so optional resources
+    are appended to the argument list only when present and land in the
+    schedule's trailing ``*optional`` parameter in declaration order.
+    ``resources`` names the optional resources in that order; a ``None`` entry
+    was not passed and binds to ``None``.
+    """
+    proxy_iter = iter(proxies)
+    return tuple(
+        next(proxy_iter) if resource is not None else None for resource in resources
+    )
 
 
 def _packed_context_skip_predicate(
@@ -1056,6 +1079,7 @@ def create_softmax_task(
     s0s1_seq: S0S1SequenceResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
+    skip_vote: SmemSkipVoteResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create a four-warp Softmax task.
@@ -1065,6 +1089,8 @@ def create_softmax_task(
 
     Args:
         task_class: Task subclass used to instantiate the softmax schedule.
+        skip_vote: Skip-softmax vote resource of this instance, published by
+            ``TmemSPResource`` through the softmax warps of this task.
     """
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
@@ -1077,14 +1103,17 @@ def create_softmax_task(
         if tmem_p is not None and tmem_sp.cfg.has_tmem_p_pipeline:
             src = _src_resources(tmem_sp, work_queue=work_queue)
             dst = [tmem_vec, tmem_p]
+            if skip_vote is not None:
+                dst.append(skip_vote)
 
             @schedule
             def softmax_schedule(
                 sp: TmemSPResource,
                 vec: TmemStatsResource,
                 tp: TmemPResource,
-                wq: WorkQueue | None = None,
+                *optional: MemoryResource,
             ) -> None:
+                skip, wq = _optional_schedule_resources(optional, skip_vote, work_queue)
                 p_chunk = sp.init_softmax_state()
                 scale_softmax_log2 = sp.load_scale_softmax_log2()
                 vec.init_store_state()
@@ -1094,7 +1123,7 @@ def create_softmax_task(
                     )
                     vec.init_store_work_tile_state()
                     if tmem_sp.cfg.enable_skip_softmax:
-                        sp.cache_skip_softmax_state()
+                        skip.cache_state()
                     if tmem_sp.uses_varlen_q_offset_cache:
                         q_offset = sp.cache_q_offset()
                     if tmem_sp.uses_packed_dense_k_mask:
@@ -1338,7 +1367,12 @@ def create_softmax_task(
                         vec.commit()
 
             captured_schedule = _schedule_with_work_queue(
-                softmax_schedule, tmem_sp, tmem_vec, tmem_p, work_queue=work_queue
+                softmax_schedule,
+                tmem_sp,
+                tmem_vec,
+                tmem_p,
+                *_present_resources(skip_vote),
+                work_queue=work_queue,
             )
             return task_class(
                 src_resources=src,
@@ -1355,13 +1389,16 @@ def create_softmax_task(
         # SP stage and releases that same resource for MMA to consume directly.
         src = _src_resources(tmem_sp, work_queue=work_queue)
         dst = [tmem_vec]
+        if skip_vote is not None:
+            dst.append(skip_vote)
 
         @schedule
         def softmax_schedule(
             sp: TmemSPResource,
             vec: TmemStatsResource,
-            wq: WorkQueue | None = None,
+            *optional: MemoryResource,
         ) -> None:
+            skip, wq = _optional_schedule_resources(optional, skip_vote, work_queue)
             old_row_max, row_max, row_sum, p_chunk, q_offset = (
                 sp.create_function_variables()
             )
@@ -1377,6 +1414,8 @@ def create_softmax_task(
                         )
                     )
                     vec.create_work_tile_variables()
+                if tmem_sp.cfg.enable_skip_softmax:
+                    skip.cache_state()
                 if tmem_sp.uses_varlen_q_offset_cache:
                     q_offset = sp.cache_q_offset()
                 if tmem_sp.uses_packed_dense_k_mask:
@@ -1532,7 +1571,11 @@ def create_softmax_task(
                     vec.commit()
 
         captured_schedule = _schedule_with_work_queue(
-            softmax_schedule, tmem_sp, tmem_vec, work_queue=work_queue
+            softmax_schedule,
+            tmem_sp,
+            tmem_vec,
+            *_present_resources(skip_vote),
+            work_queue=work_queue,
         )
         return task_class(
             src_resources=src,
@@ -1554,15 +1597,18 @@ def create_softmax_task(
     dst = [tmem_vec]
     if s0s1_seq is not None and index == 0:
         dst.append(s0s1_seq)
+    if skip_vote is not None:
+        dst.append(skip_vote)
 
     @schedule
     def softmax_schedule(
         sp: TmemSPResource,
         vec: TmemStatsResource,
         seq: S0S1SequenceResource,
-        wq: WorkQueue | None = None,
+        *optional: MemoryResource,
     ) -> None:
         """Captured schedule for one softmax warp group."""
+        skip, wq = _optional_schedule_resources(optional, skip_vote, work_queue)
         if tmem_sp.enable_early_tile_sum:
             # The contribution is produced and consumed inside each iteration;
             # do not carry even the scalar tile sum through the persistent loop.
@@ -1576,7 +1622,7 @@ def create_softmax_task(
             old_row_max, row_max, row_sum, q_offset = sp.init_softmax_work_tile_state()
             vec.init_store_work_tile_state()
             if tmem_sp.cfg.enable_skip_softmax:
-                sp.cache_skip_softmax_state()
+                skip.cache_state()
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
@@ -1825,7 +1871,12 @@ def create_softmax_task(
                 vec.commit()
 
     captured_schedule = _schedule_with_work_queue(
-        softmax_schedule, tmem_sp, tmem_vec, s0s1_seq, work_queue=work_queue
+        softmax_schedule,
+        tmem_sp,
+        tmem_vec,
+        s0s1_seq,
+        *_present_resources(skip_vote),
+        work_queue=work_queue,
     )
     return task_class(
         src_resources=src,

@@ -105,10 +105,6 @@ SoftmaxRowSumContribution: TypeAlias = SoftmaxChunks | SoftmaxScalar
 # Stored at module level (not on self) to avoid adding a non-dynamic-expression
 # field to the dataclass, which breaks the framework's scf.if handling.
 _tmem_sp_sdata: dict[int, list] = {}
-# Trace-time storage for the warp-uniform skip-softmax predicate produced by
-# the row-max work and consumed by the P store and row-sum work of the same
-# K/V tile.
-_tmem_sp_skips: dict[int, Any] = {}
 
 
 @cute.jit
@@ -389,16 +385,6 @@ class FmhaConfig:
     def single_qkv_instance(self) -> bool:
         """Return whether one work tile carries a single Q/KV/O instance."""
         return self.num_qkv_instances == 1
-
-    @property
-    def skip_softmax_vote_words(self) -> int:
-        """Return the SMEM Int32 skip-softmax vote words.
-
-        Every Q/KV instance keeps one word per S/P pipeline stage whose four
-        bytes hold the votes of the stage's four softmax warps, so a vote is
-        never rewritten before the MMA task has consumed the matching P tile.
-        """
-        return self.num_qkv_instances * self.mma_softmax_stage
 
     @property
     def uses_early_tile_sum(self) -> bool:
@@ -1931,6 +1917,171 @@ class SmemKVResource(MemoryResource):
 
 
 # ---------------------------------------------------------------------------
+# SmemSkipVoteResource -- skip-softmax state and vote word of one Q/KV instance
+# ---------------------------------------------------------------------------
+
+
+@dataclass(kw_only=True)
+class SmemSkipVoteResource(MemoryResource):
+    """Skip-softmax state and vote word of one Q/KV instance (no pipeline).
+
+    Owns the per-request skip threshold, the base-2 softmax scale, the
+    request Q-length inputs that let TMA padding rows abstain, and one SMEM
+    Int32 vote word per softmax warp and S/P stage of the instance. The
+    softmax schedule caches the per-work-tile state through ``cache_state``;
+    ``TmemSPResource`` decides the warp-uniform skip in its row-max work and
+    publishes each warp's word with ``publish``; ``TmemOResource`` reads the
+    words with ``all_skipped`` through a resource reference, like the cached
+    correction stats, to decide whether to issue the PV MMA. The words are
+    stored before the P-ready arrive of the S/P stage and read after the
+    matching P-ready wait, so the P-ready handoff (``TmemSPResource`` in the
+    paired schedule, ``TmemPResource`` in the staged schedule) orders the
+    votes and this resource needs no pipeline of its own.
+    """
+
+    cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
+    # Q/KV instance whose softmax warps vote here (the q_half of its TmemSP).
+    inst_idx: Constexpr[int] = 0
+    # Per-request e-based skip-softmax thresholds, indexed by batch coordinate.
+    skip_softmax_threshold: cute.Tensor | None = field(init=False, default=None)
+    scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
+    cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
+    # Fixed-layout Q length of every request; packed layouts derive it from
+    # the cumulative offsets instead.
+    seq_len_q: int | Int32 | None = field(init=False, default=None)
+    _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
+    # Per-work-tile state cached before the K/V loop: this request's log2 skip
+    # threshold, the base-2 softmax scale, and whether this lane's row lies
+    # inside the request.
+    log2_threshold_cached: Float32 | None = field(init=False, default=None)
+    scale_softmax_log2_cached: Float32 | None = field(init=False, default=None)
+    row_valid_cached: Boolean | None = field(init=False, default=None)
+
+    def __init__(
+        self,
+        cfg: FmhaConfig,
+        inst_idx: int,
+        skip_softmax_threshold: cute.Tensor | None,
+        scale_softmax_log2: cute.Tensor | None = None,
+        cum_seqlen_q: cute.Tensor | None = None,
+        seq_len_q: int | Int32 | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Bind the skip inputs and reserve the vote words of every S/P stage."""
+        super().__init__(**kwargs)
+        self.cfg = cfg
+        self.inst_idx = inst_idx
+        self.skip_softmax_threshold = skip_softmax_threshold
+        self.scale_softmax_log2 = scale_softmax_log2
+        self.cum_seqlen_q = cum_seqlen_q
+        self.seq_len_q = seq_len_q
+        self._alloc = SmemAllocation(
+            f"smem_skip_vote_{inst_idx}",
+            dtype=Int32,
+            count=cfg.mma_softmax_stage * len(cfg.softmax0_warp_ids),
+            alignment=16,
+        )
+        self.log2_threshold_cached = Float32(-Float32.inf)
+        self.scale_softmax_log2_cached = Float32(0.0)
+        self.row_valid_cached = Boolean(True)
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Return the vote words, one per softmax warp and S/P stage."""
+        return [self._alloc]
+
+    @cute.jit
+    def _vote_words(self, stage_info: StageInfo) -> cutlass.Array:
+        """Return the Int32 view of the vote words, S/P stage major."""
+        context = stage_info.context
+        assert context is not None and context.smem_base is not None
+        assert self._alloc is not None
+        return cutlass.Array(
+            context.smem_base.data_ptr() + self._alloc.offset,
+            dtype=Int32,
+            shape=(self.cfg.mma_softmax_stage * len(self.cfg.softmax0_warp_ids),),
+            addrspace=3,
+        )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def cache_state(self, stage_info: StageInfo) -> None:
+        """Cache the log2 skip threshold, softmax scale, and row validity.
+
+        The public threshold bounds ``exp(sm_scale * (tile_max - running_max))``
+        in the ordinary softmax domain. The K/V loop compares base-2 scaled
+        score gaps, so the request value is converted once here; a zero
+        threshold becomes ``-inf`` and never admits a skip. The base-2 scale is
+        the same runtime value the softmax works receive as a task-local token.
+
+        Rows past the request's Q length are TMA padding: zero-filled for
+        fixed storage and NaN-filled for 16-bit packed storage. Their scores
+        carry no information, so they abstain from the warp vote instead of
+        blocking the valid rows of a partial Q tile.
+        """
+        seq_coord, _, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        threshold = Float32(self.skip_softmax_threshold[batch_coord])
+        self.log2_threshold_cached = cute.math.log2(threshold, fastmath=True)
+        if cutlass.const_expr(self.scale_softmax_log2 is not None):
+            self.scale_softmax_log2_cached = Float32(self.scale_softmax_log2[0])
+        num_softmax_warps = len(self.cfg.softmax0_warp_ids)
+        warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
+        row_in_tile = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+        local_q = (
+            seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
+            + self.inst_idx * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
+            + row_in_tile
+        )
+        if cutlass.const_expr(self.cfg.has_varlen):
+            if cutlass.const_expr(self.cfg.has_uniform_varlen):
+                seqlen_q = Int32(self.cfg.uniform_seq_len_q)
+            else:
+                cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
+                seqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)]) - cuseqlen_q
+        else:
+            seqlen_q = Int32(self.seq_len_q)
+        self.row_valid_cached = local_q < seqlen_q
+
+    @cute.jit
+    def publish(
+        self, stage_info: StageInfo, stage_idx: Int32, warp_skips: Boolean
+    ) -> None:
+        """Store this softmax warp's vote word for the S/P stage.
+
+        Each warp owns one word of the stage, so no reset or atomic is needed.
+        The P-ready arrive that follows in the softmax schedule orders the
+        store before the MMA warp reads the words.
+        """
+        num_softmax_warps = len(self.cfg.softmax0_warp_ids)
+        warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
+        vote_word = stage_idx * Int32(num_softmax_warps) + warp_id_in_sg
+        vote = Int32(0)
+        if warp_skips:
+            vote = Int32(1)
+        if prims.elect_sync():
+            self._vote_words(stage_info)[vote_word] = vote
+
+    @cute.jit
+    def all_skipped(self, stage_info: StageInfo, stage_idx: Int32) -> Boolean:
+        """Return whether every softmax warp of the instance skipped the stage.
+
+        The vote words were published before the P-ready arrive that the MMA
+        schedule waited on, so one plain vector SMEM read observes them all.
+        """
+        num_softmax_warps = len(self.cfg.softmax0_warp_ids)
+        votes = self._vote_words(stage_info).load(
+            stage_idx * Int32(num_softmax_warps),
+            vector_size=num_softmax_warps,
+            alignment=16,
+        )
+        all_votes = Int32(votes[0])
+        for warp_idx in cutlass.range_constexpr(1, num_softmax_warps):
+            all_votes = all_votes & Int32(votes[warp_idx])
+        return cute.arch.make_warp_uniform(all_votes) == Int32(1)
+
+
+# ---------------------------------------------------------------------------
 # TmemSPResource -- TMEM S/P ping-pong buffer with UmmaAsync pipeline
 # ---------------------------------------------------------------------------
 
@@ -1961,23 +2112,12 @@ class TmemSPResource(MemoryResource):
     variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
     scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
-    # Per-request e-based skip-softmax thresholds, indexed by batch coordinate.
-    skip_softmax_threshold: cute.Tensor | None = field(init=False, default=None)
-    skip_softmax_vote_alloc: Constexpr[Optional[SmemAllocation]] = field(
-        init=False, default=None
-    )
-    # Byte view of the vote words: each softmax warp owns one byte of the word
-    # of its S/P stage.
-    _smem_skip_softmax_vote_bytes: cutlass.Array = field(init=False, default=None)
-    # Fixed-layout Q length of every request; packed layouts derive it from
-    # the cumulative offsets instead.
-    seq_len_q: int | Int32 | None = field(init=False, default=None)
-    # Softmax-warp copies of the base-2 softmax scale, this request's log2
-    # skip threshold, and whether this lane's row lies inside the request,
-    # cached before the K/V loop for the skip decision.
-    scale_softmax_log2_cached: Float32 | None = field(init=False, default=None)
-    log2_skip_softmax_threshold_cached: Float32 | None = field(init=False, default=None)
-    skip_softmax_row_valid_cached: Boolean | None = field(init=False, default=None)
+    # Skip-softmax votes of this instance; the row-max work decides the
+    # warp-uniform skip and publishes it there.
+    skip_vote_resource: SmemSkipVoteResource | None = field(init=False, default=None)
+    # Warp-uniform skip of the current K/V tile, produced by the row-max work
+    # and consumed by the P store and row-sum reduction of the same tile.
+    warp_skips_cached: Boolean | None = field(init=False, default=None)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed TMEM pointers/addresses (set by auxiliary work). Avoids
     # per-iteration inttoptr + address math.
@@ -2016,9 +2156,7 @@ class TmemSPResource(MemoryResource):
         variable_window_cta_starts: cute.Tensor | None = None,
         variable_window_q_stride: int | Int32 = 0,
         scale_softmax_log2: cute.Tensor | None = None,
-        skip_softmax_threshold: cute.Tensor | None = None,
-        skip_softmax_vote_alloc: SmemAllocation | None = None,
-        seq_len_q: int | Int32 | None = None,
+        skip_vote_resource: SmemSkipVoteResource | None = None,
         **kwargs: Any,
     ) -> None:
         """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata."""
@@ -2036,13 +2174,8 @@ class TmemSPResource(MemoryResource):
         self.variable_window_cta_starts = variable_window_cta_starts
         self.variable_window_q_stride = variable_window_q_stride
         self.scale_softmax_log2 = scale_softmax_log2
-        self.skip_softmax_threshold = skip_softmax_threshold
-        self.skip_softmax_vote_alloc = skip_softmax_vote_alloc
-        self.seq_len_q = seq_len_q
-        self._smem_skip_softmax_vote_bytes = _placeholder_smem_array(cutlass.Int8)
-        self.scale_softmax_log2_cached = Float32(0.0)
-        self.log2_skip_softmax_threshold_cached = Float32(-Float32.inf)
-        self.skip_softmax_row_valid_cached = Boolean(True)
+        self.skip_vote_resource = skip_vote_resource
+        self.warp_skips_cached = Boolean(False)
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
             cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage,
@@ -2341,14 +2474,7 @@ class TmemSPResource(MemoryResource):
         # Initialize to establish DSL type; real values are set per work tile.
         self.tmem_s_addr_cached = Int32(0)
         self.tmem_p_addr_cached = Int32(0)
-        if cutlass.const_expr(self.cfg.enable_skip_softmax):
-            self._smem_skip_softmax_vote_bytes = cutlass.Array(
-                stage_info.context.smem_base.data_ptr()
-                + self.skip_softmax_vote_alloc.offset,
-                dtype=cutlass.Int8,
-                shape=(self.cfg.skip_softmax_vote_words * 4,),
-                addrspace=3,
-            )
+        _ = stage_info
 
     @cute.jit
     def _default_p_chunk(self) -> SoftmaxRowSumContribution:
@@ -2394,13 +2520,10 @@ class TmemSPResource(MemoryResource):
     def load_scale_softmax_log2(self, stage_info: StageInfo) -> Float32:
         """Load the runtime softmax scale once before the K/V loop."""
         _ = stage_info
-        # Zero is a safe fallback for validation-only resource construction.
-        scale_softmax_log2 = Float32(0.0)
-        if cutlass.const_expr(self.scale_softmax_log2 is not None):
-            scale_softmax_log2 = Float32(self.scale_softmax_log2[0])
-        if cutlass.const_expr(self.cfg.enable_skip_softmax):
-            self.scale_softmax_log2_cached = scale_softmax_log2
-        return scale_softmax_log2
+        if cutlass.const_expr(self.scale_softmax_log2 is None):
+            # Safe fallback for validation-only resource construction.
+            return Float32(0.0)
+        return self.scale_softmax_log2[0]
 
     @cute.jit
     def _init_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -2480,46 +2603,6 @@ class TmemSPResource(MemoryResource):
         cuseqlen_k = Int32(self.cum_seqlen_k[batch_coord])
         return Int32(self.cum_seqlen_k[batch_coord + Int32(1)]) - cuseqlen_k
 
-    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
-    @cute.jit
-    def cache_skip_softmax_state(self, stage_info: StageInfo) -> None:
-        """Cache the request's log2 skip threshold and this lane's row validity.
-
-        The public threshold bounds ``exp(sm_scale * (tile_max - running_max))``
-        in the ordinary softmax domain. The K/V loop compares base-2 scaled
-        score gaps, so the request value is converted once here; a zero
-        threshold becomes ``-inf`` and never admits a skip.
-
-        Rows past the request's Q length are TMA padding: zero-filled for
-        fixed storage and NaN-filled for 16-bit packed storage. Their scores
-        carry no information, so they abstain from the warp vote instead of
-        blocking the valid rows of a partial Q tile.
-        """
-        seq_coord, _, batch_coord = _resolve_work_tile_coords(
-            self.cfg, stage_info.work_tile.tile_idx
-        )
-        threshold = Float32(self.skip_softmax_threshold[batch_coord])
-        self.log2_skip_softmax_threshold_cached = cute.math.log2(
-            threshold, fastmath=True
-        )
-        num_softmax_warps = 4
-        warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
-        row_in_tile = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
-        local_q = (
-            seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
-            + self.q_half * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
-            + row_in_tile
-        )
-        if cutlass.const_expr(self.cfg.has_varlen):
-            if cutlass.const_expr(self.cfg.has_uniform_varlen):
-                seqlen_q = Int32(self.cfg.uniform_seq_len_q)
-            else:
-                cuseqlen_q = Int32(self.cum_seqlen_q[batch_coord])
-                seqlen_q = Int32(self.cum_seqlen_q[batch_coord + Int32(1)]) - cuseqlen_q
-        else:
-            seqlen_q = Int32(self.seq_len_q)
-        self.skip_softmax_row_valid_cached = local_q < seqlen_q
-
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
         returns=(variable_window_start, variable_window_end),
@@ -2591,23 +2674,20 @@ class TmemSPResource(MemoryResource):
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         old_row_max = row_max
-        uses_fp8_cadence = (
+        # The skip specialization reduces the tile alone so its maximum stays
+        # separate from the running maximum for the skip decision; the dense
+        # kernel folds the running maximum into the same reduction.
+        seed = row_max
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
+            seed = Float32(-Float32.inf)
+        if cutlass.const_expr(
             self.cfg.uses_d128_fp8_softmax_cadence
             or self.cfg.uses_d256_fp8_softmax_cadence
-        )
-        if cutlass.const_expr(uses_fp8_cadence):
-            # Four independent chains over the tile only; the running maximum
-            # joins after the tile reduction so the tile maximum stays
-            # available for the skip-softmax decision. Scores are read only
-            # inside the unrolled loop: the staged frontend resolves fragments
-            # that a mask branch rewrote through their variable references
-            # there, whereas a bare read right after that branch sees the
-            # stale in-branch value.
-            neg_inf = Float32(-Float32.inf)
-            max_0 = neg_inf
-            max_1 = neg_inf
-            max_2 = neg_inf
-            max_3 = neg_inf
+        ):
+            max_0 = seed
+            max_1 = seed
+            max_2 = seed
+            max_3 = seed
             for chunk_idx in cutlass.range_constexpr(num_chunks):
                 for elem_idx in cutlass.range_constexpr(0, tmem_x, 4):
                     max_0 = cute.math.max(max_0, s_data[chunk_idx][elem_idx], ftz=True)
@@ -2622,7 +2702,7 @@ class TmemSPResource(MemoryResource):
                     )
             max_0 = cute.math.max(max_0, max_2, ftz=True)
             max_1 = cute.math.max(max_1, max_3, ftz=True)
-            tile_row_max = cute.math.max(max_0, max_1, ftz=True)
+            row_max = cute.math.max(max_0, max_1, ftz=True)
         else:
             row_values: tuple[Any, ...] = ()
             for chunk_idx in cutlass.range_constexpr(num_chunks):
@@ -2630,30 +2710,20 @@ class TmemSPResource(MemoryResource):
                     row_values += (s_data[chunk_idx][elem_idx],)
             row_vector = cutlass.Vector.from_elements(row_values, self.cfg.qk_acc_dtype)
             tile_row_max = row_vector.reduce("max")
+            row_max = cute.math.max(seed, tile_row_max)
         _tmem_sp_sdata[id(self)] = s_data
         if cutlass.const_expr(self.cfg.enable_skip_softmax):
-            # The skip specialization carries the exact running maximum, which
-            # stays -inf until a row meets its first valid key; the P store,
-            # row-sum reduction, and stats store substitute zero where needed.
+            # Seeded with -inf, row_max holds the tile maximum here. The skip
+            # specialization carries the exact running maximum, which stays
+            # -inf until a row meets its first valid key; the P store, row-sum
+            # reduction, and stats store substitute zero where needed.
             return old_row_max, self._skip_softmax_row_max(
-                stage_info, row_max, tile_row_max
+                stage_info, old_row_max, row_max
             )
-        if cutlass.const_expr(uses_fp8_cadence):
-            row_max = cute.math.max(row_max, tile_row_max, ftz=True)
-        else:
-            row_max = cute.math.max(row_max, tile_row_max)
         row_max_safe = row_max
         if row_max == -Float32.inf:
             row_max_safe = Float32(0.0)
         return old_row_max, row_max_safe
-
-    @cute.jit
-    def _skip_softmax_vote_word(self, stage_info: StageInfo) -> Int32:
-        """Return the vote word of this instance's current S/P stage."""
-        stage_idx = Int32(0)
-        if cutlass.const_expr(self.cfg.mma_softmax_stage > 1):
-            stage_idx = Int32(stage_info.stage_idx)
-        return Int32(self.q_half * self.cfg.mma_softmax_stage) + stage_idx
 
     @cute.jit
     def _skip_softmax_row_max(
@@ -2673,26 +2743,17 @@ class TmemSPResource(MemoryResource):
         the warp must agree because it owns 32 rows of the P tile consumed by
         one PV MMA; padding rows abstain.
         """
-        gap_log2 = (tile_row_max - row_max) * self.scale_softmax_log2_cached
-        lane_skips = gap_log2 < self.log2_skip_softmax_threshold_cached
-        if not self.skip_softmax_row_valid_cached:
+        skip_vote = self.skip_vote_resource
+        gap_log2 = (tile_row_max - row_max) * skip_vote.scale_softmax_log2_cached
+        lane_skips = gap_log2 < skip_vote.log2_threshold_cached
+        if not skip_vote.row_valid_cached:
             lane_skips = Boolean(True)
         warp_skips = cute.arch.vote_all_sync(lane_skips)
-        num_softmax_warps = 4
-        warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
-        vote_byte = (
-            self._skip_softmax_vote_word(stage_info) * Int32(num_softmax_warps)
-            + warp_id_in_sg
-        )
-        vote = cutlass.Int8(0)
-        if warp_skips:
-            vote = cutlass.Int8(1)
-        # Each warp owns one byte of the vote word, so no reset or atomic is
-        # needed. The P-ready pipeline arrive orders this store before the MMA
-        # warp reads the word.
-        if prims.elect_sync():
-            self._smem_skip_softmax_vote_bytes[vote_byte] = vote
-        _tmem_sp_skips[id(self)] = warp_skips
+        stage_idx = Int32(0)
+        if cutlass.const_expr(self.cfg.mma_softmax_stage > 1):
+            stage_idx = Int32(stage_info.stage_idx)
+        skip_vote.publish(stage_info, stage_idx, warp_skips)
+        self.warp_skips_cached = warp_skips
         row_max_next = row_max
         if not warp_skips:
             row_max_next = cute.math.max(row_max, tile_row_max)
@@ -2714,7 +2775,7 @@ class TmemSPResource(MemoryResource):
             row_max_safe = row_max
             if row_max == -Float32.inf:
                 row_max_safe = Float32(0.0)
-            warp_skips = _tmem_sp_skips[id(self)]
+            warp_skips = self.warp_skips_cached
             p_chunk = self._default_p_chunk()
             if warp_skips:
                 self._store_zero_p(tmem_p_addr)
@@ -3644,7 +3705,7 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # A skipped tile publishes zero probabilities and keeps the running
             # maximum, so the accumulated denominator is unchanged.
-            warp_skips = _tmem_sp_skips.pop(id(self))
+            warp_skips = self.warp_skips_cached
             row_sum_next = row_sum
             if not warp_skips:
                 row_sum_next = self._reduce_row_sum(
@@ -4238,12 +4299,10 @@ class TmemOResource(MemoryResource):
     # Skip-softmax vote of the staged P tile, read once per tile so both
     # head-dimension PV stages share one SMEM read.
     skips_pv_cached: Boolean | None = field(init=False, default=None)
-    skip_softmax_vote_alloc: Constexpr[Optional[SmemAllocation]] = field(
-        init=False, default=None
-    )
-    # Word view of the votes: one Int32 per Q/KV instance and S/P stage whose
-    # bytes hold the votes of the four softmax warps.
-    _smem_skip_softmax_vote_words: cutlass.Array = field(init=False, default=None)
+    # References to the skip-softmax vote resources of each Q/KV instance; the
+    # PV producer reads their words to skip all-zero P tiles.
+    skip_vote0_resource: SmemSkipVoteResource | None = field(init=False, default=None)
+    skip_vote1_resource: SmemSkipVoteResource | None = field(init=False, default=None)
     # References to TmemStats resources for reading cached correction stats.
     # consumer_work reads stats from these instead of from TMEM, because
     # the stats TMEM region overlaps with S0/S1 and can be overwritten by
@@ -4262,18 +4321,19 @@ class TmemOResource(MemoryResource):
         tmem_o1_offset: int,
         tmem_vec0_resource: TmemStatsResource | None = None,
         tmem_vec1_resource: TmemStatsResource | None = None,
-        skip_softmax_vote_alloc: SmemAllocation | None = None,
+        skip_vote0_resource: SmemSkipVoteResource | None = None,
+        skip_vote1_resource: SmemSkipVoteResource | None = None,
         **kwargs: Any,
     ) -> None:
-        """Bind O TMEM offsets and correction-stat resources."""
+        """Bind O TMEM offsets, correction-stat resources, and skip votes."""
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
         self.tmem_o0_offset = tmem_o0_offset
         self.tmem_o1_offset = tmem_o1_offset
         self.tmem_vec0_resource = tmem_vec0_resource
         self.tmem_vec1_resource = tmem_vec1_resource
-        self.skip_softmax_vote_alloc = skip_softmax_vote_alloc
-        self._smem_skip_softmax_vote_words = _placeholder_smem_array(Int32)
+        self.skip_vote0_resource = skip_vote0_resource
+        self.skip_vote1_resource = skip_vote1_resource
         self._alloc_o0 = TmemAllocation("tmem_o0", 128)
         self._alloc_o1 = TmemAllocation("tmem_o1", 128)
         self.tmem_addr_cached = Int32(0)
@@ -4311,14 +4371,7 @@ class TmemOResource(MemoryResource):
         self.tmem_p_base_cached = Int32(0)
         self.p_stage_idx_cached = Int32(0)
         self.skips_pv_cached = Boolean(False)
-        if cutlass.const_expr(self.cfg.enable_skip_softmax):
-            self._smem_skip_softmax_vote_words = cutlass.Array(
-                stage_info.context.smem_base.data_ptr()
-                + self.skip_softmax_vote_alloc.offset,
-                dtype=Int32,
-                shape=(self.cfg.skip_softmax_vote_words,),
-                addrspace=3,
-            )
+        _ = stage_info
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
@@ -4366,29 +4419,12 @@ class TmemOResource(MemoryResource):
         The staged schedule calls this after the P-ready wait, so the skip
         vote of that P tile is read here once for both head-dimension stages.
         """
-        _ = stage_info
         self.tmem_p_base_cached = tmem_p_base
         self.p_stage_idx_cached = p_stage_idx
         if cutlass.const_expr(self.cfg.enable_skip_softmax):
-            self.skips_pv_cached = self._skip_softmax_votes_skip(inst_idx=0)
-
-    @cute.jit
-    def _skip_softmax_votes_skip(self, inst_idx: cutlass.Constexpr[int]) -> Boolean:
-        """Return whether every softmax warp of the instance skipped this tile.
-
-        The four vote bytes of the S/P stage were published before the P-ready
-        arrive that the MMA schedule waited on, so a plain SMEM read of the
-        word observes them.
-        """
-        stage_idx = Int32(0)
-        if cutlass.const_expr(self.cfg.mma_softmax_stage > 1):
-            stage_idx = self.p_stage_idx_cached
-        vote_word = Int32(inst_idx * self.cfg.mma_softmax_stage) + stage_idx
-        votes = cute.arch.make_warp_uniform(
-            self._smem_skip_softmax_vote_words[vote_word]
-        )
-        # Every byte reads 1 only when all four softmax warps voted to skip.
-        return votes == Int32(0x01010101)
+            self.skips_pv_cached = self.skip_vote0_resource.all_skipped(
+                stage_info, p_stage_idx
+            )
 
     @producer_work
     @cute.jit
@@ -4446,8 +4482,12 @@ class TmemOResource(MemoryResource):
             ):
                 skips_pv = self.skips_pv_cached
             else:
-                vote_inst_idx = 0 if (self.cfg.single_qkv_instance or writes_o0) else 1
-                skips_pv = self._skip_softmax_votes_skip(inst_idx=vote_inst_idx)
+                skip_vote = (
+                    self.skip_vote0_resource
+                    if (self.cfg.single_qkv_instance or writes_o0)
+                    else self.skip_vote1_resource
+                )
+                skips_pv = skip_vote.all_skipped(stage_info, Int32(0))
 
         if not skip_o0_invalid and not skips_pv:
             tmem_ptr_raw = self.tmem_ptr_raw_cached

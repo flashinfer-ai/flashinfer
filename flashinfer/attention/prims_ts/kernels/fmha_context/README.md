@@ -190,10 +190,11 @@ Q + contiguous or paged K/V
 
 The TS graph assigns load, MMA, softmax, correction, epilogue, page-offset,
 and scheduling work to cooperating tasks. Resources own the corresponding
-SMEM/TMEM buffers and pipeline state. Skip-softmax specializations add one
-SMEM vote word per S/P stage and Q/KV instance, one byte per softmax warp: the
-softmax warp writes its byte before publishing P, and the MMA task reads the
-word after the P-ready wait to decide whether to issue the PV MMA.
+SMEM/TMEM buffers and pipeline state. Skip-softmax specializations add a
+pipeline-less `SmemSkipVoteResource` per Q/KV instance that owns the request
+threshold and one SMEM vote word per softmax warp and S/P stage: the softmax
+warp writes its word before publishing P, and the MMA task reads the four words
+of the stage after the P-ready wait to decide whether to issue the PV MMA.
 
 Paged D256 uses topology-derived page-ID staging. For a dense static domain
 that is divisible by the complete staged window and whose exact SMEM footprint

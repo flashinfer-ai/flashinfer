@@ -171,6 +171,7 @@ from .fmha_resources import (
     SmemOResource,
     SmemPageOffsetsKvResource,
     SmemQResource,
+    SmemSkipVoteResource,
     TmemOResource,
     TmemPResource,
     TmemSPResource,
@@ -695,10 +696,11 @@ def build_context_task_manager(
     it. ``output_scale`` multiplies the final O store; FP8 output can fold the
     V dequant scale and output quant scale into it. ``skip_softmax_threshold``
     is the ``float32[B]`` per-request skip-softmax threshold consumed only by
-    ``cfg.enable_skip_softmax`` specializations; the softmax resource converts it to
-    the log2 domain once per work tile. ``seq_len_q`` is the fixed-layout Q
-    length those specializations use to let padding rows abstain from the
-    skip vote; packed layouts derive it from ``cum_seqlen_q``.
+    ``cfg.enable_skip_softmax`` specializations; the skip-vote resource of each
+    Q/KV instance converts it to the log2 domain once per work tile.
+    ``seq_len_q`` is the fixed-layout Q length those specializations use to let
+    padding rows abstain from the skip vote; packed layouts derive it from
+    ``cum_seqlen_q``.
 
     SMEM buffers are declared via ``SmemAllocation`` and bound from
     ``ResourceContext`` by auxiliary resource init work. The ``SmemAllocator``
@@ -1079,17 +1081,30 @@ def build_context_task_manager(
         else:
             work_queue = WorkQueue(**work_queue_kwargs)
 
-    # Skip softmax packs the votes of the four softmax warps of every S/P stage
-    # of each instance into one Int32 word, one byte per warp. The MMA task
-    # reads the word after the matching P-ready wait.
-    skip_softmax_vote_alloc: SmemAllocation | None = None
+    # Skip softmax gives every Q/KV instance a vote resource that owns the
+    # per-request threshold and one SMEM vote word per softmax warp and S/P stage.
+    skip_vote0: SmemSkipVoteResource | None = None
+    skip_vote1: SmemSkipVoteResource | None = None
     if cfg.enable_skip_softmax:
-        skip_softmax_vote_alloc = SmemAllocation(
-            "smem_skip_softmax_vote",
-            dtype=cutlass.Int32,
-            count=cfg.skip_softmax_vote_words,
-            alignment=4,
+        skip_vote0 = SmemSkipVoteResource(
+            cfg=cfg,
+            inst_idx=0,
+            skip_softmax_threshold=skip_softmax_threshold,
+            scale_softmax_log2=scale_softmax_log2,
+            cum_seqlen_q=cum_seqlen_q,
+            seq_len_q=seq_len_q,
+            name="smem_skip_vote_0",
         )
+        if not cfg.single_qkv_instance:
+            skip_vote1 = SmemSkipVoteResource(
+                cfg=cfg,
+                inst_idx=1,
+                skip_softmax_threshold=skip_softmax_threshold,
+                scale_softmax_log2=scale_softmax_log2,
+                cum_seqlen_q=cum_seqlen_q,
+                seq_len_q=seq_len_q,
+                name="smem_skip_vote_1",
+            )
 
     tmem_sp0 = TmemSPResource(
         pipeline_config=tmem_sp0_pipeline_cfg,
@@ -1105,9 +1120,7 @@ def build_context_task_manager(
         variable_window_cta_starts=variable_window_cta_starts,
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
-        skip_softmax_threshold=skip_softmax_threshold,
-        skip_softmax_vote_alloc=skip_softmax_vote_alloc,
-        seq_len_q=seq_len_q,
+        skip_vote_resource=skip_vote0,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1170,9 +1183,7 @@ def build_context_task_manager(
             variable_window_cta_starts=variable_window_cta_starts,
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
-            skip_softmax_threshold=skip_softmax_threshold,
-            skip_softmax_vote_alloc=skip_softmax_vote_alloc,
-            seq_len_q=seq_len_q,
+            skip_vote_resource=skip_vote1,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1216,7 +1227,8 @@ def build_context_task_manager(
         tmem_o1_offset=cfg.tmem_o1_offset,
         tmem_vec0_resource=tmem_vec0,
         tmem_vec1_resource=tmem_vec1,
-        skip_softmax_vote_alloc=skip_softmax_vote_alloc,
+        skip_vote0_resource=skip_vote0,
+        skip_vote1_resource=skip_vote1,
         name="tmem_o",
         **tmem_o_kwargs,
     )
@@ -1277,6 +1289,7 @@ def build_context_task_manager(
         tmem_p0,
         s0s1_seq,
         work_queue,
+        skip_vote=skip_vote0,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1290,6 +1303,7 @@ def build_context_task_manager(
             None,
             s0s1_seq,
             work_queue,
+            skip_vote=skip_vote1,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1411,6 +1425,10 @@ def build_context_task_manager(
         resource_dependency_graph[tmem_stats_done_0] = [tmem_vec0]
     if tmem_p0 is not None:
         resource_dependency_graph[tmem_p0] = scheduler_deps(tmem_sp0)
+    if skip_vote0 is not None:
+        resource_dependency_graph[skip_vote0] = scheduler_deps(tmem_sp0)
+    if skip_vote1 is not None:
+        resource_dependency_graph[skip_vote1] = scheduler_deps(tmem_sp1)
     if not single_qkv_instance:
         resource_dependency_graph.update(
             {
@@ -1461,6 +1479,8 @@ def build_context_task_manager(
         add_smem_resource(tmem_p0)
     add_smem_resource(tmem_vec0)
     add_smem_resource(tmem_o)
+    add_smem_resource(skip_vote0)
+    add_smem_resource(skip_vote1)
     if not cfg.stats_via_smem:
         add_smem_resource(tmem_stats_done_0)
     if tmem_sp1 is not None:
@@ -1505,8 +1525,6 @@ def build_context_task_manager(
     dealloc_mbar_alloc = smem_allocator.add(
         SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
     )
-    if skip_softmax_vote_alloc is not None:
-        smem_allocator.add(skip_softmax_vote_alloc)
     clc_response_alloc: SmemAllocation | None = None
     if is_clc_dynamic and clc_response_ptr is None:
         # Keep the CLC response inside the unified TS allocation. The kernel
@@ -1700,7 +1718,11 @@ def _infer_single_instance_kv_stages(
     if is_clc_dynamic:
         control_bytes += cutlass.Int128.width // 8
     if cfg.enable_skip_softmax:
-        control_bytes += cfg.skip_softmax_vote_words * cutlass.Int32.width // 8
+        # One Int32 vote per softmax warp and S/P stage of every Q/KV instance.
+        num_vote_words = (
+            cfg.num_qkv_instances * cfg.mma_softmax_stage * len(cfg.softmax0_warp_ids)
+        )
+        control_bytes += num_vote_words * cutlass.Int32.width // 8
     fixed_barrier_stages = sum(
         _context_pipeline_stage_counts(
             cfg,
