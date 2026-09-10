@@ -4529,6 +4529,7 @@ def build_cudnn_gemm_bf16_graph(
     bias_shape,
     bias_stride,
     tactic=-1,
+    c_stride=None,
 ):
     _check_cudnn_availability()
 
@@ -4565,6 +4566,8 @@ def build_cudnn_gemm_bf16_graph(
             c_final_cudnn_tensor = c_cudnn_tensor
 
         c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
+        if c_stride is not None:
+            c_final_cudnn_tensor.set_stride(c_stride)
 
         a_cudnn_tensor.set_uid(UIDs.A_UID.value)
         b_cudnn_tensor.set_uid(UIDs.B_UID.value)
@@ -4809,6 +4812,7 @@ def _cudnn_gemm_bf16(
     # This allows the same graph to work for both mm (2D) and bmm (3D)
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
+    _, c_stride = _get_bf16_3d_shape_stride(out)
 
     if bias is not None:
         bias_shape, bias_stride = _get_3d_shape_stride_from_vector(bias, 2)
@@ -4827,6 +4831,7 @@ def _cudnn_gemm_bf16(
         bias_shape,
         bias_stride,
         tactic=tactic,
+        c_stride=c_stride,
     )
 
     execute_cudnn_gemm_bf16_graph(graph, a, b, bias, out, workspace, tactic=tactic)
@@ -4924,6 +4929,9 @@ def _cudnn_gemm_bf16_runner(
                 bias is not None,
                 self._is_a_k_major,
                 self._is_b_k_major,
+                # Fixed-shape plans bind output strides. Do not reuse a
+                # tuned tactic ordinal across different output layouts.
+                tuple(out.stride()),
             )
 
         def get_valid_tactics(
@@ -4956,6 +4964,7 @@ def _cudnn_gemm_bf16_runner(
                     bias_shape,
                     bias_stride,
                     tactic=0,
+                    c_stride=_get_bf16_3d_shape_stride(out)[1],
                 )
 
             return _cudnn_graph_engine_knob_tactics(graph)
