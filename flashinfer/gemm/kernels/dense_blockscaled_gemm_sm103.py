@@ -2602,14 +2602,8 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             )
         elif cutlass.const_expr(not self.use_tma_store):
             c_n = cute.assume(n, divby=64)
-            c_ptr = cute.make_ptr(
-                mC.element_type,
-                mC.iterator.toint(),
-                cute.AddressSpace.gmem,
-                assumed_align=32,
-            )
             c_tensor = cute.make_tensor(
-                c_ptr,
+                mC.iterator,
                 layout=cute.make_ordered_layout(
                     (m, c_n, l),
                     order=(1, 0, 2),
