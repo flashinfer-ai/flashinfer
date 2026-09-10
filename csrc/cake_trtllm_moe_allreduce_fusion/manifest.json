@@ -44,7 +44,27 @@
     "dynamic_smem_bytes": 256
   },
   "schema_version": 1,
-  "source_sha256": "2f84020f7bc56de3aef2fb4539abc9ab2ae72d4509faae64dc2abb8463473f80",
+  "sm100_ws8_mid_kernel_symbols": [
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm100_ws8_mid",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o1110_sm100_ws8_mid",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm100_ws8_mid",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110_sm100_ws8_mid"
+  ],
+  "sm103_t1_kernel_symbols": [
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110_sm103_t1"
+  ],
+  "source_sha256": "b6ac2eaf7f4939250db5d5c16f51e7aff8717df54f25e013b78963e1c0b5dfa9",
   "workspace_protocol": {
     "flag_region_bytes_by_world_size": {
       "2": 2048,

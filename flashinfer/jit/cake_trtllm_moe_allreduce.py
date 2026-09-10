@@ -6,6 +6,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,6 +32,11 @@ _KERNEL_SYMBOLS = (
     "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110",
     "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110",
     "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110",
+)
+
+_SM103_T1_KERNEL_SYMBOLS = tuple(f"{symbol}_sm103_t1" for symbol in _KERNEL_SYMBOLS)
+_SM100_WS8_MID_KERNEL_SYMBOLS = tuple(
+    f"{_KERNEL_SYMBOLS[index]}_sm100_ws8_mid" for index in (4, 5, 10, 11)
 )
 
 _TARGET_ARCH_BY_CAPABILITY = {
@@ -75,6 +81,13 @@ _HOST_SOURCE = r"""
 #include <algorithm>
 #include <cstdint>
 
+#ifndef CAKE_MOE_AR_ENABLE_SM103_T1
+#error "CAKE_MOE_AR_ENABLE_SM103_T1 must be defined by the loader"
+#endif
+#ifndef CAKE_MOE_AR_ENABLE_SM100_WS8_MID
+#error "CAKE_MOE_AR_ENABLE_SM100_WS8_MID must be defined by the loader"
+#endif
+
 TVM_FFI_EMBED_CUBIN(cake_trtllm_moe_allreduce);
 
 namespace cake_trtllm_moe_allreduce {
@@ -83,6 +96,8 @@ using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
 
 constexpr int64_t kHiddenDim = 7168;
+constexpr bool kEnableSm103T1 = CAKE_MOE_AR_ENABLE_SM103_T1 != 0;
+constexpr bool kEnableSm100Ws8Mid = CAKE_MOE_AR_ENABLE_SM100_WS8_MID != 0;
 
 void CheckCudaTensor(TensorView tensor, const char* name) {
   TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError)
@@ -219,6 +234,12 @@ void RunReduction(int64_t world_size, int64_t world_rank, int64_t token_num,
   int32_t world_index = WorldIndex(world_size);
   int32_t output_index = moe_allreduce_out.has_value() ? 1 : 0;
   int32_t kernel_index = dtype_index * 6 + world_index * 2 + output_index;
+  if (kEnableSm103T1 && token_num == 1) {
+    kernel_index += 12;
+  } else if (kEnableSm100Ws8Mid && world_size == 8 &&
+             (token_num == 64 || token_num == 128)) {
+    kernel_index = 24 + dtype_index * 2 + output_index;
+  }
   int32_t rank32 = static_cast<int32_t>(world_rank);
   int32_t tokens32 = static_cast<int32_t>(token_num);
   int32_t experts32 = static_cast<int32_t>(active_experts);
@@ -257,6 +278,22 @@ void RunReduction(int64_t world_size, int64_t world_rank, int64_t token_num,
     CAKE_MOE_AR_LAUNCH_CASE(9, kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110)
     CAKE_MOE_AR_LAUNCH_CASE(10, kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110)
     CAKE_MOE_AR_LAUNCH_CASE(11, kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110)
+    CAKE_MOE_AR_LAUNCH_CASE(12, kernel_cake_trtllm_moe_reduction_float16_ws2_o0110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(13, kernel_cake_trtllm_moe_reduction_float16_ws2_o1110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(14, kernel_cake_trtllm_moe_reduction_float16_ws4_o0110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(15, kernel_cake_trtllm_moe_reduction_float16_ws4_o1110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(16, kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(17, kernel_cake_trtllm_moe_reduction_float16_ws8_o1110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(18, kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o0110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(19, kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o1110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(20, kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o0110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(21, kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(22, kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(23, kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110_sm103_t1)
+    CAKE_MOE_AR_LAUNCH_CASE(24, kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm100_ws8_mid)
+    CAKE_MOE_AR_LAUNCH_CASE(25, kernel_cake_trtllm_moe_reduction_float16_ws8_o1110_sm100_ws8_mid)
+    CAKE_MOE_AR_LAUNCH_CASE(26, kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm100_ws8_mid)
+    CAKE_MOE_AR_LAUNCH_CASE(27, kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110_sm100_ws8_mid)
   }
   TVM_FFI_LOG_AND_THROW(ValueError)
       << "invalid Cake MoE all-reduce kernel selection";
@@ -295,7 +332,17 @@ def _reject_duplicate_manifest_keys(
     return decoded
 
 
-def _load_source_bundle() -> tuple[Path, bytes]:
+def _source_kernel_symbols(source_bytes: bytes) -> tuple[str, ...]:
+    return tuple(
+        match.decode()
+        for match in re.findall(
+            rb"(?m)^kernel_cake_trtllm_moe_reduction_[A-Za-z0-9_]+(?=\()",
+            source_bytes,
+        )
+    )
+
+
+def _load_source_bundle_details() -> tuple[Path, bytes, bool, bool]:
     source_dir = _source_dir()
     source = source_dir / "cake_trtllm_moe_allreduce_fusion_kernels.cu"
     manifest_path = source_dir / "manifest.json"
@@ -309,6 +356,12 @@ def _load_source_bundle() -> tuple[Path, bytes]:
         manifest_path.read_text(encoding="utf-8"),
         object_pairs_hook=_reject_duplicate_manifest_keys,
     )
+    if not isinstance(manifest, dict):
+        raise RuntimeError("Cake TRT-LLM MoE all-reduce manifest identity is invalid")
+    raw_sm103_t1_symbols = manifest.get("sm103_t1_kernel_symbols")
+    has_sm103_t1_symbols = raw_sm103_t1_symbols is not None
+    raw_sm100_ws8_mid_symbols = manifest.get("sm100_ws8_mid_kernel_symbols")
+    has_sm100_ws8_mid_symbols = raw_sm100_ws8_mid_symbols is not None
     expected = {
         "schema_version": 1,
         "architectures": list(_TARGET_ARCH_BY_CAPABILITY.values()),
@@ -329,8 +382,31 @@ def _load_source_bundle() -> tuple[Path, bytes]:
         "workspace_protocol": _WORKSPACE_PROTOCOL,
         "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
     }
-    if not isinstance(manifest, dict) or manifest != expected:
+    if has_sm103_t1_symbols:
+        expected["sm103_t1_kernel_symbols"] = list(_SM103_T1_KERNEL_SYMBOLS)
+    if has_sm100_ws8_mid_symbols:
+        expected["sm100_ws8_mid_kernel_symbols"] = list(_SM100_WS8_MID_KERNEL_SYMBOLS)
+    if manifest != expected:
         raise RuntimeError("Cake TRT-LLM MoE all-reduce manifest identity is invalid")
+    expected_source_symbols: tuple[str, ...] = _KERNEL_SYMBOLS
+    if has_sm103_t1_symbols:
+        expected_source_symbols += _SM103_T1_KERNEL_SYMBOLS
+    if has_sm100_ws8_mid_symbols:
+        expected_source_symbols += _SM100_WS8_MID_KERNEL_SYMBOLS
+    if _source_kernel_symbols(source_bytes) != expected_source_symbols:
+        raise RuntimeError(
+            "Cake TRT-LLM MoE all-reduce source symbol inventory is invalid"
+        )
+    return (
+        source,
+        source_bytes,
+        has_sm103_t1_symbols,
+        has_sm100_ws8_mid_symbols,
+    )
+
+
+def _load_source_bundle() -> tuple[Path, bytes]:
+    source, source_bytes, _, _ = _load_source_bundle_details()
     return source, source_bytes
 
 
@@ -360,7 +436,30 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-def _module_name(source_bytes: bytes, arch: str, nvcc: Path) -> str:
+def _enable_sm103_t1(arch: str, has_sm103_t1_symbols: bool) -> bool:
+    return arch == "sm_103a" and has_sm103_t1_symbols
+
+
+def _enable_sm100_ws8_mid(arch: str, has_sm100_ws8_mid_symbols: bool) -> bool:
+    return arch == "sm_100a" and has_sm100_ws8_mid_symbols
+
+
+def _host_compile_flags(enable_sm103_t1: bool, enable_sm100_ws8_mid: bool) -> list[str]:
+    return [
+        "-O3",
+        f"-DCAKE_MOE_AR_ENABLE_SM103_T1={int(enable_sm103_t1)}",
+        f"-DCAKE_MOE_AR_ENABLE_SM100_WS8_MID={int(enable_sm100_ws8_mid)}",
+    ]
+
+
+def _module_name(
+    source_bytes: bytes,
+    arch: str,
+    nvcc: Path,
+    *,
+    enable_sm103_t1: bool = False,
+    enable_sm100_ws8_mid: bool = False,
+) -> str:
     version = subprocess.run(
         [str(nvcc), "--version"],
         text=True,
@@ -377,6 +476,8 @@ def _module_name(source_bytes: bytes, arch: str, nvcc: Path) -> str:
     digest.update(source_bytes)
     digest.update(_HOST_SOURCE.encode())
     digest.update(arch.encode())
+    digest.update(str(int(enable_sm103_t1)).encode())
+    digest.update(str(int(enable_sm100_ws8_mid)).encode())
     digest.update(str(nvcc).encode())
     digest.update(version.stdout.encode())
     return f"cake_trtllm_moe_allreduce_{arch}_{digest.hexdigest()[:16]}"
@@ -384,10 +485,23 @@ def _module_name(source_bytes: bytes, arch: str, nvcc: Path) -> str:
 
 @functools.cache
 def load(device_index: int) -> Any:
-    source, source_bytes = _load_source_bundle()
+    (
+        source,
+        source_bytes,
+        has_sm103_t1_symbols,
+        has_sm100_ws8_mid_symbols,
+    ) = _load_source_bundle_details()
     arch = _target_arch(device_index)
+    enable_sm103_t1 = _enable_sm103_t1(arch, has_sm103_t1_symbols)
+    enable_sm100_ws8_mid = _enable_sm100_ws8_mid(arch, has_sm100_ws8_mid_symbols)
     nvcc = _nvcc()
-    module_name = _module_name(source_bytes, arch, nvcc)
+    module_name = _module_name(
+        source_bytes,
+        arch,
+        nvcc,
+        enable_sm103_t1=enable_sm103_t1,
+        enable_sm100_ws8_mid=enable_sm100_ws8_mid,
+    )
     build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
     build_dir.mkdir(parents=True, exist_ok=True)
     cubin_path = build_dir / "cake_trtllm_moe_allreduce.cubin"
@@ -419,7 +533,7 @@ def load(device_index: int) -> Any:
             cpp_sources=_HOST_SOURCE,
             embed_cubin={"cake_trtllm_moe_allreduce": cubin_path.read_bytes()},
             extra_include_paths=[str(nvcc.parent.parent / "include")],
-            extra_cflags=["-O3"],
+            extra_cflags=_host_compile_flags(enable_sm103_t1, enable_sm100_ws8_mid),
             extra_ldflags=["-lcuda"],
             build_directory=str(build_dir),
         )
