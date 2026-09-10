@@ -5,7 +5,8 @@
 - nvfp4_quantize_smooth : NVFP4-quantize(x * pre_quant_scale).
 - svdquant_linear       : the full quantize -> LoRA-down -> residual/correction chain.
 
-SM100/SM103 use fused CUTLASS. SM120/SM121 use fused CuTe DSL, with an explicit
+SM100/SM103 use fused CUTLASS or the explicit generated Cake backend. SM120/SM121
+use fused CuTe DSL, with an explicit
 ``cute-dsl-unfused`` composition retained as a differential oracle.
 """
 
@@ -42,6 +43,11 @@ def test_nvfp4_svdquant_backend_arch_support():
     assert mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 120)
     assert mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 121)
     assert not mm_nvfp4_svdquant.is_backend_supported("cute-dsl-unfused", 100)
+    assert mm_nvfp4_svdquant.is_backend_supported("cake", 100)
+    assert mm_nvfp4_svdquant.is_backend_supported("cake", 103)
+    assert not mm_nvfp4_svdquant.is_backend_supported("cake", 107)
+    assert not mm_nvfp4_svdquant.is_backend_supported("cake", 120)
+    assert not mm_nvfp4_svdquant.is_backend_supported("cake", 121)
 
 
 def test_sm120_svdquant_kernel_iket_flag_defaults_off():
@@ -1059,6 +1065,81 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
 
     # Same tactic and operands: the deterministic kernel must match bit-exactly.
     assert torch.equal(out_graph, out_eager)
+
+
+@pytest.mark.parametrize(
+    "m,k,rank,use_bias",
+    [
+        (129, 3072, 32, False),
+        (129, 12288, 32, False),
+        (129, 3072, 96, True),
+        (6912, 3072, 96, True),
+        (129, 3072, 64, True),
+        (129, 12288, 32, True),
+        (129, 3072, 32, True),
+        (129, 3072, 128, True),
+    ],
+)
+def test_mm_nvfp4_svdquant_cake_cuda_graph_replay(m, k, rank, use_bias):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    torch.manual_seed(0)
+    p = _make_gemm_problem(m, 3072, k, rank=rank)
+    out = torch.empty(m, 3072, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=p["bias"] if use_bias else None,
+            out=out,
+            backend="cake",
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = p["ref_bias"] if use_bias else p["ref"]
+    assert _sqnr_db(expected, out.float()) > 40.0
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_mm_nvfp4_svdquant_cake_pooled_scale_buffers(use_bias):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    torch.manual_seed(0)
+    p = _make_gemm_problem(129, 3072, 3072, rank=32)
+
+    def run(a_sf, b_sf):
+        return mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            a_sf,
+            b_sf,
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=p["bias"] if use_bias else None,
+            backend="cake",
+        )
+
+    expected = run(p["x_sf_flat"], p["w_sf_flat"])
+    padding = torch.tensor([255], dtype=torch.uint8, device="cuda")
+    actual = run(
+        torch.cat((p["x_sf_flat"], padding)),
+        torch.cat((p["w_sf_flat"], padding)),
+    )
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
