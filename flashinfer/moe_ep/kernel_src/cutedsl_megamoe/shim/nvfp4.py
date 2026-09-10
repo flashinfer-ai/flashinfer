@@ -540,12 +540,6 @@ class MegaMoENvfp4Frontend:
         self._mega = mega
         return self._mega
 
-    # NOTE: the new kernel drop reduces the top-k combine INSIDE the mega kernel
-    # (Sm100MegaMoEKernel.__call__), so there is no separate topk-reduce launch.
-    # The drop's moe_nvfp4_swapab.topk_reduce.TopkReduce class covers the
-    # standalone combine-reduce path, which moe_ep does not use; port it here
-    # (with a test) if a caller ever needs in_kernel_fc2_reduce=False combine.
-
     # ------------------------------------------------------------------
     # Launch helpers
     # ------------------------------------------------------------------
