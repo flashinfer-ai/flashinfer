@@ -1341,6 +1341,24 @@ def quant_qkv_pack_fused(
 # ---------------------------------------------------------------------------
 
 
+def _scale_widths(sequence: int, q_group: int, k_group: int) -> Tuple[int, int]:
+    """Per-head (Q, K) scale slot counts for a ``q_group`` / ``k_group`` grid.
+
+    SageAttention keeps four Q scales per Q-CTA -- one per warp on the
+    SM89/SM120 HMMA kernels, one per warp-group on the SM90 WGMMA kernel -- so
+    the Q width rounds up to a whole ``4 * q_group``-token CTA; K carries one
+    scale per ``k_group``-token CTA.  This is the single source for both
+    architectures:
+
+      SM89 / SM120 (32, 64):  ceil(s/128)*4, ceil(s/64)
+      SM90         (16, 128): ceil(s/64)*4,  ceil(s/128)
+    """
+
+    sequence = _positive_int("sequence", sequence)
+    q_cta = 4 * q_group
+    return (sequence + q_cta - 1) // q_cta * 4, (sequence + k_group - 1) // k_group
+
+
 def scale_widths(sequence: int) -> Tuple[int, int]:
     """Per-head Q/K scale slot counts the SageAttention per-warp consumer
     derives from ``sequence`` rows: ``ceil(sequence/128)*4`` Q slots (32-token
@@ -1348,8 +1366,7 @@ def scale_widths(sequence: int) -> Tuple[int, int]:
     ``unpack_for_sage(..., out=)`` scale buffers with this for the
     ``scale_sequence`` you will pass."""
 
-    sequence = _positive_int("sequence", sequence)
-    return (sequence + 127) // 128 * 4, (sequence + 63) // 64
+    return _scale_widths(sequence, Q_GROUP, K_GROUP)
 
 
 @flashinfer_api(trace=ulysses_lowp_unpack_for_sage_trace)
@@ -1885,6 +1902,16 @@ class UlyssesLowpSageLayout:
 
     # ── payload geometry ────────────────────────────────────────────────────
 
+    @classmethod
+    def scale_widths(cls, sequence: int) -> Tuple[int, int]:
+        """Per-head (Q, K) scale slot counts this layout's SageAttention2
+        consumer derives from ``sequence`` rows.  Size
+        ``unpack_for_sage(..., out=)`` scale buffers with this;
+        ``payload_spec()["q_scale_alloc"]`` / ``["k_scale_alloc"]`` are the
+        same rule applied to ``payload_spec()["logical_sequence"]``."""
+
+        return _scale_widths(sequence, cls.Q_GROUP, cls.K_GROUP)
+
     def payload_spec(
         self,
         *,
@@ -2050,6 +2077,16 @@ class UlyssesLowpSageLayoutSM90:
 
     # ── payload geometry ──────────────────────────────────────────────────────
 
+    @classmethod
+    def scale_widths(cls, sequence: int) -> Tuple[int, int]:
+        """Per-head (Q, K) scale slot counts the SM90 WGMMA SageAttention2
+        consumer derives from ``sequence`` rows: ``ceil(sequence/64)*4`` Q slots
+        (four 16-token warp-groups per 64-token CTA_Q) and ``ceil(sequence/128)``
+        K slots (one per 128-token CTA_K).  Same rule as
+        :meth:`UlyssesLowpSageLayout.scale_widths`, on this class's grid."""
+
+        return _scale_widths(sequence, cls.Q_GROUP, cls.K_GROUP)
+
     def payload_spec(
         self,
         *,
@@ -2084,8 +2121,13 @@ class UlyssesLowpSageLayoutSM90:
             # sequence is 64- but not 128-aligned.  SM120 keeps the 64-row pad:
             # its Sage kernel is CTA_K = 64.
             "padded_sequence": (logical_sequence + 127) // 128 * 128,
-            "q_scale_alloc": (logical_sequence + self.Q_GROUP - 1) // self.Q_GROUP,
-            "k_scale_alloc": (logical_sequence + self.K_GROUP - 1) // self.K_GROUP,
+            # NOT ceil(S/Q_GROUP): the SM90 Sage kernel indexes four Q scales
+            # per 64-token CTA_Q, so the Q width rounds up to a whole CTA.
+            # Sharing scale_widths() with unpack_for_sage() below is what keeps
+            # the advertised width and the width check_shape_3d demands from
+            # diverging when S is not a multiple of 64.
+            "q_scale_alloc": self.scale_widths(logical_sequence)[0],
+            "k_scale_alloc": self.scale_widths(logical_sequence)[1],
             "main_bytes": main_bytes,
             "q_offset": 0,
             "k_offset": main_bytes,
@@ -2338,8 +2380,7 @@ class UlyssesLowpSageLayoutSM90:
         # SM90 SageAttention2 WGMMA kernel scale slot counts (per head):
         #   Q: ceil(seq / 64) * 4  (4 warp-groups per 64-token CTA_Q)
         #   K: ceil(seq / 128)     (1 scale per 128-token CTA_K)
-        q_scale_width = (int(scale_sequence) + 63) // 64 * 4
-        k_scale_width = (int(scale_sequence) + 127) // 128
+        q_scale_width, k_scale_width = self.scale_widths(int(scale_sequence))
         if out is None:
             q_logical = torch.empty(
                 (batch_size, logical_sequence, local_heads, self.HEAD_DIM),

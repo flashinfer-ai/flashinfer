@@ -899,6 +899,81 @@ def test_scale_widths_match_sage_per_warp_contract():
         lowp.scale_widths(0)
 
 
+def test_scale_widths_sm90_match_sage_wgmma_contract():
+    """SM90 mirror of the SM120 contract above: CTA_Q = 64 tokens split over
+    four 16-token warp-groups -> ceil(s/64)*4 Q slots; CTA_K = 128 ->
+    ceil(s/128) K slots.  Pure arithmetic on the class constants: no SM90
+    device needed."""
+
+    sm90 = lowp.UlyssesLowpSageLayoutSM90
+    assert sm90.scale_widths(1024) == (64, 8)
+    assert sm90.scale_widths(1023) == (64, 8)
+    assert sm90.scale_widths(1025) == (68, 9)
+    assert sm90.scale_widths(1) == (4, 1)
+    with pytest.raises(ValueError):
+        sm90.scale_widths(0)
+
+
+def test_module_scale_widths_is_the_sm120_layout_rule():
+    """The free function is the SM89/SM120 grid; it must not drift from the
+    layout class it delegates to."""
+
+    for sequence in (1, 63, 64, 127, 128, 129, 260, 1180, 4720, 9440, 37888):
+        assert lowp.scale_widths(sequence) == lowp.UlyssesLowpSageLayout.scale_widths(
+            sequence
+        )
+
+
+@pytest.mark.parametrize(
+    ("layout_cls", "csrc_rule"),
+    [
+        (lowp.UlyssesLowpSageLayout, lambda s: ((s + 127) // 128 * 4, (s + 63) // 64)),
+        (
+            lowp.UlyssesLowpSageLayoutSM90,
+            lambda s: ((s + 63) // 64 * 4, (s + 127) // 128),
+        ),
+    ],
+    ids=["sm120", "sm90"],
+)
+def test_scale_widths_reproduce_the_csrc_shape_checks(layout_cls, csrc_rule):
+    """One rule -- ceil(s/(4*Q_GROUP))*4 Q slots, ceil(s/K_GROUP) K slots --
+    must reproduce, for every s, the q_scale_alloc / k_scale_alloc that
+    csrc/ulysses_lowp.cu and csrc/ulysses_lowp_sm90.cu check the caller's scale
+    tensors against."""
+
+    for sequence in list(range(1, 600)) + [1023, 1025, 4720, 9440, 37888, 65536]:
+        assert layout_cls.scale_widths(sequence) == csrc_rule(sequence), sequence
+
+
+@pytest.mark.parametrize(
+    "layout_cls",
+    [lowp.UlyssesLowpSageLayout, lowp.UlyssesLowpSageLayoutSM90],
+    ids=["sm120", "sm90"],
+)
+@pytest.mark.parametrize("world", [2, 4, 8])
+@pytest.mark.parametrize(
+    "local_sequence", [65, 128, 130, 193, 256, 1180, 1184, 2360, 4736]
+)
+def test_payload_spec_scale_alloc_equals_scale_widths(layout_cls, world, local_sequence):
+    """Regression guard: payload_spec() advertises the receive-side scale
+    widths, unpack_for_sage() allocates with scale_widths(), and check_shape_3d
+    rejects anything else -- so a caller sizing an ``out=`` buffer from the spec
+    must land on exactly the width the kernel demands.  Structural: no device
+    needed."""
+
+    layout = layout_cls()
+    spec = layout.payload_spec(
+        batch_size=1,
+        local_sequence=local_sequence,
+        num_heads=_HEADS,
+        world_size=world,
+    )
+    logical_sequence = int(spec["logical_sequence"])
+    assert (int(spec["q_scale_alloc"]), int(spec["k_scale_alloc"])) == (
+        layout.scale_widths(logical_sequence)
+    )
+
+
 @requires_sm120
 @pytest.mark.parametrize(
     ("world", "local_sequence", "aligned"),
