@@ -710,6 +710,9 @@ class RecurrentKDAPrefillWrapper:
     launched by ``run`` may still be reading the wrapper's planned buffers.
     """
 
+    #: Mechanical identification: the decorators only mark ``plan`` and ``run``.
+    is_experimental = True
+
     def __init__(
         self,
         device: torch.device | str,
@@ -717,26 +720,7 @@ class RecurrentKDAPrefillWrapper:
         from .experimental.kda_prefill_wrapper import RecurrentKDAPrefillPlanner
 
         self._impl = RecurrentKDAPrefillPlanner(device)
-
-    @property
-    def device(self) -> torch.device:
-        return self._impl.device
-
-    @property
-    def _workspace(self):
-        return self._impl.workspace
-
-    @property
-    def _cu_seqlens_buf(self) -> Optional[torch.Tensor]:
-        return self._impl.cu_seqlens_buf
-
-    @property
-    def _seq_order_buf(self) -> Optional[torch.Tensor]:
-        return self._impl.seq_order_buf
-
-    @property
-    def _cu_chunks_buf(self) -> Optional[torch.Tensor]:
-        return self._impl.cu_chunks_buf
+        self.device = self._impl.device
 
     @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def plan(

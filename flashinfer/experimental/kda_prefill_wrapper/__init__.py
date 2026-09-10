@@ -28,6 +28,8 @@ import torch
 
 from ... import kda_prefill as _kda_prefill
 
+__all__ = ["RecurrentKDAPrefillPlanner"]
+
 
 class RecurrentKDAPrefillPlanner:
     """Fixed-address plan state for packed CuTe DSL recurrent-KDA prefill."""

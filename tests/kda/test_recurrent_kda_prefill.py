@@ -23,7 +23,7 @@ import torch
 from packaging.version import Version
 
 import flashinfer
-from flashinfer.kda import RecurrentKDAPrefillWrapper, recurrent_kda
+from flashinfer.kda import recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
 
@@ -75,7 +75,6 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
         flashinfer.RecurrentKDAPrefillWorkspace
         is kda_prefill_api.RecurrentKDAPrefillWorkspace
     )
-    assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
 
 
 @pytest.mark.parametrize(

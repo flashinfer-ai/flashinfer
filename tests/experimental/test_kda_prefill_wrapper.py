@@ -24,6 +24,7 @@ eager path it wraps, and that captured graphs replay against fixed addresses.
 import importlib
 import inspect
 
+import flashinfer
 import pytest
 import torch
 
@@ -59,6 +60,23 @@ def flash_kda_device(cuda_device):
     return cuda_device
 
 
+def test_prefill_wrapper_is_exported_from_the_top_level():
+    assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
+
+
+def test_prefill_wrapper_is_marked_experimental():
+    """The marking is the point of the change, so removing it must fail here.
+
+    The warning itself fires once per process, so it is not assertable in a
+    lane that already exercises ``plan``; the flag and the injected banner are.
+    """
+
+    assert RecurrentKDAPrefillWrapper.is_experimental
+    for method in (RecurrentKDAPrefillWrapper.plan, RecurrentKDAPrefillWrapper.run):
+        assert method.is_experimental
+        assert "experimental" in method.__doc__
+
+
 def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device, monkeypatch):
     wrapper = RecurrentKDAPrefillWrapper(cuda_device)
     offsets = torch.tensor([0, 0, 7, 7, 12], device=cuda_device)
@@ -72,17 +90,17 @@ def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device, monkeyp
     monkeypatch.setattr(torch.Tensor, "to", reject_device_to_host)
     wrapper.plan(offsets)
 
-    cu_seqlens_ptr = wrapper._cu_seqlens_buf.data_ptr()
-    seq_order_ptr = wrapper._seq_order_buf.data_ptr()
-    cu_chunks_ptr = wrapper._cu_chunks_buf.data_ptr()
-    assert wrapper._cu_seqlens_buf.dtype == torch.int64
-    assert wrapper._cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
-    assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
+    cu_seqlens_ptr = wrapper._impl.cu_seqlens_buf.data_ptr()
+    seq_order_ptr = wrapper._impl.seq_order_buf.data_ptr()
+    cu_chunks_ptr = wrapper._impl.cu_chunks_buf.data_ptr()
+    assert wrapper._impl.cu_seqlens_buf.dtype == torch.int64
+    assert wrapper._impl.cu_seqlens_buf.tolist() == [0, 0, 7, 7, 12]
+    assert wrapper._impl.workspace._cute_dsl_generate_planned_metadata is True
 
     wrapper.plan(torch.tensor([0, 0, 2, 2, 12], device=cuda_device))
-    assert wrapper._cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
-    assert wrapper._seq_order_buf.data_ptr() == seq_order_ptr
-    assert wrapper._cu_chunks_buf.data_ptr() == cu_chunks_ptr
+    assert wrapper._impl.cu_seqlens_buf.data_ptr() == cu_seqlens_ptr
+    assert wrapper._impl.seq_order_buf.data_ptr() == seq_order_ptr
+    assert wrapper._impl.cu_chunks_buf.data_ptr() == cu_chunks_ptr
 
     with pytest.raises(ValueError, match="number of sequences is fixed"):
         wrapper.plan(torch.tensor([0, 2, 12], device=cuda_device))
@@ -108,9 +126,9 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
     tensors["output_final_state"] = True
 
     assert wrapper.run(**tensors) is sentinel
-    assert calls[0]["cu_seqlens"] is wrapper._cu_seqlens_buf
-    assert calls[0]["seq_order"] is wrapper._seq_order_buf
-    assert calls[0]["prefill_workspace"] is wrapper._workspace
+    assert calls[0]["cu_seqlens"] is wrapper._impl.cu_seqlens_buf
+    assert calls[0]["seq_order"] is wrapper._impl.seq_order_buf
+    assert calls[0]["prefill_workspace"] is wrapper._impl.workspace
     assert calls[0]["backend"] == "cute-dsl"
 
     # Every parameter of run must reach recurrent_kda, so that dropping one
@@ -119,37 +137,93 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
     assert forwarded - {"self"} <= set(calls[0])
     for name, value in tensors.items():
         assert calls[0][name] is value or calls[0][name] == value
-    assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
-    assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
+    assert wrapper._impl.workspace._cute_dsl_cu_chunks is wrapper._impl.cu_chunks_buf
+    assert wrapper._impl.workspace._cute_dsl_generate_planned_metadata is True
 
 
-def test_prefill_wrapper_planned_path_matches_eager_reference(cuda_device):
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_prefill_wrapper_planned_path_matches_eager_reference(
+    cuda_device, checkpointed
+):
     """The planned path must agree with the eager packed path it wraps.
 
     The wrapper only reorders work and stages metadata, so the reference is the
-    same kernels driven without a plan.
+    same kernels driven without a plan. The checkpointed case also covers the
+    configuration the stable cake comparisons exercise eagerly.
     """
 
     if torch.cuda.get_device_capability(cuda_device) not in ((10, 0), (10, 3)):
         pytest.skip("packed CuTe DSL prefill requires CC 10.0 or 10.3")
 
-    inputs = packed_prefill_inputs(cuda_device, seq_lens=[7, 29, 13], seed=4936)
+    seq_lens = [33, 65] if checkpointed else [7, 29, 13]
+    num_heads = 12 if checkpointed else 2
+    inputs = packed_prefill_inputs(
+        cuda_device, seq_lens=seq_lens, num_heads=num_heads, seed=4936
+    )
     common = dict(inputs)
     cu_seqlens = common.pop("cu_seqlens")
 
-    expected_output, expected_state = kda_api.recurrent_kda(
+    if checkpointed:
+        interval = 32
+        counts = [-(-length // interval) for length in seq_lens]
+        starts = [0]
+        for count in counts:
+            starts.append(starts[-1] + count)
+        common["ssm_state_indices"] = torch.arange(
+            len(seq_lens), dtype=torch.int32, device=cuda_device
+        )
+        common["checkpoint_cu_starts"] = torch.tensor(
+            starts, dtype=torch.int64, device=cuda_device
+        )
+        common["checkpoint_every_n_tokens"] = interval
+
+    def per_call_buffers():
+        """Fresh state pool per call: the kernel writes final state back in place."""
+
+        if not checkpointed:
+            return {}
+        return {
+            "initial_state": torch.zeros(
+                len(seq_lens),
+                num_heads,
+                128,
+                128,
+                dtype=torch.bfloat16,
+                device=cuda_device,
+            ),
+            "state_checkpoints": torch.empty(
+                starts[-1],
+                num_heads,
+                128,
+                128,
+                dtype=torch.bfloat16,
+                device=cuda_device,
+            ),
+        }
+
+    eager_ckpt = per_call_buffers()
+    expected = kda_api.recurrent_kda(
         **common,
+        **eager_ckpt,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
         backend="cute-dsl",
     )
 
+    planned_ckpt = per_call_buffers()
     wrapper = RecurrentKDAPrefillWrapper(cuda_device)
     wrapper.plan(cu_seqlens)
-    actual_output, actual_state = wrapper.run(**common, output_final_state=True)
+    actual = wrapper.run(**common, **planned_ckpt, output_final_state=True)
 
-    torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
-    torch.testing.assert_close(actual_state, expected_state, atol=0, rtol=0)
+    for actual_value, expected_value in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_value, expected_value, atol=0, rtol=0)
+    if checkpointed:
+        torch.testing.assert_close(
+            planned_ckpt["state_checkpoints"],
+            eager_ckpt["state_checkpoints"],
+            atol=0,
+            rtol=0,
+        )
 
 
 @pytest.mark.parametrize("num_heads", [12, 64])
@@ -188,9 +262,9 @@ def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
         inputs["initial_state"].copy_(initial_state_seed)
         output.zero_()
     capture_stream.synchronize()
-    assert wrapper._seq_order_buf.tolist() == [3, 1, 0, 2]
+    assert wrapper._impl.seq_order_buf.tolist() == [3, 1, 0, 2]
     if num_heads == 12:
-        assert wrapper._cu_chunks_buf.tolist() == [0, 0, 2, 2, 5]
+        assert wrapper._impl.cu_chunks_buf.tolist() == [0, 0, 2, 2, 5]
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture_stream):
@@ -205,7 +279,7 @@ def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
 
     assert captured_output.data_ptr() == output.data_ptr()
     assert captured_state is inputs["initial_state"]
-    assert wrapper._workspace._captured
+    assert wrapper._impl.workspace._captured
     torch.testing.assert_close(
         captured_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
     )
@@ -231,9 +305,9 @@ def test_cute_dsl_planned_zero_length_cuda_graph_capture_and_replay(
         graph.replay()
     capture_stream.synchronize()
 
-    assert wrapper._seq_order_buf.tolist() == [2, 3, 0, 1]
+    assert wrapper._impl.seq_order_buf.tolist() == [2, 3, 0, 1]
     if num_heads == 12:
-        assert wrapper._cu_chunks_buf.tolist() == [0, 1, 1, 3, 5]
+        assert wrapper._impl.cu_chunks_buf.tolist() == [0, 1, 1, 3, 5]
     assert sum(replay_seq_lens) == output.shape[1]
     torch.testing.assert_close(
         captured_output.float(),
@@ -415,8 +489,8 @@ def test_cute_dsl_cuda_graph_replay_updates_offsets_and_indexed_checkpoints(
         graph.replay()
     capture_stream.synchronize()
 
-    assert wrapper._seq_order_buf.tolist() == [0, 1]
-    assert wrapper._cu_chunks_buf.tolist() == [0, 9, 14]
+    assert wrapper._impl.seq_order_buf.tolist() == [0, 1]
+    assert wrapper._impl.cu_chunks_buf.tolist() == [0, 9, 14]
     torch.testing.assert_close(
         output.float(), expected_replay[0].float(), atol=1e-2, rtol=1e-2
     )
