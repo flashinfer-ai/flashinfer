@@ -138,14 +138,13 @@ if [ "${BUILD_TARGET}" = "provider" ]; then
   fi
   PACKAGE_VERSION="${PACKAGE_VERSION}+${FLASHINFER_LOCAL_VERSION}"
 
-  python ../scripts/verify_jit_cache_provider_wheelhouse.py \
-    --wheelhouse dist \
+  python ../scripts/verify_jit_cache_provider_artifact.py \
+    --artifact-dir dist \
     --provider "${PROVIDER_TAG}" \
     --version "${PACKAGE_VERSION}" \
     --provider-platform-tag "${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG}" \
     --cuobjdump /usr/local/cuda/bin/cuobjdump \
-    --cuda-architecture-policy "${CUDA_ARCHITECTURE_POLICY:-strict}" \
-    --provider-only
+    --cuda-architecture-policy "${CUDA_ARCHITECTURE_POLICY:-strict}"
 fi
 
 # Verify version and git version

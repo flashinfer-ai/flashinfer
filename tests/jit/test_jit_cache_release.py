@@ -53,7 +53,7 @@ def release_verifier_module():
         yield module
     finally:
         sys.modules.pop(name, None)
-        sys.modules.pop("verify_jit_cache_provider_wheelhouse", None)
+        sys.modules.pop("jit_cache_provider_validation", None)
         sys.path.remove(str(scripts_dir))
 
 

@@ -31,7 +31,8 @@ on:
       - 'scripts/jit_cache_build_common.sh'
       - 'scripts/update_whl_index.py'
       - 'scripts/verify_jit_cache_provider_release.py'
-      - 'scripts/verify_jit_cache_provider_wheelhouse.py'
+      - 'scripts/jit_cache_provider_validation.py'
+      - 'scripts/verify_jit_cache_provider_artifact.py'
 
 concurrency:
   # Superseded PR dry-runs only waste runner time; real release dispatches use

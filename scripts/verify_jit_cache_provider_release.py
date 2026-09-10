@@ -11,47 +11,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-from verify_jit_cache_provider_wheelhouse import (
+from jit_cache_provider_validation import (
     Wheel,
     canonicalize_distribution,
-    normalize_requirement,
     require,
     validate_provider,
+    validate_shim,
 )
-
-
-def validate_shim(
-    wheel: Wheel,
-    expected_version: str,
-    expected_providers: set[str],
-    expected_platform_tag: str | None = None,
-) -> None:
-    require(
-        canonicalize_distribution(wheel.distribution) == "flashinfer-jit-cache",
-        f"Unexpected shim distribution: {wheel.distribution}",
-    )
-    require(
-        wheel.version == expected_version,
-        f"Shim version {wheel.version} does not match {expected_version}",
-    )
-    require(
-        not any(path.endswith(".so") for path in wheel.contents),
-        "Shim wheel must not contain shared libraries",
-    )
-    if expected_platform_tag:
-        require(
-            wheel.path.name.endswith(f"-{expected_platform_tag}.whl"),
-            f"Shim wheel {wheel.path.name} does not use {expected_platform_tag}",
-        )
-    requirements = dict(map(normalize_requirement, wheel.requirements))
-    expected_requirements = {
-        f"flashinfer-jit-cache-{provider}": expected_version
-        for provider in expected_providers
-    }
-    require(
-        requirements == expected_requirements,
-        f"Shim requirements {requirements} do not match {expected_requirements}",
-    )
 
 
 def _installed_provider_ids(target: Path) -> list[str]:

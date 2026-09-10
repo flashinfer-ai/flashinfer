@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import re
 import subprocess
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email.parser import BytesParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 def canonicalize_distribution(name: str) -> str:
@@ -195,6 +197,68 @@ def validate_shim(
         requirements == expected_requirements,
         f"Shim requirements {requirements} do not match {expected_requirements}",
     )
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_validation_report(
+    output_dir: Path,
+    wheels: Mapping[str, Wheel],
+    provider: str,
+    manifest: Mapping[str, Any],
+    module_architectures: Mapping[str, list[str]],
+    ptx_modules: list[str],
+    report_filename: str,
+) -> None:
+    architecture_summary = {
+        "provider_only": sum(
+            targets == [provider] for targets in module_architectures.values()
+        ),
+        "mixed": sum(
+            provider in targets and targets != [provider]
+            for targets in module_architectures.values()
+        ),
+        "foreign_only": sum(
+            bool(targets) and provider not in targets
+            for targets in module_architectures.values()
+        ),
+        "no_cubin": sum(not targets for targets in module_architectures.values()),
+    }
+    report = {
+        "schema_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "provider_id": provider,
+        "version": manifest["version"],
+        "cuda_architectures": manifest["cuda_architectures"],
+        "module_count": len(manifest["modules"]),
+        "modules": sorted(manifest["modules"]),
+        "module_cuda_architectures": module_architectures,
+        "module_cuda_architecture_summary": architecture_summary,
+        "ptx_module_count": len(ptx_modules),
+        "ptx_modules": ptx_modules,
+        "wheels": {
+            distribution: {
+                "filename": wheel.path.name,
+                "size_bytes": wheel.path.stat().st_size,
+                "sha256": sha256(wheel.path),
+            }
+            for distribution, wheel in sorted(wheels.items())
+        },
+    }
+    (output_dir / report_filename).write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    checksum_lines = [
+        f"{details['sha256']}  {details['filename']}"
+        for details in report["wheels"].values()
+    ]
+    (output_dir / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
 
 
 def inspect_cuda_architectures(
