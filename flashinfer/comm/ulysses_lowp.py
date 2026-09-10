@@ -2077,7 +2077,13 @@ class UlyssesLowpSageLayoutSM90:
             "q_slots_per_source": q_slots,
             "k_slots_per_source": k_slots,
             "logical_sequence": logical_sequence,
-            "padded_sequence": (logical_sequence + 63) // 64 * 64,
+            # SageAttention2's SM90 WGMMA kernel runs CTA_K = 128 and asserts
+            # `value.size(3) >= div_ceil(kv_len, 128) * 128`.  That assert is
+            # compiled in (SageAttention builds without NDEBUG), so a 64-row pad
+            # aborts the rank -- not a catchable error -- whenever the global
+            # sequence is 64- but not 128-aligned.  SM120 keeps the 64-row pad:
+            # its Sage kernel is CTA_K = 64.
+            "padded_sequence": (logical_sequence + 127) // 128 * 128,
             "q_scale_alloc": (logical_sequence + self.Q_GROUP - 1) // self.Q_GROUP,
             "k_scale_alloc": (logical_sequence + self.K_GROUP - 1) // self.K_GROUP,
             "main_bytes": main_bytes,

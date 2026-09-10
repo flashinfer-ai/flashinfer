@@ -628,7 +628,11 @@ void ulysses_lowp_unpack_for_sage(TensorView input, TensorView q, TensorView k, 
   const int64_t logical_sequence = local_sequence * world_size;
   const int64_t local_heads = q.size(2);
   const int64_t head_dim = q.size(3);
-  const int64_t padded_sequence = (logical_sequence + 63) / 64 * 64;
+  // SageAttention2 SM90 runs CTA_K = 128 and asserts
+  // `value.size(3) >= div_ceil(kv_len, 128) * 128`, so the transposed V
+  // buffer is padded to a 128-token multiple.  (csrc/ulysses_lowp.cu keeps
+  // 64: that kernel is CTA_K = 64.)  grid = padded_sequence / 64 stays exact.
+  const int64_t padded_sequence = (logical_sequence + 127) / 128 * 128;
   // Scale tensors are emitted at the width the Sage consumer derives from the
   // rows it is given (ceil(rows/128)*4 Q slots, ceil(rows/64) K slots); a
   // caller that attends over a live prefix passes that prefix so no
@@ -718,7 +722,11 @@ void ulysses_lowp_unpack_for_sage_unaligned(TensorView input, TensorView q, Tens
   const int64_t logical_sequence = local_sequence * world_size;
   const int64_t local_heads = q.size(2);
   const int64_t head_dim = q.size(3);
-  const int64_t padded_sequence = (logical_sequence + 63) / 64 * 64;
+  // SageAttention2 SM90 runs CTA_K = 128 and asserts
+  // `value.size(3) >= div_ceil(kv_len, 128) * 128`, so the transposed V
+  // buffer is padded to a 128-token multiple.  (csrc/ulysses_lowp.cu keeps
+  // 64: that kernel is CTA_K = 64.)  grid = padded_sequence / 64 stays exact.
+  const int64_t padded_sequence = (logical_sequence + 127) / 128 * 128;
   // Scale tensors are emitted at the width the Sage consumer derives from the
   // rows it is given (ceil(rows/128)*4 Q slots, ceil(rows/64) K slots); a
   // caller that attends over a live prefix passes that prefix so no
