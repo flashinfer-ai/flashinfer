@@ -811,6 +811,9 @@ def _payloads(rank, experts):
         tokens * (_HIDDEN_SIZE // 2), dtype=torch.uint8, device="cuda"
     ).reshape(tokens, _HIDDEN_SIZE // 2)
     packed.add_(rank * 20)
+    # With two ranks and three tokens, the 4-byte LoRA plane leaves the next
+    # receive plane only 8-byte aligned. Keep it before the wider FP8/packed
+    # payloads to exercise address-aware vector widths in the default backend.
     return [hidden, experts, weights, lora_ids, fp8, packed]
 
 
@@ -1209,19 +1212,6 @@ def _run_public_mpi2_cycle(backend):
         )
 
     comm.barrier()
-    if rank == 0:
-        rank_zero_mask = moe_a2a_active_rank_mask((0,), 2)
-        _run_public_combine_round(
-            collective,
-            rank,
-            routes,
-            payloads,
-            rank_zero_mask,
-            (0,),
-            (0,),
-            payload_in_workspace=False,
-        )
-    comm.barrier()
     return collective, topk8_collective
 
 
@@ -1236,3 +1226,25 @@ def test_public_mpi2_nondivisible_six_payload_eplb_and_external_output():
             != cake_collective.workspace.data_ptr()
         )
     _run_public_mpi2_cycle(backend="trtllm")
+
+    # Check a dropped peer only after all full-rank reuse checks. A peer that
+    # misses collective epochs cannot rejoin without coordinated reinitialization.
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    comm.barrier()
+    if rank == 0:
+        routes = torch.tensor(_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda")
+        payloads = _payloads(rank, routes)
+        rank_zero_mask = moe_a2a_active_rank_mask((0,), 2)
+        for collective in (legacy[0], cake[0]):
+            _run_public_combine_round(
+                collective,
+                rank,
+                routes,
+                payloads,
+                rank_zero_mask,
+                (0,),
+                (0,),
+                payload_in_workspace=False,
+            )
+    comm.barrier()

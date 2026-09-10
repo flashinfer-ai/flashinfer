@@ -559,6 +559,9 @@ def moe_a2a_dispatch(
         participates in this collective; tokens routed to a masked-off rank are dropped
         instead of hanging the collective.  Requires ``enable_rank_mask=True``; the local
         ``ep_rank``'s own bit must always be set.
+        Masking a peer does not advance that peer's transport epoch. Before a
+        skipped peer rejoins, all ranks must quiesce and coordinate workspace
+        reinitialization; merely restoring its mask bit is insufficient.
     backend : {"trtllm", "cake"}
         Defaults to ``"trtllm"``. Pass ``"cake"`` to opt in on CC 10.0/10.3;
         must match workspace initialization, combine, and all peer ranks.
