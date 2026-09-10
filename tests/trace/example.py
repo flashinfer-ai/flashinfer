@@ -337,6 +337,8 @@ if torch.cuda.get_device_capability() == (10, 3):
         post_eps=1e-8,
         next_eps=1e-5,
         next_gain_center=1.0,
+        post_weight=gated_weight,
+        post_gain_center=1.0,
     )
 
     gate_input = torch.randn(8, 32, 64, dtype=torch.bfloat16, device=device)

@@ -25,9 +25,11 @@ def _inputs(rows: int):
     return branch, residual, next_weight, alpha, beta
 
 
-def _reference(inputs):
+def _reference(inputs, post_weight=None, post_gain_center=0.0):
     branch, residual, next_weight, alpha, beta = inputs
     branch_fp32 = branch.float()
+    if post_weight is not None:
+        branch_fp32 *= post_weight.float() + post_gain_center
     branch_fp32 *= torch.rsqrt(
         branch_fp32.square().mean(dim=-1, keepdim=True) + POST_EPS
     )
@@ -39,12 +41,13 @@ def _reference(inputs):
     return residual_out, ffn_input.to(torch.bfloat16)
 
 
-def _call(inputs):
+def _call(inputs, **kwargs):
     return gated_residual_next_rmsnorm(
         *inputs,
         post_eps=POST_EPS,
         next_eps=NEXT_EPS,
         next_gain_center=NEXT_GAIN_CENTER,
+        **kwargs,
     )
 
 
@@ -53,12 +56,20 @@ def _assert_close(actual, expected):
     torch.testing.assert_close(actual[1], expected[1], rtol=0.015625, atol=0.03125)
 
 
-@pytest.mark.parametrize("rows", [0, 1, 17, 128])
-def test_gated_residual_next_rmsnorm_matches_reference(rows):
+@pytest.mark.parametrize("rows", [0, 1, 17, 128, 2048])
+@pytest.mark.parametrize("post_gain_center", [None, 0.0, 1.0])
+def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
+    torch.manual_seed(1000 + rows)
     inputs = _inputs(rows)
     if not supports_gated_residual_next_rmsnorm(*inputs):
         pytest.skip("gated residual next RMSNorm requires SM103")
-    _assert_close(_call(inputs), _reference(inputs))
+    kwargs = {}
+    if post_gain_center is not None:
+        kwargs = {
+            "post_weight": torch.randn_like(inputs[2]) * 0.1,
+            "post_gain_center": post_gain_center,
+        }
+    _assert_close(_call(inputs, **kwargs), _reference(inputs, **kwargs))
 
 
 def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
@@ -90,6 +101,21 @@ def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
     assert not supports_gated_residual_next_rmsnorm(
         inputs[0], inputs[1], strided_weight, inputs[3], inputs[4]
     )
+    misaligned_weight = torch.empty(
+        HIDDEN_SIZE + 1, dtype=torch.bfloat16, device="cuda"
+    )[1:]
+    for post_weight in (
+        strided_weight,
+        misaligned_weight,
+        inputs[2][:-1],
+        inputs[2].float(),
+        inputs[2].cpu(),
+    ):
+        assert not supports_gated_residual_next_rmsnorm(
+            *inputs, post_weight=post_weight
+        )
+        with pytest.raises(ValueError, match="contract"):
+            _call(inputs, post_weight=post_weight)
 
     storage = torch.empty(HIDDEN_SIZE + 16, dtype=torch.float32, device="cuda")
     misaligned_residual_out = storage[4 : 4 + HIDDEN_SIZE].view(1, HIDDEN_SIZE)
@@ -104,19 +130,28 @@ def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
         )
 
 
-def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs():
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(post_input_scale):
     inputs = list(_inputs(17))
     if not supports_gated_residual_next_rmsnorm(*inputs):
         pytest.skip("gated residual next RMSNorm requires SM103")
-    _call(inputs)
+    kwargs = {}
+    if post_input_scale:
+        kwargs = {
+            "post_weight": torch.randn_like(inputs[2]) * 0.1,
+            "post_gain_center": 1.0,
+        }
+    _call(inputs, **kwargs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = _call(inputs)
+        actual = _call(inputs, **kwargs)
 
     for seed in (3001, 4001):
         torch.manual_seed(seed)
         inputs[0].copy_(torch.randn_like(inputs[0]))
         inputs[1].copy_(torch.randn_like(inputs[1]))
+        if post_input_scale:
+            kwargs["post_weight"].copy_(torch.randn_like(inputs[2]) * 0.1)
         graph.replay()
         torch.cuda.synchronize()
-        _assert_close(actual, _reference(inputs))
+        _assert_close(actual, _reference(inputs, **kwargs))

@@ -120,9 +120,12 @@ def _dual_norm_kernel(
     gWt: cute.Tensor,
     gRo: cute.Tensor,
     gFo: cute.Tensor,
+    gPw: cute.Tensor,
     post_eps: cutlass.Constexpr,
     next_eps: cutlass.Constexpr,
     gain: cutlass.Constexpr,
+    has_post_weight: cutlass.Constexpr,
+    post_gain: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cy, _ = cute.arch.block_idx()
@@ -158,6 +161,10 @@ def _dual_norm_kernel(
     cute.autovec_copy(tAl, fAl)
     cute.autovec_copy(tBe, fBe)
     cute.autovec_copy(tWt, fWt)
+    if const_expr(has_post_weight):
+        tPw = gPw[wc]
+        fPw = cute.make_fragment_like(tPw)
+        cute.autovec_copy(tPw, fPw)
 
     if const_expr(CLUSTER_N > 1):
         if tidx == 0:
@@ -173,6 +180,8 @@ def _dual_norm_kernel(
         rank = Int32(0)
 
     b = fBr.load().to(Float32)
+    if const_expr(has_post_weight):
+        b = b * (fPw.load().to(Float32) + post_gain)
     u = fAl.load().to(Float32) * fSt.load().to(Float32)
     v = fBe.load().to(Float32) * b
 
@@ -209,9 +218,12 @@ def _launch(
     mWt: cute.Tensor,
     mRo: cute.Tensor,
     mFo: cute.Tensor,
+    mPw: cute.Tensor,
     post_eps: cutlass.Constexpr,
     next_eps: cutlass.Constexpr,
     gain: cutlass.Constexpr,
+    has_post_weight: cutlass.Constexpr,
+    post_gain: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     tiler = (1, VEC)
@@ -222,9 +234,22 @@ def _launch(
     gWt = cute.zipped_divide(mWt, tiler)
     gRo = cute.zipped_divide(mRo, tiler)
     gFo = cute.zipped_divide(mFo, tiler)
+    gPw = cute.zipped_divide(mPw, tiler)
 
     _dual_norm_kernel(
-        gBr, gSt, gAl, gBe, gWt, gRo, gFo, post_eps, next_eps, gain
+        gBr,
+        gSt,
+        gAl,
+        gBe,
+        gWt,
+        gRo,
+        gFo,
+        gPw,
+        post_eps,
+        next_eps,
+        gain,
+        has_post_weight,
+        post_gain,
     ).launch(
         grid=[mBr.shape[0], CLUSTER_N, 1],
         block=[THREADS, 1, 1],
@@ -239,7 +264,13 @@ def _float_key(value: float) -> str:
 
 
 @functools.cache
-def _get_compiled(post_eps: float, next_eps: float, next_gain_center: float):
+def _get_compiled(
+    post_eps: float,
+    next_eps: float,
+    next_gain_center: float,
+    has_post_weight: bool,
+    post_gain_center: float,
+):
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
@@ -277,6 +308,8 @@ def _get_compiled(post_eps: float, next_eps: float, next_gain_center: float):
             f"peps{_float_key(post_eps)}",
             f"neps{_float_key(next_eps)}",
             f"gc{_float_key(next_gain_center)}",
+            f"pw{int(has_post_weight)}",
+            f"pgc{_float_key(post_gain_center)}",
         )
     )
     return build_and_load_cute_dsl_kernel(
@@ -291,9 +324,12 @@ def _get_compiled(post_eps: float, next_eps: float, next_gain_center: float):
             next_weight,
             residual,
             ffn_input,
+            next_weight,
             post_eps,
             next_eps,
             next_gain_center,
+            has_post_weight,
+            post_gain_center,
             cuda_stream,
             options="--enable-tvm-ffi",
         ),
@@ -312,10 +348,18 @@ def run(
     next_gain_center: float,
     residual_out: torch.Tensor,
     ffn_input: torch.Tensor,
+    post_weight: torch.Tensor | None = None,
+    post_gain_center: float = 0.0,
 ) -> None:
     if branch.shape[0] == 0:
         return
-    fn = _get_compiled(float(post_eps), float(next_eps), float(next_gain_center))
+    fn = _get_compiled(
+        float(post_eps),
+        float(next_eps),
+        float(next_gain_center),
+        post_weight is not None,
+        float(post_gain_center) if post_weight is not None else 0.0,
+    )
     fn(
         branch,
         residual,
@@ -324,6 +368,7 @@ def run(
         next_weight.unsqueeze(0),
         residual_out,
         ffn_input,
+        (post_weight if post_weight is not None else next_weight).unsqueeze(0),
     )
 
 
@@ -338,6 +383,8 @@ def gated_residual_next_rmsnorm(
     next_gain_center: float,
     residual_out: torch.Tensor,
     ffn_input: torch.Tensor,
+    post_weight: torch.Tensor | None = None,
+    post_gain_center: float = 0.0,
 ) -> None:
     """Run the fixed-width fused gated-residual plus next-RMSNorm kernel."""
     run(
@@ -351,4 +398,6 @@ def gated_residual_next_rmsnorm(
         next_gain_center,
         residual_out,
         ffn_input,
+        post_weight,
+        post_gain_center,
     )

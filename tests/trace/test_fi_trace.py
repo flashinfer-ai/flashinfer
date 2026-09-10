@@ -558,13 +558,17 @@ def test_gated_residual_rmsnorm_fi_trace():
     assert defn["outputs"]["output"]["dtype"] == "float32"
 
 
-def test_gated_residual_next_rmsnorm_fi_trace():
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale):
     import flashinfer.norm
 
     branch = torch.empty(2, 8192, dtype=torch.bfloat16)
     residual = torch.empty(2, 8192, dtype=torch.float32)
     next_weight = torch.empty(8192, dtype=torch.bfloat16)
     gate = torch.empty(8192, dtype=torch.float32)
+    kwargs = {}
+    if post_input_scale:
+        kwargs = {"post_weight": next_weight, "post_gain_center": 1.0}
     defn = flashinfer.norm.gated_residual_next_rmsnorm.fi_trace(
         branch=branch,
         residual=residual,
@@ -574,6 +578,7 @@ def test_gated_residual_next_rmsnorm_fi_trace():
         post_eps=1e-8,
         next_eps=1e-5,
         next_gain_center=1.0,
+        **kwargs,
     )
     _check_defn(
         defn,
@@ -583,6 +588,8 @@ def test_gated_residual_next_rmsnorm_fi_trace():
     assert defn["axes"]["hidden_size"]["value"] == 8192
     assert defn["outputs"]["residual_out"]["dtype"] == "float32"
     assert defn["outputs"]["ffn_input"]["dtype"] == "bfloat16"
+    if post_input_scale:
+        assert defn["inputs"]["post_weight"]["dtype"] == "bfloat16"
 
 
 def test_rmsnorm_sigmoid_gate_fi_trace():

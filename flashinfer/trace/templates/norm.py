@@ -369,8 +369,12 @@ def _gated_residual_next_rmsnorm_reference(
     post_eps=1e-6,
     next_eps=1e-6,
     next_gain_center=0.0,
+    post_weight=None,
+    post_gain_center=0.0,
 ):
     branch_fp32 = branch.to(torch.float32)
+    if post_weight is not None:
+        branch_fp32 *= post_weight.to(torch.float32) + float(post_gain_center)
     branch_fp32 *= torch.rsqrt(
         branch_fp32.square().mean(dim=-1, keepdim=True) + float(post_eps)
     )
@@ -398,11 +402,13 @@ def _gated_residual_next_rmsnorm_init(
             num_rows, hidden_size, dtype=torch.float32, device=device
         ),
         "next_weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
+        "post_weight": torch.randn(hidden_size, dtype=torch.bfloat16, device=device),
         "alpha": torch.randn(hidden_size, dtype=torch.float32, device=device),
         "beta": torch.randn(hidden_size, dtype=torch.float32, device=device),
         "post_eps": 1e-6,
         "next_eps": 1e-6,
         "next_gain_center": 0.0,
+        "post_gain_center": 1.0,
     }
 
 
@@ -415,11 +421,13 @@ gated_residual_next_rmsnorm_trace = TraceTemplate(
         "branch": Tensor(["num_rows", "hidden_size"]),
         "residual": Tensor(["num_rows", "hidden_size"]),
         "next_weight": Tensor(["hidden_size"]),
+        "post_weight": Tensor(["hidden_size"], optional=True),
         "alpha": Tensor(["hidden_size"]),
         "beta": Tensor(["hidden_size"]),
         "post_eps": Scalar("float32"),
         "next_eps": Scalar("float32"),
         "next_gain_center": Scalar("float32"),
+        "post_gain_center": Scalar("float32", optional=True),
     },
     outputs={
         "residual_out": Tensor(["num_rows", "hidden_size"], dtype_from="residual"),

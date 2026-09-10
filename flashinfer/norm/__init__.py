@@ -223,15 +223,26 @@ def supports_gated_residual_next_rmsnorm(
     next_weight: torch.Tensor,
     alpha: torch.Tensor,
     beta: torch.Tensor,
+    *,
+    post_weight: Optional[torch.Tensor] = None,
 ) -> bool:
     """Return whether tensors satisfy the SM103 two-norm kernel contract."""
-    tensors = (branch, residual, next_weight, alpha, beta)
+    tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, alpha, beta)
+    if post_weight is not None:
+        tensors += (post_weight,)
     return (
         _HAS_CUTE_DSL_FUSED_NORM
         and branch.ndim == 2
         and branch.shape[1] == _GATED_RESIDUAL_HIDDEN_SIZE
         and residual.shape == branch.shape
         and next_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+        and (
+            post_weight is None
+            or (
+                post_weight.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
+                and post_weight.dtype == torch.bfloat16
+            )
+        )
         and alpha.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
         and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
         and branch.dtype == torch.bfloat16
@@ -262,12 +273,17 @@ def gated_residual_next_rmsnorm(
     next_gain_center: float = 0.0,
     residual_out: Optional[torch.Tensor] = None,
     ffn_input: Optional[torch.Tensor] = None,
+    *,
+    post_weight: Optional[torch.Tensor] = None,
+    post_gain_center: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Blend a normalized branch and apply the next RMSNorm in one launch.
 
     This computes ``residual_out = alpha * residual + beta * RMSNorm(branch)``
     in FP32. It then computes ``ffn_input = RMSNorm(residual_out) *
     (next_weight + next_gain_center)`` and rounds only that output to BF16.
+    When ``post_weight`` is supplied, ``branch`` is multiplied by
+    ``post_weight + post_gain_center`` in FP32 before its RMSNorm.
     The optimized implementation supports contiguous hidden-size-8192 tensors
     on SM103 GPUs.
 
@@ -289,6 +305,10 @@ def gated_residual_next_rmsnorm(
         Optional FP32 destination with the same shape as ``residual``.
     ffn_input : Optional[torch.Tensor]
         Optional BF16 destination with the same shape as ``branch``.
+    post_weight : Optional[torch.Tensor]
+        Optional BF16 input scale for the first RMSNorm, with shape ``(8192,)``.
+    post_gain_center : float
+        Constant added to ``post_weight`` in FP32; unused when it is ``None``.
 
     Returns
     -------
@@ -296,7 +316,7 @@ def gated_residual_next_rmsnorm(
         The FP32 residual stream and BF16 normalized FFN input.
     """
     if not supports_gated_residual_next_rmsnorm(
-        branch, residual, next_weight, alpha, beta
+        branch, residual, next_weight, alpha, beta, post_weight=post_weight
     ):
         raise ValueError(
             "tensors do not satisfy the gated_residual_next_rmsnorm contract"
@@ -331,6 +351,8 @@ def gated_residual_next_rmsnorm(
         post_eps,
         next_eps,
         next_gain_center,
+        post_weight,
+        post_gain_center,
     )
     return residual_out, ffn_input
 
@@ -350,6 +372,8 @@ def _gated_residual_next_rmsnorm_impl(
     post_eps: float,
     next_eps: float,
     next_gain_center: float,
+    post_weight: Optional[torch.Tensor],
+    post_gain_center: float,
 ) -> None:
     _gated_residual_next_rmsnorm_cute(
         branch,
@@ -362,6 +386,8 @@ def _gated_residual_next_rmsnorm_impl(
         next_gain_center,
         residual_out,
         ffn_input,
+        post_weight,
+        post_gain_center,
     )
 
 
@@ -377,6 +403,8 @@ def _gated_residual_next_rmsnorm_fake(
     post_eps: float,
     next_eps: float,
     next_gain_center: float,
+    post_weight: Optional[torch.Tensor],
+    post_gain_center: float,
 ) -> None:
     return None
 
