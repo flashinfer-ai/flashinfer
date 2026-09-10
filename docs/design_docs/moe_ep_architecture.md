@@ -113,9 +113,7 @@ the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
 `in_kernel_fc2_reduce` (ikr — makes the accumulation order
 nondeterministic); the knobs may select it, but only when the config sets
 `enable_in_kernel_fc2_reduce=True`, so leaving `enable_in_kernel_fc2_reduce`
-at `False` keeps the session bit-reproducible. Every kernel treats it as a
-permission this way: both reduce paths land in the session workspace, so ikr
-is invisible to the caller and can flip per-compile.
+at `False` keeps the session bit-reproducible.
 - **perf knobs** are output-neutral and free to sweep: `group_hint`,
   `flag_batch`, `epi_flag_batch`.
 
@@ -180,9 +178,6 @@ default `knobs=None` and gets the tuned winner as a pure lookup — no
 compiles, no collectives, no timing on the hot path. Nondeterministic ikr
 candidates are excluded from the CLI sweep unless
 `--allow-nondeterministic` is passed.
-Note: BF16 and BF16xMXFP8 cannot fall back to a deterministic path,
-the cache must contain results from `--allow-nondeterministic`
-to enable ikr for these kernels
 
 Measured results, methodology, and the full knob reference live in
 [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
