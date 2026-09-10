@@ -10,7 +10,7 @@ from __future__ import annotations
 import functools
 import math
 from numbers import Real
-from typing import ClassVar, Optional, Union, cast
+from typing import ClassVar, Optional, Union
 
 import torch
 
@@ -20,6 +20,7 @@ from flashinfer.utils import (
     device_support_pdl,
     get_compute_capability,
     get_device_sm_count,
+    is_sm12x_supported,
 )
 
 from .._contracts import _resolve_structural_mla_input
@@ -61,13 +62,14 @@ def get_xqa_module_mla(
 def _validate_xqa_device_capability(device: torch.device) -> None:
     if device.type != "cuda":
         raise _BackendPlanUnsupportedError(
-            "XQA MLA wrapper requires a CUDA device with SM120/SM121 capability."
+            "XQA MLA wrapper requires a CUDA device with SM12x capability."
         )
     major, minor = get_compute_capability(device)
-    if (major, minor) not in ((12, 0), (12, 1)):
+    if not is_sm12x_supported(device):
         raise _BackendPlanUnsupportedError(
-            "XQA MLA wrapper requires SM120/SM121, got compute capability "
-            f"SM{major}{minor}."
+            "XQA MLA wrapper requires SM120a (CUDA >= 12.8) or SM12x "
+            "minor >= 1 (CUDA >= 12.9), got compute capability "
+            f"SM{major}{minor} with CUDA {torch.version.cuda}."
         )
 
 
@@ -205,7 +207,6 @@ class _BatchMLAPagedAttentionXqaBackend:
             cum_seq_lens_q=dense.cum_seq_lens_q,
             block_tables=dense.block_tables,
             seq_lens=dense.seq_lens,
-            max_q_len=dense.max_q_len,
             num_heads=args.num_heads,
             head_dim_ckv=args.head_dim_ckv,
             head_dim_kpe=args.head_dim_kpe,
@@ -223,7 +224,6 @@ class _BatchMLAPagedAttentionXqaBackend:
         cum_seq_lens_q: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
-        max_q_len: int,
         num_heads: int,
         head_dim_ckv: int,
         head_dim_kpe: int,
@@ -233,10 +233,6 @@ class _BatchMLAPagedAttentionXqaBackend:
         kv_data_type: torch.dtype,
         enable_pdl: Optional[bool],
     ) -> None:
-        if max_q_len != 1:
-            raise _BackendPlanUnsupportedError(
-                f"XQA MLA wrapper requires exactly one query token per request, got {max_q_len}."
-            )
         for name, tensor in (
             ("cum_seq_lens_q", cum_seq_lens_q),
             ("block_tables", block_tables),
@@ -440,7 +436,7 @@ class _BatchMLAPagedAttentionXqaBackend:
         kv_cache_4d = kv_cache.unsqueeze(2)
         self._module.xqa_mla(
             self._sm_count,
-            cast(float, resolved_bmm1_scale),
+            float(resolved_bmm1_scale),
             out,
             query_4d,
             kv_cache_4d,
@@ -449,7 +445,7 @@ class _BatchMLAPagedAttentionXqaBackend:
             self._max_seq_len,
             self._seq_lens_2d,
             self._batch_size,
-            cast(float, resolved_bmm2_scale),
+            float(resolved_bmm2_scale),
             self._semaphore,
             self._scratch,
             self._enable_pdl,
