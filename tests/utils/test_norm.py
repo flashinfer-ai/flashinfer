@@ -34,17 +34,16 @@ def llama_rms_norm(x, w, eps=1e-6):
     return x
 
 
-def llama_rms_norm_quant(x, w, scale, eps=1e-6):
+def llama_rms_norm_quant(x, w, scale, quant_dtype, eps=1e-6):
     inv_scale = torch.reciprocal(torch.tensor(scale)).float()
     x = x.float()
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
     x = x * w.float()
     x = x * inv_scale
-    x = torch.clamp(
-        x, torch.finfo(torch.float8_e4m3fn).min, torch.finfo(torch.float8_e4m3fn).max
-    )
-    x = x.to(torch.float8_e4m3fn)
+    finfo = torch.finfo(quant_dtype)
+    x = torch.clamp(x, finfo.min, finfo.max)
+    x = x.to(quant_dtype)
     return x
 
 
@@ -93,7 +92,7 @@ def fused_add_rms_norm(x, residual, weight, eps):
     return x, residual
 
 
-def fused_add_rms_norm_quant(x, residual, weight, scale, eps):
+def fused_add_rms_norm_quant(x, residual, weight, scale, quant_dtype, eps):
     inv_scale = torch.reciprocal(torch.tensor(scale)).float()
     orig_dtype = x.dtype
     x = x.to(torch.float32)
@@ -103,10 +102,9 @@ def fused_add_rms_norm_quant(x, residual, weight, scale, eps):
     x = x * torch.rsqrt(variance + eps)
     x = x * weight.float()
     x = x * inv_scale
-    x = torch.clamp(
-        x, torch.finfo(torch.float8_e4m3fn).min, torch.finfo(torch.float8_e4m3fn).max
-    )
-    x = x.to(torch.float8_e4m3fn)
+    finfo = torch.finfo(quant_dtype)
+    x = torch.clamp(x, finfo.min, finfo.max)
+    x = x.to(quant_dtype)
     return x, residual
 
 
@@ -141,11 +139,12 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_norm_quant(
-    batch_size, hidden_size, dtype, quant_scale, enable_pdl, contiguous
+    batch_size, hidden_size, dtype, quant_dtype, quant_scale, enable_pdl, contiguous
 ):
     if contiguous:
         x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
@@ -158,8 +157,8 @@ def test_norm_quant(
 
     w = torch.randn(hidden_size).to(0).to(dtype)
 
-    y_ref = llama_rms_norm_quant(x, w, quant_scale)
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn, device="cuda")
+    y_ref = llama_rms_norm_quant(x, w, quant_scale, quant_dtype)
+    y = torch.empty_like(x, dtype=quant_dtype, device="cuda")
     flashinfer.norm.rmsnorm_quant(
         y, x, w, torch.tensor(quant_scale, device="cuda"), enable_pdl=enable_pdl
     )
@@ -235,11 +234,12 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_fused_add_rmsnorm_quant(
-    batch_size, hidden_size, dtype, quant_scale, enable_pdl, contiguous
+    batch_size, hidden_size, dtype, quant_dtype, quant_scale, enable_pdl, contiguous
 ):
     eps = 1e-6
 
@@ -256,12 +256,12 @@ def test_fused_add_rmsnorm_quant(
     weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
 
     x_native, residual_native = fused_add_rms_norm_quant(
-        x.clone(), residual.clone(), weight, quant_scale, eps
+        x.clone(), residual.clone(), weight, quant_scale, quant_dtype, eps
     )
 
     x_fused = x.clone()
     residual_fused = residual.clone()
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn, device="cuda")
+    y = torch.empty_like(x, dtype=quant_dtype, device="cuda")
     flashinfer.norm.fused_add_rmsnorm_quant(
         y,
         x_fused,
@@ -274,6 +274,144 @@ def test_fused_add_rmsnorm_quant(
 
     torch.testing.assert_close(y.float(), x_native.float(), rtol=1, atol=1)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+def fused_add_rms_norm_fp8_block_quant(x, residual, weight, eps, block=128):
+    """Reference: add residual, RMSNorm, then per-1x128-block fp8-e4m3 quant.
+
+    Returns (fp8 out, scale[M, H/block], pre-norm residual, bf16/fp16 normed).
+    """
+    orig_dtype = x.dtype
+    xf = x.to(torch.float32) + residual.to(torch.float32)
+    residual = xf.to(orig_dtype)  # pre-norm residual
+    variance = xf.pow(2).mean(dim=-1, keepdim=True)
+    normed = (xf * torch.rsqrt(variance + eps) * weight.float()).to(
+        orig_dtype
+    )  # round to T
+    M, H = normed.shape
+    nb = normed.float().view(M, H // block, block)
+    amax = nb.abs().amax(dim=-1).clamp_min(1e-4)  # (M, H/block)
+    scale = amax / 448.0  # e4m3 max
+    q = (nb / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(M, H)
+    return q, scale, residual, normed
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("hidden_size", [256, 512, 1024, 3072, 4096, 6144, 8192, 16384])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_fused_add_rmsnorm_fp8_block_quant(batch_size, hidden_size, dtype, enable_pdl):
+    eps = 1e-6
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda") * 0.1
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+    residual = torch.randn_like(x) * 0.1
+    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+
+    q_ref, scale_ref, residual_ref, normed_ref = fused_add_rms_norm_fp8_block_quant(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    m_pad = (batch_size + 3) & ~3
+    out = torch.empty(batch_size, hidden_size, dtype=torch.float8_e4m3fn, device="cuda")
+    block_scale = torch.empty(
+        hidden_size // 128, m_pad, dtype=torch.float32, device="cuda"
+    )
+    normed_out = torch.empty_like(x)
+    residual_fused = residual.clone()
+    flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+        out,
+        block_scale,
+        normed_out,
+        x,
+        residual_fused,
+        weight,
+        eps,
+        enable_pdl=enable_pdl,
+    )
+
+    # pre-norm residual and bf16/fp16 normed: tight
+    torch.testing.assert_close(residual_fused, residual_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(normed_out, normed_ref, rtol=1e-2, atol=1e-2)
+    # per-1x128-block scale, read back from the (H/128, round_up(M,4)) column-major buffer.
+    # scale = block amax / 448; amax can differ by up to ~2 low-dtype ULP between kernel and
+    # reference (fast rsqrt + a different reduction order flip the max element's rounding), so
+    # use a dtype-appropriate rtol rather than an exact match.
+    scale_got = block_scale.transpose(0, 1)[:batch_size]
+    torch.testing.assert_close(scale_got, scale_ref, rtol=2e-2, atol=1e-5)
+    # dequantized fp8 vs the reference normed (loose fp8 tolerance)
+    deq = out.float().view(batch_size, hidden_size // 128, 128) * scale_got.unsqueeze(
+        -1
+    )
+    torch.testing.assert_close(
+        deq.view(batch_size, hidden_size), normed_ref.float(), rtol=0.1, atol=0.3
+    )
+
+
+@pytest.mark.parametrize("hidden_size", [1152, 32768])
+def test_fused_add_rmsnorm_fp8_block_quant_rejects_unsupported_hidden(hidden_size):
+    # single-wave contract: hidden_size must be <= 16384 and a multiple of 32*vec_size
+    # (256 for <=8192). 1152 is %128==0 but %256!=0; 32768 exceeds 16384. Both must raise.
+    batch_size = 64
+    x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=torch.bfloat16, device="cuda")
+    m_pad = (batch_size + 3) & ~3
+    out = torch.empty(batch_size, hidden_size, dtype=torch.float8_e4m3fn, device="cuda")
+    block_scale = torch.empty(
+        hidden_size // 128, m_pad, dtype=torch.float32, device="cuda"
+    )
+    normed_out = torch.empty_like(x)
+    with pytest.raises(RuntimeError, match="hidden_size"):
+        flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+            out, block_scale, normed_out, x, residual, weight, 1e-6, enable_pdl=False
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "out_dtype",
+        "out_shape",
+        "block_scale_dtype",
+        "block_scale_stride",
+        "normed_out_dtype",
+    ],
+)
+def test_fused_add_rmsnorm_fp8_block_quant_rejects_bad_outputs(bad):
+    # The kernel reinterprets the output buffers with fixed types (e4m3 out, fp32 block_scale,
+    # input-dtype normed_out) and indexes block_scale unit-stride along m, so each of these would
+    # silently corrupt memory without a host-side check.
+    batch_size, hidden_size = 64, 1024
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+    m_pad = (batch_size + 3) & ~3
+    out = torch.empty(batch_size, hidden_size, dtype=torch.float8_e4m3fn, device="cuda")
+    block_scale = torch.empty(
+        hidden_size // 128, m_pad, dtype=torch.float32, device="cuda"
+    )
+    normed_out = torch.empty_like(x)
+
+    if bad == "out_dtype":
+        out = out.to(torch.float8_e5m2)
+    elif bad == "out_shape":
+        out = out[:, : hidden_size // 2]
+    elif bad == "block_scale_dtype":
+        block_scale = block_scale.to(torch.float16)
+    elif bad == "block_scale_stride":
+        # transposed (m-major) view: last dim is no longer unit-stride
+        block_scale = torch.empty(
+            m_pad, hidden_size // 128, dtype=torch.float32, device="cuda"
+        ).t()
+    elif bad == "normed_out_dtype":
+        normed_out = normed_out.to(torch.float32)
+
+    with pytest.raises(RuntimeError):
+        flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+            out, block_scale, normed_out, x, residual, weight, 1e-6, enable_pdl=False
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -476,7 +614,7 @@ def test_rmsnorm_quant_int64_stride():
     y = torch.empty(2, H, dtype=torch.float8_e4m3fn, device="cuda")
     flashinfer.norm.rmsnorm_quant(y, x, w, torch.tensor(quant_scale, device="cuda"))
 
-    y_ref = llama_rms_norm_quant(x.contiguous(), w, quant_scale)
+    y_ref = llama_rms_norm_quant(x.contiguous(), w, quant_scale, torch.float8_e4m3fn)
     torch.testing.assert_close(y.float(), y_ref.float(), rtol=1, atol=1)
 
 
@@ -516,7 +654,7 @@ def test_fused_add_rmsnorm_quant_int64_stride():
     x = torch.as_strided(buf_x, (2, H), (_INT64_STRIDE, 1))
     assert not x.is_contiguous()
     x_ref, r_ref = fused_add_rms_norm_quant(
-        x.contiguous().clone(), r.clone(), w, quant_scale, eps
+        x.contiguous().clone(), r.clone(), w, quant_scale, torch.float8_e4m3fn, eps
     )
 
     y = torch.empty(2, H, dtype=torch.float8_e4m3fn, device="cuda")
@@ -619,7 +757,9 @@ def test_rmsnorm_quant_contiguous_overflow():
     _spot_check_rows(
         y,
         x,
-        lambda r: llama_rms_norm_quant(x[r : r + 1], w, quant_scale),
+        lambda r: llama_rms_norm_quant(
+            x[r : r + 1], w, quant_scale, torch.float8_e4m3fn
+        ),
         rtol=1,
         atol=1,
     )
@@ -703,7 +843,7 @@ def test_fused_add_rmsnorm_quant_contiguous_overflow():
 
     for i in check_rows:
         y_ref, r_ref = fused_add_rms_norm_quant(
-            x_snap[i], r_snap[i], w, quant_scale, eps
+            x_snap[i], r_snap[i], w, quant_scale, torch.float8_e4m3fn, eps
         )
         torch.testing.assert_close(y[i : i + 1].float(), y_ref.float(), rtol=1, atol=1)
         torch.testing.assert_close(r[i : i + 1], r_ref, rtol=1e-3, atol=1e-3)

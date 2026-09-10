@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import csv
 import gzip
+import json
 from pathlib import Path
 
+import pytest
+
+from scripts.rebuild_test_duration_estimates import _prune_scope
+from scripts.test_sharding.models import CollectedNode, Plan, PlanningOptions
 from scripts.test_sharding.observations import (
     EstimateRefresh,
     ObservedCase,
@@ -118,3 +123,25 @@ def test_refresh_is_byte_reproducible_and_decreases_gradually(tmp_path: Path) ->
         ),
     )
     assert second_file.read_bytes() == first_bytes
+
+
+def test_prune_scope_resolves_test_path_from_repository_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = CollectedNode.from_nodeid("tests/test_sample.py::test_case", 0)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "selection": {"sanity_test": False},
+                "test_path": "tests",
+                "plan": Plan(
+                    options=PlanningOptions(), nodes=(node,), units=()
+                ).to_dict(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _prune_scope(manifest) == {node.nodeid}

@@ -15,7 +15,6 @@
 #include <cuda_fp16.h>
 #include <flashinfer/exception.h>
 #include <flashinfer/trtllm/common.h>
-#include <nvrtc.h>
 
 #include <algorithm>
 #include <array>

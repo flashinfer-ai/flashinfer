@@ -83,7 +83,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
     hidden_states, topk_ids, topk_weights = batch
     x, sf, idx_out, w_out = buffers
     if quant_type == "nvfp4":
-        from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.staging import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
 
@@ -98,7 +98,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
             norm_const=norm_const,
         )
     else:
-        from flashinfer.moe_ep.backends.mega.kernel.mxfp8_cutedsl.staging import (
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
 
@@ -180,7 +180,7 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     _require_blackwell()
     pytest.importorskip("deep_gemm")
 
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.staging import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.staging import (
         stage_mega_moe_inputs,
     )
 
@@ -210,7 +210,6 @@ def test_fused_stage_bit_matches_deep_gemm_torch_stage(monkeypatch):
     assert torch.equal(ref[3], got[3]), "topk_weights"
 
 
-@pytest.mark.arch_blackwell
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("quant_type", ["nvfp4", "mxfp8_e4m3"])
 def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
@@ -275,6 +274,7 @@ def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
     assert staged_tokens(idx_out) == 0
 
 
+@pytest.mark.arch_blackwell
 def test_fused_stage_tail_memo_shrinking_batches(monkeypatch):
     """Tail re-mask memo: shrink/grow sequences must keep [n:] masked."""
     import torch

@@ -14,10 +14,11 @@
 
 """Sweep frozen recurrent-KDA decode value splits through the public API.
 
-This B200-only harness forces every split1/2/4/8 specialization for the
-D128, H16, HV32 precomputed-gate T=1/2/4/5/6 contracts. T=1 uses the standard
-decode ABI; the other token counts use packed speculative decode. For every
-coordinate, it:
+This exact-SM100a/SM103a harness forces every split1/2/4/8 specialization for
+the D128, H16, HV32 precomputed-gate T=1/2/4/5/6 contracts. It additionally
+sweeps both direct-state T=1 schedules (split8 and split16), while retaining
+the four T=1 WY schedules. T=1 uses the standard decode ABI; the other token
+counts use packed speculative decode. For every coordinate, it:
 
 1. computes a reference with the explicit public ``backend="cute-dsl"`` path;
 2. checks the output and the complete mutated state from every forced frozen
@@ -57,6 +58,7 @@ NUM_VALUE_HEADS = 32
 TOKEN_COUNTS = (1, 2, 4, 5, 6)
 SEQUENCE_COUNTS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128)
 VALUE_SPLITS = (1, 2, 4, 8)
+SUPPORTED_FLASH_KDA_DECODE_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 VARIANT_PREFIXES = {
     1: "d128_t1_precomputed_split",
     2: "d128_t2_precomputed_split",
@@ -68,8 +70,28 @@ VARIANT_PREFIXES = {
 recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
 
 
-def _variant_name(num_tokens: int, value_split: int) -> str:
-    return f"{VARIANT_PREFIXES[num_tokens]}{value_split}"
+def _variant_specs_for_tokens(num_tokens: int) -> tuple[dict, ...]:
+    """Return every frozen schedule that should be swept for one token count."""
+
+    schedule_kind = "coefficient_gram" if num_tokens in (5, 6) else "wy"
+    specs = [
+        {
+            "schedule_kind": schedule_kind,
+            "value_split": value_split,
+            "variant": f"{VARIANT_PREFIXES[num_tokens]}{value_split}",
+        }
+        for value_split in VALUE_SPLITS
+    ]
+    if num_tokens == 1:
+        specs.extend(
+            {
+                "schedule_kind": "direct_state",
+                "value_split": value_split,
+                "variant": f"d128_t1_precomputed_direct_split{value_split}",
+            }
+            for value_split in (8, 16)
+        )
+    return tuple(specs)
 
 
 def _make_case(num_tokens: int, num_sequences: int, device: torch.device) -> dict:
@@ -469,9 +491,19 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        raise RuntimeError("this benchmark requires exact B200 / sm_100a")
+    compute_capability = torch.cuda.get_device_capability(device)
+    if compute_capability not in SUPPORTED_FLASH_KDA_DECODE_ARCHS:
+        raise RuntimeError(
+            "this benchmark requires exact CC 10.0 (SM100a; B200/GB200) "
+            "or CC 10.3 (SM103a; B300/GB300), got "
+            f"CC {compute_capability[0]}.{compute_capability[1]}"
+        )
     device_properties = torch.cuda.get_device_properties(device)
+    cuda_arch = SUPPORTED_FLASH_KDA_DECODE_ARCHS[compute_capability]
+    print(
+        f"Hardware: {device_properties.name} CC {compute_capability[0]}."
+        f"{compute_capability[1]} ({cuda_arch})"
+    )
 
     rows = []
     best_by_t_n = []
@@ -493,8 +525,9 @@ def main() -> None:
             )
 
             case_rows = []
-            for value_split in VALUE_SPLITS:
-                variant = _variant_name(num_tokens, value_split)
+            for variant_spec in _variant_specs_for_tokens(num_tokens):
+                value_split = variant_spec["value_split"]
+                variant = variant_spec["variant"]
                 correctness = _check_correctness(
                     case,
                     initial_state=initial_state,
@@ -520,6 +553,7 @@ def main() -> None:
                     "HV": case["HV"],
                     "api_mode": case["api_mode"],
                     "gate_mode": case["gate_mode"],
+                    "schedule_kind": variant_spec["schedule_kind"],
                     "value_split": value_split,
                     "variant": variant,
                     "correctness": correctness,
@@ -550,6 +584,7 @@ def main() -> None:
                 "HV": NUM_VALUE_HEADS,
                 "api_mode": case["api_mode"],
                 "gate_mode": case["gate_mode"],
+                "best_schedule_kind": best_row["schedule_kind"],
                 "best_value_split": best_row["value_split"],
                 "best_variant": best_row["variant"],
                 "cute_dsl_median_ms": best_row["cute_dsl"]["median_ms"],
@@ -568,8 +603,12 @@ def main() -> None:
         "source_root": str(args.expected_source_root.resolve()),
         "flashinfer_version": flashinfer.__version__,
         "device": device_properties.name,
-        "compute_capability": list(torch.cuda.get_device_capability(device)),
+        "compute_capability": list(compute_capability),
+        "cuda_arch": cuda_arch,
         "sm_count": device_properties.multi_processor_count,
+        "total_memory_bytes": device_properties.total_memory,
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
         "timing_backend": "CUPTI",
         "cupti_python_version": cupti_python_version,
         "matrix": {
@@ -579,6 +618,10 @@ def main() -> None:
             "H": NUM_HEADS,
             "HV": NUM_VALUE_HEADS,
             "value_splits": list(VALUE_SPLITS),
+            "variants_by_t": {
+                str(num_tokens): list(_variant_specs_for_tokens(num_tokens))
+                for num_tokens in TOKEN_COUNTS
+            },
             "gate_mode": "precomputed",
             "t1_api_mode": "standard_decode",
             "other_api_mode": "packed_spec_decode",

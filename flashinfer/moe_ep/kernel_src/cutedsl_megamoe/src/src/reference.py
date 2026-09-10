@@ -12,9 +12,10 @@ implemented in
 local experts in order, and within each expert the tokens are placed in the
 exact round-robin (min-peeling) order produced by the device-side scheduler.
 
-Token metadata 12-byte packing convention (matches ``TokenSrcMetadata`` in
+Token metadata 8-byte (i64 LE) packing convention (matches
+``TokenSrcMetadata.store`` in
 ``DeepGEMM/deep_gemm/include/deep_gemm/layout/mega_moe.cuh``):
-``[rank_idx: u32 LE][token_idx: u32 LE][topk_idx: u32 LE]``.
+low 32 bits = ``src_token``, high 32 bits = ``(src_rank << 16) | src_topk``.
 Padding entries are filled with ``0xFF`` per byte (sentinel).
 """
 

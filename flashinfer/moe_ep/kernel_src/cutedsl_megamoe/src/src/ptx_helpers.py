@@ -532,7 +532,7 @@ def _fence_rel_gpu(
     *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
 ) -> None:
     """
-    Fence operation with acquire-release semantics at system scope.
+    Fence operation with acquire-release semantics at device (gpu) scope.
 
     See the `PTX documentation <https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-membar>`__.
     """

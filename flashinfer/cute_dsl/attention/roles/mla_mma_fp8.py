@@ -137,8 +137,9 @@ class MLAMmaFP8Role:
     #  whether the first k-block overwrites (False) or accumulates (True).
     #  Subsequent k-blocks always accumulate.  The caller computes the
     #  flag from its own loop position; the helper never communicates
-    #  state back via TiledMma mutations (they would be invisible to the
-    #  caller due to SSA pass-by-value at the @cute.jit boundary).
+    #  state back via TiledMma mutations (mutations of caller-owned DSL
+    #  objects inside helpers are not loop-carried across run()'s dynamic
+    #  loops — see the helper-method rules in roles/loader_tma.py).
     #
     #  Inner k-block loops use ``cutlass.range_constexpr`` (compile-time
     #  unrolled) for maximum tcgen05 MMA dispatch throughput.  To prevent

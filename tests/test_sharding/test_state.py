@@ -51,7 +51,7 @@ def test_unit_elapsed_recovers_only_the_stale_claim_window(tmp_path: Path) -> No
 
 def _manifest(tmp_path: Path, source_git_sha: str | None) -> dict[str, Any]:
     test_path = tmp_path / "tests"
-    plan = Plan(options=PlanningOptions(profile="test"), nodes=(), units=())
+    plan = Plan(options=PlanningOptions(), nodes=(), units=())
     return build_manifest(
         ManifestBuild(
             repo_root=tmp_path,
@@ -86,7 +86,7 @@ def test_manifest_rejects_different_available_source_git_shas(
         source_git_sha="saved-sha",
         test_path=tmp_path / "tests",
         selection={"sanity_test": False},
-        planning_options=PlanningOptions(profile="test").to_dict(),
+        planning_options=PlanningOptions().to_dict(),
     )
 
     with pytest.raises(RunnerStateError, match="source_git_sha"):
@@ -95,7 +95,7 @@ def test_manifest_rejects_different_available_source_git_shas(
             source_git_sha="current-sha",
             test_path=tmp_path / "tests",
             selection={"sanity_test": False},
-            planning_options=PlanningOptions(profile="test").to_dict(),
+            planning_options=PlanningOptions().to_dict(),
         )
 
 
@@ -115,7 +115,7 @@ def test_manifest_assumes_source_matches_when_either_sha_is_unavailable(
         source_git_sha=current_sha,
         test_path=tmp_path / "tests",
         selection={"sanity_test": False},
-        planning_options=PlanningOptions(profile="test").to_dict(),
+        planning_options=PlanningOptions().to_dict(),
     )
 
 

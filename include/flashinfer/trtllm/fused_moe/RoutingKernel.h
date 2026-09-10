@@ -40,6 +40,19 @@ struct PackedScoreIdx {
 struct DataBase {
   bool mUsePdl{false};
 
+  // Opt-in: give each CTA of the cooperative routing kernel one contiguous
+  // range of expanded indices instead of a grid stride. Rows of an expert then
+  // arrive in a few narrow token windows, so a downstream grouped-GEMM tile
+  // gathers from a bounded slice of the activation tensor instead of the whole
+  // token range. Measured on B200 with a large-expert-count MoE: the distinct
+  // 2 MiB pages touched per GEMM1 tile drop by roughly 6x at 128K tokens,
+  // making GEMM1 1.33-1.42x faster and the fused-MoE pipeline 1.15-1.17x
+  // faster. The effect only appears once the gather working set
+  // outgrows the uTLB, so callers should enable it only for large batches; it
+  // is neutral-to-negative below ~64K tokens. Only the cooperative kernel
+  // honours this flag -- the block, cluster and multi-kernel paths ignore it.
+  bool mUseContiguousRouteWindows{false};
+
   // optional: only used as an intermediate buffer when the number of tokens is large.
   // dim: max([2*NumThreads] = [512], mNumExperts*2)
   int32_t* mPtrExpertCounts{nullptr};
@@ -115,6 +128,8 @@ struct DataBase {
   // Records the selected expert IDs per token for replay
   // NOTE: placed at end of struct to preserve field offsets for existing routing kernels
   int16_t* mPtrRoutingReplayOut{nullptr};
+  // optional: final token count for each expert, separate from histogram scratch
+  int32_t* mPtrNumTokensPerExpert{nullptr};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -157,11 +172,16 @@ struct KernelParamsBase {
 
   // NOTE: placed at end to preserve field offsets for existing routing kernels
   int16_t* mPtrRoutingReplayOut = nullptr;
+  // See DataBase::mUseContiguousRouteWindows. Appended for the same reason.
+  bool mUseContiguousRouteWindows = false;
+  // Optional final token count for each expert, separate from histogram scratch.
+  int32_t* mPtrNumTokensPerExpert = nullptr;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
   void setBaseParams(DataType const& data) {
     mUsePdl = data.mUsePdl;
+    mUseContiguousRouteWindows = data.mUseContiguousRouteWindows;
     mIsPow2 = data.mPaddingLog2 > 0;
     mPtrExpertCounts = data.mPtrExpertCounts;
     mPtrPermutedIdxSize = data.mPtrPermutedIdxSize;
@@ -175,6 +195,7 @@ struct KernelParamsBase {
     mPtrTopKIds = static_cast<int32_t*>(data.mPtrTopKIds);
     mPtrScores = (InputT const*)data.mPtrScores;
     mPtrRoutingReplayOut = data.mPtrRoutingReplayOut;
+    mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
 
     mNumTokens = data.mNumTokens;
     mNumExperts = data.mNumExperts;
@@ -191,6 +212,47 @@ struct KernelParamsBase {
     mTotalExpertsPerToken = data.mTotalExpertsPerToken;
   }
 };
+
+namespace routingPrecomputed {
+
+/// Maximum number of tile-specific metadata outputs fused into one routing launch.
+inline constexpr int32_t kMaxRoutingMetadataTiles = 8;
+
+/// Storage representation supplied to the fused precomputed-routing launch.
+enum class ExpertIdType : int32_t { Packed = 0, Int16 = 1, Int32 = 2 };
+
+/// Routing-method-neutral input for materializing permutation metadata from precomputed top-k.
+struct Data : public DataBase {
+  tg::Dtype mDtypeOutput{tg::Dtype::Bfloat16};
+  void const* mPtrPrecomputedExpertIds{nullptr};
+  ExpertIdType mExpertIdType{ExpertIdType::Packed};
+};
+
+/// Kernel parameters specialized only by routing-weight and bounded problem sizes.
+template <typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
+struct KernelParams : public KernelParamsBase<float, OutputT_, MaxNumExperts_, MaxNumTopExperts_> {
+  using OutputT = OutputT_;
+
+  PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
+  trtllm::dev::IntFastDiv mTopK;
+
+  /// Convert one framework-independent routing descriptor into device kernel parameters.
+  static KernelParams setKernelParams(Data const& data) {
+    KernelParams params;
+    params.setBaseParams(data);
+    params.mPtrTopKPacked = static_cast<PackedScoreIdx<OutputT>*>(data.mPtrTopKPacked);
+    params.mTopK = trtllm::dev::IntFastDiv(data.mTopK);
+    return params;
+  }
+};
+
+/// Return the largest token count accepted by the fused multi-tile cluster topology.
+int32_t maxTokensMultiTileCluster(int32_t numExperts);
+
+/// Materialize metadata for all tile descriptors with one CUDA kernel launch.
+void runMultiTileCluster(Data* data, int32_t numTiles, void* stream);
+
+}  // namespace routingPrecomputed
 
 namespace routingDeepSeek {
 
@@ -318,6 +380,7 @@ enum class RoutingPreprocessType {
 enum class RoutingPostprocessType {
   None,                // No postprocessing after topK
   Softmax,             // Apply softmax on top-K scores
+  Sigmoid,             // Apply sigmoid on top-K scores (selection ranks the raw logits)
   SumNormalize,        // Normalize top-K scores by their sum
   ScaledSumNormalize,  // Recover sigmoid scores, normalize by sum and scale (DeepSeek-style)
 };

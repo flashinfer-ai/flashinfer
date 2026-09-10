@@ -14,6 +14,10 @@ from scripts.test_sharding.scanner import (
 from scripts.test_sharding.summary import batch_xml_path
 
 
+def _planning(**values: int) -> PlanningOptions:
+    return PlanningOptions(default_source_overhead_seconds=0, **values)
+
+
 def test_scanner_reads_authoritative_batch_xml(
     tmp_path: Path,
 ) -> None:
@@ -27,11 +31,10 @@ def test_scanner_reads_authoritative_batch_xml(
     plan = build_plan(
         nodes,
         estimates,
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=10,
             target_unit_seconds=10,
-            unknown_case_seconds=5,
+            default_case_seconds=5,
             shard_count=1,
         ),
     )
@@ -62,7 +65,8 @@ def test_scanner_reads_authoritative_batch_xml(
     raw.write_text(
         f'<testsuites><testsuite name="{batch.id}" tests="2" failures="0" '
         f'errors="0" skipped="0" time="3"><properties><property name="batch_id" '
-        f'value="{batch.id}"/></properties>{testcases}</testsuite></testsuites>',
+        f'value="{batch.id}"/><property name="timing_profile" '
+        f'value="artifact-profile"/></properties>{testcases}</testsuite></testsuites>',
         encoding="utf-8",
     )
     raw.with_name(f"{batch.id}.meta.json").write_text(
@@ -83,8 +87,10 @@ def test_scanner_reads_authoritative_batch_xml(
 
     assert diagnostics == []
     assert [item.nodeid for item in observations] == [node.nodeid for node in nodes]
+    assert {item.profile for item in observations} == {"artifact-profile"}
     assert [item.seconds for item in observations] == [1, 2]
     assert len(overheads) == 1
+    assert overheads[0].profile == "artifact-profile"
     assert overheads[0].process_startup_seconds == 1
     assert overheads[0].source_warmup_seconds == 0.5
 
@@ -106,11 +112,10 @@ def test_scanner_recovers_cleaned_gitlab_artifacts(
     plan = build_plan(
         nodes,
         estimates,
-        PlanningOptions(
-            profile="planning-profile",
+        _planning(
             checkpoint_seconds=10,
             target_unit_seconds=10,
-            unknown_case_seconds=5,
+            default_case_seconds=5,
             shard_count=1,
         ),
     )
@@ -176,11 +181,10 @@ def test_scanner_omits_ambiguous_truncated_artifact_nodeids(
     plan = build_plan(
         nodes,
         EstimateBook(),
-        PlanningOptions(
-            profile="planning-profile",
+        _planning(
             checkpoint_seconds=10,
             target_unit_seconds=10,
-            unknown_case_seconds=5,
+            default_case_seconds=5,
             shard_count=1,
         ),
     )
@@ -228,11 +232,10 @@ def test_scanner_combines_nodeid_and_testcase_name_prefixes(
     plan = build_plan(
         nodes,
         EstimateBook(),
-        PlanningOptions(
-            profile="planning-profile",
+        _planning(
             checkpoint_seconds=10,
             target_unit_seconds=10,
-            unknown_case_seconds=5,
+            default_case_seconds=5,
             shard_count=1,
         ),
     )
@@ -275,11 +278,10 @@ def test_scanner_omits_prefix_resolution_collisions_across_batches(
     plan = build_plan(
         [node],
         EstimateBook(),
-        PlanningOptions(
-            profile="planning-profile",
+        _planning(
             checkpoint_seconds=10,
             target_unit_seconds=10,
-            unknown_case_seconds=5,
+            default_case_seconds=5,
             shard_count=1,
         ),
     )

@@ -22,8 +22,11 @@ Top-K Selection
   :toctree: ../generated
 
   top_k
+  top_k_varlen
   top_k_page_table_transform
   top_k_ragged_transform
+
+.. autofunction:: top_k
 
 Utility Functions
 -----------------

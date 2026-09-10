@@ -56,12 +56,28 @@ class SplitKernelBackend(ABC):
         self._transformed_weights = weights
         return weights
 
+    def pack_dispatch_payload(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Optionally transform the token payload before EP dispatch.
+
+        Default: identity (BF16 tokens on the wire). A backend that quantizes
+        activations may override this to send a packed quantized payload and
+        unpack it in :meth:`compute`. ``FleetParams`` keeps describing the
+        LOGICAL bf16 token; the packed row's byte width must not exceed
+        ``token_hidden_size * dtype_bytes`` (the transport's per-token byte
+        budget)."""
+        return x
+
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
 
 
 class MegaKernelBackend(ABC):
     """Fused kernel backend that owns comm + local MoE on the mega EP path."""
+
+    # Backends opt in to returning a workspace-backed output view by setting
+    # this capability during backend registration.  Keep the default false so
+    # existing backends retain the materializing output path.
+    supports_output_view: bool = False
 
     def __init__(self, config: object) -> None:
         self._config = config
@@ -228,16 +244,12 @@ class MegaKernelBackend(ABC):
         from .workspace_pool import release_workspace
 
         if release_workspace(workspace):
-            # The fused-stage memos key on topk_idx.data_ptr(); the symmetric
-            # heap reuses freed addresses, so evict before the buffer dies.
-            # sys.modules lookup (not an import): if the shim was never
-            # loaded, no memo exists and the heavy import must not happen.
-            import sys
-
-            quant_stage = sys.modules.get(
-                "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
-            )
-            topk_idx = getattr(workspace, "topk_idx", None)
-            if quant_stage is not None and topk_idx is not None:
-                quant_stage.forget_staged_tokens(topk_idx)
+            self._forget_workspace_state(workspace)
             workspace.destroy()
+
+    def _forget_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Backend hook: drop memoized state keyed on this workspace's buffers.
+
+        Called on the last release, just before ``workspace.destroy()`` frees
+        the buffers (whose addresses the symmetric heap may reuse). Default is
+        a no-op; backends with per-workspace memos override this."""

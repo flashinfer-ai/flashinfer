@@ -386,6 +386,45 @@ struct SumNormalizePostprocess {
   }
 };
 
+/// Sigmoid: applies sigmoid to the top-K scores selected from the raw logits.
+/// Paired with NoOpPreprocess this implements TopK -> Sigmoid, where expert
+/// selection ranks the raw logits and only the K survivors are passed through
+/// sigmoid.  Because sigmoid is strictly monotonic this selects the same
+/// experts as SigmoidPreprocess + TopK for all inputs except logits large
+/// enough that sigmoid saturates to exactly 1.0f (|x| above ~17), where
+/// selecting on the saturated scores would instead tie-break by expert index.
+struct SigmoidPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
+  template <typename OutputT>
+  struct Params {
+    void set(routingCustom::Data const& /*data*/) {}
+  };
+
+  template <typename DataType, int K, typename ParamsT>
+  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& /*warp*/,
+                                               DataType (&warpTopKScore)[K],
+                                               int32_t const (& /*warpTopKExpertIdx*/)[K],
+                                               int32_t laneIdx, int32_t topK,
+                                               ParamsT const& /*params*/) {
+    if (laneIdx < topK) {
+      warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoid_accurate(static_cast<float>(warpTopKScore[laneIdx])));
+    }
+  }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
+};
+
 /// ScaledSumNormalize: normalizes un-biased sigmoid scores by sum and applies
 /// routeScale. SigmoidBias selection uses sigmoid(raw) + bias as the top-K key,
 /// but final weights must use sigmoid(raw). Warp-per-token routing recomputes
@@ -840,6 +879,17 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess> {
                          >;
 };
 
+/// None + Sigmoid (TopKSigmoid: TopK -> Sigmoid).
+/// Mirrors the tiers of Sigmoid + SumNormalize, the policy pair it is the
+/// selection-order counterpart of.
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
+template <>
+struct PolicyTraits<NoOpPreprocess, SigmoidPostprocess> {
+  using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
+                         Tier<256, 8>   // Medium expert counts (≤256 experts)
+                         >;
+};
+
 /// None + None (TopK only: no softmax or renormalize).
 /// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
 template <>
@@ -1004,6 +1054,8 @@ inline void dispatchRoutingPolicy(Data const& data, Fn&& fn) {
     fn(SoftmaxPreprocess{}, SumNormalizePostprocess{}, "SoftmaxPreprocess+SumNormalizePostprocess");
   else if (data.mPostprocessType == RoutingPostprocessType::Softmax)
     fn(NoOpPreprocess{}, SoftmaxPostprocess{}, "NoOpPreprocess+SoftmaxPostprocess");
+  else if (data.mPostprocessType == RoutingPostprocessType::Sigmoid)
+    fn(NoOpPreprocess{}, SigmoidPostprocess{}, "NoOpPreprocess+SigmoidPostprocess");
   else
     fn(NoOpPreprocess{}, NoOpPostprocess{}, "NoOpPreprocess+NoOpPostprocess");
 }

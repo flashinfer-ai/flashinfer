@@ -1259,7 +1259,7 @@ class GatedDeltaNetChunkedKernel:
             while work.is_valid_tile:
                 batch_idx, head_idx, _ = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
-                seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
+                seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_pairs = 2
                 num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * num_pairs)
 
@@ -1326,7 +1326,7 @@ class GatedDeltaNetChunkedKernel:
             while work.is_valid_tile:
                 batch_idx, head_idx, _ = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
-                seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
+                seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                 if num_chunks_b > 0:
                     checkpoint_offset = 0
@@ -1454,7 +1454,7 @@ class GatedDeltaNetChunkedKernel:
             while work.is_valid_tile:
                 batch_idx, _, _ = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
-                seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
+                seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * 2)
                 for _pair_idx in cutlass.range(num_pairs_b):
                     (
@@ -1490,7 +1490,7 @@ class GatedDeltaNetChunkedKernel:
             while work.is_valid_tile:
                 batch_idx, _, _ = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
-                seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
+                seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
                 num_chunks = cute.ceil_div(seqlen_b, self.b_t * 2) * 2
 
                 run_cg1_mma = num_chunks > 0
@@ -1612,7 +1612,7 @@ class GatedDeltaNetChunkedKernel:
                 batch_idx, head_idx, _ = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
                 batch_end = cu_seqlens[batch_idx + 1]
-                seqlen_b = batch_end - batch_start
+                seqlen_b = cutlass.Int32(batch_end - batch_start)
                 num_pairs = 2
                 num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * num_pairs)
                 num_chunks_b = num_pairs_b * num_pairs
@@ -1729,7 +1729,7 @@ class GatedDeltaNetChunkedKernel:
                 batch_idx, head_idx, _ = work.tile_idx
                 batch_start = cu_seqlens[batch_idx]
                 batch_end = cu_seqlens[batch_idx + 1]
-                seqlen_b = batch_end - batch_start
+                seqlen_b = cutlass.Int32(batch_end - batch_start)
                 num_pairs = 2
                 num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * num_pairs)
                 num_chunks_b = num_pairs_b * num_pairs
@@ -2455,7 +2455,7 @@ class GatedDeltaNetChunkedKernel:
         while work.is_valid_tile:
             batch_idx, _, _ = work.tile_idx
             batch_start = cu_seqlens[batch_idx]
-            seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
+            seqlen_b = cutlass.Int32(cu_seqlens[batch_idx + 1] - batch_start)
             num_pairs_b = cute.ceil_div(seqlen_b, self.b_t * 2)
             num_chunks_padded = num_pairs_b * 2
             first_loop_chunk = 0
@@ -3978,7 +3978,7 @@ class GatedDeltaNetChunkedKernel:
         tGR_tCrState = cute.make_rmem_tensor_like(tRT_tCcState, self.state_dtype)
 
         if cutlass.const_expr(mS_indices is not None):
-            state_row = mS_indices[batch_idx]
+            state_row = cutlass.Int32(mS_indices[batch_idx])
         else:
             state_row = batch_idx
         gS_init = cute.flat_divide(
@@ -4031,7 +4031,7 @@ class GatedDeltaNetChunkedKernel:
         cg1_tidx = tidx % num_threads_cg1
         state_elements = self.mma_tiler_kv[0] * self.mma_tiler_kv[1]
         if cutlass.const_expr(mS_indices is not None):
-            state_row = mS_indices[batch_idx]
+            state_row = cutlass.Int32(mS_indices[batch_idx])
         else:
             state_row = batch_idx
         for linear_idx in cutlass.range(
@@ -4129,7 +4129,7 @@ class GatedDeltaNetChunkedKernel:
                         )
             if cutlass.const_expr(self.store_final_state):
                 if cutlass.const_expr(mS_indices is not None):
-                    state_row = mS_indices[batch_idx]
+                    state_row = cutlass.Int32(mS_indices[batch_idx])
                 else:
                     state_row = batch_idx
                 gS_out = cute.flat_divide(

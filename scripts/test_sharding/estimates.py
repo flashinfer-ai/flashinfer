@@ -81,11 +81,19 @@ class EstimateBook:
         self._exact = {
             (estimate.profile, estimate.nodeid): estimate for estimate in self.durations
         }
+        self._first_by_node: dict[str, DurationEstimate] = {}
+        for estimate in self.durations:
+            self._first_by_node.setdefault(estimate.nodeid, estimate)
         self._by_node: dict[str, list[DurationEstimate]] = defaultdict(list)
         self._overhead = {
             (estimate.profile, estimate.source_file): estimate
             for estimate in self.overheads
         }
+        self._first_overhead_by_source: dict[str, OverheadEstimate] = {}
+        for overhead_estimate in self.overheads:
+            self._first_overhead_by_source.setdefault(
+                overhead_estimate.source_file, overhead_estimate
+            )
         self._overhead_profiles = frozenset(
             estimate.profile for estimate in self.overheads
         )
@@ -129,37 +137,63 @@ class EstimateBook:
 
     @classmethod
     def from_files(
-        cls, duration_path: Path, overhead_path: Path | None = None
+        cls, duration_path: Path | None = None, overhead_path: Path | None = None
     ) -> "EstimateBook":
         durations: list[DurationEstimate] = []
-        if duration_path.exists():
+        if duration_path is not None and duration_path.exists():
             opener = gzip.open if duration_path.suffix == ".gz" else open
             with opener(duration_path, "rt", newline="", encoding="utf-8") as stream:
                 for row in csv.DictReader(stream):
                     durations.append(
                         DurationEstimate(
-                            profile=row["profile"],
+                            profile=row.get("profile", ""),
                             nodeid=row["nodeid"],
                             estimated_seconds=float(row["estimated_seconds"]),
-                            sample_count=int(row["sample_count"]),
+                            sample_count=int(row.get("sample_count") or 1),
                         )
                     )
         overheads: list[OverheadEstimate] = []
         if overhead_path is not None and overhead_path.exists():
-            with overhead_path.open(newline="", encoding="utf-8") as stream:
+            overhead_opener = gzip.open if overhead_path.suffix == ".gz" else open
+            with overhead_opener(
+                overhead_path, "rt", newline="", encoding="utf-8"
+            ) as stream:
                 for row in csv.DictReader(stream):
                     overheads.append(
                         OverheadEstimate(
-                            profile=row["profile"],
+                            profile=row.get("profile", ""),
                             source_file=row["source_file"],
                             process_startup_seconds=float(
                                 row["process_startup_seconds"]
                             ),
                             source_warmup_seconds=float(row["source_warmup_seconds"]),
-                            sample_count=int(row["sample_count"]),
+                            sample_count=int(row.get("sample_count") or 1),
                         )
                     )
         return cls(durations, overheads)
+
+    def lookup_runtime(
+        self, nodeid: str, default_case_seconds: float
+    ) -> DurationLookup:
+        """Use the first exact row, ignoring profile, or the configured default."""
+
+        exact = self._first_by_node.get(nodeid)
+        if exact is not None:
+            return DurationLookup(exact.estimated_seconds, "provided")
+        return DurationLookup(default_case_seconds, "default-case")
+
+    def overhead_ms_runtime(
+        self, source_file: str, default_source_overhead_seconds: float
+    ) -> int:
+        """Use the first exact source row, ignoring profile, or the default."""
+
+        exact = self._first_overhead_by_source.get(source_file)
+        seconds = (
+            exact.process_startup_seconds + exact.source_warmup_seconds
+            if exact is not None
+            else default_source_overhead_seconds
+        )
+        return max(0, round(seconds * 1000))
 
     def lookup(
         self,

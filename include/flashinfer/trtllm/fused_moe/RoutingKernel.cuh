@@ -260,10 +260,12 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
-          int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false>
+          int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
+          typename PrecomputedExpertId = int32_t>
 __device__ void routingPermutation(KernelParams params,
                                    PackedScoreIdx<BaseType>* smemPackedScoreIdx,
-                                   int32_t const warpIdx, uint32_t const clusterBlockRank) {
+                                   int32_t const warpIdx, uint32_t const clusterBlockRank,
+                                   PrecomputedExpertId const* precomputedExpertIds = nullptr) {
   using OutputT = typename KernelParams::OutputT;
   using TypePacked = PackedScoreIdx<BaseType>;
 
@@ -319,7 +321,10 @@ __device__ void routingPermutation(KernelParams params,
   auto loopBody = [&](int ii, int expandedIdx) {
     TypePacked scoreIdx;
     if constexpr (LoadExpertIdxFromGlobal) {
-      if (params.mPtrTopKIds != nullptr) {
+      if (precomputedExpertIds != nullptr) {
+        scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
+                              static_cast<int16_t>(precomputedExpertIds[expandedIdx])};
+      } else if (params.mPtrTopKIds != nullptr) {
         scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
                               static_cast<int16_t>(params.mPtrTopKIds[expandedIdx])};
       } else {
@@ -338,7 +343,8 @@ __device__ void routingPermutation(KernelParams params,
     auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
                          (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
-    if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr) {
+    if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr &&
+        precomputedExpertIds == nullptr) {
       params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
     }
   };
@@ -435,6 +441,11 @@ __device__ void routingPermutation(KernelParams params,
   for (int e = 0; e < ExpertsPerThread; e++) {
     int expert = threadIdx.x * ExpertsPerThread + e;
     if (expert < params.mNumExperts) {
+      // DA's fused multi-tile preamble reuses this routing pass as the authoritative per-expert
+      // count producer. Publish once per cluster because every cluster block sees the same count.
+      if (clusterBlockRank == 0 && params.mPtrNumTokensPerExpert != nullptr) {
+        params.mPtrNumTokensPerExpert[expert] = count[e];
+      }
       // Strided loop to share this work between blocks.
       for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
         const int32_t localExpertIdx =
@@ -991,6 +1002,39 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
   auto expandedIdxSize = params.mNumTokens * params.mTopK;
 
+  // Expanded-index assignment. The default grid stride spreads one CTA's
+  // indices over the whole batch; since an expert's rows are laid out in CTA
+  // arrival order, they end up drawn from everywhere and a downstream
+  // grouped-GEMM tile gathers across the entire activation tensor. With
+  // mUseContiguousRouteWindows each CTA owns one contiguous span instead, so a
+  // tile gathers from a few narrow token windows. See
+  // DataBase::mUseContiguousRouteWindows for the measured effect.
+  //
+  // The span is sized to keep every CTA busy rather than fixed at the
+  // per-thread maximum. The coop path is only selected when
+  // expandedIdxSize <= numBlocks * NumThreads * MaxExpandedIdxPerThread, so
+  // rounding the per-CTA share up to a NumThreads multiple stays within the
+  // per-thread budget and the grid still covers the batch.
+  int32_t const idxPerBlockRequested =
+      divUpMulTileN<int32_t>(divUpTileN<int32_t>(expandedIdxSize, numBlocks), NumThreads);
+  // Fall back to the grid stride if one CTA's contiguous span would not fit in
+  // its per-thread budget, which would silently drop routes.
+  bool const contiguousWindows = params.mUseContiguousRouteWindows &&
+                                 idxPerBlockRequested <= NumThreads * MaxExpandedIdxPerThread;
+  int32_t const idxPerBlock = contiguousWindows ? idxPerBlockRequested : 0;
+  auto expandedIdxAt = [&](int32_t ii) {
+    return contiguousWindows
+               ? gridBlockIdx * idxPerBlock + ii * NumThreads + static_cast<int32_t>(threadIdx.x)
+               : gridThreadIdx + ii * numThreadsPerGrid;
+  };
+  // Exclusive upper bound on the indices this CTA owns. A CTA's span is
+  // usually shorter than MaxExpandedIdxPerThread iterations, and the remaining
+  // iterations would otherwise land inside the *next* CTA's span -- still below
+  // expandedIdxSize, so the size check alone would not stop them and every
+  // route in the overlap would be counted and permuted more than once.
+  int32_t const idxEnd =
+      contiguousWindows ? min(expandedIdxSize, (gridBlockIdx + 1) * idxPerBlock) : expandedIdxSize;
+
   // pre-fill the counts with 0 — each thread represents one expert
   smemExpertCount[threadIdx.x] = 0;
   __syncthreads();
@@ -1023,21 +1067,24 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
 #pragma unroll
   for (int32_t ii0 = 0; ii0 < MaxExpandedIdxPerThread; ii0 += IterStride) {
-    bool const takeFastPath = (ii0 + IterStride) * numThreadsPerGrid <= expandedIdxSize;
+    // The unguarded fast path relies on the grid-stride bound; contiguous
+    // windows end at a CTA-dependent index, so they always take the guarded
+    // path. Both mappings are monotonic in ii, so the break stays correct.
+    bool const takeFastPath =
+        !contiguousWindows && (ii0 + IterStride) * numThreadsPerGrid <= expandedIdxSize;
     if (takeFastPath) {
 #pragma unroll
       for (int32_t jj = 0; jj < IterStride; jj++) {
         int const ii = ii0 + jj;
-        auto expandedIdx = static_cast<int32_t>(gridThreadIdx) + ii * numThreadsPerGrid;
-        loopBody(ii, expandedIdx);
+        loopBody(ii, expandedIdxAt(ii));
       }
     } else {
       bool doBreak = false;
 #pragma unroll
       for (int32_t jj = 0; jj < IterStride; jj++) {
         int const ii = ii0 + jj;
-        auto expandedIdx = static_cast<int32_t>(gridThreadIdx) + ii * numThreadsPerGrid;
-        if (expandedIdx >= expandedIdxSize) {
+        auto expandedIdx = expandedIdxAt(ii);
+        if (expandedIdx >= idxEnd) {
           doBreak = true;
           break;
         }
@@ -1069,6 +1116,12 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
 
   // Get total count for this expert.
   int32_t count = (threadIdx.x < params.mNumExperts) ? params.mPtrExpertCounts[threadIdx.x] : 0;
+  // DA needs the live per-expert histogram for selection and tile-specific body metadata. Reuse
+  // this routing pass's authoritative count so capture keeps one routing producer instead of
+  // adding a second histogram kernel; ordinary callers pass null and preserve their write set.
+  if (threadIdx.x < params.mNumExperts && params.mPtrNumTokensPerExpert != nullptr) {
+    params.mPtrNumTokensPerExpert[threadIdx.x] = count;
+  }
 
   int32_t numCta;
   if (params.mIsPow2) {
@@ -1127,8 +1180,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // each thread has the same "expanded indexes" assigned to it as above
 #pragma unroll
   for (int32_t ii = 0; ii < MaxExpandedIdxPerThread; ++ii) {
-    auto expandedIdx = static_cast<int32_t>(gridThreadIdx) + ii * numThreadsPerGrid;
-    if (expandedIdx >= expandedIdxSize) {
+    auto expandedIdx = expandedIdxAt(ii);
+    if (expandedIdx >= idxEnd) {
       break;
     }
     auto expertIdx = expertIndexes[ii];

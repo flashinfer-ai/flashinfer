@@ -26,14 +26,13 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
-void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
-                                   TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,
-                                   TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
-                                   TensorView kpe_cache, TensorView kv_indices, TensorView o,
-                                   Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                   int64_t num_heads, int64_t page_size, double sm_scale,
-                                   bool return_lse_base_on_e, double ckv_scale,
-                                   double kpe_scale ADDITIONAL_FUNC_PARAMS) {
+void BatchMLAPagedAttentionSM90Run(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe, TensorView ckv_cache,
+    TensorView kpe_cache, TensorView kv_indices, TensorView o, Optional<TensorView> maybe_lse,
+    int64_t mask_mode_code, int64_t num_heads, int64_t page_size, double sm_scale,
+    bool return_lse_base_on_e, double ckv_scale, double kpe_scale,
+    Optional<TensorView> maybe_ckv_scale_arr ADDITIONAL_FUNC_PARAMS) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
@@ -119,6 +118,10 @@ void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
         params.sm_scale = sm_scale;
         params.ckv_scale = static_cast<float>(ckv_scale);
         params.kpe_scale = static_cast<float>(kpe_scale);
+        params.ckv_scale_arr =
+            maybe_ckv_scale_arr.has_value()
+                ? static_cast<const float*>(maybe_ckv_scale_arr.value().data_ptr())
+                : nullptr;
 
         cudaError_t status =
             mla::BatchMLAPageAttentionHopper<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
