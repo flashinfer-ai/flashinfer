@@ -625,8 +625,8 @@
         "source_unit": "decode_uniform_fp8_qkv_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "17923e99f86181a47096b602f5ce008f6c0bb49e22f598bf30190b1daffa7ecd",
-        "vendored_sha256": "a7ba437f19fb10e234ca4284ec4785d961617114216fcb5f267d41809ff572df",
-        "binding_sha256": "b7f1ec927936fc5990d8a8638e92dfee4bde0dca764357a4db69cb5d54380006",
+        "vendored_sha256": "7210f586ee8ded8e8bd5662654346d36552b02d20041f0f3bc20ed49438cbbc2",
+        "binding_sha256": "01f354d8b97269e7d4c626f829c5ce7c518782d519b8715a39369794529f2834",
         "arg_plan_sha256": "706df10fe82c59904254a8c183386490f441067f2987881fd2cffdadc730560a",
         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1",
         "replacement_counts": {
@@ -1195,8 +1195,8 @@
         "source_unit": "decode_uniform_fp8_qkv_paged",
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "17923e99f86181a47096b602f5ce008f6c0bb49e22f598bf30190b1daffa7ecd",
-        "vendored_sha256": "a7ba437f19fb10e234ca4284ec4785d961617114216fcb5f267d41809ff572df",
-        "binding_sha256": "b7f1ec927936fc5990d8a8638e92dfee4bde0dca764357a4db69cb5d54380006",
+        "vendored_sha256": "7210f586ee8ded8e8bd5662654346d36552b02d20041f0f3bc20ed49438cbbc2",
+        "binding_sha256": "01f354d8b97269e7d4c626f829c5ce7c518782d519b8715a39369794529f2834",
         "arg_plan_sha256": "706df10fe82c59904254a8c183386490f441067f2987881fd2cffdadc730560a",
         "kernel_entry": "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1",
         "replacement_counts": {

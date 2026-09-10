@@ -1271,11 +1271,14 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
                 int query = work_idx_l / (unsigned int)num_kv_heads;
                 int kv_head = work_idx_l % (unsigned int)num_kv_heads;
                 int group_size = num_q_heads / num_kv_heads;
+                constexpr int kAttentionTopK = 16;
                 int task_kind_base;
                 if constexpr (kTaskKindTokenMajor) {
-                    task_kind_base = work_idx_l * 16;
+                    // Token-major storage is [query, kv_head, topk]. Since work_idx_l is
+                    // query * num_kv_heads + kv_head, it already linearizes the first two axes.
+                    task_kind_base = work_idx_l * kAttentionTopK;
                 } else {
-                    task_kind_base = (kv_head * total_q + query) * 16;
+                    task_kind_base = (kv_head * total_q + query) * kAttentionTopK;
                 }
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;

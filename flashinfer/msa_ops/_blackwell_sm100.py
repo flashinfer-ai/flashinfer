@@ -462,7 +462,12 @@ def _validate_attention_tensors(
             not q2k_indices.is_contiguous()
             and (
                 not allow_strided_q2k
-                or q2k_indices.stride() != (16, num_kv_heads * 16, 1)
+                or q2k_indices.stride()
+                != (
+                    _ATTENTION_TOPK,
+                    num_kv_heads * _ATTENTION_TOPK,
+                    1,
+                )
             )
         )
     ):
@@ -2396,7 +2401,7 @@ def blackwell_msa_sparse_decode_attention(
         v_global_scale=v_global_scale,
         allow_uniform_fp8=True,
     )
-    allow_packed_hnd_kv = (
+    uniform_fp8_paged_layouts_allowed = (
         page_table is not None
         and force_fused is True
         and causal
@@ -2411,8 +2416,8 @@ def blackwell_msa_sparse_decode_attention(
         k,
         v,
         q2k_indices,
-        allow_packed_hnd_kv=allow_packed_hnd_kv,
-        allow_strided_q2k=allow_packed_hnd_kv,
+        allow_packed_hnd_kv=uniform_fp8_paged_layouts_allowed,
+        allow_strided_q2k=uniform_fp8_paged_layouts_allowed,
     )
     if seqlen_q <= 0 or total_q % seqlen_q:
         raise ValueError("q rows must equal batch_size * positive seqlen_q")

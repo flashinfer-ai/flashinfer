@@ -100,6 +100,8 @@ inline bool IsPackedHndKvPair(const TensorView& k, const TensorView& v) {
 }
 
 inline void CheckContiguousOrPackedHndKvPair(const TensorView& k, const TensorView& v) {
+  // Separate contiguous K/V tensors do not share the backing-storage relationship required by
+  // IsPackedHndKvPair, so keep the two supported layouts as distinct alternatives.
   TVM_FFI_CHECK(
       (k.IsContiguous() && v.IsContiguous()) || IsPackedHndKvPair(k, v), ValueError)
       << "K/V must be contiguous or exact views split from a compact packed HND cache";
@@ -380,14 +382,17 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
       << "num_q_heads must be divisible by num_kv_heads";
   TVM_FFI_CHECK(arg_num_kv_heads >= 1, ValueError)
       << "num_kv_heads must be >= " << 1      << ", got " << arg_num_kv_heads;
+  constexpr int64_t kAttentionTopK = 16;
   TVM_FFI_CHECK(arg_task_kind.size(0) == arg_num_kv_heads &&
-                    arg_task_kind.size(1) == arg_total_q && arg_task_kind.size(2) >= 16,
+                    arg_task_kind.size(1) == arg_total_q &&
+                    arg_task_kind.size(2) == kAttentionTopK,
                 ValueError)
-      << "task_kind must have shape (num_kv_heads, total_q, at least 16)";
+      << "task_kind must have shape (num_kv_heads, total_q, " << kAttentionTopK << ")";
   const bool task_kind_head_major = arg_task_kind.IsContiguous();
   const bool task_kind_token_major =
-      arg_task_kind.stride(0) == 16 &&
-      arg_task_kind.stride(1) == arg_num_kv_heads * 16;
+      arg_task_kind.stride(0) == kAttentionTopK &&
+      arg_task_kind.stride(1) == arg_num_kv_heads * kAttentionTopK &&
+      arg_task_kind.stride(2) == 1;
   TVM_FFI_CHECK(task_kind_head_major || task_kind_token_major, ValueError)
       << "task_kind must be compact head-major or an exact compact token-major transpose";
 
