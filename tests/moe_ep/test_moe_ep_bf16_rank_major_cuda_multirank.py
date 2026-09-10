@@ -52,10 +52,10 @@ def problem():
     if platform.machine() != "x86_64" or torch.cuda.device_count() != _WORLD:
         pytest.skip("requires one x86_64 node with eight visible B200 GPUs")
     for device in range(_WORLD):
-        if (
-            torch.cuda.get_device_capability(device) != (10, 0)
-            or "B200" not in torch.cuda.get_device_name(device)
-        ):
+        if torch.cuda.get_device_capability(device) != (
+            10,
+            0,
+        ) or "B200" not in torch.cuda.get_device_name(device):
             pytest.skip("requires eight B200 GPUs (SM100)")
 
     rank = int(os.environ["RANK"])
@@ -144,9 +144,7 @@ def _inputs(rank: int, tokens: int, routing: str, seed: int) -> MoEEpTensors:
     )
     scores = (scores + 0.1) / _TOP_K
     scores[::3, 0] = 0.0
-    return MoEEpTensors(
-        hidden_states=hidden_states, topk_ids=ids, topk_weights=scores
-    )
+    return MoEEpTensors(hidden_states=hidden_states, topk_ids=ids, topk_weights=scores)
 
 
 def _gather(tensor: torch.Tensor) -> torch.Tensor:
