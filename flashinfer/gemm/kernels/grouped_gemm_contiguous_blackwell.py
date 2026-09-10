@@ -28,6 +28,7 @@
 
 """Persistent contiguous grouped FP8 GEMM for SM100-family GPUs."""
 
+import functools
 import math
 from typing import Callable, Optional, Tuple, Type, Union
 
@@ -44,8 +45,6 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
-
-from flashinfer.cute_dsl.utils import get_max_active_clusters
 
 
 @dsl_user_op
@@ -86,82 +85,13 @@ _DEEPK_SCALE_KG = 4
 _K128_EPI_N = 32
 
 
-"""
-High-performance persistent blockwise contiguous grouped dense GEMM (C = (SFA * A) * (SFB * B)) example for the NVIDIA Blackwell architecture
-using CUTE DSL.
-- Matrix A is MxKx1, A can be row-major("K"), ValidM is composed of valid m in different groups
-- Matrix B is NxKxL, B can be column-major("K"), L is grouped dimension
-- Matrix C is MxNx1, C can be row-major("N"), ValidM is composed of valid m in different groups
-- Each block will apply the scale factor SFA
-- Each row will apply the scale factor SFB
-- For each iteration, the kernel will compute C = A * B and then apply the scale factor C *= SFA * SFB
-
-Matrix A/C Memory Layout Diagrams:
-
-   ```
-    Group 0    Group 1   Group 2
-   -+---------+---------+---------+
-    |         |         |         |
-   K| ValidM0 | ValidM1 | ValidM2 |
-    |         |         |         |
-   -+---------+---------+---------+
-    |<-        ValidM           ->|
-   ```
-   Note: the Group(L) dimension will be flatted into M dimension, and the rest Group(L) size is 1.
-         Internal group boundaries are aligned to 128 rows; the final group may end in a partial tile.
-
-This GEMM kernel supports the following features:
-    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
-    - Utilizes Blackwell's tcgen05.mma for matrix multiply-accumulate (MMA) operations
-    - Implements TMA multicast with cluster to reduce L2 memory traffic
-    - Support persistent tile scheduling to better overlap memory load/store with mma between tiles
-    - Support warp specialization to avoid explicit pipelining between mainloop load and mma
-
-This GEMM works as follows:
-1. DMA warp: Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-2. SCALE warp: Load scaleA and scaleB matrices from global memory (GMEM) to shared memory (SMEM) using async copy operations.
-2. MMA warp: Perform matrix multiply-accumulate (MMA) operations using tcgen05.mma instruction.
-3. EPILOGUE warp:
-    - Load completed accumulator from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
-    - Apply the scale factor and update the final accumulator Final = C * SFA * SFB + Final
-    - Type convert Final matrix to output type.
-    - Store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations.
-
-SM100 tcgen05.mma instructions operate as follows:
-- Read matrix A from SMEM
-- Read matrix B from SMEM
-- Write accumulator to TMEM
-The accumulator in TMEM must then be loaded to registers before writing back to GMEM.
-
-.. code-block:: bash
-
-    python examples/cute/blackwell/kernel/blockwise_gemm/contiguous_grouped_gemm.py         \
-      --ab_dtype Float8E4M3FN --c_dtype BFloat16 --acc_dtype Float32            \
-      --scale_dtype Float32                                                     \
-      --mma_tiler_mn 128,128 --cluster_shape_mn 1,2                             \
-      --mnkl 256,4096,4096,16
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python examples/cute/blackwell/kernel/blockwise_gemm/contiguous_grouped_gemm.py     \
-      --ab_dtype Float8E4M3FN --c_dtype BFloat16 --acc_dtype Float32            \
-      --scale_dtype Float32                                                     \
-      --mma_tiler_mn 128,128 --cluster_shape_mn 1,2                             \
-      --mnkl 256,4096,4096,16
-
-
-Constraints are same as dense_gemm.py:
-* Supported input data types: fp8 (e4m3fn)
-  see detailed valid dtype combinations in below BlockwiseContiguousGroupedGemmKernel class documentation
-* A/B tensor must have the same data type
-* Mma tiler M must be 64/128/256
-* Mma tiler N must be 128, align with the scaleB requirement
-* Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-* Cluster shape M must be a multiple of 2 when two-CTA MMA is enabled
-* The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned
-"""
+# A and C concatenate expert rows along M; B stores one matrix per expert.
+# Each 128-row tile selects one expert. Internal expert boundaries must be
+# 128-aligned; only the final expert may end in a partial tile.
+# FP8 MMA accumulates in TMEM, then warp-specialized accumulator/epilogue
+# roles apply FP32 per-row A scales and 128x128 B scales before BF16 stores.
+# Public input validation lives in gemm_base.py. Configuration validation runs
+# before compilation in grouped_gemm_fp8_nt_groupwise_contiguous_sm100.
 
 
 class BlockwiseContiguousGroupedGemmKernel:
@@ -3297,6 +3227,14 @@ _FP8 = cutlass.Float8E4M3FN
 _COMPILED: dict[Tuple[Optional[int], int, int, int, int], Callable] = {}
 
 
+@functools.cache
+def _max_active_clusters(device_index: int, cluster_size: int) -> int:
+    """Cache occupancy metadata per device rather than defaulting to device 0."""
+    return utils.HardwareInfo(device_id=device_index).get_max_active_clusters(
+        cluster_size
+    )
+
+
 def _opt_level():
     try:
         from cutlass import CUDA_VERSION
@@ -3420,36 +3358,55 @@ def grouped_gemm_fp8_nt_groupwise_contiguous_sm100(
     out: torch.Tensor,
 ) -> None:
     """Run the contiguous grouped GEMM on the current PyTorch CUDA stream."""
-    m, k = a.shape
-    num_groups, n, _ = b.shape
+    with torch.cuda.device(a.device):
+        m, k = a.shape
+        num_groups, n, _ = b.shape
 
-    a_c = _t_fp8(a.unsqueeze(-1))
-    b_c = _t_fp8(b.permute(1, 2, 0))
-    c_c = _t(out.unsqueeze(-1))
-    sfa_c = _t(a_scale.unsqueeze(-1))
-    sfb_c = _t(b_scale.permute(1, 2, 0))
-    gidx_c = from_dlpack(m_indices).mark_layout_dynamic()
+        a_c = _t_fp8(a.unsqueeze(-1))
+        b_c = _t_fp8(b.permute(1, 2, 0))
+        c_c = _t(out.unsqueeze(-1))
+        sfa_c = _t(a_scale.unsqueeze(-1))
+        sfb_c = _t(b_scale.permute(1, 2, 0))
+        gidx_c = from_dlpack(m_indices).mark_layout_dynamic()
 
-    stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
 
-    key = (a.device.index, m, n, k, num_groups)
-    fn = _COMPILED.get(key)
-    if fn is None:
-        cfg = _pick_config(m, n, k, num_groups)
-        gemm = _build(m, n, k, num_groups, cfg)
-        mac = get_max_active_clusters(cfg[2][0] * cfg[2][1])
-        fn = cute.compile(
-            gemm,
-            a_c,
-            b_c,
-            c_c,
-            sfa_c,
-            sfb_c,
-            gidx_c,
-            mac,
-            stream,
-            options=f"--opt-level {_opt_level()}",
-        )
-        _COMPILED[key] = fn
+        key = (a.device.index, m, n, k, num_groups)
+        fn = _COMPILED.get(key)
+        if fn is None:
+            cfg = _pick_config(m, n, k, num_groups)
+            if not BlockwiseContiguousGroupedGemmKernel.can_implement(
+                _FP8,
+                cutlass.Float32,
+                cutlass.BFloat16,
+                cfg[0],
+                cfg[1],
+                cfg[2],
+                m,
+                n,
+                k,
+                num_groups,
+                "k",
+                "k",
+                "n",
+            ):
+                raise ValueError(
+                    "The selected contiguous grouped GEMM configuration is unsupported"
+                )
+            gemm = _build(m, n, k, num_groups, cfg)
+            mac = _max_active_clusters(a.device.index, cfg[2][0] * cfg[2][1])
+            fn = cute.compile(
+                gemm,
+                a_c,
+                b_c,
+                c_c,
+                sfa_c,
+                sfb_c,
+                gidx_c,
+                mac,
+                stream,
+                options=f"--opt-level {_opt_level()}",
+            )
+            _COMPILED[key] = fn
 
-    fn(a_c, b_c, c_c, sfa_c, sfb_c, gidx_c, stream)
+        fn(a_c, b_c, c_c, sfa_c, sfb_c, gidx_c, stream)

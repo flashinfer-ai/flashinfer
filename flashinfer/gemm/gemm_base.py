@@ -82,6 +82,7 @@ from ..utils import (
     is_sm12x_supported,
     LibraryError,
     backend_requirement,
+    BackendSupportedError,
     supported_compute_capability,
 )
 from ..jit.gemm import gen_gemm_sm90_module
@@ -8902,7 +8903,12 @@ def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["deepgemm", "cute_dsl"] = "deepgemm",
+    validate_indices: bool = False,
 ) -> bool:
+    if backend not in ("deepgemm", "cute_dsl"):
+        raise BackendSupportedError(
+            f"Unsupported backend {backend!r}; choose 'deepgemm' or 'cute_dsl'"
+        )
     from flashinfer.deep_gemm import (
         _check_group_deepgemm_fp8_nt_contiguous_problem_size,
     )
@@ -8932,9 +8938,11 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["deepgemm", "cute_dsl"] = "cute_dsl",
+    validate_indices: bool = False,
 ) -> bool:
+    """Check tensor metadata and optionally the synchronized routing contract."""
     if not CUTE_DSL_AVAILABLE:
-        raise RuntimeError("The cute_dsl backend requires nvidia-cutlass-dsl")
+        raise ValueError("The cute_dsl backend requires nvidia-cutlass-dsl")
     _check_cute_dsl_arch(a.device)
     if scale_granularity_mnk != (1, 128, 128):
         raise ValueError(
@@ -8944,8 +8952,8 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
 
     m, k = a.shape
     num_groups, n, _ = b.shape
-    if min(m, n, k, num_groups) <= 0:
-        raise ValueError("m, n, k, and the number of groups must be positive")
+    if min(n, k, num_groups) <= 0:
+        raise ValueError("n, k, and the number of groups must be positive")
     for dim_name, dim_value in (("n", n), ("k", k)):
         if dim_value % 128 != 0:
             raise ValueError(
@@ -8967,6 +8975,8 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
         raise ValueError("a_scale and b_scale must use torch.float32")
 
     tensors = [a, b, a_scale, b_scale, m_indices]
+    if m_indices.ndim != 1:
+        raise ValueError("m_indices must be one-dimensional")
     if out is not None:
         tensors.append(out)
     if any(tensor.device != a.device for tensor in tensors):
@@ -8975,6 +8985,35 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
         raise ValueError("All inputs and out must be contiguous")
     if any(tensor.data_ptr() % 16 != 0 for tensor in tensors):
         raise ValueError("All inputs and out must be at least 16-byte aligned")
+
+    if validate_indices and m:
+        with torch.cuda.device(a.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise ValueError(
+                    "validate_indices=True synchronizes with the CPU; validate "
+                    "routing before CUDA graph capture and use validate_indices=False "
+                    "during capture"
+                )
+            previous, following = m_indices[:-1], m_indices[1:]
+            rows = torch.arange(1, m, device=a.device)
+            checks = torch.stack(
+                [
+                    ((m_indices >= 0) & (m_indices < num_groups)).all(),
+                    (following >= previous).all(),
+                    ((following == previous) | (rows % 128 == 0)).all(),
+                ]
+            ).tolist()
+        for valid, message in zip(
+            checks,
+            (
+                "m_indices must satisfy 0 <= index < num_groups; -1 padding is unsupported",
+                "m_indices must be sorted in nondecreasing order",
+                "Internal expert boundaries in m_indices must be aligned to 128 rows",
+            ),
+            strict=True,
+        ):
+            if not valid:
+                raise ValueError(message)
 
     return True
 
@@ -8997,6 +9036,7 @@ def group_deepgemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,  # (m, n)
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["deepgemm", "cute_dsl"] = "deepgemm",
+    validate_indices: bool = False,
 ):
     r"""Perform contiguous grouped matrix multiplication with FP8 data types.
 
@@ -9057,6 +9097,13 @@ def group_deepgemm_fp8_nt_groupwise(
         backend; ``"cute_dsl"`` selects the SM100/SM103 persistent kernel optimized
         for 128x128 block scaling. Defaults to ``"deepgemm"``.
 
+    validate_indices : bool, optional
+        For ``"cute_dsl"``, validate expert-index range, sortedness and internal
+        boundary alignment. Defaults to ``False`` to avoid synchronizing the
+        GPU with the CPU on each call. Enable when checking new routing data,
+        outside CUDA graph capture. Ignored for ``"deepgemm"`` and when
+        ``skip_check=True``.
+
     Returns
     -------
     torch.Tensor
@@ -9105,15 +9152,26 @@ def group_deepgemm_fp8_nt_groupwise(
       with a partial 128-row tile
     - For ``cute_dsl``, expert rows must be sorted and every internal expert
       boundary must be aligned to 128 rows. The final non-empty expert may have
-      an unpadded row count
+      an unpadded row count. Every index must satisfy ``0 <= index < b.shape[0]``;
+      DeepGEMM's ``-1`` padding convention is not supported. These value-level
+      preconditions are unchecked unless ``validate_indices=True``. Violations
+      result in undefined behavior, including incorrect results or invalid memory
+      accesses
+    - Both backends return an empty output without launching a kernel when M is zero
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
+    if backend not in ("deepgemm", "cute_dsl"):
+        raise BackendSupportedError(
+            f"Unsupported backend {backend!r}; choose 'deepgemm' or 'cute_dsl'"
+        )
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
 
     if backend == "cute_dsl":
+        if a.shape[0] == 0:
+            return out
         from .kernels.grouped_gemm_contiguous_blackwell import (
             grouped_gemm_fp8_nt_groupwise_contiguous_sm100,
         )

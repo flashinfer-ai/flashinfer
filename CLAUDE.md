@@ -180,6 +180,13 @@ median_time, std_time = bench_gpu_time(
 
 → **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
 
+For contiguous grouped FP8 GEMM, `python benchmarks/bench_grouped_fp8.py
+--production-shapes` compares DeepGEMM and CuTe-DSL with preallocated outputs;
+`--cache-probe` measures first-call and new-token-count compilation separately.
+The CuTe-DSL API's optional `validate_indices=True` checks expert-index values
+and synchronizes with the CPU. Validate new routing data before CUDA graph
+capture; the default path assumes valid indices and performs metadata checks only.
+
 ## Code Linting
 
 Run all pre-commit hooks:

@@ -322,7 +322,7 @@ def test_fp8_groupwise_group_deepgemm(
 
 
 def _assert_fp8_groupwise_group_cute_dsl(
-    group_counts, n, k, use_non_default_stream=False
+    group_counts, n, k, use_non_default_stream=False, use_out=False
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability not in [(10, 0), (10, 3)]:
@@ -356,8 +356,10 @@ def _assert_fp8_groupwise_group_cute_dsl(
         ).to(torch.bfloat16)
         row_start = row_end
 
+    output = torch.empty_like(ref) if use_out else None
     if use_non_default_stream:
         stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
         stream_context = torch.cuda.stream(stream)
     else:
         stream = torch.cuda.current_stream()
@@ -370,16 +372,21 @@ def _assert_fp8_groupwise_group_cute_dsl(
             b_scale,
             m_indices,
             backend="cute_dsl",
+            out=output,
+            validate_indices=True,
         )
+        if use_out:
+            assert out is output
     stream.synchronize()
 
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.parametrize("n,k", [(256, 128), (256, 4096)])
-def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
+@pytest.mark.parametrize("use_out", [False, True])
+def test_fp8_groupwise_group_cute_dsl_current_stream(n, k, use_out):
     _assert_fp8_groupwise_group_cute_dsl(
-        [128, 256, 128, 256], n, k, use_non_default_stream=True
+        [128, 256, 128, 256], n, k, use_non_default_stream=True, use_out=use_out
     )
 
 
@@ -394,8 +401,236 @@ def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
         ([128, 128, 1, 0], 256, 1024),
     ],
 )
-def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k):
-    _assert_fp8_groupwise_group_cute_dsl(group_counts, n, k)
+@pytest.mark.parametrize("use_out", [False, True])
+def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k, use_out):
+    _assert_fp8_groupwise_group_cute_dsl(group_counts, n, k, use_out=use_out)
+
+
+def _grouped_cute_dsl_inputs(m=256, n=128, k=128, device="cuda"):
+    """Small inputs with two experts and unit scales for integration tests."""
+    if get_compute_capability(torch.device(device)) not in [(10, 0), (10, 3)]:
+        pytest.skip("Requires SM100 or SM103")
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available")
+    a = torch.randn(m, k, device=device).to(torch.float8_e4m3fn)
+    b = torch.randn(2, n, k, device=device).to(torch.float8_e4m3fn)
+    a_scale = torch.ones(m, k // 128, device=device)
+    b_scale = torch.ones(2, n // 128, k // 128, device=device)
+    indices = (torch.arange(m, device=device) >= 128).to(torch.int32)
+    return a, b, a_scale, b_scale, indices
+
+
+@pytest.mark.parametrize("backend", ["deepgemm", "cute_dsl"])
+@pytest.mark.parametrize("use_out", [False, True])
+def test_grouped_cute_dsl_empty(backend, use_out):
+    inputs = _grouped_cute_dsl_inputs(m=0)
+    supplied = torch.empty(0, 128, dtype=torch.bfloat16, device="cuda")
+    out = group_deepgemm_fp8_nt_groupwise(
+        *inputs,
+        backend=backend,
+        out=supplied if use_out else None,
+        validate_indices=True,
+    )
+    assert out.shape == (0, 128)
+    if use_out:
+        assert out is supplied
+
+
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("negative", "0 <= index"),
+        ("too_large", "0 <= index"),
+        ("unsorted", "sorted"),
+        ("mid_tile", "aligned to 128"),
+    ],
+)
+def test_grouped_cute_dsl_rejects_indices(case, match):
+    inputs = _grouped_cute_dsl_inputs()
+    indices = inputs[-1]
+    if case == "negative":
+        indices[0] = -1
+    elif case == "too_large":
+        indices[-1] = 2
+    elif case == "unsorted":
+        indices[:128], indices[128:] = 1, 0
+    else:
+        indices[64:] = 1
+    with pytest.raises(ValueError, match=match):
+        group_deepgemm_fp8_nt_groupwise(
+            *inputs, backend="cute_dsl", validate_indices=True
+        )
+
+
+@pytest.mark.parametrize(
+    "case,match",
+    [
+        ("n", "multiple of 128"),
+        ("k", "multiple of 128"),
+        ("scale_shape", "a_scale.shape"),
+        ("scale_dtype", "torch.float32"),
+        ("noncontiguous", "contiguous"),
+        ("alignment", "16-byte aligned"),
+        ("index_shape", "one-dimensional"),
+        ("device", "same CUDA device"),
+        ("output_dtype", "bfloat16"),
+        ("granularity", "scale_granularity_mnk"),
+    ],
+)
+def test_grouped_cute_dsl_rejects_metadata(case, match):
+    inputs = list(
+        _grouped_cute_dsl_inputs(
+            n=192 if case == "n" else 128, k=192 if case == "k" else 128
+        )
+    )
+    kwargs = {}
+    if case == "scale_shape":
+        inputs[2] = torch.ones(256, 2, device="cuda")
+    elif case == "scale_dtype":
+        inputs[2] = inputs[2].half()
+    elif case == "noncontiguous":
+        inputs[2] = torch.ones(256, 2, device="cuda")[:, :1]
+    elif case == "alignment":
+        inputs[2] = torch.ones(257, device="cuda")[1:].view(256, 1)
+    elif case == "index_shape":
+        inputs[4] = inputs[4].view(256, 1)
+    elif case == "device":
+        inputs[2] = inputs[2].cpu()
+    elif case == "output_dtype":
+        kwargs["out_dtype"] = torch.float16
+    elif case == "granularity":
+        kwargs["scale_granularity_mnk"] = (1, 64, 128)
+    with pytest.raises(ValueError, match=match):
+        group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl", **kwargs)
+
+
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("skip_check", [False, True])
+def test_grouped_cute_dsl_rejects_auto(monkeypatch, available, skip_check):
+    import flashinfer.gemm.gemm_base as gb
+    from flashinfer.utils import BackendSupportedError
+
+    inputs = _grouped_cute_dsl_inputs()
+    monkeypatch.setattr(gb, "CUTE_DSL_AVAILABLE", available)
+    with pytest.raises(BackendSupportedError, match="choose 'deepgemm' or 'cute_dsl'"):
+        group_deepgemm_fp8_nt_groupwise(*inputs, backend="auto", skip_check=skip_check)
+
+
+def test_grouped_cute_dsl_requires_package(monkeypatch):
+    import flashinfer.gemm.gemm_base as gb
+
+    inputs = _grouped_cute_dsl_inputs()
+    monkeypatch.setattr(gb, "CUTE_DSL_AVAILABLE", False)
+    with pytest.raises(ValueError, match="requires nvidia-cutlass-dsl"):
+        group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+
+
+def test_grouped_cute_dsl_requires_arch(monkeypatch):
+    import flashinfer.gemm.gemm_base as gb
+
+    inputs = _grouped_cute_dsl_inputs()
+    checked = []
+
+    def reject(device):
+        checked.append(device)
+        raise ValueError("installed DSL cannot compile this architecture")
+
+    monkeypatch.setattr(gb, "_check_cute_dsl_arch", reject)
+    with pytest.raises(ValueError, match="cannot compile this architecture"):
+        group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+    assert checked == [inputs[0].device]
+
+
+def test_grouped_cute_dsl_graph():
+    """Opt-in value checks run before capture; normal execution can be replayed."""
+    inputs = _grouped_cute_dsl_inputs()
+    out = torch.empty(256, 128, dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        group_deepgemm_fp8_nt_groupwise(
+            *inputs, out=out, backend="cute_dsl", validate_indices=True
+        )
+    stream.synchronize()
+    expected = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        with pytest.raises(
+            ValueError, match="validate routing before CUDA graph capture"
+        ):
+            group_deepgemm_fp8_nt_groupwise(
+                *inputs, out=out, backend="cute_dsl", validate_indices=True
+            )
+        group_deepgemm_fp8_nt_groupwise(*inputs, out=out, backend="cute_dsl")
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("k", [128, 4096])
+def test_grouped_cute_dsl_launch_stream(monkeypatch, k):
+    """Observe the actual DSL launch stream after warming compilation."""
+    import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
+
+    inputs = _grouped_cute_dsl_inputs(k=k)
+    group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+    torch.cuda.synchronize()
+    key = (inputs[0].device.index, 256, 128, k, 2)
+    compiled = mod._COMPILED[key]
+    launched = []
+
+    def record_launch(*args):
+        launched.append(int(args[-1]))
+        return compiled(*args)
+
+    monkeypatch.setitem(mod._COMPILED, key, record_launch)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        out = group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+    stream.synchronize()
+    assert launched == [stream.cuda_stream]
+    ref = torch.cat(
+        [
+            inputs[0][:128].float() @ inputs[1][0].float().T,
+            inputs[0][128:].float() @ inputs[1][1].float().T,
+        ]
+    ).bfloat16()
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
+def test_grouped_cute_dsl_noncurrent_device(monkeypatch):
+    """Compile and launch on the input device, preserving the caller's context."""
+    import flashinfer.gemm.kernels.grouped_gemm_contiguous_blackwell as mod
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA devices")
+    initial = torch.cuda.current_device()
+    target = (initial + 1) % torch.cuda.device_count()
+    inputs = _grouped_cute_dsl_inputs(m=257, device=f"cuda:{target}")
+    key = (target, 257, 128, 128, 2)
+    monkeypatch.delitem(mod._COMPILED, key, raising=False)
+    compiled_on = []
+    compile_fn = mod.cute.compile
+
+    def record_compile(*args, **kwargs):
+        compiled_on.append(torch.cuda.current_device())
+        return compile_fn(*args, **kwargs)
+
+    monkeypatch.setattr(mod.cute, "compile", record_compile)
+    out = group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+    torch.cuda.synchronize(target)
+    # HardwareInfo may compile an occupancy probe in addition to the GEMM.
+    assert compiled_on and set(compiled_on) == {target}
+    assert torch.cuda.current_device() == initial
+    ref = torch.cat(
+        [
+            inputs[0][:128].float() @ inputs[1][0].float().T,
+            inputs[0][128:].float() @ inputs[1][1].float().T,
+        ]
+    ).bfloat16()
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
