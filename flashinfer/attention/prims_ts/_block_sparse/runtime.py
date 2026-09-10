@@ -28,6 +28,7 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
+from ..sage import SageAttentionParams, sage_adapter_slots, validate_sage_params
 from .common import (
     _SIGNED_INT32_MAX,
     _num_sparse_pattern_heads,
@@ -98,6 +99,9 @@ class _BlockSparseRunArgs:
     exact_block_bits: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
+    # The Sage scale slots of the contiguous adapter in ABI order; a plan
+    # without Sage leaves every slot ``None``.
+    sage_slots: tuple[torch.Tensor | None, ...] = sage_adapter_slots({})
 
 
 def _validate_metadata_tensor(
@@ -214,14 +218,6 @@ def validate_block_sparse_metadata(
         raise ValueError("kv_valid_bits must be None when use_kv_valid_bits=False")
 
 
-def _reject_routing_inputs_in_dense_mode(**routing_inputs: object) -> None:
-    """Reject every sparse-only run input against a dense contiguous plan."""
-
-    _validate_dense_contiguous_plan_inputs(
-        (name, value, None) for name, value in routing_inputs.items()
-    )
-
-
 def _validate_bshd_tensor(
     tensor: torch.Tensor,
     name: str,
@@ -329,6 +325,7 @@ def validate_block_sparse_run(
     kv_valid_bits: torch.Tensor | None,
     sm_scale: float | None,
     out: torch.Tensor | None,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
     """Validate one run and allocate only an omitted output tensor.
 
@@ -337,7 +334,9 @@ def validate_block_sparse_run(
     normalized once into zero-copy HND cache views plus launch metadata. An
     explicit output is returned by identity and may not overlap any live launch
     input or plan-owned buffer. Storage overlap is a caller precondition and
-    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
+    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``. A
+    Sage plan takes the scale tensors of this run as ``sage``; a plan without
+    Sage rejects them.
     """
 
     use_proxy_routes = state.use_proxy_routes
@@ -345,13 +344,16 @@ def validate_block_sparse_run(
     if not state.use_block_sparse:
         # A dense plan owns the rejection of every routing input, summaries
         # included; the route checks below see block-sparse plans only.
-        _reject_routing_inputs_in_dense_mode(
-            block_indptr=block_indptr,
-            block_indices=block_indices,
-            exact_block_bits=exact_block_bits,
-            k_summary=k_summary,
-            v_summary=v_summary,
-            kv_valid_bits=kv_valid_bits,
+        _validate_dense_contiguous_plan_inputs(
+            (name, value, None)
+            for name, value in (
+                ("block_indptr", block_indptr),
+                ("block_indices", block_indices),
+                ("exact_block_bits", exact_block_bits),
+                ("k_summary", k_summary),
+                ("v_summary", v_summary),
+                ("kv_valid_bits", kv_valid_bits),
+            )
         )
     else:
         validate_block_sparse_metadata(
@@ -457,6 +459,25 @@ def validate_block_sparse_run(
     else:
         raise TypeError("kv_storage must be _ContiguousKVStorage or _PagedKVStorage")
 
+    if (sage is None) != (state.sage is None):
+        raise ValueError(
+            "sage=SageAttentionParams(...) is required by a Sage plan and "
+            "rejected by a plan without Sage attention"
+        )
+    if sage is not None:
+        assert state.sage is not None
+        validate_sage_params(
+            sage,
+            state.sage,
+            batch_size=state.batch_size,
+            seq_len_q=state.seq_len_q,
+            seq_len_kv=state.seq_len_kv,
+            num_qo_heads=state.num_qo_heads,
+            num_kv_heads=state.num_kv_heads,
+            head_dim=state.head_dim,
+            device=state.device,
+        )
+
     effective_scale = (
         1.0 / math.sqrt(state.head_dim)
         if sm_scale is None
@@ -486,6 +507,7 @@ def validate_block_sparse_run(
         kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
         paged_kv=paged_kv,
+        sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
 
 
@@ -502,6 +524,7 @@ def prepare_block_sparse_run_unchecked(
     kv_valid_bits: torch.Tensor | None,
     sm_scale: float | None,
     out: torch.Tensor | None,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
     """Canonicalize one trusted run without invoking explicit validators.
 
@@ -556,6 +579,7 @@ def prepare_block_sparse_run_unchecked(
         if sm_scale is None
         else float(sm_scale),
         paged_kv=paged_kv,
+        sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
 
 
@@ -581,6 +605,9 @@ def record_block_sparse_run_args(
     if run_args.kv_valid_bits_is_live:
         assert run_args.kv_valid_bits is not None
         run_args.kv_valid_bits.record_stream(stream)
+    for tensor in run_args.sage_slots:
+        if tensor is not None:
+            tensor.record_stream(stream)
     if run_args.paged_kv is not None:
         run_args.paged_kv.block_tables.record_stream(stream)
         run_args.paged_kv.seq_lens_kv.record_stream(stream)
@@ -634,6 +661,7 @@ def launch_block_sparse(
             state.row_route_offsets,
             state.route_workspace,
             0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
+            *run_args.sage_slots,
             run_args.sm_scale,
         )
     return run_args.out

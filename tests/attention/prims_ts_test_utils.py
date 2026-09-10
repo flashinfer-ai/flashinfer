@@ -26,6 +26,12 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
+from flashinfer.attention.prims_ts.sage import (
+    SageAttentionConfig,
+    SageAttentionParams,
+    sage_scale_shapes,
+)
+
 if TYPE_CHECKING:
     from flashinfer.attention.prims_ts._block_sparse.config import (
         _BlockSparseCompileKey,
@@ -35,10 +41,12 @@ HEAD_DIM = 128
 FP8 = torch.float8_e4m3fn
 Patterns = tuple[tuple[tuple[tuple[int, ...], ...], ...], ...]
 
+# The block-sparse and Sage kernels run on SM100 and SM103; the dense decode
+# tests keep their stricter SM100-only signoff marker.
 REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="PrimTS block-sparse attention requires SM100 or SM103",
+    reason="PrimTS block-sparse and Sage attention require SM100 or SM103",
 )
 
 
@@ -56,6 +64,130 @@ def dense_stream_columns(kv_tile_size: int, device: torch.device) -> list[torch.
             torch.cat((tile_columns[64:128], tile_columns[192:256])),
         ]
     return [tile_columns]
+
+
+def fold_stream(state, new_max, tile_sum, tile_acc):
+    """Fold one tile into an online-softmax stream ``(max, sum, acc)``.
+
+    ``new_max`` is the stream's maximum after the tile; ``None`` starts the
+    stream.
+    """
+
+    if state is None:
+        return new_max, tile_sum, tile_acc
+    correction = torch.exp(state[0] - new_max)
+    return (
+        new_max,
+        state[1] * correction + tile_sum,
+        state[2] * correction.unsqueeze(-1) + tile_acc,
+    )
+
+
+def merge_streams(streams) -> torch.Tensor:
+    """Return the normalized output of the live online-softmax streams."""
+
+    live = [state for state in streams if state is not None]
+    final_max = torch.stack([state[0] for state in live]).amax(dim=0)
+    final_sum = torch.zeros_like(final_max)
+    final_acc = torch.zeros_like(live[0][2])
+    for maximum, total, acc in live:
+        correction = torch.exp(maximum - final_max)
+        final_sum += total * correction
+        final_acc += acc * correction.unsqueeze(-1)
+    return final_acc / final_sum.unsqueeze(-1)
+
+
+def make_sage_decode_config(
+    *,
+    tile_size_q: int,
+    tile_size_kv: int,
+    qkv_dtype=None,
+    o_dtype=None,
+    sage_args: dict[str, object] | None = None,
+    mask_type: str = "dense",
+    qkv_layout: str = "contiguousKv",
+    num_tokens_per_page: int = 32,
+    split_kv_mode: str = "disabled",
+    splits_kv: int = 1,
+):
+    """Build a dense contiguous Sage profile the way the dense wrapper does.
+
+    ``qkv_dtype`` defaults to E4M3 and ``o_dtype`` to BF16; ``sage_args``
+    override or extend the profile arguments.
+    """
+
+    from cutlass import BFloat16, Float8E4M3FN
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        make_decode_config,
+    )
+
+    args: dict[str, object] = {
+        "use_keeps_mma_ab": True,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": tile_size_kv,
+        "groups_tokens_heads_q": True,
+        "sage_k_block_size": 16,
+        "sage_q_block_size": 1,
+    }
+    if sage_args is not None:
+        args.update(sage_args)
+    heads_q_per_kv = 1 if tile_size_q == 64 else 8
+    return make_decode_config(
+        headdim=HEAD_DIM,
+        args=args,
+        seq_len_q=64 if tile_size_q == 64 else 16,
+        seq_len_kv=1000,
+        batch_size=2,
+        num_heads_q=8,
+        num_heads_kv=8 // heads_q_per_kv,
+        qkv_dtype=Float8E4M3FN if qkv_dtype is None else qkv_dtype,
+        o_dtype=BFloat16 if o_dtype is None else o_dtype,
+        qkv_layout=qkv_layout,
+        num_tokens_per_page=num_tokens_per_page,
+        split_kv_mode=split_kv_mode,
+        splits_kv=splits_kv,
+        mask_type=mask_type,
+        auto_tuner=False,
+    )
+
+
+def make_sage_params(
+    *,
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int = HEAD_DIM,
+    q_block_size: int = 1,
+    k_block_size: int = 16,
+    with_mean: bool = False,
+    device: torch.device | str = "cpu",
+) -> SageAttentionParams:
+    """Return random positive scales of one geometry and recipe in the flat layout."""
+
+    shapes = sage_scale_shapes(
+        SageAttentionConfig(
+            q_block_size=q_block_size, k_block_size=k_block_size, v_mean=with_mean
+        ),
+        batch_size=batch_size,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
+
+    def positive(name: str) -> torch.Tensor:
+        return torch.rand(shapes[name], device=device)
+
+    return SageAttentionParams(
+        q_scale=positive("q_scale"),
+        k_scale=positive("k_scale"),
+        v_scale=positive("v_scale"),
+        v_mean=torch.randn(shapes["v_mean"], device=device) if with_mean else None,
+    )
 
 
 def widest_bsr_row(patterns: Patterns) -> int:
@@ -153,7 +285,7 @@ def make_block_sparse_compile_key(**overrides: object) -> _BlockSparseCompileKey
 
     The defaults describe a dense-masked BSR plan without token mask, proxy
     routes or parallel sparse loads; ``overrides`` replace any field of the
-    key.
+    key. The output dtype key follows ``dtype_key`` unless overridden.
     """
 
     from flashinfer.attention.prims_ts._block_sparse.config import (
@@ -178,6 +310,7 @@ def make_block_sparse_compile_key(**overrides: object) -> _BlockSparseCompileKey
         "use_parallel_sparse_kv_loads": False,
     }
     fields.update(overrides)
+    fields.setdefault("out_dtype_key", fields["dtype_key"])
     return _BlockSparseCompileKey(**fields)
 
 
@@ -200,3 +333,14 @@ def assert_decode_smem_within_capacity(cfg, smem_allocator) -> None:
     )
     launch_smem_bytes = _align_up(unified_smem_bytes, cfg.stensor_align)
     assert launch_smem_bytes <= cutlass_utils.get_smem_capacity_in_bytes("sm_100")
+
+
+def heavy_tailed(
+    shape: tuple[int, ...], *, device: torch.device, magnitude: float = 1.0
+) -> torch.Tensor:
+    """Return BF16 normal values with log-uniform per-element spread."""
+
+    x = torch.randn(shape, device=device) * magnitude
+    return (x * torch.exp((torch.rand(shape, device=device) - 0.5) * 3.2)).to(
+        torch.bfloat16
+    )

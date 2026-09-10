@@ -81,8 +81,10 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
+from .sage_scales import SageKScales
 from .smem_block_sparse_metadata import _route_is_proxy
 from .tmem_s import TmemSResource
+
 
 # Tunable: number of score pairs per streamed fragment whose exponentials run
 # as FMA polynomials instead of MUFU. The MUFU issue rate bounds the fragment
@@ -142,6 +144,9 @@ class SmemPResource(DecodeGenResourceBase):
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
+    # Where the tile's ``sfK`` words live during the softmax passes; shared
+    # with the S resource and the route metadata consumer of the same instance.
+    sage_k_scales: Constexpr[SageKScales | None] = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
@@ -381,6 +386,28 @@ class SmemPResource(DecodeGenResourceBase):
 
     @producer_work
     @cute.jit
+    def compute_sage_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        sage_q_scale: Float32,
+        sage_scale_arr: cutlass.Array,
+    ) -> None:
+        """Stream every K32 fragment with per-group Sage dequantization scales."""
+        assert self.cfg.use_sage_attention
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=cutlass.Boolean(False),
+            route_origin0=Int32(0),
+            route_origin1=Int32(0),
+            sage_q_scale=sage_q_scale,
+            sage_scale_arr=sage_scale_arr,
+        )
+
+    @producer_work
+    @cute.jit
     def compute_proxy_route_p_fragments(
         self,
         stage_info: StageInfo,
@@ -409,6 +436,8 @@ class SmemPResource(DecodeGenResourceBase):
         route_is_proxy: cutlass.Boolean,
         route_origin0: Int32,
         route_origin1: Int32,
+        sage_q_scale: Float32 | None = None,
+        sage_scale_arr: cutlass.Array | None = None,
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
@@ -419,8 +448,11 @@ class SmemPResource(DecodeGenResourceBase):
         fragment and both softmax instances and leave the softmax warps
         instruction-fetch bound. The max pass has already written masked
         scores back to TMEM, so the reload needs no mask logic of its own.
+        Sage attention only changes the exponent multipliers, ``c * sfQ *
+        sfK_g`` per scale group, which the ``sage_k_scales`` strategy hands
+        over one fragment at a time; the addend already uses the dequantized
+        maximum.
         """
-        _ = stage_info
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
         assert self._tmem_alloc.offset == self.tmem_s_ref._alloc.offset
@@ -434,9 +466,23 @@ class SmemPResource(DecodeGenResourceBase):
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
 
+        # ``c * sfQ`` is one factor per lane and tile; the strategy applies it
+        # to the raw ``sfK`` words where that is cheapest for its storage.
+        exp_scale = None
+        scales_view = None
+        if cutlass.const_expr(cfg.use_sage_attention):
+            exp_scale = self.scale_softmax_log2 * sage_q_scale
+            scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, exp_scale)
+
         total_sum = Float32(0.0)
         for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
             fragment = Int32(fragment_idx)
+            fragment_multipliers = None
+            if cutlass.const_expr(cfg.use_sage_attention):
+                fragment_multipliers = self.sage_k_scales.fragment(
+                    scales_view, fragment, exp_scale
+                )
+                self.sage_k_scales.advance(scales_view)
             loaded = _keeps_tcgen05_ld(
                 cfg,
                 prims.make_tmem_ptr(
@@ -452,7 +498,12 @@ class SmemPResource(DecodeGenResourceBase):
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = loaded[score_idx]
 
-            local_sum = self._exponentiate_fragment_pairs(s_arr, exponent_addend)
+            group_multipliers = self._fragment_exponent_multipliers(
+                fragment_multipliers
+            )
+            local_sum = self._exponentiate_fragment_pairs(
+                s_arr, exponent_addend, group_multipliers
+            )
             if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                 if route_is_proxy:
                     local_sum = self._proxy_fragment_sum(
@@ -518,24 +569,53 @@ class SmemPResource(DecodeGenResourceBase):
         )
 
     @cute.jit
+    def _fragment_exponent_multipliers(
+        self, fragment_multipliers: cutlass.Array | None
+    ) -> cutlass.Array:
+        """Return one fragment's exponent multipliers, one per scale group.
+
+        Sage attention takes the fragment's ``c * sfQ * sfK_g`` multipliers
+        from the scale strategy (``fragment_multipliers``); without Sage the
+        single group holds the softmax scale.
+        """
+        cfg = self.cfg
+        groups = cfg.sage_k_groups_per_fragment
+        group_multipliers = cutlass.Array(
+            Float32, groups, space=cutlass.AddressSpace.rmem
+        )
+        if cutlass.const_expr(cfg.use_sage_attention):
+            for group_idx in cutlass.range_constexpr(groups):
+                group_multipliers[group_idx] = Float32(fragment_multipliers[group_idx])
+        else:
+            group_multipliers[0] = self.scale_softmax_log2
+        return group_multipliers
+
+    @cute.jit
     def _exponentiate_fragment_pairs(
-        self, s_arr: cutlass.Array, exponent_addend: Float32
+        self,
+        s_arr: cutlass.Array,
+        exponent_addend: Float32,
+        group_multipliers: cutlass.Array,
     ) -> Float32:
         """Turn one fragment of scaled scores into probabilities in place.
 
         Returns the fragment's probability sum. Eight independent chains keep
         the denominator update off one long dependency chain, and a configurable
-        subset of pairs runs its exponentials on the FMA pipe.
+        subset of pairs runs its exponentials on the FMA pipe. Each score pair
+        uses the exponent multiplier of its compile-time scale group; without
+        Sage attention there is one group holding the softmax scale.
         """
         pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
+        pairs_per_group = pairs_per_fragment // self.cfg.sage_k_groups_per_fragment
         sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
         for chain_idx in cutlass.range_constexpr(8):
             sum_chains[chain_idx] = Float32(0.0)
         for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
+            multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
             p0, p1 = cute.arch.fma_packed_f32x2(
                 (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-                (self.scale_softmax_log2, self.scale_softmax_log2),
+                (multiplier, multiplier),
                 (exponent_addend, exponent_addend),
             )
             if cutlass.const_expr(
