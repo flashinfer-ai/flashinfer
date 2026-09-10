@@ -385,6 +385,10 @@ template <class EpilogueParams, class Problem>
 __device__ __forceinline__ void build_prebuilt_d_tma_descriptor(
     Problem const& problem, int group, cute::TmaDescriptor* smem_tma_desc,
     EpilogueParams const& epilogue_params, cute::TmaDescriptor* prebuilt_tma_desc_D) {
+  if (cute::get<1>(problem) == 0) {
+    return;
+  }
+
   cute::TmaDescriptor& smem_desc = smem_tma_desc[kPrebuiltTmaDescriptorSlotD];
   if (threadIdx.x == kPrebuiltTmaDescriptorWarpD * 32) {
     constexpr int MaxTensorRank = 5;
@@ -393,12 +397,8 @@ __device__ __forceinline__ void build_prebuilt_d_tma_descriptor(
     using ElementD = std::remove_cv_t<
         std::remove_pointer_t<std::remove_reference_t<decltype(epilogue_params.ptr_D[group])>>>;
     ElementD const* ptr_D = nullptr;
-    // The device problem has already been SwapAB-transformed to
-    // (output_channels, routed_tokens, K). TMA extents cannot be zero, but a
-    // zero-token expert has no work tiles and therefore never stores.
     uint32_t const M = static_cast<uint32_t>(cute::get<0>(problem));
-    uint32_t const logical_N = static_cast<uint32_t>(cute::get<1>(problem));
-    uint32_t const N = logical_N == 0 ? 1 : logical_N;
+    uint32_t const N = static_cast<uint32_t>(cute::get<1>(problem));
     Tensor tensor_d =
         make_tensor(ptr_D, make_layout(make_shape(M, N, uint32_t(1)), epilogue_params.dD[group]));
 
