@@ -85,12 +85,6 @@ _FULL_DOMAIN_SHAPES = tuple(
 )
 _FULL_DOMAIN_SCHEMA = "cake-fused-kda-full-domain-benchmark-v2"
 _FULL_DOMAIN_ROW_SCHEMA = "cake-fused-kda-full-domain-row-v2"
-_FULL_DOMAIN_INHERITANCE_SCHEMA = "cake-fused-kda-full-domain-inheritance-v2"
-_EQUIVALENCE_SCHEMA = "cake-fused-kda-decode-equivalence-v1"
-_EQUIVALENCE_VERIFIER = "tools/verify_cake_fused_kda_decode_equivalence.py"
-_LEGACY_FULL_DOMAIN_SCHEMA = "fused-kda-generated-full-domain-benchmark-v1"
-_LEGACY_FULL_DOMAIN_ROW_SCHEMA = "fused-kda-generated-full-domain-row-v1"
-_MEASURED_PREDECESSOR_COMMIT = "00a9d35a9d2ec1870a2068d9f970a7c15a9fa92a"
 _EXACT_PR_BASELINE_COMMIT = "fad4af96fac0714feb197044a7226d382cb58a31"
 _EXACT_PR_MERGE_COMMIT = "180f0d660aa05892fdaf77d2e4333dc1bb29d3ae"
 _EXACT_PR_BASELINE_SOURCE_SHA256 = (
@@ -202,7 +196,7 @@ def _require_gpu_and_cupti(*, allow_b300=False):
 
 
 def _require_b200_and_cupti():
-    # Full-domain timing and historical inheritance remain B200-only.
+    # Full-domain timing remains B200-only.
     cupti_version, _ = _require_gpu_and_cupti()
     return cupti_version
 
@@ -1001,7 +995,7 @@ def _run_full_domain_cell(
     return measurement, correctness_snapshot, correctness
 
 
-def _validate_full_domain_row(row, index, repeat_iters, *, legacy=False):
+def _validate_full_domain_row(row, index, repeat_iters):
     if not isinstance(row, dict) or set(row) != {
         "shape",
         "num_heads",
@@ -1053,14 +1047,9 @@ def _validate_full_domain_row(row, index, repeat_iters, *, legacy=False):
         if type(cell["route_call_count"]) is not int:
             raise RuntimeError(f"{shape} route count is invalid")
         if expected_backend == "baseline":
-            route_count_is_valid = (
-                cell["route_call_count"] >= 1
-                if legacy
-                else cell["route_call_count"] == 0
-            )
             if (
                 cell["variant_name"] is not None
-                or not route_count_is_valid
+                or cell["route_call_count"] != 0
                 or cell["fallback_call_count"] < 1
             ):
                 raise RuntimeError(f"{shape} baseline route proof is invalid")
@@ -1076,13 +1065,10 @@ def _validate_full_domain_row(row, index, repeat_iters, *, legacy=False):
     if len(candidate_variants) != 1:
         raise RuntimeError(f"{shape} candidate cells selected different variants")
     correctness = row["correctness"]
-    expected_candidate = (
-        "public generated dispatcher" if legacy else "public Cake dispatcher"
-    )
     if (
         not isinstance(correctness, dict)
         or correctness.get("checked") is not True
-        or correctness.get("candidate") != expected_candidate
+        or correctness.get("candidate") != "public Cake dispatcher"
         or correctness.get("reference") != "exact PR fallback"
         or any(
             correctness.get(name, {}).get("passed") is not True
@@ -1123,13 +1109,7 @@ def _full_domain_row_path(rows_root, index):
     return rows_root / f"row-{index:04d}.json"
 
 
-def _load_full_domain_rows(
-    rows_root,
-    identity_sha256,
-    repeat_iters,
-    *,
-    inherited_identity_sha256_by_row=None,
-):
+def _load_full_domain_rows(rows_root, identity_sha256, repeat_iters):
     if not rows_root.is_dir():
         return [], []
     row_files = sorted(rows_root.glob("row-*.json"))
@@ -1160,23 +1140,9 @@ def _load_full_domain_rows(
             "row",
         }:
             raise RuntimeError(f"full-domain receipt {path.name} schema is invalid")
-        if inherited_identity_sha256_by_row is not None and index < len(
-            inherited_identity_sha256_by_row
-        ):
-            expected_identity_sha256 = inherited_identity_sha256_by_row[index]
-        else:
-            expected_identity_sha256 = identity_sha256
-        inherited = inherited_identity_sha256_by_row is not None and index < len(
-            inherited_identity_sha256_by_row
-        )
-        valid_schemas = (
-            {_FULL_DOMAIN_ROW_SCHEMA, _LEGACY_FULL_DOMAIN_ROW_SCHEMA}
-            if inherited
-            else {_FULL_DOMAIN_ROW_SCHEMA}
-        )
         if (
-            receipt["schema"] not in valid_schemas
-            or receipt["identity_sha256"] != expected_identity_sha256
+            receipt["schema"] != _FULL_DOMAIN_ROW_SCHEMA
+            or receipt["identity_sha256"] != identity_sha256
             or receipt["shape_index"] != index
         ):
             raise RuntimeError(f"full-domain receipt {path.name} identity is invalid")
@@ -1192,720 +1158,12 @@ def _load_full_domain_rows(
             receipt["row"],
             index,
             repeat_iters,
-            legacy=receipt["schema"] == _LEGACY_FULL_DOMAIN_ROW_SCHEMA,
         )
         rows.append(receipt["row"])
         row_receipts.append(
             {"path": path.name, "sha256": hashlib.sha256(receipt_bytes).hexdigest()}
         )
     return rows, row_receipts
-
-
-def _checkpoint_receipt_identity_sha256_by_row(
-    checkpoint_path,
-    checkpoint,
-    *,
-    seen_paths=None,
-):
-    """Resolve immutable receipt identities through an inheritance chain."""
-
-    seen = set() if seen_paths is None else set(seen_paths)
-    resolved_path = checkpoint_path.resolve()
-    if resolved_path in seen:
-        raise RuntimeError("full-domain checkpoint inheritance contains a cycle")
-    seen.add(resolved_path)
-    identity = checkpoint.get("identity")
-    progress = checkpoint.get("progress")
-    if not isinstance(identity, dict) or not isinstance(progress, dict):
-        raise RuntimeError("inherited checkpoint identity or progress is invalid")
-    completed_rows = progress.get("completed_rows")
-    if (
-        type(completed_rows) is not int
-        or completed_rows < 1
-        or completed_rows > len(_FULL_DOMAIN_SHAPES)
-    ):
-        raise RuntimeError("inherited checkpoint completed row count is invalid")
-    identity_sha256 = _canonical_json_sha256(identity)
-    identities = [identity_sha256] * completed_rows
-    inheritance = checkpoint.get("inheritance")
-    if inheritance is None:
-        return identities
-    legacy_keys = {
-        "manifest_path",
-        "manifest_sha256",
-        "predecessor_checkpoint",
-        "predecessor_identity_sha256",
-        "completed_rows",
-        "inherited_route_names",
-    }
-    current_keys = {
-        "equivalence_path",
-        "equivalence_sha256",
-        "predecessor_checkpoint",
-        "predecessor_identity_sha256",
-        "completed_rows",
-        "inherited_route_names",
-    }
-    if not isinstance(inheritance, dict) or set(inheritance) not in (
-        legacy_keys,
-        current_keys,
-    ):
-        raise RuntimeError("checkpoint inheritance attestation is invalid")
-    inherited_count = inheritance["completed_rows"]
-    if (
-        type(inherited_count) is not int
-        or inherited_count < 1
-        or inherited_count > completed_rows
-    ):
-        raise RuntimeError("checkpoint inherited row count is invalid")
-    predecessor_record = inheritance["predecessor_checkpoint"]
-    if not isinstance(predecessor_record, dict) or set(predecessor_record) != {
-        "path",
-        "sha256",
-    }:
-        raise RuntimeError("checkpoint predecessor record is invalid")
-    predecessor_path = Path(predecessor_record["path"]).resolve()
-    if not predecessor_path.is_file() or predecessor_path.is_symlink():
-        raise RuntimeError("checkpoint predecessor is not a regular file")
-    predecessor_bytes = predecessor_path.read_bytes()
-    if hashlib.sha256(predecessor_bytes).hexdigest() != predecessor_record["sha256"]:
-        raise RuntimeError("checkpoint predecessor SHA-256 mismatch")
-    predecessor = json.loads(predecessor_bytes)
-    predecessor_identity = predecessor.get("identity")
-    if (
-        predecessor.get("schema")
-        not in (
-            _FULL_DOMAIN_SCHEMA,
-            _LEGACY_FULL_DOMAIN_SCHEMA,
-        )
-        or predecessor.get("status") not in ("in_progress", "complete")
-        or predecessor.get("measurement") != checkpoint.get("measurement")
-        or predecessor.get("progress", {}).get("completed_rows") != inherited_count
-        or not isinstance(predecessor_identity, dict)
-        or _canonical_json_sha256(predecessor_identity)
-        != inheritance["predecessor_identity_sha256"]
-        or predecessor_identity.get("baseline") != identity.get("baseline")
-        or predecessor_identity.get("shape_inventory_sha256")
-        != identity.get("shape_inventory_sha256")
-    ):
-        raise RuntimeError("checkpoint predecessor identity or protocol is invalid")
-    predecessor_identities = _checkpoint_receipt_identity_sha256_by_row(
-        predecessor_path,
-        predecessor,
-        seen_paths=seen,
-    )
-    if len(predecessor_identities) != inherited_count:
-        raise RuntimeError("checkpoint predecessor receipt inventory is invalid")
-    identities[:inherited_count] = predecessor_identities
-    return identities
-
-
-def _require_sha256(value, description):
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise RuntimeError(f"{description} is not a SHA-256 digest")
-
-
-def _normalize_kernel_symbol(source, symbol, description):
-    encoded_symbol = symbol.encode()
-    occurrences = source.count(encoded_symbol)
-    if occurrences != 1:
-        raise RuntimeError(
-            f"{description} contains {occurrences} occurrences of {symbol!r}, expected one"
-        )
-    return source.replace(encoded_symbol, b"CAKE_FUSED_KDA_KERNEL_SYMBOL")
-
-
-def _normalize_predecessor_binding(source):
-    body_guard = (
-        b"#ifndef FLASHINFER_FUSED_KDA_DECODE_BODY_FILE\n"
-        b'#error "FLASHINFER_FUSED_KDA_DECODE_BODY_FILE must name one frozen CUDA body"\n'
-        b"#endif\n"
-    )
-    if source.count(body_guard) != 1:
-        raise RuntimeError("predecessor binding body guard is invalid")
-    source = source.replace(body_guard, b"", 1)
-    preamble_start = source.index(b"#include <cstdint>\n")
-    preamble_end = source.index(b"#undef int8_t\n", preamble_start) + len(
-        b"#undef int8_t\n"
-    )
-    source = source[:preamble_start] + source[preamble_end:]
-    replacements = (
-        (
-            b"FLASHINFER_FUSED_KDA_DECODE",
-            b"FLASHINFER_CAKE_FUSED_KDA_DECODE",
-        ),
-        (b"fused_kda_decode_generated", b"cake_fused_kda_decode"),
-        (
-            b"fused KDA decode generated kernel ABI changed",
-            b"Cake fused KDA decode kernel ABI changed",
-        ),
-        (
-            b"fused KDA decode argument-plan identity",
-            b"Cake fused KDA decode argument-plan identity",
-        ),
-        (b"this fused KDA decode module", b"this Cake fused KDA decode module"),
-        (
-            b"fused KDA decode dynamic shared memory",
-            b"Cake fused KDA decode dynamic shared memory",
-        ),
-        (
-            b"cudaFuncSetAttribute(fused KDA decode)",
-            b"cudaFuncSetAttribute(Cake fused KDA decode)",
-        ),
-        (
-            b"fused KDA decode repeated-row launch",
-            b"Cake fused KDA decode repeated-row launch",
-        ),
-        (b"fused KDA decode launch", b"Cake fused KDA decode launch"),
-    )
-    for predecessor, current in replacements:
-        source = source.replace(predecessor, current)
-    return source.replace(
-        b'identity must be a full SHA-256");\n\n\n#include',
-        b'identity must be a full SHA-256");\n\n#include',
-        1,
-    )
-
-
-def _normalize_predecessor_kernel_source(source):
-    predecessor_assert = (
-        b"static_assert(alignof(CUtensorMap) == 128, "
-        b'"CUtensorMap CUDA ABI must be 128-byte aligned");'
-    )
-    current_assert = (
-        b"static_assert(alignof(FlashInferTensorMap) == 128, "
-        b'"kernel tensor-map ABI must be 128-byte aligned");'
-    )
-    if source.count(predecessor_assert) != 1:
-        raise RuntimeError("predecessor tensor-map alignment assertion is invalid")
-    return source.replace(predecessor_assert, current_assert, 1)
-
-
-def _legacy_eligibility(variant):
-    result = []
-    for rule in variant.get("eligibility", []):
-        if not isinstance(rule, dict) or "slot_classes" not in rule:
-            raise RuntimeError("predecessor eligibility schema is invalid")
-        converted = dict(rule)
-        converted["state_indices_modes"] = converted.pop("slot_classes")
-        result.append(converted)
-    return result
-
-
-def _validate_equivalence_receipt(
-    receipt,
-    *,
-    repo_root,
-    predecessor_identity,
-    predecessor_manifest,
-    predecessor_manifest_sha256,
-    current_identity,
-    predecessor_rows,
-):
-    if not isinstance(receipt, dict) or set(receipt) != {
-        "schema",
-        "verifier",
-        "predecessor",
-        "current",
-        "variants",
-        "route_equivalence",
-        "result",
-    }:
-        raise RuntimeError("equivalence receipt schema is invalid")
-    if receipt["schema"] != _EQUIVALENCE_SCHEMA:
-        raise RuntimeError("unsupported equivalence receipt")
-
-    verifier = receipt["verifier"]
-    if not isinstance(verifier, dict) or set(verifier) != {
-        "script_sha256",
-        "slurm_job_id",
-        "node",
-        "gpu_uuid",
-        "gpu_name",
-        "compute_capability",
-        "cuda_version",
-        "nvcc_version",
-        "cuobjdump_version",
-        "python_version",
-        "torch_version",
-        "tvm_ffi_version",
-        "toolchain_sha256",
-    }:
-        raise RuntimeError("equivalence verifier identity is invalid")
-    _require_sha256(verifier["script_sha256"], "equivalence verifier script")
-    _require_sha256(verifier["toolchain_sha256"], "equivalence toolchain")
-    if (
-        not all(
-            isinstance(verifier[name], str) and verifier[name]
-            for name in (
-                "slurm_job_id",
-                "node",
-                "gpu_uuid",
-                "gpu_name",
-                "cuda_version",
-                "nvcc_version",
-                "cuobjdump_version",
-                "python_version",
-                "torch_version",
-                "tvm_ffi_version",
-            )
-        )
-        or "B200" not in verifier["gpu_name"].upper()
-        or verifier["compute_capability"] != [10, 0]
-    ):
-        raise RuntimeError("equivalence receipt is not complete B200 evidence")
-    verifier_path = repo_root / _EQUIVALENCE_VERIFIER
-    toolchain = {
-        name: verifier[name]
-        for name in (
-            "cuda_version",
-            "nvcc_version",
-            "cuobjdump_version",
-            "python_version",
-            "torch_version",
-            "tvm_ffi_version",
-        )
-    }
-    if verifier["script_sha256"] != hashlib.sha256(
-        verifier_path.read_bytes()
-    ).hexdigest() or verifier["toolchain_sha256"] != _canonical_json_sha256(toolchain):
-        raise RuntimeError("equivalence verifier or toolchain identity is invalid")
-
-    predecessor = receipt["predecessor"]
-    current = receipt["current"]
-    if not isinstance(predecessor, dict) or set(predecessor) != {
-        "commit",
-        "manifest_sha256",
-    }:
-        raise RuntimeError("equivalence predecessor identity is invalid")
-    if not isinstance(current, dict) or set(current) != {
-        "commit",
-        "program_identity_sha256",
-        "registry_sha256",
-        "binding_sha256",
-    }:
-        raise RuntimeError("equivalence current identity is invalid")
-    registry_path = Path(
-        importlib.import_module("flashinfer.jit.cake_fused_kda_decode").__file__
-    ).resolve()
-    binding_path = repo_root / "csrc/kda/cake_fused_kda_decode_binding.cuh"
-    predecessor_binding = subprocess.run(
-        (
-            "git",
-            "-C",
-            str(repo_root),
-            "show",
-            f"{predecessor['commit']}:csrc/kda/fused_kda_decode_generated_binding.cuh",
-        ),
-        check=True,
-        capture_output=True,
-    ).stdout
-    if (
-        predecessor["commit"] != _MEASURED_PREDECESSOR_COMMIT
-        or predecessor["manifest_sha256"] != predecessor_manifest_sha256
-        or current["commit"] != current_identity.get("source_commit")
-        or current["program_identity_sha256"]
-        != current_identity.get("program", {}).get("identity_sha256")
-        or current["registry_sha256"]
-        != hashlib.sha256(registry_path.read_bytes()).hexdigest()
-        or current["binding_sha256"]
-        != hashlib.sha256(binding_path.read_bytes()).hexdigest()
-        or _normalize_predecessor_binding(predecessor_binding)
-        != binding_path.read_bytes()
-    ):
-        raise RuntimeError("equivalence source identity does not match this run")
-
-    predecessor_variants = predecessor_manifest.get("variants")
-    current_variants = current_identity.get("program", {}).get("variants")
-    proof_variants = receipt["variants"]
-    if (
-        not isinstance(predecessor_variants, list)
-        or not isinstance(current_variants, list)
-        or not isinstance(proof_variants, list)
-        or len(predecessor_variants) != 44
-        or len(current_variants) != 44
-        or len(proof_variants) != 44
-    ):
-        raise RuntimeError("equivalence receipt must cover exactly 44 variants")
-
-    proof_variant_keys = {
-        "name",
-        "target",
-        "predecessor_source_sha256",
-        "current_source_sha256",
-        "predecessor_kernel_symbol",
-        "current_kernel_symbol",
-        "normalized_source_sha256",
-        "symbol_rename_occurrences",
-        "abi_sha256",
-        "compile_flags_sha256",
-        "predecessor_sass_sha256",
-        "current_sass_sha256",
-        "predecessor_resource_usage_sha256",
-        "current_resource_usage_sha256",
-        "execution_input_sha256",
-        "predecessor_execution_sha256",
-        "current_execution_sha256",
-        "source_transform_exact",
-        "predecessor_alignment_assert_normalized",
-        "abi_equal",
-        "compile_flags_equal",
-        "launch_equal",
-        "sass_equal",
-        "resource_usage_equal",
-        "execution_bitwise_equal",
-    }
-    for predecessor_variant, current_variant, proof in zip(
-        predecessor_variants, current_variants, proof_variants, strict=True
-    ):
-        if not isinstance(proof, dict) or set(proof) != proof_variant_keys:
-            raise RuntimeError("equivalence variant record schema is invalid")
-        name = current_variant.get("name")
-        if predecessor_variant.get("name") != name or proof["name"] != name:
-            raise RuntimeError("equivalence variant order or name changed")
-        predecessor_abi = (
-            predecessor_manifest.get("contract", {})
-            .get("kernel_abis", {})
-            .get(predecessor_variant.get("abi_kind"))
-        )
-        metadata_equal = (
-            predecessor_variant.get("target") == current_variant.get("target")
-            and predecessor_variant.get("abi_kind") == current_variant.get("abi_kind")
-            and predecessor_abi == current_variant.get("abi")
-            and predecessor_variant.get("state_dtype")
-            == current_variant.get("state_dtype")
-            and predecessor_variant.get("slot_offset_bits", 32)
-            == current_variant.get("slot_offset_bits")
-            and predecessor_variant.get("extra_cuda_cflags")
-            == current_variant.get("extra_cuda_cflags")
-            and predecessor_variant.get("launch", {}).get("threads")
-            == current_variant.get("threads")
-            and predecessor_variant.get("launch", {}).get("dynamic_smem_bytes")
-            == current_variant.get("dynamic_smem_bytes")
-            and _legacy_eligibility(predecessor_variant)
-            == current_variant.get("eligibility")
-        )
-        if not metadata_equal:
-            raise RuntimeError(f"static launch contract changed for {name!r}")
-
-        predecessor_body = f"csrc/kda/{predecessor_variant['body']}"
-        predecessor_source = subprocess.run(
-            (
-                "git",
-                "-C",
-                str(repo_root),
-                "show",
-                f"{predecessor['commit']}:{predecessor_body}",
-            ),
-            check=True,
-            capture_output=True,
-        ).stdout
-        current_source = (repo_root / current_variant["body"]).read_bytes()
-        if hashlib.sha256(predecessor_source).hexdigest() != predecessor_variant.get(
-            "source_sha256"
-        ) or hashlib.sha256(current_source).hexdigest() != current_variant.get(
-            "source_sha256"
-        ):
-            raise RuntimeError(f"source identity changed for {name!r}")
-        predecessor_normalized = _normalize_kernel_symbol(
-            _normalize_predecessor_kernel_source(predecessor_source),
-            predecessor_variant["kernel_symbol"],
-            f"predecessor {name}",
-        )
-        current_normalized = _normalize_kernel_symbol(
-            current_source,
-            current_variant["kernel_symbol"],
-            f"current {name}",
-        )
-        normalized_sha256 = hashlib.sha256(current_normalized).hexdigest()
-        abi_sha256 = _canonical_json_sha256(current_variant["abi"])
-        for digest_name in (
-            "compile_flags_sha256",
-            "predecessor_sass_sha256",
-            "current_sass_sha256",
-            "predecessor_resource_usage_sha256",
-            "current_resource_usage_sha256",
-            "execution_input_sha256",
-            "predecessor_execution_sha256",
-            "current_execution_sha256",
-        ):
-            _require_sha256(proof[digest_name], f"{name} {digest_name}")
-        if (
-            predecessor_normalized != current_normalized
-            or proof["target"] != current_variant["target"]
-            or proof["predecessor_source_sha256"]
-            != predecessor_variant["source_sha256"]
-            or proof["current_source_sha256"] != current_variant["source_sha256"]
-            or proof["predecessor_kernel_symbol"]
-            != predecessor_variant["kernel_symbol"]
-            or proof["current_kernel_symbol"] != current_variant["kernel_symbol"]
-            or proof["normalized_source_sha256"] != normalized_sha256
-            or proof["symbol_rename_occurrences"] != 1
-            or proof["abi_sha256"] != abi_sha256
-            or proof["predecessor_sass_sha256"] != proof["current_sass_sha256"]
-            or proof["predecessor_resource_usage_sha256"]
-            != proof["current_resource_usage_sha256"]
-            or proof["predecessor_execution_sha256"]
-            != proof["current_execution_sha256"]
-            or any(
-                proof[name] is not True
-                for name in (
-                    "source_transform_exact",
-                    "predecessor_alignment_assert_normalized",
-                    "abi_equal",
-                    "compile_flags_equal",
-                    "launch_equal",
-                    "sass_equal",
-                    "resource_usage_equal",
-                    "execution_bitwise_equal",
-                )
-            )
-        ):
-            raise RuntimeError(f"execution equivalence failed for {name!r}")
-
-    variants = get_cake_fused_kda_decode_variants()
-    route_records = []
-    used_variants = set()
-    for index, row in enumerate(predecessor_rows):
-        candidate_cells = [
-            cell for cell in row["measurements"] if cell["backend"] == "candidate"
-        ]
-        names = {cell["variant_name"] for cell in candidate_cells}
-        if len(names) != 1:
-            raise RuntimeError(f"predecessor row {index} has inconsistent routes")
-        predecessor_name = names.pop()
-        heads, num_rows = _FULL_DOMAIN_SHAPES[index]
-        conv_stride, state_stride = _page_strides(heads)
-        selected = select_cake_fused_kda_decode_variant(
-            target="sm100a",
-            num_heads=heads,
-            num_rows=num_rows,
-            num_slots=num_rows + 1,
-            state_dtype="float32",
-            state_indices_mode="positive_unique",
-            lower_bound=-5.0,
-            norm_eps=1.0e-5,
-            x_row_stride=3 * heads * _HEAD_DIM + 17,
-            conv_slot_stride=conv_stride,
-            beta_row_stride=heads + 1,
-            state_slot_stride=state_stride,
-            output_gate_row_stride=heads * _HEAD_DIM + 7,
-            variants=variants,
-        )
-        if selected is None or selected.name != predecessor_name:
-            raise RuntimeError(
-                f"current selector does not preserve inherited row {index} route"
-            )
-        used_variants.add(predecessor_name)
-        route_records.append(
-            {
-                "shape_index": index,
-                "num_heads": heads,
-                "num_rows": num_rows,
-                "variant_name": predecessor_name,
-            }
-        )
-    route_sha256 = _canonical_json_sha256(route_records)
-    route_equivalence = receipt["route_equivalence"]
-    if not isinstance(route_equivalence, dict) or set(route_equivalence) != {
-        "shape_count",
-        "shape_inventory_sha256",
-        "predecessor_routes_sha256",
-        "current_routes_sha256",
-        "missing",
-        "mismatches",
-        "used_variants",
-    }:
-        raise RuntimeError("route equivalence schema is invalid")
-    if (
-        route_equivalence["shape_count"] != len(predecessor_rows)
-        or route_equivalence["shape_inventory_sha256"]
-        != current_identity["shape_inventory_sha256"]
-        or route_equivalence["predecessor_routes_sha256"] != route_sha256
-        or route_equivalence["current_routes_sha256"] != route_sha256
-        or route_equivalence["missing"] != 0
-        or route_equivalence["mismatches"] != []
-        or route_equivalence["used_variants"] != sorted(used_variants)
-    ):
-        raise RuntimeError("route equivalence does not match the inherited rows")
-
-    result = receipt["result"]
-    if not isinstance(result, dict) or set(result) != {
-        "variant_count",
-        "route_count",
-        "all_variants_passed",
-        "all_routes_passed",
-        "eligible_for_timing_inheritance",
-    }:
-        raise RuntimeError("equivalence result schema is invalid")
-    if result != {
-        "variant_count": 44,
-        "route_count": len(predecessor_rows),
-        "all_variants_passed": True,
-        "all_routes_passed": True,
-        "eligible_for_timing_inheritance": True,
-    }:
-        raise RuntimeError("equivalence receipt did not pass every gate")
-    return sorted(used_variants)
-
-
-def _load_full_domain_inheritance(
-    inheritance_path,
-    *,
-    current_identity,
-    current_identity_sha256,
-    measurement,
-    rows_root,
-    repeat_iters,
-):
-    inheritance_bytes = inheritance_path.read_bytes()
-    inheritance = json.loads(inheritance_bytes)
-    if not isinstance(inheritance, dict) or set(inheritance) != {
-        "schema",
-        "predecessor_checkpoint",
-        "predecessor_manifest",
-        "predecessor_rows_root",
-        "predecessor_identity_sha256",
-        "completed_rows",
-        "current_identity_sha256",
-        "equivalence_receipt",
-    }:
-        raise RuntimeError("full-domain inheritance schema is invalid")
-    if inheritance["schema"] != _FULL_DOMAIN_INHERITANCE_SCHEMA:
-        raise RuntimeError("unsupported full-domain inheritance record")
-    if inheritance["current_identity_sha256"] != current_identity_sha256:
-        raise RuntimeError("inheritance record does not name the current identity")
-    completed_rows = inheritance["completed_rows"]
-    if (
-        type(completed_rows) is not int
-        or completed_rows < 1
-        or completed_rows > len(_FULL_DOMAIN_SHAPES)
-    ):
-        raise RuntimeError("inheritance completed row count is invalid")
-
-    predecessor_checkpoint_record = inheritance["predecessor_checkpoint"]
-    if not isinstance(predecessor_checkpoint_record, dict) or set(
-        predecessor_checkpoint_record
-    ) != {"path", "sha256"}:
-        raise RuntimeError("predecessor checkpoint record is invalid")
-    predecessor_checkpoint_path = Path(predecessor_checkpoint_record["path"]).resolve()
-    if (
-        not predecessor_checkpoint_path.is_file()
-        or predecessor_checkpoint_path.is_symlink()
-    ):
-        raise RuntimeError("predecessor checkpoint is not a regular file")
-    predecessor_checkpoint_bytes = predecessor_checkpoint_path.read_bytes()
-    if (
-        hashlib.sha256(predecessor_checkpoint_bytes).hexdigest()
-        != predecessor_checkpoint_record["sha256"]
-    ):
-        raise RuntimeError("predecessor checkpoint SHA-256 mismatch")
-    predecessor_checkpoint = json.loads(predecessor_checkpoint_bytes)
-    predecessor_identity = predecessor_checkpoint.get("identity")
-    if not isinstance(predecessor_identity, dict):
-        raise RuntimeError("predecessor identity is invalid")
-    predecessor_identity_sha256 = _canonical_json_sha256(predecessor_identity)
-    if (
-        predecessor_checkpoint.get("schema")
-        not in (_FULL_DOMAIN_SCHEMA, _LEGACY_FULL_DOMAIN_SCHEMA)
-        or predecessor_checkpoint.get("status") not in ("in_progress", "complete")
-        or predecessor_checkpoint.get("measurement") != measurement
-        or predecessor_checkpoint.get("progress", {}).get("completed_rows")
-        != completed_rows
-        or predecessor_identity_sha256 != inheritance["predecessor_identity_sha256"]
-        or predecessor_identity.get("baseline") != current_identity.get("baseline")
-        or predecessor_identity.get("shape_inventory_sha256")
-        != current_identity.get("shape_inventory_sha256")
-    ):
-        raise RuntimeError("predecessor checkpoint identity or protocol is invalid")
-
-    predecessor_manifest_record = inheritance["predecessor_manifest"]
-    if not isinstance(predecessor_manifest_record, dict) or set(
-        predecessor_manifest_record
-    ) != {"path", "sha256"}:
-        raise RuntimeError("predecessor manifest record is invalid")
-    predecessor_manifest_path = Path(predecessor_manifest_record["path"]).resolve()
-    if (
-        not predecessor_manifest_path.is_file()
-        or predecessor_manifest_path.is_symlink()
-    ):
-        raise RuntimeError("predecessor manifest is not a regular file")
-    predecessor_manifest_bytes = predecessor_manifest_path.read_bytes()
-    predecessor_manifest_sha256 = hashlib.sha256(predecessor_manifest_bytes).hexdigest()
-    if predecessor_manifest_sha256 != predecessor_manifest_record[
-        "sha256"
-    ] or predecessor_manifest_sha256 != predecessor_identity.get("manifest_sha256"):
-        raise RuntimeError("predecessor manifest SHA-256 mismatch")
-    predecessor_manifest = json.loads(predecessor_manifest_bytes)
-
-    predecessor_rows_root = Path(inheritance["predecessor_rows_root"]).resolve()
-    predecessor_identity_sha256_by_row = _checkpoint_receipt_identity_sha256_by_row(
-        predecessor_checkpoint_path,
-        predecessor_checkpoint,
-    )
-    if len(predecessor_identity_sha256_by_row) != completed_rows:
-        raise RuntimeError("predecessor checkpoint receipt identity count is invalid")
-    predecessor_rows, predecessor_receipts = _load_full_domain_rows(
-        predecessor_rows_root,
-        predecessor_identity_sha256,
-        repeat_iters,
-        inherited_identity_sha256_by_row=predecessor_identity_sha256_by_row,
-    )
-    if len(predecessor_rows) != completed_rows:
-        raise RuntimeError("predecessor row receipts do not match completed rows")
-    if predecessor_checkpoint.get("row_receipts") != predecessor_receipts:
-        raise RuntimeError("predecessor checkpoint row inventory is invalid")
-
-    equivalence_record = inheritance["equivalence_receipt"]
-    if not isinstance(equivalence_record, dict) or set(equivalence_record) != {
-        "path",
-        "sha256",
-    }:
-        raise RuntimeError("equivalence receipt record is invalid")
-    equivalence_path = Path(equivalence_record["path"]).resolve()
-    if not equivalence_path.is_file() or equivalence_path.is_symlink():
-        raise RuntimeError("equivalence receipt is not a regular file")
-    equivalence_bytes = equivalence_path.read_bytes()
-    if hashlib.sha256(equivalence_bytes).hexdigest() != equivalence_record["sha256"]:
-        raise RuntimeError("equivalence receipt SHA-256 mismatch")
-    used_variants = _validate_equivalence_receipt(
-        json.loads(equivalence_bytes),
-        repo_root=Path(__file__).resolve().parents[1],
-        predecessor_identity=predecessor_identity,
-        predecessor_manifest=predecessor_manifest,
-        predecessor_manifest_sha256=predecessor_manifest_sha256,
-        current_identity=current_identity,
-        predecessor_rows=predecessor_rows,
-    )
-
-    rows_root.mkdir(parents=True, exist_ok=True)
-    for index in range(completed_rows):
-        source = _full_domain_row_path(predecessor_rows_root, index)
-        destination = _full_domain_row_path(rows_root, index)
-        source_bytes = source.read_bytes()
-        if destination.exists():
-            if destination.read_bytes() != source_bytes:
-                raise RuntimeError(f"inherited row {index} copy differs")
-            continue
-        temporary = destination.with_name(f".{destination.name}.tmp-{os.getpid()}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        fd = os.open(temporary, flags, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(source_bytes)
-        os.replace(temporary, destination)
-
-    return {
-        "equivalence_path": str(equivalence_path),
-        "equivalence_sha256": hashlib.sha256(equivalence_bytes).hexdigest(),
-        "predecessor_checkpoint": predecessor_checkpoint_record,
-        "predecessor_identity_sha256": predecessor_identity_sha256,
-        "completed_rows": completed_rows,
-        "inherited_route_names": used_variants,
-    }, predecessor_identity_sha256_by_row
 
 
 def _summarize_full_domain(rows):
@@ -1950,7 +1208,6 @@ def _write_full_domain_checkpoint(
     measurement,
     rows,
     row_receipts,
-    inheritance=None,
     summary=None,
 ):
     payload = {
@@ -1972,8 +1229,6 @@ def _write_full_domain_checkpoint(
         },
         "row_receipts": row_receipts,
     }
-    if inheritance is not None:
-        payload["inheritance"] = inheritance
     if summary is not None:
         payload["summary"] = summary
         payload["rows"] = rows
@@ -1995,22 +1250,10 @@ def _run_full_domain_benchmark(args):
     measurement = _full_domain_measurement_config(args, cupti_version)
     rows_root = _full_domain_rows_root(output_path)
     rows_root.mkdir(parents=True, exist_ok=True)
-    inheritance = None
-    inherited_identity_sha256_by_row = None
-    if args.inheritance_json is not None:
-        inheritance, inherited_identity_sha256_by_row = _load_full_domain_inheritance(
-            Path(args.inheritance_json).resolve(),
-            current_identity=identity,
-            current_identity_sha256=identity_sha256,
-            measurement=measurement,
-            rows_root=rows_root,
-            repeat_iters=args.repeat_iters,
-        )
     rows, row_receipts = _load_full_domain_rows(
         rows_root,
         identity_sha256,
         args.repeat_iters,
-        inherited_identity_sha256_by_row=inherited_identity_sha256_by_row,
     )
     if output_path.is_file():
         checkpoint = json.loads(output_path.read_text(encoding="utf-8"))
@@ -2018,7 +1261,7 @@ def _run_full_domain_benchmark(args):
             checkpoint.get("schema") != _FULL_DOMAIN_SCHEMA
             or checkpoint.get("identity") != identity
             or checkpoint.get("measurement") != measurement
-            or checkpoint.get("inheritance") != inheritance
+            or checkpoint.get("inheritance") is not None
         ):
             raise RuntimeError("full-domain checkpoint identity or protocol drifted")
     if len(rows) == len(_FULL_DOMAIN_SHAPES):
@@ -2030,7 +1273,6 @@ def _run_full_domain_benchmark(args):
             measurement=measurement,
             rows=rows,
             row_receipts=row_receipts,
-            inheritance=inheritance,
             summary=summary,
         )
         print(f"checkpoint is already complete: {output_path}", flush=True)
@@ -2108,7 +1350,6 @@ def _run_full_domain_benchmark(args):
             measurement=measurement,
             rows=rows,
             row_receipts=row_receipts,
-            inheritance=inheritance,
         )
         new_rows = len(rows) - starting_row_count
         print(
@@ -2139,7 +1380,6 @@ def _run_full_domain_benchmark(args):
             measurement=measurement,
             rows=rows,
             row_receipts=row_receipts,
-            inheritance=inheritance,
             summary=summary,
         )
         print(json.dumps(summary, indent=2), flush=True)
@@ -2163,7 +1403,6 @@ def _parse_args():
     parser.add_argument("--repeat-iters", type=int, default=30)
     parser.add_argument("--max-new-rows", type=int)
     parser.add_argument("--max-runtime-seconds", type=float)
-    parser.add_argument("--inheritance-json")
     parser.add_argument("--worker-backend", choices=("baseline", "candidate"))
     parser.add_argument("--worker-heads", type=int)
     parser.add_argument("--worker-rows", type=int)
@@ -2189,8 +1428,6 @@ def _parse_args():
             parser.error(
                 "full-domain requires 5 warmups and 16 timed replays per ABBA cell"
             )
-        if args.inheritance_json is not None and args.shapes != "full-domain":
-            parser.error("--inheritance-json requires --shapes full-domain")
     return args
 
 
