@@ -31,12 +31,12 @@
 #include <unordered_map>
 #include <vector>
 
-extern "C" __global__ void kernel_cake_warp_decode_a310449091fa15daa2b0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-extern "C" __global__ void kernel_cake_warp_decode_869cb2224446cd6ef472(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+extern "C" __global__ void kernel_cake_warp_decode_2b1cc06cd9069d7c882a(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+extern "C" __global__ void kernel_cake_warp_decode_450a8e8be186fbc052cc(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
 extern "C" __global__ void kernel_cake_warp_decode_719081f5ef4da6c57e95(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 
 
-namespace cake_host_shim_9948382fe5e1b69b {
+namespace cake_host_shim_e8b54a2d3f495287 {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -488,7 +488,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
       }
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_cake_warp_decode_a310449091fa15daa2b0),
+            reinterpret_cast<const void*>(kernel_cake_warp_decode_2b1cc06cd9069d7c882a),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             199040);
       }
@@ -498,7 +498,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
     }
   }
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute for kernel_cake_warp_decode_a310449091fa15daa2b0 failed: "
+      << "cudaFuncSetAttribute for kernel_cake_warp_decode_2b1cc06cd9069d7c882a failed: "
       << cudaGetErrorString(smem_status);
   prepared.p_A = EncodeTma_A(arg_A);
   prepared.p_B = arg_B.data_ptr();
@@ -564,9 +564,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_a310449091fa15daa2b0), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_2b1cc06cd9069d7c882a), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_warp_decode_a310449091fa15daa2b0 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_warp_decode_2b1cc06cd9069d7c882a failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -694,7 +694,7 @@ inline CUtensorMap EncodeTma_SFA(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'SFA' resolved a non-positive global dim";
   TVM_FFI_CHECK(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3], ValueError)
-      << "TMA box (256, 2, 12, 1) exceeds resolved global dims for 'SFA'";
+      << "TMA box (256, 2, 4, 1) exceeds resolved global dims for 'SFA'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'SFA' resolved global stride 1 negative";
@@ -721,7 +721,7 @@ inline CUtensorMap EncodeTma_SFA(const TensorView& t) {
       (uint64_t)((carrier_stride_1 * 8) / 8),
       (uint64_t)((carrier_stride_2 * 8) / 8),
   };
-  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
@@ -749,7 +749,7 @@ inline CUtensorMap EncodeTma_SFB(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'SFB' resolved a non-positive global dim";
   TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2], ValueError)
-      << "TMA box (32, 12, 1) exceeds resolved global dims for 'SFB'";
+      << "TMA box (32, 4, 1) exceeds resolved global dims for 'SFB'";
   int64_t carrier_stride_0 = d1;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 1 negative";
@@ -768,7 +768,7 @@ inline CUtensorMap EncodeTma_SFB(const TensorView& t) {
       (uint64_t)((carrier_stride_0 * 8) / 8),
       (uint64_t)((carrier_stride_1 * 8) / 8),
   };
-  uint32_t box_dim[3] = {32u, 12u, 1u};
+  uint32_t box_dim[3] = {32u, 4u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
@@ -952,7 +952,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
       }
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_cake_warp_decode_869cb2224446cd6ef472),
+            reinterpret_cast<const void*>(kernel_cake_warp_decode_450a8e8be186fbc052cc),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             179456);
       }
@@ -962,7 +962,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
     }
   }
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute for kernel_cake_warp_decode_869cb2224446cd6ef472 failed: "
+      << "cudaFuncSetAttribute for kernel_cake_warp_decode_450a8e8be186fbc052cc failed: "
       << cudaGetErrorString(smem_status);
   prepared.p_A = EncodeTma_A(arg_A);
   prepared.p_B = EncodeTma_B(arg_B);
@@ -1018,9 +1018,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_869cb2224446cd6ef472), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_450a8e8be186fbc052cc), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_warp_decode_869cb2224446cd6ef472 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_warp_decode_450a8e8be186fbc052cc failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -1150,14 +1150,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_finalize::Submit(prepared_finalize, stream);
 }
 
-}  // namespace cake_host_shim_9948382fe5e1b69b
+}  // namespace cake_host_shim_e8b54a2d3f495287
 
 extern "C" {
 TVM_FFI_DLL_EXPORT int __tvm_ffi_run(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_9948382fe5e1b69b::RunPacked(
+  cake_host_shim_e8b54a2d3f495287::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();

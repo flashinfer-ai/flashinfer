@@ -31,12 +31,13 @@
 #include <unordered_map>
 #include <vector>
 
-extern "C" __global__ void kernel_cake_warp_decode_05eeb4fae0e0bb547df0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
-extern "C" __global__ void kernel_cake_warp_decode_a6e9552ad3990d2bbb48(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
-extern "C" __global__ void kernel_cake_warp_decode_719081f5ef4da6c57e95(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+extern "C" __global__ void kernel_cake_warp_decode_564663b76745284e7a8d(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+extern "C" __global__ void kernel_cake_warp_decode_c685ed484e923bbf4945(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+extern "C" __global__ void kernel_cake_warp_decode_36fc9a61f8b57722891f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+extern "C" __global__ void kernel_cake_warp_decode_432ccf353bf44819bac3(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 
 
-namespace cake_host_shim_b86e4f90b1e976cd {
+namespace cake_host_shim_8c1f61bf207c2f90 {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -160,6 +161,155 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     }
   }
 }
+
+namespace stage_route_pack {
+
+
+struct PreparedLaunch {
+  void* p_route_experts = nullptr;
+  void* p_route_map = nullptr;
+  void* p_tile_expert = nullptr;
+  void* p_tile_mn_limit = nullptr;
+  void* p_route_slots = nullptr;
+  void* p_num_non_exiting_ctas = nullptr;
+  void* p_fc1_work_counter = nullptr;
+  void* p_fc2_work_counter = nullptr;
+  int32_t v_route_count{};
+  int32_t v_top_k{};
+  int32_t v_local_expert_offset{};
+  int32_t v_num_experts{};
+  int32_t v_fc1_initial_work{};
+  int32_t v_fc2_initial_work{};
+  dim3 grid;
+  dim3 block;
+  void* kargs[14] = {};
+  std::vector<TensorView> retained;
+};
+
+inline void Prepare(PreparedLaunch& prepared, TensorView arg_route_experts, TensorView arg_route_map, TensorView arg_tile_expert, TensorView arg_tile_mn_limit, TensorView arg_route_slots, TensorView arg_num_non_exiting_ctas, TensorView arg_fc1_work_counter, TensorView arg_fc2_work_counter, int64_t arg_route_count, int64_t arg_top_k, int64_t arg_local_expert_offset, int64_t arg_num_experts, int64_t arg_fc1_initial_work, int64_t arg_fc2_initial_work, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+  CheckCudaTensor(arg_route_experts, "route_experts");
+  CheckDtype(arg_route_experts, "route_experts", 0, 32, 1);
+  CheckContiguous(arg_route_experts, "route_experts");
+  CheckCudaTensor(arg_route_map, "route_map");
+  CheckDtype(arg_route_map, "route_map", 0, 32, 1);
+  CheckContiguous(arg_route_map, "route_map");
+  CheckCudaTensor(arg_tile_expert, "tile_expert");
+  CheckDtype(arg_tile_expert, "tile_expert", 0, 32, 1);
+  CheckContiguous(arg_tile_expert, "tile_expert");
+  CheckCudaTensor(arg_tile_mn_limit, "tile_mn_limit");
+  CheckDtype(arg_tile_mn_limit, "tile_mn_limit", 0, 32, 1);
+  CheckContiguous(arg_tile_mn_limit, "tile_mn_limit");
+  CheckCudaTensor(arg_route_slots, "route_slots");
+  CheckDtype(arg_route_slots, "route_slots", 0, 32, 1);
+  CheckContiguous(arg_route_slots, "route_slots");
+  CheckCudaTensor(arg_num_non_exiting_ctas, "num_non_exiting_ctas");
+  CheckDtype(arg_num_non_exiting_ctas, "num_non_exiting_ctas", 0, 32, 1);
+  CheckContiguous(arg_num_non_exiting_ctas, "num_non_exiting_ctas");
+  CheckCudaTensor(arg_fc1_work_counter, "fc1_work_counter");
+  CheckDtype(arg_fc1_work_counter, "fc1_work_counter", 0, 32, 1);
+  CheckContiguous(arg_fc1_work_counter, "fc1_work_counter");
+  CheckCudaTensor(arg_fc2_work_counter, "fc2_work_counter");
+  CheckDtype(arg_fc2_work_counter, "fc2_work_counter", 0, 32, 1);
+  CheckContiguous(arg_fc2_work_counter, "fc2_work_counter");
+  TVM_FFI_CHECK(arg_route_count >= -2147483648LL && arg_route_count <= 2147483647LL, ValueError)
+      << "scalar 'route_count' value " << arg_route_count
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_top_k >= -2147483648LL && arg_top_k <= 2147483647LL, ValueError)
+      << "scalar 'top_k' value " << arg_top_k
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_local_expert_offset >= -2147483648LL && arg_local_expert_offset <= 2147483647LL, ValueError)
+      << "scalar 'local_expert_offset' value " << arg_local_expert_offset
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_num_experts >= -2147483648LL && arg_num_experts <= 2147483647LL, ValueError)
+      << "scalar 'num_experts' value " << arg_num_experts
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_fc1_initial_work >= -2147483648LL && arg_fc1_initial_work <= 2147483647LL, ValueError)
+      << "scalar 'fc1_initial_work' value " << arg_fc1_initial_work
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_fc2_initial_work >= -2147483648LL && arg_fc2_initial_work <= 2147483647LL, ValueError)
+      << "scalar 'fc2_initial_work' value " << arg_fc2_initial_work
+      << " is outside i32 range [-2147483648, 2147483647]";
+  CheckSameCudaDevice(arg_route_map, arg_route_experts, "route_map", "route_experts");
+  CheckSameCudaDevice(arg_tile_expert, arg_route_experts, "tile_expert", "route_experts");
+  CheckSameCudaDevice(arg_tile_mn_limit, arg_route_experts, "tile_mn_limit", "route_experts");
+  CheckSameCudaDevice(arg_route_slots, arg_route_experts, "route_slots", "route_experts");
+  CheckSameCudaDevice(arg_num_non_exiting_ctas, arg_route_experts, "num_non_exiting_ctas", "route_experts");
+  CheckSameCudaDevice(arg_fc1_work_counter, arg_route_experts, "fc1_work_counter", "route_experts");
+  CheckSameCudaDevice(arg_fc2_work_counter, arg_route_experts, "fc2_work_counter", "route_experts");
+  CheckCurrentCudaDevice(arg_route_experts, "route_experts");
+  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
+      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
+
+  prepared.retained.clear();
+  prepared.retained.reserve(8);
+  prepared.retained.push_back(arg_route_experts);
+  prepared.retained.push_back(arg_route_map);
+  prepared.retained.push_back(arg_tile_expert);
+  prepared.retained.push_back(arg_tile_mn_limit);
+  prepared.retained.push_back(arg_route_slots);
+  prepared.retained.push_back(arg_num_non_exiting_ctas);
+  prepared.retained.push_back(arg_fc1_work_counter);
+  prepared.retained.push_back(arg_fc2_work_counter);
+
+
+  prepared.p_route_experts = arg_route_experts.data_ptr();
+  prepared.p_route_map = arg_route_map.data_ptr();
+  prepared.p_tile_expert = arg_tile_expert.data_ptr();
+  prepared.p_tile_mn_limit = arg_tile_mn_limit.data_ptr();
+  prepared.p_route_slots = arg_route_slots.data_ptr();
+  prepared.p_num_non_exiting_ctas = arg_num_non_exiting_ctas.data_ptr();
+  prepared.p_fc1_work_counter = arg_fc1_work_counter.data_ptr();
+  prepared.p_fc2_work_counter = arg_fc2_work_counter.data_ptr();
+  prepared.v_route_count = (int32_t)arg_route_count;
+  prepared.v_top_k = (int32_t)arg_top_k;
+  prepared.v_local_expert_offset = (int32_t)arg_local_expert_offset;
+  prepared.v_num_experts = (int32_t)arg_num_experts;
+  prepared.v_fc1_initial_work = (int32_t)arg_fc1_initial_work;
+  prepared.v_fc2_initial_work = (int32_t)arg_fc2_initial_work;
+  prepared.grid = dim3((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
+  prepared.block = dim3(256u, 1u, 1u);
+  prepared.kargs[0] = &prepared.p_route_experts;
+  prepared.kargs[1] = &prepared.p_route_map;
+  prepared.kargs[2] = &prepared.p_tile_expert;
+  prepared.kargs[3] = &prepared.p_tile_mn_limit;
+  prepared.kargs[4] = &prepared.p_route_slots;
+  prepared.kargs[5] = &prepared.p_num_non_exiting_ctas;
+  prepared.kargs[6] = &prepared.p_fc1_work_counter;
+  prepared.kargs[7] = &prepared.p_fc2_work_counter;
+  prepared.kargs[8] = &prepared.v_route_count;
+  prepared.kargs[9] = &prepared.v_top_k;
+  prepared.kargs[10] = &prepared.v_local_expert_offset;
+  prepared.kargs[11] = &prepared.v_num_experts;
+  prepared.kargs[12] = &prepared.v_fc1_initial_work;
+  prepared.kargs[13] = &prepared.v_fc2_initial_work;
+}
+
+inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
+  dim3 grid = prepared.grid;
+  dim3 block = prepared.block;
+  void** kargs = prepared.kargs;
+
+  cudaLaunchAttribute attrs[1]{};
+  int n = 0;
+  attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[n].val.programmaticStreamSerializationAllowed = 1;
+  ++n;
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 896u;
+  config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = n;
+  cudaError_t launch_status = cudaLaunchKernelExC(
+      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_564663b76745284e7a8d), kargs);
+  TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
+      << "cudaLaunchKernelExC for kernel_cake_warp_decode_564663b76745284e7a8d failed: "
+      << cudaGetErrorString(launch_status);
+
+}
+}  // namespace stage_route_pack
 
 namespace stage_fc1 {
 
@@ -353,6 +503,8 @@ struct PreparedLaunch {
   void* p_route_map = nullptr;
   void* p_tile_expert = nullptr;
   void* p_tile_mn_limit = nullptr;
+  void* p_num_non_exiting_ctas = nullptr;
+  void* p_work_counter = nullptr;
   void* p_scale_c = nullptr;
   void* p_scale_gate = nullptr;
   void* p_clamp_limit = nullptr;
@@ -365,11 +517,11 @@ struct PreparedLaunch {
   int32_t v_K_tiles{};
   dim3 grid;
   dim3 block;
-  void* kargs[19] = {};
+  void* kargs[21] = {};
   std::vector<TensorView> retained;
 };
 
-inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B, TensorView arg_SFA, TensorView arg_SFB, TensorView arg_C, TensorView arg_SFC, TensorView arg_route_map, TensorView arg_tile_expert, TensorView arg_tile_mn_limit, TensorView arg_scale_c, TensorView arg_scale_gate, TensorView arg_clamp_limit, TensorView arg_act_alpha, TensorView arg_act_beta, int64_t arg_M_out, int64_t arg_K, int64_t arg_grid_m, int64_t arg_grid_n, int64_t arg_K_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B, TensorView arg_SFA, TensorView arg_SFB, TensorView arg_C, TensorView arg_SFC, TensorView arg_route_map, TensorView arg_tile_expert, TensorView arg_tile_mn_limit, TensorView arg_num_non_exiting_ctas, TensorView arg_work_counter, TensorView arg_scale_c, TensorView arg_scale_gate, TensorView arg_clamp_limit, TensorView arg_act_alpha, TensorView arg_act_beta, int64_t arg_M_out, int64_t arg_K, int64_t arg_grid_m, int64_t arg_grid_n, int64_t arg_K_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   CheckCudaTensor(arg_A, "A");
   CheckDtype(arg_A, "A", 1, 8, 1);
   CheckContiguous(arg_A, "A");
@@ -395,6 +547,12 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   CheckCudaTensor(arg_tile_mn_limit, "tile_mn_limit");
   CheckDtype(arg_tile_mn_limit, "tile_mn_limit", 0, 32, 1);
   CheckContiguous(arg_tile_mn_limit, "tile_mn_limit");
+  CheckCudaTensor(arg_num_non_exiting_ctas, "num_non_exiting_ctas");
+  CheckDtype(arg_num_non_exiting_ctas, "num_non_exiting_ctas", 0, 32, 1);
+  CheckContiguous(arg_num_non_exiting_ctas, "num_non_exiting_ctas");
+  CheckCudaTensor(arg_work_counter, "work_counter");
+  CheckDtype(arg_work_counter, "work_counter", 0, 32, 1);
+  CheckContiguous(arg_work_counter, "work_counter");
   CheckCudaTensor(arg_scale_c, "scale_c");
   CheckDtype(arg_scale_c, "scale_c", 2, 32, 1);
   CheckContiguous(arg_scale_c, "scale_c");
@@ -433,6 +591,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   CheckSameCudaDevice(arg_route_map, arg_A, "route_map", "A");
   CheckSameCudaDevice(arg_tile_expert, arg_A, "tile_expert", "A");
   CheckSameCudaDevice(arg_tile_mn_limit, arg_A, "tile_mn_limit", "A");
+  CheckSameCudaDevice(arg_num_non_exiting_ctas, arg_A, "num_non_exiting_ctas", "A");
+  CheckSameCudaDevice(arg_work_counter, arg_A, "work_counter", "A");
   CheckSameCudaDevice(arg_scale_c, arg_A, "scale_c", "A");
   CheckSameCudaDevice(arg_scale_gate, arg_A, "scale_gate", "A");
   CheckSameCudaDevice(arg_clamp_limit, arg_A, "clamp_limit", "A");
@@ -444,7 +604,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
       << ", " << grid_z << ")";
 
   prepared.retained.clear();
-  prepared.retained.reserve(14);
+  prepared.retained.reserve(16);
   prepared.retained.push_back(arg_A);
   prepared.retained.push_back(arg_B);
   prepared.retained.push_back(arg_SFA);
@@ -454,6 +614,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   prepared.retained.push_back(arg_route_map);
   prepared.retained.push_back(arg_tile_expert);
   prepared.retained.push_back(arg_tile_mn_limit);
+  prepared.retained.push_back(arg_num_non_exiting_ctas);
+  prepared.retained.push_back(arg_work_counter);
   prepared.retained.push_back(arg_scale_c);
   prepared.retained.push_back(arg_scale_gate);
   prepared.retained.push_back(arg_clamp_limit);
@@ -476,9 +638,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
       }
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_cake_warp_decode_05eeb4fae0e0bb547df0),
+            reinterpret_cast<const void*>(kernel_cake_warp_decode_c685ed484e923bbf4945),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            198912);
+            199040);
       }
       smem_status_by_device->emplace(dev.device_id, smem_status);
     } else {
@@ -486,7 +648,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
     }
   }
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute for kernel_cake_warp_decode_05eeb4fae0e0bb547df0 failed: "
+      << "cudaFuncSetAttribute for kernel_cake_warp_decode_c685ed484e923bbf4945 failed: "
       << cudaGetErrorString(smem_status);
   prepared.p_A = EncodeTma_A(arg_A);
   prepared.p_B = arg_B.data_ptr();
@@ -497,6 +659,8 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   prepared.p_route_map = arg_route_map.data_ptr();
   prepared.p_tile_expert = arg_tile_expert.data_ptr();
   prepared.p_tile_mn_limit = arg_tile_mn_limit.data_ptr();
+  prepared.p_num_non_exiting_ctas = arg_num_non_exiting_ctas.data_ptr();
+  prepared.p_work_counter = arg_work_counter.data_ptr();
   prepared.p_scale_c = arg_scale_c.data_ptr();
   prepared.p_scale_gate = arg_scale_gate.data_ptr();
   prepared.p_clamp_limit = arg_clamp_limit.data_ptr();
@@ -518,16 +682,18 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   prepared.kargs[6] = &prepared.p_route_map;
   prepared.kargs[7] = &prepared.p_tile_expert;
   prepared.kargs[8] = &prepared.p_tile_mn_limit;
-  prepared.kargs[9] = &prepared.p_scale_c;
-  prepared.kargs[10] = &prepared.p_scale_gate;
-  prepared.kargs[11] = &prepared.p_clamp_limit;
-  prepared.kargs[12] = &prepared.p_act_alpha;
-  prepared.kargs[13] = &prepared.p_act_beta;
-  prepared.kargs[14] = &prepared.v_M_out;
-  prepared.kargs[15] = &prepared.v_K;
-  prepared.kargs[16] = &prepared.v_grid_m;
-  prepared.kargs[17] = &prepared.v_grid_n;
-  prepared.kargs[18] = &prepared.v_K_tiles;
+  prepared.kargs[9] = &prepared.p_num_non_exiting_ctas;
+  prepared.kargs[10] = &prepared.p_work_counter;
+  prepared.kargs[11] = &prepared.p_scale_c;
+  prepared.kargs[12] = &prepared.p_scale_gate;
+  prepared.kargs[13] = &prepared.p_clamp_limit;
+  prepared.kargs[14] = &prepared.p_act_alpha;
+  prepared.kargs[15] = &prepared.p_act_beta;
+  prepared.kargs[16] = &prepared.v_M_out;
+  prepared.kargs[17] = &prepared.v_K;
+  prepared.kargs[18] = &prepared.v_grid_m;
+  prepared.kargs[19] = &prepared.v_grid_n;
+  prepared.kargs[20] = &prepared.v_K_tiles;
 }
 
 inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
@@ -543,14 +709,14 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 198912u;
+  config.dynamicSmemBytes = 199040u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_05eeb4fae0e0bb547df0), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_c685ed484e923bbf4945), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_warp_decode_05eeb4fae0e0bb547df0 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_warp_decode_c685ed484e923bbf4945 failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -678,7 +844,7 @@ inline CUtensorMap EncodeTma_SFA(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'SFA' resolved a non-positive global dim";
   TVM_FFI_CHECK(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3], ValueError)
-      << "TMA box (256, 2, 4, 1) exceeds resolved global dims for 'SFA'";
+      << "TMA box (256, 2, 12, 1) exceeds resolved global dims for 'SFA'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'SFA' resolved global stride 1 negative";
@@ -705,7 +871,7 @@ inline CUtensorMap EncodeTma_SFA(const TensorView& t) {
       (uint64_t)((carrier_stride_1 * 8) / 8),
       (uint64_t)((carrier_stride_2 * 8) / 8),
   };
-  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
@@ -717,50 +883,68 @@ inline CUtensorMap EncodeTma_SFA(const TensorView& t) {
   return tm;
 }
 
-// 3D TMA descriptor for buffer 'SFB' — compiled from the
+// 4D TMA descriptor for buffer 'SFB' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_SFB(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'SFB' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 4, ValueError)
+      << "TMA source 'SFB' must have at least 4 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'SFB' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
   int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+  int64_t d3 = t.size(t.ndim() - 3);
+  int64_t d4 = t.size(t.ndim() - 4);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0, ValueError)
       << "TMA source 'SFB' trailing dims must be positive";
-  int64_t outer2 = t.numel() / (d1 * d2);
-  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'SFB' physical strides must be positive";
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'SFB' physical strides must be positive";
+  int64_t s4 = t.stride(t.ndim() - 4) * 1;
+  TVM_FFI_CHECK(s4 > 0, ValueError)
+      << "TMA source 'SFB' physical strides must be positive";
+  uint64_t global_dim[4] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(d3), (uint64_t)(d4)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'SFB' resolved a non-positive global dim";
-  TVM_FFI_CHECK(32u <= global_dim[0] && 1u <= global_dim[2], ValueError)
-      << "TMA box (32, 4, 1) exceeds resolved global dims for 'SFB'";
-  int64_t carrier_stride_0 = d1;
+  TVM_FFI_CHECK(1u <= global_dim[3], ValueError)
+      << "TMA box (256, 2, 12, 1) exceeds resolved global dims for 'SFB'";
+  int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 1 negative";
   TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 1 zero while global dimension 1 is not 1";
   TVM_FFI_CHECK((carrier_stride_0 * 8) % 8 == 0, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 1 to a non-whole-byte offset";
-  int64_t carrier_stride_1 = (d1 * d2);
+  int64_t carrier_stride_1 = s3;
   TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 2 negative";
   TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 2 zero while global dimension 2 is not 1";
   TVM_FFI_CHECK((carrier_stride_1 * 8) % 8 == 0, ValueError)
       << "TMA descriptor for 'SFB' resolved global stride 2 to a non-whole-byte offset";
-  uint64_t global_strides[2] = {
+  int64_t carrier_stride_2 = s4;
+  TVM_FFI_CHECK(carrier_stride_2 >= 0, ValueError)
+      << "TMA descriptor for 'SFB' resolved global stride 3 negative";
+  TVM_FFI_CHECK(carrier_stride_2 != 0 || global_dim[3] == 1, ValueError)
+      << "TMA descriptor for 'SFB' resolved global stride 3 zero while global dimension 3 is not 1";
+  TVM_FFI_CHECK((carrier_stride_2 * 8) % 8 == 0, ValueError)
+      << "TMA descriptor for 'SFB' resolved global stride 3 to a non-whole-byte offset";
+  uint64_t global_strides[3] = {
       (uint64_t)((carrier_stride_0 * 8) / 8),
       (uint64_t)((carrier_stride_1 * 8) / 8),
+      (uint64_t)((carrier_stride_2 * 8) / 8),
   };
-  uint32_t box_dim[3] = {32u, 4u, 1u};
-  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
+  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (3D, 'SFB') failed: CUresult=" << (int)r;
+      << "cuTensorMapEncodeTiled (4D, 'SFB') failed: CUresult=" << (int)r;
   return tm;
 }
 
@@ -855,7 +1039,6 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   CheckDtype(arg_SFA, "SFA", 1, 8, 1);
   CheckCudaTensor(arg_SFB, "SFB");
   CheckDtype(arg_SFB, "SFB", 1, 8, 1);
-  CheckContiguous(arg_SFB, "SFB");
   CheckCudaTensor(arg_C_tma, "C_tma");
   CheckDtype(arg_C_tma, "C_tma", 4, 16, 1);
   CheckCudaTensor(arg_C, "C");
@@ -936,9 +1119,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
       }
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_cake_warp_decode_a6e9552ad3990d2bbb48),
+            reinterpret_cast<const void*>(kernel_cake_warp_decode_36fc9a61f8b57722891f),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            179456);
+            196736);
       }
       smem_status_by_device->emplace(dev.device_id, smem_status);
     } else {
@@ -946,7 +1129,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
     }
   }
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute for kernel_cake_warp_decode_a6e9552ad3990d2bbb48 failed: "
+      << "cudaFuncSetAttribute for kernel_cake_warp_decode_36fc9a61f8b57722891f failed: "
       << cudaGetErrorString(smem_status);
   prepared.p_A = EncodeTma_A(arg_A);
   prepared.p_B = EncodeTma_B(arg_B);
@@ -965,7 +1148,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_A, TensorView arg_B
   prepared.v_grid_n = (int32_t)arg_grid_n;
   prepared.v_K_tiles = (int32_t)arg_K_tiles;
   prepared.grid = dim3((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
-  prepared.block = dim3(512u, 1u, 1u);
+  prepared.block = dim3(384u, 1u, 1u);
   prepared.kargs[0] = &prepared.p_A;
   prepared.kargs[1] = &prepared.p_B;
   prepared.kargs[2] = &prepared.p_SFA;
@@ -997,14 +1180,14 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 179456u;
+  config.dynamicSmemBytes = 196736u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_a6e9552ad3990d2bbb48), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_36fc9a61f8b57722891f), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_warp_decode_a6e9552ad3990d2bbb48 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_warp_decode_36fc9a61f8b57722891f failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -1107,41 +1290,45 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_719081f5ef4da6c57e95), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_warp_decode_432ccf353bf44819bac3), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_warp_decode_719081f5ef4da6c57e95 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_warp_decode_432ccf353bf44819bac3 failed: "
       << cudaGetErrorString(launch_status);
 
 }
 }  // namespace stage_finalize
 
 void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
-  TVM_FFI_CHECK(num_args == 52, TypeError)
-      << "prepared sequence expects 52 arguments, got " << num_args;
+  TVM_FFI_CHECK(num_args == 71, TypeError)
+      << "prepared sequence expects 71 arguments, got " << num_args;
   DLDevice dev = args[0].cast<TensorView>().device();
   ScopedCudaDevice device_guard(dev.device_id);
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
-  CheckSameCudaDevice(args[22].cast<TensorView>(), args[0].cast<TensorView>(), "A", "fc1.A");
-  CheckSameCudaDevice(args[41].cast<TensorView>(), args[0].cast<TensorView>(), "route_outputs", "fc1.A");
+  CheckSameCudaDevice(args[17].cast<TensorView>(), args[0].cast<TensorView>(), "A", "route_pack.route_experts");
+  CheckSameCudaDevice(args[41].cast<TensorView>(), args[0].cast<TensorView>(), "A", "route_pack.route_experts");
+  CheckSameCudaDevice(args[60].cast<TensorView>(), args[0].cast<TensorView>(), "route_outputs", "route_pack.route_experts");
+  stage_route_pack::PreparedLaunch prepared_route_pack;
   stage_fc1::PreparedLaunch prepared_fc1;
   stage_fc2::PreparedLaunch prepared_fc2;
   stage_finalize::PreparedLaunch prepared_finalize;
-  stage_fc1::Prepare(prepared_fc1, args[0].cast<TensorView>(), args[1].cast<TensorView>(), args[2].cast<TensorView>(), args[3].cast<TensorView>(), args[4].cast<TensorView>(), args[5].cast<TensorView>(), args[6].cast<TensorView>(), args[7].cast<TensorView>(), args[8].cast<TensorView>(), args[9].cast<TensorView>(), args[10].cast<TensorView>(), args[11].cast<TensorView>(), args[12].cast<TensorView>(), args[13].cast<TensorView>(), args[14].cast<int64_t>(), args[15].cast<int64_t>(), args[16].cast<int64_t>(), args[17].cast<int64_t>(), args[18].cast<int64_t>(), args[19].cast<int64_t>(), args[20].cast<int64_t>(), args[21].cast<int64_t>(), stream);
-  stage_fc2::Prepare(prepared_fc2, args[22].cast<TensorView>(), args[23].cast<TensorView>(), args[24].cast<TensorView>(), args[25].cast<TensorView>(), args[26].cast<TensorView>(), args[27].cast<TensorView>(), args[28].cast<TensorView>(), args[29].cast<TensorView>(), args[30].cast<TensorView>(), args[31].cast<TensorView>(), args[32].cast<TensorView>(), args[33].cast<int64_t>(), args[34].cast<int64_t>(), args[35].cast<int64_t>(), args[36].cast<int64_t>(), args[37].cast<int64_t>(), args[38].cast<int64_t>(), args[39].cast<int64_t>(), args[40].cast<int64_t>(), stream);
-  stage_finalize::Prepare(prepared_finalize, args[41].cast<TensorView>(), args[42].cast<TensorView>(), args[43].cast<TensorView>(), args[44].cast<TensorView>(), args[45].cast<int64_t>(), args[46].cast<int64_t>(), args[47].cast<int64_t>(), args[48].cast<int64_t>(), args[49].cast<int64_t>(), args[50].cast<int64_t>(), args[51].cast<int64_t>(), stream);
+  stage_route_pack::Prepare(prepared_route_pack, args[0].cast<TensorView>(), args[1].cast<TensorView>(), args[2].cast<TensorView>(), args[3].cast<TensorView>(), args[4].cast<TensorView>(), args[5].cast<TensorView>(), args[6].cast<TensorView>(), args[7].cast<TensorView>(), args[8].cast<int64_t>(), args[9].cast<int64_t>(), args[10].cast<int64_t>(), args[11].cast<int64_t>(), args[12].cast<int64_t>(), args[13].cast<int64_t>(), args[14].cast<int64_t>(), args[15].cast<int64_t>(), args[16].cast<int64_t>(), stream);
+  stage_fc1::Prepare(prepared_fc1, args[17].cast<TensorView>(), args[18].cast<TensorView>(), args[19].cast<TensorView>(), args[20].cast<TensorView>(), args[21].cast<TensorView>(), args[22].cast<TensorView>(), args[23].cast<TensorView>(), args[24].cast<TensorView>(), args[25].cast<TensorView>(), args[26].cast<TensorView>(), args[27].cast<TensorView>(), args[28].cast<TensorView>(), args[29].cast<TensorView>(), args[30].cast<TensorView>(), args[31].cast<TensorView>(), args[32].cast<TensorView>(), args[33].cast<int64_t>(), args[34].cast<int64_t>(), args[35].cast<int64_t>(), args[36].cast<int64_t>(), args[37].cast<int64_t>(), args[38].cast<int64_t>(), args[39].cast<int64_t>(), args[40].cast<int64_t>(), stream);
+  stage_fc2::Prepare(prepared_fc2, args[41].cast<TensorView>(), args[42].cast<TensorView>(), args[43].cast<TensorView>(), args[44].cast<TensorView>(), args[45].cast<TensorView>(), args[46].cast<TensorView>(), args[47].cast<TensorView>(), args[48].cast<TensorView>(), args[49].cast<TensorView>(), args[50].cast<TensorView>(), args[51].cast<TensorView>(), args[52].cast<int64_t>(), args[53].cast<int64_t>(), args[54].cast<int64_t>(), args[55].cast<int64_t>(), args[56].cast<int64_t>(), args[57].cast<int64_t>(), args[58].cast<int64_t>(), args[59].cast<int64_t>(), stream);
+  stage_finalize::Prepare(prepared_finalize, args[60].cast<TensorView>(), args[61].cast<TensorView>(), args[62].cast<TensorView>(), args[63].cast<TensorView>(), args[64].cast<int64_t>(), args[65].cast<int64_t>(), args[66].cast<int64_t>(), args[67].cast<int64_t>(), args[68].cast<int64_t>(), args[69].cast<int64_t>(), args[70].cast<int64_t>(), stream);
+  stage_route_pack::Submit(prepared_route_pack, stream);
   stage_fc1::Submit(prepared_fc1, stream);
   stage_fc2::Submit(prepared_fc2, stream);
   stage_finalize::Submit(prepared_finalize, stream);
 }
 
-}  // namespace cake_host_shim_b86e4f90b1e976cd
+}  // namespace cake_host_shim_8c1f61bf207c2f90
 
 extern "C" {
 TVM_FFI_DLL_EXPORT int __tvm_ffi_run(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_b86e4f90b1e976cd::RunPacked(
+  cake_host_shim_8c1f61bf207c2f90::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();
