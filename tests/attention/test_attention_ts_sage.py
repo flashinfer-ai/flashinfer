@@ -634,8 +634,9 @@ class _DenseSageCase:
     out_dtype: torch.dtype
     mask_type: str = "dense"
     qk_dtype: torch.dtype = _FP8
-    # Scheduler the launch heuristic selects for this shape.
-    scheduler: str = "static"
+    # "auto" follows the launch heuristic; "static" and "persistent" force the
+    # selection and check the published policy.
+    scheduler: str = "auto"
 
     @property
     def expected_q_tile(self) -> int:
@@ -785,27 +786,20 @@ _DENSE_SAGE_CASES = (
         out_dtype=torch.bfloat16,
         qk_dtype=torch.int8,
     ),
-    # Thirty-two batches exceed one resident wave on both profiles, so the
-    # launch heuristic takes the persistent scheduler.
-    _DenseSageCase(
-        "kv256_k16_q1_bf16_persistent",
-        **{**_KV256_MHA, "batch_size": 32},
-        sage_q_block_size=1,
-        sage_k_block_size=16,
-        with_mean=False,
-        out_dtype=torch.bfloat16,
-        scheduler="persistent",
-    ),
-    _DenseSageCase(
-        "q128_int8_k16_q1_bf16_mean_persistent",
-        **{**_Q128_GQA, "batch_size": 32},
-        sage_q_block_size=1,
-        sage_k_block_size=16,
-        with_mean=True,
-        out_dtype=torch.bfloat16,
-        qk_dtype=torch.int8,
-        scheduler="persistent",
-    ),
+)
+# The dense persistent loop resolves every tile through the work tile; cover
+# one E4M3 case, one causal case with the V mean, one INT8 case, and the
+# Q128/KV128 profile on it.
+_PERSISTENT_DENSE_SAGE_CASE_NAMES = (
+    "kv256_k16_q1_bf16",
+    "kv256_k16_q1_fp16_mean_causal",
+    "kv256_int8_k16_q1_bf16",
+    "q128_int8_k16_q1_bf16_mean",
+)
+_DENSE_SAGE_CASES += tuple(
+    replace(case, name=f"{case.name}_persistent", scheduler="persistent")
+    for case in _DENSE_SAGE_CASES
+    if case.name in _PERSISTENT_DENSE_SAGE_CASE_NAMES
 )
 
 
@@ -982,32 +976,43 @@ def _plan_dense_sage(case: _DenseSageCase, params: SageAttentionParams, device):
     from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
 
     wrapper = BlockSparseTSWrapper()
+    select_scheduler = sparse_config._select_persistent_launch
+    if case.scheduler != "auto":
+
+        def select_scheduler(**_kwargs):
+            return case.scheduler == "persistent"
+
     sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     try:
-        wrapper.plan(
-            case.batch_size,
-            case.seq_len_q,
-            case.seq_len_kv,
-            case.num_qo_heads,
-            case.num_kv_heads,
-            _HEAD_DIM,
-            case.q_block_size,
-            case.kv_block_size,
-            device=device,
-            use_block_sparse=False,
-            mask_type=case.mask_type,
-            q_data_type=case.qk_dtype,
-            kv_data_type=case.qk_dtype,
-            o_data_type=case.out_dtype,
-            sage=params,
-            **_v_data_type_kwargs(case.qk_dtype),
-        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                sparse_config, "_select_persistent_launch", select_scheduler
+            )
+            wrapper.plan(
+                case.batch_size,
+                case.seq_len_q,
+                case.seq_len_kv,
+                case.num_qo_heads,
+                case.num_kv_heads,
+                _HEAD_DIM,
+                case.q_block_size,
+                case.kv_block_size,
+                device=device,
+                use_block_sparse=False,
+                mask_type=case.mask_type,
+                q_data_type=case.qk_dtype,
+                kv_data_type=case.qk_dtype,
+                o_data_type=case.out_dtype,
+                sage=params,
+                **_v_data_type_kwargs(case.qk_dtype),
+            )
     finally:
         sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     policy = dict(wrapper._policy)
     assert policy["tile_size_q"] == case.expected_q_tile
     assert policy["tile_size_kv"] == case.expected_kv_tile
-    assert policy["scheduler"] == case.scheduler
+    if case.scheduler != "auto":
+        assert policy["scheduler"] == case.scheduler
     return wrapper
 
 
@@ -1043,6 +1048,31 @@ def test_dense_sage_matches_dequantized_reference(case: _DenseSageCase) -> None:
     else:
         rtol, atol = 2e-3, 2e-3
     torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    _cases_named(_DENSE_SAGE_CASES, "kv256_k16_q1_bf16", "kv256_int8_k16_q1_bf16"),
+    ids=lambda case: case.name,
+)
+@torch.no_grad()
+def test_dense_sage_persistent_scheduler_matches_static_grid_bitwise(
+    case: _DenseSageCase,
+) -> None:
+    """The work-tile loop only reorders tiles, so both schedulers publish the same bits."""
+
+    torch.manual_seed(20260908)
+    device = torch.device("cuda", 0)
+    q, k, v, params = _random_sage_inputs(case, device)
+    sm_scale = _HEAD_DIM**-0.5
+    outputs = []
+    for scheduler in ("static", "persistent"):
+        wrapper = _plan_dense_sage(replace(case, scheduler=scheduler), params, device)
+        outputs.append(wrapper.run(q, k, v, sm_scale=sm_scale))
+        torch.cuda.synchronize()
+    assert torch.equal(outputs[0], outputs[1])
 
 
 @_REQUIRES_PRIMTS_GPU
