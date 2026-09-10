@@ -29,6 +29,7 @@ from flashinfer.fused_moe import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    QuantConfig,
     ReLU,
     ReLU2,
     SiLU,
@@ -48,6 +49,12 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from flashinfer.utils import get_compute_capability
+
+
+def quant_id(quant: QuantConfig) -> str:
+    """Pytest id for a QuantConfig MMA pair: ``NVFP4`` or ``NVFP4xBF16``."""
+    weight, activation = quant.pair
+    return weight.name if weight is activation else f"{weight.name}x{activation.name}"
 
 
 def assert_trtllm_packed_call_contract(runner, inputs) -> None:

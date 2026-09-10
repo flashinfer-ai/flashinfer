@@ -65,6 +65,7 @@ from tests.moe.test_b12x_fused_moe import (  # noqa: E402
     cute_dsl_available,
     sm120_required,
 )
+from tests.moe.utils import quant_id
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +208,7 @@ class TestB12xUnifiedValidation:
                 QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
             ),
         ),
+        ids=["NVFP4", "NVFP4xBF16"],
     )
     @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
     def test_b12x_accepts_implemented_activations(
@@ -323,6 +325,7 @@ class TestB12xUnifiedValidation:
                 QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             ),
         ),
+        ids=["NVFP4-runner-NVFP4xBF16-quant", "NVFP4xBF16-runner-NVFP4-quant"],
     )
     def test_quantization_backend_mismatch_rejected(
         self, runner_type, backend, variant
@@ -461,7 +464,7 @@ def _make_b12x_layer_and_packs(
 ):
     activation_config = _B12X_ACTIVATIONS[activation]
     hidden_size = tensors["x_bf16"].shape[1]
-    if quant == QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4):
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         backend_config = B12xNvfp4Config()
         prepared = backend_config.prepare_weights(
             tensors["w1_weight_bf16"],
@@ -543,8 +546,7 @@ def _b12x_reference(
         intermediate_size=intermediate_size,
         fc2_input_scale=(
             tensors["fc2_input_scale"]
-            if quant
-            == QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+            if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
             else None
         ),
     )
@@ -744,6 +746,19 @@ class TestUnifiedB12xConformance:
     @pytest.mark.parametrize(
         "variant,activation,num_tokens,top_k,num_experts,hidden_size,intermediate_size",
         _B12X_DISPATCH_CASES,
+        ids=[
+            f"{quant_id(quant)}-{activation}-t{num_tokens}-k{top_k}"
+            f"-e{num_experts}-h{hidden_size}-i{intermediate_size}"
+            for (
+                quant,
+                activation,
+                num_tokens,
+                top_k,
+                num_experts,
+                hidden_size,
+                intermediate_size,
+            ) in _B12X_DISPATCH_CASES
+        ],
     )
     def test_dispatch_accuracy(
         self,
@@ -787,6 +802,7 @@ class TestUnifiedB12xConformance:
                 192,
             ),
         ),
+        ids=["NVFP4-t8", "NVFP4-t128", "NVFP4xBF16-t32"],
     )
     def test_ragged_intermediate(
         self, variant, activation, num_tokens, intermediate_size
@@ -887,6 +903,7 @@ class TestUnifiedB12xConformance:
                 64,
             ),
         ),
+        ids=["NVFP4-silu", "NVFP4-relu2", "NVFP4xBF16-silu"],
     )
     def test_cuda_graph(
         self,
@@ -943,6 +960,7 @@ class TestUnifiedB12xConformance:
                 "compressed_tensors",
             ),
         ),
+        ids=["NVFP4-modelopt", "NVFP4xBF16-modelopt", "NVFP4xBF16-compressed"],
     )
     def test_matches_legacy_wrapper(self, variant, source_format):
         from flashinfer.fused_moe import B12xMoEWrapper
@@ -978,8 +996,7 @@ class TestUnifiedB12xConformance:
             hidden_size=256,
             intermediate_size=512,
             quant_mode="w4a16"
-            if variant
-            == QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16)
+            if variant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
             else "nvfp4",
             source_format=source_format,
         )

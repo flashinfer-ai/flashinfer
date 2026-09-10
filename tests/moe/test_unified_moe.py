@@ -115,6 +115,7 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
 from tests.moe.utils import (  # noqa: E402
     assert_trtllm_packed_call_contract,
     create_relu2_moe_tensors,
+    quant_id,
 )
 
 
@@ -2272,6 +2273,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
     ),
+    ids=quant_id,
 )
 @pytest.mark.parametrize(
     "activation",
@@ -2281,6 +2283,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         GeGLUTanh(),
         ReLU2(),
     ),
+    ids=lambda activation: type(activation).__name__,
 )
 def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
     shape = dict(

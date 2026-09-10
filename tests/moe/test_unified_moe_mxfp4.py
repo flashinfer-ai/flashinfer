@@ -52,6 +52,7 @@ from tests.moe.test_cute_dsl_fused_moe import (
     check_accuracy,
     compute_reference_moe_fp4,
 )
+from tests.moe.utils import quant_id
 
 
 def _sm100_family() -> bool:
@@ -67,9 +68,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def _xfail_w4a16_sm103(variant: QuantConfig) -> None:
-    if variant == QuantConfig(
-        weight=QuantFormat.MXFP4, activation=QuantFormat.BF16
-    ) and get_compute_capability(torch.device("cuda")) == (10, 3):
+    if variant.pair == (QuantFormat.MXFP4, QuantFormat.BF16) and get_compute_capability(
+        torch.device("cuda")
+    ) == (10, 3):
         pytest.xfail("TRTLLM MXFP4×BF16 is currently disabled on SM103")
 
 
@@ -236,6 +237,7 @@ def _make_runtime_case(
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
+    ids=quant_id,
 )
 def test_trtllm_mxfp4_unified_matches_reference(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -503,18 +505,25 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
 
 
+_FP4_PREP_SHAPE_CASES = [
+    *[
+        (variant, activation)
+        for variant in (
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        )
+        for activation in (SwiGLU(), GeGLU(), SiTU(), ReLU2())
+    ],
+    (QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16), SwiGLU()),
+]
+
+
 @pytest.mark.parametrize(
     "variant,activation",
-    [
-        *[
-            (variant, activation)
-            for variant in (
-                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-                QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
-            )
-            for activation in (SwiGLU(), GeGLU(), SiTU(), ReLU2())
-        ],
-        (QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16), SwiGLU()),
+    _FP4_PREP_SHAPE_CASES,
+    ids=[
+        f"{quant_id(quant)}-{type(activation).__name__}"
+        for quant, activation in _FP4_PREP_SHAPE_CASES
     ],
 )
 def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activation):
@@ -539,6 +548,7 @@ def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activati
         QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
     ),
+    ids=quant_id,
 )
 def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
     _xfail_w4a16_sm103(variant)
@@ -679,6 +689,7 @@ def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
+    ids=quant_id,
 )
 def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -716,6 +727,7 @@ def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantConfig):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
+    ids=quant_id,
 )
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 def test_trtllm_mxfp4_unpacked_matches_packed(
@@ -742,6 +754,7 @@ def test_trtllm_mxfp4_unpacked_matches_packed(
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
+    ids=quant_id,
 )
 def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -768,6 +781,7 @@ def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantConfig):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
+    ids=quant_id,
 )
 def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -792,6 +806,7 @@ def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantConfig):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
+    ids=quant_id,
 )
 @pytest.mark.parametrize(
     "hidden_size,intermediate_size",
@@ -817,69 +832,76 @@ def test_trtllm_mxfp4_rejects_unaligned_weights(
         )
 
 
+_FP4_ARCH_GATES = [
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (10, 0),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (10, 3),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (10, 7),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (12, 0),
+        False,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (10, 0),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (10, 3),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (10, 7),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (12, 0),
+        False,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (10, 0),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (10, 3),
+        False,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (10, 7),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (12, 0),
+        False,
+    ),
+]
+
+
 @pytest.mark.parametrize(
     "variant,compute_capability,supported",
-    [
-        (
-            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-            (10, 0),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-            (10, 3),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-            (10, 7),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
-            (12, 0),
-            False,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
-            (10, 0),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
-            (10, 3),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
-            (10, 7),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
-            (12, 0),
-            False,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
-            (10, 0),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
-            (10, 3),
-            False,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
-            (10, 7),
-            True,
-        ),
-        (
-            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
-            (12, 0),
-            False,
-        ),
+    _FP4_ARCH_GATES,
+    ids=[
+        f"{quant_id(quant)}-sm{cc[0]}{cc[1]}-{supported}"
+        for quant, cc, supported in _FP4_ARCH_GATES
     ],
 )
 def test_trtllm_fp4_variant_architecture_gates(
