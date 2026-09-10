@@ -3,7 +3,7 @@
   "description": "Standalone PrimTS MLA decode with concatenated latent/RoPE query and KV dimensions, native dense page tables, runtime KV lengths, and caller-owned workspace. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets.",
   "op_type": "mla_paged",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.mla_decode.prims_ts_batch_decode_with_kv_cache_mla",
+    "fi_api:flashinfer.attention.prims_ts.mla_decode.prims_ts_batch_mla_decode_with_kv_cache",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental",

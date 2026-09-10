@@ -4578,9 +4578,17 @@ class TrtllmDaRuntime:
 
 
 def _validate_routing_replay_out(
-    routing_replay_out: Optional[torch.Tensor], top_k: int
+    routing_replay_out: Optional[torch.Tensor],
+    top_k: int,
+    num_tokens: int,
 ) -> None:
-    """Validate routing_replay_out tensor properties before passing to C++ kernels."""
+    """Validate routing_replay_out tensor properties before passing to C++ kernels.
+
+    ``num_tokens`` bounds dim0 from below: the routing kernels write one replay row per
+    token unconditionally, so a shorter buffer is written past its end. Oversized buffers
+    stay legal for CUDA-graph capture at a fixed maximum batch size. It is required rather
+    than defaulted so that a new entry point cannot silently opt out of the bound.
+    """
     if routing_replay_out is None:
         return
     if routing_replay_out.dtype != torch.int16:
@@ -4594,6 +4602,12 @@ def _validate_routing_replay_out(
     if routing_replay_out.shape[1] != top_k:
         raise ValueError(
             f"routing_replay_out dim1 must equal top_k={top_k}, got {routing_replay_out.shape[1]}"
+        )
+    if routing_replay_out.shape[0] < num_tokens:
+        raise ValueError(
+            f"routing_replay_out dim0 must be >= num_tokens={num_tokens}, "
+            f"got {routing_replay_out.shape[0]}; the routing kernel writes one replay "
+            "row per token"
         )
     if not routing_replay_out.is_contiguous():
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
@@ -4808,7 +4822,9 @@ def trtllm_bf16_moe(
         scalar return; will become ``[output]`` in v0.8.0).  Otherwise returns
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
     _validate_bf16_gemm1_activation_params(
         activation_type,
         gemm1_alpha,
@@ -5025,7 +5041,9 @@ def trtllm_bf16_routed_moe(
         ``False``      ``Tensor``          ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx, gemm1_activation_output]``
         =============  ==================  =========================================================================
     """
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
     _validate_bf16_gemm1_activation_params(
         activation_type,
         gemm1_alpha,
@@ -5198,7 +5216,9 @@ def trtllm_fp8_per_tensor_scale_moe(
         Final MoE output when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_moe(
         routing_logits,
         routing_bias,
@@ -5337,7 +5357,9 @@ def trtllm_fp8_per_tensor_scale_routed_moe(
         Final MoE output when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_tensor_scale_routed_moe(
         routing_mode,
@@ -5821,7 +5843,11 @@ def trtllm_fp8_block_scale_moe(
         routing_method_type,
         routing_replay_out,
     )
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out,
+        top_k,
+        num_tokens=hidden_states.shape[0],
+    )
     _validate_fp8_block_scale_gemm1_activation_params(
         fp8_quantization_type,
         activation_type,
@@ -6312,6 +6338,10 @@ def trtllm_fp4_block_scale_moe(
     List[torch.Tensor]
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
+        The ``expert_weights`` tensor is always ``bfloat16`` (the routing
+        kernel emits bf16 weights for every routing method), regardless of
+        the ``routing_logits`` dtype — including the ``do_finalize=False``
+        path and fp32 ``DeepSeekV3`` logits.
     """
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
@@ -6321,7 +6351,11 @@ def trtllm_fp4_block_scale_moe(
         routing_method_type,
         routing_replay_out,
     )
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out,
+        top_k,
+        num_tokens=hidden_states.shape[0],
+    )
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
         routing_logits,
@@ -6766,7 +6800,9 @@ def trtllm_mxint4_block_scale_moe(
         ``[output]`` when ``do_finalize`` is ``True``, otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
-    _validate_routing_replay_out(routing_replay_out, top_k)
+    _validate_routing_replay_out(
+        routing_replay_out, top_k, num_tokens=hidden_states.shape[0]
+    )
     return get_trtllm_moe_sm100_module().trtllm_mxint4_block_scale_moe(
         routing_logits,
         routing_bias,

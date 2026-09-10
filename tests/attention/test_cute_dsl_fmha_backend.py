@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Frontend tests for the `cute-dsl` backend routed to the trtllm JIT FMHA kernel.
+"""Frontend tests for APIs backed by the shared CuTe DSL FMHA runner.
 
 Covers entry points:
-* `trtllm_ragged_attention_deepseek(backend="cute-dsl")` — the shared low-level API.
-* `BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")` — delegates to the former
-  for standard attention, falls back to prefill.py for ALiBi / soft-cap.
+* `trtllm_ragged_attention_deepseek(backend="cute-dsl")` — the TRT-LLM API entry.
+* `BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")` — independently calls
+  the runner for standard attention and uses modular prefill for ALiBi / soft-cap.
 """
 
 import math
@@ -225,7 +225,7 @@ def test_cute_dsl_jit_case(monkeypatch):
 
 
 def test_batch_prefill_cute_dsl_alibi():
-    """ALiBi is unsupported by the trtllm kernel; must use prefill.py instead."""
+    """ALiBi is unsupported by the FMHA runner; use modular prefill instead."""
     torch.manual_seed(0)
     b, s, H, D = 2, 256, 8, 128
     qo = _indptr([s] * b)
