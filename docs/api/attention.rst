@@ -18,75 +18,10 @@ for the public entry points, supported contracts, and examples. Current accuracy
 and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
 but not yet signoff-qualified.
 
-.. currentmodule:: flashinfer.attention.prims_ts
-
-FMHA Context/Prefill
---------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_prefill
-    batch_prefill_with_paged_kv_cache
-
-.. autoclass:: BatchPrefillTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchPrefillPagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-FMHA Decode
------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_decode_with_paged_kv_cache
-    get_prims_ts_batch_decode_workspace_size
-    prims_ts_batch_decode_with_kv_cache
-
-.. autoclass:: BatchDecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-Block-Sparse FMHA
------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    block_sparse_attention
-    block_sparse_attention_with_paged_kv_cache
-
-.. autoclass:: BlockSparseTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BlockSparsePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-MLA Decode
-----------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_mla_decode_with_paged_kv_cache
-    get_prims_ts_batch_mla_decode_workspace_size
-    prims_ts_batch_mla_decode_with_kv_cache
-
-.. autoclass:: BatchMLADecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
+Calling these APIs is an explicit opt-in and emits an
+``ExperimentalWarning`` once per decorated function. They provide no API
+compatibility guarantee; generated stable API reference entries are deferred
+until graduation. Logging and existing ``fi_trace`` bindings remain available.
 
 
 flashinfer.decode

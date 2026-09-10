@@ -31,7 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
 position.
 
 PrimTS context entry points are intentionally excluded from ``fi_trace`` for
-now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
+now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators do not
 register trace templates.
 """
 
@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 
 from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
 
@@ -2326,12 +2326,12 @@ class BatchPrefillTSWrapper:
     dependency.
     """
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self) -> None:
         """Initialize an unplanned task-scheduled context-attention wrapper."""
         self._plan_state: Optional[_ContextPlanState] = None
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         *,
@@ -2463,7 +2463,7 @@ class BatchPrefillTSWrapper:
             policy=policy,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
@@ -2689,7 +2689,7 @@ class BatchPrefillPagedTSWrapper:
     planning stream, the caller must establish that dependency.
     """
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
         """Create an unplanned paged-context wrapper.
 
@@ -2703,7 +2703,7 @@ class BatchPrefillPagedTSWrapper:
         self._kv_layout = kv_layout
         self._plan_state: Optional[_PagedContextPlanState] = None
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         *,
@@ -2844,7 +2844,7 @@ class BatchPrefillPagedTSWrapper:
             policy=policy,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
@@ -2987,7 +2987,7 @@ class BatchPrefillPagedTSWrapper:
         return out
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def batch_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3097,7 +3097,7 @@ def batch_prefill(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def batch_prefill_with_paged_kv_cache(
     q: torch.Tensor,
     k_cache: torch.Tensor,

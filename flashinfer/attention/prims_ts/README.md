@@ -5,6 +5,11 @@ kernels for NVIDIA Blackwell GPUs. Scheduling, tile selection, and split-KV
 reduction are implementation details; the public interfaces expose attention
 and cache semantics without tuning knobs.
 
+Public entry points marked with `@flashinfer_experimental_api` warn once on
+first use and provide no compatibility guarantee. Calling an API is the opt-in;
+no environment variable is required. Existing API logging and `fi_trace`
+bindings remain available.
+
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but is not yet signoff-qualified.
 
