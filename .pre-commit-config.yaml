@@ -25,7 +25,7 @@
 # KDA CUDA/host trees, including frozen fallback and generated-dispatch sources,
 # are byte-faithful exports. Their SHA-256 digests are checked by JIT manifests
 # and must not be rewritten.
-exclude: ^(?:csrc/(?:kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|fused_moe/warp_decode/generated/|kda/(?:cake_flashkda_blackwell_evolution_.*|training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a))\.cu)|flashinfer/(?:experimental/(?:cake_mxfp8_megamoe_ep16|sm110_gqa_decode)/csrc/|moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/))
+exclude: ^(?:csrc/(?:cake_minimax_h3_mxfp8_pre_attention/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|fused_moe/warp_decode/generated/|kda/(?:cake_flashkda_blackwell_evolution_.*|training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a))\.cu)|flashinfer/(?:experimental/(?:cake_mxfp8_megamoe_ep16|sm110_gqa_decode)/csrc/|moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/))
 
 repos:
   # Standard hooks
