@@ -121,6 +121,18 @@ from .reduction import (  # noqa: F401
 _PERSISTENT_SCHEDULE_TOKEN_STAGES = 2
 
 
+def _clc_response_in_unified_smem(cfg: FmhaDecodeConfig) -> bool:
+    """Whether the CLC response slots are carved from the unified SMEM block.
+
+    In the byte-wide kernels a separately allocated response buffer costs every
+    worker role one uniform value that is demoted to local memory across the
+    persistent loop; the unified placement removes that reload. The mechanism
+    does not depend on the element type, but the 16-bit kernels do not demote
+    the address and keep the separate buffer.
+    """
+    return cfg.use_8bit_qkv
+
+
 def _block_sparse_bshd_tma_strides(
     *,
     q_seq: cutlass.Integer | int,
@@ -543,10 +555,10 @@ def _build_decode_gen_schedule(
     # stats or TMEM-P alias S: their overwrite-credit cadence is tied to each
     # instruction. Dense Swaps uses the shared FIFO, including staged H256.
     # Sparse KV128 keeps instruction-local rings in either MMA orientation;
-    # sparse KV256 reuses its only feasible three-stage shared data ring while
-    # retaining instruction-local route metadata. The load warp issues V(route
-    # R) before replacing that metadata with route R+1, so its lifetime remains
-    # independent of the K/V data-ring depth.
+    # sparse KV256 reuses the shared data ring at its element-width-derived
+    # depth while retaining instruction-local route metadata. The load warp
+    # issues V(route R) before replacing that metadata with route R+1, so its
+    # lifetime remains independent of the K/V data-ring depth.
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
@@ -1714,8 +1726,18 @@ def _build_decode_gen_schedule(
     # SMEM / TMEM allocators
     # ------------------------------------------------------------------
     smem_allocator = SmemAllocator()
+    clc_response_alloc = None
     if work_queue is not None:
         smem_allocator.add_resource(work_queue)
+        if tile_sched_params is not None and _clc_response_in_unified_smem(cfg):
+            clc_response_alloc = smem_allocator.add(
+                SmemAllocation(
+                    "clc_response",
+                    dtype=cutlass.Int128,
+                    count=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
+                    alignment=16,
+                )
+            )
     if schedule_token_throttle is not None:
         smem_allocator.add_resource(schedule_token_throttle)
     smem_allocator.add_resource(smem_q)
@@ -1759,6 +1781,22 @@ def _build_decode_gen_schedule(
         SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
     )
     smem_allocator.compute_layout()
+    if clc_response_alloc is not None:
+        # The slots are a compile-time offset from the unified base address that
+        # every role already holds, so the scheduler is bound to them here, before
+        # the task manager creates the work queue.
+        smem_allocator.allocate()
+        work_queue.tile_scheduler_config = (
+            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+                response_ptr=cute.make_ptr(
+                    cutlass.Int128,
+                    smem_allocator.get(clc_response_alloc).data_ptr(),
+                    mem_space=cutlass.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+            )
+        )
     tmem_allocator = TmemAllocator()
     if cfg.use_keeps_mma_ab:
         if use_one_inst_qkv:
@@ -2114,7 +2152,9 @@ def _run_decode_gen_active(
     init_warp += 1
 
     clc_response_ptr = None
-    if cutlass.const_expr(use_clc_dynamic_scheduler):
+    if cutlass.const_expr(
+        use_clc_dynamic_scheduler and not _clc_response_in_unified_smem(cfg)
+    ):
         clc_response_ptr = cute.arch.alloc_smem(
             cutlass.Int128, _PERSISTENT_SCHEDULE_TOKEN_STAGES
         )

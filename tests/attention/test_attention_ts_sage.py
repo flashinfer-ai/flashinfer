@@ -634,6 +634,9 @@ class _DenseSageCase:
     out_dtype: torch.dtype
     mask_type: str = "dense"
     qk_dtype: torch.dtype = _FP8
+    # "auto" follows the planner; the test shapes fill less than one wave, so
+    # persistent cases force the selection.
+    scheduler: str = "auto"
 
     @property
     def expected_q_tile(self) -> int:
@@ -783,6 +786,18 @@ _DENSE_SAGE_CASES = (
         out_dtype=torch.bfloat16,
         qk_dtype=torch.int8,
     ),
+)
+# The dense persistent loop resolves every tile through the work tile; cover
+# one E4M3 case, one causal case with the V mean, and one INT8 case on it.
+_PERSISTENT_DENSE_SAGE_CASE_NAMES = (
+    "kv256_k16_q1_bf16",
+    "kv256_k16_q1_fp16_mean_causal",
+    "kv256_int8_k16_q1_bf16",
+)
+_DENSE_SAGE_CASES += tuple(
+    replace(case, name=f"{case.name}_persistent", scheduler="persistent")
+    for case in _DENSE_SAGE_CASES
+    if case.name in _PERSISTENT_DENSE_SAGE_CASE_NAMES
 )
 
 
@@ -959,31 +974,43 @@ def _plan_dense_sage(case: _DenseSageCase, params: SageAttentionParams, device):
     from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
 
     wrapper = BatchDecodeTSWrapper()
+    select_scheduler = sparse_config._select_dense_contiguous_scheduler
+    if case.scheduler != "auto":
+
+        def select_scheduler(**_kwargs):
+            return case.scheduler == "persistent"
+
     sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     try:
-        wrapper.plan(
-            case.batch_size,
-            case.seq_len_q,
-            case.seq_len_kv,
-            case.num_qo_heads,
-            case.num_kv_heads,
-            _HEAD_DIM,
-            case.q_block_size,
-            case.kv_block_size,
-            device=device,
-            use_block_sparse=False,
-            mask_type=case.mask_type,
-            q_data_type=case.qk_dtype,
-            kv_data_type=case.qk_dtype,
-            o_data_type=case.out_dtype,
-            sage=params,
-            **_v_data_type_kwargs(case.qk_dtype),
-        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                sparse_config, "_select_dense_contiguous_scheduler", select_scheduler
+            )
+            wrapper.plan(
+                case.batch_size,
+                case.seq_len_q,
+                case.seq_len_kv,
+                case.num_qo_heads,
+                case.num_kv_heads,
+                _HEAD_DIM,
+                case.q_block_size,
+                case.kv_block_size,
+                device=device,
+                use_block_sparse=False,
+                mask_type=case.mask_type,
+                q_data_type=case.qk_dtype,
+                kv_data_type=case.qk_dtype,
+                o_data_type=case.out_dtype,
+                sage=params,
+                **_v_data_type_kwargs(case.qk_dtype),
+            )
     finally:
         sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     policy = dict(wrapper._policy)
     assert policy["tile_size_q"] == case.expected_q_tile
     assert policy["tile_size_kv"] == case.expected_kv_tile
+    if case.scheduler != "auto":
+        assert policy["scheduler"] == case.scheduler
     return wrapper
 
 
@@ -1019,6 +1046,31 @@ def test_dense_sage_matches_dequantized_reference(case: _DenseSageCase) -> None:
     else:
         rtol, atol = 2e-3, 2e-3
     torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    _cases_named(_DENSE_SAGE_CASES, "kv256_k16_q1_bf16", "kv256_int8_k16_q1_bf16"),
+    ids=lambda case: case.name,
+)
+@torch.no_grad()
+def test_dense_sage_persistent_scheduler_matches_static_grid_bitwise(
+    case: _DenseSageCase,
+) -> None:
+    """The work-tile loop only reorders tiles, so both schedulers publish the same bits."""
+
+    torch.manual_seed(20260908)
+    device = torch.device("cuda", 0)
+    q, k, v, params = _random_sage_inputs(case, device)
+    sm_scale = _HEAD_DIM**-0.5
+    outputs = []
+    for scheduler in ("static", "persistent"):
+        wrapper = _plan_dense_sage(replace(case, scheduler=scheduler), params, device)
+        outputs.append(wrapper.run(q, k, v, sm_scale=sm_scale))
+        torch.cuda.synchronize()
+    assert torch.equal(outputs[0], outputs[1])
 
 
 @_REQUIRES_PRIMTS_GPU

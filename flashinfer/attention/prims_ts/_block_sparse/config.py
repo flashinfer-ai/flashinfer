@@ -61,6 +61,14 @@ _Q8_FINE_KV_CLC_MAX_QUALIFIED_ROW_ROUTES = 128
 # tile so cross-geometries do not create additional codegen policy variants.
 _B8_MASKED_MIN_PARALLEL_ROUTE_PAIRS = 3
 _B16_MIN_PARALLEL_ROUTE_PAIRS = 4
+# Dense contiguous byte-wide KV256 plans switch to the CLC work-tile loop once
+# the static grid exceeds this many resident waves. The persistent loop
+# overlaps one tile's epilogue with the next tile's QK head, which a static CTA
+# that exits after its single tile cannot do, so it pays off as soon as a
+# second wave exists. 16-bit dense plans keep the static grid. A
+# ``gmem_reduction`` outcome of the launch heuristic maps to the static grid,
+# because Sage attention forbids split-KV.
+_DENSE_CONTIGUOUS_8BIT_CLC_MIN_WAVES = 1
 
 
 @dataclass(frozen=True)
@@ -268,6 +276,53 @@ def _select_block_sparse_scheduler(
             ),
         )
     return q_tile_size, mode == "persistent"
+
+
+def _select_dense_contiguous_scheduler(
+    *,
+    device_index: int,
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    q_tile_size: int,
+    kv_route_size: int,
+    dtype_key: str,
+) -> bool:
+    """Return whether a dense contiguous plan runs the persistent scheduler.
+
+    Byte-wide KV256 plans take the CLC work-tile loop once the static grid
+    spans more than ``_DENSE_CONTIGUOUS_8BIT_CLC_MIN_WAVES`` resident waves.
+    16-bit plans and the Q128/KV128 profile keep the static grid: the former
+    by policy, the latter because its dense recipe admits no persistent loop.
+    """
+
+    if (
+        kv_route_size != _BLOCK_SPARSE_KV256_ROUTE_SIZE
+        or _cutlass_dtype(dtype_key).width != 8
+    ):
+        return False
+    from ..kernels.fmha_decode.fmha_decode_config import (
+        _select_auto_launch_mode,
+        make_q_tile_geometry,
+    )
+
+    q_geometry = make_q_tile_geometry(
+        rows_per_cta=q_tile_size,
+        heads_q_per_kv=num_qo_heads // num_kv_heads,
+        groups_tokens_heads_q=True,
+    )
+    with torch.cuda.device(device_index):
+        mode = _select_auto_launch_mode(
+            batch_size=batch_size,
+            num_heads_kv=num_kv_heads,
+            seq_len_kv=seq_len_kv,
+            num_q_tiles=q_geometry.num_q_ctas(seq_len_q),
+            tile_size_kv=kv_route_size,
+            persistent_min_waves=_DENSE_CONTIGUOUS_8BIT_CLC_MIN_WAVES,
+        )
+    return mode == "persistent"
 
 
 def _validate_dense_contiguous_kv_extent(
@@ -643,8 +698,8 @@ def _resolve_block_sparse_launch_spec(
     index values and physical-tail morphology never specialize this cache
     entry. Proxy and exact routes share one scheduler selection. An
     unsupported persistent profile falls back to its valid static
-    counterpart. Dense contiguous mode keeps the sparse tile selection but
-    runs the static grid, because it owns no prepared routes to amortize.
+    counterpart. Dense contiguous mode keeps the sparse tile selection and
+    chooses its scheduler through ``_select_dense_contiguous_scheduler``.
     """
 
     if use_block_sparse:
@@ -667,7 +722,17 @@ def _resolve_block_sparse_launch_spec(
             heads_q_per_kv=num_qo_heads // num_kv_heads,
             kv_block_size=kv_block_size,
         )
-        use_persistent_scheduler = False
+        use_persistent_scheduler = _select_dense_contiguous_scheduler(
+            device_index=device_index,
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            q_tile_size=q_tile_size,
+            kv_route_size=kv_route_size,
+            dtype_key=dtype_key,
+        )
         _validate_dense_contiguous_kv_extent(
             seq_len_kv=seq_len_kv,
             num_kv_heads=num_kv_heads,
@@ -716,6 +781,13 @@ def _resolve_block_sparse_launch_spec(
                 cause=error,
             ) from error
         if not compile_key.use_persistent_scheduler:
+            if sage_k_block_size > 0 and "Keeps profile" in str(error):
+                raise _sage_profile_error(
+                    q_tile_size=q_tile_size,
+                    kv_route_size=kv_route_size,
+                    kv_block_size=kv_block_size,
+                    cause=error,
+                ) from error
             raise
         compile_key = replace(
             compile_key,
