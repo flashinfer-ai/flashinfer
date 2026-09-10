@@ -553,7 +553,9 @@ class BlockSparseAttentionWrapper:
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
-            The number of columns of the block-sparse matrix, ``NB = N // C``, ``N`` should be divisible by ``C``.
+            The number of columns of the block-sparse matrix, ``NB = ceil_div(N, C)``.
+            For most backends ``N`` must be divisible by ``C``; the ``vsa_sm100_blk64``
+            backend additionally supports a partial last KV block (``N % C != 0``).
         R : int
             The number of rows in each block.
         C : int
