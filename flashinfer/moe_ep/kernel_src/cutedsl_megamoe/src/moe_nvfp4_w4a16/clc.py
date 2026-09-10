@@ -310,6 +310,37 @@ def complete_fc1(workspace, counter, work, threshold: cutlass.Constexpr, in_boun
 
 
 @cute.jit
+def claim_and_publish_bundle(
+    cluster_pipeline,
+    storage,
+    workspace,
+    claim_pipe,
+    ds,
+    claim_state,
+    bundle,
+    bundles,
+    fc1_tasks,
+    cluster_x: cutlass.Constexpr,
+    bundle_size: cutlass.Constexpr,
+):
+    owned = cutlass.Int32(0)
+    if (
+        ds.is_leader_cta
+        and cute.arch.lane_idx() == 0
+        and bundle >= 0
+        and bundle < bundles
+    ):
+        owned = cutlass.Int32(workspace.claim(bundle))
+    owned, ds = broadcast(cluster_pipeline, ds, owned, cluster_x)
+    if owned != 0:
+        for sub in cutlass.range_constexpr(bundle_size):
+            index = bundle * bundle_size + sub
+            if index < fc1_tasks:
+                claim_state = publish_claim(storage, claim_pipe, claim_state, index)
+    return ds, claim_state
+
+
+@cute.jit
 def run(
     scheduler,
     storage,
@@ -337,22 +368,25 @@ def run(
     consumer = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
     response = storage.clc_response.data_ptr()
     x, _, z = cute.arch.block_idx()
-    bundle = x // cluster_x + z
+    initial_bundle = x // cluster_x + z
     clc_enabled = True
     scan_exhausted = False
     claim_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
+    ds, claim_state = claim_and_publish_bundle(
+        scheduler._cluster_pipeline,
+        storage,
+        workspace,
+        claim_pipe,
+        ds,
+        claim_state,
+        initial_bundle,
+        bundles,
+        fc1_tasks,
+        cluster_x,
+        bundle_size,
+    )
     done = False
     while not done:
-        owned = cutlass.Int32(0)
-        if elected and bundle >= 0 and bundle < bundles:
-            owned = cutlass.Int32(workspace.claim(bundle))
-        owned, ds = broadcast(scheduler._cluster_pipeline, ds, owned, cluster_x)
-        if owned != 0:
-            for sub in cutlass.range_constexpr(bundle_size):
-                index = bundle * bundle_size + sub
-                if index < fc1_tasks:
-                    claim_state = publish_claim(storage, claim_pipe, claim_state, index)
-
         task = cutlass.Int32(-1)
         if elected:
             task = workspace.pop()
@@ -407,6 +441,20 @@ def run(
                     bundle = next_bundle
                 else:
                     scan_exhausted = True
+            # The bundle dies after publication instead of crossing the loop header.
+            ds, claim_state = claim_and_publish_bundle(
+                scheduler._cluster_pipeline,
+                storage,
+                workspace,
+                claim_pipe,
+                ds,
+                claim_state,
+                bundle,
+                bundles,
+                fc1_tasks,
+                cluster_x,
+                bundle_size,
+            )
 
     if leader:
         clc_pipe.producer_tail(producer)
