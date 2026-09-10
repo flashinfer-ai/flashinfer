@@ -233,11 +233,6 @@ class W4A16Epilogue:
 
             work_tile_info = sched_consumer.consume_work()
 
-            # Drain pending FC1 stores before publishing the fc1-done counter.
-            if cur_was_linear1:
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-            # _fence_rel_gpu()
             wait_only_named_barrier.arrive_and_wait()
 
             # Publish completion for the work tile snapshotted above.
