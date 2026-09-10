@@ -20,7 +20,12 @@ import statistics
 import subprocess
 
 
+class BenchmarkGateError(RuntimeError):
+    """A fixed, benchmark-authored message safe to include in a shared receipt."""
+
+
 def positive_int(value):
+    """Parse a strictly positive CLI dimension or iteration count."""
     value = int(value)
     if value <= 0:
         raise argparse.ArgumentTypeError("must be positive")
@@ -28,6 +33,7 @@ def positive_int(value):
 
 
 def parse_args(argv=None):
+    """Parse one low-M shape without importing or initializing CUDA."""
     parser = argparse.ArgumentParser(description=__doc__)
     for axis in ("m", "n", "k"):
         parser.add_argument(f"--{axis}", type=positive_int, required=True)
@@ -41,6 +47,7 @@ def parse_args(argv=None):
 
 
 def check_rows(actual, reference):
+    """Validate every row against FP32, including zero-reference edge cases."""
     import torch
 
     if actual.ndim != 2 or actual.shape != reference.shape:
@@ -67,6 +74,7 @@ def check_rows(actual, reference):
 
 
 def bracket(before, candidate, after):
+    """Summarize one A/B/A trial using the mean of the two control medians."""
     medians = [statistics.median(v) for v in (before, candidate, after)]
     if not all(
         math.isfinite(x) and x > 0
@@ -86,8 +94,9 @@ def bracket(before, candidate, after):
 
 
 def run(args, result):
+    """Validate and time frozen default/tuned graphs, retaining partial results."""
     if os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") != "0":
-        raise RuntimeError(
+        raise BenchmarkGateError(
             "disable inherited file-based tuning for a default comparison"
         )
     import torch
@@ -103,11 +112,13 @@ def run(args, result):
     from cupti import cupti  # noqa: F401 -- require CUPTI, never silently time events
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        raise RuntimeError("requires SM100 or SM103")
+        raise BenchmarkGateError("requires SM100 or SM103")
     if not is_cute_dsl_experimental_available():
-        raise RuntimeError("requires the current warp-capable CuTe DSL >=4.7 runtime")
+        raise BenchmarkGateError(
+            "requires the current warp-capable CuTe DSL >=4.7 runtime"
+        )
     if int(importlib.metadata.version("cupti-python").split(".")[0]) < 13:
-        raise RuntimeError("requires cupti-python >=13")
+        raise BenchmarkGateError("requires cupti-python >=13")
     root = Path(flashinfer.__file__).resolve().parent.parent
     sha = subprocess.check_output(
         ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -152,6 +163,7 @@ def run(args, result):
     checks = result.setdefault("correctness", {})
 
     def capture(name, fn, out, tune=False):
+        """Check eager output and freeze the selected kernels before cache changes."""
         print(json.dumps({"event": "prepare", "arm": name}), flush=True)
         with autotune(tune):
             fn()
@@ -176,6 +188,7 @@ def run(args, result):
             out = torch.empty(args.m, args.n, device="cuda", dtype=torch.bfloat16)
 
             def call(backend=backend, out=out):
+                """Bind each backend and output before the surrounding loop advances."""
                 return mm_bf16(a, b, out=out, backend=backend, pdl=False)
 
             capture(name, call, out, tuned)
@@ -197,6 +210,7 @@ def run(args, result):
     result["timings"] = {}
 
     def measure(name):
+        """Collect complete cold-L2 graph replay durations in microseconds."""
         times = bench_gpu_time_with_cupti(
             graphs[name].replay,
             dry_run_iters=20,
@@ -205,7 +219,7 @@ def run(args, result):
             cold_l2_cache=True,
         )
         if len(times) != args.iterations:
-            raise RuntimeError("CUPTI did not report every requested replay")
+            raise BenchmarkGateError("CUPTI did not report every requested replay")
         return [float(t) * 1000 for t in times]
 
     for name in graphs:
@@ -218,9 +232,10 @@ def run(args, result):
                 measure(name),
                 measure("cublaslt_tuned"),
             )
+            summary = bracket(a1, candidate, a2)
             trials.append(
                 {
-                    **bracket(a1, candidate, a2),
+                    **summary,
                     "samples_us": {"before": a1, "candidate": candidate, "after": a2},
                 }
             )
@@ -230,7 +245,7 @@ def run(args, result):
                         "event": "bracket",
                         "arm": name,
                         "trial": len(trials),
-                        **bracket(a1, candidate, a2),
+                        **summary,
                     }
                 ),
                 flush=True,
@@ -239,6 +254,7 @@ def run(args, result):
 
 
 def main(argv=None):
+    """Write a non-overwriting receipt while preserving any failure traceback."""
     args = parse_args(argv)
     result = {
         "shape": {a: getattr(args, a) for a in ("m", "n", "k")},
@@ -253,6 +269,12 @@ def main(argv=None):
             run(args, result)
         except Exception as exc:
             result["error_type"] = type(exc).__name__
+            # Third-party exception text can contain paths or command arguments.
+            result["error_message"] = (
+                str(exc)
+                if isinstance(exc, BenchmarkGateError)
+                else "Failure details are available in stderr."
+            )
             raise
         finally:
             json.dump(result, output, indent=2, allow_nan=False)
