@@ -36,6 +36,10 @@ mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd="rn")
 fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
 fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
 ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
+# TRTLLM-gen spells the packed softmax affine transform as modifier-free
+# ``mul.f32x2`` + ``add.f32x2`` PTX. Unlike explicit ``.rn`` operations,
+# these are eligible for ptxas contraction to one FFMA2. Keep distinct names
+# so numerical helpers elsewhere retain their explicit-rounding contract.
 
 
 def ceil_div(a, b):
@@ -145,18 +149,25 @@ def qk_desc_stride_byte_offset(cfg) -> int:
 
 def p_desc_layout(cfg):
     """Return the UMMA descriptor layout for P in SMEM."""
+    if cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128:
+        # Source BMM2 P: leading=8192, stride=1024, S128B.
+        return 2
     del cfg
     return 4
 
 
 def p_desc_leading_byte_offset(cfg) -> int:
     """Return the descriptor leading byte offset for P in SMEM."""
+    if cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128:
+        return 8192
     del cfg
     return 16
 
 
 def p_desc_stride_byte_offset(cfg) -> int:
     """Return the descriptor stride byte offset for P in SMEM."""
+    if cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128:
+        return 1024
     del cfg
     return 512
 

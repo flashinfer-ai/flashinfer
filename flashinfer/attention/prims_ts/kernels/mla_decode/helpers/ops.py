@@ -17,6 +17,8 @@
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T as mlir_T
 from cutlass.experimental import primitives as cprims
 
 from .constants import (
@@ -42,6 +44,133 @@ primitives_inline_ptx = cprims.inline_ptx
 
 inline_ptx = cute.arch.inline_ptx
 """CuTe inline PTX entry point used by MLA helper ops."""
+
+
+def _emit_ptxas_pragma(pragma: str, *, loc=None, ip=None) -> None:
+    """Emit one side-effecting PTXAS scheduling pragma.
+
+    These pragmas do not become device instructions.  The memory clobber is
+    nevertheless required: TRTLLM-gen uses the same compiler fences to keep
+    ptxas from moving operations across the intended software schedule.
+    """
+
+    llvm.inline_asm(
+        None,
+        [],
+        pragma,
+        "~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
+def dsv4_warp_switch(*, loc=None, ip=None) -> None:
+    """Match ``trtllm::dev::warpSwitch`` for the following instruction."""
+
+    _emit_ptxas_pragma('.pragma "next knob WarpOpexPrev=1";', loc=loc, ip=ip)
+
+
+@cutlass.dsl_user_op
+def dsv4_code_fence(*, loc=None, ip=None) -> None:
+    """Match TRTLLM-gen's non-runtime ``cfence`` compiler barrier."""
+
+    _emit_ptxas_pragma('.pragma "next knob FenceCode";', loc=loc, ip=ip)
+
+
+@cutlass.dsl_user_op
+def dsv4_sched_res_busy_xu64(*, loc=None, ip=None) -> None:
+    """Select the source MUFU issue-spacing hint in the current scope."""
+
+    _emit_ptxas_pragma('.pragma "set knob SchedResBusyXU64=1";', loc=loc, ip=ip)
+
+
+@cutlass.dsl_user_op
+def dsv4_set_cold_block(*, loc=None, ip=None) -> None:
+    """Mark the following source-equivalent mask block as cold."""
+
+    _emit_ptxas_pragma('.pragma "set knob ColdBlock";', loc=loc, ip=ip)
+
+
+@cutlass.dsl_user_op
+def dsv4_reset_cold_block(*, loc=None, ip=None) -> None:
+    """End a source-equivalent cold mask block."""
+
+    _emit_ptxas_pragma('.pragma "reset knob ColdBlock";', loc=loc, ip=ip)
+
+
+@cutlass.dsl_user_op
+def dsv4_cp_async_cg_l2_128b(dst, src, *, loc=None, ip=None) -> None:
+    """Issue source-exact W9 ``cp.async.cg ... L2::128B``.
+
+    CuTe's public per-thread ``cp_async_shared_global`` primitive exposes the
+    L1 cache scope but not the PTX L2 prefetch-size qualifier.  TRTLLM-gen's
+    16-byte ``trtllm::dev::cpAsync`` uses both ``.cg`` and ``.L2::128B``;
+    keep this tiny wrapper local to the DSV4 selector stream rather than
+    changing cache policy for unrelated MLA copies.
+    """
+
+    dst_addr = dst.toint(Int32, loc=loc, ip=ip)
+    # Tensor iterator ``llvm_ptr`` is already an LLVM pointer OpResult rather
+    # than a CuTe ``Pointer`` wrapper.  Convert that exact value explicitly;
+    # calling ``Pointer.toint`` here would be a front-end type error.
+    src_addr = llvm.ptrtoint(mlir_T.i64(), src, loc=loc, ip=ip)
+    llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            dst_addr.ir_value(loc=loc, ip=ip),
+            src_addr,
+        ],
+        ("{ cp.async.cg.shared.global.L2::128B [$1], [$2], 16; mov.u32 $0, 0; }"),
+        "=r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
+def dsv4_clc_response_predicated(result_addr, *, loc=None, ip=None):
+    """Decode one DSV4 CLC response without querying an invalid CTA id.
+
+    CUDA defines ``get_first_ctaid`` only when ``is_canceled`` succeeds.
+    Keep both queries in one source-equivalent asm block so the CTA-coordinate
+    query is predicated by that exact response predicate.  Coordinate outputs
+    are intentionally unspecified on failure and must only be consumed under
+    the returned valid predicate.
+    """
+
+    # CLC response storage is a CuTe SMEM pointer; its ``toint`` chooses the
+    # address-space-native Int32 token without an explicit dtype argument.
+    result_addr_i32 = result_addr.toint(loc=loc, ip=ip)
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.i32()] * 4),
+        [result_addr_i32.ir_value(loc=loc, ip=ip)],
+        """
+        {
+          .reg .pred p1;
+          .reg .b128 clc_result;
+          ld.shared.b128 clc_result, [$4];
+          clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
+          selp.u32 $3, 1, 0, p1;
+          @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$0, $1, $2, _}, clc_result;
+        }
+        """,
+        "=r,=r,=r,=r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Int32(llvm.extractvalue(mlir_T.i32(), result, [idx], loc=loc, ip=ip))
+        for idx in range(4)
+    )
 
 
 @cute.jit
@@ -106,6 +235,17 @@ def fmax_f32(a, b, *, loc=None, ip=None):
     """Return the maximum of two values as Float32."""
     return Float32(
         cute.math.max(Float32(a), Float32(b), ftz=True, loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cutlass.dsl_user_op
+def fabs_f32(value: Float32, *, loc=None, ip=None):
+    """Return ``fabsf(value)`` through NVVM's native FTZ operation."""
+
+    return Float32(
+        cute.math.abs(Float32(value), ftz=True, loc=loc, ip=ip),
         loc=loc,
         ip=ip,
     )
@@ -214,6 +354,166 @@ def pack_float4_to_fp8_e4m3(v0: Float32, v1: Float32, v2: Float32, v3: Float32):
         "}",
         write_only_types=[Int32],
         read_only_args=[v0, v1, v2, v3],
+    )
+
+
+@cute.jit
+def convert_f32_vector_to_bf16_satfinite(values, num_elements: cutlass.Constexpr[int]):
+    """Pack an even Float32 vector to BF16 with source epilogue saturation.
+
+    ``TensorSSA.to(BFloat16)`` lowers to ``cvt.rn.bf16x2.f32``.  TRTLLM-gen's
+    epilogue instead instantiates CUTLASS's ``round_to_nearest_satfinite``
+    converter, which lowers to ``cvt.rn.satfinite.bf16x2.f32``.  The modifier
+    is observable when a runtime output scale overflows BF16, so it belongs to
+    the numerical ABI rather than being only a SASS tuning detail.
+
+    Keep the result packed in 32-bit registers so callers can retain their
+    existing 128/256-bit GMEM stores.
+    """
+
+    if cutlass.const_expr(num_elements <= 0 or num_elements % 2 != 0):
+        raise ValueError("BF16 satfinite conversion requires a positive even vector")
+    packed = cutlass.Array(
+        Int32,
+        num_elements // 2,
+        space=cutlass.AddressSpace.rmem,
+    )
+    for pair_idx in cutlass.range_constexpr(num_elements // 2):
+        src_idx = pair_idx * 2
+        packed[pair_idx] = inline_ptx(
+            "cvt.rn.satfinite.bf16x2.f32 {$w0}, {$r1}, {$r0};",
+            write_only_types=[Int32],
+            read_only_args=[values[src_idx], values[src_idx + 1]],
+        )
+    return packed.load(0, num_elements // 2).bitcast(cutlass.BFloat16)
+
+
+@cute.jit
+def mul_ftz_f32(lhs: Float32, rhs: Float32):
+    """Multiply scalar FP32 with TRTLLM-gen's fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "mul.rn.ftz.f32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def rcp_approx_ftz_f32(value: Float32):
+    """Approximate scalar reciprocal matching CUDA ``__fdividef`` lowering."""
+
+    return inline_ptx(
+        "rcp.approx.ftz.f32 {$w0}, {$r0};",
+        write_only_types=[Float32],
+        read_only_args=[value],
+    )
+
+
+@cute.jit
+def add_ftz_f32(lhs: Float32, rhs: Float32):
+    """Add scalar FP32 with TRTLLM-gen's fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "add.rn.ftz.f32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def sub_ftz_f32(lhs: Float32, rhs: Float32):
+    """Subtract scalar FP32 with TRTLLM-gen's fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "sub.rn.ftz.f32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def fma_ftz_f32(lhs: Float32, rhs: Float32, addend: Float32):
+    """FMA scalar FP32 with TRTLLM-gen's fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "fma.rn.ftz.f32 {$w0}, {$r0}, {$r1}, {$r2};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs, addend],
+    )
+
+
+@cutlass.dsl_user_op
+def affine2_contractible_f32(
+    lhs0: Float32,
+    lhs1: Float32,
+    rhs0: Float32,
+    rhs1: Float32,
+    add0: Float32,
+    add1: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Compute two affine values through source-exact contractible PTX.
+
+    TRTLLM-gen emits modifier-free ``mul.f32x2`` followed by ``add.f32x2``;
+    ptxas contracts that pair to FFMA2 while retaining a different scheduling
+    graph from directly requesting ``fma.rn.f32x2``.  Returning scalars from
+    the same asm block also places the packed-result unpack before the next
+    source ``FenceCode`` pragma.
+    """
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.f32(), mlir_T.f32()]),
+        [
+            Float32(lhs0).ir_value(loc=loc, ip=ip),
+            Float32(lhs1).ir_value(loc=loc, ip=ip),
+            Float32(rhs0).ir_value(loc=loc, ip=ip),
+            Float32(rhs1).ir_value(loc=loc, ip=ip),
+            Float32(add0).ir_value(loc=loc, ip=ip),
+            Float32(add1).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+          .reg .b64 lhs;
+          .reg .b64 rhs;
+          .reg .b64 addend;
+          .reg .b64 product;
+          .reg .b64 affine;
+          mov.b64 lhs, {$2, $3};
+          mov.b64 rhs, {$4, $5};
+          mov.b64 addend, {$6, $7};
+          mul.f32x2 product, lhs, rhs;
+          add.f32x2 affine, product, addend;
+          mov.b64 {$0, $1}, affine;
+        }
+        """,
+        "=f,=f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(mlir_T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(mlir_T.f32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@cute.jit
+def fnma_ftz_f32(lhs: Float32, rhs: Float32, addend: Float32):
+    """Compute ``-lhs * rhs + addend`` using one source-shaped FTZ FMA."""
+
+    # CuTe lowers the negated input through the NVVM FMA intrinsic.  Keeping
+    # the negation outside inline PTX lets NVVM express the operand modifier;
+    # ptxas then folds it into the single FFMA.FTZ instruction used by source.
+    return cute.math.fma(
+        -lhs,
+        rhs,
+        addend,
+        ftz=True,
     )
 
 
