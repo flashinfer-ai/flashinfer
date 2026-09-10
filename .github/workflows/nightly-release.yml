@@ -22,7 +22,7 @@ jobs:
       release_tag: ${{ steps.set-suffix.outputs.release_tag }}
       version: ${{ steps.set-suffix.outputs.version }}
       jit_cache_provider_matrix: ${{ steps.cuda-versions.outputs.providers }}
-      jit_cache_shim_matrix: ${{ steps.cuda-versions.outputs.shims }}
+      jit_cache_provider_set_matrix: ${{ steps.cuda-versions.outputs.provider_sets }}
       runtime_cuda_matrix: ${{ steps.cuda-versions.outputs.runtime }}
     steps:
       - name: Checkout code
@@ -74,7 +74,7 @@ jobs:
         id: cuda-versions
         run: |
           echo "providers=$(python3 ci/validate_cuda_versions.py --matrix providers)" >> "$GITHUB_OUTPUT"
-          echo "shims=$(python3 ci/validate_cuda_versions.py --matrix shims)" >> "$GITHUB_OUTPUT"
+          echo "provider_sets=$(python3 ci/validate_cuda_versions.py --matrix provider-sets)" >> "$GITHUB_OUTPUT"
           echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
   build-flashinfer-python:
@@ -257,7 +257,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.setup.outputs.jit_cache_shim_matrix) }}
+        include: ${{ fromJSON(needs.setup.outputs.jit_cache_provider_set_matrix) }}
     runs-on: [self-hosted, linux, "${{ matrix.cpu_architecture == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
     steps:
       - name: Cleanup
@@ -300,7 +300,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.setup.outputs.jit_cache_shim_matrix) }}
+        include: ${{ fromJSON(needs.setup.outputs.jit_cache_provider_set_matrix) }}
     runs-on: [self-hosted, linux, "${{ matrix.cpu_architecture == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
     steps:
       - name: Checkout code
@@ -337,14 +337,7 @@ jobs:
     needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim, validate-flashinfer-jit-cache-providers]
     # Publish only from main: a workflow_dispatch on any other branch runs the
     # builds and tests as a dry run without touching the nightly release/index.
-    if: >-
-      always() && github.ref == 'refs/heads/main' &&
-      needs.setup.result == 'success' &&
-      needs.build-flashinfer-python.result == 'success' &&
-      needs.build-flashinfer-cubin.result == 'success' &&
-      needs.build-flashinfer-jit-cache-provider.result == 'success' &&
-      needs.build-flashinfer-jit-cache-shim.result == 'success' &&
-      needs.validate-flashinfer-jit-cache-providers.result == 'success'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -434,13 +427,6 @@ jobs:
 
   test-nightly-build:
     needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache-provider, build-flashinfer-jit-cache-shim, validate-flashinfer-jit-cache-providers]
-    if: >-
-      always() && needs.setup.result == 'success' &&
-      needs.build-flashinfer-python.result == 'success' &&
-      needs.build-flashinfer-cubin.result == 'success' &&
-      needs.build-flashinfer-jit-cache-provider.result == 'success' &&
-      needs.build-flashinfer-jit-cache-shim.result == 'success' &&
-      needs.validate-flashinfer-jit-cache-providers.result == 'success'
     strategy:
       fail-fast: false
       matrix:

@@ -176,8 +176,8 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
     _prepare_build()
 
-    # Shim requirements differ by CPU platform, so both wheel kinds need a
-    # platform tag even though the shim itself contains only Python metadata.
+    # Requirements differ by CPU platform, so this metadata-only shim still
+    # needs a platform tag.
     with _MonkeyPatchBdistWheel():
         return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 

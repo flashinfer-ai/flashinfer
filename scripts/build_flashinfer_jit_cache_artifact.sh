@@ -19,7 +19,7 @@ export CUDA_MAJOR CUDA_MINOR
 
 mkdir -p "${FLASHINFER_CI_CACHE}" "${REPO_ROOT}/sccache-stats"
 
-if [ "${FLASHINFER_JIT_CACHE_BUILD_TARGET}" != "shim" ] && \
+if [ "${FLASHINFER_JIT_CACHE_BUILD_TARGET}" = "provider" ] && \
    [ "${FLASHINFER_LOCAL_VERSION}" = "cu134" ]; then
   : "${SCCACHE_PATCHED_BINARY_PATH:=/ci-cache/sccache-cu134/${ARCH}/sccache}"
   export SCCACHE_PATCHED_BINARY_PATH

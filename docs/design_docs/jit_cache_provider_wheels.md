@@ -4,17 +4,17 @@
 
 This document describes the provider-based `flashinfer-jit-cache` layout. The
 runtime discovery contract and provider release/nightly paths are implemented.
-This final-state variant removes monolithic wheel production; the complete
-provider inventory must still be validated before deploying it in production.
+The implementation removes monolithic wheel production; the complete provider
+inventory must still be validated before deploying it in production.
 
 ## Problem
 
-The current wheel puts every generated AOT shared library in one distribution.
-Adding a CUDA architecture adds code to many of those libraries, so the wheel
-continues to grow and is already close to release-asset limits. A local-version
-split such as `flashinfer-jit-cache+cu130.sm90` does not solve installation:
-those artifacts are versions of the same distribution, and pip can install only
-one of them at a time.
+The previous monolithic wheel put every generated AOT shared library in one
+distribution. Adding a CUDA architecture adds code to many of those libraries,
+so the wheel continues to grow and is already close to release-asset limits. A
+local-version split such as `flashinfer-jit-cache+cu130.sm90` does not solve
+installation: those artifacts are versions of the same distribution, and pip
+can install only one of them at a time.
 
 The published jit-cache wheels contain host code plus SASS cubins. They do not
 contain PTX. An unsuffixed sm80 cubin has CUDA's same-major binary compatibility,
@@ -22,15 +22,15 @@ but cannot provide a fallback for Hopper or Blackwell. Architecture-specific
 targets such as sm90a and sm121a are exact-target binaries and are not forward
 compatible.
 
-The current monolithic build also uses size-oriented fatbin compression, omits
-single-request prefill/decode modules, and excludes selected architectures from
-size-constrained matrix entries. Those are useful tactical reductions, but they
-do not replace provider splitting: removing an architecture from an aggregate
-wheel removes its warm-cache coverage entirely. Provider coverage must therefore
-be a separate policy from the architecture list used to keep a monolithic wheel
-under its publication limit. In particular, standalone sm75 and sm121a providers
-can retain coverage even when those targets are absent from the corresponding
-aggregate wheel.
+The previous monolithic build also used size-oriented fatbin compression,
+omitted single-request prefill/decode modules, and excluded selected
+architectures from size-constrained matrix entries. Those are useful tactical
+reductions, but they do not replace provider splitting: removing an architecture
+from an aggregate wheel removes its warm-cache coverage entirely. Provider
+coverage must therefore be a separate policy from the architecture list used to
+keep a monolithic wheel under its publication limit. In particular, standalone
+sm75 and sm121a providers can retain coverage even when those targets are absent
+from the corresponding aggregate wheel.
 
 The new layout must support both of these workflows:
 
