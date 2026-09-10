@@ -186,7 +186,15 @@ def test_cake_targets_share_sources_but_have_distinct_build_identities():
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
     assert len(sm100_variants) == len(sm103_variants) == 44
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
-        assert replace(sm100, target="sm103a") == sm103
+        expected_flags = sm100.extra_cuda_cflags
+        if sm100.name in (
+            "compact_async_f32_wide_slot_offsets",
+            "compact_async_pr_eval_h96_f32_wide_slot_offsets",
+        ):
+            expected_flags += ("-Xptxas=--minnctapersm=3",)
+        assert (
+            replace(sm100, target="sm103a", extra_cuda_cflags=expected_flags) == sm103
+        )
         assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
         sm100_uri = cake_jit.get_cake_fused_kda_decode_uri(sm100.name, "sm100a")
         sm103_uri = cake_jit.get_cake_fused_kda_decode_uri(sm103.name, "sm103a")
@@ -225,13 +233,23 @@ def test_cake_selector_resolves_requested_target_registry(target):
 
 
 @pytest.mark.parametrize(("target", "minor"), (("sm100a", 0), ("sm103a", 3)))
-def test_cake_jit_spec_uses_exact_target_flags(monkeypatch, tmp_path, target, minor):
+@pytest.mark.parametrize(
+    ("name", "sm103_min_blocks"),
+    (
+        ("wide512_f32_wide_slot_offsets", False),
+        ("compact_async_f32_wide_slot_offsets", True),
+        ("compact_async_pr_eval_h96_f32_wide_slot_offsets", True),
+    ),
+)
+def test_cake_jit_spec_uses_exact_target_flags(
+    monkeypatch, tmp_path, target, minor, name, sm103_min_blocks
+):
     monkeypatch.setattr(
         jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, f"{minor}a")}
     )
     monkeypatch.setattr(cake_jit.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
     cake_jit.gen_cake_fused_kda_decode_module.cache_clear()
-    variant = cake_jit.get_cake_fused_kda_decode_variants(target)[0]
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
     spec = cake_jit.gen_cake_fused_kda_decode_module(variant.name, target)
     assert spec.name == cake_jit.get_cake_fused_kda_decode_uri(variant.name, target)
     assert spec.sources[0] == variant.body_path
@@ -242,6 +260,14 @@ def test_cake_jit_spec_uses_exact_target_flags(monkeypatch, tmp_path, target, mi
         f"-DFLASHINFER_CAKE_FUSED_KDA_DECODE_TARGET_MINOR={minor}"
         in spec.extra_cuda_cflags
     )
+    expected_occupancy_flags = (
+        ["-Xptxas=--minnctapersm=3"] if target == "sm103a" and sm103_min_blocks else []
+    )
+    assert [
+        flag
+        for flag in spec.extra_cuda_cflags
+        if flag.startswith("-Xptxas=--minnctapersm=")
+    ] == expected_occupancy_flags
     cake_jit.gen_cake_fused_kda_decode_module.cache_clear()
 
 

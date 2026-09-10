@@ -3627,6 +3627,14 @@ def get_cake_fused_kda_decode_variants(
                 f"Cake fused KDA source identity mismatch for {name}: "
                 f"{source_sha256} != {item['source_sha256']}"
             )
+        extra_cuda_cflags = tuple(item["extra_cuda_cflags"])
+        if target == "sm103a" and name in (
+            "compact_async_f32_wide_slot_offsets",
+            "compact_async_pr_eval_h96_f32_wide_slot_offsets",
+        ):
+            # Preserve three resident CTAs when NVCC allocates more registers
+            # than the source compiler for these wide-offset schedules.
+            extra_cuda_cflags += ("-Xptxas=--minnctapersm=3",)
         eligibility = []
         for rule in item["eligibility"]:
             eligibility.append(
@@ -3650,7 +3658,7 @@ def get_cake_fused_kda_decode_variants(
                 abi_kind=item["abi_kind"],
                 state_dtype=item["state_dtype"],
                 slot_offset_bits=item["slot_offset_bits"],
-                extra_cuda_cflags=tuple(item["extra_cuda_cflags"]),
+                extra_cuda_cflags=extra_cuda_cflags,
                 threads=item["threads"],
                 dynamic_smem_bytes=item["dynamic_smem_bytes"],
                 eligibility=tuple(eligibility),
