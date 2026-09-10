@@ -2679,10 +2679,12 @@ class _FullyFusedDeltaRuleSm80(KeyedCompileMixin):
 # ─── Public API ──────────────────────────────────────────────────────────────
 
 
-#: Private opt-in for the v32 prototype. Off, and no public or automatic path
-#: sets it: the specialization is a measurement subject, not a feature. A
-#: benchmark that sets this still only gets v32 on the one contract
-#: `_v32_applies` admits, and gets the shipped kernel everywhere else.
+#: Benchmark opt-in for the v32 specialization, and off. It is not how the
+#: public entry reaches v32 -- `gdn_prefill` offers the specialization from
+#: host-side data through the `enabled` argument below -- it is the override
+#: for a caller measuring v32 without that offer. Either way v32 is taken
+#: only on the one contract `_v32_applies` admits; everything else gets the
+#: shipped kernel.
 _V32_PROTOTYPE = False
 
 
@@ -2702,10 +2704,11 @@ def _v32_applies(
     """Whether this call takes v32: the caller asked, and the contract holds.
 
     The contract is deliberately exact rather than a region. Everything in it
-    was measured on `1x8192 gva4x16` -- above 1.00x against Triton on all four
-    items, in three independent processes -- and nothing outside it has been.
-    Anything else falls back to the shipped kernel rather than taking a path
-    no measurement covers.
+    was measured on `1x8192 gva4x16` in three independent processes, where
+    v32 runs 1.067x-1.094x of the shipped V64 path on all four items; see
+    `V32_SM80_MAX_SEQ_LEN` for how those readings sit against Triton. Nothing
+    outside the contract has been measured, so anything else falls back to the
+    shipped kernel rather than taking a path no measurement covers.
 
     `enabled` is what the dispatcher decided from host-side data it has and
     this function does not, chiefly the exact longest sequence and the compute
