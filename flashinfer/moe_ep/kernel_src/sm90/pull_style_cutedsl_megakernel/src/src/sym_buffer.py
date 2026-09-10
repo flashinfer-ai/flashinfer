@@ -19,6 +19,7 @@ freeing those slots lets all 16 byval lanes hold offsets (EP16, not EP14).
 """
 
 from dataclasses import dataclass
+import inspect
 from typing import Any, Optional
 
 import cutlass
@@ -35,6 +36,40 @@ from cutlass.base_dsl.typing import get_c_pointers
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm
 
+
+try:
+    _LLVM_GEP_REQUIRES_NO_WRAP = (
+        "no_wrap_flags" in inspect.signature(llvm.getelementptr).parameters
+    )
+except Exception:
+    _LLVM_GEP_REQUIRES_NO_WRAP = False
+
+
+def _llvm_getelementptr(
+    result_type,
+    base,
+    dynamic_indices,
+    raw_constant_indices,
+    element_type,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Call the LLVM dialect GEP builder across CuTeDSL 4.5/4.6."""
+
+    args = (
+        result_type,
+        base,
+        dynamic_indices,
+        raw_constant_indices,
+        element_type,
+    )
+    if _LLVM_GEP_REQUIRES_NO_WRAP:
+        return llvm.getelementptr(
+            *args, llvm.GEPNoWrapFlags(0), loc=loc, ip=ip
+        )
+    return llvm.getelementptr(*args, loc=loc, ip=ip)
+
 try:
     # GEP encodes a runtime index by storing this sentinel in rawConstantIndices;
     # it is MLIR's LLVM::GEPOp::kDynamicIndex (== INT32_MIN), frozen by the IR
@@ -46,7 +81,7 @@ except ImportError:  # older wheels: value is fixed by the GEP encoding ABI
 _BYVAL_RANK_LIMIT = 16             # struct<(array<16 x i64>)> == exactly 128B
 
 
-# TODO: Remove once the compiler is fixed. Workaround for the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
+#TODO: Fix this when compiler fixed. This is a shit WAR due to the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
 def _byval_struct_ty() -> Any:
     """128B byval pointee shared by alloca / GEP / the ``llvm.byval`` attr."""
     return ir.Type.parse(f"!llvm.struct<(array<{_BYVAL_RANK_LIMIT} x i64>)>")
@@ -95,13 +130,12 @@ class SymBufferDeviceBase:
             # so a flat ``gep i64, ptr, dst_rank`` reaches offsets[dst_rank]
             # directly; the byval struct type only governs the 128B const-bank copy.
             i64_ty = ir.Type.parse("i64")
-            off_ptr = llvm.getelementptr(
+            off_ptr = _llvm_getelementptr(
                 ir.Type.parse("!llvm.ptr"),
                 self.val,
                 [dst_rank_idx.ir_value()],
                 [MLIR_DYNAMIC_INDEX],
                 i64_ty,
-                no_wrap_flags="None",
             )
             off = Int64(llvm.load(i64_ty, off_ptr))
         else:
@@ -127,6 +161,45 @@ class SymBufferDeviceBase:
 
 
 @dataclass(frozen=True)
+class SingleRankSymBufferDevice:
+    """Zero-field identity mapper for single-rank MegaMoE launches."""
+
+    def __extract_mlir_values__(self) -> list:
+        return []
+
+    def __new_from_mlir_values__(
+        self, values: list
+    ) -> "SingleRankSymBufferDevice":
+        if values:
+            raise ValueError("SingleRankSymBufferDevice has no MLIR values")
+        return self
+
+    def __get_mlir_types__(self) -> list:
+        return []
+
+    def __extract_mlir_attributes__(self) -> list:
+        return []
+
+    @cute.jit
+    def map(
+        self,
+        local_ptr: Int64,
+        dst_rank_idx: Int32,
+        byte_off: Int64 = Int64(0),
+    ) -> Int64:
+        return local_ptr + byte_off
+
+    @cute.jit
+    def ptr_map_to_rank(
+        self,
+        ptr,
+        dst_rank_idx: Int32,
+        byte_align: Optional[int] = None,
+    ):
+        return ptr
+
+
+@dataclass(frozen=True)
 class SymBufferHost:
     """Runtime launch payload for a device-side ``SymBuffer{N}``.
 
@@ -149,11 +222,11 @@ class SymBufferHost:
 
     @staticmethod
     def _as_int64(value) -> Int64:
-        return value if isinstance(value, Int64) else Int64(int(value))
+        return value if isinstance(value, Int64) else Int64(value)
 
     @staticmethod
     def _as_int32(value) -> Int32:
-        return value if isinstance(value, Int32) else Int32(int(value))
+        return value if isinstance(value, Int32) else Int32(value)
 
     @dsl_user_op
     def make_device_obj(self, *, loc=None, ip=None) -> Any:
@@ -179,9 +252,9 @@ class SymBufferHost:
                 alignment=64, loc=loc, ip=ip,
             )
             for i, off in enumerate(offsets):
-                slot = llvm.getelementptr(
+                slot = _llvm_getelementptr(
                     ptr_ty, buf, [], [i], i64_ty,
-                    no_wrap_flags="None", loc=loc, ip=ip,
+                    loc=loc, ip=ip,
                 )
                 llvm.store(self._as_int64(off).ir_value(), slot, loc=loc, ip=ip)
             return SymBufferDeviceBase(val=buf, num_max_ranks=num_max_ranks)

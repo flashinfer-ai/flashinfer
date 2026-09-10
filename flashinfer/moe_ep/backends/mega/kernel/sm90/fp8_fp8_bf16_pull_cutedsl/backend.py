@@ -53,6 +53,40 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config: Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig = config
+        if config.knobs is not None:
+            if not (isinstance(config.knobs, dict) or config.knobs == "auto"):
+                raise ValueError(
+                    f"knobs must be None, a knob dict, or 'auto'; got {config.knobs!r}"
+                )
+            if any(
+                v is not None
+                for v in (
+                    config.swap_ab,
+                    config.pingpong,
+                    config.mma_tiler_mnk,
+                    config.cluster_shape_mnk,
+                )
+            ):
+                raise ValueError(
+                    "knobs= is mutually exclusive with the explicit geometry "
+                    "fields (swap_ab / pingpong / mma_tiler_mnk / "
+                    "cluster_shape_mnk)"
+                )
+        # knobs="auto": tune at the first compute() (weights + staged inputs
+        # exist there), then keep the winner for the session.
+        self._autotune_pending = config.knobs == "auto"
+        if self._autotune_pending:
+            import warnings
+
+            warnings.warn(
+                "knobs='auto' runs a COLLECTIVE compile+timing sweep at the "
+                "first forward — never use it inside a serving engine. Tune "
+                "offline instead (python -m flashinfer.moe_ep.tune); winners "
+                "persist in the knob cache and knobs=None then resolves them "
+                "with a pure lookup.",
+                UserWarning,
+                stacklevel=3,
+            )
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -114,6 +148,40 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    def _frontend_config_kwargs(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        fp = fleet_params
+        return {
+            "num_total_experts": fp.num_experts,
+            "num_max_tokens": fp.max_tokens_per_rank,
+            "num_topk": k.top_k,
+            "hidden": fp.token_hidden_size,
+            "intermediate": k.intermediate_size,
+            "rank": self.ep_rank,
+            "world_size": self.ep_world_size,
+            "kind": k.kind,
+            "fp8_scale_mode": k.fp8_scale_mode,
+            "fp8_accum_mode": k.fp8_accum_mode,
+            "knobs": k.knobs if isinstance(k.knobs, dict) else None,
+            "swap_ab": k.swap_ab,
+            "pingpong": k.pingpong,
+            "mma_tiler_mnk": k.mma_tiler_mnk,
+            "cluster_shape_mnk": k.cluster_shape_mnk,
+            "load_balance_mode": k.load_balance_mode,
+            "gate_up_clamp": _resolve_gate_up_clamp(k),
+            "activation_clamp": k.activation_clamp,
+            "in_kernel_fc2_reduce": k.in_kernel_fc2_reduce,
+            "token_back_by_dispatch": k.token_back_by_dispatch,
+            "token_back_mode": k.token_back_mode,
+            "dedup_dispatch": k.dedup_dispatch,
+            "grouped_token_back": k.grouped_token_back,
+            "combine_format": k.combine_format,
+            "active_dispatch_warps": k.active_dispatch_warps,
+            "fc1_store_offload": k.fc1_store_offload,
+            "fc1_early_done_publish": k.fc1_early_done_publish,
+            "fold_producer_warps": k.fold_producer_warps,
+        }
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Backend talks only to the pull_style_cutedsl_megakernel shim (never
         # src/ directly).
@@ -121,26 +189,8 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             get_symm_buffer_for_hopper_fp8_mega_moe,
         )
 
-        k = self._kernel_config
-        fp = fleet_params
         return get_symm_buffer_for_hopper_fp8_mega_moe(
-            fp.num_experts,
-            fp.max_tokens_per_rank,
-            k.top_k,
-            fp.token_hidden_size,
-            k.intermediate_size,
-            self.ep_rank,
-            self.ep_world_size,
-            kind=k.kind,
-            fp8_scale_mode=k.fp8_scale_mode,
-            fp8_accum_mode=k.fp8_accum_mode,
-            swap_ab=k.swap_ab,
-            mma_tiler_mnk=k.mma_tiler_mnk,
-            load_balance_mode=k.load_balance_mode,
-            gate_up_clamp=_resolve_gate_up_clamp(k),
-            activation_clamp=k.activation_clamp,
-            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
-            token_back_by_dispatch=k.token_back_by_dispatch,
+            **self._frontend_config_kwargs(fleet_params)
         )
 
     def validate_forward(
@@ -240,6 +290,11 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         if output is not None:
             num_tokens = output.shape[0]
         else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
             staged = staged_tokens(workspace.topk_idx)
             if staged is None:
                 raise ValueError(
@@ -249,6 +304,31 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             num_tokens = staged
 
         kcfg = self._kernel_config
+        if self._autotune_pending:
+            # COLLECTIVE: every EP rank reaches this first compute() together,
+            # so the candidate sweep stays in lockstep (see shim/autotune.py).
+            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                autotune_hopper_fp8_mega_moe,
+            )
+
+            autotune_hopper_fp8_mega_moe(
+                output,
+                transformed_weights[0],
+                transformed_weights[1],
+                workspace,
+                num_tokens=num_tokens,
+                gate_up_clamp=_resolve_gate_up_clamp(kcfg),
+                activation_clamp=kcfg.activation_clamp,
+                process_group=(
+                    self._ep_comm_group
+                    if self._ep_comm_group is not None
+                    else (self.ep_comm_group if self.ep_world_size > 1 else None)
+                ),
+            )
+            # Cleared only on success: if the collective tune raises, a retried
+            # compute() re-attempts it (all ranks fail together, so lockstep
+            # holds).
+            self._autotune_pending = False
         view = hopper_fp8_mega_moe(
             output,
             transformed_weights[0],
@@ -265,28 +345,46 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         return output if output is not None else view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        if self._kernel_config.knobs == "auto":
+            # Autotune retunes (and recompiles) the workspace's shared
+            # frontend at first compute; give each session its own buffer.
+            return None
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            resolve_hopper_fp8_mega_moe_config,
+        )
+
+        # The resolved frontend config is the complete session tactic. This
+        # intentionally ignores whether an equivalent tactic was requested
+        # explicitly or came from cache/heuristic resolution.
+        resolved_config = resolve_hopper_fp8_mega_moe_config(
+            **self._frontend_config_kwargs(fleet_params)
+        )
+        return self._workspace_pool_key_from_config(resolved_config)
+
+    def _workspace_pool_key_from_config(self, resolved_config: Any) -> Any:
         import torch
 
-        k = self._kernel_config
-        fp = fleet_params
         return (
             "sm90_fp8_fp8_bf16_pull_cutedsl",
             torch.cuda.current_device(),
-            self.ep_rank,
-            self.ep_world_size,
             id(self._ep_comm_group),
-            fp.num_experts,
-            fp.max_tokens_per_rank,
-            k.top_k,
-            fp.token_hidden_size,
-            k.intermediate_size,
-            k.kind,
-            k.fp8_scale_mode,
-            k.fp8_accum_mode,
-            k.swap_ab,
-            k.mma_tiler_mnk,
-            k.load_balance_mode,
-            _resolve_gate_up_clamp(k),
-            k.in_kernel_fc2_reduce,
-            k.token_back_by_dispatch,
+            resolved_config,
+        )
+
+    def _workspace_pool_request(self, fleet_params: FleetParams) -> Any:
+        if self._kernel_config.knobs == "auto":
+            return None
+        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config,
+            resolve_hopper_fp8_mega_moe_config,
+        )
+
+        resolved_config = resolve_hopper_fp8_mega_moe_config(
+            **self._frontend_config_kwargs(fleet_params)
+        )
+        key = self._workspace_pool_key_from_config(resolved_config)
+        return key, lambda: (
+            _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config(
+                resolved_config
+            )
         )

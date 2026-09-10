@@ -148,6 +148,48 @@ def test_base_prepare_workspace_unpooled_when_key_none():
     ws1.destroy.assert_called_once()
 
 
+def test_base_prepare_workspace_uses_one_bound_key_factory_request():
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams
+    from flashinfer.moe_ep.core.kernel.base import MegaKernelBackend
+
+    resolved = object()
+
+    class _RequestBackend(MegaKernelBackend):
+        request_calls = 0
+        factory_calls = 0
+        legacy_allocations = 0
+
+        @classmethod
+        def kernel_name(cls) -> str:
+            return "request_backend"
+
+        def _workspace_pool_request(self, fleet_params):
+            type(self).request_calls += 1
+
+            def factory():
+                type(self).factory_calls += 1
+                return mock.MagicMock(name="bound_workspace")
+
+            return ("resolved", resolved), factory
+
+        def _allocate_workspace(self, fleet_params):
+            type(self).legacy_allocations += 1
+            raise AssertionError("pooled request must use its bound factory")
+
+        def compute(self, workspace, transformed_weights, *, output):
+            return output
+
+    bootstrap = BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    fp = FleetParams(num_experts=2, max_tokens_per_rank=4, token_hidden_size=8)
+    first = _RequestBackend(object()).prepare_workspace(bootstrap, fp)
+    second = _RequestBackend(object()).prepare_workspace(bootstrap, fp)
+
+    assert first is second
+    assert _RequestBackend.request_calls == 2
+    assert _RequestBackend.factory_calls == 1
+    assert _RequestBackend.legacy_allocations == 0
+
+
 @pytest.mark.arch_blackwell
 def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
     """Two same-geometry layers: one buffer, one compile, correct numerics."""
