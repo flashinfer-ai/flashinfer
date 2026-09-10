@@ -221,8 +221,10 @@ if __name__ == "__main__":
     if args.update_config and configs:
         # ProfilingCacheKey.file_key excludes the runner's hash, which might be
         # different across machines, and matches the lookup format used by
-        # load_from_file. v[0] and v[1] are the runner id and the tactic.
-        converted = {k.file_key: (v[0], v[1]) for k, v in configs.items()}
+        # load_from_file. Cache values are (tactic, profile); the runner-id
+        # slot is written as 0 for file-format compatibility — lookups resolve
+        # the runner from the class name embedded in file_key, not this slot.
+        converted = {k.file_key: (0, v[0]) for k, v in configs.items()}
         config_path = get_config_path(is_module=False)
         with open(config_path, "w") as f:
             f.write("best_configs = ")

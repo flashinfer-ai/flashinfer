@@ -74,7 +74,6 @@ _INCLUDE_FILES = [
     "src/moe_scale_inputs.cuh",
     "src/moe_interface.h",
     "src/moe_internal.h",
-    "src/moe_grid_barrier.h",
     "src/moe_tma.h",
     "src/ptx_utils.h",
 ]
@@ -86,9 +85,10 @@ def gen_monomoe_module():
     Generate the JIT compilation spec for the MonoMoe kernel.
 
     Compiles the single-kernel top-K MoE pipeline (routing, up-projection,
-    SiLU, down-projection, reduction) for the Qwen3.5-35B block-FP8
-    WGMMA+TMA path.  Hopper (SM90a) only — the kernel uses
-    `wgmma.mma_async` and TMA, which require SM90.
+    SiLU, down-projection, reduction) for the block-FP8 WGMMA+TMA path,
+    hard-specialized to the fixed E=256/N=512/K=2048 shape (BS8, M <= 8).
+    Hopper (SM90a) only — the kernel uses `wgmma.mma_async` and TMA, which
+    require SM90.
 
     Returns:
         JitSpec that can be built and loaded.
@@ -107,7 +107,8 @@ def gen_monomoe_module():
             raise FileNotFoundError(f"monomoe source file not found: {src_path}")
         dest_path = gen_directory / rel_name
         os.makedirs(dest_path.parent, exist_ok=True)
-        shutil.copy(src_path, dest_path)
+        # copy2 keeps source mtimes; a fresh mtime forces a full ninja rebuild
+        shutil.copy2(src_path, dest_path)
         return dest_path
 
     sources = [_copy(fname) for fname in _SOURCE_FILES]

@@ -34,22 +34,18 @@ struct MoEDimensions {
   struct KernelConfig {
     static constexpr std::uint32_t GRID_SIZE = (2 * N) / 16;
     static constexpr std::uint32_t BLOCK_SIZE = 384;
-    // Defaults for the generic (non-WGMMA) path.  Concrete shape variants
-    // (e.g. Dims_BS8_..._WGMMA_TMA) override these.  K_STEP_* default to 128
-    // (the SWZ128 atom K-width).
-    static constexpr bool USE_WGMMA = false;
-    static constexpr bool USE_TMA = false;
-    static constexpr std::uint32_t K_STEP_DOWN = 128;
-    static constexpr std::uint32_t K_STEP_UP = 128;
   };
 };
 
-// The single BS8 shape variant: TMA + WGMMA, SWIZZLE_128B on both weight
-// sides.  Phase 3 (up-proj) uses the Hopper wgmma.mma_async fp8 path with a
-// v1 dual-warpgroup K=128 streaming pipeline.  Group geometry (UP_GRID,
-// UP_GROUPS, DOWN_GRID, DOWN_GROUPS) and the TMA caller contracts live in
-// docs/design_docs/monomoe_kernel.md §5/§6; per-tensor specifics are in the moe_tma.h factory docs.
-struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
+// ── Single fixed-shape Dims (E=256, N=512, K=2048 block-wise FP8) ─────────
+// The kernel is hard-specialized to one shape and one token cap (BS8: M <= 8).
+// The KernelConfig knobs below are the shipped default (formerly config 0);
+// the omitted DOWN_COL_TILE / UP_COL_HALVES / UP_W_SLOTS / DOWN_PIPE_DEPTH are
+// derived by the SFINAE detectors in moe_internal.h (UP_COL_HALVES resolves to
+// 1 for this coupled shape, DOWN_PIPE_DEPTH to 2), so this struct is
+// byte-identical to the pre-reduction default kernel.  Grid = 128 <= H200's
+// 132 SMs (the co-residency invariant).
+struct Dims_BS8_E256_N512_K2048_BlockFP8_WGMMA_TMA {
   static constexpr uint32_t HIDDEN_STATES = 2048;
   static constexpr uint32_t K = 2048;
   static constexpr uint32_t N = 512;
@@ -84,6 +80,7 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
     // cost of doubling the per-slot bf16/fp8 activation tile and the
     // per-slot weight tile in SHM (see the K-step note in moe_internal.h).
     static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr bool USE_PAIR_LAYOUT = true;
   };
 };
 
@@ -100,11 +97,24 @@ using S_element = float;           // scaling factors
 using R_element = __nv_bfloat16;   // MoE output
 
 /**
+ * @brief Returns the maximum amount of shared memory necessary to run
+ * moe_kernel_topk()
+ */
+constexpr size_t get_moe_max_shmem_size();
+
+/**
+ * @brief Returns the maximum amount of global scratchpad memory to run
+ * moe_kernel_topk()
+ */
+constexpr size_t get_moe_max_scratchpad_size();
+
+/**
  * @brief W8A8 MoE kernel with configurable top-K routing, scoring function,
  *        and renormalization.
  *
- * Designed for Qwen3.5-30B-A3B FP8 (softmax scoring, top_k=8, 256 experts).
- * Also supports block-wise (128×128) FP8 quantization for Qwen3.5-35B.
+ * Supports block-wise (128×128) FP8 quantization for the fixed
+ * E256_N512_K2048 shape (softmax scoring, top_k up to 8, 256 experts).  See
+ * docs/design_docs/monomoe_kernel.md for the architecture.
  *
  * @param [in] activations_in Input activations. Shape: [M, K]
  * @param [in] token_count Number of active tokens

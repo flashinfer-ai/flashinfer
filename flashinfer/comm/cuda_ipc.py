@@ -109,6 +109,8 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
+        # ​cudaError_t cudaIpcCloseMemHandle ( void* devPtr )
+        Function("cudaIpcCloseMemHandle", cudaError_t, [ctypes.c_void_p]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -190,6 +192,9 @@ class CudaRTLibrary:
         )
         return devPtr
 
+    def cudaIpcCloseMemHandle(self, devPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaIpcCloseMemHandle"](devPtr))
+
 
 class _LazyCudaRTLibrary:
     _library: Optional[CudaRTLibrary] = None
@@ -237,8 +242,6 @@ def create_shared_buffer(
     rank = dist.get_rank(group=group)
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
-    handles = [None] * world_size
-    dist.all_gather_object(handles, handle, group=group)
 
     pointers: List[int] = []
     for i, h in enumerate(handles):
@@ -256,8 +259,15 @@ def free_shared_buffer(
 ) -> None:
     r"""Free a shared buffer previously created by :func:`create_shared_buffer`.
 
-    Each rank releases only its rank-local allocation; the IPC-mapped peer
-    pointers must not be freed here.
+    Collective: every rank in the group must call this together. Callers must
+    ensure no kernel is still using the buffers (synchronize the streams that
+    touched them) before calling.
+
+    Teardown order matters for CUDA IPC: every rank first closes the peer
+    mappings it opened with ``cudaIpcOpenMemHandle``, a barrier confirms all
+    mappings are closed everywhere, and only then does each rank ``cudaFree``
+    its own allocation — freeing memory still IPC-mapped in a peer process is
+    undefined behavior.
 
     Parameters
     ----------
@@ -270,6 +280,10 @@ def free_shared_buffer(
     if group is None:
         group = dist.group.WORLD
     rank = dist.get_rank(group=group)
+    for i, ptr in enumerate(pointers or []):
+        if i != rank and ptr is not None:
+            cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(ptr))
+    dist.barrier(group=group)
     if pointers and len(pointers) > rank and pointers[rank] is not None:
         cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
     dist.barrier(group=group)

@@ -1703,12 +1703,12 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
     }
   }
   int threads_per_token = params.hidden_dim / VEC_SIZE;
-  int cluster_size;
-  if (SM >= 90) {
-    cluster_size = 8;
-  } else {
-    cluster_size = 1;
-  }
+  // Clamp to the largest cluster the device can launch.
+  static const int max_cluster_size =
+      GetMaxClusterSize(reinterpret_cast<void const*>(
+                            allreduce_fusion_kernel_oneshot_lamport<Pattern, T, NRanks, Fp32Acc>),
+                        128);
+  int cluster_size = std::min(8, max_cluster_size);
   while (threads_per_token % cluster_size != 0 && cluster_size > 1) {
     cluster_size /= 2;
   }

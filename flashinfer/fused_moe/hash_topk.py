@@ -33,7 +33,7 @@ from flashinfer.utils import (
 
 # hash_topk is plain CUDA (warp shuffle + table gather), portable across all
 # tensor-core capable architectures.
-_HASH_TOPK_SUPPORTED_CC = [80, 86, 89, 90, 100, 103, 110, 120, 121]
+_HASH_TOPK_SUPPORTED_CC = [80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 
 
 @supported_compute_capability(_HASH_TOPK_SUPPORTED_CC)

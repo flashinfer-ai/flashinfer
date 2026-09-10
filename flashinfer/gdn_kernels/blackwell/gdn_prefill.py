@@ -38,6 +38,8 @@ from cutlass.cute.runtime import from_dlpack
 from flashinfer.cute_dsl.utils import get_num_sm
 
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from ..cute_dsl_cache_naming import make_kernel_name
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +49,61 @@ from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
 
 # Keyed on static kernel configuration. Head counts (HQ, HV) are part of
 # the key because the tile scheduler and GQA reshape logic bake them in.
+_CUTE_DSL_MODULE = "gdn_blackwell_prefill"
+
+
+def _kernel_source_files() -> tuple:
+    """Source files whose content invalidates the on-disk kernel cache."""
+    from . import gated_delta_net_chunked, gated_delta_net_tile_scheduler
+
+    return (
+        __file__,
+        gated_delta_net_chunked.__file__,
+        gated_delta_net_tile_scheduler.__file__,
+    )
+
+
+def _prefill_kernel_name(
+    io_dtype_str: str,
+    state_dtype_str: str,
+    HQ: int,
+    HV: int,
+    is_GQA: bool,
+    use_initial_state: bool,
+    store_final_state: bool,
+    enable_checkpoints: bool,
+    use_state_indices: bool,
+    cu_seqlens_dtype_str: str,
+    state_indices_dtype_str: str,
+    cu_checkpoints_dtype_str: str,
+    initial_state_inner_strides,
+    output_state_inner_strides,
+    num_sm: int,
+) -> str:
+    """Specialization name within the gdn_blackwell_prefill module.
+
+    Encodes every ``_get_compiled_cache`` key component plus ``num_sm``, which
+    the compile below bakes in as ``max_active_clusters``.
+    """
+    return make_kernel_name(
+        io_dtype_str,
+        state_dtype_str,
+        HQ,
+        HV,
+        is_GQA,
+        use_initial_state,
+        store_final_state,
+        enable_checkpoints,
+        use_state_indices,
+        cu_seqlens_dtype_str,
+        state_indices_dtype_str,
+        cu_checkpoints_dtype_str,
+        initial_state_inner_strides,
+        output_state_inner_strides,
+        num_sm,
+    )
+
+
 @functools.cache
 def _get_compiled_cache(
     io_dtype_str: str,
@@ -57,8 +114,20 @@ def _get_compiled_cache(
     use_initial_state: bool,
     store_final_state: bool,
     enable_checkpoints: bool,
+    use_state_indices: bool,
+    cu_seqlens_dtype_str: str,
+    state_indices_dtype_str: str,
+    cu_checkpoints_dtype_str: str,
+    initial_state_inner_strides: tuple[int, ...] | None,
+    output_state_inner_strides: tuple[int, ...] | None,
 ):
-    """Return a mutable dict that lazily stores the compiled kernel."""
+    """Return a mutable dict that lazily stores the compiled kernel.
+
+    Holds only the compiled callable and static metadata (``num_sm``). Mutable
+    execution state such as workspaces must not be stored here: the dict is
+    process-global per specialization, so any buffer it holds is shared across
+    streams and CUDA graphs.
+    """
     return {}
 
 
@@ -91,6 +160,38 @@ def _cutlass_state_dtype(torch_dtype: torch.dtype):
         )
 
 
+def _mark_state_layout(s_cute, use_state_indices: bool, DK: int) -> None:
+    """Mark the recurrent-state tensor layout for compilation.
+
+    Packed mode (``use_state_indices=False``): the caller passes a compact
+    ``[num_seqs, H, V, K]`` state, so we keep the original marking that both
+    makes the layout dynamic (stride-1 K dim auto-deduced) and attaches a
+    ``divisibility=DK`` hint on the K dim for wider vectorized state copies.
+
+    Pool/indexed mode (``use_state_indices=True``): the caller passes its real
+    SSM state pool ``[N_pool, H, V, K]`` whose dim-0 (slot) stride is padded by
+    the mamba conv+ssm cache packing, i.e. ``stride[0] > H*V*K`` -> the layout is
+    NON-COMPACT. ``mark_compact_shape_dynamic`` asserts a compact layout and
+    raises ``RuntimeError: The stride_order is not consistent with the layout``.
+    ``mark_layout_dynamic()`` alone pins the single stride-1 dim (mode 3 = K) to
+    stride 1 and carries every other stride (including the padded dim-0) through
+    as a dynamic runtime value. The kernel addresses the state purely via
+    ``s.stride[...]`` (reshape at ~475-497 and ``mS_init/mS_out[..., state_row]``),
+    so a padded dim-0 stride is handled correctly. cutlass-dsl offers no way to
+    attach a divisibility hint without also requiring compactness, so this path
+    drops the ``divisibility=DK`` hint; the stride-1 K dim is retained, so the
+    128x128 state autovec copy still vectorizes (possibly a narrower vector).
+    That copy is a negligible fraction of the kernel, so correctness is kept
+    with no meaningful perf cost.
+    """
+    if use_state_indices:
+        s_cute.mark_layout_dynamic()
+    else:
+        s_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
+            mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -110,6 +211,7 @@ def chunk_gated_delta_rule_sm100(
     checkpoint_every_n_tokens: int = 0,
     cu_checkpoints: Optional[torch.Tensor] = None,
     output_checkpoints: Optional[torch.Tensor] = None,
+    state_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
@@ -151,8 +253,10 @@ def chunk_gated_delta_rule_sm100(
     _initial_state = initial_state if use_initial_state else None
     B = cu_seqlens.size(0) - 1
     _output_state = output_state if store_final_state else None
+    use_state_indices = state_indices is not None
+    _state_indices = state_indices if use_state_indices else None
 
-    cache = _get_compiled_cache(
+    cache_key = (
         str(q.dtype),
         str(state_torch_dtype),
         HQ,
@@ -161,7 +265,22 @@ def chunk_gated_delta_rule_sm100(
         use_initial_state,
         store_final_state,
         enable_checkpoints,
+        use_state_indices,
+        str(cu_seqlens.dtype),
+        str(state_indices.dtype) if state_indices is not None else "none",
+        str(cu_checkpoints.dtype) if cu_checkpoints is not None else "none",
+        (
+            tuple(initial_state.stride()[1:])
+            if use_state_indices and initial_state is not None
+            else None
+        ),
+        (
+            tuple(output_state.stride()[1:])
+            if use_state_indices and output_state is not None
+            else None
+        ),
     )
+    cache = _get_compiled_cache(*cache_key)
 
     if "compiled" not in cache:
         # --- First call: compile the kernel ---
@@ -170,6 +289,10 @@ def chunk_gated_delta_rule_sm100(
 
         gdn = GatedDeltaNetChunkedKernel(
             io_dtype=io_dtype,
+            # The kernel requires the triangular-inverse dtype to match io_dtype
+            # (asserted in its __init__); pass io_dtype so bf16 uses the same
+            # validated path as fp16 instead of the default Float16.
+            inverse_dtype=io_dtype,
             acc_dtype=cutlass.Float32,
             state_dtype=state_dtype,
             mma_tiler_qk=(64, 64, 128),
@@ -217,16 +340,18 @@ def chunk_gated_delta_rule_sm100(
         s_in_cute = None
         if use_initial_state:
             s_in_cute = from_dlpack(_initial_state, assumed_align=16)
-            s_in_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
-                mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
-            )
+            _mark_state_layout(s_in_cute, use_state_indices, DK)
 
         s_out_cute = None
         if store_final_state:
             s_out_cute = from_dlpack(_output_state, assumed_align=16)
-            s_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
-                mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
-            )
+            _mark_state_layout(s_out_cute, use_state_indices, DK)
+
+        s_indices_cute = None
+        if use_state_indices:
+            s_indices_cute = from_dlpack(
+                _state_indices, assumed_align=4
+            ).mark_layout_dynamic()
 
         s_checkpoints_cute = None
         cu_checkpoints_cute = None
@@ -247,24 +372,30 @@ def chunk_gated_delta_rule_sm100(
 
         stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
-        compiled = cute.compile(
-            gdn,
-            q_cute,
-            k_cute,
-            v_cute,
-            gate_cute,
-            beta_cute,
-            o_cute,
-            cu_seqlens_cute,
-            s_in_cute,
-            s_out_cute,
-            s_checkpoints_cute,
-            cu_checkpoints_cute,
-            checkpoint_every_n_tokens,
-            scale,
-            workspace_cute,
-            stream,
-            options="--enable-tvm-ffi --opt-level 2",
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _prefill_kernel_name(*cache_key, num_sm),
+            lambda: cute.compile(
+                gdn,
+                q_cute,
+                k_cute,
+                v_cute,
+                gate_cute,
+                beta_cute,
+                o_cute,
+                cu_seqlens_cute,
+                s_in_cute,
+                s_out_cute,
+                s_indices_cute,
+                s_checkpoints_cute,
+                cu_checkpoints_cute,
+                checkpoint_every_n_tokens,
+                scale,
+                workspace_cute,
+                stream,
+                options="--enable-tvm-ffi --opt-level 3",
+            ),
+            extra_key_files=_kernel_source_files(),
         )
 
         cache["compiled"] = compiled
@@ -277,10 +408,11 @@ def chunk_gated_delta_rule_sm100(
     workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
         num_sm, B, HQ, HV, True
     )
-    ws_key = f"workspace_{q.device.index}"
-    if ws_key not in cache or cache[ws_key].size(0) < workspace_size:
-        cache[ws_key] = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
-    workspace = cache[ws_key]
+    # Fresh per-call allocation: the kernel writes TMA tensormap descriptors into
+    # the workspace on every launch, so a cached buffer shared across streams lets
+    # concurrent same-specialization calls clobber each other's descriptors. The
+    # caching allocator makes this near-free next to the prefill kernel itself.
+    workspace = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
 
     stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(
@@ -293,6 +425,7 @@ def chunk_gated_delta_rule_sm100(
         cu_seqlens,
         _initial_state,
         _output_state,
+        _state_indices,
         output_checkpoints,
         cu_checkpoints,
         checkpoint_every_n_tokens,

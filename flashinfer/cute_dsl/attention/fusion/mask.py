@@ -1,20 +1,355 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Mask types and masking helper functions for attention kernels.
+"""Composable band-mask helpers for attention kernels.
 
-All helpers are standalone @cute.jit functions that take mask_type and
-window_left as compile-time parameters, so they can be reused across
-different kernel variants (prefill, decode).
+The set of KV positions a query row attends to is modeled as a contiguous
+band.  With ``offset = seqlen_k - seqlen_q`` (queries right-aligned to the
+end of KV, the append/prefill-with-cache convention), row ``q`` sees::
+
+    k in [ lo(q), hi(q) )
+    lo(q) = max(0, q + offset - window_left)                if window_left >= 0 else 0
+    hi(q) = min(seqlen_k, q + offset + 1)                   if causal
+          = min(seqlen_k, q + offset + window_right + 1)    elif window_right >= 0
+          = seqlen_k                                        otherwise
+
+``MaskSpec`` describes which bounds exist.  The spec is a compile-time
+parameter: absent bounds compile away via ``cutlass.const_expr``, so e.g. a
+no-mask kernel contains no masking code.  ``causal`` and ``window_left`` are
+independent, matching the FlashInfer convention elsewhere
+(``include/flashinfer/attention/variants.cuh``): ``window_left`` bounds
+lookback and composes with ``causal``; ``window_right`` bounds lookahead for
+non-causal masks (e.g. symmetric windows) and is mutually exclusive with
+``causal``.
+
+All helpers are standalone ``@cute.jit`` functions so they can be reused
+across kernel variants (prefill, decode).
 """
 
-import enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, is_dataclass
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Int32, Float32, Optional
+
+
+@dataclass(frozen=True)
+class MaskSpec:
+    """Compile-time description of WHICH band bounds exist.
+
+    Only bound *presence* is compile-time (it drives dead-code
+    elimination: a no-window kernel contains no window instructions).
+    The bound *values* (``window_left``/``window_right``) are runtime
+    kernel arguments, so one compiled kernel serves every window size.
+    Causal masking is a right bound with a runtime value of 0, not a
+    separate spec kind.  The ``k < seqlen_k`` tail bound is always on:
+    the trip-segment math yields zero masked blocks at runtime when
+    every ``seqlen_k`` is tile-aligned, so alignment does not change
+    which kernel is compiled (and cannot trigger recompiles).
+
+    Attributes:
+        has_window_left: a max-lookback bound exists.
+        has_window_right: a max-lookahead bound exists (0 = causal).
+    """
+
+    has_window_left: bool = False
+    has_window_right: bool = False
+
+    @property
+    def has_left_bound(self) -> bool:
+        return self.has_window_left
+
+    @property
+    def has_right_bound(self) -> bool:
+        return self.has_window_right
+
+    @property
+    def needs_masking(self) -> bool:
+        # The seqlen_k tail bound is unconditional; see class docstring.
+        return True
+
+
+@cute.jit
+def get_kv_block_range(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> tuple[Int32, Int32]:
+    """[start, end) KV block range visited for this Q tile (union over rows).
+
+    ``start`` is nonzero only with window_left; ``end`` shrinks with causal
+    or window_right.
+    """
+    qk_offset = seqlen_k - seqlen_q
+    start_block = 0
+    if cutlass.const_expr(spec.has_window_left):
+        first_q = blk_coord[0] * tile_shape[0] + qk_offset
+        min_kv = cutlass.max(0, first_q - window_left)
+        start_block = min_kv // tile_shape[1]
+    last_q = (blk_coord[0] + 1) * tile_shape[0] - 1 + qk_offset
+    end_elem = seqlen_k
+    if cutlass.const_expr(spec.has_window_right):
+        end_elem = cutlass.min(seqlen_k, last_q + window_right + 1)
+    end_block = cute.ceil_div(end_elem, tile_shape[1])
+    return start_block, end_block
+
+
+@cute.jit
+def get_trip_count(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> Int32:
+    """Number of KV tile blocks to process for this Q tile."""
+    start_block, end_block = get_kv_block_range(
+        spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right
+    )
+    return end_block - start_block
+
+
+@cute.jit
+def get_peel_sections(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> tuple[Int32, Int32, Int32, Int32, Int32]:
+    """Head/main/tail split of the union KV range across the two 128-row halves.
+
+    Returns ``(kv_start, head, main, tail, stage1_lo_extra)``:
+
+    - ``kv_start`` — first union block (== stage 0's band start).
+    - ``head``     — leading blocks visited only by stage 0 (its band starts
+      earlier: ``lo`` is nondecreasing in the row).
+    - ``main``     — blocks visited by both halves.
+    - ``tail``     — trailing blocks visited only by stage 1.
+    - ``stage1_lo_extra`` — blocks by which stage 1's band start was clamped
+      down to keep the three sections contiguous (nonzero only when stage 1's
+      rows are entirely out of the valid Q range and its raw band start lands
+      beyond stage 0's band end).  Stage 1 treats these as extra masked-left
+      blocks; their rows see an empty band and mask to -inf.
+
+    ``head + main + tail`` equals the full-tile ``get_trip_count`` by
+    construction — every role deriving its loop counts from this one helper
+    agrees with the loader's union fetch.
+    """
+    stage_tiler = (tile_shape[0] // 2, tile_shape[1])
+    lo0, hi0 = get_kv_block_range(
+        spec,
+        (blk_coord[0] * 2, blk_coord[1], blk_coord[2]),
+        stage_tiler,
+        seqlen_k,
+        seqlen_q,
+        window_left,
+        window_right,
+    )
+    lo1, hi1 = get_kv_block_range(
+        spec,
+        (blk_coord[0] * 2 + 1, blk_coord[1], blk_coord[2]),
+        stage_tiler,
+        seqlen_k,
+        seqlen_q,
+        window_left,
+        window_right,
+    )
+    # lo is nondecreasing and hi is nondecreasing in the row, so lo0 <= lo1
+    # and hi0 <= hi1; only lo1 can escape past hi0 (OOB stage-1 rows).
+    lo1_clamped = cutlass.min(lo1, hi0)
+    head = lo1_clamped - lo0
+    main = hi0 - lo1_clamped
+    # Borrow one head block into main when the bands don't overlap
+    # (window_left == 0, or fully-OOB stage-1 rows): main >= 1 lets every
+    # consumer keep a straight-line main prologue/epilogue, and stage 1
+    # masks the borrowed block to -inf (it is outside its band).  head >= 1
+    # whenever main == 0, since stage 0's band is never empty.
+    borrow = cutlass.min(head, cutlass.max(0, 1 - main))
+    return (
+        lo0,
+        head - borrow,
+        main + borrow,
+        hi1 - hi0,
+        (lo1 - lo1_clamped) + borrow,
+    )
+
+
+@cute.jit
+def get_stage_peel_segments(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    stage: int,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> tuple[Int32, Int32, Int32, Int32, Int32, Int32]:
+    """One 128-row stage's iteration plan under the head/tail peel.
+
+    Returns ``(start_block, masked_left, unmasked, masked_right,
+    token_pre_consume, token_post_produce)``: the stage's own band segments
+    (stage 0 iterates the union's head+main blocks, stage 1 the main+tail
+    blocks, starting from the clamped band start so blocks folded in by
+    get_peel_sections mask to -inf), plus the sequence-token dummy counts
+    that keep the s0->s1 token ring balanced (stage 1 pre-consumes stage 0's
+    ``head`` tokens; stage 0 post-produces ``tail`` tokens).
+    """
+    union_start, head, _, tail, stage1_extra = get_peel_sections(
+        spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right
+    )
+    _, masked_left, unmasked, masked_right = get_trip_segments(
+        spec,
+        (blk_coord[0] * 2 + stage, blk_coord[1], blk_coord[2]),
+        (tile_shape[0] // 2, tile_shape[1]),
+        seqlen_k,
+        seqlen_q,
+        window_left,
+        window_right,
+    )
+    if cutlass.const_expr(stage == 0):
+        return union_start, masked_left, unmasked, masked_right, Int32(0), tail
+    else:
+        return (
+            union_start + head,
+            masked_left + stage1_extra,
+            unmasked,
+            masked_right,
+            head,
+            Int32(0),
+        )
+
+
+@cute.jit
+def get_trip_segments(
+    spec: MaskSpec,
+    blk_coord: cute.Coord,
+    tile_shape: cute.Shape,
+    seqlen_k: Int32,
+    seqlen_q: Int32,
+    window_left: Int32,
+    window_right: Int32,
+) -> tuple[Int32, Int32, Int32, Int32]:
+    """KV trip structure: (start_block, masked_left, unmasked, masked_right).
+
+    ``start_block`` is the first KV block visited; the three counts partition
+    the visited range and always sum to get_trip_count().  A block is
+    unmasked when every row of the Q tile sees every column of the block;
+    boundary blocks (window left edge, causal diagonal / right edge,
+    seqlen_k tail) need apply_mask.
+    """
+    start_block, end_block = get_kv_block_range(
+        spec, blk_coord, tile_shape, seqlen_k, seqlen_q, window_left, window_right
+    )
+    if cutlass.const_expr(not spec.needs_masking):
+        return start_block, 0, end_block - start_block, 0
+    else:
+        qk_offset = seqlen_k - seqlen_q
+        first_q = blk_coord[0] * tile_shape[0] + qk_offset
+        last_q = first_q + tile_shape[0] - 1
+        # Intersection over all rows of the tile: blocks fully inside
+        # [lo_max, hi_min) are visible to every row.
+        lo_max = 0
+        if cutlass.const_expr(spec.has_window_left):
+            lo_max = cutlass.max(0, last_q - window_left)
+        hi_min = seqlen_k
+        if cutlass.const_expr(spec.has_window_right):
+            hi_min = cutlass.min(seqlen_k, first_q + window_right + 1)
+        unmasked_start = cute.ceil_div(lo_max, tile_shape[1])
+        unmasked_end = hi_min // tile_shape[1]
+        unmasked_start = cutlass.min(
+            cutlass.max(unmasked_start, start_block), end_block
+        )
+        unmasked_end = cutlass.min(cutlass.max(unmasked_end, unmasked_start), end_block)
+        return (
+            start_block,
+            unmasked_start - start_block,
+            unmasked_end - unmasked_start,
+            end_block - unmasked_end,
+        )
+
+
+@cute.jit
+def apply_mask(
+    spec: MaskSpec,
+    acc_qk: cute.Tensor,
+    index_qk: cute.Tensor,
+    seqlen_k: Int32,
+    causal_offset: Int32,
+    index_qk_static: cute.Tensor,
+    window_left: Int32,
+    window_right: Int32,
+) -> None:
+    """Set out-of-band scores to -inf.
+
+    The row's visible band ``[lo, hi)`` (see module docstring) is hoisted
+    out of the element loop, so each element only compares its K
+    coordinate against row-invariant bounds.  ``index_qk`` is the
+    identity partition of the score tile carrying global ``(q, k)``
+    coordinates; ``index_qk_static`` is the same partition of the
+    unshifted identity tensor, so its coordinates are trace-time
+    constants.
+
+    Layout assumptions:
+    - One Q row per thread fragment, so the band bounds are uniform
+      across a thread's elements (the softmax's scalar row_max reduction
+      relies on the same fact).
+    - ``index_qk[i] == index_qk_static[i] + domain_offset`` for all i,
+      so the tile's dynamic base folds into the hoisted bounds.
+    Fragment layouts that break these (e.g. head-packed decode rows, or
+    a gathered/sparse KV axis) cannot use this function as-is; they need
+    per-element two-coordinate predicates instead of hoisted bounds.
+
+    Codegen rules — both are required to avoid register spills:
+    - Masked writes use ``cutlass.select_``, never a traced ``if``.
+      Register data is immutable SSA values in the IR, so a traced
+      conditional element write is recorded as an ``scf.if`` that
+      yields the whole fragment, and the backend does not reliably
+      reduce that to a single-element select.  ``cutlass.select_``
+      emits one scalar ``arith.select`` per element and is safe for
+      any predicate shape.
+    - Per-element K reads come from ``index_qk_static``: its
+      coordinates are compile-time constants that lower to immediate
+      operands, whereas reading the shifted partition materializes
+      each global coordinate through per-element address arithmetic
+      that inflates register pressure.
+    """
+    if cutlass.const_expr(spec.needs_masking):
+        base_k = index_qk[0][1] - index_qk_static[0][1]
+        row_q = index_qk[0][0] + causal_offset
+        hi = seqlen_k
+        if cutlass.const_expr(spec.has_window_right):
+            hi = cutlass.min(row_q + window_right + 1, seqlen_k)
+        hi_rel = hi - base_k
+        if cutlass.const_expr(spec.has_window_left):
+            lo_rel = row_q - window_left - base_k
+            for i in range(cute.size(acc_qk)):
+                k = index_qk_static[i][1]
+                acc_qk[i] = cutlass.select_(
+                    (k < lo_rel) | (k >= hi_rel),
+                    -Float32.inf,
+                    acc_qk[i],
+                )
+        else:
+            # Right-bound-only specs (causal, right window, seqlen_k
+            # tail): single-direction compare — safe here because
+            # select_ has no scf.if region for MLIR to fold.
+            for i in range(cute.size(acc_qk)):
+                acc_qk[i] = cutlass.select_(
+                    index_qk_static[i][1] >= hi_rel,
+                    -Float32.inf,
+                    acc_qk[i],
+                )
 
 
 # JIT-extendable masking configurations
@@ -281,169 +616,3 @@ class SlidingWindowMask(AttentionMask):
         masked_stop = num_tiles_kv
         masked_step = warpgroups_kv * kv_splits
         return ((masked_start, masked_stop, masked_step, True),)
-
-
-#
-# Legacy enum-based masking configuration
-# only supports GQA/MHA prefill kernel
-#
-class MaskType(enum.Enum):
-    NO_MASK = enum.auto()
-    RESIDUAL_MASK = enum.auto()
-    CAUSAL_MASK = enum.auto()
-    SLIDING_WINDOW_MASK = enum.auto()
-
-
-@cute.jit
-def get_trip_count(
-    mask_type: MaskType,
-    window_left: int,
-    blk_coord: cute.Coord,
-    tile_shape: cute.Shape,
-    seqlen_k: Int32,
-    seqlen_q: Int32 = 0,
-) -> Int32:
-    """Number of KV tile blocks to process for this Q tile."""
-    result = 0
-    if mask_type == MaskType.NO_MASK or mask_type == MaskType.RESIDUAL_MASK:
-        result = cute.ceil_div(seqlen_k, tile_shape[1])
-    elif mask_type == MaskType.CAUSAL_MASK:
-        max_blocks_k = cute.ceil_div(seqlen_k, tile_shape[1])
-        causal_offset = seqlen_k - seqlen_q
-        max_blocks_q = cute.ceil_div(
-            (blk_coord[0] + 1) * tile_shape[0] + causal_offset, tile_shape[1]
-        )
-        result = cutlass.min(max_blocks_k, max_blocks_q)
-    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
-        qk_offset = seqlen_k - seqlen_q
-        first_q = blk_coord[0] * tile_shape[0] + qk_offset
-        last_q = (blk_coord[0] + 1) * tile_shape[0] - 1 + qk_offset
-        min_kv = cutlass.max(0, first_q - window_left)
-        max_kv = cutlass.min(seqlen_k - 1, last_q + window_left)
-        start_block = min_kv // tile_shape[1]
-        end_block = cute.ceil_div(max_kv + 1, tile_shape[1])
-        result = end_block - start_block
-    return result
-
-
-@cute.jit
-def get_masked_trip_count(
-    mask_type: MaskType,
-    window_left: int,
-    blk_coord: cute.Coord,
-    tile_shape: cute.Shape,
-    seqlen_k: Int32,
-    seqlen_q: Int32 = 0,
-) -> Int32:
-    """Number of masked (boundary) KV tile blocks."""
-    result = 0
-    if mask_type == MaskType.NO_MASK:
-        result = 0
-    elif mask_type == MaskType.RESIDUAL_MASK:
-        if seqlen_k % tile_shape[1] != 0:
-            result = 1
-        else:
-            result = 0
-    elif mask_type == MaskType.CAUSAL_MASK:
-        trip_count = get_trip_count(
-            mask_type, window_left, blk_coord, tile_shape, seqlen_k, seqlen_q
-        )
-        causal_offset = seqlen_k - seqlen_q
-        first_boundary = (blk_coord[0] * tile_shape[0] + causal_offset) // tile_shape[1]
-        last_boundary = (
-            (blk_coord[0] + 1) * tile_shape[0] - 1 + causal_offset
-        ) // tile_shape[1]
-        result = cutlass.min(
-            trip_count,
-            last_boundary - first_boundary + 1,
-        )
-    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
-        trip_count = get_trip_count(
-            mask_type, window_left, blk_coord, tile_shape, seqlen_k, seqlen_q
-        )
-        result = trip_count
-    return result
-
-
-@cute.jit
-def get_unmasked_trip_count(
-    mask_type: MaskType,
-    window_left: int,
-    blk_coord: cute.Coord,
-    tile_shape: cute.Shape,
-    seqlen_k: Int32,
-    seqlen_q: Int32 = 0,
-) -> Int32:
-    """Number of fully unmasked KV tile blocks."""
-    result = 0
-    if mask_type == MaskType.NO_MASK:
-        result = get_trip_count(mask_type, window_left, blk_coord, tile_shape, seqlen_k)
-    elif mask_type == MaskType.RESIDUAL_MASK:
-        if seqlen_k % tile_shape[1] != 0:
-            result = (
-                get_trip_count(mask_type, window_left, blk_coord, tile_shape, seqlen_k)
-                - 1
-            )
-        else:
-            result = get_trip_count(
-                mask_type, window_left, blk_coord, tile_shape, seqlen_k
-            )
-    elif mask_type == MaskType.CAUSAL_MASK:
-        result = get_trip_count(
-            mask_type, window_left, blk_coord, tile_shape, seqlen_k, seqlen_q
-        ) - get_masked_trip_count(
-            mask_type, window_left, blk_coord, tile_shape, seqlen_k, seqlen_q
-        )
-    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
-        result = 0
-    return result
-
-
-@cute.jit
-def get_kv_start_block_idx(
-    mask_type: MaskType,
-    window_left: int,
-    blk_coord: cute.Coord,
-    tile_shape: cute.Shape,
-    seqlen_k: Int32,
-    seqlen_q: Int32 = 0,
-) -> Int32:
-    """Starting KV block index (nonzero only for sliding window)."""
-    if cutlass.const_expr(mask_type == MaskType.SLIDING_WINDOW_MASK):
-        qk_offset = seqlen_k - seqlen_q
-        first_q = blk_coord[0] * tile_shape[0] + qk_offset
-        min_kv = cutlass.max(0, first_q - window_left)
-        return min_kv // tile_shape[1]
-    else:
-        return 0
-
-
-@cute.jit
-def apply_mask(
-    mask_type: MaskType,
-    window_left: int,
-    acc_qk: cute.Tensor,
-    index_qk: cute.Tensor,
-    seqlen_k: Int32,
-    causal_offset: Int32 = 0,
-):
-    """Apply attention mask (causal, residual, or sliding window) to scores."""
-    if mask_type == MaskType.RESIDUAL_MASK:
-        for i in range(cute.size(acc_qk)):
-            pos = index_qk[i]
-            if pos[1] >= seqlen_k:
-                acc_qk[i] = -Float32.inf
-    elif mask_type == MaskType.CAUSAL_MASK:
-        for i in range(cute.size(acc_qk)):
-            pos = index_qk[i]
-            if pos[0] + causal_offset < pos[1] or pos[1] >= seqlen_k:
-                acc_qk[i] = -Float32.inf
-    elif mask_type == MaskType.SLIDING_WINDOW_MASK:
-        for i in range(cute.size(acc_qk)):
-            pos = index_qk[i]
-            if (
-                pos[1] - pos[0] - causal_offset > window_left
-                or pos[0] + causal_offset - pos[1] > window_left
-                or pos[1] >= seqlen_k
-            ):
-                acc_qk[i] = -Float32.inf

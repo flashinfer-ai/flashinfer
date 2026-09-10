@@ -102,3 +102,20 @@ __device__ __forceinline__ void ldmatrix_load_A_bf16(uint32_t& a0, uint32_t& a1,
   int col = (lane >> 4) * 8;
   ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride_elems + col);
 }
+
+// FP8 [32×16] → the [16×32] A operand: lane l addresses row l, 16B aligned
+__device__ __forceinline__ void ldmatrix_x2_trans_b8(uint32_t& d0, uint32_t& d1, uint32_t& d2,
+                                                     uint32_t& d3, const void* smem_ptr) {
+  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared.b8 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+               : "r"(addr));
+}
+
+// FP8 A operand [16×32] transposed, straight out of a [candidate, dim] tile
+template <int KV_STRIDE>
+__device__ __forceinline__ void ldmatrix_load_A_fp8_trans(uint32_t& a0, uint32_t& a1, uint32_t& a2,
+                                                          uint32_t& a3, const uint8_t* smem_base,
+                                                          int k_start, int dim, int lane) {
+  ldmatrix_x2_trans_b8(a0, a1, a2, a3, smem_base + (size_t)(k_start + lane) * KV_STRIDE + dim);
+}

@@ -386,13 +386,58 @@ struct SumNormalizePostprocess {
   }
 };
 
-/// ScaledSumNormalize: recovers un-biased sigmoid scores by subtracting per-expert bias from the
-/// selection scores (sigmoid + bias), then normalizes by sum and applies routeScale.
+/// Sigmoid: applies sigmoid to the top-K scores selected from the raw logits.
+/// Paired with NoOpPreprocess this implements TopK -> Sigmoid, where expert
+/// selection ranks the raw logits and only the K survivors are passed through
+/// sigmoid.  Because sigmoid is strictly monotonic this selects the same
+/// experts as SigmoidPreprocess + TopK for all inputs except logits large
+/// enough that sigmoid saturates to exactly 1.0f (|x| above ~17), where
+/// selecting on the saturated scores would instead tie-break by expert index.
+struct SigmoidPostprocess {
+  /// Opts into the block-per-token kernel (provides applyWithAux below).
+  static constexpr bool kSupportsBlockPerToken = true;
+
+  template <typename OutputT>
+  struct Params {
+    void set(routingCustom::Data const& /*data*/) {}
+  };
+
+  template <typename DataType, int K, typename ParamsT>
+  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& /*warp*/,
+                                               DataType (&warpTopKScore)[K],
+                                               int32_t const (& /*warpTopKExpertIdx*/)[K],
+                                               int32_t laneIdx, int32_t topK,
+                                               ParamsT const& /*params*/) {
+    if (laneIdx < topK) {
+      warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoid_accurate(static_cast<float>(warpTopKScore[laneIdx])));
+    }
+  }
+
+  template <typename DataType, int K, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyWithAux(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType (&warpTopKScore)[K],
+                                                      int32_t const (&warpTopKExpertIdx)[K],
+                                                      int32_t laneIdx, int32_t topK,
+                                                      SmemT const* /*smemAux*/,
+                                                      ParamsT const& params) {
+    apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, params);
+  }
+};
+
+/// ScaledSumNormalize: normalizes un-biased sigmoid scores by sum and applies
+/// routeScale. SigmoidBias selection uses sigmoid(raw) + bias as the top-K key,
+/// but final weights must use sigmoid(raw). Warp-per-token routing recomputes
+/// selected sigmoid(raw) from raw logits to avoid cancellation when a tiny
+/// sigmoid is rounded away by a large bias; block-per-token routing reads the
+/// same un-biased sigmoid from smemAux.
 /// Used by DeepSeek-style routing: final_weight = sigmoid(raw) * routeScale / (sum + epsilon).
-/// DeepSeek uses epsilon=0 (no guard); MiniMax2 uses epsilon=1e-20 to prevent division by zero.
+/// The DeepSeek and MiniMax2 runners use epsilon=1e-20 to prevent division by zero.
 struct ScaledSumNormalizePostprocess {
   /// Opts into the block-per-token kernel (provides applyWithAux below).
   static constexpr bool kSupportsBlockPerToken = true;
+  static constexpr bool kSupportsLaneOwnedTopK = true;
+  static constexpr bool kNeedsRawScores = true;
 
   /// Needs per-expert aux data (un-biased sigmoid) in the block-per-token
   /// kernel — paired with SigmoidBiasPreprocess, which writes the un-biased
@@ -402,35 +447,65 @@ struct ScaledSumNormalizePostprocess {
 
   template <typename OutputT>
   struct Params {
-    // Store as void const* to support any bias dtype (float, bfloat16, etc.) without conversion.
-    void const* ptrRoutingBias = nullptr;
-    batchedGemm::trtllm::gen::Dtype dtypeBias = batchedGemm::trtllm::gen::Dtype::Bfloat16;
     float routeScale = 1.0f;
     float sumEpsilon = 0.0f;
 
     void set(routingCustom::Data const& data) {
-      ptrRoutingBias = data.mPtrRoutingBias;
-      dtypeBias = data.mDtypeBias;
       routeScale = data.mRouteScale;
       sumEpsilon = data.mSumEpsilon;
     }
   };
 
-  template <typename DataType, int K, typename ParamsT>
-  __forceinline__ __device__ static void apply(cg::thread_block_tile<WarpSize> const& warp,
-                                               DataType (&warpTopKScore)[K],
-                                               int32_t const (&warpTopKExpertIdx)[K],
-                                               int32_t laneIdx, int32_t topK,
-                                               ParamsT const& params) {
-    // Recover sigmoid score: selection_score = sigmoid(raw) + bias, so sigmoid = score - bias
-    float biasVal = laneIdx < topK ? loadScalar(params.ptrRoutingBias, warpTopKExpertIdx[laneIdx],
-                                                params.dtypeBias)
-                                   : 0.f;
-    float sigmoidScore =
-        laneIdx < topK ? (static_cast<float>(warpTopKScore[laneIdx]) - biasVal) : 0.f;
+  /// Warp-per-token variant with access to the original raw scores. SigmoidBias
+  /// selection uses sigmoid(raw) + bias as the topK key, but final weights must
+  /// be normalized from the un-biased sigmoid(raw). Recomputing sigmoid(raw)
+  /// avoids lossy recovery when a tiny sigmoid is rounded away by a large bias.
+  template <typename DataType, typename InputType, int K, typename ParamsT>
+  __forceinline__ __device__ static void applyWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType (&warpTopKScore)[K],
+      int32_t const (&warpTopKExpertIdx)[K], int32_t laneIdx, int32_t topK,
+      InputType const* ptrScores, ParamsT const& params) {
+    float sigmoidScore = 0.f;
+    if (laneIdx < topK) {
+      int32_t const expertIdx = warpTopKExpertIdx[laneIdx];
+      sigmoidScore = sigmoid_accurate(static_cast<float>(ptrScores[expertIdx]));
+    }
+
     float sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
     if (laneIdx < topK) {
       warpTopKScore[laneIdx] =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Lane-owned warp-per-token variant with access to the original raw scores.
+  /// This is the scalar counterpart to applyWithScores.
+  template <typename DataType, typename InputType, typename ParamsT>
+  __forceinline__ __device__ static void applyForLaneWithScores(
+      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
+      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, InputType const* ptrScores,
+      ParamsT const& params) {
+    float const sigmoidScore =
+        laneIdx < topK ? sigmoid_accurate(static_cast<float>(ptrScores[laneTopKExpertIdx])) : 0.f;
+    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      laneTopKScore =
+          static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
+    }
+  }
+
+  /// Lane-owned block-per-token variant. Reads the un-biased sigmoid from
+  /// smemAux just like applyWithAux, but consumes scalar TopK state.
+  template <typename DataType, typename SmemT, typename ParamsT>
+  __forceinline__ __device__ static void applyForLaneWithAux(
+      cg::thread_block_tile<WarpSize> const& warp, DataType& laneTopKScore,
+      int32_t laneTopKExpertIdx, int32_t laneIdx, int32_t topK, SmemT const* smemAux,
+      ParamsT const& params) {
+    float const sigmoidScore =
+        laneIdx < topK ? static_cast<float>(smemAux[laneTopKExpertIdx]) : 0.f;
+    float const sum = cg::reduce(warp, sigmoidScore, cg::plus<float>());
+    if (laneIdx < topK) {
+      laneTopKScore =
           static_cast<DataType>(sigmoidScore * params.routeScale / (sum + params.sumEpsilon));
     }
   }
@@ -479,8 +554,8 @@ struct ScaledSumNormalizePostprocess {
 /// differs from the topK selection key (via its `kNeedsAux` member).  Today
 /// only `ScaledSumNormalize` sets `kNeedsAux = true`.  For every other
 /// postprocess, `smemAux` aliases `smemBiased` and no extra smem is
-/// allocated.  Postprocess policies that don't declare `kNeedsAux` are
-/// treated as not needing it (safe default).
+/// allocated. Postprocess policies that don't declare `kNeedsAux` are treated
+/// as not needing it (safe default).
 template <typename PostprocessPolicy_, typename = void>
 struct PostprocessNeedsAux : std::false_type {};
 
@@ -490,6 +565,28 @@ struct PostprocessNeedsAux<PostprocessPolicy_, std::void_t<decltype(PostprocessP
 
 template <typename PreprocessPolicy_, typename PostprocessPolicy_>
 struct PolicyPairNeedsAux : PostprocessNeedsAux<PostprocessPolicy_> {};
+
+/// Does a postprocess policy need the original raw scores after TopK?
+/// This is intentionally opt-in so generic routing policies do not acquire a
+/// raw-score dependency unless they implement the corresponding overloads.
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessNeedsRawScores : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessNeedsRawScores<PostprocessPolicy_,
+                                 std::void_t<decltype(PostprocessPolicy_::kNeedsRawScores)>>
+    : std::bool_constant<PostprocessPolicy_::kNeedsRawScores> {};
+
+/// Does a postprocess policy implement the scalar lane-owned TopK interface?
+/// This is intentionally opt-in: adding a new policy cannot silently select a
+/// specialization whose numerical semantics it has not implemented.
+template <typename PostprocessPolicy_, typename = void>
+struct PostprocessSupportsLaneOwnedTopK : std::false_type {};
+
+template <typename PostprocessPolicy_>
+struct PostprocessSupportsLaneOwnedTopK<
+    PostprocessPolicy_, std::void_t<decltype(PostprocessPolicy_::kSupportsLaneOwnedTopK)>>
+    : std::bool_constant<PostprocessPolicy_::kSupportsLaneOwnedTopK> {};
 
 /// Trait: does a (pre, post) policy pair implement the block-per-token
 /// interface (`PreProc::applyToSmem` + `PostProc::applyWithAux`) and
@@ -566,8 +663,49 @@ struct TopKExpertSelect {
     topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore, topK);
 
     // Apply postprocess (e.g. renormalize, softmax over top-K, scaled renormalize, ...)
-    PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
-                              params.mExpertSelectParams.mPostprocessParams);
+    if constexpr (PostprocessNeedsRawScores<PostprocessPolicy_>::value) {
+      PostprocessPolicy_::template applyWithScores<DataType, InputType, K>(
+          warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::apply(warp, warpTopKScore, warpTopKExpertIdx, laneIdx, topK,
+                                params.mExpertSelectParams.mPostprocessParams);
+    }
+  }
+
+  /// Lane-owned TopK variant. It shares the generic preprocess and exact
+  /// comparison/tie-breaking logic, but returns only the result consumed by
+  /// laneIdx. Callers gate this method with PostprocessSupportsLaneOwnedTopK.
+  template <typename DataType, typename InputType, int VecSize, int K, typename KP>
+  __forceinline__ __device__ static void applyForLane(cg::thread_block_tile<WarpSize> const& warp,
+                                                      DataType& laneTopKScore,
+                                                      int32_t& laneTopKExpertIdx, int32_t laneIdx,
+                                                      int32_t numExperts, int32_t topK,
+                                                      InputType const* ptrScores,
+                                                      KP const& params) {
+    DataType const minScore = DataType{-INFINITY};
+    DataType score[VecSize];
+    int32_t idx[VecSize];
+
+#pragma unroll
+    for (int i = 0; i < VecSize; ++i) {
+      int32_t const expertIdx = i * WarpSize + laneIdx;
+      score[i] = expertIdx < numExperts ? static_cast<DataType>(ptrScores[expertIdx]) : minScore;
+      idx[i] = expertIdx;
+    }
+
+    PreprocessPolicy_::apply(warp, score, idx, numExperts,
+                             params.mExpertSelectParams.mPreprocessParams);
+    topk::reduceTopKForLane<K>(warp, laneTopKScore, laneTopKExpertIdx, score, idx, minScore,
+                               laneIdx);
+    if constexpr (PostprocessNeedsRawScores<PostprocessPolicy_>::value) {
+      PostprocessPolicy_::template applyForLaneWithScores<DataType, InputType>(
+          warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK, ptrScores,
+          params.mExpertSelectParams.mPostprocessParams);
+    } else {
+      PostprocessPolicy_::applyForLane(warp, laneTopKScore, laneTopKExpertIdx, laneIdx, topK,
+                                       params.mExpertSelectParams.mPostprocessParams);
+    }
   }
 };
 
@@ -584,6 +722,7 @@ static constexpr int NumExperts256Experts = 256;
 static constexpr int NumExperts384Experts = 384;
 static constexpr int NumExperts512Experts = 512;
 static constexpr int NumExperts576Experts = 576;
+static constexpr int NumExperts896Experts = 896;
 static constexpr int NumExperts1024Experts = 1024;
 static constexpr int MaxSupportedExperts = 2048;
 
@@ -619,6 +758,8 @@ inline int32_t getMaxNumExperts(int32_t numExperts) {
     return NumExperts512Experts;
   } else if (numExperts <= NumExperts576Experts) {
     return NumExperts576Experts;
+  } else if (numExperts <= NumExperts896Experts) {
+    return NumExperts896Experts;
   } else if (numExperts <= NumExperts1024Experts) {
     return NumExperts1024Experts;
   } else if (numExperts <= MaxSupportedExperts) {
@@ -709,7 +850,8 @@ struct PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> {
                          Tier<512, 32>,   // 512-expert models with topK 23..32
                          Tier<576, 8>,    // Customized model with 576 experts
                          Tier<768, 32>,   // 576..768 experts with high topK
-                         Tier<1024, 32>,  // 768..1024 experts with high topK
+                         Tier<896, 16>,   // 769..896 experts with topK <=16
+                         Tier<1024, 32>,  // 896..1024 experts with high topK
                          Tier<2048, 32>   // Large-expert fallback
                          >;
 };
@@ -732,7 +874,19 @@ struct PolicyTraits<SigmoidBiasPreprocess, ScaledSumNormalizePostprocess> {
                          Tier<384, 8>,  // Kimi K2 (384 experts)
                          Tier<512, 8>,  // DeepSeek nGroup≤1 (256 experts → E512 fallback)
                          Tier<512, 22>,  // Nemotron Super V3 (512 experts, topK=22, nGroup≤1)
-                         Tier<1024, 32>  // Default fallback (expert count may grow beyond 512)
+                         Tier<896, 16>,  // 513..896 experts with topK <=16
+                         Tier<1024, 32>  // Default fallback (expert count may grow beyond 896)
+                         >;
+};
+
+/// None + Sigmoid (TopKSigmoid: TopK -> Sigmoid).
+/// Mirrors the tiers of Sigmoid + SumNormalize, the policy pair it is the
+/// selection-order counterpart of.
+/// NOTE: Currently only covers ≤256 experts. If a model requires more, add a larger Tier here.
+template <>
+struct PolicyTraits<NoOpPreprocess, SigmoidPostprocess> {
+  using Pairs = TierList<Tier<128, 8>,  // Small expert counts (≤128 experts)
+                         Tier<256, 8>   // Medium expert counts (≤256 experts)
                          >;
 };
 
@@ -864,6 +1018,10 @@ struct DefaultRoutingLaunchConfig {
     LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
                                  stream, NoOpPreprocess, NoOpPostprocess, NumExperts576Experts,    \
                                  NumTop8Experts);                                                  \
+  } else if (data.mNumExperts <= NumExperts896Experts) {                                           \
+    LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
+                                 stream, NoOpPreprocess, NoOpPostprocess, NumExperts896Experts,    \
+                                 NumTop8Experts);                                                  \
   } else if (data.mNumExperts <= NumExperts1024Experts) {                                          \
     LAUNCH_ROUTING_WITH_POLICIES(data, coopLaunch, kernel, numBlocks, numThreads, smemSize,        \
                                  stream, NoOpPreprocess, NoOpPostprocess, NumExperts1024Experts,   \
@@ -896,6 +1054,8 @@ inline void dispatchRoutingPolicy(Data const& data, Fn&& fn) {
     fn(SoftmaxPreprocess{}, SumNormalizePostprocess{}, "SoftmaxPreprocess+SumNormalizePostprocess");
   else if (data.mPostprocessType == RoutingPostprocessType::Softmax)
     fn(NoOpPreprocess{}, SoftmaxPostprocess{}, "NoOpPreprocess+SoftmaxPostprocess");
+  else if (data.mPostprocessType == RoutingPostprocessType::Sigmoid)
+    fn(NoOpPreprocess{}, SigmoidPostprocess{}, "NoOpPreprocess+SigmoidPostprocess");
   else
     fn(NoOpPreprocess{}, NoOpPostprocess{}, "NoOpPreprocess+NoOpPostprocess");
 }

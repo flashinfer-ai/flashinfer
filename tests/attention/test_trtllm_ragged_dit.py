@@ -4,7 +4,7 @@ Tests for DiT (Diffusion Transformer) oriented ragged attention kernels.
 Covers three variants:
 1. Q/K/V all FP8 E4M3 (standard case)
 2. Q/K in BF16, V in FP8 E4M3 (DiT: BMM1 in BF16, BMM2 in FP8)
-3. Q/K in INT8, V in FP8 E4M3, with SageAttention scaling factors
+3. BF16 Q/K/V quantized on GPU to SageAttention INT8/FP8, then run by attention
 
 All tests run on SM100/SM103 only (Blackwell).
 """
@@ -34,36 +34,6 @@ def _to_float8(x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
     scale = finfo.max / amax * 0.1
     x_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
     return x_sat.to(dtype), scale.float().reciprocal()
-
-
-def _to_int8_blocked(x: torch.Tensor, block_size: int):
-    """
-    Quantize float tensor to INT8 with per-block scaling.
-
-    x: [tokens, heads, head_dim]
-    block_size: number of elements per block along tokens
-
-    Returns:
-        x_q: INT8 tensor same shape as x
-        sfs: float32 per-block scales [heads * (tokens // block_size)]
-              (inverse scales / dequant scales)
-    """
-    tokens, heads, head_dim = x.shape
-    assert tokens % block_size == 0
-    num_blocks = tokens // block_size
-    x_blocks = x.reshape(num_blocks, block_size, heads, head_dim)
-    amax = (
-        x_blocks.abs()
-        .amax(dim=-1, keepdim=True)
-        .amax(dim=1, keepdim=True)
-        .clamp(min=1e-12)
-    )
-    scale = 127.0 / amax  # per-block quantization scale
-    x_sat = (x_blocks * scale).round().clamp(-128, 127)
-    x_q = x_sat.reshape(tokens, heads, head_dim).to(torch.int8)
-    # inv_scale (dequant scale): 1/scale = amax / 127
-    inv_scale = (amax / 127.0).reshape(num_blocks, heads).T.flatten().contiguous()
-    return x_q, inv_scale
 
 
 def _ragged_reference_bf16(
@@ -299,7 +269,7 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Q/K in INT8, V in FP8 E4M3, with SageAttention block scaling
+# Test 3: Q/K quantized to INT8, V to FP8 E4M3, with SageAttention block scaling
 # ---------------------------------------------------------------------------
 
 
@@ -309,12 +279,13 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 )
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (512, 2048)])
+@pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (1560, 1560), (512, 2048)])
 @pytest.mark.parametrize("num_heads", [1, 8])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("sage_blk_q", [1])
 @pytest.mark.parametrize("sage_blk_k", [4, 16])
-def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
+@pytest.mark.parametrize("smooth_k", [False, True])
+def test_trtllm_ragged_dit_sage_qdq(
     causal: bool,
     batch_size: int,
     s_qo: int,
@@ -323,6 +294,7 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
     head_dim: int,
     sage_blk_q: int,
     sage_blk_k: int,
+    smooth_k: bool,
 ):
     torch.manual_seed(42)
     device = GPU_DEVICE
@@ -332,31 +304,9 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
     total_q = int(q_lens.sum())
     total_kv = int(kv_lens.sum())
 
-    q_f = torch.randn(total_q, num_heads, head_dim, device=device)
-    k_f = torch.randn(total_kv, num_heads, head_dim, device=device)
-    v_f = torch.randn(total_kv, num_heads, head_dim, device=device)
-
-    # Per-block INT8 quantization for Q and K
-    q_int8, q_sfs = _to_int8_blocked(q_f.cpu(), sage_blk_q)
-    k_int8, k_sfs = _to_int8_blocked(k_f.cpu(), sage_blk_k)
-    q_int8 = q_int8.to(device)
-    k_int8 = k_int8.to(device)
-    q_sfs = q_sfs.to(device)
-    k_sfs = k_sfs.to(device)
-
-    sage_blk_v = 1
-    v_fp8, v_inv_scale = _to_float8(v_f)
-    v_sfs = torch.ones((num_heads * head_dim), device=device)
-
-    # For SageAttention, bmm1_scale encodes 1/sqrt(head_dim) only;
-    # per-block Q/K dequant is handled via sage_attn_sfs_q/k
-    scale = 1.0 / math.sqrt(head_dim)
-    # INT8 range is [-127,127] so per-block inv_scale is amax/127;
-    # the effective per-block scale that the kernel uses is
-    # sfs_q[i] * sfs_k[j] * (1/sqrt(head_dim)), but bmm1_scale here is 1.0
-    # because the kernel multiplies by sfs_q * sfs_k internally.
-    bmm1_scale = 1.0 / math.sqrt(head_dim)
-    bmm2_scale = float(v_inv_scale)
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
 
     qo_indptr = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
@@ -364,6 +314,46 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
     kv_indptr = torch.cat(
         [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
     )
+
+    quantized = flashinfer.trtllm_sage_attention_quantize(
+        q,
+        k,
+        v,
+        q_block_size=sage_blk_q,
+        k_block_size=sage_blk_k,
+        qk_quant_dtype=torch.int8,
+        cum_seq_lens_q=qo_indptr,
+        cum_seq_lens_kv=kv_indptr,
+        smooth_k=smooth_k,
+    )
+    q_int8, k_int8, v_fp8, q_sfs, k_sfs, v_sfs = quantized[:6]
+    if smooth_k:
+        k_mean = quantized[6]
+        assert k_mean.shape == (num_heads, head_dim)
+        assert k_mean.dtype == torch.float32
+        assert torch.isfinite(k_mean).all()
+
+    assert q_sfs.shape == (
+        num_heads,
+        (total_q + sage_blk_q - 1) // sage_blk_q + batch_size - 1,
+    )
+    assert k_sfs.shape == (
+        num_heads,
+        (total_kv + sage_blk_k - 1) // sage_blk_k + batch_size - 1,
+    )
+    assert v_sfs.shape == (num_heads, head_dim)
+    assert torch.isfinite(v_sfs).all()
+
+    sage_blk_v = 1
+
+    # For SageAttention, bmm1_scale encodes 1/sqrt(head_dim) only;
+    # per-block Q/K dequant is handled via sage_attn_sfs_q/k
+    scale = 1.0 / math.sqrt(head_dim)
+    # Per-block Q/K dequantization is handled inside the attention kernel, so
+    # bmm1_scale only contains the usual attention normalization.
+    bmm1_scale = 1.0 / math.sqrt(head_dim)
+    # All dequantization scales are supplied through SageAttention scale tensors.
+    bmm2_scale = 1.0
 
     workspace = _get_workspace()
 
@@ -393,9 +383,9 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
     assert out_trtllm.dtype == torch.bfloat16
 
     out_ref = _ragged_reference_bf16(
-        q_f,
-        k_f,
-        v_f,
+        q,
+        k,
+        v,
         q_lens,
         kv_lens,
         scale,
@@ -407,3 +397,56 @@ def test_trtllm_ragged_dit_sage_qk_int8_v_fp8(
         atol=0.1,
         rtol=0.1,
     )
+
+
+@pytest.mark.skipif(
+    (CC_MAJOR, CC_MINOR) != (10, 0),
+    reason="SageAttention quantization tests require SM100.",
+)
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_trtllm_sage_quant_qkv_error(head_dim: int):
+    torch.manual_seed(42)
+    num_tokens, num_heads = 260, 2
+    q_block_size = 1
+    k_block_size = 16
+
+    q = torch.randn(
+        num_tokens,
+        num_heads,
+        head_dim,
+        device=GPU_DEVICE,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    q_block_indices = torch.arange(num_tokens, device=GPU_DEVICE) // q_block_size
+    block_indices = torch.arange(num_tokens, device=GPU_DEVICE) // k_block_size
+    max_error_tolerance = {"q": 0.04, "k": 0.04, "v": 0.17}
+    for smooth_k in (False, True):
+        quantized = flashinfer.trtllm_sage_attention_quantize(
+            q,
+            k,
+            v,
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            qk_quant_dtype=torch.int8,
+            smooth_k=smooth_k,
+        )
+        q_quant, k_quant, v_quant, q_sfs, k_sfs, v_sfs = quantized[:6]
+        k_mean = quantized[6] if smooth_k else None
+
+        q_dequant = q_quant.float() * q_sfs[:, q_block_indices].T.unsqueeze(-1)
+        k_dequant = k_quant.float() * k_sfs[:, block_indices].T.unsqueeze(-1)
+        if k_mean is not None:
+            k_dequant += k_mean.unsqueeze(0)
+        v_dequant = v_quant.float() * v_sfs.unsqueeze(0)
+
+        for name, dequant, reference in (
+            ("q", q_dequant, q),
+            ("k", k_dequant, k),
+            ("v", v_dequant, v),
+        ):
+            abs_error = (dequant - reference.float()).abs()
+            assert torch.isfinite(abs_error).all()
+            assert abs_error.max().item() < max_error_tolerance[name]

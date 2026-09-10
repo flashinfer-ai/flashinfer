@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 
 import pytest
 
@@ -28,6 +30,24 @@ def dist_not_initialized():
 
     with mock.patch("torch.distributed.is_initialized", return_value=False):
         yield
+
+
+@pytest.fixture(scope="session")
+def isolated_deep_gemm_cache():
+    """Provide one session cache when the caller did not configure DeepGEMM."""
+    configured_cache = os.environ.get("TRTLLM_DG_CACHE_DIR")
+    if configured_cache is not None:
+        yield configured_cache
+        return
+
+    cache_dir = tempfile.mkdtemp(prefix="flashinfer-deep-gemm-test-")
+    os.environ["TRTLLM_DG_CACHE_DIR"] = cache_dir
+    try:
+        yield cache_dir
+    finally:
+        if os.environ.get("TRTLLM_DG_CACHE_DIR") == cache_dir:
+            os.environ.pop("TRTLLM_DG_CACHE_DIR")
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 # NOTE: ``pytest_addoption`` (--backend), ``pytest_configure`` (nvep/gpu_*/

@@ -922,7 +922,12 @@ def trtllm_custom_all_reduce(
     - strategy_code: the strategy code.
     - config_code: the config code.
     - launch_with_pdl: whether to launch with pdl.
-    - flag_value: the flag value.
+    - flag_value: monotonic counter, same value on all ranks for a given call.
+      Calls that dispatch to the lamport kernel (see ``is_lamport_supported``
+      in the kernel header) need consecutive flag values across those calls:
+      keep a separate counter for them, or re-run
+      ``trtllm_lamport_initialize_all`` before each one. Sharing one counter
+      with other calls silently corrupts the lamport output.
     - peer_comm_buffer_ptrs: the peer communication buffer pointers.
     - peer_barrier_ptrs_in: the peer barrier pointers in.
     - peer_barrier_ptrs_out: the peer barrier pointers out.

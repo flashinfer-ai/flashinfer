@@ -20,9 +20,14 @@ DISABLE_SANITY_TEST=true
 source "${SCRIPT_DIR}/test_utils.sh"
 
 # Define the specific test files for multi-GPU comm tests (single-node)
-# TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py tests/comm/test_trtllm_allreduce_fusion.py"
+# MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py tests/comm/test_allreduce_negative.py tests/comm/test_trtllm_allreduce_fusion.py"
 # Add others back once they are fixed
-TEST_FILES="tests/comm/test_allreduce_unified_api.py"
+MPI_TEST_FILES="tests/comm/test_allreduce_unified_api.py"
+
+# These tests create their own distributed workers with torch.multiprocessing.spawn.
+# Running them under mpirun would start multiple pytest parents and can collide on
+# TCPStore ports.
+SPAWN_MANAGED_TEST_FILES="tests/comm/test_quantized_allreduce.py"
 
 # Tests that require torchrun instead of mpirun
 TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_multi_gpu_cute_dsl_blockscaled_gemm_fusion.py"
@@ -41,16 +46,28 @@ main() {
 
     # Print test files
     echo "Multi-GPU comm kernel test files (running with: ${PYTEST_COMMAND_PREFIX}):"
-    for test_file in $TEST_FILES; do
+    for test_file in $MPI_TEST_FILES; do
         echo "  $test_file"
     done
     echo ""
 
     # Execute tests or dry run
     if [ "$DRY_RUN" == "true" ]; then
-        execute_dry_run "$TEST_FILES"
+        execute_dry_run "$MPI_TEST_FILES"
     else
-        execute_tests "$TEST_FILES"
+        execute_tests "$MPI_TEST_FILES"
+    fi
+
+    echo "Spawn-managed multi-GPU comm test files (running with plain pytest):"
+    for test_file in $SPAWN_MANAGED_TEST_FILES; do
+        echo "  $test_file"
+    done
+    echo ""
+
+    if [ "$DRY_RUN" == "true" ]; then
+        PYTEST_COMMAND_PREFIX= execute_dry_run "$SPAWN_MANAGED_TEST_FILES"
+    else
+        PYTEST_COMMAND_PREFIX= execute_tests "$SPAWN_MANAGED_TEST_FILES"
     fi
 
     # Execute torchrun tests (torchrun requires -m pytest, not direct pytest invocation)

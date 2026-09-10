@@ -40,7 +40,7 @@ from flashinfer.fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.jit import setup_cubin_loader
-from flashinfer.utils import _get_cache_buf
+from flashinfer.utils import _get_cache_buf, get_compute_capability
 
 # Tensor index constants for trtllm_low_latency_gemm inputs: [A, B, global_scale, out]
 _LLGEMM_A_IDX = 0
@@ -63,9 +63,15 @@ _LLGEMM_TUNING_CONFIG = TuningConfig(
 )
 
 
-@functools.cache
 def get_trtllm_low_latency_gemm_module():
-    mod = gen_trtllm_low_latency_gemm_module()
+    device = torch.device("cuda", torch.cuda.current_device())
+    enable_rubin = get_compute_capability(device) == (10, 7)
+    return _get_trtllm_low_latency_gemm_module_impl(enable_rubin)
+
+
+@functools.cache
+def _get_trtllm_low_latency_gemm_module_impl(enable_rubin: bool):
+    mod = gen_trtllm_low_latency_gemm_module(enable_rubin=enable_rubin)
     op = mod.build_and_load()
     setup_cubin_loader(str(mod.get_library_path()))
 

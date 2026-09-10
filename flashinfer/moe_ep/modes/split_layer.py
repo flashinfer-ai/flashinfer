@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Sequence, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 
 from ..algo_knobs import (
     AlgoKnob,
+    FleetAlgoKnobFaultTolerance,
     FleetAlgoKnobQuantization,
     FleetAlgoKnobTopologyCapacity,
     HandleAlgoKnobTopKWeights,
@@ -34,7 +35,6 @@ from ..core.runtime import (
     split_comm_runtime_requirements,
 )
 from ..core.validation.common import (
-    MoEEpConfigError,
     ensure_bootstrap_dist_validated,
     validate_arch_for_backend,
     validate_bootstrap_world_size,
@@ -64,7 +64,7 @@ class MoEEpSplitLayer(nn.Module):
         super().__init__()
         self._bootstrap = bootstrap
         self._fleet_params = fleet_params
-        self._weights = weights
+        self._weights: Optional[MoEWeightPack] = weights
         self._fleet_knobs = list(fleet_knobs)
         if isinstance(backend, SplitConfig):
             self._comm_backend = backend.comm
@@ -89,6 +89,11 @@ class MoEEpSplitLayer(nn.Module):
 
         if type(self._kernel).requires_weights():
             self._kernel.preprocess_weights(self._weights, fleet_params)
+        # Source pack is only needed for init-time validation and kernel
+        # preprocessing; the kernel retains what it needs. Release it so the
+        # layer does not pin a per-layer weight copy for the model lifetime
+        # (same OOM pattern as the mega path — see MoEEpMegaLayer docstring).
+        self._weights = None
 
         self._fleet: Fleet | None = None
 
@@ -114,11 +119,11 @@ class MoEEpSplitLayer(nn.Module):
         validate_fleet_weights(
             self._weights, self._fleet_params, self._bootstrap.world_size
         )
-        if backend_name == "nixl_ep" and self._bootstrap.tcp_store is None:
-            raise MoEEpConfigError(
-                "nixl_ep requires BootstrapConfig.tcp_store; construct a "
-                "torch.distributed.TCPStore and pass it at layer init."
-            )
+        # nixl_ep rendezvous-store validation is deferred to fleet creation
+        # (first forward): layers are routinely constructed before
+        # torch.distributed is initialized, and NixlEpFleet._resolve_store
+        # raises the same actionable error when neither tcp_store nor an
+        # initialized default group is available.
         if backend_name not in ("nccl_ep", "nixl_ep"):
             return
         validate_arch_for_backend(backend_name)
@@ -133,6 +138,7 @@ class MoEEpSplitLayer(nn.Module):
             world_size=self._bootstrap.world_size,
             quant=fleet_knobs.get(FleetAlgoKnobQuantization),  # type: ignore[arg-type]
             topology_capacity=topology_capacity,
+            fault_tolerance=fleet_knobs.get(FleetAlgoKnobFaultTolerance),  # type: ignore[arg-type]
         )
 
     def _ensure_fleet(self) -> Fleet:
@@ -175,7 +181,11 @@ class MoEEpSplitLayer(nn.Module):
         result: torch.Tensor | None = None
         try:
             if not self.enable_timing:
-                dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+                dispatch = handle.dispatch(
+                    DispatchInputParams(
+                        x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
+                    )
+                )
                 expert_out = self._inner_compute(dispatch)
                 combine = handle.combine(
                     CombineInputParams(
@@ -193,7 +203,11 @@ class MoEEpSplitLayer(nn.Module):
                     for k in ("dispatch", "compute", "combine")
                 }
                 ev["dispatch"][0].record()
-                dispatch = handle.dispatch(DispatchInputParams(x=[t.hidden_states]))
+                dispatch = handle.dispatch(
+                    DispatchInputParams(
+                        x=[self._kernel.pack_dispatch_payload(t.hidden_states)]
+                    )
+                )
                 ev["dispatch"][1].record()
                 ev["compute"][0].record()
                 expert_out = self._inner_compute(dispatch)

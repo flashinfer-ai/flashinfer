@@ -30,7 +30,9 @@ def MoEEpLayer(
 
     ``weights`` is the canonical :class:`~flashinfer.moe_ep.weights.MoEWeightPack`
     holding this rank's expert weights; it is validated and (depending on the
-    kernel) preprocessed at construction.
+    kernel) preprocessed at construction. The layer does not retain the pack
+    afterwards — the kernel's transformed/retained tensors own the memory, so
+    callers can drop their reference to reclaim the source copy.
     """
     if isinstance(backend, MegaConfig):
         if fleet_knobs:

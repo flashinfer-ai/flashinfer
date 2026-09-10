@@ -335,7 +335,7 @@ __global__ void routingMainKernel(KernelParams params) {
 
       float scoreNorm = laneIdx < params.mTopK ? smemScoreSigmoid[expertIdx] : 0.F;
       auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-      auto finalScore = OutputT{scoreNorm * params.mRouteScale / redNorm};
+      auto finalScore = OutputT{scoreNorm * params.mRouteScale / (redNorm + params.mSumEpsilon)};
 
       // write expert idx out already
       auto idxTopK = blockIdx.x * params.mTotalExpertsPerToken + laneIdx;
@@ -422,6 +422,8 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
   assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void launchClusterKernel(Data& data, int numThreadsHist, void* stream) {
   LAUNCH_ROUTING_DEEPSEEK(data,
@@ -620,8 +622,9 @@ void run(Data& data, void* stream) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+}  // namespace routingDeepSeek
+
 #undef LAUNCH_DEEPSEEK_WITH_TOPK
 #undef LAUNCH_ROUTING_DEEPSEEK
 
-}  // namespace routingDeepSeek
 }  // namespace moe::dev::routing
