@@ -65,6 +65,36 @@ _CUTILE_ACTIVATIONS = (
 )
 
 
+@pytest.mark.parametrize("arch", (80, 86, 89, 90, 100, 103, 120, 121))
+@pytest.mark.parametrize("weight_format", (QuantFormat.NVFP4, QuantFormat.MXFP4))
+@pytest.mark.parametrize("activation_fp4", (False, True))
+def test_cutile_w4a16_default_backend_candidates(arch, weight_format, activation_fp4):
+    from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=4, top_k=2),
+        quant=QuantConfig(
+            weight_format, weight_format if activation_fp4 else QuantFormat.BF16
+        ),
+        experts=ExpertConfig(intermediate_size=128),
+    )
+    w4a16_configs = (CuTileNvfp4Bf16Config, CuTileMxfp4Bf16Config)
+    candidates = [
+        _BACKEND_RUNNERS[type(candidate)]
+        for candidate in config.backend.valid_for(arch)
+        if type(candidate) in w4a16_configs
+        and _BACKEND_RUNNERS[type(candidate)].supports_quant(config.quant)
+    ]
+    expected = []
+    if arch in (89, 90, 120, 121) and not activation_fp4:
+        expected = [
+            CuTileNvfp4Bf16Runner
+            if weight_format == QuantFormat.NVFP4
+            else CuTileMxfp4Bf16Runner
+        ]
+    assert candidates == expected
+
+
 def test_cutile_activation_capabilities_and_scalar_lowering():
     from flashinfer.fused_moe.cutile.activation import _activation_kernel_args
 

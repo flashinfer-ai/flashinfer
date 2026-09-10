@@ -1838,6 +1838,8 @@ _DEFAULT_BACKEND = BackendOptions(
         CutlassBf16Config(),
         CutlassW4A16Config(),
         CuteDslConfig(),
+        CuTileMxfp4Bf16Config(),
+        CuTileNvfp4Bf16Config(),
     )
 )
 

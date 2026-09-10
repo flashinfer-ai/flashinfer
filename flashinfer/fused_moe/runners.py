@@ -3326,6 +3326,10 @@ def _cutile_fp4_config_rejection_reason(
 class _CuTileFp4Runner(CuTileBf16Runner):
     """Shared adapter for cuTile FP4-weight MoE pipelines."""
 
+    _activation_fp4: ClassVar[bool]
+    _scale_block_size: ClassVar[int]
+    _scale_dtype: ClassVar[torch.dtype]
+
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     # Dispatch and kernels use the weight/activation pair, never the legacy variant.
     quant_dispatch_is_pair_keyed = True
