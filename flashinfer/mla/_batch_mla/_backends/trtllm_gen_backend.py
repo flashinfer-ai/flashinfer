@@ -32,7 +32,7 @@ from ._capabilities import (
 )
 
 
-_SUPPORTED_MLA_DIMENSIONS = frozenset({(512, 64), (256, 64), (512, 0)})
+_SUPPORTED_MLA_DIMENSIONS = frozenset({(512, 64), (256, 64)})
 
 
 @functools.cache
@@ -387,7 +387,9 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         self._q_len = q_len
         self._has_ragged_query = not is_uniform
         self._use_sinks = use_sinks
-        self._max_q_len = max_q_len
+        # Without query offsets, the native launcher uses this as the exact
+        # per-request length rather than an upper bound.
+        self._max_q_len = q_len if is_uniform else max_q_len
         self._total_q = total_q
         self._num_heads = num_heads
         self._kv_lora_rank = head_dim_ckv

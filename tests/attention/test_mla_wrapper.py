@@ -2015,10 +2015,8 @@ def _skip_if_planned_backend_runtime_is_unavailable(backend):
     if backend == "xqa":
         from flashinfer.utils import is_sm12x_supported
 
-        if capability not in ((12, 0), (12, 1)) or not is_sm12x_supported(
-            torch.device("cuda:0")
-        ):
-            pytest.skip(f"xqa planned MLA requires SM120/SM121, got {capability}")
+        if not is_sm12x_supported(torch.device("cuda:0")):
+            pytest.skip("xqa planned MLA requires a supported SM12x/CUDA configuration")
         return
 
     if capability not in ((10, 0), (10, 3)):
@@ -2279,6 +2277,169 @@ def test_planned_backend_wrapper_matches_direct(backend, dtype, use_sinks):
         rtol=tolerance,
         atol=tolerance,
     )
+
+
+@pytest.mark.parametrize("q_lengths", [(1,), (1, 2)])
+def test_trtllm_gen_planned_query_length_upper_bound(q_lengths):
+    from dataclasses import replace
+
+    import flashinfer
+
+    case = _make_planned_backend_runtime_case("trtllm-gen", torch.bfloat16, plan=False)
+    total_q = sum(q_lengths)
+    max_q_len = max(q_lengths) + 1
+    batch_size = len(q_lengths)
+    offsets = torch.tensor((0, *q_lengths), dtype=torch.int32, device="cuda").cumsum(
+        0, dtype=torch.int32
+    )
+    case["plan_kwargs"]["metadata"] = replace(
+        case["metadata"],
+        cum_seq_lens_q=offsets,
+        block_tables=case["metadata"].block_tables.repeat(batch_size, 1),
+        seq_lens=case["metadata"].seq_lens.repeat(batch_size),
+        max_q_len=max_q_len,
+    )
+    # Extra backing rows expose an incorrect launch length without relying on
+    # an out-of-allocation GPU access.
+    storage_rows = batch_size * max_q_len + 1
+    query_storage = torch.randn(
+        (storage_rows, 128, 576), dtype=torch.bfloat16, device="cuda"
+    )
+    output_storage = torch.full(
+        (storage_rows, 128, 512), 777.0, dtype=torch.bfloat16, device="cuda"
+    )
+    case["query"] = query_storage[:total_q]
+    case["out"] = output_storage[:total_q]
+    case["wrapper"].plan(**case["plan_kwargs"])
+    actual = _run_planned_backend_runtime_case(case)
+    torch.cuda.synchronize()
+    assert torch.all(output_storage[total_q:] == 777), "output guard rows overwritten"
+
+    metadata = case["plan_kwargs"]["metadata"]
+    expected = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=case["query"],
+        kv_cache=case["kv_cache"].unsqueeze(1),
+        workspace_buffer=torch.empty_like(case["workspace"]),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=metadata.block_tables,
+        seq_lens=metadata.seq_lens,
+        max_seq_len=case["max_seq_len"],
+        cum_seq_lens_q=offsets,
+        max_q_len=max(q_lengths),
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+        enable_pdl=True,
+        backend="trtllm-gen",
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_trtllm_gen_planned_rejects_no_rope():
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    case = _make_planned_backend_runtime_case("trtllm-gen", torch.bfloat16, plan=False)
+    case["plan_kwargs"]["head_dim_kpe"] = 0
+    with pytest.raises(_BackendPlanUnsupportedError, match="MLA dimensions"):
+        case["wrapper"].plan(**case["plan_kwargs"])
+
+
+@pytest.mark.parametrize(
+    "backend", ["cute-dsl-monolithic", "cute-dsl-modular", "cute-dsl"]
+)
+def test_cute_dsl_planned_rejects_unsupported_installed_arch(backend, monkeypatch):
+    import flashinfer.cute_dsl.availability as availability
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+    from flashinfer.mla._batch_mla._backends._cute_dsl_common import (
+        _BatchMLAPagedAttentionCuteDslBackendBase,
+    )
+
+    case = _make_planned_backend_runtime_case(backend, torch.bfloat16, plan=False)
+    monkeypatch.setattr(availability, "is_cute_dsl_arch_supported", lambda *args: False)
+
+    def unexpected_plan(*args, **kwargs):
+        pytest.fail("unsupported installed architecture reached backend planning")
+
+    monkeypatch.setattr(
+        _BatchMLAPagedAttentionCuteDslBackendBase, "plan", unexpected_plan
+    )
+    with pytest.raises(_BackendPlanUnsupportedError, match="installed CuTe DSL"):
+        case["wrapper"].plan(**case["plan_kwargs"])
+
+
+@pytest.mark.parametrize("actual_q_len", [1, 2])
+def test_xqa_planned_query_length_upper_bound(actual_q_len):
+    from dataclasses import replace
+
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    case = _make_planned_backend_runtime_case("xqa", torch.bfloat16, plan=False)
+    metadata = replace(
+        case["metadata"],
+        cum_seq_lens_q=torch.tensor(
+            [0, actual_q_len], dtype=torch.int32, device="cuda"
+        ),
+        max_q_len=2,
+    )
+    kwargs = {**case["plan_kwargs"], "metadata": metadata}
+    if actual_q_len != 1:
+        with pytest.raises(_BackendPlanUnsupportedError, match="one query token"):
+            case["wrapper"].plan(**kwargs)
+        return
+
+    case["wrapper"].plan(**kwargs)
+    torch.testing.assert_close(
+        _run_planned_backend_runtime_case(case).float(),
+        _direct_planned_backend_runtime_oracle(case).float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("scale_name", ["bmm1_scale", "bmm2_scale"])
+def test_xqa_planned_integer_scale(scale_name):
+    case = _make_planned_backend_runtime_case("xqa", torch.bfloat16)
+    case[scale_name] = 1
+    actual = _run_planned_backend_runtime_case(case)
+    case[scale_name] = 1.0
+    expected = _direct_planned_backend_runtime_oracle(case)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("capability", "cuda_version", "supported"),
+    [
+        ((12, 0), "12.7", False),
+        ((12, 0), "12.8", True),
+        ((12, 1), "12.8", False),
+        ((12, 1), "12.9", True),
+        ((10, 0), "13.0", False),
+    ],
+)
+def test_xqa_planned_device_support(capability, cuda_version, supported, monkeypatch):
+    import flashinfer.utils as utils
+    from flashinfer.mla._batch_mla._backends import xqa_backend
+    from flashinfer.mla._batch_mla._backends._capabilities import (
+        _BackendPlanUnsupportedError,
+    )
+
+    monkeypatch.setattr(utils, "get_compute_capability", lambda device: capability)
+    monkeypatch.setattr(
+        xqa_backend, "get_compute_capability", lambda device: capability
+    )
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    if supported:
+        xqa_backend._validate_xqa_device_capability(torch.device("cuda"))
+    else:
+        with pytest.raises(_BackendPlanUnsupportedError):
+            xqa_backend._validate_xqa_device_capability(torch.device("cuda"))
 
 
 @pytest.mark.parametrize(

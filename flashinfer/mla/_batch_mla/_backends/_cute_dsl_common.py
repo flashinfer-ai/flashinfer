@@ -107,6 +107,13 @@ def _validate_cute_dsl_plan_args_before_metadata(args: _MLAPlanArguments) -> Non
             "cute-dsl backend requires SM100/SM103, got compute capability "
             f"SM{major}{minor}."
         )
+    from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
+
+    if not is_cute_dsl_arch_supported(major, minor):
+        raise _BackendPlanUnsupportedError(
+            "cute-dsl backend: the installed CuTe DSL does not support "
+            f"sm_{major}{minor}."
+        )
 
 
 def _q_layout(cum_seq_lens_q: torch.Tensor) -> tuple[int, int, int, bool, int]:
