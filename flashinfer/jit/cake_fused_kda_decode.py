@@ -3881,7 +3881,12 @@ def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
             "high_work_positive_h96_f32",
             "high_work_positive_f32",
         )
-    if num_heads <= 24 and 3 * sm_count < 2 * work_items <= 4 * sm_count:
+    # Pair-channel producers win the measured H12/22 and H24/10 cases.
+    if (
+        num_heads <= 24
+        and (num_heads, num_rows) not in ((12, 22), (24, 10))
+        and 3 * sm_count < 2 * work_items <= 4 * sm_count
+    ):
         return ("wide512_vector4_positive_f32",)
     return ("wide512_positive_f32",)
 

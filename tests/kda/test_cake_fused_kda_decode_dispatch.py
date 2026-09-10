@@ -252,10 +252,11 @@ def _select_positive_route(target, heads, rows, *, lower_bound=-5.0, wide=False)
     (
         (12, 18, "wide512_positive_f32"),
         (12, 19, "wide512_vector4_positive_f32"),
+        (12, 22, "wide512_positive_f32"),
         (12, 24, "wide512_vector4_positive_f32"),
         (12, 25, "compact_async_positive_f32"),
         (24, 9, "wide512_positive_f32"),
-        (24, 10, "wide512_vector4_positive_f32"),
+        (24, 10, "wide512_positive_f32"),
         (24, 12, "wide512_vector4_positive_f32"),
         (24, 13, "compact_async_positive_f32"),
         (32, 9, "wide512_positive_f32"),
