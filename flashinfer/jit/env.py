@@ -24,6 +24,10 @@ import pathlib
 from dataclasses import dataclass
 from typing import FrozenSet, Tuple
 
+from ._cuda_architecture import (
+    cuda_binary_target_compatibility_score,
+)
+
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
 
@@ -191,14 +195,29 @@ def _target_cuda_architectures() -> FrozenSet[str]:
 def _provider_covers_targets(
     provider_architectures: FrozenSet[str], target_architectures: FrozenSet[str]
 ) -> bool:
-    """Return whether a provider explicitly covers every active CUDA target.
+    """Return whether provider targets can execute on every active CUDA target."""
+    return (
+        _provider_compatibility_score(provider_architectures, target_architectures)
+        is not None
+    )
 
-    Exact matching is intentional. In particular, ``a`` targets are
-    architecture-specific and cannot be forwarded to another compute capability.
-    Baseline and ``f`` targets also remain exact here until provider manifests can
-    distinguish executable compatibility from complete AOT module coverage.
-    """
-    return target_architectures.issubset(provider_architectures)
+
+def _provider_compatibility_score(
+    provider_architectures: FrozenSet[str], target_architectures: FrozenSet[str]
+) -> tuple[tuple[int, int], ...] | None:
+    """Score a provider, preferring exact and newer compatible targets."""
+    scores = []
+    for target in sorted(target_architectures):
+        compatible_scores = [
+            score
+            for architecture in provider_architectures
+            if (score := cuda_binary_target_compatibility_score(architecture, target))
+            is not None
+        ]
+        if not compatible_scores:
+            return None
+        scores.append(max(compatible_scores))
+    return tuple(sorted(scores))
 
 
 def get_aot_path(module_name: str) -> pathlib.Path:
@@ -210,16 +229,22 @@ def get_aot_path(module_name: str) -> pathlib.Path:
     target_architectures = _target_cuda_architectures()
     if not target_architectures:
         return fallback_path
+    candidates = []
     for provider in FLASHINFER_AOT_PROVIDERS:
         if module_name not in provider.modules:
             continue
-        if not _provider_covers_targets(
+        compatibility_score = _provider_compatibility_score(
             provider.cuda_architectures, target_architectures
-        ):
+        )
+        if compatibility_score is None:
             continue
         provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
         if provider_path.exists():
-            return provider_path
+            candidates.append(
+                (compatibility_score, provider.provider_id, provider_path)
+            )
+    if candidates:
+        return max(candidates, key=lambda candidate: candidate[:2])[2]
 
     # JitSpec uses this stable path for existence checks and diagnostics when
     # no compatible prebuilt module is installed.

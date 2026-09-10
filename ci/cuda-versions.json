@@ -32,7 +32,6 @@
       "pytorch_index": "cu129",
       "x86_64_provider_architectures": [
         "8.0",
-        "8.6",
         "8.9",
         "9.0a",
         "10.0a",
@@ -41,7 +40,6 @@
       ],
       "aarch64_provider_architectures": [
         "8.0",
-        "8.6",
         "8.9",
         "9.0a",
         "10.0a",
@@ -55,7 +53,6 @@
       "pytorch_index": "cu130",
       "x86_64_provider_architectures": [
         "8.0",
-        "8.6",
         "8.9",
         "9.0a",
         "10.0a",
@@ -64,7 +61,6 @@
       ],
       "aarch64_provider_architectures": [
         "8.0",
-        "8.6",
         "8.9",
         "9.0a",
         "10.0a",
@@ -80,7 +76,6 @@
       "pytorch_index": "nightly/cu134",
       "x86_64_provider_architectures": [
         "8.0",
-        "8.6",
         "8.9",
         "9.0a",
         "10.0a",
@@ -90,7 +85,6 @@
       ],
       "aarch64_provider_architectures": [
         "8.0",
-        "8.6",
         "8.9",
         "9.0a",
         "10.0a",

@@ -54,7 +54,7 @@ def _write_provider_requirements(version: str) -> None:
     provider_tags = sorted(
         {_provider_tag(architecture) for architecture in architecture_list.split()}
     )
-    # Provider lists are literal; sm80 SASS is not a portable baseline.
+    # Dependencies are literal; runtime ranks compatibility from provider targets.
     requirements = [
         f"flashinfer-jit-cache-{provider_tag}=={version}"
         for provider_tag in provider_tags

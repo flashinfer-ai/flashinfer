@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -14,6 +16,23 @@ from datetime import datetime, timezone
 from email.parser import BytesParser
 from pathlib import Path
 from typing import Any, Mapping
+
+_CUDA_ARCHITECTURE_PATH = (
+    Path(__file__).resolve().parents[1] / "flashinfer/jit/_cuda_architecture.py"
+)
+_CUDA_ARCHITECTURE_SPEC = importlib.util.spec_from_file_location(
+    "_flashinfer_jit_cuda_architecture", _CUDA_ARCHITECTURE_PATH
+)
+if _CUDA_ARCHITECTURE_SPEC is None or _CUDA_ARCHITECTURE_SPEC.loader is None:
+    raise ImportError(
+        f"Could not load CUDA architecture helpers from {_CUDA_ARCHITECTURE_PATH}"
+    )
+_cuda_architecture = importlib.util.module_from_spec(_CUDA_ARCHITECTURE_SPEC)
+sys.modules[_CUDA_ARCHITECTURE_SPEC.name] = _cuda_architecture
+_CUDA_ARCHITECTURE_SPEC.loader.exec_module(_cuda_architecture)
+cuda_binary_target_compatibility_score = (
+    _cuda_architecture.cuda_binary_target_compatibility_score
+)
 
 
 def canonicalize_distribution(name: str) -> str:
@@ -56,6 +75,38 @@ class Wheel:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def cuda_binary_target_is_compatible(
+    binary_target: str, device_architecture: str
+) -> bool:
+    """Return whether a SASS target can execute on a device architecture."""
+    return (
+        cuda_binary_target_compatibility_score(binary_target, device_architecture)
+        is not None
+    )
+
+
+def _cuda_architecture_issues(
+    binary_targets: list[str], device_architectures: list[str]
+) -> tuple[list[str], list[str]]:
+    incompatible_targets = [
+        target
+        for target in binary_targets
+        if not any(
+            cuda_binary_target_is_compatible(target, architecture)
+            for architecture in device_architectures
+        )
+    ]
+    uncovered_architectures = [
+        architecture
+        for architecture in device_architectures
+        if not any(
+            cuda_binary_target_is_compatible(target, architecture)
+            for target in binary_targets
+        )
+    ]
+    return incompatible_targets, uncovered_architectures
 
 
 def normalize_requirement(requirement: str) -> tuple[str, str]:
@@ -216,16 +267,22 @@ def write_validation_report(
     ptx_modules: list[str],
     report_filename: str,
 ) -> None:
+    def is_compatible(targets: list[str]) -> bool:
+        if not targets:
+            return False
+        incompatible, uncovered = _cuda_architecture_issues(targets, [provider])
+        return not incompatible and not uncovered
+
     architecture_summary = {
-        "provider_only": sum(
+        "provider_target_only": sum(
             targets == [provider] for targets in module_architectures.values()
         ),
-        "mixed": sum(
-            provider in targets and targets != [provider]
+        "compatible_targets": sum(
+            targets != [provider] and is_compatible(targets)
             for targets in module_architectures.values()
         ),
-        "foreign_only": sum(
-            bool(targets) and provider not in targets
+        "incompatible_targets": sum(
+            bool(targets) and not is_compatible(targets)
             for targets in module_architectures.values()
         ),
         "no_cubin": sum(not targets for targets in module_architectures.values()),
@@ -322,19 +379,28 @@ def inspect_cuda_architectures(
                 if "No PTX file found" not in ptx_output:
                     ptx_modules.append(module)
 
-    mismatches = {
-        module: targets
-        for module, targets in result.items()
-        if targets and targets != [provider]
-    }
-    if strict and mismatches:
+    architecture_issues = {}
+    for module, targets in result.items():
+        if not targets:
+            continue
+        incompatible_targets, uncovered_architectures = _cuda_architecture_issues(
+            targets, [provider]
+        )
+        if incompatible_targets or uncovered_architectures:
+            architecture_issues[module] = {
+                "targets": targets,
+                "incompatible": incompatible_targets,
+                "uncovered": uncovered_architectures,
+            }
+    if strict and architecture_issues:
         examples = ", ".join(
-            f"{module}={targets}"
-            for module, targets in list(sorted(mismatches.items()))[:10]
+            f"{module}={issues}"
+            for module, issues in list(sorted(architecture_issues.items()))[:10]
         )
         require(
             False,
-            f"{len(mismatches)} modules do not contain only {provider}: {examples}",
+            f"{len(architecture_issues)} modules contain CUDA targets incompatible "
+            f"with provider target {provider}: {examples}",
         )
     if strict and ptx_modules:
         examples = ", ".join(sorted(ptx_modules)[:10])

@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         "--cuda-architecture-policy",
         choices=("strict", "report"),
         default="strict",
-        help="Fail on non-provider cubins, or retain them in the inventory report",
+        help="Fail on incompatible cubins, or retain them in the inventory report",
     )
     parser.add_argument("--install-smoke", action="store_true")
     return parser.parse_args()

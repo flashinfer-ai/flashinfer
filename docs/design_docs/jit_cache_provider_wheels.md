@@ -93,19 +93,30 @@ CUDA distinguishes three target kinds:
 - An architecture-specific `smXXa` or `compute_XXa` target runs only on that
   exact compute capability. It is neither forward nor backward compatible.
 - A family-specific `smXXf` or `compute_XXf` target runs only on devices in the
-  CUDA-defined family for that target.
+  same or later compatible feature set in its compute-capability major. Family
+  targets are ordered by compute capability, so newly supported targets such as
+  `sm107f` do not require another hand-maintained membership table.
 - An unsuffixed cubin uses CUDA's baseline binary-compatibility rules, including
   forward compatibility to a higher minor compute capability in the same major
   family. Unsuffixed cubins are not compatible across major families.
 
-The initial provider implementation deliberately requires an exact manifest
-target match for all three forms. Minimal auto-detection on an SM121 device
-therefore installs the `sm121a` provider, not `sm120f`; similarly, an `sm100a`
-provider cannot satisfy an `sm103a` target. This conservative rule treats
-binary executability and complete AOT module coverage as separate questions.
-Broader baseline or family coverage can be introduced later only through
-explicit manifest coverage that has been validated for every packaged module;
-the resolver must never infer a closest lower provider from the target name.
+Artifact validation applies these rules to the SASS target in each shared
+library, rather than requiring that target to be textually identical to the
+provider name. For example, a module containing baseline `sm100` SASS is valid
+in an `sm103a` provider, while one containing exact `sm100a` SASS is not. Every
+non-host module must contain only targets usable by the declared devices and
+must cover every architecture in the manifest. PTX remains prohibited.
+
+Runtime selection applies the same compatibility rules to the target declared
+by each installed provider and chooses the closest compatible provider. Exact
+targets win over family targets, family targets win over unsuffixed baselines,
+and a higher compatible minor wins within either forward-compatible class. The
+resolver still checks each provider's module inventory and file before using it,
+so an absent module falls back to JIT instead of requiring every compatible
+provider to have an identical inventory. The `sm80` provider therefore serves
+SM86 without claiming `sm86` in its manifest, while an installed native `sm89`
+provider remains preferred on SM89. Architecture-specific `a` providers remain
+exact.
 
 ## Installation Modes
 
@@ -119,8 +130,10 @@ This leaves provider selection to the shim's static `Requires-Dist` metadata.
 Pip does not detect GPUs and should not be asked to make a hardware-dependent
 resolution decision.
 
-Minimal mode installs the shim and selected providers in one no-dependencies
-transaction:
+Minimal mode first downloads the small exact shim wheel without dependencies and
+reads its `Requires-Dist` metadata. It then installs the shim and the best
+compatible providers from that published CUDA/CPU inventory in one
+no-dependencies transaction:
 
 ```bash
 flashinfer install-jit-cache-wheel --mode minimal
@@ -128,11 +141,12 @@ flashinfer install-jit-cache-wheel --mode minimal --sm sm120f
 ```
 
 Without `--sm`, the CLI uses the visible CUDA devices. `--sm` may be repeated
-when preparing an image on a different machine. The current prototype provider
-is self-contained for one target. Minimal mode installs exactly the detected or
-requested providers and never adds an implicit sm80 baseline.
+when preparing an image on a different machine. Each provider is self-contained
+for its declared target. Minimal mode ranks only providers named by that shim,
+so SM86 currently selects `sm80` because it is the closest compatible published
+target, not because SM86 is a special case. No cross-major baseline is added.
 
-## SM80 Is Not a Baseline Provider
+## SM80 Is Not a Cross-Major Baseline
 
 FlashInfer's NVCC flags emit SASS targets such as `code=sm_80`; they do not emit
 a PTX fallback such as `code=compute_80`. NVIDIA documents unsuffixed cubin
@@ -148,10 +162,10 @@ and no PTX. A complete scan of the v0.6.16.post1 cu130 AArch64 wheel also found
 no PTX. The standalone `flashinfer-jit-cache` package has therefore never
 provided the proposed compute_80 PTX fallback in the audited release range.
 
-The sm80 provider remains useful for systems that actually contain Ampere GPUs.
+The sm80 provider remains useful for SM80 and later compatible 8.x GPUs.
 It is an independent provider, not a dependency of sm90, sm100, sm120, or sm121
 providers. Shim dependency lists are literal: sm80 is installed only when the
-published all-provider set or an explicit user selection includes it.
+published all-provider set includes it or minimal selection chooses it.
 
 The existing `sm80` capability in `flashinfer/aot.py` is a source and module
 enumeration condition: it selects kernels whose implementation requires the
@@ -281,15 +295,16 @@ wheelhouse measurement before release integration.
 inventory for each CUDA and CPU platform. Release and nightly workflows always
 perform three provider stages:
 
-1. Build every CUDA/CPU/provider matrix entry and reject foreign cubins or PTX.
+1. Build every CUDA/CPU/provider matrix entry and reject incompatible cubins or
+   PTX.
 2. Build one platform-specific shim per CUDA/CPU entry whose exact dependencies
    name every provider in that entry's configured inventory.
 3. Assemble each set and exercise both dependency-driven default installation
    and a one-provider, no-dependencies minimal installation before publication.
 
 The existing nightly GPU test then installs the assembled x86_64 wheel set with
-JIT disabled. Its SM86 runner is why SM86 appears explicitly in the provider
-inventory; exact provider matching does not treat SM80 as covering SM86.
+JIT disabled. Its SM86 runner validates generic forward-compatible selection of
+the SM80 provider without a separate SM86 wheel.
 
 Provider publication and wheel-index updates occur only after the complete set
 passes. Rollback after this stage requires reverting the release workflow to a
@@ -302,8 +317,8 @@ Before deploying the provider-only release workflow:
 1. Build each CUDA and CPU matrix entry on the fork and record compressed size,
    uncompressed size, module count, and build time per provider.
 2. Use `cuobjdump --list-elf` and `cuobjdump --list-ptx` on every packaged `.so`.
-   Compare actual cubin targets with the provider manifest and require native
-   providers to contain no PTX.
+   Require each cubin target to be executable on the manifest's declared
+   devices, require every declared device to be covered, and reject PTX.
 3. Compare module inventories from one-target builds with the current multi-arch
    build. Any module that appears only when `8.0` is added needs its AOT
    registration condition corrected or an explicit support decision.
@@ -313,20 +328,16 @@ Before deploying the provider-only release workflow:
    deterministic architecture selection.
 6. Test a process with heterogeneous visible GPUs. Until a provider contains
    all required targets, it should miss AOT cleanly and fall back to JIT.
-7. Add negative selection tests proving that architecture-specific providers do
-   not match another compute capability, including sm100a versus sm103a and
-   sm121a versus future SM12x targets. Keep baseline and family providers exact
-   until broader coverage is represented explicitly and validated module by
-   module.
+7. Keep selection tests proving that architecture-specific providers do not
+   match another compute capability, compatible baselines and family targets are
+   ranked below exact targets, and new family targets do not require a code
+   table update.
 8. Exercise the release and nightly matrices from the fork, including
    wheel-index generation. Decide stale-provider uninstall behavior before
    declaring minimal installation stable.
 
 ## Open Decisions
 
-- Whether later provider manifests should add broader baseline or family
-  coverage after every `.so` and module inventory has been validated for the
-  additional devices. Architecture-specific `a` targets always remain exact.
 - Whether a measured common module set warrants separate common-module
   providers as a size optimization.
 - Whether provider manifests should include hashes and per-module code targets,

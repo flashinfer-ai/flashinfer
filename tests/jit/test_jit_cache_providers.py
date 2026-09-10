@@ -343,8 +343,46 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     assert trap_marker.is_file()
 
 
-def test_native_provider_cuda_inspection_reports_no_ptx(
-    monkeypatch, tmp_path, provider_validation_module
+@pytest.mark.parametrize(
+    ("binary_target", "device_architecture", "expected"),
+    [
+        ("sm80", "sm86", True),
+        ("sm80", "sm89", True),
+        ("sm86", "sm80", False),
+        ("sm100", "sm107a", True),
+        ("sm100a", "sm103a", False),
+        ("sm100f", "sm103a", True),
+        ("sm100f", "sm107a", True),
+        ("sm103f", "sm107a", True),
+        ("sm107f", "sm107a", True),
+        ("sm107f", "sm103a", False),
+        ("sm120f", "sm121a", True),
+        ("sm121a", "sm120f", False),
+    ],
+)
+def test_cuda_binary_target_compatibility(
+    provider_validation_module, binary_target, device_architecture, expected
+):
+    assert (
+        provider_validation_module.cuda_binary_target_is_compatible(
+            binary_target, device_architecture
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "binary_target"),
+    [
+        ("sm120f", "sm120f"),
+        ("sm100a", "sm100"),
+        ("sm103a", "sm100"),
+        ("sm107a", "sm100"),
+        ("sm120f", "sm120"),
+    ],
+)
+def test_native_provider_cuda_inspection_accepts_compatible_sass(
+    monkeypatch, tmp_path, provider_validation_module, provider, binary_target
 ):
     wheel_path = tmp_path / "provider.whl"
     archive_path = "provider/jit_cache/test_module/test_module.so"
@@ -352,7 +390,7 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
         archive.writestr(archive_path, b"test")
     wheel = provider_validation_module.Wheel(
         path=wheel_path,
-        distribution="flashinfer-jit-cache-sm120f",
+        distribution=f"flashinfer-jit-cache-{provider}",
         version="0.6.16+cu130",
         requirements=(),
         contents=(archive_path,),
@@ -364,7 +402,7 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
     def mock_run(cmd, **_kwargs):
         if cmd[1] == "--list-elf":
             return subprocess.CompletedProcess(
-                cmd, 0, stdout="ELF file 1: test.sm120f.cubin\n", stderr=""
+                cmd, 0, stdout=f"ELF file 1: test.{binary_target}.cubin\n", stderr=""
             )
         assert cmd[1] == "--list-ptx"
         return subprocess.CompletedProcess(
@@ -379,13 +417,55 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
     architectures, ptx_modules = provider_validation_module.inspect_cuda_architectures(
         wheel,
         {"test_module": archive_path},
-        "sm120f",
+        provider,
         cuobjdump,
         strict=True,
     )
 
-    assert architectures == {"test_module": ["sm120f"]}
+    assert architectures == {"test_module": [binary_target]}
     assert ptx_modules == []
+
+
+def test_native_provider_cuda_inspection_rejects_incompatible_sass(
+    monkeypatch, tmp_path, provider_validation_module
+):
+    wheel_path = tmp_path / "provider.whl"
+    archive_path = "provider/jit_cache/test_module/test_module.so"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(archive_path, b"test")
+    wheel = provider_validation_module.Wheel(
+        path=wheel_path,
+        distribution="flashinfer-jit-cache-sm103a",
+        version="0.6.16+cu130",
+        requirements=(),
+        contents=(archive_path,),
+        metadata_path="provider.dist-info/METADATA",
+    )
+    cuobjdump = tmp_path / "cuobjdump"
+    cuobjdump.touch()
+
+    def mock_run(cmd, **_kwargs):
+        if cmd[1] == "--list-elf":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="ELF file 1: test.sm100a.cubin\n", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="",
+            stderr="cuobjdump info: No PTX file found to extract\n",
+        )
+
+    monkeypatch.setattr(provider_validation_module.subprocess, "run", mock_run)
+
+    with pytest.raises(ValueError, match="CUDA targets incompatible"):
+        provider_validation_module.inspect_cuda_architectures(
+            wheel,
+            {"test_module": archive_path},
+            "sm103a",
+            cuobjdump,
+            strict=True,
+        )
 
 
 def test_native_provider_cuda_inspection_rejects_ptx(
@@ -462,19 +542,54 @@ def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
     assert jit_env.get_aot_path("attention_module") == expected
 
 
+def test_get_aot_path_uses_best_compatible_provider(monkeypatch, tmp_path):
+    fallback_root = tmp_path / "package-aot"
+    sm80_root = tmp_path / "sm80"
+    sm89_root = tmp_path / "sm89"
+    expected = _create_aot_module(sm89_root, "attention_module")
+    _create_aot_module(sm80_root, "attention_module")
+    providers = (
+        jit_env.AOTProvider(
+            provider_id="sm80",
+            distribution="flashinfer-jit-cache-sm80",
+            version="0.6.16+cu130",
+            jit_cache_dir=sm80_root,
+            cuda_architectures=frozenset({"sm80"}),
+            modules=frozenset({"attention_module"}),
+        ),
+        jit_env.AOTProvider(
+            provider_id="sm89",
+            distribution="flashinfer-jit-cache-sm89",
+            version="0.6.16+cu130",
+            jit_cache_dir=sm89_root,
+            cuda_architectures=frozenset({"sm89"}),
+            modules=frozenset({"attention_module"}),
+        ),
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", providers)
+    monkeypatch.setattr(
+        jit_env, "_target_cuda_architectures", lambda: frozenset({"sm89"})
+    )
+
+    assert jit_env.get_aot_path("attention_module") == expected
+
+
 @pytest.mark.parametrize(
-    ("provider_architecture", "target_architecture"),
+    ("provider_architecture", "target_architecture", "compatible"),
     [
-        ("sm100a", "sm103a"),
-        ("sm120f", "sm121a"),
-        ("sm80", "sm86"),
+        ("sm80", "sm86", True),
+        ("sm100f", "sm107a", True),
+        ("sm120f", "sm121a", True),
+        ("sm100a", "sm103a", False),
     ],
 )
-def test_get_aot_path_does_not_infer_provider_compatibility(
+def test_get_aot_path_applies_cuda_provider_compatibility(
     monkeypatch,
     tmp_path,
     provider_architecture,
     target_architecture,
+    compatible,
 ):
     fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / provider_architecture
@@ -495,8 +610,9 @@ def test_get_aot_path_does_not_infer_provider_compatibility(
         lambda: frozenset({target_architecture}),
     )
 
+    expected_root = provider_root if compatible else fallback_root
     assert jit_env.get_aot_path("attention_module") == (
-        fallback_root / "attention_module" / "attention_module.so"
+        expected_root / "attention_module" / "attention_module.so"
     )
 
 
