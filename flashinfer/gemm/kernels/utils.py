@@ -34,11 +34,28 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
-# Eager M bucket boundaries — powers of 2 for fast bucketing via
-# next_positive_power_of_2 (imported from flashinfer.utils). Larger buckets are
-# added lazily: capping the fallback at 4096 made all large prefill shapes use
-# the M=4096 decision even though their preferred orientation can change.
-_M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+# M bucket boundaries — powers of 2 for fast bucketing via
+# next_positive_power_of_2 (imported from flashinfer.utils). Precompute through
+# the largest profiled prefill shape so those decisions stay off the inference
+# hot path, then clamp larger shapes to the final bucket.
+_M_BUCKETS = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+)
 
 # The matched SM100/SM107 microbenchmarks show that the old narrow-M
 # orientation rule is no longer predictive above M=8192. Large-M preference
@@ -235,11 +252,7 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
             )
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    bucket = next_positive_power_of_2(m)
-    if bucket not in bucket_tactics:
-        bucket_tactics[bucket] = _compute_tactic_for_m(
-            bucket, n, real_k, sm_count, sf_vec_size
-        )
+    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
     return bucket_tactics[bucket]
 
 
@@ -423,9 +436,5 @@ def _select_sm107_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
             )
         _SM107_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    bucket = next_positive_power_of_2(m)
-    if bucket not in bucket_tactics:
-        bucket_tactics[bucket] = _compute_sm107_tactic_for_m(
-            bucket, n, real_k, sm_count, sf_vec_size
-        )
+    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
     return bucket_tactics[bucket]
