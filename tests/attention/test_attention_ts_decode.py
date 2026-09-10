@@ -4281,7 +4281,11 @@ def test_attention_ts_decode_mixed_kv_dtype_resources_build(
     cfg = _make_mixed_kv_dtype_config(tile_size_q=tile_size_q, config_args=config_args)
     resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
 
-    assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
+    # Mixed k_dtype != v_dtype shares one K ring and one V ring across both
+    # K/V instances rather than allocating separate rings per instance.
+    assert {"smemK0", "smemV0"} <= resources.keys()
+    assert "smemK1" not in resources
+    assert "smemV1" not in resources
     assert cfg.smem_k_tile_bytes == cfg.smem_v_tile_bytes * 2
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
