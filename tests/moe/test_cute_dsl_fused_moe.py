@@ -3630,10 +3630,8 @@ def test_w4a8_fused_moe_tactics_and_apis(
     assert passed, f"Only {percent_within * 100:.2f}% within tolerance ({atol=:.4f})"
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
-
-
+@cute_dsl_available
+@sm10x_required
 class TestRubinMultiCtaTacticRejected:
     """A Rubin tactic with ``cluster_shape_m > 1`` must be refused.
 
@@ -3789,6 +3787,8 @@ class TestRubinMultiCtaTacticRejected:
         )
 
 
+@cute_dsl_available
+@sm10x_required
 class TestOddTileCountBoundsContract:
     """Exercise the active-count bounds contract at an *odd* tile count.
 
@@ -4072,3 +4072,7 @@ class TestOddTileCountBoundsContract:
                 f"(atol={atol:.4f}) -- a stale tile-map entry from the "
                 f"previous replay leaked into this one"
             )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
