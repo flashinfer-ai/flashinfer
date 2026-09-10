@@ -55,6 +55,20 @@ class IpcVariant(IntEnum):
     STAGED = 1
     STAGED_RING = 2
     FLAT_STAGED = 3
+    # Copy-engine ring. `blocks` on this variant is not a grid size: it carries
+    # the ring's sub-chunk depth, which moves the collective by an order more
+    # than the add kernel's geometry does -- the geometry is not free, it is
+    # dominated -- so the one tunable integer goes to the knob that decides the
+    # outcome. Reusing the field rather than widening IpcLaunchConfig keeps
+    # the tactic a 3-tuple, which leaves the codec, pack_config and every arity
+    # test untouched, and holds this variant to a handful of candidates.
+    COPY_ENGINE_RING = 4
+    # The 4+4 decomposition. Reachable only at world size 8 and only on a
+    # fabric that grouping describes -- see _is_launchable, and the profile
+    # filter in pcie_ipc_tuning.get_valid_tactics, which keeps it out of the
+    # candidate list on fabrics it does not describe, where it lost to both
+    # the flat ring and the SM path.
+    COPY_ENGINE_ISLAND = 5
 
 
 @dataclass(frozen=True)
@@ -135,12 +149,59 @@ def _seed(
     return IpcLaunchConfig(min(16, max_blocks), 256, IpcVariant.UNSTAGED)
 
 
-def _is_launchable(world_size: int, config: IpcLaunchConfig, max_blocks: int) -> bool:
+CE_MAX_PIECES = 4
+# The copy-engine add kernel's block size. Fixed, not tuned -- see _is_launchable.
+CE_THREADS = 256
+
+
+def _is_launchable(
+    world_size: int,
+    config: IpcLaunchConfig,
+    max_blocks: int,
+    numel: Optional[int] = None,
+    elem_size: int = 2,
+) -> bool:
     """Reject configurations the kernels cannot accept.
 
     A violation here degrades to "unsupported shape" and a caller fallback,
     which is far better than reaching the kernel and failing a hard check.
+
+    `numel` is optional because most callers ask whether a configuration can
+    exist at all, not whether it fits one shape; passing it is what admits the
+    shape-dependent rules below. The tuner must pass it: the copy-engine ring
+    has a divisibility precondition that `_admits` does not imply, and a
+    candidate that reaches the launcher and fails its hard check raises on one
+    rank while its peers spin with no timeout.
     """
+    if config.variant in (IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND):
+        if config.variant == IpcVariant.COPY_ENGINE_ISLAND and world_size != 8:
+            return False
+        # A copy-engine variant is not exempt from the world-size-2 rule just
+        # because it names its own launcher: the launcher admits exactly two
+        # variants there and rejects every other one by number, so a candidate
+        # that gets past this point fails its hard check. The schedule is
+        # correct at two ranks and costs nothing to leave out; the header of
+        # pcie_ipc_ce_ring.cuh says why, and how far that has been established.
+        if world_size == 2:
+            return False
+        if not 0 < config.blocks <= CE_MAX_PIECES:
+            return False
+        # The ring is bound by the fabric rather than by the SM, so the add
+        # kernel's geometry is not worth a search dimension. The SM variants
+        # are the opposite case, which is why their geometry stays tunable.
+        if config.threads != CE_THREADS:
+            return False
+        if numel is not None:
+            pack_elems = 16 // elem_size
+            # The island schedule splits into four chunks whatever the world size.
+            shards = (
+                4 if config.variant == IpcVariant.COPY_ENGINE_ISLAND else world_size
+            )
+            if numel % (shards * pack_elems) != 0:
+                return False
+            if (numel // shards) % (config.blocks * pack_elems) != 0:
+                return False
+        return world_size <= config.threads <= 1024
     if not 0 < config.blocks <= max_blocks:
         return False
     if not world_size <= config.threads <= 1024:
