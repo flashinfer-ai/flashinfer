@@ -29,6 +29,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 
 | Backend (alias) | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
+| `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16 E4M3, optional per-expert FP32 global scales) | BF16 | SM100/SM103 | `knobs=None`, `"auto"`, or an explicit supported dictionary; online weight decode with BF16 dispatch/combine |
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
@@ -39,6 +40,105 @@ The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
 by default (the backend quantizes at `preprocess_weights`); kernel-ready
 pre-quantized weights can be supplied instead.
+
+### W4A16 MegaMoE
+
+The implementation lives in `flashinfer/moe_ep/cute_dsl/megamoe/nvfp4_w4a16/`,
+with its frontend beside the kernel modules. Vendored MegaMoE implementations
+remain under `kernel_src/`.
+
+Select `Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` to keep activations and
+communication in BF16 while decoding NVFP4 expert weights online. For `E`
+local experts, hidden size `H`, and intermediate size `I`, supply:
+
+- `w13`: packed E2M1 `uint8` or `float4_e2m1fn_x2`, `[E, 2*I, H/2]`,
+  with the canonical gate half before the up half.
+- `w2`: packed E2M1, `[E, H, I/2]`.
+- `w13_scale` / `w2_scale`: linear E4M3 block scales, respectively
+  `[E, 2*I, H/16]` / `[E, H, I/16]`.
+- `w13_global_scale` / `w2_global_scale`: optional FP32 `[E]` tensors;
+  omitted scales mean one. These are weight scales, applied after FP32
+  GEMM accumulation. Folding them into BF16 decoded weights changes rounding.
+
+Weight preparation shares the W4A4 NVFP4 layout: FC1 gate/up rows interleave
+in groups of 16, and packed weights expose `[E, K/2, N]` transpose views of
+contiguous `[E, N, K/2]` storage. Keep these views without making them
+contiguous: the packed K axis must retain stride 1. Prepared scales are
+contiguous E4M3 `[E, round_up(N, 128) * round_up(K/16, 4)]` buffers; the batched
+`block_scale_interleave` conversion preserves padding within each expert.
+The first two tensors of each W4A16 `(weight, scale, alpha)` triple can reuse
+W4A4 prepared storage; W4A16 keeps its FP32 global scale as the third tensor.
+Callers can use equivalent uint8 aliases for packed weights and scale bytes.
+Inside the fused kernel, packed weights and scales are loaded
+with TMA and decoded directly into BF16 operand-A TMEM for GEMM consumption.
+Two decode warpgroups use the existing local W4A16 partition to transform
+disjoint halves of each K tile and publish one complete TMEM operand stage.
+The shared FC1 row order places gate16/up16 within each warp. Autotuning uses
+M256/N64 or N128/K256 allocation geometry with two CTAs and a dynamic
+routed-token MMA width; it does not materialize a full BF16 expert-weight matrix.
+
+The packed-weight and scale ring uses up to five stages, selected from the
+actual shared-memory layouts and scheduler storage. BF16 activations use three
+stages with a two-stage fallback. Decoded TMEM uses three stages for N64 and
+two for N128, with two accumulator stages. Shapes that cannot fit two raw
+stages are rejected before compilation.
+
+With `knobs=None`, W4A16 loads a recorded winner or uses the built-in profile:
+`group_hint=512`, `flag_batch=4`, `epi_flag_batch=(2, 4)`,
+`load_balance_mode="atomic_counter"`, and `token_back_mode="epi_warps"`.
+An explicit knob dictionary, including `{}`, preserves the existing manual
+configuration behavior instead of merging these defaults. `knobs="auto"`
+collectively tunes eight tactics on the first forward before graph capture:
+N64/N128, flag batches 4/8, and epilogue/reused-dispatch token return, all with
+two scheduler stages. Explicit configurations also support M128 outside the
+default autotune catalog.
+
+```python
+from flashinfer.moe_ep import (
+    MegaConfig,
+    MoEEpLayer,
+    MoEEpTensors,
+    PrequantizedMoEWeights,
+    Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
+
+weights = PrequantizedMoEWeights(
+    w13, w2, w13_scale, w2_scale,
+    w13_global_scale=w13_global_scale,
+    w2_global_scale=w2_global_scale,
+)
+layer = MoEEpLayer(
+    bootstrap, fleet_params, weights,
+    backend=MegaConfig(
+        megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=I, top_k=top_k,
+        ),
+    ),
+)
+tensors = MoEEpTensors(hidden_states=x_bf16, topk_ids=ids, topk_weights=scores_fp32)
+layer.warmup()  # Collective on all EP ranks, before CUDA graph capture.
+y_bf16 = layer.forward(tensors)
+```
+
+Use the default `warmup()` batch to compile the final reducer on every rank.
+Warming up only with an empty local batch does not prepare a later nonempty
+CUDA graph capture.
+
+The default `MegaConfig.quantize_input=True` denotes the normal input path;
+this backend copies BF16 inputs without quantizing them. It rejects
+prequantized activation fields (`scales`, `fc1_alpha`, `fc2_alpha`, and
+`fc1_norm_const`). Routing IDs are int32/int64, and routing scores are FP32
+and applied after the BF16 FC2 result. The initial backend supports SwiGLU,
+hidden sizes divisible by 32, intermediate sizes divisible by 64, and
+`top_k <= min(32, num_experts)`. Static and atomic-counter scheduling fuse
+dispatch, both GEMMs, and combine in one MegaMoE launch. The final top-k
+reduction is separate.
+
+`PrequantizedMoEWeights` global scales are optional keyword-only additions.
+The W4A16 backend applies them after FP32 accumulation. For numerical tests
+and the shared-weight EP benchmark, see
+`tests/moe_ep/test_cutedsl_w4a16_mega.py` and
+`benchmarks/bench_cute_dsl_moe_distributed.py`.
 
 ### Split (dispatch → inner kernel → combine)
 

@@ -24,7 +24,7 @@ style findings inside `src/` are not actionable.
 
 Access flows one direction only (full rules in the ``flashinfer.moe_ep``
 package docstring): a drop's `shim/` is the only code that imports its `src/`;
-backends are the only consumers of a drop, and only via the drop's package
+backends and maintained kernels consume drops only via the drop's package
 `__init__` (never shim submodules); the layer/modes/core tiers use backend
 APIs only. Sole exception: kernel-oracle tests may import a drop's package
 `__init__` to validate it below the backend.

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from ......weights import MoEWeightPack, PrequantizedMoEWeights
+from ......weights import (
+    MoEWeightPack,
+    PrequantizedMoEWeights,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -87,16 +90,27 @@ def _interleave_gate_up_16(
             f"(local_experts, {2 * intermediate_size}, ...), got {tuple(tensor.shape)}"
         )
 
-    gate = tensor[:, :intermediate_size, :].contiguous()
-    up = tensor[:, intermediate_size:, :].contiguous()
-    num_pairs = intermediate_size // 16
-    out = tensor.new_empty(tensor.shape)
-    out_view = out.view(tensor.shape[0], num_pairs, 2, 16, tensor.shape[2])
-    gate_view = gate.view(tensor.shape[0], num_pairs, 16, tensor.shape[2])
-    up_view = up.view(tensor.shape[0], num_pairs, 16, tensor.shape[2])
-    out_view[:, :, 0].copy_(gate_view)
-    out_view[:, :, 1].copy_(up_view)
-    return out.contiguous()
+    import torch
+
+    # Split the canonical gate/up axis, then interleave 16-row blocks with one
+    # contiguous output copy. clone also keeps independent storage when there
+    # is only one block and the permutation happens to be contiguous already.
+    # Reinterpret byte-backed floats while copying: FP4 has no generic Torch
+    # copy kernel on some hosts, and the row permutation must preserve bits.
+    copy_tensor = (
+        tensor.view(torch.uint8)
+        if tensor.is_floating_point() and tensor.element_size() == 1
+        else tensor
+    )
+    interleaved = (
+        copy_tensor.reshape(
+            tensor.shape[0], 2, intermediate_size // 16, 16, tensor.shape[2]
+        )
+        .transpose(1, 2)
+        .clone(memory_format=torch.contiguous_format)
+        .view(tensor.shape)
+    )
+    return interleaved.view(tensor.dtype) if copy_tensor is not tensor else interleaved
 
 
 def preprocess_mega_weights(

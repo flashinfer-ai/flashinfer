@@ -34,7 +34,7 @@ import math
 import statistics
 import time
 import warnings
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 import torch
 
@@ -145,13 +145,54 @@ def autotune_knobs(
     COLLECTIVE: every EP rank must call this in the same iteration with the
     same ``candidates`` (order included).  Returns the winning knob dict.
     """
+
+    def sample_seconds(count: int) -> Sequence[float]:
+        samples = []
+        for _ in range(count):
+            start = time.perf_counter()
+            launch()  # The exported contract is a synchronized forward.
+            samples.append(time.perf_counter() - start)
+        return samples
+
+    return _autotune_knobs_impl(
+        frontend,
+        launch,
+        sample_seconds,
+        candidates,
+        label=label,
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        on_winner=on_winner,
+    )
+
+
+class _KnobFrontend(Protocol):
+    def apply_knobs(self, knobs: Dict[str, Any]) -> None: ...
+
+
+class _CollectiveGraphTimingError(RuntimeError):
+    """A private graph timing failure that must stop the collective sweep."""
+
+
+def _autotune_knobs_impl(
+    frontend: _KnobFrontend,
+    warmup_launch: Callable[[], None],
+    sample_seconds: Callable[[int], Sequence[float]],
+    candidates: List[Dict[str, Any]],
+    *,
+    label: str,
+    warmup_iters: int,
+    timed_iters: int,
+    on_winner: Optional[Callable[[Dict[str, Any], float], None]],
+) -> Dict[str, Any]:
+    """Shared sweep; sample_seconds returns local seconds with no live graph."""
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
 
     from .comm import ensure_not_capturing
 
-    # The sweep barriers, compiles per candidate, wall-clock times with
-    # internal syncs, and all_reduces -- none of it can run mid-capture.
+    # The sweep owns host-side compile, allocation, timing and collectives;
+    # it must finish before the caller captures its serving graph.
     ensure_not_capturing("knobs='auto' collective autotune sweep")
 
     import torch.distributed as dist
@@ -172,14 +213,13 @@ def autotune_knobs(
             frontend.apply_knobs(knobs)
             _barrier()
             for _ in range(warmup_iters):  # first launch compiles
-                launch()
+                warmup_launch()
             _barrier()
-            iters: List[float] = []
-            for _ in range(timed_iters):  # launch() syncs internally
-                t0 = time.perf_counter()
-                launch()
-                iters.append(time.perf_counter() - t0)
-            scores.append(statistics.median(iters))
+            scores.append(statistics.median(sample_seconds(timed_iters)))
+        except _CollectiveGraphTimingError:
+            # A peer may already be waiting in a captured collective. Never
+            # advance to a different candidate after graph timing fails.
+            raise
         except Exception as exc:  # noqa: BLE001 -- score-and-continue by design
             warnings.warn(
                 f"[cutedsl-autotune] {label}: candidate {knobs} failed: {exc}",

@@ -20,7 +20,7 @@ the "unquantized" path downstream. Backends discriminate with
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Union
 
 import torch
@@ -57,6 +57,8 @@ class MoEWeightPack:
     w2: torch.Tensor
     w13_scale: Optional[torch.Tensor]
     w2_scale: Optional[torch.Tensor]
+    w13_global_scale: Optional[torch.Tensor]
+    w2_global_scale: Optional[torch.Tensor]
 
     def __new__(
         cls,
@@ -64,6 +66,9 @@ class MoEWeightPack:
         w2: torch.Tensor = None,  # type: ignore[assignment]
         w13_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
+        *,
+        w13_global_scale: Optional[torch.Tensor] = None,
+        w2_global_scale: Optional[torch.Tensor] = None,
     ):
         if cls is not MoEWeightPack:
             # Variant subclasses construct normally (their dataclass __init__
@@ -79,9 +84,16 @@ class MoEWeightPack:
                 "bf16). Pass both scales, or neither."
             )
         if w13_scale is None:
+            if w13_global_scale is not None or w2_global_scale is not None:
+                raise ValueError("global weight scales require a pre-quantized pack")
             return UnquantizedMoEWeights(w13=w13, w2=w2)
         return PrequantizedMoEWeights(
-            w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale
+            w13=w13,
+            w2=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            w13_global_scale=w13_global_scale,
+            w2_global_scale=w2_global_scale,
         )
 
     # No __init__ here: after __new__ returns a variant, CPython re-runs the
@@ -103,6 +115,8 @@ class UnquantizedMoEWeights(MoEWeightPack):
     # mypy flags instance->class overrides; the shadowing is the point here.
     w13_scale: ClassVar[None] = None  # type: ignore[misc]
     w2_scale: ClassVar[None] = None  # type: ignore[misc]
+    w13_global_scale: ClassVar[None] = None  # type: ignore[misc]
+    w2_global_scale: ClassVar[None] = None  # type: ignore[misc]
 
     def __init__(
         self,
@@ -110,12 +124,18 @@ class UnquantizedMoEWeights(MoEWeightPack):
         w2: torch.Tensor,
         w13_scale: None = None,
         w2_scale: None = None,
+        *,
+        w13_global_scale: None = None,
+        w2_global_scale: None = None,
     ) -> None:
         # Hand-written (dataclass skips codegen when __init__ exists): the
         # factory's re-init passes the caller's ORIGINAL arguments, so
         # ``MoEWeightPack(w13, w2, None, None)`` / the kwargs form re-enter
         # here with explicit None scales — accept those, reject real scales.
-        if w13_scale is not None or w2_scale is not None:
+        if any(
+            s is not None
+            for s in (w13_scale, w2_scale, w13_global_scale, w2_global_scale)
+        ):
             raise TypeError(
                 "UnquantizedMoEWeights takes no scale planes; construct "
                 "PrequantizedMoEWeights (or MoEWeightPack with both scales)."
@@ -127,12 +147,20 @@ class UnquantizedMoEWeights(MoEWeightPack):
 @dataclass(frozen=True)
 class PrequantizedMoEWeights(MoEWeightPack):
     """Packed quantized expert weights + both block-scale planes (consumed
-    verbatim by the backend; no re-quantization)."""
+    verbatim by the backend; no re-quantization).
+
+    ``w13_global_scale`` and ``w2_global_scale`` are optional per-expert FP32
+    weight decode scales (``None`` means one). They are separate from block
+    scales and from activation quantization. The W4A16 mega backend applies
+    them after FP32 GEMM accumulation.
+    """
 
     w13: torch.Tensor
     w2: torch.Tensor
     w13_scale: torch.Tensor
     w2_scale: torch.Tensor
+    w13_global_scale: Optional[torch.Tensor] = field(default=None, kw_only=True)
+    w2_global_scale: Optional[torch.Tensor] = field(default=None, kw_only=True)
 
 
 def dummy_moe_weights(
