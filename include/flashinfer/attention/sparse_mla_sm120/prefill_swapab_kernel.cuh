@@ -124,6 +124,11 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(24));
 
     const int io_tid = threadIdx.x - MATH_THREADS;
+    // Threads with io_tid >= BI gather nothing and no barrier counts them, so
+    // the pipeline's mbarrier phases advance without them; one starved past a
+    // full phase window near kernel drain would spin on a parity that never
+    // completes again. Retire them: they have no work past the sync above.
+    if (io_tid >= BI) return;
     const uint64_t kv_l2_policy = create_l2_evict_last_policy();
 
     // Stage this thread's candidate index a tile ahead: the LDG for tile ti+2

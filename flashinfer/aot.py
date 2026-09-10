@@ -107,7 +107,10 @@ from .jit.fused_moe import (
 from .jit.cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module,
 )
-from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.bgmv_moe import (
+    BGMV_MOE_SUPPORTED_MAJOR_VERSIONS,
+    gen_bgmv_moe_module,
+)
 from .jit.blackwell_bgmv_moe import (
     BLACKWELL_BGMV_MOE_DTYPES,
     BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
@@ -137,6 +140,10 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
+from .jit.cake_minimax_h3_mxfp8 import (
+    MiniMaxH3Mxfp8Target,
+    gen_minimax_h3_mxfp8_aot_modules,
+)
 from .jit.mla import (
     gen_mla_module,
     gen_sparse_mla_nvfp4_sm120_module,
@@ -383,7 +390,7 @@ def gen_attention(
         from .jit.attention import gen_batch_prefill_attention_sink_module
 
         for dtype in f16_dtype_:
-            for backend in ["fa2", "fa3"]:
+            for backend in ["fa2"] + (["fa3"] if has_sm90 else []):
                 for use_swa in [True, False]:
                     yield gen_batch_prefill_attention_sink_module(
                         backend=backend,
@@ -518,6 +525,7 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
@@ -585,6 +593,14 @@ def gen_all_modules(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
+
+    minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_target, enabled in minimax_h3_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
@@ -694,13 +710,15 @@ def gen_all_modules(
     if add_moe:
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
-        jit_specs.append(gen_bgmv_moe_module())
+        if has_bgmv_moe:
+            jit_specs.append(gen_bgmv_moe_module())
         if sm_capabilities.get("sm100a_exact", False):
             jit_specs.extend(
                 gen_blackwell_bgmv_moe_module(hidden_size, dtype)
                 for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
                 for dtype in BLACKWELL_BGMV_MOE_DTYPES
             )
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_sm90:
@@ -745,7 +763,8 @@ def gen_all_modules(
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
-            jit_specs.append(gen_cake_fused_moe_warp_decode_module())
+        if sm_capabilities.get("sm103a_exact", False):
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
         if has_sm107:
             jit_specs.append(gen_fp4_quantization_sm107_module())
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
@@ -1152,6 +1171,10 @@ def detect_sm_capabilities():
     }
     flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
+        "bgmv_moe": any(
+            major in BGMV_MOE_SUPPORTED_MAJOR_VERSIONS
+            for major, _ in compilation_context.TARGET_CUDA_ARCHS
+        ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
