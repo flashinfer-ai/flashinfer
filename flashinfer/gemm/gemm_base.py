@@ -37,6 +37,7 @@ from ..trace.templates.gemm import (
     bmm_mxfp8_trace,
     fp8_blockscale_gemm_sm90_trace,
     gemm_fp8_nt_groupwise_trace,
+    group_gemm_fp8_nt_groupwise_contiguous_trace,
     mm_bf16_trace,
     mm_fp4_trace,
     mm_fp8_trace,
@@ -82,7 +83,6 @@ from ..utils import (
     is_sm12x_supported,
     LibraryError,
     backend_requirement,
-    BackendSupportedError,
     supported_compute_capability,
 )
 from ..jit.gemm import gen_gemm_sm90_module
@@ -8902,13 +8902,7 @@ def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["deepgemm", "cute_dsl"] = "deepgemm",
-    validate_indices: bool = False,
 ) -> bool:
-    if backend not in ("deepgemm", "cute_dsl"):
-        raise BackendSupportedError(
-            f"Unsupported backend {backend!r}; choose 'deepgemm' or 'cute_dsl'"
-        )
     from flashinfer.deep_gemm import (
         _check_group_deepgemm_fp8_nt_contiguous_problem_size,
     )
@@ -8922,13 +8916,138 @@ def _check_group_deepgemm_fp8_nt_groupwise_problem_size(
     )
 
 
-@supported_compute_capability([100, 103, 107])
-def _check_group_deepgemm_fp8_nt_groupwise_deepgemm(**kwargs) -> bool:
-    return True
+@backend_requirement(
+    {},
+    common_check=_check_group_deepgemm_fp8_nt_groupwise_problem_size,
+)
+@flashinfer_api
+def group_deepgemm_fp8_nt_groupwise(
+    a: torch.Tensor,  # (m, k)
+    b: torch.Tensor,  # (batch_size, n, k)
+    a_scale: torch.Tensor,  # (m, k // block_size)
+    b_scale: torch.Tensor,  # (batch_size, n // block_size, k // block_size)
+    m_indices: torch.Tensor,  # (m, )
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,  # (m, n)
+    out_dtype: Optional[torch.dtype] = None,
+):
+    r"""Perform grouped matrix multiplication with FP8 data types using DeepGEMM backend.
+
+    This function performs a grouped GEMM operation where each group in tensor `b` is multiplied
+    with the corresponding rows in tensor `a`. The grouping is determined by the `m_indices` tensor,
+    which specifies which group each row belongs to. This is particularly useful for scenarios
+    like mixture of experts (MoE) where different tokens are routed to different experts.
+
+    The operation can be conceptualized as:
+
+    >>> for i in range(num_groups):
+    >>>    row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
+    >>>    output[row_slice] = a[row_slice] @ b[i].T
+
+    Currently only supported on NVIDIA Blackwell (SM100) architecture.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input tensor A of shape ``(m, k)`` with FP8 data type (``torch.float8_e4m3fn``).
+        This tensor contains all rows that will be multiplied with different groups in `b`.
+
+    b : torch.Tensor
+        Input tensor B of shape ``(batch_size, n, k)`` with FP8 data type (``torch.float8_e4m3fn``).
+        Each slice ``b[i]`` represents a different group/expert that will be multiplied with
+        the corresponding rows in `a`.
+
+    a_scale : torch.Tensor
+        Scaling factors for tensor `a` of shape ``(m, k // block_size)`` with ``torch.float32`` dtype.
+        These are typically generated from per-token quantization of the original float32 tensor.
+
+    b_scale : torch.Tensor
+        Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
+        with ``torch.float32`` dtype. These are typically generated from per-block quantization
+        of the original float32 tensor for each group.
+
+    m_indices : torch.Tensor
+        Group assignment tensor of shape ``(m,)`` with ``torch.int32`` dtype. Each element
+        specifies which group (index into `b`) the corresponding row in `a` belongs to.
+        For example, if ``m_indices[i] = j``, then row ``i`` in `a` will be multiplied with
+        group ``j`` in `b`.
+
+    scale_granularity_mnk : Tuple[int, int, int], optional
+        The granularity of the scaling factors as ``(m_granularity, n_granularity, k_granularity)``.
+        Default is ``(1, 128, 128)`` which means per-token scaling for `a` and 128x128 block
+        scaling for `b`.
+
+    out : Optional[torch.Tensor], optional
+        Pre-allocated output tensor of shape ``(m, n)``. If not provided, a new tensor will be
+        created.
+
+    out_dtype : Optional[torch.dtype], optional
+        Data type of the output tensor. If `out` is provided, this parameter is ignored.
+        Default is ``torch.bfloat16``.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape ``(m, n)`` containing the results of the grouped matrix multiplication.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
+    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>>
+    >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
+    >>> m_per_group, n, k = 128, 2048, 4096
+    >>> group_size = 2
+    >>> m = m_per_group * group_size
+    >>>
+    >>> # Create float32 inputs
+    >>> a_f32 = torch.randn(m, k, device="cuda", dtype=torch.float32)
+    >>> b_f32 = torch.randn(group_size, n, k, device="cuda", dtype=torch.float32)
+    >>>
+    >>> # Quantize to FP8 with appropriate scaling
+    >>> a_fp8, a_scale = per_token_cast_to_fp8(a_f32)
+    >>> b_fp8 = torch.empty_like(b_f32, dtype=torch.float8_e4m3fn)
+    >>> b_scale = torch.empty((group_size, n // 128, k // 128), device="cuda", dtype=torch.float32)
+    >>> for i in range(group_size):
+    ...     b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b_f32[i])
+    >>>
+    >>> # Create group assignment
+    >>> m_indices = torch.empty(m, device="cuda", dtype=torch.int32)
+    >>> for i in range(group_size):
+    ...     row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
+    ...     m_indices[row_slice] = i
+    >>>
+    >>> # Perform grouped GEMM
+    >>> result = group_deepgemm_fp8_nt_groupwise(
+    ...     a_fp8, b_fp8, a_scale, b_scale, m_indices, out_dtype=torch.bfloat16
+    ... )
+    >>> print(result.shape)  # torch.Size([256, 2048])
+
+    Notes
+    -----
+    - This function requires NVIDIA Blackwell (SM100) architecture
+    - The scaling factors should be generated using appropriate quantization functions
+      like ``per_token_cast_to_fp8`` for `a` and ``per_block_cast_to_fp8`` for `b`
+    - The function internally uses the DeepGEMM backend for optimized FP8 computation
+    - All input tensors must be on the same CUDA device
+    - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
+    """
+    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
+
+    m_grouped_fp8_gemm_nt_contiguous(
+        (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
+    )
+
+    return out
 
 
 @supported_compute_capability([100, 103])
-def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
+def _check_group_gemm_fp8_nt_groupwise_contiguous(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -8937,7 +9056,6 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["deepgemm", "cute_dsl"] = "cute_dsl",
     validate_indices: bool = False,
 ) -> bool:
     """Check tensor metadata and optionally the synchronized routing contract."""
@@ -8950,8 +9068,26 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
             f"but got {scale_granularity_mnk}"
         )
 
+    if a.ndim != 2 or b.ndim != 3:
+        raise ValueError("a must have shape (M, K) and b must have shape (G, N, K)")
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise ValueError("a and b must use torch.float8_e4m3fn")
+
     m, k = a.shape
-    num_groups, n, _ = b.shape
+    num_groups, n, b_k = b.shape
+    if k != b_k:
+        raise ValueError("a and b must have the same K dimension")
+    if m_indices.dtype != torch.int32:
+        raise ValueError("m_indices must use torch.int32")
+    if m_indices.numel() != m:
+        raise ValueError("m_indices must contain one expert index per row of a")
+    effective_out_dtype = (
+        out.dtype if out is not None else (out_dtype or torch.bfloat16)
+    )
+    if effective_out_dtype != torch.bfloat16:
+        raise ValueError("out must use torch.bfloat16")
+    if out is not None and out.shape != (m, n):
+        raise ValueError(f"out.shape must be {(m, n)}, but got {out.shape}")
     if min(n, k, num_groups) <= 0:
         raise ValueError("n, k, and the number of groups must be positive")
     for dim_name, dim_value in (("n", n), ("k", k)):
@@ -9019,173 +9155,99 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
 
 
 @backend_requirement(
-    {
-        "deepgemm": _check_group_deepgemm_fp8_nt_groupwise_deepgemm,
-        "cute_dsl": _check_group_deepgemm_fp8_nt_groupwise_cute_dsl,
-    },
-    common_check=_check_group_deepgemm_fp8_nt_groupwise_problem_size,
+    {},
+    common_check=_check_group_gemm_fp8_nt_groupwise_contiguous,
 )
-@flashinfer_api
-def group_deepgemm_fp8_nt_groupwise(
-    a: torch.Tensor,  # (m, k)
-    b: torch.Tensor,  # (batch_size, n, k)
-    a_scale: torch.Tensor,  # (m, k // block_size)
-    b_scale: torch.Tensor,  # (batch_size, n // block_size, k // block_size)
-    m_indices: torch.Tensor,  # (m, )
+@flashinfer_api(trace=group_gemm_fp8_nt_groupwise_contiguous_trace)
+def group_gemm_fp8_nt_groupwise_contiguous(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indices: torch.Tensor,
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
-    out: Optional[torch.Tensor] = None,  # (m, n)
+    out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["deepgemm", "cute_dsl"] = "deepgemm",
     validate_indices: bool = False,
-):
-    r"""Perform contiguous grouped matrix multiplication with FP8 data types.
+) -> torch.Tensor:
+    r"""Compute contiguous grouped FP8 GEMM using CuTe DSL on SM100/SM103.
 
-    This function performs a grouped GEMM operation where each group in tensor `b` is multiplied
-    with the corresponding rows in tensor `a`. The grouping is determined by the `m_indices` tensor,
-    which specifies which group each row belongs to. This is particularly useful for scenarios
-    like mixture of experts (MoE) where different tokens are routed to different experts.
-
-    The operation can be conceptualized as:
-
-    >>> for i in range(num_groups):
-    >>>    row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
-    >>>    output[row_slice] = a[row_slice] @ b[i].T
-
-    Currently only supported on NVIDIA Blackwell (SM100) architecture.
+    Each row of `a` is multiplied by the transposed expert matrix selected
+    by `m_indices`. Input A uses per-row, 128-element K-block scales; B uses
+    128x128 block scales. The output uses bfloat16.
 
     Parameters
     ----------
     a : torch.Tensor
-        Input tensor A of shape ``(m, k)`` with FP8 data type (``torch.float8_e4m3fn``).
-        This tensor contains all rows that will be multiplied with different groups in `b`.
-
+        Contiguous FP8 E4M3 input of shape ``(M, K)``.
     b : torch.Tensor
-        Input tensor B of shape ``(batch_size, n, k)`` with FP8 data type (``torch.float8_e4m3fn``).
-        Each slice ``b[i]`` represents a different group/expert that will be multiplied with
-        the corresponding rows in `a`.
-
+        Contiguous FP8 E4M3 expert weights of shape ``(G, N, K)``.
     a_scale : torch.Tensor
-        Scaling factors for tensor `a` of shape ``(m, k // block_size)`` with ``torch.float32`` dtype.
-        These are typically generated from per-token quantization of the original float32 tensor.
-
+        Contiguous float32 scales of shape ``(M, K // 128)``.
     b_scale : torch.Tensor
-        Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
-        with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
-
+        Contiguous float32 scales of shape ``(G, N // 128, K // 128)``.
     m_indices : torch.Tensor
-        Group assignment tensor of shape ``(m,)`` with ``torch.int32`` dtype. Each element
-        specifies which group (index into `b`) the corresponding row in `a` belongs to.
-        For example, if ``m_indices[i] = j``, then row ``i`` in `a` will be multiplied with
-        group ``j`` in `b`.
-
+        Contiguous int32 expert indices of shape ``(M,)``, sorted in
+        nondecreasing order. Internal expert boundaries must align to 128 rows;
+        the final expert may end in a partial tile. All values must satisfy
+        ``0 <= index < G``; ``-1`` padding is unsupported.
     scale_granularity_mnk : Tuple[int, int, int], optional
-        The granularity of the scaling factors as ``(m_granularity, n_granularity, k_granularity)``.
-        Default is ``(1, 128, 128)`` which means per-token scaling for `a` and 128x128 block
-        scaling for `b`.
-
+        Scale granularity. Only ``(1, 128, 128)`` is supported.
     out : Optional[torch.Tensor], optional
-        Pre-allocated output tensor of shape ``(m, n)``. If not provided, a new tensor will be
-        created.
-
+        Contiguous bfloat16 output of shape ``(M, N)``. Allocated if omitted.
     out_dtype : Optional[torch.dtype], optional
-        Data type of the output tensor. If `out` is provided, this parameter is ignored.
-        Default is ``torch.bfloat16``.
-
-    backend : Literal["deepgemm", "cute_dsl"], optional
-        Implementation to use. ``"deepgemm"`` preserves the existing precompiled
-        backend; ``"cute_dsl"`` selects the SM100/SM103 persistent kernel optimized
-        for 128x128 block scaling. Defaults to ``"deepgemm"``.
-
+        Output dtype when allocating; only ``torch.bfloat16`` is supported.
+        Ignored when `out` is supplied.
     validate_indices : bool, optional
-        For ``"cute_dsl"``, validate expert-index range, sortedness and internal
-        boundary alignment. Defaults to ``False`` to avoid synchronizing the
-        GPU with the CPU on each call. Enable when checking new routing data,
-        outside CUDA graph capture. Ignored for ``"deepgemm"`` and when
+        Validate expert-index values, sortedness and boundary alignment.
+        Defaults to ``False`` to avoid a GPU-to-CPU synchronization per call.
+        Enable for new routing data outside CUDA graph capture. Ignored with
         ``skip_check=True``.
 
     Returns
     -------
     torch.Tensor
-        Output tensor of shape ``(m, n)`` containing the results of the grouped matrix multiplication.
-
-    Examples
-    --------
-    >>> import torch
-    >>> from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
-    >>>
-    >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
-    >>> m_per_group, n, k = 128, 2048, 4096
-    >>> group_size = 2
-    >>> m = m_per_group * group_size
-    >>>
-    >>> # Create float32 inputs
-    >>> a_f32 = torch.randn(m, k, device="cuda", dtype=torch.float32)
-    >>> b_f32 = torch.randn(group_size, n, k, device="cuda", dtype=torch.float32)
-    >>>
-    >>> # Quantize to FP8 with appropriate scaling
-    >>> a_fp8, a_scale = per_token_cast_to_fp8(a_f32)
-    >>> b_fp8 = torch.empty_like(b_f32, dtype=torch.float8_e4m3fn)
-    >>> b_scale = torch.empty((group_size, n // 128, k // 128), device="cuda", dtype=torch.float32)
-    >>> for i in range(group_size):
-    ...     b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b_f32[i])
-    >>>
-    >>> # Create group assignment
-    >>> m_indices = torch.empty(m, device="cuda", dtype=torch.int32)
-    >>> for i in range(group_size):
-    ...     row_slice = slice(i * m_per_group, (i + 1) * m_per_group)
-    ...     m_indices[row_slice] = i
-    >>>
-    >>> # Perform grouped GEMM
-    >>> result = group_deepgemm_fp8_nt_groupwise(
-    ...     a_fp8, b_fp8, a_scale, b_scale, m_indices, out_dtype=torch.bfloat16
-    ... )
-    >>> print(result.shape)  # torch.Size([256, 2048])
+        The supplied or allocated bfloat16 output of shape ``(M, N)``.
 
     Notes
     -----
-    - This function requires NVIDIA Blackwell (SM100) architecture
-    - The scaling factors should be generated using appropriate quantization functions
-      like ``per_token_cast_to_fp8`` for `a` and ``per_block_cast_to_fp8`` for `b`
-    - The ``cute_dsl`` backend requires N and K to be multiples of 128; M may end
-      with a partial 128-row tile
-    - For ``cute_dsl``, expert rows must be sorted and every internal expert
-      boundary must be aligned to 128 rows. The final non-empty expert may have
-      an unpadded row count. Every index must satisfy ``0 <= index < b.shape[0]``;
-      DeepGEMM's ``-1`` padding convention is not supported. These value-level
-      preconditions are unchecked unless ``validate_indices=True``. Violations
-      result in undefined behavior, including incorrect results or invalid memory
-      accesses
-    - Both backends return an empty output without launching a kernel when M is zero
-    - All input tensors must be on the same CUDA device
-    - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
+    Requires ``nvidia-cutlass-dsl``. N and K must be positive multiples of 128,
+    and G must be positive. M may be zero, in which case no kernel is launched.
+    All tensors must be on the same CUDA device and at least 16-byte aligned.
+
+    Index values are unchecked unless ``validate_indices=True``. Violating
+    their preconditions results in undefined behavior, including incorrect
+    results or invalid memory accesses.
+
+    Execution uses PyTorch's current stream for ``a.device``. Compilation is
+    cached by device, weight shape, and M's 128-row alignment class; warm both
+    classes used by a workload before CUDA graph capture.
+
+    Examples
+    --------
+    >>> from flashinfer.gemm import group_gemm_fp8_nt_groupwise_contiguous
+    >>> # a/b are FP8; a_scale/b_scale are float32 block scales.
+    >>> out = group_gemm_fp8_nt_groupwise_contiguous(
+    ...     a, b, a_scale, b_scale, m_indices, validate_indices=True
+    ... )
     """
-    if backend not in ("deepgemm", "cute_dsl"):
-        raise BackendSupportedError(
-            f"Unsupported backend {backend!r}; choose 'deepgemm' or 'cute_dsl'"
-        )
     if out is None:
-        out_dtype = out_dtype or torch.bfloat16
-        out = torch.empty(a.shape[0], b.shape[1], dtype=out_dtype, device=a.device)
-
-    if backend == "cute_dsl":
-        if a.shape[0] == 0:
-            return out
-        from .kernels.grouped_gemm_contiguous_blackwell import (
-            grouped_gemm_fp8_nt_groupwise_contiguous_sm100,
+        out = torch.empty(
+            a.shape[0],
+            b.shape[1],
+            dtype=out_dtype or torch.bfloat16,
+            device=a.device,
         )
+    if a.shape[0] == 0:
+        return out
 
-        grouped_gemm_fp8_nt_groupwise_contiguous_sm100(
-            a, b, a_scale, b_scale, m_indices, out
-        )
-    else:
-        from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_contiguous
+    from .kernels.grouped_gemm_contiguous_blackwell import (
+        grouped_gemm_fp8_nt_groupwise_contiguous_sm100,
+    )
 
-        m_grouped_fp8_gemm_nt_contiguous(
-            (a, a_scale), (b, b_scale), out, m_indices, scale_granularity_mnk
-        )
-
+    grouped_gemm_fp8_nt_groupwise_contiguous_sm100(
+        a, b, a_scale, b_scale, m_indices, out
+    )
     return out
 
 

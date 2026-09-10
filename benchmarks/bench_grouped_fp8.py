@@ -19,7 +19,10 @@ import time
 
 import torch
 
-from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
+from flashinfer.gemm import (
+    group_deepgemm_fp8_nt_groupwise,
+    group_gemm_fp8_nt_groupwise_contiguous,
+)
 
 
 PRODUCTION_SHAPES = [
@@ -82,7 +85,7 @@ def cache_probe():
         for phase in ("new_m", "repeat"):
             torch.cuda.synchronize()
             start = time.perf_counter()
-            out = group_deepgemm_fp8_nt_groupwise(*inputs, backend="cute_dsl")
+            out = group_gemm_fp8_nt_groupwise_contiguous(*inputs)
             torch.cuda.synchronize()
             host_ms = (time.perf_counter() - start) * 1000
             torch.testing.assert_close(out, expected, atol=3e-2, rtol=3e-2)
@@ -112,12 +115,16 @@ def benchmark(
 
     torch.manual_seed(0)
     inputs = make_inputs(*shape)
+    implementations = {
+        "deepgemm": group_deepgemm_fp8_nt_groupwise,
+        "cute_dsl": group_gemm_fp8_nt_groupwise_contiguous,
+    }
     outputs = {
         backend: torch.empty(shape[0], shape[1], device="cuda", dtype=torch.bfloat16)
         for backend in backends
     }
     for backend, out in outputs.items():
-        group_deepgemm_fp8_nt_groupwise(*inputs, out=out, backend=backend)
+        implementations[backend](*inputs, out=out)
     torch.cuda.synchronize()
     expected = outputs["deepgemm"] if "deepgemm" in outputs else reference(inputs)
     for out in outputs.values():
@@ -127,9 +134,7 @@ def benchmark(
         for backend in list(outputs) if repeat % 2 == 0 else list(reversed(outputs)):
 
             def call():
-                return group_deepgemm_fp8_nt_groupwise(
-                    *inputs, out=outputs[backend], backend=backend
-                )
+                return implementations[backend](*inputs, out=outputs[backend])
 
             times = bench_gpu_time(
                 call,

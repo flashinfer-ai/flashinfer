@@ -180,13 +180,18 @@ median_time, std_time = bench_gpu_time(
 
 → **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
 
+`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
+CuTe-DSL grouped FP8 API; `group_deepgemm_fp8_nt_groupwise` keeps its original
+DeepGEMM-only signature. Both use per-row expert indices, unlike the indptr-based
+`group_gemm_fp8_nt_groupwise` API.
+
 For contiguous grouped FP8 GEMM, `python benchmarks/bench_grouped_fp8.py
 --production-shapes` compares DeepGEMM and CuTe-DSL with preallocated outputs;
 `--cache-probe` measures first-call and new-token-count compilation separately.
 Compiled grouped CuTe-DSL kernels are reused across token counts with the same
 128-row alignment class, with at most two variants per device and weight shape.
 Concurrent misses share one compilation; warm hits do not acquire the compile lock.
-The CuTe-DSL API's optional `validate_indices=True` checks expert-index values
+The standalone API's optional `validate_indices=True` checks expert-index values
 and synchronizes with the CPU. Validate new routing data before CUDA graph
 capture; the default path assumes valid indices and performs metadata checks only.
 

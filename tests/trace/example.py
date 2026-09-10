@@ -30,6 +30,7 @@ gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
+group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
 gemm_nvfp4_svdquant_N3072_K_packed1536_rank32.json
 gemma_fused_add_rmsnorm_h4608.json
@@ -428,6 +429,19 @@ with contextlib.suppress(Exception):
     b_scale_g = torch.ones(N // BS, K // BS, dtype=torch.float32, device=device)
     flashinfer.gemm.gemm_fp8_nt_groupwise(
         a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
+    )
+
+# Contiguous grouped FP8: two experts, with a partial final M tile.
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.gemm import (
+        group_gemm_fp8_nt_groupwise_contiguous_trace,
+    )
+
+    contiguous_inputs = group_gemm_fp8_nt_groupwise_contiguous_trace.init(
+        M=129, num_groups=2, N=128, K=128, device=device
+    )
+    flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous(
+        **contiguous_inputs, validate_indices=True
     )
 
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────

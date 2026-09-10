@@ -1721,6 +1721,79 @@ grouped_gemm_nt_masked_trace = TraceTemplate(
 )
 
 
+@torch.no_grad()
+def _group_gemm_fp8_nt_groupwise_contiguous_reference(
+    a, b, a_scale, b_scale, m_indices, **_unused
+):
+    """Dequantize the row/block scales and multiply each expert's rows."""
+    af = a.float() * a_scale.float().repeat_interleave(128, dim=1)
+    bf = b.float() * b_scale.float().repeat_interleave(128, dim=1).repeat_interleave(
+        128, dim=2
+    )
+    out = torch.empty(a.shape[0], b.shape[1], dtype=torch.bfloat16, device=a.device)
+    for group in range(b.shape[0]):
+        rows = m_indices == group
+        out[rows] = (af[rows] @ bf[group].T).bfloat16()
+    return out
+
+
+def _group_gemm_fp8_nt_groupwise_contiguous_init(
+    *,
+    M: int,
+    num_groups: int,
+    N: int = 128,
+    K: int = 128,
+    K_div_128: int = 0,
+    N_div_128: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Generate sorted, tile-aligned expert rows with a possible partial tail."""
+    del K_div_128, N_div_128
+    torch.manual_seed(seed)
+    a, a_scale = fp8_block_quant_1d(torch.randn(M, K, device=device), block=128)
+    b, b_scale = fp8_block_quant_2d(
+        torch.randn(num_groups, N, K, device=device), block=128
+    )
+    rows_per_group = max(128, (M // num_groups // 128) * 128)
+    indices = (
+        torch.arange(M, device=device, dtype=torch.int32) // rows_per_group
+    ).clamp(max=num_groups - 1)
+    return dict(a=a, b=b, a_scale=a_scale, b_scale=b_scale, m_indices=indices)
+
+
+group_gemm_fp8_nt_groupwise_contiguous_trace = TraceTemplate(
+    op_type="gemm_fp8",
+    name_prefix="group_gemm_fp8_nt_groupwise_contiguous",
+    description=(
+        "Contiguous grouped FP8 E4M3 GEMM with per-row 128-element A scales "
+        "and 128x128 B scales. Expert indices must be sorted, in range, and "
+        "constant within each 128-row tile; the final tile may be partial. "
+        "Output is bfloat16."
+    ),
+    axes={
+        "M": Var(),
+        "num_groups": Const(abbrev="g"),
+        "N": Const(abbrev="n"),
+        "K": Const(abbrev="k"),
+        "K_div_128": Var(description="K // 128."),
+        "N_div_128": Var(description="N // 128."),
+    },
+    inputs={
+        "a": Tensor(["M", "K"], dtype="float8_e4m3fn"),
+        "b": Tensor(["num_groups", "N", "K"], dtype="float8_e4m3fn"),
+        "a_scale": Tensor(["M", "K_div_128"], dtype="float32"),
+        "b_scale": Tensor(["num_groups", "N_div_128", "K_div_128"], dtype="float32"),
+        "m_indices": Tensor(["M"], dtype="int32"),
+    },
+    outputs={"out": Tensor(["M", "N"], dtype="bfloat16")},
+    constraints=["K_div_128 == K // 128", "N_div_128 == N // 128"],
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_group_gemm_fp8_nt_groupwise_contiguous_reference,
+    init=_group_gemm_fp8_nt_groupwise_contiguous_init,
+)
+
+
 # ── batch_deepgemm_fp8_nt_groupwise (batched FP8 group-wise GEMM) ────────────
 
 
