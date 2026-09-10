@@ -5235,7 +5235,7 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
-    skip_all_rows_active_check: bool = False,
+    skip_all_rows_active_check: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5312,23 +5312,21 @@ def trtllm_ragged_attention_deepseek(
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
-        together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
-        all-active ragged fast path asynchronous while still compacting empty
-        rows (either ``q_len == 0`` or ``kv_len == 0``). If omitted, the
-        wrapper derives lengths from the device indptrs and may synchronize
-        to preserve correctness for direct callers. Under CUDA graph capture,
-        this device-side detection would require an illegal ``.item()``
-        readback, so both mirrors must be provided; without them the wrapper
-        cannot tell whether any row has ``q_len == 0`` or ``kv_len == 0`` and
-        will refuse to launch. Currently only consulted by the ``trtllm-gen``
-        backend.
+        together with ``kv_seq_lens_cpu``, the Python wrapper validates and
+        compacts empty rows (either ``q_len == 0`` or ``kv_len == 0``). Mirrors
+        take precedence over the omitted/default all-rows-active mode. Currently
+        only consulted by the ``trtllm-gen`` backend.
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
     skip_all_rows_active_check : bool
-        Skip empty-row detection when the caller guarantees that every row has
-        positive query and KV lengths. Mutually exclusive with CPU length
-        mirrors. Currently only consulted by the ``trtllm-gen`` backend.
+        Controls empty-row detection. ``True`` (default) assumes every row has
+        positive query and KV lengths and avoids device-to-host synchronization.
+        Paired CPU length mirrors take precedence and request checked/compacting
+        behavior regardless of this setting. ``False`` without CPU mirrors
+        derives row activity from device tensors, which may synchronize outside
+        CUDA graph capture and requires CPU mirrors during capture. Currently
+        only consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -5497,13 +5495,7 @@ def trtllm_ragged_attention_deepseek(
         has_inactive_rows = False
         has_active_rows = True
 
-        if skip_all_rows_active_check:
-            if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
-                raise ValueError(
-                    "skip_all_rows_active_check cannot be combined with CPU length "
-                    "mirrors"
-                )
-        elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
             if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
@@ -5532,6 +5524,10 @@ def trtllm_ragged_attention_deepseek(
             if not bool(active_rows_cpu.all().item()):
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
+        elif skip_all_rows_active_check:
+            # The default assumes all rows have positive Q and KV lengths.
+            # Keep the original tensors and avoid device-to-host row inspection.
+            pass
         else:
             # An active row requires q_len > 0 AND kv_len > 0; detecting
             # either kind of empty row from device indptrs needs an
