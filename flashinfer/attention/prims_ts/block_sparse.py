@@ -162,6 +162,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         share_pattern_across_kv_heads: bool = False,
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
+        v_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
         sage_config: SageAttentionConfig | None = None,
     ) -> None:
@@ -225,11 +226,16 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ordered on one stream or externally synchronized. Unordered concurrent
         runs require distinct wrappers.
 
+        ``kv_data_type`` is the K dtype and defaults to ``q_data_type``;
+        ``v_data_type`` defaults to ``kv_data_type``.
+
         ``sage_config`` enables Sage attention in both modes when the block sizes
-        select a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
-        ``torch.float8_e4m3fn`` dequantized with one scale per token block, V
-        is ``torch.float8_e4m3fn`` with one scale per channel, and the output
-        is ``torch.bfloat16`` (the default) or ``torch.float16``.
+        select a Keeps profile (Q64/KV256 or Q128/KV128): Q and K share
+        ``torch.float8_e4m3fn`` or ``torch.int8`` dequantized with one scale
+        per token block, V is ``torch.float8_e4m3fn`` with one scale per
+        channel (the INT8 recipe therefore passes
+        ``v_data_type=torch.float8_e4m3fn``), and the output is
+        ``torch.bfloat16`` (the default) or ``torch.float16``.
         :class:`SageAttentionConfig` fixes the scale block sizes and whether a
         V mean is added back; every :meth:`run` supplies the scale tensors as
         :class:`SageAttentionParams`, including ``k_summary_scale`` for the
@@ -270,6 +276,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             mask_type=mask_type,
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
+            v_dtype=v_data_type,
             output_dtype=o_data_type,
             max_blocks_per_row=(
                 max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
@@ -350,9 +357,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         structural tokens (the final partial block averages only the tokens it
         covers); a proxy block stands for that many identical tokens, so its
         probability carries the block's token mass. With Sage attention the
-        summaries are E4M3: K summaries are dequantized with
-        ``k_summary_scale`` and V summaries share ``v_scale`` (built from
-        ``V - v_mean`` when a mean is used).
+        K summaries use the K dtype and are dequantized with
+        ``k_summary_scale``; the V summaries are E4M3 and share ``v_scale``
+        (built from ``V - v_mean`` when a mean is used).
 
         Every row must fit the planned semantic-block capacity. Reusable runs
         trust routing values. CuTe DSL assertions can diagnose violations when
@@ -373,8 +380,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         k : torch.Tensor
             Compact key tensor ``[B, Skv, Hkv, D]`` matching the plan.
         v : torch.Tensor
-            Compact value tensor with the same shape, dtype, and strides as
-            ``k``.
+            Compact value tensor ``[B, Skv, Hkv, D]`` matching the plan. Its
+            dtype is the planned V dtype: the K dtype, except for the INT8
+            Sage recipe, where V is ``torch.float8_e4m3fn``.
         block_indptr : torch.Tensor, optional
             Contiguous Int32 BSR row offsets with shape
             ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``, where Hpattern is one
@@ -486,7 +494,9 @@ def block_sparse_attention(
     k : torch.Tensor
         Compact key tensor ``[B, Skv, Hkv, D]``.
     v : torch.Tensor
-        Compact value tensor with the same shape, dtype, and strides as ``k``.
+        Compact value tensor with the same shape and strides as ``k``; its
+        dtype follows ``k`` except for the INT8 Sage recipe, whose V is
+        ``torch.float8_e4m3fn``.
     block_indptr : torch.Tensor, optional
         Contiguous Int32 BSR row offsets with shape
         ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
@@ -581,8 +591,10 @@ def block_sparse_attention(
         mask_type=mask_type,
         q_dtype=q.dtype,
         kv_dtype=k.dtype,
+        v_dtype=v.dtype,
         output_dtype=None if out is None else out.dtype,
         sage=sage_config,
+        use_block_sparse=use_block_sparse,
     )
     if use_proxy_routes and static.mask_type != "dense":
         raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -641,6 +653,7 @@ def block_sparse_attention(
         mask_type=static.mask_type,
         q_data_type=static.q_dtype,
         kv_data_type=static.kv_dtype,
+        v_data_type=static.v_dtype,
         o_data_type=static.output_dtype,
         share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
         sage_config=sage_config,

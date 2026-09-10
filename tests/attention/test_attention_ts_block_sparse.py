@@ -46,6 +46,7 @@ from flashinfer.attention.prims_ts._block_sparse import plan as block_sparse_pla
 from flashinfer.attention.prims_ts._block_sparse.prepared import (
     _BlockSparseRouteLayout,
 )
+from flashinfer.attention.prims_ts.sage import sage_scale_shapes
 
 from tests.attention.prims_ts_test_utils import (
     FP8 as _FP8,
@@ -633,6 +634,7 @@ def _plan_state_stub(**overrides: object) -> SimpleNamespace:
         "use_kv_valid_bits": False,
         "q_dtype": torch.float16,
         "kv_dtype": torch.float16,
+        "v_dtype": torch.float16,
         "output_dtype": torch.float16,
         "dummy_kv_valid_bits": None,
         "row_route_offsets": None,
@@ -640,8 +642,24 @@ def _plan_state_stub(**overrides: object) -> SimpleNamespace:
         "max_blocks_per_row": None,
         "page_size": None,
         "sage": None,
+        "sage_scale_shapes": None,
     }
     fields.update(overrides)
+    if fields["sage"] is not None and fields["sage_scale_shapes"] is None:
+        fields["sage_scale_shapes"] = sage_scale_shapes(
+            fields["sage"],
+            batch_size=fields["batch_size"],
+            seq_len_q=fields["seq_len_q"],
+            seq_len_kv=fields["seq_len_kv"],
+            num_qo_heads=fields["num_qo_heads"],
+            num_kv_heads=fields["num_kv_heads"],
+            head_dim=fields["head_dim"],
+            summary_seq_len=(
+                math.ceil(fields["seq_len_kv"] / fields["kv_block_size"])
+                if fields["use_proxy_routes"]
+                else None
+            ),
+        )
     return SimpleNamespace(**fields)
 
 
@@ -1647,8 +1665,46 @@ def test_block_sparse_static_profile_relaxes_dtypes_with_sage(
     )
 
     assert profile.dtype_key == "float8_e4m3fn"
+    assert profile.v_dtype == _FP8
     assert profile.output_dtype == (output_dtype or torch.bfloat16)
     assert profile.sage == recipe
+
+
+@pytest.mark.parametrize("output_dtype", (None, torch.float16))
+def test_block_sparse_static_profile_accepts_int8_qk_with_sage(
+    output_dtype: torch.dtype | None,
+) -> None:
+    """INT8 Q/K with E4M3 V is the second Sage recipe; V must be named."""
+
+    config = prims_ts.SageAttentionConfig()
+    profile = _validate_static_profile(
+        q_dtype=torch.int8,
+        kv_dtype=torch.int8,
+        output_dtype=output_dtype,
+        sage=config,
+        v_dtype=_FP8,
+    )
+
+    assert profile.dtype_key == "int8"
+    assert profile.q_dtype == profile.kv_dtype == torch.int8
+    assert profile.v_dtype == _FP8
+    assert profile.output_dtype == (output_dtype or torch.bfloat16)
+    assert profile.sage == config
+
+
+def test_block_sparse_static_profile_v_dtype_defaults_to_k_dtype() -> None:
+    """Omitting V follows the K dtype; the decode configuration judges INT8 V."""
+
+    profile = _validate_static_profile(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+    )
+    assert profile.v_dtype == torch.bfloat16
+    profile = _validate_static_profile(
+        q_dtype=torch.int8, kv_dtype=torch.int8, sage=prims_ts.SageAttentionConfig()
+    )
+    assert profile.v_dtype == torch.int8
 
 
 @pytest.mark.parametrize(
@@ -1659,6 +1715,12 @@ def test_block_sparse_static_profile_relaxes_dtypes_with_sage(
             NotImplementedError,
             "torch.float16 and torch.bfloat16",
             id="fp8-qk",
+        ),
+        pytest.param(
+            {"q_dtype": torch.int8},
+            NotImplementedError,
+            "torch.float16 and torch.bfloat16",
+            id="int8-qk",
         ),
         pytest.param(
             {
@@ -1676,6 +1738,12 @@ def test_block_sparse_static_profile_relaxes_dtypes_with_sage(
             "matching",
             id="16-bit-output-mismatch",
         ),
+        pytest.param(
+            {"v_dtype": torch.bfloat16},
+            ValueError,
+            "matching",
+            id="16-bit-v-mismatch",
+        ),
     ),
 )
 def test_block_sparse_static_profile_keeps_the_16_bit_dtype_rule_without_sage(
@@ -1683,11 +1751,38 @@ def test_block_sparse_static_profile_keeps_the_16_bit_dtype_rule_without_sage(
     error_type: type[Exception],
     message: str,
 ) -> None:
-    """Without a Sage recipe, Q, K/V and the output share one 16-bit dtype."""
+    """Without a Sage recipe, Q, K, V and the output share one 16-bit dtype."""
 
     with pytest.raises(error_type, match=message):
         _validate_static_profile(**overrides)
     assert _validate_static_profile().dtype_key == "float16"
+
+
+def test_block_sparse_compile_key_builds_int8_sage_config() -> None:
+    """The INT8 key selects the INT32-score kernel with E4M3 V and P."""
+
+    from cutlass import BFloat16, Float8E4M3FN, Int8
+
+    key = make_block_sparse_compile_key(
+        dtype_key="int8",
+        out_dtype_key="bfloat16",
+        v_dtype_key="float8_e4m3fn",
+        sage=prims_ts.SageAttentionConfig(),
+    )
+    cfg = block_sparse_config._make_block_sparse_config(key)
+    assert cfg.q_dtype == cfg.kv_dtype == Int8
+    assert cfg.v_dtype == Float8E4M3FN
+    assert cfg.out_dtype == BFloat16
+    assert cfg.uses_int32_scores
+    assert cfg.use_8bit_qkv
+    fp8_cfg = block_sparse_config._make_block_sparse_config(
+        replace(key, dtype_key="float8_e4m3fn", v_dtype_key="float8_e4m3fn")
+    )
+    assert fp8_cfg.v_dtype == Float8E4M3FN
+    assert not fp8_cfg.uses_int32_scores
+    # INT8 Q/K with V following K is the decode configuration's rejection.
+    with pytest.raises(ValueError, match="Float8E4M3FN V"):
+        block_sparse_config._make_block_sparse_config(replace(key, v_dtype_key="int8"))
 
 
 def test_sage_static_profile_requires_one_qk_dtype_and_a_config() -> None:
@@ -2940,6 +3035,7 @@ def test_dense_runtime_binds_the_sage_scales_of_each_run() -> None:
         use_block_sparse=False,
         q_dtype=_FP8,
         kv_dtype=_FP8,
+        v_dtype=_FP8,
         output_dtype=torch.bfloat16,
         sage=prims_ts.SageAttentionConfig(),
     )
@@ -3399,6 +3495,7 @@ def test_block_sparse_clc_requires_about_two_sm_waves(
         kv_route_size=256,
         dtype_key="bfloat16",
         out_dtype_key="bfloat16",
+        v_dtype_key="bfloat16",
         mask_type="dense",
         use_kv_valid_bits=True,
         max_row_route_capacity=8,
@@ -3466,6 +3563,7 @@ def test_gqa_launch_spec_uses_q_token_cta_geometry(
             kv_route_size=256,
             dtype_key="float16",
             out_dtype_key="float16",
+            v_dtype_key="float16",
             mask_type="dense",
             use_kv_valid_bits=False,
             max_row_route_capacity=4,
@@ -3528,6 +3626,7 @@ def test_proxy_routes_share_exact_route_scheduler_selection(
             kv_route_size=256,
             dtype_key="bfloat16",
             out_dtype_key="bfloat16",
+            v_dtype_key="bfloat16",
             mask_type="dense",
             use_kv_valid_bits=False,
             max_row_route_capacity=16,
@@ -3588,6 +3687,7 @@ def test_clc_capacity_gates_control_launch_resolution(
         kv_route_size=128,
         dtype_key="bfloat16",
         out_dtype_key="bfloat16",
+        v_dtype_key="bfloat16",
         mask_type="dense",
     )
     block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
@@ -3651,6 +3751,7 @@ def test_static_fallback_reselects_sparse_load_policy(
             kv_route_size=128,
             dtype_key="bfloat16",
             out_dtype_key="bfloat16",
+            v_dtype_key="bfloat16",
             mask_type="dense",
             use_kv_valid_bits=True,
             max_row_route_capacity=4,

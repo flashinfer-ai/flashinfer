@@ -82,6 +82,11 @@ DENSE = 0
 CAUSAL = 1
 MASK_TYPES = ("dense", "causal")
 
+SUPPORTED_IO_DTYPES = {Float16, BFloat16, Float8E4M3FN}
+# Q and K additionally admit Int8, which the Sage recipe pairs with E4M3 V.
+SUPPORTED_QK_DTYPES = SUPPORTED_IO_DTYPES | {Int8}
+SUPPORTED_ACC_DTYPES = {Float32}
+
 # Every correction lane reduces one packed 16-byte partial-O vector.  The
 # default four-warp correction group therefore owns a 2-KiB reducer slice.
 SPLIT_REDUCTION_VECTOR_BYTES_PER_THREAD = 16
@@ -103,13 +108,16 @@ _CONTIGUOUS_GROUPED_KEEPS_PROFILES = {
     _GROUPED_KEEPS_MAIN_PROFILE,
     (BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
 }
-# Sage attention recipes: 8-bit Q/K/V dequantized with per-block and
-# per-channel scales into a 16-bit output. They run the contiguous Keeps
-# resource recipes above and are keyed apart by ``use_sage_attention``, since
-# ``(E4M3, E4M3, F16)`` without scales is the static-only FP8 profile below.
+# Sage attention recipes: 8-bit Q/K (E4M3 with FP32 scores or Int8 with INT32
+# scores) and E4M3 V dequantized with per-block and per-channel scales into a
+# 16-bit output; ``validate_dtypes`` pins the V dtype. They run the contiguous
+# Keeps resource recipes above and are keyed apart by ``use_sage_attention``,
+# since ``(E4M3, E4M3, F16)`` without scales is the static-only FP8 profile
+# below.
 _SAGE_GROUPED_KEEPS_PROFILES = {
-    (Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
-    (Float8E4M3FN, Float8E4M3FN, BFloat16, 128, 0, 2, 2),
+    (qk_dtype, qk_dtype, out_dtype, 128, 0, 2, 2)
+    for qk_dtype in (Float8E4M3FN, Int8)
+    for out_dtype in (Float16, BFloat16)
 }
 _SAGE_DTYPE_RECIPES = {profile[:3] for profile in _SAGE_GROUPED_KEEPS_PROFILES}
 _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
@@ -186,6 +194,11 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
 }
 
 _KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
+
+
+def _dtype_bytes(dtype: type) -> int:
+    """Return the storage bytes of one element of a CUTLASS numeric type."""
+    return dtype.width // BITS_PER_BYTE
 
 
 # ``(Q, K/V, O)`` dtype recipes of the Q64/KV256 profile without Sage
@@ -598,12 +611,18 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Data types
     # ------------------------------------------------------------------
-    # Q element type. One of Float16 / BFloat16 / Float8E4M3FN. Must equal
-    # kv_dtype — mixed Q/KV element types are not supported yet; enforced by
-    # the guard in make_decode_config.
+    # Q element type. One of Float16 / BFloat16 / Float8E4M3FN / Int8. Must
+    # equal kv_dtype — mixed Q/K element types are not supported; enforced by
+    # ``validate_dtypes``.
     q_dtype: type = Float16
-    # K and V element type. One of Float16 / BFloat16 / Float8E4M3FN.
+    # K element type. One of Float16 / BFloat16 / Float8E4M3FN / Int8 (Int8
+    # requires Sage attention).
     kv_dtype: type = Float16
+    # V element type. It equals ``kv_dtype`` except in the INT8 Sage recipe,
+    # which keeps E4M3 V (and therefore E4M3 P); ``validate_dtypes`` enforces
+    # the rule and ``_assign_dtypes`` sets it together with the other dtypes,
+    # from the K dtype when a caller leaves it out.
+    v_dtype: type = Float16
     # Output O element type. One of Float16 / BFloat16 / Float8E4M3FN.
     out_dtype: type = Float16
     # Accumulator type (BMM accumulators and softmax stats), always Float32
@@ -1012,21 +1031,24 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     @property
     def q_dtype_bytes(self) -> int:
-        """Byte width of one Q element (fp16/bf16=2, e4m3=1).
+        """Byte width of one Q element (fp16/bf16=2, e4m3/int8=1).
 
         Also the byte width used by anything that feeds the MMA on the Q/S/P
         side (softmax stats, P tile, MMA operand descriptors)."""
-        return 1 if self.q_dtype == Float8E4M3FN else 2
+        return _dtype_bytes(self.q_dtype)
 
     @property
     def kv_dtype_bytes(self) -> int:
-        """Byte width of one K/V element (fp16/bf16=2, e4m3=1)."""
-        return 1 if self.kv_dtype == Float8E4M3FN else 2
+        """Byte width of one K element (fp16/bf16=2, e4m3/int8=1).
+
+        Also the V width: ``validate_dtypes`` keeps K and V at one width, so
+        the shared K/V ring and the TMA boxes are sized from this value."""
+        return _dtype_bytes(self.kv_dtype)
 
     @property
     def o_dtype_bytes(self) -> int:
         """Byte width of one O element (fp16/bf16=2, e4m3=1)."""
-        return 1 if self.out_dtype == Float8E4M3FN else 2
+        return _dtype_bytes(self.out_dtype)
 
     @property
     def acc_dtype_bytes(self) -> int:
@@ -1049,9 +1071,15 @@ class FmhaDecodeConfig:
         return SWIZZLE_128B_ROW_BYTES // self.kv_dtype_bytes
 
     @property
-    def use_fp8_qkv(self) -> bool:
-        """fp8 (E4M3) Q/K/V path: switches MMA kind and P-quantization."""
-        return self.kv_dtype == Float8E4M3FN
+    def use_8bit_qkv(self) -> bool:
+        """8-bit Q/K (E4M3 or Int8) with E4M3 V: the byte-wide data path.
+
+        Selects one byte per staged element, K = 32 per MMA, four packed P
+        values per TMEM column and the E4M3 P quantization with its static
+        448 scale (V and hence P are E4M3 for every 8-bit recipe). The QK MMA
+        kind and the score interpretation follow ``q_dtype`` separately.
+        """
+        return self.q_dtype_bytes == 1
 
     @property
     def use_fp8_output(self) -> bool:
@@ -1483,7 +1511,7 @@ class FmhaDecodeConfig:
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
         regs_per_repeat = (
             FP8_P_PACKED_REGS_PER_Q_REPEAT
-            if self.use_fp8_qkv
+            if self.use_8bit_qkv
             else FP16_P_PACKED_REGS_PER_Q_REPEAT
         )
         return regs_per_repeat * q_repeats
@@ -1550,7 +1578,7 @@ class FmhaDecodeConfig:
     @property
     def inferred_kv_stages(self) -> int:
         """Return the deepest K/V ring that fits the shared-memory budget."""
-        q_dtype_bits = 8 if self.q_dtype == Float8E4M3FN else 16
+        q_dtype_bits = self.q_dtype_bytes * BITS_PER_BYTE
         q_row_bytes = (
             (q_dtype_bits * self.headdim // BITS_PER_BYTE + Q_ROW_ALIGNMENT_BYTES - 1)
             // Q_ROW_ALIGNMENT_BYTES
@@ -1568,27 +1596,49 @@ class FmhaDecodeConfig:
         )
 
     def validate_dtypes(self) -> None:
-        """Validate decode input, output, and accumulator dtypes."""
+        """Validate decode input, output, and accumulator dtypes.
+
+        Q and K share one dtype. V follows K except for the INT8 Sage recipe,
+        where INT8 Q/K pair with E4M3 V so that P stays E4M3 and the K/V ring
+        keeps one element width.
+        """
         for name, dtype, supported in (
-            ("q_dtype", self.q_dtype, SUPPORTED_IO_DTYPES),
-            ("kv_dtype", self.kv_dtype, SUPPORTED_IO_DTYPES),
-            ("out_dtype", self.out_dtype, SUPPORTED_IO_DTYPES),
-            ("acc_dtype", self.acc_dtype, SUPPORTED_ACC_DTYPES),
+            ("q_dtype", self.q_dtype, SUPPORTED_QK_DTYPES),
+            ("kv_dtype", self.kv_dtype, SUPPORTED_QK_DTYPES),
         ):
             if dtype not in supported:
                 raise ValueError(f"Unsupported {name}: {dtype}")
         if self.q_dtype != self.kv_dtype:
             raise ValueError(
                 f"q_dtype ({self.q_dtype}) != kv_dtype ({self.kv_dtype}): "
-                "mixed Q/KV element types are not supported"
+                "mixed Q/K element types are not supported"
             )
-        if (
-            self.use_sage_attention
-            and (self.q_dtype, self.kv_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES
+        if self.kv_dtype == Int8:
+            if not self.use_sage_attention:
+                raise ValueError("Int8 Q/K requires Sage attention scales")
+            if self.v_dtype != Float8E4M3FN:
+                raise ValueError(
+                    f"Int8 Q/K requires Float8E4M3FN V, got v_dtype {self.v_dtype}"
+                )
+        for name, dtype, supported in (
+            ("v_dtype", self.v_dtype, SUPPORTED_IO_DTYPES),
+            ("out_dtype", self.out_dtype, SUPPORTED_IO_DTYPES),
+            ("acc_dtype", self.acc_dtype, SUPPORTED_ACC_DTYPES),
+        ):
+            if dtype not in supported:
+                raise ValueError(f"Unsupported {name}: {dtype}")
+        if self.kv_dtype != Int8 and self.v_dtype != self.kv_dtype:
+            raise ValueError(
+                f"v_dtype ({self.v_dtype}) != kv_dtype ({self.kv_dtype}): "
+                "V follows the K dtype outside the Int8 Sage recipe"
+            )
+        if self.use_sage_attention and (
+            (self.q_dtype, self.kv_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES
+            or self.v_dtype != Float8E4M3FN
         ):
             raise ValueError(
-                "Sage attention requires Float8E4M3FN Q, K and V with Float16 "
-                "or BFloat16 output"
+                "Sage attention requires Float8E4M3FN or Int8 Q and K with "
+                "Float8E4M3FN V and Float16 or BFloat16 output"
             )
 
     def validate_boolean_fields(self) -> None:
@@ -2144,7 +2194,7 @@ class FmhaDecodeConfig:
         return (
             self.tile_size_kv == 256
             or self.use_block_sparse
-            or (self.use_fp8_qkv and self.keeps_stats_via_smem)
+            or (self.use_8bit_qkv and self.keeps_stats_via_smem)
         )
 
     @property
@@ -2162,7 +2212,7 @@ class FmhaDecodeConfig:
         """
         return (
             self.use_keeps_mma_ab
-            and not self.use_fp8_qkv
+            and not self.use_8bit_qkv
             and (self.tile_size_kv == 256 or self.use_block_sparse)
         )
 
@@ -2202,7 +2252,7 @@ class FmhaDecodeConfig:
         """Whether two-instance Keeps has room for standalone stats tiles."""
         if not (
             self.use_keeps_mma_ab
-            and self.use_fp8_qkv
+            and self.use_8bit_qkv
             and self.tile_size_kv == 128
             and self.head_dim_per_stage_kv == 0
             and self.num_insts_kv == 2
@@ -2416,7 +2466,7 @@ class FmhaDecodeConfig:
                 or not self._kv256_dtypes_qualified
                 # FP8 Keeps recipes exclude attention sinks, as the paged FP8
                 # Q64/Q128 profiles do.
-                or (self.use_fp8_qkv and self.use_attention_sinks)
+                or (self.use_8bit_qkv and self.use_attention_sinks)
                 or self.use_cluster_smem_reduction
                 or not self.matches_kv256_task_topology
             ):
@@ -2554,10 +2604,6 @@ class FmhaDecodeConfig:
         if self.use_separate_reduction_kernel and self.use_variable_seqlens_q:
             return not self.use_attention_sinks or self.mask_type == CAUSAL
         return self.mask_type == DENSE and not self.use_attention_sinks
-
-
-SUPPORTED_IO_DTYPES = {Float16, BFloat16, Float8E4M3FN}
-SUPPORTED_ACC_DTYPES = {Float32}
 
 
 def _decode_config_items(source: object):
@@ -2704,6 +2750,20 @@ def _apply_mask_type_config(
         mask_type if mask_type is not None else source_mask_type,
         sliding_window_causal=sliding_window_causal,
     )
+
+
+def _assign_dtypes(
+    cfg: FmhaDecodeConfig,
+    *,
+    qkv_dtype: type,
+    o_dtype: type,
+    v_dtype: type | None = None,
+) -> None:
+    """Set the Q, K, V and output dtypes together; V follows K unless named."""
+    cfg.q_dtype = qkv_dtype
+    cfg.kv_dtype = qkv_dtype
+    cfg.v_dtype = qkv_dtype if v_dtype is None else v_dtype
+    cfg.out_dtype = o_dtype
 
 
 def _set_if_implicit(
@@ -3016,6 +3076,7 @@ def _make_static_decode_config(
     """
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    _set_if_implicit(cfg, "v_dtype", cfg.kv_dtype, explicit_fields)
     _apply_mask_type_config(
         cfg,
         source=args,
@@ -3659,9 +3720,7 @@ def _resolve_grouped_q_launch_candidates(
         # its Q geometry and modeled cost are identical to the qualified FP16
         # logical candidate. The KV selector materializes and validates the
         # actual BF16 profile only after the Q winner is known.
-        probe.q_dtype = Float16
-        probe.kv_dtype = Float16
-        probe.out_dtype = Float16
+        _assign_dtypes(probe, qkv_dtype=Float16, o_dtype=Float16)
     try:
         _finalize_static_decode_config(
             probe,
@@ -4530,6 +4589,7 @@ def make_decode_config(
     num_heads_kv: int | None = None,
     qkv_dtype: type = Float16,
     o_dtype: type = Float16,
+    v_dtype: type | None = None,
     qkv_layout: str = "contiguousKv",
     num_tokens_per_page: int = 32,
     storage_tokens_per_page: int | None = None,
@@ -4651,9 +4711,7 @@ def make_decode_config(
         explicit_fields=explicit_fields,
         heads_q_per_kv=num_heads_q // num_heads_kv,
     )
-    cfg.q_dtype = qkv_dtype
-    cfg.kv_dtype = qkv_dtype
-    cfg.out_dtype = o_dtype
+    _assign_dtypes(cfg, qkv_dtype=qkv_dtype, o_dtype=o_dtype, v_dtype=v_dtype)
 
     qkv_layout = _apply_layout_config(
         cfg,

@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
@@ -154,9 +154,30 @@ def _swaps_routed_coordinate(
     return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
-    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16
+def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA kind of BMM1 from the Q/K dtype.
+
+    Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
+    """
+    if cfg.uses_int32_scores:
+        return prims.Tcgen05MMAKind.INT8
+    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_8bit_qkv else prims.Tcgen05MMAKind.F16
+
+
+def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA kind of BMM2 from the V (and hence P) dtype."""
+    if cfg.v_dtype == Float8E4M3FN:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
+    """Return the type BMM1 accumulates one score as: Int32 for Int8 Q/K.
+
+    INT32 scores are accumulated on top of ``INT32_SCORE_BIAS``, so the
+    softmax reads every score tile as FP32.
+    """
+    return Int32 if cfg.uses_int32_scores else Float32
 
 
 @cute.jit
@@ -377,7 +398,7 @@ def _pack_float2_to_bf16(v0: Float32, v1: Float32) -> Int32:
 
 def _qkv_smem_swizzle(cfg: FmhaDecodeConfig) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for staged Q/K/V tiles."""
-    if cfg.use_fp8_qkv and cfg.headdim == 64:
+    if cfg.use_8bit_qkv and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 

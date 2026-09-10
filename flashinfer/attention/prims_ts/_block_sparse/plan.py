@@ -24,8 +24,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from ..decode import _dtype_key
-from ..sage import SageAttentionConfig
+from ..sage import SageAttentionConfig, sage_scale_shapes
 from .common import (
     _SIGNED_INT32_MAX,
     _block_sparse_proxy_summary_geometry,
@@ -108,12 +107,16 @@ class _BlockSparsePlanState:
     kv_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    # The resolved V dtype (the K dtype unless the plan named another one).
+    v_dtype: torch.dtype
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
     page_size: int | None
     # The compile-time Sage recipe; every run supplies the matching scale
     # tensors. ``None`` runs 16-bit attention without Sage.
     sage: SageAttentionConfig | None
+    # The shape of every scale tensor a Sage run supplies, by field name.
+    sage_scale_shapes: dict[str, tuple[int, int]] | None
 
     # Only an unmasked block-sparse specialization needs a shape-correct ABI
     # placeholder. A dense contiguous plan runs without a prepare kernel and
@@ -246,6 +249,22 @@ def _build_block_sparse_plan_state(
     num_rows, max_row_route_capacity = _block_sparse_route_capacity(
         static, use_proxy_routes=use_proxy_routes
     )
+    scale_shapes = None
+    if static.sage is not None:
+        scale_shapes = sage_scale_shapes(
+            static.sage,
+            batch_size=static.batch_size,
+            seq_len_q=static.seq_len_q,
+            seq_len_kv=static.seq_len_kv,
+            num_qo_heads=static.num_qo_heads,
+            num_kv_heads=static.num_kv_heads,
+            head_dim=static.head_dim,
+            summary_seq_len=(
+                ceil_div(static.seq_len_kv, static.kv_block_size)
+                if use_proxy_routes
+                else None
+            ),
+        )
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
             device_index=device_index,
@@ -267,7 +286,8 @@ def _build_block_sparse_plan_state(
             sparse_format=sparse_format,
             use_proxy_routes=use_proxy_routes,
             use_block_sparse=static.use_block_sparse,
-            out_dtype_key=_dtype_key(static.output_dtype),
+            out_dtype_key=static.out_dtype_key,
+            v_dtype_key=static.v_dtype_key,
             sage=static.sage,
         )
         policy = (
@@ -315,10 +335,12 @@ def _build_block_sparse_plan_state(
         kv_block_size=static.kv_block_size,
         q_dtype=static.q_dtype,
         kv_dtype=static.kv_dtype,
+        v_dtype=static.v_dtype,
         output_dtype=static.output_dtype,
         use_kv_valid_bits=static.use_kv_valid_bits,
         page_size=static.page_size,
         sage=static.sage,
+        sage_scale_shapes=scale_shapes,
         dummy_kv_valid_bits=dummy_kv_valid_bits,
         row_route_offsets=row_route_offsets,
         route_workspace=route_workspace,

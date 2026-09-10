@@ -345,7 +345,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.head_dim,
         )
         k_fake = fake_compact(config.kv_dtype, kv_shape)
-        v_fake = fake_compact(config.kv_dtype, kv_shape)
+        v_fake = fake_compact(config.v_dtype, kv_shape)
         k_summary_fake = None
         v_summary_fake = None
         indptr_fake = None
@@ -362,7 +362,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.head_dim,
             )
             k_summary_fake = fake_compact(config.kv_dtype, summary_shape)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape)
+            v_summary_fake = fake_compact(config.v_dtype, summary_shape)
         if key.use_block_sparse:
             if sparse_format == "bsr":
                 indptr_fake = fake_compact(
@@ -456,7 +456,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.v_dtype,
             kv_shape,
             stride=(
                 v_outer_stride,

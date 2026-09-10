@@ -191,3 +191,26 @@ PARALLEL_REDUCTION_FINAL_REDUCERS = 4
 OUTPUT_VALUES_PER_THREAD = 8
 FP8_PACKED_OUTPUT_REGS_PER_THREAD = 2
 PACKED_OUTPUT_REGS_PER_THREAD = 4
+
+# INT8 Q/K scores are accumulated on top of the bit pattern of ``1.5 * 2**23``:
+# every integer in ``[2**23, 2**24)`` is an FP32 number with unit spacing, and
+# every INT8 dot product satisfies ``|score| <= 128 * 128 * 128 = 2**21`` for
+# ``D = 128`` (the only Sage head dimension), so the final INT32 accumulator
+# ``bias + score`` is exactly the FP32 number ``12582912.0 + score``. The
+# softmax reads the scores as FP32 without a per-element conversion; the max
+# pass subtracts the bias once per scale group and the exp pass folds
+# ``-bias * multiplier`` into each group's exponent addend.
+INT32_SCORE_BIAS = 12582912.0
+# The bias is written by one ``kind::f16`` MMA step before the INT8 K steps.
+# Both operands read the same BF16 tile, whose every K = 16 row is
+# ``[1024, 1024, 1024, 0]`` repeated: the twelve nonzero products ``2**20``
+# sum to exactly ``1.5 * 2**23`` (every product and partial sum is a multiple
+# of ``2**20`` below ``2**24``). One shared operand descriptor keeps the MMA
+# warp's live state small. The tile is stored as unswizzled K-major 32-byte
+# rows whose 8x16-byte core matrices are 128 bytes apart along the row and
+# 256 bytes apart between eight-row groups; every 16-byte chunk holds the
+# pattern, so the two packed words alternate with the word index.
+INT32_SCORE_SEED_MMA_K = 16
+INT32_SCORE_SEED_TILE_WORDS = (0x44804480, 0x00004480)
+INT32_SCORE_SEED_TILE_LBO = 128
+INT32_SCORE_SEED_TILE_SBO = 256

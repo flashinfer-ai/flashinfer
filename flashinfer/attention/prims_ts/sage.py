@@ -14,12 +14,13 @@
 
 """Sage attention inputs for the PrimTS decode kernels.
 
-Sage attention runs ``QK^T`` on 8-bit Q/K with one dequantization scale per
-token block and ``PV`` on E4M3 P/V with one scale per V channel. The scale
-tensors follow the trtllm-gen flat layout produced by TensorRT-LLM's
-``sageQuant``: per head, sequence ``b`` starts at ``b * S // blk + b`` and token
-``t`` uses slot ``t // blk`` inside it, so ``ceil(B * S / blk) + B - 1`` slots
-cover a fixed ``[B, S, H, D]`` tensor.
+Sage attention runs ``QK^T`` on 8-bit Q/K (INT8 with INT32 scores, or E4M3
+with FP32 scores) with one dequantization scale per token block and ``PV`` on
+E4M3 P/V with one scale per V channel. The scale tensors follow the trtllm-gen
+flat layout produced by TensorRT-LLM's ``sageQuant``: per head, sequence ``b``
+starts at ``b * S // blk + b`` and token ``t`` uses slot ``t // blk`` inside
+it, so ``ceil(B * S / blk) + B - 1`` slots cover a fixed ``[B, S, H, D]``
+tensor.
 
 :class:`SageAttentionConfig` is the compile-time recipe a plan is built for;
 :class:`SageAttentionParams` carries the scale tensors of one run.
@@ -195,50 +196,26 @@ def sage_scale_shapes(
 
 def validate_sage_params(
     params: SageAttentionParams,
-    config: SageAttentionConfig,
+    expected_shapes: Mapping[str, tuple[int, int]],
     *,
-    batch_size: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
     device: torch.device,
-    summary_seq_len: int | None = None,
 ) -> None:
-    """Validate the scale tensors of one run against the planned recipe.
+    """Validate the scale tensors of one run against the plan's expected shapes.
 
-    Plan compilation validates the recipe; this validates what a run supplies:
-    the tensors and their agreement with ``config.v_mean``.
-    ``summary_seq_len`` is the number of KV blocks of a proxy plan;
-    ``k_summary_scale`` must then cover that summary sequence in the flat
-    layout and must be absent otherwise.
+    ``expected_shapes`` is the plan's ``sage_scale_shapes`` result: it names
+    ``k_summary_scale`` only for a proxy plan and ``v_mean`` only for a recipe
+    with a V mean, so a tensor is required exactly when its name is present.
     """
 
     if not isinstance(params, SageAttentionParams):
         raise TypeError("sage must be a SageAttentionParams instance")
-    if (params.v_mean is None) == config.v_mean:
-        raise ValueError(
-            "v_mean is required by a plan configured with v_mean=True and "
-            "rejected otherwise"
-        )
-    if summary_seq_len is None and params.k_summary_scale is not None:
-        raise ValueError(
-            "k_summary_scale is consumed only by block-sparse proxy routes"
-        )
-    if summary_seq_len is not None and params.k_summary_scale is None:
-        raise ValueError("k_summary_scale is required by block-sparse proxy routes")
-    shapes = sage_scale_shapes(
-        config,
-        batch_size=batch_size,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        summary_seq_len=summary_seq_len,
-    )
-    for name, expected_shape in shapes.items():
+    for name, consumer in (
+        ("v_mean", "a plan configured with v_mean=True"),
+        ("k_summary_scale", "block-sparse proxy routes"),
+    ):
+        if (getattr(params, name) is None) == (name in expected_shapes):
+            raise ValueError(f"{name} is required by {consumer} and rejected otherwise")
+    for name, expected_shape in expected_shapes.items():
         _validate_scale_tensor(
             getattr(params, name), name, expected_shape=expected_shape, device=device
         )
