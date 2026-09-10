@@ -5,10 +5,9 @@ chunk's local transfer and state, fix those into chunk-boundary states, and run
 the prefill recurrence inside each chunk. Only the first three are ported here.
 The fourth computes a prefill over a token range from a given state, which
 `_FullyFusedDeltaRuleSm80` already does correctly, so chunks are handed to it as
-independent sequences; the composition is proven bit-exact in
-`logs/cp_compose/RESULT.md` in the measurement harness, and its contract is
-written down in
-`CP_LAYOUTS.md`.
+independent sequences. `test_the_whole_cp_path_is_byte_identical_through_either_abi`
+holds that composition to the fused result, and its layout contract is written
+down in `CP_LAYOUTS.md`.
 
 Ported from `delta_rule_cp_sm120.py`, which is the closer base: it uses the same
 `warp.MmaF16BF16Op((16, 8, 16))` this target has, where the sm_90 file uses
@@ -139,8 +138,7 @@ class _CPInvocation:
     The reason it exists is measured. On `1x8192 h2` the pointer path spends
     366 us idle between its four kernels -- 185 us after T and 171 us after
     the fixup, both short kernels the GPU drains before the host has issued the
-    next entry -- against 391 us of GPU work
-    (`logs/cp_timeline_ptr/RESULT.md` in the measurement harness). Argument
+    next entry -- against 391 us of GPU work. Argument
     generation is only 99 us of that, so what is left is each entry
     re-deriving what the entry before it already had.
 
@@ -288,6 +286,43 @@ def _cp_workspace(name, shape, dtype, device):
     """A cached device buffer of this shape, viewed as the requested dtype."""
     nbytes = math.prod(shape) * dtype.itemsize
     return _get_cache_buf(name, nbytes, device)[:nbytes].view(dtype).view(shape)
+
+
+def _resolve_stream(_ctx, device, _stream):
+    """The stream a stage launches on: the composition's, an explicit one, or
+    the current one, in that order."""
+    if _ctx is not None:
+        return _ctx.stream
+    if _stream is not None:
+        return _stream
+    import cuda.bindings.driver as cuda_driver
+
+    return cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+
+def _launch_or_plan(compiled, args, plan_sink):
+    """Run the compiled stage, or hand the call to a caller that replays it.
+
+    `plan_sink` is how the composition captures the four launches; what it
+    records is exactly what a direct call would have passed.
+    """
+    if plan_sink is not None:
+        plan_sink.append((compiled, args))
+    else:
+        compiled(*args)
+
+
+def _compile_and_launch(kernel, args, compile_options, plan_sink):
+    """Compile once per (kernel, options), then `_launch_or_plan`.
+
+    Only the pointer entries take this path. Their compile-time and run-time
+    arguments are the same tuple, where a tensor entry has to build DLPack
+    views for the compile and pass the tensors themselves to the call.
+    """
+    compiled = get_cached_compile(kernel, compile_options)
+    if compiled is None:
+        compiled = cached_compile(kernel, *args, compile_options=compile_options)
+    _launch_or_plan(compiled, args, plan_sink)
 
 
 class CPDeltaRuleTPrecomputeSm80(KeyedCompileMixin):
@@ -1453,8 +1488,8 @@ class CPDeltaRuleTPrecomputePtrSm80(CPDeltaRuleTPrecomputeSm80):
     """The T precompute, entered through pointers instead of tensors.
 
     `generate_execution_args` is 684 us of the CP path's 719 us of host time
-    per call, against 35 us for the four launches themselves -- see
-    `cp_host_split.py` in the measurement harness. The cost is per tensor
+    per call, against 35 us for the four launches themselves. The cost is per
+    tensor
     argument: a DLPack capsule from the torch tensor, a CuTe runtime tensor
     around it, a dynamic-layout marking and a set of C pointers, all in Python,
     ten tensors deep and four entries wide.
@@ -1519,15 +1554,11 @@ class CPDeltaRuleTPrecomputePtrSm80(CPDeltaRuleTPrecomputeSm80):
 
 
 @functools.cache
-def _get_t_precompute_ptr_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleTPrecomputePtrSm80(
-        kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype)
-    )
-
-
-@functools.cache
-def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleTPrecomputeSm80(
+def _get_t_precompute_kernel(kernel_dtype, cu_seqlens_dtype, ptr_abi):
+    """`ptr_abi` picks the pointer twin. Same specialization axes either way,
+    and the flag is part of the cache key, so the two never share a build."""
+    cls = CPDeltaRuleTPrecomputePtrSm80 if ptr_abi else CPDeltaRuleTPrecomputeSm80
+    return cls(
         kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype)
     )
 
@@ -1563,8 +1594,6 @@ def cp_delta_rule_t_precompute_dsl_sm80(
     Inputs must already be contiguous. This validates that contract rather than
     materialising copies of anything.
     """
-    import cuda.bindings.driver as cuda_driver
-
     device = k.device if _device is None else _device
     if not _skip_check:
         if k.ndim != 3:
@@ -1635,13 +1664,7 @@ def cp_delta_rule_t_precompute_dsl_sm80(
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
     }[k.dtype]
-    stream = (
-        _ctx.stream
-        if _ctx is not None
-        else _stream
-        if _stream is not None
-        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    )
+    stream = _resolve_stream(_ctx, device, _stream)
     compile_options = (
         _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device)
     )
@@ -1661,7 +1684,7 @@ def cp_delta_rule_t_precompute_dsl_sm80(
                 ("t", t, 128),
             ),
         )
-        kernel = _get_t_precompute_ptr_kernel(kernel_dtype, cu_seqlens.dtype)
+        kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype, True)
         args = (
             mk(kernel_dtype, k, 16, "k"),
             mk(cutlass.Float32, beta, 16, "beta"),
@@ -1675,15 +1698,9 @@ def cp_delta_rule_t_precompute_dsl_sm80(
             cutlass.Int32(num_seqs),
             stream,
         )
-        compiled = get_cached_compile(kernel, compile_options)
-        if compiled is None:
-            compiled = cached_compile(kernel, *args, compile_options=compile_options)
-        if _plan_sink is not None:
-            _plan_sink.append((compiled, args))
-        else:
-            compiled(*args)
+        _compile_and_launch(kernel, args, compile_options, _plan_sink)
         return t
-    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    kernel = _get_t_precompute_kernel(kernel_dtype, cu_seqlens.dtype, False)
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
         from_dlpack = cute.runtime.from_dlpack
@@ -1700,37 +1717,19 @@ def cp_delta_rule_t_precompute_dsl_sm80(
             stream,
         )
         compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
-    if _plan_sink is not None:
-        _plan_sink.append(
-            (
-                compiled,
-                (
-                    k_dhs,
-                    beta.reshape(-1),
-                    t.view(-1),
-                    cu_seqlens,
-                    num_k_heads,
-                    num_sab_heads,
-                    total_t_blocks,
-                    max_t_blocks_per_seq,
-                    num_seqs,
-                    stream,
-                ),
-            )
-        )
-    else:
-        compiled(
-            k_dhs,
-            beta.reshape(-1),
-            t.view(-1),
-            cu_seqlens,
-            num_k_heads,
-            num_sab_heads,
-            total_t_blocks,
-            max_t_blocks_per_seq,
-            num_seqs,
-            stream,
-        )
+    call_args = (
+        k_dhs,
+        beta.reshape(-1),
+        t.view(-1),
+        cu_seqlens,
+        num_k_heads,
+        num_sab_heads,
+        total_t_blocks,
+        max_t_blocks_per_seq,
+        num_seqs,
+        stream,
+    )
+    _launch_or_plan(compiled, call_args, _plan_sink)
     return t
 
 
@@ -1812,15 +1811,11 @@ class CPDeltaRuleMNPrecomputePtrSm80(CPDeltaRuleMNPrecomputeSm80):
 
 
 @functools.cache
-def _get_mn_precompute_ptr_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleMNPrecomputePtrSm80(
-        kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype)
-    )
-
-
-@functools.cache
-def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype):
-    return CPDeltaRuleMNPrecomputeSm80(
+def _get_mn_precompute_kernel(kernel_dtype, cu_seqlens_dtype, ptr_abi):
+    """`ptr_abi` picks the pointer twin. Same specialization axes either way,
+    and the flag is part of the cache key, so the two never share a build."""
+    cls = CPDeltaRuleMNPrecomputePtrSm80 if ptr_abi else CPDeltaRuleMNPrecomputeSm80
+    return cls(
         kernel_dtype, cu_seqlens_dtype=integer_dtype_to_cutlass(cu_seqlens_dtype)
     )
 
@@ -1858,8 +1853,6 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
     transposed write is the same shape and only the numbers come out wrong.
     See `CP_LAYOUTS.md`.
     """
-    import cuda.bindings.driver as cuda_driver
-
     device = k.device if _device is None else _device
     if not _skip_check:
         if k.ndim != 3:
@@ -1948,13 +1941,7 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
     }[k.dtype]
-    stream = (
-        _ctx.stream
-        if _ctx is not None
-        else _stream
-        if _stream is not None
-        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    )
+    stream = _resolve_stream(_ctx, device, _stream)
     compile_options = (
         _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device)
     )
@@ -1973,7 +1960,7 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
                 ("cu_seqlens", cu_seqlens, 8),
             ),
         )
-        kernel = _get_mn_precompute_ptr_kernel(kernel_dtype, cu_seqlens.dtype)
+        kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype, True)
         args = (
             mk(kernel_dtype, k, 16, "k"),
             mk(kernel_dtype, v, 16, "v"),
@@ -1993,15 +1980,9 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
             cutlass.Int32(num_seqs),
             stream,
         )
-        compiled = get_cached_compile(kernel, compile_options)
-        if compiled is None:
-            compiled = cached_compile(kernel, *args, compile_options=compile_options)
-        if _plan_sink is not None:
-            _plan_sink.append((compiled, args))
-        else:
-            compiled(*args)
+        _compile_and_launch(kernel, args, compile_options, _plan_sink)
         return transfer_VK, state_VK
-    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype)
+    kernel = _get_mn_precompute_kernel(kernel_dtype, cu_seqlens.dtype, False)
     compiled = get_cached_compile(kernel, compile_options)
     if compiled is None:
         from_dlpack = cute.runtime.from_dlpack
@@ -2024,49 +2005,25 @@ def cp_delta_rule_mn_precompute_dsl_sm80(
             stream,
         )
         compiled = cached_compile(kernel, *kernel_args, compile_options=compile_options)
-    if _plan_sink is not None:
-        _plan_sink.append(
-            (
-                compiled,
-                (
-                    k_dhs,
-                    v_dhs,
-                    t.view(-1),
-                    alpha.view(-1),
-                    transfer_VK.view(-1),
-                    state_VK.view(-1),
-                    cu_seqlens,
-                    cp_chunk_len,
-                    num_k_heads,
-                    num_v_heads,
-                    num_sab_heads,
-                    total_cp_chunks,
-                    total_t_blocks,
-                    max_cp_chunks_per_seq,
-                    num_seqs,
-                    stream,
-                ),
-            )
-        )
-    else:
-        compiled(
-            k_dhs,
-            v_dhs,
-            t.view(-1),
-            alpha.view(-1),
-            transfer_VK.view(-1),
-            state_VK.view(-1),
-            cu_seqlens,
-            cp_chunk_len,
-            num_k_heads,
-            num_v_heads,
-            num_sab_heads,
-            total_cp_chunks,
-            total_t_blocks,
-            max_cp_chunks_per_seq,
-            num_seqs,
-            stream,
-        )
+    call_args = (
+        k_dhs,
+        v_dhs,
+        t.view(-1),
+        alpha.view(-1),
+        transfer_VK.view(-1),
+        state_VK.view(-1),
+        cu_seqlens,
+        cp_chunk_len,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        total_cp_chunks,
+        total_t_blocks,
+        max_cp_chunks_per_seq,
+        num_seqs,
+        stream,
+    )
+    _launch_or_plan(compiled, call_args, _plan_sink)
     return transfer_VK, state_VK
 
 
@@ -2631,8 +2588,6 @@ def cp_delta_rule_fixup_dsl_sm80(
     `(total_cp_chunks, num_heads, DimV, DimK)` layout produced by
     `cp_delta_rule_mn_precompute_dsl_sm80`.
     """
-    import cuda.bindings.driver as cuda_driver
-
     device = local_transfer.device if _device is None else _device
     if not _skip_check:
         if local_transfer.ndim != 4:
@@ -2721,13 +2676,7 @@ def cp_delta_rule_fixup_dsl_sm80(
     if total_cp_chunks == 0:
         return fixed_state
 
-    stream = (
-        _ctx.stream
-        if _ctx is not None
-        else _stream
-        if _stream is not None
-        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    )
+    stream = _resolve_stream(_ctx, device, _stream)
     d = local_transfer.shape[-1]
     local_transfer_tma = local_transfer.as_strided(
         (d, d, num_heads, total_cp_chunks),
@@ -2819,13 +2768,7 @@ def cp_delta_rule_fixup_dsl_sm80(
             if _ctx is not None
             else _sm80_cp_compile_options(device)
         )
-        compiled = get_cached_compile(kernel, opts)
-        if compiled is None:
-            compiled = cached_compile(kernel, *args, compile_options=opts)
-        if _plan_sink is not None:
-            _plan_sink.append((compiled, args))
-        else:
-            compiled(*args)
+        _compile_and_launch(kernel, args, opts, _plan_sink)
         return fixed_state
     kernel = _get_fixup_kernel(*spec)
     compiled = get_cached_compile(
@@ -2874,39 +2817,20 @@ def cp_delta_rule_fixup_dsl_sm80(
                 else _sm80_cp_compile_options(device)
             ),
         )
-    if _plan_sink is not None:
-        _plan_sink.append(
-            (
-                compiled,
-                (
-                    local_transfer_tma,
-                    local_state_tma,
-                    initial_state if needs_initial_state else None,
-                    state_indices if use_state_indices else None,
-                    fixed_state.reshape(-1),
-                    cu_seqlens,
-                    cp_chunk_len,
-                    total_cp_chunks,
-                    num_seqs,
-                    num_heads,
-                    stream,
-                ),
-            )
-        )
-    else:
-        compiled(
-            local_transfer_tma,
-            local_state_tma,
-            initial_state if needs_initial_state else None,
-            state_indices if use_state_indices else None,
-            fixed_state.reshape(-1),
-            cu_seqlens,
-            cp_chunk_len,
-            total_cp_chunks,
-            num_seqs,
-            num_heads,
-            stream,
-        )
+    call_args = (
+        local_transfer_tma,
+        local_state_tma,
+        initial_state if needs_initial_state else None,
+        state_indices if use_state_indices else None,
+        fixed_state.reshape(-1),
+        cu_seqlens,
+        cp_chunk_len,
+        total_cp_chunks,
+        num_seqs,
+        num_heads,
+        stream,
+    )
+    _launch_or_plan(compiled, call_args, _plan_sink)
     return fixed_state
 
 
@@ -3255,112 +3179,29 @@ class CPDeltaRulePrefillSm80(_FullyFusedDeltaRuleSm80):
             ]
 
     @cute.jit
-    def issue_block_loads(
+    def issue_beta_stage(
         self,
-        sQ_SD: cute.Tensor,
-        sK_DS: cute.Tensor,
-        sV_DS: cute.Tensor,
-        sAlpha: cute.Tensor,
         sBeta: cute.Tensor,
-        gQ_full: cute.Tensor,
-        gK_full: cute.Tensor,
-        gV_full: cute.Tensor,
-        g_alpha: cute.Tensor,
         g_beta: cute.Tensor,
-        q_pipeline,
-        q_producer_state,
-        k_pipeline,
-        k_producer_state,
-        v_pipeline,
-        v_producer_state,
-        alpha_pipeline,
-        alpha_producer_state,
         beta_pipeline,
         beta_producer_state,
         blk: cutlass.Int32,
         t_block_start: cutlass.Int32,
         tok_start,
         tok_end: cutlass.Int32,
-        scale: cutlass.Float32,
-        q_head_idx: cutlass.Int32,
-        k_head_idx: cutlass.Int32,
-        v_head_idx: cutlass.Int32,
-        v_row_offset: cutlass.Int32,
         sab_head_idx: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         tid: cutlass.Int32,
         warp_idx: cutlass.Int32,
     ):
-        """Fetch everything one block needs, with the whole block issuing it.
+        """A T tile where the fused kernel loads beta.
 
-        The sm_90 kernel gives this to a warp group of its own and lets the
-        math warps wait on an mbarrier, which this DSL will not emit for an
-        sm_80 target -- and without one a thread can only wait on cp.async it
-        issued itself. So the block does its own fetching and the math follows
-        behind a barrier.
-
-        Q, K and V go through cp.async and land when the consumer drains the
-        group. Alpha and beta are scalar streams read with ordinary loads, so
-        they are already in shared memory when this returns; the same barrier
-        publishes them.
+        `needs_beta` is off on this path -- stage 1 already folded beta into T
+        -- so the stage's pipeline and its producer state carry T instead, and
+        nothing else in `issue_block_loads` changes. The whole block issues
+        this one, where beta is one warp's: a T tile is a tile, not a scalar
+        stream.
         """
-        (
-            q_producer_state,
-            k_producer_state,
-            v_producer_state,
-        ) = self.load_qkv_cpasync(
-            sQ_SD,
-            sK_DS,
-            sV_DS,
-            gQ_full,
-            gK_full,
-            gV_full,
-            q_pipeline,
-            q_producer_state,
-            k_pipeline,
-            k_producer_state,
-            v_pipeline,
-            v_producer_state,
-            blk,
-            tok_start,
-            tok_end,
-            q_head_idx,
-            k_head_idx,
-            v_head_idx,
-            v_row_offset,
-            tid,
-        )
-
-        # Alpha's scan reads and writes the same channel, so exactly one warp
-        # may run it; a second would race the first between its load and its
-        # store. Beta only writes, but it is kept to one warp for the same
-        # reason, and there is nothing to gain from the rest doing it too.
-        #
-        # Neither branch contains a barrier, so restricting them does not make
-        # the block's barrier participation uneven.
-        if cutlass.const_expr(self.needs_alpha):
-            alpha_pipeline.producer_acquire(alpha_producer_state)
-            if warp_idx == cutlass.Int32(0):
-                blk_tok = tok_start + blk * cutlass.Int32(self.BLK_Q)
-                self.load_alpha(
-                    sAlpha,
-                    g_alpha,
-                    blk_tok,
-                    tok_end,
-                    sab_head_idx,
-                    num_sab_heads,
-                    alpha_producer_state.index,
-                )
-                AlphaProcessor().run(
-                    sAlpha[None, None, alpha_producer_state.index], scale
-                )
-            alpha_pipeline.producer_commit(alpha_producer_state)
-            alpha_producer_state.advance()
-
-        # A T tile where the fused kernel loads beta. `needs_beta` is off on this
-        # path -- stage 1 already folded beta into T -- so the beta stage's
-        # pipeline and its producer state carry T instead, and nothing else in
-        # the issuer changes.
         beta_pipeline.producer_acquire(beta_producer_state)
         self.load_t_tile_into_stage(
             sBeta,
@@ -3373,14 +3214,7 @@ class CPDeltaRulePrefillSm80(_FullyFusedDeltaRuleSm80):
         cute.arch.cp_async_commit_group()
         beta_pipeline.producer_commit(beta_producer_state)
         beta_producer_state.advance()
-
-        return (
-            q_producer_state,
-            k_producer_state,
-            v_producer_state,
-            alpha_producer_state,
-            beta_producer_state,
-        )
+        return beta_producer_state
 
     @cute.jit
     def kk_epi(
@@ -4620,40 +4454,6 @@ class CPDeltaRulePrefillPtrSm80(CPDeltaRulePrefillSm80):
 
 
 @functools.cache
-def _get_prefill_ptr_kernel(
-    kernel_dtype,
-    needs_initial_state,
-    store_final_state,
-    initial_state_dtype,
-    state_dtype,
-    checkpoint_state_dtype,
-    use_state_indices,
-    needs_checkpointing,
-    cu_seqlens_dtype,
-    state_indices_dtype,
-    checkpoint_cu_starts_dtype,
-    state_inner_strides,
-    initial_state_inner_strides,
-):
-    """The pointer twin of `_get_prefill_kernel`, same thirteen axes."""
-    return CPDeltaRulePrefillPtrSm80(
-        kernel_dtype,
-        needs_initial_state=needs_initial_state,
-        store_final_state=store_final_state,
-        initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
-        state_dtype=state_dtype_to_cutlass(state_dtype),
-        checkpoint_state_dtype=state_dtype_to_cutlass(checkpoint_state_dtype),
-        use_state_indices=use_state_indices,
-        needs_checkpointing=needs_checkpointing,
-        cu_seqlens_dtype=cu_seqlens_dtype,
-        state_indices_dtype=state_indices_dtype,
-        checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
-        state_inner_strides=state_inner_strides,
-        initial_state_inner_strides=initial_state_inner_strides,
-    )
-
-
-@functools.cache
 def _get_prefill_kernel(
     kernel_dtype,
     needs_initial_state,
@@ -4668,8 +4468,12 @@ def _get_prefill_kernel(
     checkpoint_cu_starts_dtype,
     state_inner_strides,
     initial_state_inner_strides,
+    ptr_abi,
 ):
-    return CPDeltaRulePrefillSm80(
+    """`ptr_abi` picks the pointer twin. The thirteen specialization axes are
+    the same for both, and the flag is part of the cache key."""
+    cls = CPDeltaRulePrefillPtrSm80 if ptr_abi else CPDeltaRulePrefillSm80
+    return cls(
         kernel_dtype,
         needs_initial_state=needs_initial_state,
         store_final_state=store_final_state,
@@ -4727,8 +4531,6 @@ def cp_delta_rule_prefill_dsl_sm80(
     workspaces. `state` is the public per-sequence final state in native
     `(DimV, DimK)` layout.
     """
-    import cuda.bindings.driver as cuda_driver
-
     device = q.device if _device is None else _device
     needs_checkpointing = checkpoint_every_n_tokens > 0
     if not _skip_check:
@@ -4956,13 +4758,7 @@ def cp_delta_rule_prefill_dsl_sm80(
         torch.bfloat16: cutlass.BFloat16,
     }[q.dtype]
 
-    stream = (
-        _ctx.stream
-        if _ctx is not None
-        else _stream
-        if _stream is not None
-        else cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    )
+    stream = _resolve_stream(_ctx, device, _stream)
 
     needs_initial_state = initial_state is not None
     store_final_state = state is not None
@@ -5029,7 +4825,7 @@ def cp_delta_rule_prefill_dsl_sm80(
                 ),
             ),
         )
-        kernel = _get_prefill_ptr_kernel(kernel_dtype, **spec)
+        kernel = _get_prefill_kernel(kernel_dtype, **spec, ptr_abi=True)
         state_cutlass = state_dtype_to_cutlass(
             state.dtype if store_final_state else torch.float32
         )
@@ -5110,15 +4906,9 @@ def cp_delta_rule_prefill_dsl_sm80(
             if _ctx is not None
             else _sm80_cp_compile_options(device)
         )
-        compiled = get_cached_compile(kernel, opts)
-        if compiled is None:
-            compiled = cached_compile(kernel, *args, compile_options=opts)
-        if _plan_sink is not None:
-            _plan_sink.append((compiled, args))
-        else:
-            compiled(*args)
+        _compile_and_launch(kernel, args, opts, _plan_sink)
         return
-    kernel = _get_prefill_kernel(kernel_dtype, **spec)
+    kernel = _get_prefill_kernel(kernel_dtype, **spec, ptr_abi=False)
     compiled = get_cached_compile(
         kernel,
         _ctx.compile_options if _ctx is not None else _sm80_cp_compile_options(device),
@@ -5189,69 +4979,35 @@ def cp_delta_rule_prefill_dsl_sm80(
                 else _sm80_cp_compile_options(device)
             ),
         )
-    if _plan_sink is not None:
-        _plan_sink.append(
-            (
-                compiled,
-                (
-                    q_tma,
-                    k_tma,
-                    v_tma,
-                    t_tma,
-                    o_tma,
-                    alpha.reshape(-1),
-                    state_arg,
-                    fixed_state.reshape(-1),
-                    initial_state if needs_initial_state else None,
-                    state_indices if use_state_indices else None,
-                    state_checkpoints.reshape(-1) if needs_checkpointing else None,
-                    checkpoint_cu_starts if needs_checkpointing else None,
-                    cu_seqlens,
-                    scale,
-                    num_q_heads,
-                    num_k_heads,
-                    num_v_heads,
-                    num_sab_heads,
-                    num_seqs,
-                    state_checkpoints.shape[0] if needs_checkpointing else 1,
-                    checkpoint_every_n_tokens,
-                    cp_chunk_len,
-                    total_cp_chunks,
-                    int(kernel.num_v_splits * num_sab_heads * max_cp_chunks_per_seq),
-                    int(num_seqs),
-                    stream,
-                ),
-            )
-        )
-    else:
-        compiled(
-            q_tma,
-            k_tma,
-            v_tma,
-            t_tma,
-            o_tma,
-            alpha.reshape(-1),
-            state_arg,
-            fixed_state.reshape(-1),
-            initial_state if needs_initial_state else None,
-            state_indices if use_state_indices else None,
-            state_checkpoints.reshape(-1) if needs_checkpointing else None,
-            checkpoint_cu_starts if needs_checkpointing else None,
-            cu_seqlens,
-            scale,
-            num_q_heads,
-            num_k_heads,
-            num_v_heads,
-            num_sab_heads,
-            num_seqs,
-            state_checkpoints.shape[0] if needs_checkpointing else 1,
-            checkpoint_every_n_tokens,
-            cp_chunk_len,
-            total_cp_chunks,
-            int(kernel.num_v_splits * num_sab_heads * max_cp_chunks_per_seq),
-            int(num_seqs),
-            stream,
-        )
+    call_args = (
+        q_tma,
+        k_tma,
+        v_tma,
+        t_tma,
+        o_tma,
+        alpha.reshape(-1),
+        state_arg,
+        fixed_state.reshape(-1),
+        initial_state if needs_initial_state else None,
+        state_indices if use_state_indices else None,
+        state_checkpoints.reshape(-1) if needs_checkpointing else None,
+        checkpoint_cu_starts if needs_checkpointing else None,
+        cu_seqlens,
+        scale,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        num_seqs,
+        state_checkpoints.shape[0] if needs_checkpointing else 1,
+        checkpoint_every_n_tokens,
+        cp_chunk_len,
+        total_cp_chunks,
+        int(kernel.num_v_splits * num_sab_heads * max_cp_chunks_per_seq),
+        int(num_seqs),
+        stream,
+    )
+    _launch_or_plan(compiled, call_args, _plan_sink)
 
 
 def cp_delta_rule_dsl_sm80(
