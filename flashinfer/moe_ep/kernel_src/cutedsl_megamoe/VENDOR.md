@@ -1,8 +1,7 @@
 # Vendoring record: cutedsl_megamoe
 
-This package contains the upstream MegaMoE snapshot plus the FlashInfer-owned
-W4A16 precision implementation. This file records provenance and sync state;
-the drop-update workflow lives in `SKILL.md`.
+This file records provenance and sync state. The drop-update workflow lives
+in `SKILL.md`.
 
 ## Upstream
 
@@ -21,29 +20,21 @@ the drop-update workflow lives in `SKILL.md`.
 
 ## Policy
 
-- The existing upstream packages under `src/` remain **verbatim**: no injected
-  files or local edits. `diff -r src/<pkg> <upstream>/<pkg>` must come back clean.
-- `src/moe_nvfp4_w4a16/` is a FlashInfer-owned addition beside those packages.
-  Preserve it during upstream re-sync; it remains linted and type checked.
-  Its W4A16 tensor-core pipeline, FC1/FC2 scheduler and readiness extension,
-  workspace layout, epilogue, and CLC protocol are maintained independently of
-  W4A4 computation. Neutral scheduling and token-communication primitives may
-  be imported from the existing common infrastructure.
-- The owned scheduler/work-record and TMEM handoff code originated from the
-  existing local MegaMoE drop; retain its NVIDIA copyright attribution. This
-  ownership extraction does not claim a newer upstream source revision.
+- Vendored packages under `src/` are **verbatim** copies of the upstream drop:
+  no injected files or local edits. `diff -r src/<pkg> <upstream>/<pkg>` must
+  come back clean.
 - All adaptation lives in `shim/` (ours), re-exported through `__init__.py`;
   FlashInfer backends import the package `__init__` only, never `src/`.
 - Local bug fixes go upstream first, then re-sync. If an emergency local edit
   is unavoidable, list it here as a pending-upstream diff until the next drop
   absorbs it.
 
-## FlashInfer-owned precision adapter
+## Additional precision implementation
 
-`shim/w4a16.py` supplies host configuration, lazy compilation, symmetric
-buffers, and launch wrappers, parallel to `shim/{nvfp4,mxfp8,bf16}.py`. The
-package public API and common `shim/{tuner,autotune,knob_cache}.py` lifecycle
-remain the access points for the backend, tests, and benchmarks.
+`src/moe_nvfp4_w4a16/` implements NVFP4 W4A16 using the existing MegaMoE
+scheduling and communication design and the split W4A16 weight decoder.
+It is developed in FlashInfer and is not part of the recorded upstream drop.
+Its frontend is `shim/w4a16.py`, alongside the NVFP4, MXFP8, and BF16 frontends.
 
 ## Pending local diffs vs upstream
 
@@ -90,5 +81,4 @@ remain the access points for the backend, tests, and benchmarks.
 
 - `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/`
 - `backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/`
-
-- `backends/mega/kernel/sm100/bf16_nvfp4_bf16_cutedsl/` (owned W4A16)
+- `backends/mega/kernel/sm100/bf16_nvfp4_bf16_cutedsl/`
