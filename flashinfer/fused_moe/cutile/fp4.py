@@ -57,7 +57,8 @@ _PERSISTENT_CTAS_PER_SM = 2
 _PERSISTENT_MIN_ASSIGNMENTS = 65536
 _PERSISTENT_MAX_K = 1024
 _SEPARATE_ACTIVATION_MAX_ASSIGNMENTS = 64
-_NO_ACTIVATION = -1
+# Compile-time sentinel used when a grouped GEMM stage has no activation.
+_DISABLE_FUSED_ACTIVATION = -1
 
 
 def _use_row_major_scale_layout(num_assignments: int, intermediate_size: int) -> bool:
@@ -90,7 +91,6 @@ class Workspace(Bf16Workspace):
     activation_q: torch.Tensor
     activation_scale: torch.Tensor
     scale_row_major: bool
-    activation_fp4: bool
     scale_block_size: int
 
 
@@ -201,7 +201,6 @@ def allocate_workspace(
         activation_q=activation_q,
         activation_scale=activation_scale,
         scale_row_major=scale_row_major,
-        activation_fp4=activation_fp4,
         scale_block_size=scale_block_size,
     )
 
@@ -244,7 +243,7 @@ def _encode_fp4_groups(
 
 
 @ct.function
-def _quantize_nvfp4_impl(
+def _quantize_fp4_impl(
     X,
     Q,
     SCALE,
@@ -281,7 +280,7 @@ def _quantize_nvfp4_impl(
 
 
 @ct.kernel
-def _quantize_nvfp4(
+def _quantize_fp4(
     X,
     Q,
     SCALE,
@@ -292,7 +291,7 @@ def _quantize_nvfp4(
     IS_MXFP4: ConstBool,
     SCALE_ROW_MAJOR: ConstBool,
 ):
-    _quantize_nvfp4_impl(
+    _quantize_fp4_impl(
         X,
         Q,
         SCALE,
@@ -306,7 +305,7 @@ def _quantize_nvfp4(
 
 
 @ct.kernel
-def _quantize_nvfp4_i64(
+def _quantize_fp4_i64(
     X: ct.IndexedWithInt64,
     Q: ct.IndexedWithInt64,
     SCALE: ct.IndexedWithInt64,
@@ -317,7 +316,7 @@ def _quantize_nvfp4_i64(
     IS_MXFP4: ConstBool,
     SCALE_ROW_MAJOR: ConstBool,
 ):
-    _quantize_nvfp4_impl(
+    _quantize_fp4_impl(
         X,
         Q,
         SCALE,
@@ -331,7 +330,7 @@ def _quantize_nvfp4_i64(
 
 
 @ct.function
-def _activation_quantize_nvfp4_impl(
+def _activation_quantize_fp4_impl(
     X,
     Q,
     SCALE,
@@ -405,7 +404,7 @@ def _activation_quantize_nvfp4_impl(
 
 
 @ct.kernel
-def _activation_quantize_nvfp4(
+def _activation_quantize_fp4(
     X,
     Q,
     SCALE,
@@ -421,7 +420,7 @@ def _activation_quantize_nvfp4(
     IS_MXFP4: ConstBool,
     SCALE_ROW_MAJOR: ConstBool,
 ):
-    _activation_quantize_nvfp4_impl(
+    _activation_quantize_fp4_impl(
         X,
         Q,
         SCALE,
@@ -440,7 +439,7 @@ def _activation_quantize_nvfp4(
 
 
 @ct.kernel
-def _activation_quantize_nvfp4_i64(
+def _activation_quantize_fp4_i64(
     X: ct.IndexedWithInt64,
     Q: ct.IndexedWithInt64,
     SCALE: ct.IndexedWithInt64,
@@ -456,7 +455,7 @@ def _activation_quantize_nvfp4_i64(
     IS_MXFP4: ConstBool,
     SCALE_ROW_MAJOR: ConstBool,
 ):
-    _activation_quantize_nvfp4_impl(
+    _activation_quantize_fp4_impl(
         X,
         Q,
         SCALE,
@@ -554,7 +553,7 @@ def _quantize(
         rows, k, num_sms, scale_row_major, scale_block_size
     )
     base_kernel = (
-        _quantize_nvfp4_i64 if needs_int64_indexing(x, q, scale) else _quantize_nvfp4
+        _quantize_fp4_i64 if needs_int64_indexing(x, q, scale) else _quantize_fp4
     )
     kernel = (
         base_kernel
@@ -580,7 +579,7 @@ def _quantize(
 
 
 @ct.function
-def _pack_nvfp4_rows_impl(
+def _pack_fp4_rows_impl(
     Q,
     SCALE,
     SORTED_SLOTS,
@@ -633,7 +632,7 @@ def _pack_nvfp4_rows_impl(
 
 
 @ct.kernel
-def _pack_nvfp4_rows(
+def _pack_fp4_rows(
     Q,
     SCALE,
     SORTED_SLOTS,
@@ -648,7 +647,7 @@ def _pack_nvfp4_rows(
     SCALE_BLOCK_SIZE: ConstInt,
     SCALE_ROW_MAJOR: ConstBool,
 ):
-    _pack_nvfp4_rows_impl(
+    _pack_fp4_rows_impl(
         Q,
         SCALE,
         SORTED_SLOTS,
@@ -667,7 +666,7 @@ def _pack_nvfp4_rows(
 
 
 @ct.kernel
-def _pack_nvfp4_rows_i64(
+def _pack_fp4_rows_i64(
     Q: ct.IndexedWithInt64,
     SCALE: ct.IndexedWithInt64,
     SORTED_SLOTS,
@@ -682,7 +681,7 @@ def _pack_nvfp4_rows_i64(
     SCALE_BLOCK_SIZE: ConstInt,
     SCALE_ROW_MAJOR: ConstBool,
 ):
-    _pack_nvfp4_rows_impl(
+    _pack_fp4_rows_impl(
         Q,
         SCALE,
         SORTED_SLOTS,
@@ -726,9 +725,9 @@ def _pack_input(
             k // tile_k,
         ),
         (
-            _pack_nvfp4_rows_i64
+            _pack_fp4_rows_i64
             if needs_int64_indexing(q, scale, output_q, output_scale)
-            else _pack_nvfp4_rows
+            else _pack_fp4_rows
         ),
         (
             q.reshape(-1),
@@ -790,9 +789,9 @@ def _launch_activation_quantize(
     num_tiles = intermediate_size // tile_i
     tile_m = min(128, next_positive_power_of_2(x.shape[0] + 1))
     base_kernel = (
-        _activation_quantize_nvfp4_i64
+        _activation_quantize_fp4_i64
         if needs_int64_indexing(x, q, scale)
-        else _activation_quantize_nvfp4
+        else _activation_quantize_fp4
     )
     kernel = cached_replace_hints(base_kernel, occupancy=occupancy)
     ct.launch(
@@ -1248,7 +1247,7 @@ def _grouped_gemm_w4a16_impl(
                     accumulator,
                 )
             values = ct.astype(accumulator * alpha, OUT.dtype)
-            if ACTIVATION_TYPE != _NO_ACTIVATION:
+            if ACTIVATION_TYPE != _DISABLE_FUSED_ACTIVATION:
                 values = _apply_ungated_activation(
                     ct.astype(values, ct.float32),
                     ACTIVATION_TYPE,
@@ -2171,7 +2170,7 @@ def _grouped_gemm_w4a16_launch(
             config.tile_k,
             scale_block_size,
             *(
-                (_NO_ACTIVATION, 0.0, 0.0, 0.0)
+                (_DISABLE_FUSED_ACTIVATION, 0.0, 0.0, 0.0)
                 if activation is None
                 else _activation_kernel_args(activation)
             ),
@@ -2327,7 +2326,7 @@ def _run_w4a16_moe(
     gemm1_config: GemmConfig,
     gemm2_config: GemmConfig,
 ) -> torch.Tensor:
-    """Run W4A16 from the same packed weights and swizzled scales as W4A4."""
+    """Run W4A16 from the same prepared FP4 weights as W4A4."""
     num_tokens, hidden_size = hidden_states.shape
     top_k = topk_weights.shape[1]
     num_assignments = num_tokens * top_k
@@ -2425,8 +2424,6 @@ def run_moe(
     num_tokens, hidden_size = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_assignments = num_tokens * top_k
-    if num_tokens == 0:
-        return output
     sorted_slots, block_expert, num_post_pad = _permute(
         topk_ids, w1.shape[0], block_size, workspace
     )

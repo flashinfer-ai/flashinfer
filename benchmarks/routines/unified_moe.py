@@ -11,7 +11,7 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer
-from flashinfer import ActivationType, fp4_quantize
+from flashinfer import ActivationType
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     ActivationConfig,
@@ -185,16 +185,37 @@ def _quantize_cutile_nvfp4_source(weight: torch.Tensor):
     """Quantize canonical BF16 weights into cuTile's checkpoint input layout."""
     num_experts, rows, cols = weight.shape
     global_scales = torch.ones(num_experts, dtype=torch.float32, device=weight.device)
-    packed, scale = fp4_quantize(
-        weight.reshape(-1, cols),
-        global_scale=global_scales[:1],
-        sf_vec_size=16,
-        is_sf_swizzled_layout=False,
-        enable_pdl=False,
+    flat_weight = weight.reshape(-1, cols)
+    packed = torch.empty(
+        flat_weight.shape[0], cols // 2, dtype=torch.uint8, device=weight.device
     )
+    scale = torch.empty(
+        flat_weight.shape[0],
+        cols // 16,
+        dtype=torch.float8_e4m3fn,
+        device=weight.device,
+    )
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    chunk_rows = max(1, 8 * 1024 * 1024 // cols)
+    for begin in range(0, flat_weight.shape[0], chunk_rows):
+        end = min(begin + chunk_rows, flat_weight.shape[0])
+        groups = flat_weight[begin:end].float().reshape(-1, cols // 16, 16)
+        chunk_scale = (groups.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
+        values = groups / chunk_scale.float().clamp_min(2.0**-9).unsqueeze(-1)
+        codes = torch.bucketize(values.abs(), boundaries, right=False)
+        codes |= (values < 0).to(torch.int64) << 3
+        codes = codes.reshape(end - begin, cols)
+        packed[begin:end].copy_(
+            (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+        )
+        scale[begin:end].copy_(chunk_scale)
     return (
         packed.reshape(num_experts, rows, cols // 2),
-        scale.view(torch.float8_e4m3fn).reshape(num_experts, rows, cols // 16),
+        scale.reshape(num_experts, rows, cols // 16),
         global_scales,
     )
 
