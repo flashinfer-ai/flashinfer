@@ -213,7 +213,7 @@ def _nvfp4_default_knobs(
         knobs["token_back_mode"] = "reuse_dispatch_warps"
         enable_in_kernel_fc2_reduce = False
 
-    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
+    # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     return knobs
 
@@ -229,7 +229,7 @@ def _mxfp8_default_knobs(
     hard-requires ``mma_tiler (M, N) = (256, 256)``.
     """
     knobs = dict(_MXFP8_LARGE_TOKEN_KNOBS if num_tokens >= 2048 else _MXFP8_TOKEN_KNOBS)
-    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
+    # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     if enable_in_kernel_fc2_reduce:
         knobs["token_back_mode"] = "epi_warps"
@@ -239,7 +239,7 @@ def _mxfp8_default_knobs(
 def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
     """One validated fixed MMA/cluster geometry."""
     knobs = dict(_BF16_TOKEN_KNOBS)
-    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
+    # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     if enable_in_kernel_fc2_reduce:
         # IKR requires reuse dispatch warps
@@ -251,7 +251,7 @@ def _bf16_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
 def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
     """The default mixed implementation tuple (``is_valid_bf16_mxfp8``)."""
     knobs = dict(_BF16_MXFP8_TOKEN_KNOBS)
-    # Default to IKR if enabled by the user, autotuning may still disable this if it is faster
+    # Default to IKR if enabled by the user
     knobs["in_kernel_fc2_reduce"] = enable_in_kernel_fc2_reduce
     return knobs
 
@@ -293,8 +293,6 @@ def default_knobs(
             combine_dtype=combine_dtype,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
-    # Never fall through to the NVFP4 ladder: callers key on element kinds
-    # (``mxfp8_e4m3``, ``bf16_mxfp8_e4m3``, ...) and must map them first.
     raise ValueError(
         f"no knob profile for dtype {dtype!r}; expected 'nvfp4', 'mxfp8', "
         "'bf16', or 'bf16_mxfp8'."
