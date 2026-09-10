@@ -21,12 +21,12 @@ Import layering (strict, one direction)::
 
 - Only a drop's ``shim/`` may import that drop's vendored ``src/`` tree;
   nothing else imports ``src/``, ever.
-- Backends and maintained CuTe DSL kernels consume vendored entry points
-  and shared primitives through the drop's package ``__init__``
-  (``kernel_src.<drop>``), never shim submodules.
+- Only ``backends/`` and ``cute_dsl/`` may import a drop's shim, and only
+  through the drop's package ``__init__`` (``kernel_src.<drop>``), never shim
+  submodules.
 - The layer, ``modes/``, ``core/``, and everything above use backend APIs
-  only (config classes + the ``core.kernel.registry``), without importing
-  kernel implementations or shims directly.
+  only (config classes + the ``core.kernel.registry``) — no ``kernel_src``,
+  no shim.
 - Sole exception: kernel-oracle *tests* may import a drop's package
   ``__init__`` to validate the drop below the backend — still never ``src/``
   internals or shim submodules.

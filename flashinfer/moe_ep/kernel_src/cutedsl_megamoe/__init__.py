@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""CuTeDSL MegaMoE implementations (NVFP4, MXFP8, and BF16).
+"""CuTeDSL MegaMoE kernel drop (NVFP4, MXFP8, and BF16).
 
-This package is the public boundary for the verbatim MegaMoE kernel drop.
+This package is the single public boundary FlashInfer ``moe_ep`` imports from.
 It exposes the symmetric-buffer allocators and fused-launch entry points and
 talks only to the ``shim`` package (which adapts the raw kernel sources under
 ``src/``).
@@ -11,7 +11,7 @@ Layout::
 
     __init__.py  public API for moe_ep (this file); talks only to shim/
     shim/        thin adapters over the raw kernel sources (comm, nvfp4, mxfp8)
-    src/         verbatim vendor kernel sources (see VENDOR.md)
+    src/         vendored kernel sources from the kernel team
 
 Usage::
 
@@ -29,15 +29,10 @@ from __future__ import annotations
 # packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
-    _CompiledMega,
-    _compute_peer_offsets,
     bootstrap_dist,
     free_sym_tensor,
     resolve_gate_up_clamp,
     sym_zeros,
-    _autotune_knobs_impl,
-    _CollectiveGraphTimingError,
-    is_valid,
     COMBINE_FORMAT_NAMES,
     CORRECTNESS_KNOBS,
     MegaMoEMxfp8SymmBuffer,
@@ -93,13 +88,16 @@ from .shim import (
     tuner,
     with_knobs,
 )
+from .shim.comm import _CompiledMega, _compute_peer_offsets
+from .shim.autotune import _autotune_knobs_impl, _CollectiveGraphTimingError
+from .shim.tuner import is_valid
 
 # Heavy kernel helpers (``mega_runner`` byte-stacking, ``mega_runner`` fp8/E8M0
 # tensor makers, and the MXFP8 torch reference) pull ``cutlass`` transitively.
 # Expose them lazily so ``import ...cutedsl_megamoe`` stays CPU-safe; the FI
 # backend + verification tests still reach them only through this boundary (the
 # access happens inside their functions).  See ``shim/kernel_helpers.py``.
-_LAZY_HELPERS = (
+_KERNEL_PRIMITIVES = (
     "Contract",
     "FunctionMapping",
     "GpuReleaseFlagBatchTracker",
@@ -128,6 +126,10 @@ _LAZY_HELPERS = (
     "rewrite_tensor_shape",
     "spin_wait",
     "store_i32_to_peer_cluster_smem_async",
+)
+
+_LAZY_HELPERS = (
+    *_KERNEL_PRIMITIVES,
     "CombineFormat",
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
@@ -149,6 +151,7 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
+    *_KERNEL_PRIMITIVES,
     "_CompiledMega",
     "_compute_peer_offsets",
     "bootstrap_dist",
@@ -158,34 +161,6 @@ __all__ = [
     "_autotune_knobs_impl",
     "_CollectiveGraphTimingError",
     "is_valid",
-    "Contract",
-    "FunctionMapping",
-    "GpuReleaseFlagBatchTracker",
-    "MoESchedConsumer",
-    "MoESchedExtension",
-    "MoESchedulerBase",
-    "MoESchedulerParamsBase",
-    "MoEWorkTileInfo",
-    "Space",
-    "SymBufferDeviceBase",
-    "SymBufferHost",
-    "TokenCommArgs",
-    "TokenInPullTokenBackPush",
-    "TokenSrcMetadata",
-    "TopkReduce",
-    "WorkTileState",
-    "_DEFAULT_SCHED_EXT",
-    "compute_expert_token_count_from_sizes",
-    "compute_expert_token_range",
-    "eval_function_mapping",
-    "fmax",
-    "fmin",
-    "get_cutedsl_target_arch",
-    "iket",
-    "mbarrier_arrive_expect_tx_on_peer",
-    "rewrite_tensor_shape",
-    "spin_wait",
-    "store_i32_to_peer_cluster_smem_async",
     "COMBINE_FORMAT_NAMES",
     "CombineFormat",
     "MegaMoEBf16SymmBuffer",

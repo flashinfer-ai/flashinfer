@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Thin adapters over the raw CuTeDSL kernel sources under ``../src``.
 
-``comm`` holds dist / symmetric-heap / compile helpers; ``nvfp4``, ``mxfp8``,
-and ``bf16`` hold their dtype's lazy-compile frontend plus buffer +
-fused-launch wrappers.  The parent package re-exports the curated subset
+``comm`` holds dist / symmetric-heap / compile helpers; ``nvfp4`` and ``mxfp8``
+each hold their dtype's lazy-compile frontend plus the symmetric-buffer +
+fused-launch wrappers.  The parent :mod:`..api` re-exports the curated subset
 that FlashInfer ``moe_ep`` consumes.
 """
 
@@ -62,8 +62,6 @@ def _check_dsl_perf_floor() -> None:
 _check_dsl_perf_floor()
 
 from .comm import (
-    _CompiledMega,
-    _compute_peer_offsets,
     bootstrap_dist,
     ensure_not_capturing,
     finalize_dist,
@@ -125,7 +123,6 @@ from .bf16 import (
 # Kernel tuning knobs (tactic enumeration + config application).
 from . import tuner
 from .tuner import (
-    is_valid,
     CORRECTNESS_KNOBS,
     PERF_KNOBS,
     default_knobs,
@@ -135,8 +132,6 @@ from .tuner import (
 
 # Online (warmup-time) collective knob autotuning.
 from .autotune import (
-    _autotune_knobs_impl,
-    _CollectiveGraphTimingError,
     autotune_bf16_mega_moe,
     autotune_knobs,
     bf16_candidates,
@@ -158,13 +153,7 @@ from .quant_stage import (
 # Persistent offline-tuning knob cache (pure-lookup hot path).
 from .knob_cache import knob_cache_path, lookup_knobs, record_knobs, resolve_knobs
 
-
 __all__ = [
-    "_CompiledMega",
-    "_compute_peer_offsets",
-    "_autotune_knobs_impl",
-    "_CollectiveGraphTimingError",
-    "is_valid",
     # paths
     "bootstrap_paths",
     # quant_stage
