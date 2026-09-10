@@ -983,6 +983,14 @@ def _fmha_uses_encoded_page_size(kwargs, *, cache_param: str) -> bool:
             "A PrimTS page_size that differs from the physical cache extent "
             "must be 4 (encoded subpage locators)."
         )
+    if (
+        storage_page_size <= semantic_page_size
+        or storage_page_size % semantic_page_size
+    ):
+        raise ValueError(
+            "Encoded PrimTS cache storage must be larger than and divisible "
+            "by the semantic page size."
+        )
     return True
 
 

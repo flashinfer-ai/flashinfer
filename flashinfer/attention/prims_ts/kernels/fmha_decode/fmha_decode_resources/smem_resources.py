@@ -1083,6 +1083,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     # barrier.
                     # Supported scattered routes are KV128 with semantic
                     # page size four, so every lane owns one page fragment.
+                    # TMA is per-thread: each active lane issues a distinct
+                    # copy to a disjoint destination, not a warp-wide copy
+                    # that needs election. Electing here would omit fragments.
                     assert page_fragments == 32
                     assert num_chunks in (1, 2, 4)
                     assert cfg.load_num_warps in (1, 2, 4, 8)
@@ -2300,6 +2303,8 @@ class SmemKvResource(DecodeGenResourceBase):
                     # per D64 head-dimension chunk. Flatten (chunk, fragment)
                     # across all load warps so they feed the same byte-counted
                     # stage barrier concurrently for D64, D128, or D256.
+                    # Each lane owns a different copy, including its SMEM
+                    # destination; no two lanes issue the same transaction.
                     assert cached_page_ids is None
                     grouped_tile_idx = self._maybe_runtime_tile_idx(
                         stage_info, local_tile_idx

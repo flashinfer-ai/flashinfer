@@ -1000,7 +1000,7 @@ class FmhaDecodeConfig:
             and (
                 self.out_dtype in (Float16, Float8E4M3FN)
                 or (
-                    self.use_q_token_kv_block_sparse_route
+                    self.uses_q_token_kv_block_sparse_page_route
                     and self.out_dtype == BFloat16
                 )
             )

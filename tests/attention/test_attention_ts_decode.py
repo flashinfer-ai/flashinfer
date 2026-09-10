@@ -1846,6 +1846,25 @@ def test_attention_ts_decode_storage_page_size_contract() -> None:
         _validate_storage_page_size(4, True)
 
 
+@pytest.mark.parametrize("page_size", (4, 32))
+def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(page_size):
+    """A raw sparse flag must not enable the exception for ordinary paging."""
+    cfg = FmhaDecodeConfig(
+        headdim=256,
+        q_dtype=Float8E4M3FN,
+        kv_dtype=Float8E4M3FN,
+        out_dtype=BFloat16,
+        use_paged_kv=True,
+        num_tokens_per_page=page_size,
+        groups_tokens_heads_q=True,
+        use_q_token_kv_block_sparse_route=True,
+        heads_q_per_kv=12,
+        max_seq_len_q=4,
+        tile_size_q=64,
+    )
+    assert cfg.supports_reduction_dtypes is (page_size == 4)
+
+
 def _decode_runtime_for_aliasing() -> _DecodeRuntime:
     """Build the smallest runtime object accepted by the alias validator."""
 
