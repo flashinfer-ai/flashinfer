@@ -396,9 +396,12 @@ class W4A16Fc2Epilogue(EpilogueContext):
         else:
             alpha_val = None
         acc_ready = False
-        if not work_tile_info.peek_ready:
-            acc_ready = True
-            acc_pipeline.consumer_wait(acc_consumer_state)
+        if cutlass.const_expr(not self.token_back_by_dispatch):
+            # Peer routing loads need completed input metadata. Local pool
+            # routing uses only the work record and can precede the acc wait.
+            if not work_tile_info.peek_ready:
+                acc_ready = True
+                acc_pipeline.consumer_wait(acc_consumer_state)
         fc2_output_router = self._make_output_router(work_tile_info)
         tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
             tmem_acc_tensor,
