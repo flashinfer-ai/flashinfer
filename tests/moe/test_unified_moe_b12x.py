@@ -452,7 +452,7 @@ def _make_b12x_tensors(
 def _make_b12x_layer_and_packs(
     tensors,
     *,
-    variant: QuantConfig,
+    quant: QuantConfig,
     activation: str,
     intermediate_size: int,
     num_experts: int,
@@ -461,7 +461,7 @@ def _make_b12x_layer_and_packs(
 ):
     activation_config = _B12X_ACTIVATIONS[activation]
     hidden_size = tensors["x_bf16"].shape[1]
-    if variant == QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4):
+    if quant == QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4):
         backend_config = B12xNvfp4Config()
         prepared = backend_config.prepare_weights(
             tensors["w1_weight_bf16"],
@@ -503,7 +503,7 @@ def _make_b12x_layer_and_packs(
     weight_pack.prepare_for(backend_key, prepared)
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=variant,
+        quant=quant,
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=num_experts,
@@ -526,7 +526,7 @@ def _run_b12x_unified(layer, act_pack, weight_pack):
 def _b12x_reference(
     tensors,
     *,
-    variant: QuantConfig,
+    quant: QuantConfig,
     activation: str,
     intermediate_size: int,
     num_experts: int,
@@ -543,7 +543,7 @@ def _b12x_reference(
         intermediate_size=intermediate_size,
         fc2_input_scale=(
             tensors["fc2_input_scale"]
-            if variant
+            if quant
             == QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
             else None
         ),
@@ -570,7 +570,7 @@ def _assert_b12x_accurate(actual, expected):
 
 def _assert_b12x_case(
     *,
-    variant: QuantConfig,
+    quant: QuantConfig,
     activation: str,
     num_tokens: int,
     top_k: int,
@@ -588,7 +588,7 @@ def _assert_b12x_case(
     )
     layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
         tensors,
-        quant=variant,
+        quant=quant,
         activation=activation,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -597,7 +597,7 @@ def _assert_b12x_case(
     actual = _run_b12x_unified(layer, act_pack, weight_pack)
     expected = _b12x_reference(
         tensors,
-        quant=variant,
+        quant=quant,
         activation=activation,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
