@@ -81,7 +81,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     """Compute the best tactic for a specific (M, N, K) on a GPU with sm_count SMs.
 
     Used for mm_fp4(backend='cute-dsl') without autotune by taking the
-    argmax of _score_sm100_mm_fp4_tactic over kernel-feasible
+    argmax of _score_mm_fp4_tactic over kernel-feasible
     (tile, cluster, swap_ab), with prefetch disabled.
     """
     import cutlass
@@ -117,7 +117,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
                 continue  # 2-CTA MMA (tile_m == 256) requires cluster_m >= 2
             # swap_ab is only valid for 8-aligned n
             for swap_ab in (False,) if not n_aligned else (False, True):
-                score = _score_sm100_mm_fp4_tactic(
+                score = _score_mm_fp4_tactic(
                     rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                 )
                 if score > best_score and is_feasible(tile, cluster, swap_ab):
@@ -126,7 +126,7 @@ def _compute_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     return best_tactic
 
 
-def _score_sm100_mm_fp4_tactic(
+def _score_mm_fp4_tactic(
     m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
 ):
     """Score a mm_fp4 cute-dsl tactic (higher means better).
@@ -191,20 +191,6 @@ def _score_sm100_mm_fp4_tactic(
     return score
 
 
-def _score_mm_fp4_autotune_tactic(
-    m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
-):
-    """Score an FP4 tactic for measured autotune candidate pre-ranking.
-
-    At large M, the shared analytical scorer leaves both orientations neutral,
-    allowing measured autotuning to benchmark them without an orientation
-    pre-ranking bias.
-    """
-    return _score_sm100_mm_fp4_tactic(
-        m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
-    )
-
-
 def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tactics):
     """Rank and return at most ``max_tactics`` actual mm_fp4 tactics.
 
@@ -217,7 +203,7 @@ def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tac
 
     def score(tactic):
         tile, cluster, swap_ab, _, _, _ = tactic
-        return _score_mm_fp4_autotune_tactic(
+        return _score_mm_fp4_tactic(
             m, n, real_k, sm_count, tile, cluster, swap_ab
         )
 
@@ -266,7 +252,7 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
 # sm107 4 at M 33-512, and sm107 41 / sm100 19 above that -- narrow sm100 tiles
 # win decode, wide sm107 tiles win prefill.
 #
-# So this scores the union with the same _score_sm100_mm_fp4_tactic used for
+# So this scores the union with the same _score_mm_fp4_tactic used for
 # sm100 and for the top-N ranking, and emits whichever kernel won.
 _SM107_MMA_TILER_MN_CANDIDATES = [
     (128, 64),
@@ -353,7 +339,7 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
     best_score = -1.0
 
     # sm107 candidates are scored FIRST so that ties resolve to the
-    # Rubin-native kernel. _score_sm100_mm_fp4_tactic reads only tile, cluster
+    # Rubin-native kernel. _score_mm_fp4_tactic reads only tile, cluster
     # and swap_ab, so a tile offered by both kernels scores identically and the
     # strict `>` below keeps whichever was seen first. The autotuner's measured
     # preference is sm107 at large M (41/60 winners above M=512), so sm107 wins
@@ -378,7 +364,7 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
                 for swap_ab in swap_options:
                     if swap_ab and not n_aligned:
                         continue
-                    score = _score_sm100_mm_fp4_tactic(
+                    score = _score_mm_fp4_tactic(
                         rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                     )
                     if score > best_score and sm107_feasible(
@@ -407,7 +393,7 @@ def _compute_sm107_tactic_for_m(rep_m, n, real_k, sm_count, sf_vec_size):
             if tile[0] == 256 and cluster[0] < 2:
                 continue  # 2-CTA MMA (tile_m == 256) requires cluster_m >= 2
             for swap_ab in (False,) if not n_aligned else (False, True):
-                score = _score_sm100_mm_fp4_tactic(
+                score = _score_mm_fp4_tactic(
                     rep_m, n, real_k, sm_count, tile, cluster, swap_ab
                 )
                 if score > best_score and sm100_feasible(tile, cluster, swap_ab):

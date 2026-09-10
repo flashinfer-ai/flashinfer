@@ -5,9 +5,7 @@ from flashinfer.gemm.kernels.utils import (
     _MM_FP4_SWAP_PENALTY_MAX_M,
     _M_BUCKETS,
     _rank_mm_fp4_autotune_tactics,
-    _select_sm107_mm_fp4_cute_dsl_tactic,
-    _score_mm_fp4_autotune_tactic,
-    _score_sm100_mm_fp4_tactic,
+    _score_mm_fp4_tactic,
 )
 
 
@@ -41,19 +39,16 @@ def test_autotune_does_not_penalize_swap_ab_above_large_m_boundary(
 def test_fallback_does_not_penalize_either_orientation_above_large_m_boundary(
 ) -> None:
     m = _MM_FP4_SWAP_PENALTY_MAX_M * 2
-    swap0 = _score_sm100_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, False)
-    swap1 = _score_sm100_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, True)
+    swap0 = _score_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, False)
+    swap1 = _score_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, True)
 
     assert swap0 == pytest.approx(swap1)
-    assert _score_mm_fp4_autotune_tactic(
-        m, N, K, SM_COUNT, TILE, CLUSTER, False
-    ) == pytest.approx(swap1)
 
 
 def test_swap_penalty_is_retained_at_large_m_boundary() -> None:
     m = _MM_FP4_SWAP_PENALTY_MAX_M
-    swap0 = _score_sm100_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, False)
-    swap1 = _score_sm100_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, True)
+    swap0 = _score_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, False)
+    swap1 = _score_mm_fp4_tactic(m, N, K, SM_COUNT, TILE, CLUSTER, True)
 
     assert swap1 == pytest.approx(swap0 * 0.95)
 
@@ -91,21 +86,38 @@ def test_equal_sm107_scores_preserve_enumeration_order() -> None:
     assert selected == [tactic_swap1, tactic_swap0]
 
 
-def test_sm107_fallback_adds_large_m_bucket_lazily(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "selector_name,compute_name,cache_name",
+    [
+        (
+            "_select_sm100_mm_fp4_cute_dsl_tactic",
+            "_compute_tactic_for_m",
+            "_SM100_MM_FP4_TACTIC_CACHE",
+        ),
+        (
+            "_select_sm107_mm_fp4_cute_dsl_tactic",
+            "_compute_sm107_tactic_for_m",
+            "_SM107_MM_FP4_TACTIC_CACHE",
+        ),
+    ],
+)
+def test_fallback_precomputes_through_32768_and_clamps_larger_m(
+    monkeypatch, selector_name, compute_name, cache_name
+) -> None:
     calls = []
 
     def fake_compute(rep_m, n, real_k, sm_count, sf_vec_size):
         calls.append(rep_m)
         return ("tactic", rep_m)
 
-    monkeypatch.setattr(
-        "flashinfer.gemm.kernels.utils._compute_sm107_tactic_for_m", fake_compute
-    )
-    monkeypatch.setattr(gemm_utils, "_SM107_MM_FP4_TACTIC_CACHE", {})
+    monkeypatch.setattr(gemm_utils, compute_name, fake_compute)
+    monkeypatch.setattr(gemm_utils, cache_name, {})
 
-    tactic = _select_sm107_mm_fp4_cute_dsl_tactic(
-        _MM_FP4_SWAP_PENALTY_MAX_M + 1, N, K, SM_COUNT, 16
-    )
+    selector = getattr(gemm_utils, selector_name)
+    tactic = selector(_M_BUCKETS[-1] + 1, N, K, SM_COUNT, 16)
+    much_larger_tactic = selector(_M_BUCKETS[-1] * 4, N, K, SM_COUNT, 16)
 
-    assert tactic == ("tactic", 16384)
-    assert calls == [*_M_BUCKETS, 16384]
+    assert _M_BUCKETS[-3:] == (8192, 16384, 32768)
+    assert tactic == ("tactic", 32768)
+    assert much_larger_tactic == tactic
+    assert calls == list(_M_BUCKETS)
