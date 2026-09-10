@@ -55,6 +55,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         "use_proxy_routes": key.use_proxy_routes,
         "use_causal_mask": key.mask_type == "causal",
         "apply_token_mask": key.use_kv_valid_bits,
+        "store_score_words": config.uses_prepared_score_keep_words,
     }
     if key.page_size is not None:
         if key.sparse_format != "bsr" or key.use_proxy_routes:

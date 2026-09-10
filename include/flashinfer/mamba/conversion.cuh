@@ -96,6 +96,16 @@ inline __device__ void convertAndStore(int16_t* output, float input) {
 // Philox-4x32 PRNG (matches Triton's tl.randint)
 // =============================================================================
 
+// Derive a per-layer Philox seed with the SplitMix64 finalizer (Stafford mix13).
+// Multi-layer kernels use this to derive independent layer streams from one
+// base seed; single-layer kernels receive their layer-specific seed directly.
+__device__ __forceinline__ int64_t layer_philox_seed(int64_t base_seed, int layer) {
+  uint64_t z = static_cast<uint64_t>(base_seed) ^ (0x9E3779B97F4A7C15ULL * (uint64_t(layer) + 1));
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return static_cast<int64_t>(z ^ (z >> 31));
+}
+
 // Generates four pseudorandom uint32s from (seed, offset) using the Philox-4x32 algorithm.
 // Produces bit-identical output to Triton's tl.randint4x(seed, offset, n_rounds).
 // The offset is int64 and split across Philox c0 (low 32 bits) and c1 (high

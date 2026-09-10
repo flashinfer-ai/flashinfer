@@ -153,16 +153,16 @@ performs both launch plans before enqueueing either kernel so the dependent
 launches do not expose a Python/FFI inter-kernel gap. CUDA Graph capture still
 records the same two kernels and preserves the workspace contract below.
 
-For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
-caches a stable decreasing-length order on the host. CuTe DSL decomp retains
-the original sequence order because its CTA grid fits in one wave.
-``flashinfer.RecurrentKDAPrefillWrapper`` provides the explicit planned path
-needed for packed engine CUDA Graph capture: ``plan`` builds the order and the
-decomp ``cu_chunks`` prefix, then ``run`` consumes fixed-address buffers. The
-decomp prep kernel binary-searches this compact prefix instead of carrying a
-dense chunk-to-sequence tensor. The number of sequences, total tokens, and
-total BT=16 chunks are fixed by the first plan so the metadata and launch
-geometry remain valid across CUDA Graph replays.
+For packed CuTe DSL engine calls, omitting ``seq_order`` generates a stable
+decreasing-length order on the device. CuTe DSL decomp retains the original
+sequence order in the eager path because its CTA grid fits in one wave.
+``flashinfer.RecurrentKDAPrefillWrapper`` provides fixed-address metadata for
+CUDA Graph capture: ``plan`` only copies packed offsets into its device buffer,
+while a captured GPU prepass generates the order and decomp ``cu_chunks``
+prefix before the recurrent kernels run. The decomp prep kernel binary-searches
+this compact prefix instead of carrying a dense chunk-to-sequence tensor. Its
+workspace and launch use a graph-static chunk capacity derived from tensor
+shapes, while the GPU prefix supplies the actual chunk count on each replay.
 
 State and graph semantics
 -------------------------

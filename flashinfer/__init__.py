@@ -69,6 +69,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .decode import sm110_gqa_decode as sm110_gqa_decode
 from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
 from .cake_dcp import (
     get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
@@ -185,6 +186,7 @@ from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
+from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops

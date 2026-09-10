@@ -3,7 +3,7 @@
   "description": "One-shot PrimTS MLA decode over FlashInfer dense page tables. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; the wrapper derives omitted static Q/KV bounds before launch.",
   "op_type": "mla_paged",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.mla_decode.batch_decode_mla_with_paged_kv_cache",
+    "fi_api:flashinfer.attention.prims_ts.mla_decode.batch_mla_decode_with_paged_kv_cache",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental",
