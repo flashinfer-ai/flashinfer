@@ -318,8 +318,7 @@ static_assert(SelectSm100aSchedule(E60Shape(11)).route_layout == RouteLayout::kD
 static_assert(SelectSm100aSchedule(E60Shape(19)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSm100aSchedule(E60Shape(20)).route_layout == RouteLayout::kGpuPacked);
 static_assert(SelectSm100aSchedule(E60Shape(20)).route_packer == RoutePacker::kGeneral);
-static_assert(SelectSm100aSchedule(E60Shape(20)).fc1 ==
-              Fc1Schedule::kPersistentDeviceWorkfeed);
+static_assert(SelectSm100aSchedule(E60Shape(20)).fc1 == Fc1Schedule::kPersistentDeviceWorkfeed);
 static_assert(SelectSm100aSchedule(E60Shape(20)).fc2 == Fc2Schedule::kRouteParallelK256);
 static_assert(SelectSm100aSchedule(E60Shape(20)).workfeed_ctas == 152);
 static_assert(SelectSm100aSchedule(E192SiluShape(32)).route_layout == RouteLayout::kDirect);
