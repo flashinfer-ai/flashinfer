@@ -2705,7 +2705,7 @@ def _v32_applies(
 
     The contract is deliberately exact rather than a region. Everything in it
     was measured on `1x8192 gva4x16` in three independent processes, where
-    v32 runs 1.067x-1.094x of the shipped V64 path on all four items; see
+    v32 runs 1.066x-1.093x of the shipped V64 path on all four items; see
     `V32_SM80_MAX_SEQ_LEN` for how those readings sit against Triton. Nothing
     outside the contract has been measured, so anything else falls back to the
     shipped kernel rather than taking a path no measurement covers.
