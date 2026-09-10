@@ -199,6 +199,7 @@ def msa_sparse_decode_attention(
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
+    lse_out: Optional[torch.Tensor] = None,
 ):
     """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
 
@@ -281,6 +282,10 @@ def msa_sparse_decode_attention(
         ``(batch_size * seqlen_q, num_qo_heads, 128)``, reside on the same
         device as ``q``, and use the result dtype (BF16 for uniform FP8 Q/K/V,
         otherwise the query's compute dtype).
+    lse_out : torch.Tensor, optional
+        Caller-provided contiguous FP32 log-sum-exp output with shape
+        ``(batch_size * seqlen_q, num_qo_heads)``. This requires
+        ``return_softmax_lse=True``.
 
     Returns
     -------
@@ -311,6 +316,7 @@ def msa_sparse_decode_attention(
             force_fused=force_fused,
             workspace=workspace,
             out=out,
+            lse_out=lse_out,
         )
     if workspace is not None:
         raise ValueError(
@@ -344,6 +350,22 @@ def msa_sparse_decode_attention(
     if head_dim != 128:
         raise ValueError(f"head_dim must be 128, got {head_dim}")
     batch_size = total_q // seqlen_q
+    if lse_out is not None:
+        if not return_softmax_lse:
+            raise ValueError("lse_out requires return_softmax_lse=True")
+        expected_lse_shape = (total_q, num_qo_heads)
+        if not isinstance(lse_out, torch.Tensor):
+            raise TypeError("lse_out must be a torch.Tensor")
+        if (
+            tuple(lse_out.shape) != expected_lse_shape
+            or lse_out.dtype != torch.float32
+            or lse_out.device != q.device
+            or not lse_out.is_contiguous()
+        ):
+            raise ValueError(
+                "lse_out must be contiguous torch.float32 with shape "
+                f"{expected_lse_shape} on {q.device}"
+            )
     if out is not None:
         expected_shape = (total_q, num_qo_heads, head_dim)
         if not isinstance(out, torch.Tensor):
@@ -491,7 +513,11 @@ def msa_sparse_decode_attention(
                 (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=dev
             )
         )
-        lse_buf = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+        lse_buf = (
+            lse_out
+            if lse_out is not None
+            else torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
+        )
         # topk (shape[0]) and head_dim (shape[3]) are static in the compiled
         # signature.
         o_partial = torch.empty((topk, 1, 1, head_dim), dtype=partial_dtype, device=dev)
@@ -631,8 +657,7 @@ def msa_sparse_decode_attention(
             return out_buf, lse_buf
         return out_buf
 
-    lse_out = None
-    if return_softmax_lse:
+    if return_softmax_lse and lse_out is None:
         lse_out = torch.empty((total_q, num_qo_heads), dtype=torch.float32, device=dev)
     out = _combine_partials(
         o_partial,

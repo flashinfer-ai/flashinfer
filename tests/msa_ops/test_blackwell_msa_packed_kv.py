@@ -140,10 +140,7 @@ def test_uniform_fp8_packed_hnd_decode_matches_contiguous(
 
 def test_uniform_fp8_packed_hnd_decode_cuda_graph() -> None:
     device = _require_sm10x()
-    from flashinfer.msa_ops import (
-        MSASparseAttentionWorkspace,
-        msa_sparse_decode_attention,
-    )
+    from flashinfer.msa_ops import msa_sparse_decode_attention
 
     torch.manual_seed(1)
     batch_size = 4
@@ -178,12 +175,17 @@ def test_uniform_fp8_packed_hnd_decode_cuda_graph() -> None:
         .transpose(0, 1)
     )
     assert not q2k_indices.is_contiguous()
-    workspace = MSASparseAttentionWorkspace(device)
     provided_out = torch.empty(
         batch_size * seqlen_q,
         16,
         _HEAD_DIM,
         dtype=torch.bfloat16,
+        device=device,
+    )
+    provided_lse = torch.empty(
+        batch_size * seqlen_q,
+        16,
+        dtype=torch.float32,
         device=device,
     )
 
@@ -199,8 +201,8 @@ def test_uniform_fp8_packed_hnd_decode_cuda_graph() -> None:
             causal=True,
             return_softmax_lse=True,
             force_fused=True,
-            workspace=workspace,
             out=provided_out,
+            lse_out=provided_lse,
         )
 
     capture_stream = torch.cuda.Stream(device=device)
@@ -214,6 +216,7 @@ def test_uniform_fp8_packed_hnd_decode_cuda_graph() -> None:
     with torch.cuda.graph(graph, stream=capture_stream):
         graph_out, graph_lse = run()
     assert graph_out.data_ptr() == provided_out.data_ptr()
+    assert graph_lse.data_ptr() == provided_lse.data_ptr()
     graph.replay()
     torch.cuda.synchronize(device)
 

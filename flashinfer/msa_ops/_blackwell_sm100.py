@@ -265,8 +265,13 @@ def _check_warmed_launch(
     signature: tuple,
     *,
     capturing: bool,
+    allow_unwarmed_capture: bool = False,
 ) -> None:
-    if capturing and (workspace is None or signature not in workspace._warmed_launches):
+    if (
+        capturing
+        and not allow_unwarmed_capture
+        and (workspace is None or signature not in workspace._warmed_launches)
+    ):
         raise RuntimeError(
             "MSA CUDA graph capture requires an explicit "
             "MSASparseAttentionWorkspace warmed by an eager call with the "
@@ -1721,6 +1726,7 @@ def _run_fp8_direct_module(
     stream_ptr: int,
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
+    allow_unwarmed_capture: bool = False,
 ) -> None:
     variants = {
         "q1_exact": f"decode_q1_bf16_query_fp8_kv_exact_{'paged' if paged else 'flat'}",
@@ -1775,7 +1781,12 @@ def _run_fp8_direct_module(
     signature = _launch_signature(
         variant=variant, target=target, tensors=tensors, scalars=scalars, grid=grid
     )
-    _check_warmed_launch(workspace, signature, capturing=capturing)
+    _check_warmed_launch(
+        workspace,
+        signature,
+        capturing=capturing,
+        allow_unwarmed_capture=allow_unwarmed_capture,
+    )
     _get_module(variant, target).run(*tensors, *scalars, *grid, stream_ptr)
     _record_successful_launch(workspace, signature, capturing=capturing)
 
@@ -2387,6 +2398,7 @@ def blackwell_msa_sparse_decode_attention(
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
+    lse_out: Optional[torch.Tensor] = None,
 ):
     """Run sparse decode on compute capability 10.0 or 10.3."""
 
@@ -2425,7 +2437,10 @@ def blackwell_msa_sparse_decode_attention(
         raise ValueError("force_fused must be True, False, or None")
     batch_size = total_q // seqlen_q
     capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and workspace is None:
+    externally_buffered_direct = (
+        uniform_fp8_paged_layouts_allowed and out is not None and lse_out is not None
+    )
+    if capturing and workspace is None and not externally_buffered_direct:
         raise RuntimeError(
             "CUDA graph capture of MSA on compute capability 10.0/10.3 "
             "requires an explicit MSASparseAttentionWorkspace warmed with the "
@@ -2529,13 +2544,31 @@ def blackwell_msa_sparse_decode_attention(
                 f"out must be contiguous {out_dtype} with shape "
                 f"{tuple(q.shape)} on {q.device}"
             )
-        lse = _workspace_buffer(
-            workspace,
-            "decode_lse",
-            (total_q, num_q_heads),
-            dtype=torch.float32,
-            device=q.device,
-        )
+        if lse_out is not None:
+            if not return_softmax_lse:
+                raise ValueError("lse_out requires return_softmax_lse=True")
+            if not isinstance(lse_out, torch.Tensor):
+                raise TypeError("lse_out must be a torch.Tensor")
+            expected_lse_shape = (total_q, num_q_heads)
+            if (
+                tuple(lse_out.shape) != expected_lse_shape
+                or lse_out.dtype != torch.float32
+                or lse_out.device != q.device
+                or not lse_out.is_contiguous()
+            ):
+                raise ValueError(
+                    "lse_out must be contiguous torch.float32 with shape "
+                    f"{expected_lse_shape} on {q.device}"
+                )
+            lse = lse_out
+        else:
+            lse = _workspace_buffer(
+                workspace,
+                "decode_lse",
+                (total_q, num_q_heads),
+                dtype=torch.float32,
+                device=q.device,
+            )
         if non16_variant is not None:
             _run_decode_module(
                 variant=non16_variant,
@@ -2676,6 +2709,7 @@ def blackwell_msa_sparse_decode_attention(
                 stream_ptr=stream_ptr,
                 workspace=workspace,
                 capturing=capturing,
+                allow_unwarmed_capture=externally_buffered_direct,
             )
             return (out, lse) if return_softmax_lse else out
         variant = _decode_variant(
