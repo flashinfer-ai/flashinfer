@@ -641,6 +641,12 @@ def _cutlass_nvfp4_svdquant_requirement(*args, **kwargs):
 def _cake_nvfp4_svdquant_requirement(
     a, b, a_sf, b_sf, alpha, d, l1, bias=None, **kwargs
 ):
+    cuda_version = get_cuda_version()
+    if cuda_version < Version("13.0"):
+        raise ValueError(
+            "Cake NVFP4 SVDQuant requires CUDA 13.0 or later. "
+            f"Current CUDA version: {cuda_version}."
+        )
     from ..jit.cake_nvfp4_svdquant import (
         is_cake_nvfp4_svdquant_problem_supported,
     )
@@ -829,7 +835,8 @@ def mm_nvfp4_svdquant(
         Output tensor, shape ``(m, n)`` bf16; allocated when ``None``.
     backend: Literal["cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"]
         ``"cutlass"`` selects the existing fused SM100/SM103 implementation;
-        ``"cake"`` selects the generated fused SM100/SM103 implementation;
+        ``"cake"`` selects the generated fused SM100/SM103 implementation
+        and requires CUDA 13.0 or later;
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
         ``"auto"`` (default) selects by compute capability. On SM120/SM121,

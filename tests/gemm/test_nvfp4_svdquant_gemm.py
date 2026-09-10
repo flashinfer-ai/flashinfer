@@ -10,6 +10,7 @@ use fused CuTe DSL, with an explicit
 ``cute-dsl-unfused`` composition retained as a differential oracle.
 """
 
+from packaging.version import Version
 import pytest
 import torch
 
@@ -27,6 +28,7 @@ from flashinfer.gemm.gemm_svdquant import (
     SVDQUANT_LORA_RANK_GRANULARITY,
     get_nvfp4_svdquant_module,
 )
+from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
 _RANK = SVDQUANT_LORA_RANK_GRANULARITY  # base rank == the collective's rank granularity
@@ -1083,6 +1085,8 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
 def test_mm_nvfp4_svdquant_cake_cuda_graph_replay(m, k, rank, use_bias):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() < Version("13.0"):
+        pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
     torch.manual_seed(0)
     p = _make_gemm_problem(m, 3072, k, rank=rank)
     out = torch.empty(m, 3072, dtype=torch.bfloat16, device="cuda")
@@ -1117,6 +1121,8 @@ def test_mm_nvfp4_svdquant_cake_cuda_graph_replay(m, k, rank, use_bias):
 def test_mm_nvfp4_svdquant_cake_pooled_scale_buffers(use_bias):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() < Version("13.0"):
+        pytest.skip("Cake NVFP4 SVDQuant requires CUDA 13.0 or later")
     torch.manual_seed(0)
     p = _make_gemm_problem(129, 3072, 3072, rank=32)
 
@@ -1181,6 +1187,25 @@ def test_mm_nvfp4_svdquant_sm120_cuda_graph_replay(backend):
     graph.replay()
     torch.cuda.synchronize()
     _assert_sm120_accuracy(p["ref_bias"], out)
+
+
+def test_mm_nvfp4_svdquant_cake_requires_cuda13():
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake NVFP4 SVDQuant requires exact SM100 or SM103")
+    if get_cuda_version() >= Version("13.0"):
+        pytest.skip("Requires an unsupported CUDA toolkit")
+    p = _make_gemm_problem(129, 3072, 3072, rank=32)
+    with pytest.raises(ValueError, match="Cake NVFP4 SVDQuant requires CUDA 13.0"):
+        mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            backend="cake",
+        )
 
 
 if __name__ == "__main__":
