@@ -1,10 +1,12 @@
 """Focused lifecycle and transaction coverage for MLA CUDA-graph plan updates."""
 
+import ctypes
 import importlib
 import inspect
 import re
 from contextlib import nullcontext
 from types import ModuleType
+from threading import Event
 import pytest
 import torch
 
@@ -601,7 +603,9 @@ def test_transaction_publishes_device_source_and_preserves_tail() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("failure", ["invalid-csr", "planner", "commit"])
+@pytest.mark.parametrize(
+    "failure", ["invalid-csr", "planner", "commit", "plan-info", "staged-bytes"]
+)
 def test_prepublication_failures_leave_live_plan_untouched(failure: str) -> None:
     backend, wrapper, module = _transaction_fixture()
     live_before = {
@@ -615,12 +619,23 @@ def test_prepublication_failures_leave_live_plan_untouched(failure: str) -> None
         module.planner_error = RuntimeError("synthetic planner failure")
     elif failure == "commit":
         module.commit_error = RuntimeError("synthetic commit submission failure")
+    elif failure == "plan-info":
+        module.plan_info = (11, 22, 33, 45)
+    elif failure == "staged-bytes":
+        module.staged_int_workspace_bytes = 23
     qo_indptr = (
         torch.tensor([1, 2, 3], dtype=torch.int32) if failure == "invalid-csr" else None
     )
     source = torch.tensor([7, 8, 9, 10], dtype=torch.int32, device="cuda")
 
-    with pytest.raises((ValueError, RuntimeError)):
+    message = {
+        "invalid-csr": "qo_indptr must start at zero",
+        "planner": "synthetic planner failure",
+        "commit": "synthetic commit submission failure",
+        "plan-info": "candidate plan_info changed",
+        "staged-bytes": "candidate staged_int_workspace_bytes changed",
+    }[failure]
+    with pytest.raises((ValueError, RuntimeError), match=message):
         wrapper.update_cuda_graph_plan(
             metadata=_transaction_metadata(
                 kv_indices=source,
@@ -635,6 +650,94 @@ def test_prepublication_failures_leave_live_plan_untouched(failure: str) -> None
     assert torch.equal(backend._kv_indices_buf, live_before["indices"])
     assert torch.equal(backend._kv_len_arr_buf, live_before["lengths"])
     assert "commit" not in module.order or failure == "commit"
+    if failure in ("plan-info", "staged-bytes"):
+        assert module.order == ["plan"]
+        assert backend._cuda_graph_plan_update_state.slots[0].status == "idle"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_real_events_keep_both_slots_busy_until_copies_complete() -> None:
+    from cuda.bindings import runtime
+
+    backend, wrapper, module = _transaction_fixture()
+    state = backend._cuda_graph_plan_update_state
+    # Replace the fixture's always-ready event with a real, warmed CUDA event.
+    state.slots[0].completion_event = torch.cuda.Event()
+    state.slots[0].completion_event.record()
+    state.slots[0].completion_event.synchronize()
+    source = torch.tensor([7, 8, 9, 10], dtype=torch.int32, device=backend.device)
+    metadata = _transaction_metadata(kv_indices=source)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream(backend.device))
+    stream.synchronize()
+    release = Event()
+    expired = Event()
+
+    @ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+    def hold_stream(_):
+        # No CUDA calls in a CUDA host callback. The timeout also bounds cleanup
+        # if an unexpected driver/API path blocks the submitting Python thread.
+        if not release.wait(timeout=10):
+            expired.set()
+
+    try:
+        (error,) = runtime.cudaLaunchHostFunc(
+            stream.cuda_stream, ctypes.cast(hold_stream, ctypes.c_void_p).value, 0
+        )
+        assert error == runtime.cudaError_t.cudaSuccess
+        with torch.cuda.stream(stream):
+            wrapper.update_cuda_graph_plan(metadata=metadata)
+            assert state.slots[0].status == "pending"
+            assert not state.slots[0].completion_event.query()
+            wrapper.update_cuda_graph_plan(metadata=metadata)
+            assert all(slot.status == "pending" for slot in state.slots)
+            assert all(not slot.completion_event.query() for slot in state.slots)
+            with pytest.raises(RuntimeError, match="staging slots are busy"):
+                wrapper.update_cuda_graph_plan(metadata=metadata)
+            assert module.order == ["plan", "commit", "plan", "commit"]
+    finally:
+        release.set()
+        stream.synchronize()
+    assert not expired.is_set(), "stream gate timed out before the assertions finished"
+    assert all(slot.completion_event.query() for slot in state.slots)
+    with torch.cuda.stream(stream):
+        wrapper.update_cuda_graph_plan(metadata=metadata)
+    stream.synchronize()
+    assert module.order == ["plan", "commit"] * 3
+    assert torch.equal(backend._kv_indices_buf[:4], source)
+
+
+class _RecordFailureEvent(_ReadyEvent):
+    def record(self) -> None:
+        raise RuntimeError("synthetic event record failure")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_event_record_failure_poisons_slots_without_publishing() -> None:
+    backend, wrapper, module = _transaction_fixture()
+    state = backend._cuda_graph_plan_update_state
+    live = (
+        backend._int_workspace_buffer,
+        backend._qo_indptr_buf,
+        backend._kv_indptr_buf,
+        backend._kv_indices_buf,
+        backend._kv_len_arr_buf,
+    )
+    snapshots = tuple(tensor.clone() for tensor in live)
+    source = torch.tensor([7, 8, 9, 10], dtype=torch.int32, device=backend.device)
+    metadata = _transaction_metadata(kv_indices=source)
+    for slot in state.slots:
+        slot.completion_event = _RecordFailureEvent()
+    for index in range(2):
+        with pytest.raises(RuntimeError, match="synthetic event record failure"):
+            wrapper.update_cuda_graph_plan(metadata=metadata)
+        assert state.slots[index].status == "poisoned"
+    with pytest.raises(RuntimeError, match="slots are poisoned; call plan"):
+        wrapper.update_cuda_graph_plan(metadata=metadata)
+    torch.cuda.synchronize(backend.device)
+    assert module.order == ["plan", "plan"]
+    for tensor, snapshot in zip(live, snapshots, strict=True):
+        assert torch.equal(tensor, snapshot)
 
 
 def test_transaction_capability_is_enabled_only_by_generated_fa_backends() -> None:
@@ -677,6 +780,7 @@ def test_transaction_capability_is_enabled_only_by_generated_fa_backends() -> No
 @pytest.mark.parametrize("backend_name", ["fa2", "fa3"])
 def test_real_generated_capture_update_replay_uses_lean_state(
     backend_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     if backend_name == "fa3" and not is_sm90a_supported(device):
@@ -717,6 +821,19 @@ def test_real_generated_capture_update_replay_uses_lean_state(
     initial_kv = torch.tensor([0, 2, 4], dtype=torch.int32)
     initial_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     initial_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    plan_kwargs = dict(
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=1,
+        causal=False,
+        sm_scale=1.0 / (192.0**0.5),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="none",
+    )
     stream = torch.cuda.Stream()
 
     stream.wait_stream(torch.cuda.current_stream(device))
@@ -728,17 +845,7 @@ def test_real_generated_capture_update_replay_uses_lean_state(
                 initial_indices,
                 initial_lengths,
             ),
-            num_heads=num_heads,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            page_size=1,
-            causal=False,
-            sm_scale=1.0 / (192.0**0.5),
-            q_data_type=torch.float16,
-            kv_data_type=torch.float16,
-            query_layout="split",
-            kv_cache_layout="split",
-            lse_mode="none",
+            **plan_kwargs,
         )
         out = torch.empty_like(q_nope)
         expected = torch.empty_like(q_nope)
@@ -793,3 +900,98 @@ def test_real_generated_capture_update_replay_uses_lean_state(
     torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
     assert torch.equal(kv_indices_buf, live_before_failure)
     assert wrapper._cuda_graph_plan_update_stream == stream.cuda_stream
+
+    # A full replan writes the reserved CSR before initializing update state.
+    # Failure at that boundary must preserve both bytes and the runnable graph.
+    backend_before = wrapper._planned_backend
+    live_tensors = (
+        backend_before._int_workspace_buffer[
+            : backend_before._staged_int_workspace_bytes
+        ],
+        qo_indptr_buf,
+        kv_indptr_buf,
+        kv_indices_buf,
+        kv_len_arr_buf,
+    )
+    live_snapshots = tuple(tensor.clone() for tensor in live_tensors)
+    fa_common = importlib.import_module(
+        "flashinfer.mla._batch_mla._backends._fa_common"
+    )
+
+    replacement_kv = torch.tensor([0, 1, 2], dtype=torch.int32)
+    replacement_indices = torch.tensor([0, 1], dtype=torch.int32)
+    replacement_lengths = torch.tensor([1, 1], dtype=torch.int32)
+
+    def fail_update_state_init(**kwargs):
+        # Prove this is the late failure path, after backend.plan staged CSR.
+        assert torch.equal(qo_indptr_buf.cpu(), initial_qo)
+        assert torch.equal(kv_indptr_buf.cpu(), replacement_kv)
+        assert torch.equal(kv_indices_buf[:2].cpu(), replacement_indices)
+        raise RuntimeError("synthetic update state initialization failure")
+
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with monkeypatch.context() as patch, torch.cuda.stream(stream):
+        patch.setattr(
+            fa_common,
+            "_make_mla_cuda_graph_plan_update_state",
+            fail_update_state_init,
+        )
+        with pytest.raises(RuntimeError, match="update state initialization failure"):
+            wrapper.plan(
+                metadata=MLAPlanMetadata.csr(
+                    initial_qo, replacement_kv, replacement_indices, replacement_lengths
+                ),
+                **plan_kwargs,
+            )
+        graph.replay()
+    stream.synchronize()
+    assert wrapper._planned_backend is backend_before
+    assert wrapper._cuda_graph_plan_update_stream == stream.cuda_stream
+    for tensor, snapshot in zip(live_tensors, live_snapshots, strict=True):
+        assert torch.equal(tensor, snapshot)
+    torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
+
+    for slot in backend_before._cuda_graph_plan_update_state.slots:
+        slot.completion_event = _RecordFailureEvent()
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="synthetic event record failure"):
+                wrapper.update_cuda_graph_plan(
+                    metadata=MLAPlanMetadata.csr(
+                        updated_qo, updated_kv, source, updated_lengths
+                    )
+                )
+        with pytest.raises(RuntimeError, match="slots are poisoned; call plan"):
+            wrapper.update_cuda_graph_plan(
+                metadata=MLAPlanMetadata.csr(
+                    updated_qo, updated_kv, source, updated_lengths
+                )
+            )
+        graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
+
+    # A successful full plan starts a fresh stream/capture lifecycle.
+    replacement_stream = torch.cuda.Stream()
+    replacement_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(replacement_stream):
+        wrapper.plan(
+            metadata=MLAPlanMetadata.csr(
+                initial_qo, initial_kv, initial_indices, initial_lengths
+            ),
+            **plan_kwargs,
+        )
+    replacement_stream.synchronize()
+    replacement_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(replacement_graph, stream=replacement_stream):
+        wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv, kpe), out=out)
+    with torch.cuda.stream(replacement_stream):
+        wrapper.update_cuda_graph_plan(
+            metadata=MLAPlanMetadata.csr(
+                updated_qo, updated_kv, source, updated_lengths
+            )
+        )
+        replacement_graph.replay()
+    replacement_stream.synchronize()
+    assert wrapper._cuda_graph_plan_update_stream == replacement_stream.cuda_stream
+    torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)

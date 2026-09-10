@@ -652,6 +652,7 @@ class BatchMLAPagedAttentionWrapper:
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
         graph_workspace_snapshot = None
+        graph_metadata_snapshots: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
         if graph_plan_int_workspace_buffer is not None:
             prior_plan_workspace_bytes = int(
                 getattr(previous_backend, "_staged_int_workspace_bytes", 0)
@@ -668,6 +669,20 @@ class BatchMLAPagedAttentionWrapper:
             graph_workspace_snapshot = graph_plan_int_workspace_buffer[
                 :prior_plan_workspace_bytes
             ].clone()
+            if self._enable_cuda_graph_plan_update:
+                # Update-state initialization can fail after backend.plan()
+                # overwrites the shared CSR. Keep the entire replan atomic,
+                # including the index reservation's previously live prefix.
+                graph_metadata_snapshots = tuple(
+                    (tensor, tensor.clone())
+                    for tensor in (
+                        self._qo_indptr_buf,
+                        self._kv_indptr_buf,
+                        self._kv_indices_buf,
+                        self._kv_len_arr_buf,
+                    )
+                    if tensor is not None
+                )
         try:
             planned_backend = backend_type.plan_from_wrapper(plan_args)
         except Exception:
@@ -675,6 +690,8 @@ class BatchMLAPagedAttentionWrapper:
                 graph_plan_int_workspace_buffer[
                     : graph_workspace_snapshot.numel()
                 ].copy_(graph_workspace_snapshot)
+            for tensor, snapshot in graph_metadata_snapshots:
+                tensor.copy_(snapshot)
             raise
 
         # ---------------------------------------------------------------------------
@@ -706,6 +723,7 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
         self._plan_info = getattr(planned_backend, "_plan_info", None)
+        self._cuda_graph_plan_update_stream = None
 
     def _update_cuda_graph_plan_on_current_device(
         self,
@@ -754,6 +772,14 @@ class BatchMLAPagedAttentionWrapper:
         even if backend delegation later fails. The corresponding graph replay
         must execute on that same stream. Cross-stream replay is unsupported;
         the wrapper cannot observe or validate an external replay stream.
+        A successful :meth:`plan` resets the binding; a failed plan preserves
+        it. Before replanning on another stream, finish the old updates and
+        replays, then recapture :meth:`run` for the new plan.
+
+        Do not use the private fast-plan bridge on an opted-in wrapper. Its
+        CPU planner can overwrite pinned staging still read by a pending
+        update, even on the same CUDA stream. Use separate default-off
+        wrappers for legacy private planning.
 
         ``metadata`` must be a complete CSR :class:`MLAPlanMetadata` value.
         ``qo_indptr``, ``kv_indptr``, and ``kv_len_arr`` must be contiguous
