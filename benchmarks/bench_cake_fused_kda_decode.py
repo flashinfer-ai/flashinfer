@@ -38,7 +38,6 @@ from flashinfer.jit.cake_fused_kda_decode import (
     cake_fused_kda_decode_is_available,
     get_cake_fused_kda_decode_program_identity,
     get_cake_fused_kda_decode_variants,
-    select_cake_fused_kda_decode_variant,
 )
 from flashinfer.kda_decode import fused_kda_decode
 from flashinfer.testing import utils as testing_utils
