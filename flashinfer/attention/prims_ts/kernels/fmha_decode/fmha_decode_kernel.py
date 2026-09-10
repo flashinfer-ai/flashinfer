@@ -346,6 +346,12 @@ def _build_decode_gen_schedule(
     sparse_route_metadata: cute.Pointer | None = None,
     sparse_row_route_begin: Int32 | None = None,
     sparse_route_count: Int32 | None = None,
+    q_scale_ptr: cute.Pointer | None = None,
+    q_scale_head_stride: Int32 | None = None,
+    k_scale_ptr: cute.Pointer | None = None,
+    k_scale_head_stride: Int32 | None = None,
+    v_scale_ptr: cute.Pointer | None = None,
+    v_mean_ptr: cute.Pointer | None = None,
 ) -> tuple[
     list[Task],
     dict[MemoryResource, list[MemoryResource]],
@@ -1051,6 +1057,12 @@ def _build_decode_gen_schedule(
         h_r=h_r,
         q_group_idx=q_group_idx,
         seq_len_q=seq_len_q,
+        h_k_idx=h_k_idx,
+        b_idx=b_idx,
+        q_scale_ptr=q_scale_ptr,
+        q_scale_head_stride=q_scale_head_stride,
+        k_scale_ptr=k_scale_ptr,
+        k_scale_head_stride=k_scale_head_stride,
         sync_barrier_id=0,
         name="tmemS0",
     )
@@ -1064,6 +1076,12 @@ def _build_decode_gen_schedule(
         h_r=h_r,
         q_group_idx=q_group_idx,
         seq_len_q=seq_len_q,
+        h_k_idx=h_k_idx,
+        b_idx=b_idx,
+        q_scale_ptr=q_scale_ptr,
+        q_scale_head_stride=q_scale_head_stride,
+        k_scale_ptr=k_scale_ptr,
+        k_scale_head_stride=k_scale_head_stride,
         sync_barrier_id=1,
         name="tmemS1",
     )
@@ -1164,6 +1182,8 @@ def _build_decode_gen_schedule(
         partial_stats_ptr=partial_stats_ptr,
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
+        v_scale_ptr=v_scale_ptr,
+        v_mean_ptr=v_mean_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         num_heads_kv=num_heads_kv,
@@ -1187,6 +1207,8 @@ def _build_decode_gen_schedule(
         partial_stats_ptr=partial_stats_ptr,
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
+        v_scale_ptr=v_scale_ptr,
+        v_mean_ptr=v_mean_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         num_heads_kv=num_heads_kv,
@@ -1991,6 +2013,12 @@ def _run_decode_gen_active(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_q_scale: cute.Pointer | None = None,
+    g_k_scale: cute.Pointer | None = None,
+    g_v_scale: cute.Pointer | None = None,
+    g_v_mean: cute.Pointer | None = None,
+    g_q_scale_head_stride: Int32 | None = None,
+    g_k_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2132,6 +2160,12 @@ def _run_decode_gen_active(
         tma_desc_v_summary=tma_desc_v_summary_ptr,
         tma_desc_k_summary_atom=tma_desc_k_summary_atom_ptr,
         tma_desc_v_summary_atom=tma_desc_v_summary_atom_ptr,
+        q_scale_ptr=g_q_scale,
+        q_scale_head_stride=g_q_scale_head_stride,
+        k_scale_ptr=g_k_scale,
+        k_scale_head_stride=g_k_scale_head_stride,
+        v_scale_ptr=g_v_scale,
+        v_mean_ptr=g_v_mean,
         page_idx_kv=g_page_idx_kv,
         h_k_idx=h_k_idx,
         b_idx=b_idx,
@@ -2319,6 +2353,12 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_q_scale: cute.Pointer | None = None,
+    g_k_scale: cute.Pointer | None = None,
+    g_v_scale: cute.Pointer | None = None,
+    g_v_mean: cute.Pointer | None = None,
+    g_q_scale_head_stride: Int32 | None = None,
+    g_k_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2387,6 +2427,12 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_q_scale=g_q_scale,
+                g_k_scale=g_k_scale,
+                g_v_scale=g_v_scale,
+                g_v_mean=g_v_mean,
+                g_q_scale_head_stride=g_q_scale_head_stride,
+                g_k_scale_head_stride=g_k_scale_head_stride,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -2434,6 +2480,12 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_q_scale=g_q_scale,
+                g_k_scale=g_k_scale,
+                g_v_scale=g_v_scale,
+                g_v_mean=g_v_mean,
+                g_q_scale_head_stride=g_q_scale_head_stride,
+                g_k_scale_head_stride=g_k_scale_head_stride,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -2476,6 +2528,12 @@ def decode_gen_kernel(
     tma_desc_v_summary: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_k_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
+    g_q_scale: cute.Pointer | None = None,
+    g_k_scale: cute.Pointer | None = None,
+    g_v_scale: cute.Pointer | None = None,
+    g_v_mean: cute.Pointer | None = None,
+    g_q_scale_head_stride: Int32 | None = None,
+    g_k_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
@@ -2541,6 +2599,12 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_q_scale=g_q_scale,
+                g_k_scale=g_k_scale,
+                g_v_scale=g_v_scale,
+                g_v_mean=g_v_mean,
+                g_q_scale_head_stride=g_q_scale_head_stride,
+                g_k_scale_head_stride=g_k_scale_head_stride,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -2585,6 +2649,12 @@ def decode_gen_kernel(
                 tma_desc_v_summary=tma_desc_v_summary,
                 tma_desc_k_summary_atom=tma_desc_k_summary_atom,
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_q_scale=g_q_scale,
+                g_k_scale=g_k_scale,
+                g_v_scale=g_v_scale,
+                g_v_mean=g_v_mean,
+                g_q_scale_head_stride=g_q_scale_head_stride,
+                g_k_scale_head_stride=g_k_scale_head_stride,
             )
     else:
         # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
@@ -2624,8 +2694,19 @@ def fmha_decode_launch(
     v_page_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
+    q_scale_iter: cute.Pointer | None = None,
+    k_scale_iter: cute.Pointer | None = None,
+    v_scale_iter: cute.Pointer | None = None,
+    v_mean_iter: cute.Pointer | None = None,
+    q_scale_head_stride: Int32 | None = None,
+    k_scale_head_stride: Int32 | None = None,
 ) -> None:
-    """Standalone JIT launcher for FMHA decode TS."""
+    """Standalone JIT launcher for FMHA decode TS.
+
+    The Sage scale pointers and head strides are consumed only by a Sage
+    attention config; other configs leave them ``None`` so the kernel ABI is
+    unchanged.
+    """
     log2_e = math.log2(math.e)
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
@@ -2859,6 +2940,12 @@ def fmha_decode_launch(
         null_sparse_route_ptr,
         null_sparse_route_ptr,
         static_full_split_prefix,
+        g_q_scale=q_scale_iter,
+        g_k_scale=k_scale_iter,
+        g_v_scale=v_scale_iter,
+        g_v_mean=v_mean_iter,
+        g_q_scale_head_stride=q_scale_head_stride,
+        g_k_scale_head_stride=k_scale_head_stride,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

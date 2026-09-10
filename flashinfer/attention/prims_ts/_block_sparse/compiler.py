@@ -21,6 +21,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from ..sage import flat_scale_numel
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -47,7 +48,7 @@ def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., obje
     Float32 = cutlass.Float32
 
     @cute.jit
-    def dense_contiguous_adapter(
+    def launch_dense(
         q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
@@ -60,9 +61,27 @@ def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., obje
         static_num_qo_heads: cutlass.Constexpr[int],
         static_num_kv_heads: cutlass.Constexpr[int],
         static_head_dim: cutlass.Constexpr[int],
+        q_scale: cute.Tensor | None = None,
+        k_scale: cute.Tensor | None = None,
+        v_scale: cute.Tensor | None = None,
+        v_mean: cute.Tensor | None = None,
     ) -> None:
         null_i32 = cute.make_ptr(Int32, 0, mem_space=cutlass.AddressSpace.gmem)
         null_f32 = cute.make_ptr(Float32, 0, mem_space=cutlass.AddressSpace.gmem)
+        sage_kwargs = {}
+        if cutlass.const_expr(static_config.use_sage_attention):
+            # Scale tensors are [heads, flat slots]; the head stride is the
+            # flat slot count of one head.
+            sage_kwargs = {
+                "q_scale_iter": q_scale.iterator,
+                "k_scale_iter": k_scale.iterator,
+                "v_scale_iter": v_scale.iterator,
+                "v_mean_iter": (
+                    v_mean.iterator if static_config.sage_v_mean else null_f32
+                ),
+                "q_scale_head_stride": Int32(q_scale.shape[1]),
+                "k_scale_head_stride": Int32(k_scale.shape[1]),
+            }
         fmha_decode_launch(
             (
                 Int32(static_batch_size),
@@ -100,6 +119,75 @@ def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., obje
             num_physical_kv_pages=cutlass.Int64(0),
             k_page_stride=cutlass.Int64(0),
             v_page_stride=cutlass.Int64(0),
+            **sage_kwargs,
+        )
+
+    @cute.jit
+    def dense_contiguous_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        launch_dense(
+            q,
+            k,
+            v,
+            out,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+        )
+
+    @cute.jit
+    def dense_contiguous_sage_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        launch_dense(
+            q,
+            k,
+            v,
+            out,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            v_mean=v_mean,
         )
 
     def fake_compact(dtype: object, shape: tuple[object, ...]) -> object:
@@ -112,13 +200,44 @@ def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., obje
 
     q_shape = (key.batch_size, key.seq_len_q, key.num_qo_heads, key.head_dim)
     kv_shape = (key.batch_size, key.seq_len_kv, key.num_kv_heads, key.head_dim)
+    tensor_fakes = [
+        fake_compact(config.q_dtype, q_shape),
+        fake_compact(config.kv_dtype, kv_shape),
+        fake_compact(config.kv_dtype, kv_shape),
+        fake_compact(config.out_dtype, q_shape),
+    ]
+    adapter = dense_contiguous_adapter
+    if config.use_sage_attention:
+        adapter = dense_contiguous_sage_adapter
+        v_scale_shape = (key.num_kv_heads, key.head_dim)
+        tensor_fakes.extend(
+            (
+                fake_compact(
+                    cutlass.Float32,
+                    (
+                        key.num_qo_heads,
+                        flat_scale_numel(
+                            key.batch_size, key.seq_len_q, key.sage_q_block_size
+                        ),
+                    ),
+                ),
+                fake_compact(
+                    cutlass.Float32,
+                    (
+                        key.num_kv_heads,
+                        flat_scale_numel(
+                            key.batch_size, key.seq_len_kv, key.sage_k_block_size
+                        ),
+                    ),
+                ),
+                fake_compact(cutlass.Float32, v_scale_shape),
+                fake_compact(cutlass.Float32, v_scale_shape),
+            )
+        )
     with torch.cuda.device(key.device_index):
         return cute.compile(
-            dense_contiguous_adapter,
-            fake_compact(config.q_dtype, q_shape),
-            fake_compact(config.kv_dtype, kv_shape),
-            fake_compact(config.kv_dtype, kv_shape),
-            fake_compact(config.out_dtype, q_shape),
+            adapter,
+            *tensor_fakes,
             Float32(1.0),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             config,

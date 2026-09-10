@@ -59,6 +59,9 @@ FMHA Decode
 
     .. automethod:: __init__
 
+.. autoclass:: SageAttentionParams
+    :members:
+
 Block-Sparse FMHA
 -----------------
 

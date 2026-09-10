@@ -90,6 +90,7 @@ from flashinfer.utils import is_sm100a_supported
 from tests.attention.prims_ts_test_utils import (
     FP8 as _FP8,
     dense_stream_columns,
+    make_sage_decode_config,
 )
 
 
@@ -2482,6 +2483,104 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert q128_fp8_sparse.fragment_p_packed_cols == 8
     assert q128_fp8_sparse.pv_mma_steps_per_fragment == 1
     assert not q128_fp8_sparse.defers_softmax_anchor_updates
+
+    # Sage attention derives its predicates from the K block size alone: a
+    # 16-token block splits every K32 fragment into two scale groups, larger
+    # blocks share one scale per fragment, and INT32 scores appear only with
+    # Int8 Q/K.
+    assert not kv256_fp8.use_sage_attention
+    assert kv256_fp8.sage_k_groups_per_fragment == 1
+    kv256_sage = replace(kv256_fp8, sage_k_block_size=16, sage_q_block_size=1)
+    assert kv256_sage.use_sage_attention
+    assert not kv256_sage.uses_int32_scores
+    assert kv256_sage.sage_k_groups_per_fragment == 2
+    assert kv256_sage.streams_tmem_p_fragments
+    for k_block_size in (32, 64, 128, 256):
+        assert (
+            replace(
+                kv256_sage, sage_k_block_size=k_block_size
+            ).sage_k_groups_per_fragment
+            == 1
+        )
+    q128_sage = replace(q128_fp8, sage_k_block_size=16, sage_q_block_size=4)
+    assert q128_sage.use_sage_attention
+    assert q128_sage.sage_k_groups_per_fragment == 2
+    assert q128_sage.streams_tmem_p_fragments
+
+
+@pytest.mark.parametrize("tile_size_q", (64, 128))
+@pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
+    tile_size_q: int, o_dtype, mask_type: str
+) -> None:
+    """Sage runs the two streamed Keeps profiles with a 16-bit dequantized output."""
+
+    cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q,
+        tile_size_kv=256 if tile_size_q == 64 else 128,
+        o_dtype=o_dtype,
+        mask_type=mask_type,
+    )
+    assert cfg.use_sage_attention
+    assert cfg.streams_tmem_p_fragments
+    assert cfg.use_fp8_qkv
+    assert cfg.out_dtype == o_dtype
+    assert not cfg.defers_softmax_anchor_updates
+
+
+@pytest.mark.parametrize(
+    ("tile_size_q", "tile_size_kv", "overrides", "match"),
+    (
+        (
+            64,
+            256,
+            {"qkv_dtype": Float16, "o_dtype": Float16},
+            "Float8E4M3FN Q, K and V",
+        ),
+        (64, 256, {"sage_args": {"use_persistent_scheduler": True}}, "persistent"),
+        (
+            64,
+            256,
+            {
+                "sage_args": {"use_split_kv": True, "splits_kv": 2, "max_splits_kv": 2},
+                "split_kv_mode": "gmem_reduction",
+                "splits_kv": 2,
+            },
+            "split-KV",
+        ),
+        (
+            64,
+            256,
+            {"qkv_layout": "pagedKv", "num_tokens_per_page": 128},
+            "contiguous K/V",
+        ),
+        (64, 256, {"o_dtype": Float8E4M3FN}, "Float16 or BFloat16 output"),
+        (64, 256, {"sage_args": {"sage_k_block_size": 8}}, "sage_k_block_size"),
+        (64, 256, {"sage_args": {"sage_q_block_size": 3}}, "sage_q_block_size"),
+        (64, 256, {"sage_args": {"sage_q_block_size": 128}}, "sage_q_block_size"),
+        (
+            64,
+            256,
+            {
+                "o_dtype": Float16,
+                "sage_args": {"sage_k_block_size": 0, "sage_v_mean": True},
+            },
+            "require sage_k_block_size",
+        ),
+    ),
+)
+def test_attention_ts_decode_sage_profile_rejects_unsupported_recipes(
+    tile_size_q: int, tile_size_kv: int, overrides: dict[str, object], match: str
+) -> None:
+    sage_args = dict(overrides.pop("sage_args", {}))
+    with pytest.raises(ValueError, match=match):
+        make_sage_decode_config(
+            tile_size_q=tile_size_q,
+            tile_size_kv=tile_size_kv,
+            sage_args=sage_args,
+            **overrides,
+        )
 
 
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (

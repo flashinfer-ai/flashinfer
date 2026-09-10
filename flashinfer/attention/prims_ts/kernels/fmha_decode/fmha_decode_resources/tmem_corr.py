@@ -87,6 +87,11 @@ from .helpers_softmax import (
     _attention_sink_for_scale_idx,
     _pack_float4_to_fp8_e4m3,
 )
+from .sage_scales import (
+    load_staged_v_channel_scales,
+    stage_v_channel_scales,
+    staged_v_channel_scale_entries,
+)
 from .smem_p import SmemPResource
 from .tmem_softmax_stats import TmemSoftmaxLocalResource
 
@@ -119,6 +124,8 @@ class TmemCorrResource(DecodeGenResourceBase):
     partial_stats_ptr: cute.Pointer = None
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
+    v_scale_ptr: cute.Pointer | None = None
+    v_mean_ptr: cute.Pointer | None = None
     seqlens_kv: cute.Pointer = None
     max_seq_len_kv: Constexpr[int] = 0
     seq_len_q: Int32 = None
@@ -149,6 +156,8 @@ class TmemCorrResource(DecodeGenResourceBase):
     _cluster_mbarrier: cutlass.Array = None
     _kv_tile_256_exchange_alloc: Constexpr[SmemAllocation | None] = None
     _kv_tile_256_exchange: cutlass.Array = None
+    _sage_v_scale_alloc: Constexpr[SmemAllocation | None] = None
+    _sage_v_scales: cutlass.Array = None
 
     def get_o_stage_dtype_bytes(self) -> int:
         """Return the element width used by the final O staging buffer."""
@@ -197,6 +206,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         self._kv_tile_256_exchange = _placeholder_smem_array(
             Float32,
             self._kv_tile_256_exchange_entries(),
+        )
+        self._sage_v_scales = _placeholder_smem_array(
+            Float32, max(staged_v_channel_scale_entries(self.cfg), 1)
         )
 
     def _owns_final_epilogue(self) -> bool:
@@ -319,6 +331,15 @@ class TmemCorrResource(DecodeGenResourceBase):
                 size_bytes=self._kv_tile_256_exchange_entries() * 4,
                 alignment=16,
             )
+        if self.cfg.use_sage_attention and self._sage_v_scale_alloc is None:
+            # One KV head's per-channel V scales and means, staged once per
+            # work tile so the output store reads SMEM instead of waiting on
+            # global loads at the tile tail.
+            self._sage_v_scale_alloc = SmemAllocation(
+                name=f"{self.name}_sageVScales",
+                size_bytes=staged_v_channel_scale_entries(self.cfg) * 4,
+                alignment=16,
+            )
         allocs = []
         if self._alloc is not None:
             allocs.append(self._alloc)
@@ -334,6 +355,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             allocs.append(self._cluster_mbarrier_alloc)
         if self._kv_tile_256_exchange_alloc is not None:
             allocs.append(self._kv_tile_256_exchange_alloc)
+        if self._sage_v_scale_alloc is not None:
+            allocs.append(self._sage_v_scale_alloc)
         return allocs
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
@@ -896,6 +919,47 @@ class TmemCorrResource(DecodeGenResourceBase):
         return merged_vals
 
     @cute.jit
+    def _apply_sage_channel_scales(
+        self,
+        output_vals: cutlass.Array,
+        norm_scale: Float32,
+        *,
+        first_col: Int32,
+        count: Constexpr[int],
+    ) -> Float32:
+        """Dequantize ``count`` normalized output columns per V channel in place.
+
+        Sage attention multiplies column ``c`` by ``norm_scale * sfV[c]`` and
+        adds ``v_mean[c]`` when V was quantized around its channel mean, so the
+        normalization is consumed here and the caller continues with a unit
+        scale. The scales come from the SMEM copy staged by
+        ``init_epilogue_state``. Without Sage attention the values and
+        ``norm_scale`` pass through untouched.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(not cfg.use_sage_attention):
+            return norm_scale
+        v_scales, v_means = load_staged_v_channel_scales(
+            cfg,
+            self._sage_v_scales,
+            first_col=first_col,
+            count=count,
+        )
+        for pair_idx in cutlass.range_constexpr(count // 2):
+            val_base = pair_idx * 2
+            scaled = ffma2(
+                (output_vals[val_base], output_vals[val_base + 1]),
+                fmul2(
+                    (norm_scale, norm_scale),
+                    (v_scales[val_base], v_scales[val_base + 1]),
+                ),
+                (v_means[val_base], v_means[val_base + 1]),
+            )
+            output_vals[val_base] = scaled[0]
+            output_vals[val_base + 1] = scaled[1]
+        return Float32(1.0)
+
+    @cute.jit
     def _store_final_o_columns(
         self,
         final_o_dst,
@@ -1253,16 +1317,49 @@ class TmemCorrResource(DecodeGenResourceBase):
                 shape=(self._kv_tile_256_exchange_entries(),),
                 addrspace=3,
             )
+        if cutlass.const_expr(
+            context is not None
+            and context.smem_base is not None
+            and self._sage_v_scale_alloc is not None
+        ):
+            self._sage_v_scales = cutlass.Array(
+                context.smem_base.data_ptr() + self._sage_v_scale_alloc.offset,
+                dtype=Float32,
+                shape=(staged_v_channel_scale_entries(self.cfg),),
+                addrspace=3,
+            )
         return {}
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def init_epilogue_state(self, stage_info: StageInfo) -> None:
-        """Preserve the correction init schedule slot after eager SMEM binding."""
-        # ProdAuxWork: function variables are materialized before TaskManager.run()
-        # so cluster mbarriers are visible before peer async stores. Keep this as
-        # a captured-schedule placeholder for existing task structure.
-        return
+        """Stage the work tile's Sage V channel scales before the stats pipeline.
+
+        Function variables are materialized before ``TaskManager.run()`` so
+        cluster mbarriers are visible before peer async stores; this slot
+        keeps the captured schedule structure and, with Sage attention, lets
+        the epilogue owner copy the tile's KV head ``sfV`` and ``v_mean`` into
+        SMEM while no output is pending. The KV256 tail orders the copy before
+        its reads with the stats exchange barrier and protects the next tile's
+        copy with its closing barrier; the Q128 tail adds both barriers itself.
+        """
+        # ProdAuxWork: no pipeline resource is touched here.
+        cfg = self.cfg
+        if cutlass.const_expr(
+            not (cfg.use_sage_attention and self._owns_final_epilogue())
+        ):
+            return
+        task_cache = _decode_gen_task_cache(stage_info)
+        logical_h_k_idx, _ = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
+        stage_v_channel_scales(
+            cfg,
+            self.v_scale_ptr,
+            self.v_mean_ptr,
+            self._sage_v_scales,
+            kv_head_idx=logical_h_k_idx,
+            thread_idx=task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX],
+            num_threads=cfg.correction_barrier_threads,
+        )
 
     @cute.jit
     def _sync_gmem_split_reducers(
@@ -2441,10 +2538,16 @@ class TmemCorrResource(DecodeGenResourceBase):
                     mem_space=1,
                     dtype=Int32,
                 )
+                column_norm_scale = self._apply_sage_channel_scales(
+                    merged_vals,
+                    norm_scale,
+                    first_col=Int32(output_col),
+                    count=16,
+                )
                 self._store_final_o_columns(
                     final_o_dst,
                     merged_vals,
-                    norm_scale,
+                    column_norm_scale,
                     count=16,
                     sector_aligned=o_is_32b_aligned,
                 )
@@ -3217,6 +3320,13 @@ class TmemCorrResource(DecodeGenResourceBase):
                     )
             return
 
+        if cutlass.const_expr(cfg.use_sage_attention):
+            # Every lane reads all staged V channel scales written by the
+            # other correction lanes in init_epilogue_state.
+            prims.barrier_cta_sync(
+                self.store_barrier_id,
+                thread_count=cfg.correction_barrier_threads,
+            )
         regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
         for store_idx in cutlass.range_constexpr(output_pair_regs // 4):
             chunk_col = store_idx * 8
@@ -3281,6 +3391,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                         final_pair1[1],
                     )
             else:
+                final_vals = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
                 for chunk_idx in cutlass.range_constexpr(4):
                     reg_base = chunk_idx * 2
                     if cutlass.const_expr(cfg.num_insts_kv == 1):
@@ -3297,13 +3408,24 @@ class TmemCorrResource(DecodeGenResourceBase):
                                 (o0_vals[reg_base], o0_vals[reg_base + 1]),
                             ),
                         )
+                    final_vals[reg_base] = final_pair[0]
+                    final_vals[reg_base + 1] = final_pair[1]
+                # The per-instance scales above already normalized the row.
+                self._apply_sage_channel_scales(
+                    final_vals,
+                    Float32(1.0),
+                    first_col=col_base + Int32(chunk_col),
+                    count=8,
+                )
+                for chunk_idx in cutlass.range_constexpr(4):
+                    reg_base = chunk_idx * 2
                     if cutlass.const_expr(cfg.use_bf16_output):
                         regs_o_chunk[chunk_idx] = _pack_float2_to_bf16(
-                            final_pair[0], final_pair[1]
+                            final_vals[reg_base], final_vals[reg_base + 1]
                         )
                     else:
                         regs_o_chunk[chunk_idx] = _pack_float2_to_fp16(
-                            final_pair[0], final_pair[1]
+                            final_vals[reg_base], final_vals[reg_base + 1]
                         )
             dst_ptr = cutlass.inttoptr(
                 self.o_ptr.toint()
@@ -3325,6 +3447,12 @@ class TmemCorrResource(DecodeGenResourceBase):
                         regs_o_chunk.data_ptr().load(count=4, alignment=4),
                         alignment=16,
                     )
+        if cutlass.const_expr(cfg.use_sage_attention):
+            # The next persistent work tile restages the scales in place.
+            prims.barrier_cta_sync(
+                self.store_barrier_id,
+                thread_count=cfg.correction_barrier_threads,
+            )
         return
 
     @cute.jit

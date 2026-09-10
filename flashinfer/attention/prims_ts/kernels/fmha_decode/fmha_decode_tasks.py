@@ -2816,20 +2816,21 @@ def _softmax_schedule_body(
     smem_p.init_compute_state()
     if sparse_softmax_metadata is not None:
         sparse_softmax_metadata.init_read_state()
-    # The block-sparse loop takes the register-resident route payload and the
-    # proxy P pass its route kind; the work framework routes arguments by
-    # token and rejects ``None``, so each combination is its own work callable.
+    # The Sage loops take the tile's dequantization multipliers, the
+    # block-sparse loops the register-resident route payload and the proxy
+    # P pass its route kind; the work framework routes arguments by token
+    # and rejects ``None``, so each combination is its own work callable.
     use_sparse = sparse_softmax_metadata is not None
-    compute_softmax_loop = (
-        tmem_s.compute_block_sparse_softmax_loop
-        if use_sparse
-        else tmem_s.compute_softmax_loop
-    )
-    compute_p_fragments = (
-        smem_p.compute_proxy_route_p_fragments
-        if cfg.use_block_sparse_proxy_routes
-        else smem_p.compute_p_fragments
-    )
+    compute_softmax_loop = {
+        (False, False): tmem_s.compute_softmax_loop,
+        (False, True): tmem_s.compute_sage_softmax_loop,
+        (True, False): tmem_s.compute_block_sparse_softmax_loop,
+    }[(use_sparse, cfg.use_sage_attention)]
+    compute_p_fragments = {
+        (False, False): smem_p.compute_p_fragments,
+        (False, True): smem_p.compute_sage_p_fragments,
+        (True, False): smem_p.compute_proxy_route_p_fragments,
+    }[(cfg.use_block_sparse_proxy_routes, cfg.use_sage_attention)]
 
     with domain_loop(0, domain, 1, unroll=1) as d:
         if sparse_softmax_metadata is not None:
@@ -2848,6 +2849,10 @@ def _softmax_schedule_body(
                 sparse_token_word3,
             ) = sparse_softmax_metadata.load_route()
             sparse_softmax_metadata.release()
+        if cutlass.const_expr(cfg.use_sage_attention):
+            # Issue the tile's scale loads ahead of the score wait so their
+            # latency hides behind the QK MMA.
+            sage_scale_arr = tmem_s.load_sage_scales()
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()
         softmax_loop_kwargs = dict(
@@ -2856,6 +2861,8 @@ def _softmax_schedule_body(
             new_max_arr=new_max_arr,
             s_arr=s_arr,
         )
+        if cutlass.const_expr(cfg.use_sage_attention):
+            softmax_loop_kwargs["sage_scale_arr"] = sage_scale_arr
         if sparse_softmax_metadata is not None:
             softmax_loop_kwargs.update(
                 sparse_origin0=sparse_origin0,
@@ -2887,6 +2894,8 @@ def _softmax_schedule_body(
             # One rolled loop streams every K32 probability fragment; the
             # fragment body exists once in the instruction stream.
             p_fragments_kwargs = dict(new_max_arr=new_max_arr)
+            if cutlass.const_expr(cfg.use_sage_attention):
+                p_fragments_kwargs["sage_scale_arr"] = sage_scale_arr
             if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
                 p_fragments_kwargs.update(
                     route_flags=sparse_route_flags,

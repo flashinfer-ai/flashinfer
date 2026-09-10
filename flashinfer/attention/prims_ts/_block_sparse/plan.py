@@ -24,6 +24,8 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from ..decode import _dtype_key
+from ..sage import SageAttentionParams
 from .common import _SIGNED_INT32_MAX, _block_sparse_proxy_summary_geometry
 from .compiler import _get_compiled_block_sparse
 from .config import (
@@ -31,6 +33,7 @@ from .config import (
     _resolve_block_sparse_launch_spec,
 )
 from .prepared import _BlockSparseRouteLayout
+from .runtime import sage_launch_args, sage_scale_tensors
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -102,6 +105,9 @@ class _BlockSparsePlanState:
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
     page_size: int | None
+    # Physical Q tile selected by the plan; Sage validation bounds the Q scale
+    # block size by it.
+    tile_size_q: int
 
     # Only an unmasked block-sparse specialization needs a shape-correct ABI
     # placeholder. A dense contiguous plan runs without a prepare kernel and
@@ -121,6 +127,14 @@ class _BlockSparsePlanState:
     # All plan-stream work happens-before run after waiting on this event.
     ready_event: torch.cuda.Event
     ready_stream_handle: int
+
+    # Sage attention scales bound at plan time; ``run()`` validates the tensors
+    # again before every launch. The launch tuple is in adapter ABI order and
+    # the named tuple lists the live tensors whose lifetime and overlap the
+    # runs track; both are empty without Sage.
+    sage: SageAttentionParams | None = None
+    sage_launch_args: tuple[torch.Tensor, ...] = ()
+    sage_tensors: tuple[tuple[str, torch.Tensor], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -262,6 +276,7 @@ def _build_block_sparse_plan_state(
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     use_block_sparse: bool = True,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparsePlanState:
     """Build one format- and route-specialized plan atomically."""
 
@@ -292,6 +307,10 @@ def _build_block_sparse_plan_state(
             sparse_format=sparse_format,
             use_proxy_routes=use_proxy_routes,
             use_block_sparse=use_block_sparse,
+            out_dtype_key=(None if sage is None else _dtype_key(static.output_dtype)),
+            sage_q_block_size=static.sage_q_block_size,
+            sage_k_block_size=static.sage_k_block_size,
+            sage_v_mean=static.sage_v_mean,
         )
         compiled = _get_compiled_block_sparse(spec.compile_key)
         routes = (
@@ -325,6 +344,7 @@ def _build_block_sparse_plan_state(
         output_dtype=static.output_dtype,
         use_kv_valid_bits=static.use_kv_valid_bits,
         page_size=static.page_size,
+        tile_size_q=static.q_tile_size,
         dummy_kv_valid_bits=None if routes is None else routes.dummy_kv_valid_bits,
         row_route_offsets=None if routes is None else routes.row_route_offsets,
         route_workspace=None if routes is None else routes.route_workspace,
@@ -333,6 +353,9 @@ def _build_block_sparse_plan_state(
         compiled=compiled,
         ready_event=ready_event,
         ready_stream_handle=plan_stream.cuda_stream,
+        sage=sage,
+        sage_launch_args=sage_launch_args(sage),
+        sage_tensors=sage_scale_tensors(sage),
     )
 
 

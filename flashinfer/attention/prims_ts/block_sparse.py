@@ -78,6 +78,7 @@ from .decode import (
     _normalize_paged_kv_cache,
     _resolve_cuda_device,
 )
+from .sage import SageAttentionParams
 
 
 class _BlockSparseWrapperBase:
@@ -160,6 +161,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
+        sage: SageAttentionParams | None = None,
     ) -> None:
         """Choose a legal profile for the selected decode mode.
 
@@ -177,11 +179,23 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         supports two of those profiles: Q64/KV256 in ``torch.float16`` or
         ``torch.bfloat16``, and Q128/KV128 in ``torch.float16``. Planning any
         other dense combination raises before device work.
+
+        ``sage`` enables Sage attention on a dense plan: Q and K are
+        ``torch.float8_e4m3fn`` with the per-block scales of
+        :class:`SageAttentionParams`, V is ``torch.float8_e4m3fn`` with
+        per-channel scales, and the output is ``torch.bfloat16`` (the default)
+        or ``torch.float16``. Both dense profiles accept it. The scale block
+        sizes are compile-time; the scale tensors are bound to the plan and
+        validated again by every ``run()``.
         """
 
         if not isinstance(use_block_sparse, bool):
             raise TypeError("use_block_sparse must be a bool")
         if use_block_sparse:
+            if sage is not None:
+                raise NotImplementedError(
+                    "Sage attention is not supported by block-sparse plans yet"
+                )
             if max_blocks_per_row is None:
                 raise ValueError("max_blocks_per_row is required by a sparse plan")
         else:
@@ -214,6 +228,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
             o_data_type=o_data_type,
+            sage=sage,
         )
 
     def _publish_plan(
@@ -224,6 +239,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         use_block_sparse: bool,
         sparse_format: Literal["bsr", "bitmask"] = "bsr",
         use_proxy_routes: bool = False,
+        sage: SageAttentionParams | None = None,
     ) -> None:
         """Build one revision on the plan stream and publish it atomically."""
 
@@ -242,6 +258,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
                 use_block_sparse=use_block_sparse,
+                sage=sage,
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
@@ -268,6 +285,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype | None,
         o_data_type: torch.dtype | None,
+        sage: SageAttentionParams | None,
     ) -> None:
         """Validate the profile of the selected mode and publish one revision.
 
@@ -298,6 +316,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
             max_blocks_per_row=(
                 max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
             ),
+            sage=sage,
             use_block_sparse=use_block_sparse,
         )
         if use_proxy_routes and static.mask_type != "dense":
@@ -308,6 +327,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
             use_block_sparse=use_block_sparse,
             sparse_format=sparse_format,
             use_proxy_routes=use_proxy_routes,
+            sage=sage,
         )
 
     @flashinfer_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
@@ -337,8 +357,11 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         enqueued asynchronously on the caller's current CUDA stream.
 
         A dense contiguous plan attends over the whole K/V sequence and rejects
-        every routing argument below; all of them must remain ``None``. Tracing
-        a dense run has no trace template and raises ``NotImplementedError``.
+        every routing argument below; all of them must remain ``None``. A dense
+        plan with Sage attention consumes the scale tensors bound at
+        ``plan()`` time after validating their shape, dtype, device and
+        contiguity again. A dense run has no trace template; tracing it raises
+        ``NotImplementedError``.
 
         A BSR plan consumes compact Int32 ``block_indptr`` with shape
         ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and compact Int32

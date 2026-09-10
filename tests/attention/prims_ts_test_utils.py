@@ -25,14 +25,18 @@ import math
 import pytest
 import torch
 
+from flashinfer.attention.prims_ts.sage import SageAttentionParams, flat_scale_numel
+
 HEAD_DIM = 128
 FP8 = torch.float8_e4m3fn
 Patterns = tuple[tuple[tuple[tuple[int, ...], ...], ...], ...]
 
+# The block-sparse and Sage kernels run on SM100 and SM103; the dense decode
+# tests keep their stricter SM100-only signoff marker.
 REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="PrimTS block-sparse attention requires SM100 or SM103",
+    reason="PrimTS block-sparse and Sage attention require SM100 or SM103",
 )
 
 
@@ -50,6 +54,94 @@ def dense_stream_columns(kv_tile_size: int, device: torch.device) -> list[torch.
             torch.cat((tile_columns[64:128], tile_columns[192:256])),
         ]
     return [tile_columns]
+
+
+def make_sage_decode_config(
+    *,
+    tile_size_q: int,
+    tile_size_kv: int,
+    qkv_dtype=None,
+    o_dtype=None,
+    sage_args: dict[str, object] | None = None,
+    mask_type: str = "dense",
+    qkv_layout: str = "contiguousKv",
+    num_tokens_per_page: int = 32,
+    split_kv_mode: str = "disabled",
+    splits_kv: int = 1,
+):
+    """Build a dense contiguous Sage profile the way the dense wrapper does.
+
+    ``qkv_dtype`` defaults to E4M3 and ``o_dtype`` to BF16; ``sage_args``
+    override or extend the profile arguments.
+    """
+
+    from cutlass import BFloat16, Float8E4M3FN
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        make_decode_config,
+    )
+
+    args: dict[str, object] = {
+        "use_keeps_mma_ab": True,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": tile_size_kv,
+        "groups_tokens_heads_q": True,
+        "sage_k_block_size": 16,
+        "sage_q_block_size": 1,
+    }
+    if sage_args is not None:
+        args.update(sage_args)
+    heads_q_per_kv = 1 if tile_size_q == 64 else 8
+    return make_decode_config(
+        headdim=HEAD_DIM,
+        args=args,
+        seq_len_q=64 if tile_size_q == 64 else 16,
+        seq_len_kv=1000,
+        batch_size=2,
+        num_heads_q=8,
+        num_heads_kv=8 // heads_q_per_kv,
+        qkv_dtype=Float8E4M3FN if qkv_dtype is None else qkv_dtype,
+        o_dtype=BFloat16 if o_dtype is None else o_dtype,
+        qkv_layout=qkv_layout,
+        num_tokens_per_page=num_tokens_per_page,
+        split_kv_mode=split_kv_mode,
+        splits_kv=splits_kv,
+        mask_type=mask_type,
+        auto_tuner=False,
+    )
+
+
+def make_sage_params(
+    *,
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int = HEAD_DIM,
+    q_block_size: int = 1,
+    k_block_size: int = 16,
+    with_mean: bool = False,
+    device: torch.device | str = "cpu",
+) -> SageAttentionParams:
+    """Return random positive scales of one geometry in the flat layout."""
+
+    def flat_scales(num_heads: int, seq_len: int, block_size: int) -> torch.Tensor:
+        return torch.rand(
+            (num_heads, flat_scale_numel(batch_size, seq_len, block_size)),
+            device=device,
+        )
+
+    return SageAttentionParams(
+        q_scale=flat_scales(num_qo_heads, seq_len_q, q_block_size),
+        k_scale=flat_scales(num_kv_heads, seq_len_kv, k_block_size),
+        v_scale=torch.rand((num_kv_heads, head_dim), device=device),
+        v_mean=(
+            torch.randn((num_kv_heads, head_dim), device=device) if with_mean else None
+        ),
+        q_block_size=q_block_size,
+        k_block_size=k_block_size,
+    )
 
 
 def widest_bsr_row(patterns: Patterns) -> int:
@@ -140,3 +232,14 @@ def pack_token_mask(
             words[token_idx // 32] |= 1 << (token_idx % 32)
         packed_by_batch.append(words)
     return torch.tensor(packed_by_batch, device=device, dtype=torch.uint32)
+
+
+def heavy_tailed(
+    shape: tuple[int, ...], *, device: torch.device, magnitude: float = 1.0
+) -> torch.Tensor:
+    """Return BF16 normal values with log-uniform per-element spread."""
+
+    x = torch.randn(shape, device=device) * magnitude
+    return (x * torch.exp((torch.rand(shape, device=device) - 0.5) * 3.2)).to(
+        torch.bfloat16
+    )

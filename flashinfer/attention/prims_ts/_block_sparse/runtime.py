@@ -28,6 +28,7 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
+from ..sage import SageAttentionParams, validate_sage_params
 from .common import _SIGNED_INT32_MAX
 
 if TYPE_CHECKING:
@@ -82,6 +83,8 @@ class _BlockSparseRunArgs:
     exact_block_bits: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
+    # Plan-bound Sage scale tensors whose lifetimes the launch extends.
+    sage_tensors: tuple[torch.Tensor, ...] = ()
 
 
 def _validate_metadata_tensor(
@@ -448,6 +451,23 @@ def validate_block_sparse_run(
         if plan_tensor is not None:
             overlap_inputs.append((name, plan_tensor))
 
+    if state.sage is not None:
+        validate_sage_params(
+            state.sage,
+            batch_size=state.batch_size,
+            seq_len_q=state.seq_len_q,
+            seq_len_kv=state.seq_len_kv,
+            num_qo_heads=state.num_qo_heads,
+            num_kv_heads=state.num_kv_heads,
+            head_dim=state.head_dim,
+            tile_size_q=state.tile_size_q,
+            q_dtype=state.q_dtype,
+            kv_dtype=state.kv_dtype,
+            out_dtype=state.output_dtype,
+            device=state.device,
+        )
+        overlap_inputs.extend(state.sage_tensors)
+
     effective_scale = _validate_scale(
         1.0 / math.sqrt(state.head_dim) if sm_scale is None else sm_scale,
         "sm_scale",
@@ -477,6 +497,43 @@ def validate_block_sparse_run(
         kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
         paged_kv=paged_kv,
+        sage_tensors=tuple(tensor for _name, tensor in state.sage_tensors),
+    )
+
+
+def sage_scale_tensors(
+    sage: SageAttentionParams | None,
+) -> tuple[tuple[str, torch.Tensor], ...]:
+    """Return the named scale tensors bound to one plan, in launch order."""
+
+    if sage is None:
+        return ()
+    return tuple(
+        (name, tensor)
+        for name, tensor in (
+            ("q_scale", sage.q_scale),
+            ("k_scale", sage.k_scale),
+            ("v_scale", sage.v_scale),
+            ("v_mean", sage.v_mean),
+        )
+        if tensor is not None
+    )
+
+
+def sage_launch_args(sage: SageAttentionParams | None) -> tuple[torch.Tensor, ...]:
+    """Return the scale tensors a Sage adapter consumes, in ABI order.
+
+    The V mean slot is always bound so the adapter signature stays fixed;
+    without ``v_mean`` the kernel never reads it and ``v_scale`` fills it.
+    """
+
+    if sage is None:
+        return ()
+    return (
+        sage.q_scale,
+        sage.k_scale,
+        sage.v_scale,
+        sage.v_scale if sage.v_mean is None else sage.v_mean,
     )
 
 
@@ -502,6 +559,8 @@ def record_block_sparse_run_args(
     if run_args.kv_valid_bits_is_live:
         assert run_args.kv_valid_bits is not None
         run_args.kv_valid_bits.record_stream(stream)
+    for tensor in run_args.sage_tensors:
+        tensor.record_stream(stream)
     if run_args.paged_kv is not None:
         run_args.paged_kv.paged_kv_indptr.record_stream(stream)
         run_args.paged_kv.paged_kv_indices.record_stream(stream)
@@ -523,6 +582,7 @@ def launch_block_sparse(
             run_args.k,
             run_args.v,
             run_args.out,
+            *state.sage_launch_args,
             run_args.sm_scale,
         )
     elif run_args.paged_kv is not None:
@@ -627,6 +687,8 @@ __all__ = [
     "_PagedKVStorage",
     "launch_block_sparse",
     "record_block_sparse_run_args",
+    "sage_launch_args",
+    "sage_scale_tensors",
     "validate_block_sparse_metadata",
     "validate_block_sparse_run",
     "validate_paged_kv_metadata",
