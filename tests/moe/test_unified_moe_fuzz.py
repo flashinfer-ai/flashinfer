@@ -66,8 +66,9 @@ comparison adds no pass/fail power, only redundancy. See the design discussion.)
 Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` x ``logits_dtype``):
   * **pre-routed** (RoutingInputMode.PackedPrecomputed): the host computes the top-k per method and
     feeds packed indices -- the original path.
-  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4 receives separate
-    int32 ids + BF16 or FP32 weights without packed-id construction.
+  * **unpacked pre-routed** (RoutingInputMode.UnpackedPrecomputed): TRTLLM FP4, BF16,
+    and block-FP8 receive separate int32 ids + BF16 or FP32 weights without packed-id
+    construction.
   * **in-kernel** (RoutingInputMode.FromLogits): the kernel routes from raw logits per
     RoutingConfig.method -- reaches the bug cluster the pre-routed harness structurally can't:
     DeepSeekV3 group-topk + bias (#2575), all-negative logits (#2822), fp32 router logits (#2796),
@@ -77,9 +78,9 @@ Routing coverage (three modes, axes ``routing_method`` x ``routing_input_mode`` 
     single-GPU (non-EP) here; EP + in-kernel routing semantics are a separate validation.
 
 Coverage today: NVFP4, BF16, block/per-tensor FP8, MXFP4/W4A16, and MxInt4.
-CuteDSL NVFP4 is pre-routed-only; FromLogits and UnpackedPrecomputed restrict
-dispatch to capable TRTLLM runners. MxInt4 covers packed and BF16-FromLogits
-routing.
+CuteDSL NVFP4 is pre-routed-only; FromLogits restricts to capable TRTLLM
+runners. UnpackedPrecomputed is wired for TRTLLM FP4, BF16, and block-FP8.
+MxInt4 covers packed and BF16-FromLogits routing.
 
 ENABLED BY DEFAULT: this suite runs like any other test. Unsupported configurations skip at the
 no-wired-backend check. FLASHINFER_UMOE_FUZZ=0 remains the emergency waiver.
@@ -216,6 +217,7 @@ from flashinfer.fused_moe.api import (
     MoEConfig,
     MoEFinalizeConfig,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     TrtllmBf16Config,
@@ -1354,6 +1356,22 @@ def _handler_for(cfg):
     return _HANDLER_BY_ID[cfg.variant]
 
 
+def _quant_config_for_handler(handler) -> QuantConfig:
+    """Expand a fuzz handler into three-axis ``QuantConfig``.
+
+    ``QuantVariant.W4A16`` is TRTLLM/CUTLASS MXFP4×BF16 except the b12x contract
+    handler, which uses NVFP4 weights.
+    """
+    if handler.variant is QuantVariant.W4A16:
+        w4a16_weight = (
+            QuantFormat.NVFP4
+            if B12xW4A16Config in handler.candidate_configs
+            else QuantFormat.MXFP4
+        )
+        return QuantConfig.from_variant(handler.variant, w4a16_weight=w4a16_weight)
+    return QuantConfig(variant=handler.variant)
+
+
 def _activation_for(cfg):
     return {
         "swiglu": SwiGLU(),
@@ -1667,12 +1685,12 @@ def _gen(seed):
 
     activation = "swiglu"
     if variant == "bf16":
-        # FromLogits and EP require TRTLLM, whose BF16 cubins expose SwiGLU
-        # and ReLU2. CUTLASS-only activations are valid only for non-EP
-        # pre-routed cases.
+        # FromLogits, unpacked routing, and EP require TRTLLM, whose BF16 cubins
+        # expose SwiGLU and ReLU2. CUTLASS-only activations are valid only for
+        # non-EP packed pre-routed cases.
         activation = rng.choice(
             ("swiglu", "relu2")
-            if fromlogits or offset != 0 or local != ne
+            if fromlogits or unpacked or offset != 0 or local != ne
             else ("swiglu", "relu2", "geglutanh", "swiglustep", "situ")
         )
     return Cfg(
@@ -2198,7 +2216,7 @@ def test_random_seed_stream_is_unchanged():
     payload = "\n".join(repr(_gen(i)) for i in range(160)).encode()
     assert (
         hashlib.sha256(payload).hexdigest()
-        == "cff06d91b524c74c66863e4078e24303b431eeffbedc94b3237390bccd837e70"
+        == "14cf80f6bc0bf77170acc447d4b80603dafdea02eef4fe07f567cdab7b0d6242"
     )
 
 
@@ -2235,10 +2253,13 @@ def test_contract_curated_seeds_match_declared_capabilities():
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]
         runner_type = _BACKEND_RUNNERS[config_type]
-        assert handler.variant in runner_type.supported_quant_variants
+        assert (
+            _quant_config_for_handler(handler).pair
+            in runner_type.supported_quant_variants
+        )
         by_quant = runner_type.supported_activation_classes_by_quant
         activations = (
-            by_quant[handler.variant]
+            by_quant[_quant_config_for_handler(handler).pair]
             if by_quant
             else runner_type.supported_activation_classes
         )
@@ -2727,9 +2748,8 @@ def test_unified_moe_fuzz(cfg):
         # so it cannot serve a logits-only pack and would compare apples to oranges).
         wired_backends = [B for B in wired_backends if B in _FROMLOGITS_BACKENDS]
     elif cfg.is_unpacked:
-        # Exact TRTLLM Mode 3 is currently wired only through the FP4 runner.
-        # Backends that accept separate tensors through their own ABI are not
-        # implementations of RoutingInputMode.UnpackedPrecomputed.
+        # Keep only runners that implement UnpackedPrecomputed (TRTLLM FP4, BF16,
+        # and block-FP8). MxInt4 stays packed/FromLogits to match the flat API.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
     if not cfg.do_finalize:
         # Only TRTLLM returns unfinalized intermediates; like the EP filter
@@ -2904,7 +2924,7 @@ def test_unified_moe_fuzz(cfg):
             topk_group=cfg.topk_group or None,
             routed_scaling_factor=cfg.routed_scaling or None,
         ),
-        quant=QuantConfig(variant=handler.variant),
+        quant=_quant_config_for_handler(handler),
         experts=ExpertConfig(
             intermediate_size=cfg.intermediate,
             local_num_experts=cfg.n_local,
@@ -3265,7 +3285,7 @@ def test_autotune_cache_coherence(base, variant):
     layer = MoELayer(
         MoEConfig(
             routing=RoutingConfig(num_experts=E, top_k=top_k),
-            quant=QuantConfig(variant=variant),
+            quant=QuantConfig.from_variant(variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
             activation=SwiGLU(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),

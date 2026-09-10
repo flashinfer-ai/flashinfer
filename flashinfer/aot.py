@@ -76,24 +76,10 @@ from .jit.cake_kda_decode import (
     gen_cake_kda_decode_module,
 )
 from .jit.flash_kda import (
-    FlashKDATarget,
-    gen_flash_kda_bt16_chain_m64_s7_module,
-    gen_flash_kda_bt16_chain_m64_s8_module,
-    gen_flash_kda_bt16_chain_m64_s9_module,
-    gen_flash_kda_bt16_prepare_chain_m64_s8_module,
-    gen_flash_kda_bt16_prepare_beta_tma_module,
-    gen_flash_kda_bt16_prepare_module,
-    gen_flash_kda_m64_module,
-    gen_flash_kda_m128_module,
-    gen_flash_kda_m128_tensor_state_decay_module,
-    gen_flash_kda_m128_h12_long_module,
-    gen_flash_kda_m128_h12_short_module,
+    GeneratedFlashKDATarget,
+    gen_flash_kda_generated_module,
     gen_flash_kda_m128_n16_checkpoint_module,
-    gen_flash_kda_m128_n16_module,
-    gen_flash_kda_m128_n16_short_module,
-    gen_flash_kda_piece_persistent_m128_module,
-    gen_flash_kda_persistent_m128_module,
-    gen_flash_kda_small_bh_m128_module,
+    get_flash_kda_generated_variant_ids,
 )
 from .jit.flash_kda_backward import gen_flash_kda_backward_module
 from .jit.flash_kda_training import gen_flash_kda_training_module
@@ -123,14 +109,17 @@ from .jit.fused_moe import (
 from .jit.cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module,
 )
-from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.bgmv_moe import (
+    BGMV_MOE_SUPPORTED_MAJOR_VERSIONS,
+    gen_bgmv_moe_module,
+)
 from .jit.blackwell_bgmv_moe import (
     BLACKWELL_BGMV_MOE_DTYPES,
     BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
     gen_blackwell_bgmv_moe_module,
 )
 from .jit.monomoe import gen_monomoe_module
-from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from .jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from .jit.gemm import (
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
@@ -153,7 +142,15 @@ from .jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from .jit.mhc import gen_mhc_module
-from .jit.mla import gen_mla_module, gen_sparse_mla_sm120_module
+from .jit.cake_minimax_h3_mxfp8 import (
+    MiniMaxH3Mxfp8Target,
+    gen_minimax_h3_mxfp8_aot_modules,
+)
+from .jit.mla import (
+    gen_mla_module,
+    gen_sparse_mla_nvfp4_sm120_module,
+    gen_sparse_mla_sm120_module,
+)
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -395,7 +392,7 @@ def gen_attention(
         from .jit.attention import gen_batch_prefill_attention_sink_module
 
         for dtype in f16_dtype_:
-            for backend in ["fa2", "fa3"]:
+            for backend in ["fa2"] + (["fa3"] if has_sm90 else []):
                 for use_swa in [True, False]:
                     yield gen_batch_prefill_attention_sink_module(
                         backend=backend,
@@ -530,6 +527,7 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
@@ -538,8 +536,8 @@ def gen_all_modules(
     has_flash_kda_prefill_sm100a = sm_capabilities.get(
         "flash_kda_prefill_sm100a", False
     )
-    has_flash_kda_prefill_sm100f = sm_capabilities.get(
-        "flash_kda_prefill_sm100f", False
+    has_flash_kda_prefill_sm103a = sm_capabilities.get(
+        "flash_kda_prefill_sm103a", False
     )
     has_cake_kda_prefill_sm100a = sm_capabilities.get("cake_kda_prefill_sm100a", False)
     has_cake_kda_prefill_sm103a = sm_capabilities.get("cake_kda_prefill_sm103a", False)
@@ -604,35 +602,29 @@ def gen_all_modules(
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
 
-    # CUDA 12.8 predates the SM100-family target and retains one exact B200
-    # cubin per variant. CUDA 12.9+ registers one family cubin per variant.
-    flash_kda_targets: tuple[tuple[FlashKDATarget, bool], ...] = (
+    minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_target, enabled in minimax_h3_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
+
+    # Register the physical source-closed portfolio independently for each
+    # exact Blackwell target. Each JitSpec contains one generated selector TU.
+    # The checkpoint route remains as the only legacy fallback because it is
+    # intentionally outside the generated portfolio.
+    flash_kda_targets: tuple[tuple[GeneratedFlashKDATarget, bool], ...] = (
         ("sm100a", has_flash_kda_prefill_sm100a),
-        ("sm100f", has_flash_kda_prefill_sm100f),
+        ("sm103a", has_flash_kda_prefill_sm103a),
     )
     for flash_kda_target, enabled in flash_kda_targets:
         if enabled:
             jit_specs.extend(
-                [
-                    gen_flash_kda_m64_module(flash_kda_target),
-                    gen_flash_kda_m128_module(flash_kda_target),
-                    gen_flash_kda_m128_tensor_state_decay_module(flash_kda_target),
-                    gen_flash_kda_m128_h12_short_module(flash_kda_target),
-                    gen_flash_kda_m128_h12_long_module(flash_kda_target),
-                    gen_flash_kda_m128_n16_module(flash_kda_target),
-                    gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target),
-                    gen_flash_kda_m128_n16_short_module(flash_kda_target),
-                    gen_flash_kda_piece_persistent_m128_module(flash_kda_target),
-                    gen_flash_kda_small_bh_m128_module(flash_kda_target),
-                    gen_flash_kda_bt16_prepare_module(flash_kda_target),
-                    gen_flash_kda_bt16_prepare_beta_tma_module(flash_kda_target),
-                    gen_flash_kda_bt16_chain_m64_s7_module(flash_kda_target),
-                    gen_flash_kda_bt16_chain_m64_s8_module(flash_kda_target),
-                    gen_flash_kda_bt16_chain_m64_s9_module(flash_kda_target),
-                    gen_flash_kda_bt16_prepare_chain_m64_s8_module(flash_kda_target),
-                ]
+                gen_flash_kda_generated_module(variant_id)
+                for variant_id in get_flash_kda_generated_variant_ids(flash_kda_target)
             )
-            jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
+            jit_specs.append(gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target))
 
     # The Cake-owned unbounded-softplus export remains an exact-architecture
     # artifact on B200 and B300.
@@ -733,7 +725,8 @@ def gen_all_modules(
     if add_moe:
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
-        jit_specs.append(gen_bgmv_moe_module())
+        if has_bgmv_moe:
+            jit_specs.append(gen_bgmv_moe_module())
         if sm_capabilities.get("sm100a_exact", False):
             jit_specs.extend(
                 gen_blackwell_bgmv_moe_module(hidden_size, dtype)
@@ -802,7 +795,7 @@ def gen_all_modules(
             # compiles for all SM12x targets.
             jit_specs.append(gen_cutlass_fused_moe_sm120_module())
             jit_specs.append(gen_gemm_sm120_module())
-            jit_specs.append(gen_gemm_sm120_module_cute_mxfp8())
+            jit_specs.append(gen_gemm_sm120_module_cute())
             jit_specs.append(gen_gemm_sm120_module_cutlass_fp4())
             jit_specs.append(gen_gemm_sm120_module_cutlass_mxfp8())
             jit_specs.append(gen_trtllm_fmha_v2_sm120_module())
@@ -995,6 +988,7 @@ def gen_all_modules(
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
+        jit_specs.append(gen_sparse_mla_nvfp4_sm120_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
@@ -1190,6 +1184,10 @@ def detect_sm_capabilities():
     }
     flash_kda_decode_sm103_arches = {(10, "3a"), (10, "3f")}
     return {
+        "bgmv_moe": any(
+            major in BGMV_MOE_SUPPORTED_MAJOR_VERSIONS
+            for major, _ in compilation_context.TARGET_CUDA_ARCHS
+        ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
@@ -1205,10 +1203,10 @@ def detect_sm_capabilities():
         ),
         "flash_kda_prefill_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
-            and Version("12.8") <= cuda_version < Version("12.9")
+            and cuda_version >= Version("12.8")
         ),
-        "flash_kda_prefill_sm100f": (
-            bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+        "flash_kda_prefill_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
         ),
         "cake_kda_prefill_sm100a": (
