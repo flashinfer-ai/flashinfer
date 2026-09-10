@@ -57,7 +57,7 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 
 | Feature | Support |
 | --- | --- |
-| GPU | Blackwell SM100 and SM103; see validation scope below |
+| GPU | Blackwell SM100/SM103 and Rubin SM107; see validation scope below |
 | Head dimensions | Equal QK/V: 128 or 256; separate contiguous MLA: QK=192, V=128 |
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` |
 | Q/K/V dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
@@ -72,7 +72,8 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 
 The established equal-dimension paths have accuracy and performance signoff
 on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
-its B200 performance remains to be measured.
+its B200 performance remains to be measured. SM107 accuracy and performance
+have not been validated for this extension.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
 one. Causal attention requires `Sq <= Sk` for every request at run time. All
@@ -228,7 +229,11 @@ and the K/V ring. Ring depth follows the complete shared-memory footprint.
 On SM103, unmasked score tiles use LDTM.STAT to combine their TMEM load
 with the FP32 maximum reduction. DSL 4.7 uses a PTX 8.8 compatibility helper;
 DSL versions that expose the native primitive use it directly. SM100 keeps
-the software reduction, and masked tiles still apply masks before reducing.
+the software reduction. Variable-length causal loops classify each tile using
+the current request's right bound. Fully visible tiles retain the hardware
+maximum; boundary tiles mask the loaded scores and recompute their maximum.
+The hardware chunk maxima use a balanced reduction before updating the running
+maximum. This preserves the variable-length plan contract across graph replays.
 Single-query schedules use one O handoff stage so the next PV cannot write
 the accumulator until correction finishes, regardless of statistics storage.
 

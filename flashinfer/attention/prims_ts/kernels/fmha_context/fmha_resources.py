@@ -2851,14 +2851,17 @@ class TmemSPResource(MemoryResource):
         self,
         stage_info: StageInfo,
         row_max: SoftmaxScalar,
+        *,
+        causal_loop_mask: cutlass.Constexpr[bool] = False,
+        q_offset: Int32 = 0,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """LDTM.STAT: fuse S load and per-chunk row_max via tcgen05.ld.red.max.
 
         Instead of loading each S chunk with ``tcgen05.ld`` and then folding
         a per-lane max in registers, use ``tcgen05.ld.red.max`` so the
-        reduction happens as part of the TMEM load.  Only valid on the
-        non-masked path (masked variants must observe raw S values before
-        applying the mask).
+        reduction happens as part of the TMEM load. For causal loop masking,
+        only tiles crossing the runtime right bound need a software reduction
+        of masked scores; wholly visible tiles retain the hardware maximum.
         """
         tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
         tmem_x = self.cfg.tmem_x_load_s
@@ -2901,8 +2904,48 @@ class TmemSPResource(MemoryResource):
             chunk_maxima += (chunk_max,)
         cute.arch.fence_view_async_tmem_load()
         # Reduction results are asynchronous, just like the loaded scores.
-        for chunk_idx in cutlass.range_constexpr(num_chunks):
-            row_max = cute.math.max(row_max, chunk_maxima[chunk_idx])
+        tile_max = cutlass.Vector.from_elements(
+            chunk_maxima, self.cfg.qk_acc_dtype
+        ).reduce("max")
+        row_max = cute.math.max(row_max, tile_max)
+        if cutlass.const_expr(causal_loop_mask):
+            seq_coord, _, _ = _resolve_work_tile_coords(
+                self.cfg, stage_info.work_tile.tile_idx
+            )
+            q_min = (
+                q_offset
+                + seq_coord * self.cfg.cta_tiler[0]
+                + self.q_half * self.cfg.q_tile_m
+            )
+            kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
+            k_max = kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
+            if q_min < k_max:
+                q_idx = (
+                    q_min
+                    + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
+                    + cute.arch.lane_idx()
+                )
+                # Discard the unmasked maxima when any key can be invisible.
+                masked_row_max = old_row_max
+                for chunk_idx in cutlass.range_constexpr(num_chunks):
+                    num_valid = cute.math.min(
+                        cute.math.max(
+                            q_idx - kv_base - chunk_idx * tmem_x + Int32(1),
+                            Int32(0),
+                        ),
+                        Int32(tmem_x),
+                    )
+                    mask = cutlass.vector.create_mask([tmem_x], [num_valid])
+                    neg_inf = cutlass.vector.full_like(
+                        s_data[chunk_idx], Float32(-Float32.inf)
+                    )
+                    s_data[chunk_idx] = cutlass.vector.where(
+                        mask, s_data[chunk_idx], neg_inf
+                    )
+                    masked_row_max = cute.math.max(
+                        masked_row_max, s_data[chunk_idx].reduce("max")
+                    )
+                row_max = masked_row_max
         _tmem_sp_sdata[id(self)] = s_data
         row_max_safe = row_max
         if row_max == -Float32.inf:
@@ -3563,6 +3606,10 @@ class TmemSPResource(MemoryResource):
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Loop stage: apply causal masking for mixed Q right-offset batches."""
+        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+            return self._load_s_chunks_and_reduce_row_max(
+                stage_info, row_max, causal_loop_mask=True, q_offset=q_offset
+            )
         s_data = self._load_s_chunks(stage_info)
         s_data = self._apply_causal_mask_for_kv_tile(
             stage_info, s_data, kv_tile_idx=stage_info.loop_offset, q_offset=q_offset
