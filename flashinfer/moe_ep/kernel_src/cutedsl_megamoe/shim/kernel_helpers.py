@@ -38,6 +38,61 @@ from moe_nvfp4_swapab.runner_common import (
 # --- lazy: pull cutlass transitively; imported only on first attribute access
 #     (which happens inside the backend/test call sites, never at package load).
 _LAZY = {
+    "Contract": ("moe_nvfp4_swapab.contract", "Contract"),
+    "FunctionMapping": ("moe_nvfp4_swapab.contract", "FunctionMapping"),
+    "GpuReleaseFlagBatchTracker": ("src.flag_batch", "GpuReleaseFlagBatchTracker"),
+    "MoESchedConsumer": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedConsumer",
+    ),
+    "MoESchedExtension": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedExtension",
+    ),
+    "MoESchedulerBase": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedulerBase",
+    ),
+    "MoESchedulerParamsBase": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "MoESchedulerParamsBase",
+    ),
+    "MoEWorkTileInfo": ("moe_nvfp4_swapab.moe_persistent_scheduler", "MoEWorkTileInfo"),
+    "Space": ("moe_nvfp4_swapab.contract", "Space"),
+    "SymBufferDeviceBase": ("src.sym_buffer", "SymBufferDeviceBase"),
+    "SymBufferHost": ("src.sym_buffer", "SymBufferHost"),
+    "TokenCommArgs": ("src.token_comm", "TokenCommArgs"),
+    "TokenInPullTokenBackPush": ("src.token_comm", "TokenInPullTokenBackPush"),
+    "TokenSrcMetadata": ("src.token_comm", "TokenSrcMetadata"),
+    "TopkReduce": ("moe_nvfp4_swapab.topk_reduce", "TopkReduce"),
+    "WorkTileState": ("moe_nvfp4_swapab.moe_persistent_scheduler", "WorkTileState"),
+    "_DEFAULT_SCHED_EXT": (
+        "moe_nvfp4_swapab.moe_persistent_scheduler",
+        "_DEFAULT_SCHED_EXT",
+    ),
+    "compute_expert_token_count_from_sizes": (
+        "moe_nvfp4_swapab.moe_utils",
+        "compute_expert_token_count_from_sizes",
+    ),
+    "compute_expert_token_range": (
+        "moe_nvfp4_swapab.moe_utils",
+        "compute_expert_token_range",
+    ),
+    "eval_function_mapping": ("moe_nvfp4_swapab.contract", "eval_function_mapping"),
+    "fmax": ("common.moe_utils", "fmax"),
+    "fmin": ("common.moe_utils", "fmin"),
+    "get_cutedsl_target_arch": ("common.host_utils", "get_cutedsl_target_arch"),
+    "iket": ("src.iket_compat", "iket"),
+    "mbarrier_arrive_expect_tx_on_peer": (
+        "moe_nvfp4_swapab.moe_utils",
+        "mbarrier_arrive_expect_tx_on_peer",
+    ),
+    "rewrite_tensor_shape": ("moe_nvfp4_swapab.moe_utils", "rewrite_tensor_shape"),
+    "spin_wait": ("moe_nvfp4_swapab.moe_utils", "spin_wait"),
+    "store_i32_to_peer_cluster_smem_async": (
+        "moe_nvfp4_swapab.moe_utils",
+        "store_i32_to_peer_cluster_smem_async",
+    ),
     "_make_fp8_tensor": ("moe_mxfp8_glu.mega_runner", "_make_fp8_tensor"),
     "_make_e8m0_scale_tensor": ("moe_mxfp8_glu.mega_runner", "_make_e8m0_scale_tensor"),
     "compute_megamoe_reference_mxfp8": (
@@ -65,6 +120,34 @@ def __getattr__(name):  # PEP 562: keep cutlass out of the import-time path
 
 
 __all__ = [
+    "Contract",  # noqa: F822
+    "FunctionMapping",  # noqa: F822
+    "GpuReleaseFlagBatchTracker",  # noqa: F822
+    "MoESchedConsumer",  # noqa: F822
+    "MoESchedExtension",  # noqa: F822
+    "MoESchedulerBase",  # noqa: F822
+    "MoESchedulerParamsBase",  # noqa: F822
+    "MoEWorkTileInfo",  # noqa: F822
+    "Space",  # noqa: F822
+    "SymBufferDeviceBase",  # noqa: F822
+    "SymBufferHost",  # noqa: F822
+    "TokenCommArgs",  # noqa: F822
+    "TokenInPullTokenBackPush",  # noqa: F822
+    "TokenSrcMetadata",  # noqa: F822
+    "TopkReduce",  # noqa: F822
+    "WorkTileState",  # noqa: F822
+    "_DEFAULT_SCHED_EXT",  # noqa: F822
+    "compute_expert_token_count_from_sizes",  # noqa: F822
+    "compute_expert_token_range",  # noqa: F822
+    "eval_function_mapping",  # noqa: F822
+    "fmax",  # noqa: F822
+    "fmin",  # noqa: F822
+    "get_cutedsl_target_arch",  # noqa: F822
+    "iket",  # noqa: F822
+    "mbarrier_arrive_expect_tx_on_peer",  # noqa: F822
+    "rewrite_tensor_shape",  # noqa: F822
+    "spin_wait",  # noqa: F822
+    "store_i32_to_peer_cluster_smem_async",  # noqa: F822
     # eager
     "Mxfp8BlockSize",
     "Mxfp8ScaleDtype",

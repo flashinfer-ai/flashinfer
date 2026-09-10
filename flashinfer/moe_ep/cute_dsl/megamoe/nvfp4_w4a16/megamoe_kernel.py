@@ -6,7 +6,8 @@
 The local W4A16 helpers load packed weights and block scales, then decode
 BF16 tiles directly into the TMEM operand pipeline. Both GEMMs use
 dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
-The swapped Mega scheduler and BF16 dispatch/combine remain one kernel.
+Static and atomic schedulers fuse BF16 dispatch, both GEMMs, and combine.
+CLC uses separate dispatch and finish launches around fused FC1/FC2 compute.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,15 +28,17 @@ from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16_kernel import (
     Sm100W4A16GroupedGemmKernel,
 )
 from .workspace import _RegionSpec, _layout_regions, _round_up
-from common.host_utils import get_cutedsl_target_arch
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import get_cutedsl_target_arch
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
-from src.token_comm import CombineFormat, TokenSrcMetadata
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import CombineFormat, TokenSrcMetadata
 from .custom_ext import W4A16Fc12SchedExtension
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
-from moe_nvfp4_swapab.moe_utils import spin_wait
-from src.token_comm import TokenInPullTokenBackPush
-from src.token_comm import TokenCommArgs as ExtractedTokenCommArgs
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import spin_wait
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import TokenInPullTokenBackPush
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    TokenCommArgs as ExtractedTokenCommArgs,
+)
 
 from .epilogue import W4A16Epilogue, W4A16EpiArgs
 from . import dynamic_mainloop, clc
@@ -459,7 +462,7 @@ class Sm100W4A16MegaMoEKernel:
             sched_storage_cls = sched_params.get_scheduler_type().make_storage_struct(
                 sched_params, W4A16Fc12SchedExtension, num_drain_warps=0
             )
-        comm_storage_cls = self.token_comm_extra_smem_storage_class()
+        comm_storage_cls = self.token_comm.extra_smem_storage_class()
         # CuTe's 227KiB per-block capacity already excludes CUDA's 1KiB
         # reservation from the SM's 228KiB. All user storage is counted below.
         capacity = utils.get_smem_capacity_in_bytes("sm_100")
@@ -1213,14 +1216,14 @@ class Sm100W4A16MegaMoEKernel:
             sf_vec_size=16,
             fc1_done_counter_ptr=fc1_done.iterator,
             fc2_spin_threshold=fc2_threshold,
-            fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(
+            fc1_ready_counter_ptr=self.token_comm.fc1_ready_counter_ptr(
                 token_comm_args
             ),
         )
         sched_cls = sched_params.get_scheduler_type()
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage_cls)
-        comm_storage = smem.allocate(self.token_comm_extra_smem_storage_class())
+        comm_storage = smem.allocate(self.token_comm.extra_smem_storage_class())
         raw_pipe = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.raw_barriers.data_ptr(),
             num_stages=mix.num_load2trans_stage,
@@ -1349,7 +1352,7 @@ class Sm100W4A16MegaMoEKernel:
             if cutlass.const_expr(self.use_clc_scheduler):
                 clc.schedule(scheduler, storage.sched_storage, clc_claim_pipe)
             else:
-                self.token_comm_hook_sched_warp_pre_init_wait(token_comm_args)
+                self.token_comm.sched_warp_pre_init_wait(token_comm_args)
                 if cutlass.const_expr(not early_init):
                     scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
                 scheduler.gen_next_work()
@@ -1411,7 +1414,7 @@ class Sm100W4A16MegaMoEKernel:
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
                     if cutlass.const_expr(not self.use_clc_scheduler):
-                        self.token_comm_hook_fc1_tma_b_predispatch_spin(
+                        self.token_comm.fc1_tma_b_predispatch_spin(
                             token_comm_args, work
                         )
                     state = self._activation_task(
@@ -1621,7 +1624,7 @@ class Sm100W4A16MegaMoEKernel:
                         self._clc_bundle_size,
                     )
             else:
-                self.token_comm_hook_dispatch_warp_body(
+                self.token_comm.dispatch_warp_body(
                     token_comm_args,
                     comm_storage,
                     warp_idx=warp,
@@ -1633,7 +1636,7 @@ class Sm100W4A16MegaMoEKernel:
                 barrier_id=8, num_threads=self.threads_per_cta
             ).arrive_and_wait()
         else:
-            self.token_comm_hook_kernel_tail(
+            self.token_comm.kernel_tail(
                 token_comm_args, warp_idx=warp, lane_idx=cute.arch.lane_idx(), tidx=tidx
             )
 
@@ -1938,59 +1941,4 @@ class Sm100W4A16MegaMoEKernel:
             sh,
             st,
             spec.align,
-        )
-
-    def token_comm_extra_smem_storage_class(self) -> type:
-        return self.token_comm.extra_smem_storage_class()
-
-    @cute.jit
-    def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
-        self.token_comm.sched_warp_pre_init_wait(token_comm_args)
-
-    @cute.jit
-    def token_comm_hook_dispatch_warp_body(
-        self,
-        token_comm_args,
-        token_comm_storage,
-        *,
-        warp_idx,
-        lane_idx,
-        tidx,
-    ):
-        self.token_comm.dispatch_warp_body(
-            token_comm_args,
-            token_comm_storage,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
-        )
-
-    @cute.jit
-    def token_comm_hook_kernel_tail(
-        self,
-        token_comm_args,
-        *,
-        warp_idx,
-        lane_idx,
-        tidx,
-    ):
-        self.token_comm.kernel_tail(
-            token_comm_args,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
-        )
-
-    def token_comm_hook_fc1_ready_counter_ptr(self, token_comm_args):
-        return self.token_comm.fc1_ready_counter_ptr(token_comm_args)
-
-    @cute.jit
-    def token_comm_hook_fc1_tma_b_predispatch_spin(
-        self,
-        token_comm_args,
-        work_tile_info,
-    ):
-        self.token_comm.fc1_tma_b_predispatch_spin(
-            token_comm_args,
-            work_tile_info,
         )

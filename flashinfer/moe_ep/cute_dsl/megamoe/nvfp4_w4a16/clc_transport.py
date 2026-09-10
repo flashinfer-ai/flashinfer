@@ -7,7 +7,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cutlass_dsl import Int32, Int64
 
-from src.token_comm import TokenInPullTokenBackPush
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import TokenInPullTokenBackPush
 
 
 class _FixedGridTokenComm(TokenInPullTokenBackPush):

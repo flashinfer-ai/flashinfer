@@ -18,7 +18,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.backen
 @pytest.fixture
 def public():
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src import cutedsl_megamoe
+    from flashinfer.moe_ep.cute_dsl.megamoe import nvfp4_w4a16 as cutedsl_megamoe
 
     return cutedsl_megamoe
 
@@ -172,7 +172,7 @@ def test_cache_resolution_uses_buffer_capacity_and_preserves_return_mode(
     ),
 )
 def test_explicit_knobs_bypass_cache_and_preserve_final_override(factory, knobs):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.kernel_src import cutedsl_megamoe as knob_cache
 
     with mock.patch.object(knob_cache, "resolve_knobs") as lookup:
         workspace = factory(
@@ -234,7 +234,7 @@ def test_apply_knobs_capture_guard_preserves_existing_config(factory):
     try:
         with (
             mock.patch(
-                "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.comm.ensure_not_capturing",
+                "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.ensure_not_capturing",
                 side_effect=RuntimeError("capture"),
             ),
             mock.patch.object(frontend, "_release_workspace") as release,
@@ -281,7 +281,7 @@ def test_cached_c1_geometry_and_cluster_change_preserve_lifecycle(factory):
 
 
 def test_catalog_winner_restores_scheduler_depth_and_invalidates_compile(factory):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
         w4a16_candidates,
     )
 

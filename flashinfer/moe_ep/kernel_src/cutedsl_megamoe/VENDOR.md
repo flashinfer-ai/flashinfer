@@ -1,7 +1,8 @@
 # Vendoring record: cutedsl_megamoe
 
-This file records provenance and sync state. The drop-update workflow lives
-in `SKILL.md`.
+One `kernel_src/` directory = one upstream kernel repo snapshot. This file
+records *provenance and sync state* only; the drop-update *workflow* (what to
+replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
@@ -20,21 +21,13 @@ in `SKILL.md`.
 
 ## Policy
 
-- Vendored packages under `src/` are **verbatim** copies of the upstream drop:
-  no injected files or local edits. `diff -r src/<pkg> <upstream>/<pkg>` must
-  come back clean.
+- `src/` is a **verbatim** copy of the upstream drop: no injected files, no
+  local edits. `diff -r src/<pkg> <upstream>/<pkg>` must come back clean.
 - All adaptation lives in `shim/` (ours), re-exported through `__init__.py`;
   FlashInfer backends import the package `__init__` only, never `src/`.
 - Local bug fixes go upstream first, then re-sync. If an emergency local edit
   is unavoidable, list it here as a pending-upstream diff until the next drop
   absorbs it.
-
-## Additional precision implementation
-
-`src/moe_nvfp4_w4a16/` implements NVFP4 W4A16 using the existing MegaMoE
-scheduling and communication design and the split W4A16 weight decoder.
-It is developed in FlashInfer and is not part of the recorded upstream drop.
-Its frontend is `shim/w4a16.py`, alongside the NVFP4, MXFP8, and BF16 frontends.
 
 ## Pending local diffs vs upstream
 
@@ -81,4 +74,3 @@ Its frontend is `shim/w4a16.py`, alongside the NVFP4, MXFP8, and BF16 frontends.
 
 - `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/`
 - `backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/`
-- `backends/mega/kernel/sm100/bf16_nvfp4_bf16_cutedsl/`

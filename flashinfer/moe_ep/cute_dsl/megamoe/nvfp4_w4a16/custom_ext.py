@@ -12,8 +12,11 @@ from cutlass._mlir import ir
 
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 from .fc1_fc2_fuse_sched import BlockPhase
-from moe_nvfp4_swapab.moe_utils import rewrite_tensor_shape, spin_wait
-from moe_nvfp4_swapab.moe_persistent_scheduler import MoESchedExtension, MoEWorkTileInfo
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import rewrite_tensor_shape, spin_wait
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    MoESchedExtension,
+    MoEWorkTileInfo,
+)
 
 PhaseBits = 16
 PhaseMask = (1 << PhaseBits) - 1

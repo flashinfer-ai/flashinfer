@@ -93,7 +93,9 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_w4a16_mega_moe
+        from ......cute_dsl.megamoe.nvfp4_w4a16 import (
+            get_symm_buffer_for_w4a16_mega_moe,
+        )
 
         config = self._kernel_config
         return get_symm_buffer_for_w4a16_mega_moe(
@@ -185,10 +187,10 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import w4a16_mega_moe
+        from ......cute_dsl.megamoe.nvfp4_w4a16 import w4a16_mega_moe
 
         if self._autotune_pending:
-            from ......kernel_src.cutedsl_megamoe import autotune_w4a16_mega_moe
+            from ......cute_dsl.megamoe.nvfp4_w4a16 import autotune_w4a16_mega_moe
 
             self._autotune_winner = dict(
                 autotune_w4a16_mega_moe(

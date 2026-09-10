@@ -22,16 +22,16 @@ from cutlass._mlir import ir
 try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
-    from src.iket_compat import iket
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import iket  # type: ignore[no-redef]
 
-from moe_nvfp4_swapab.moe_persistent_scheduler import (
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     MoEWorkTileInfo,
     MoESchedulerParamsBase,
     MoESchedulerBase,
     WorkTileState,
     _DEFAULT_SCHED_EXT,
 )
-from moe_nvfp4_swapab.moe_utils import (
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     compute_expert_token_count_from_sizes,
     compute_expert_token_range,
     mbarrier_arrive_expect_tx_on_peer,

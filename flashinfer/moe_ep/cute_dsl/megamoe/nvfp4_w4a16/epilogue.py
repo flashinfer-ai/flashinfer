@@ -21,10 +21,10 @@ from cutlass.cute.nvgpu import tcgen05
 
 from . import clc
 from .fc1_fc2_fuse_sched import BlockPhase
-from src.iket_compat import iket
-from common.moe_utils import fmin, fmax
-from src.flag_batch import GpuReleaseFlagBatchTracker
-from moe_nvfp4_swapab.moe_persistent_scheduler import (
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import iket
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import fmin, fmax
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import GpuReleaseFlagBatchTracker
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     MoESchedConsumer,
     MoESchedExtension,
 )

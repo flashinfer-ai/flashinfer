@@ -10,7 +10,7 @@ from typing import Callable, Literal, Optional, Tuple
 
 import torch
 
-from .comm import (
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
@@ -148,7 +148,7 @@ class MegaMoEW4A16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated swapped-MMA tuning configuration and invalidate its compile."""
-        from .tuner import is_valid, with_knobs
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import is_valid, with_knobs
 
         if not is_valid(
             {
@@ -160,7 +160,9 @@ class MegaMoEW4A16Frontend:
             raise ValueError(f"unsupported W4A16 MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
-            from .comm import ensure_not_capturing
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                ensure_not_capturing,
+            )
 
             ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
@@ -218,7 +220,7 @@ class MegaMoEW4A16Frontend:
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
-        from moe_nvfp4_w4a16.megamoe_kernel import Sm100W4A16MegaMoEKernel
+        from .megamoe_kernel import Sm100W4A16MegaMoEKernel
 
         c = self.config
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
@@ -287,7 +289,7 @@ class MegaMoEW4A16Frontend:
 
     def _runtime_kwargs(self, inputs: MegaMoEW4A16Inputs, mega: _CompiledMega) -> dict:
         import cuda.bindings.driver as cuda
-        from src.sym_buffer import SymBufferHost
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import SymBufferHost
 
         c = self.config
         mapper = SymBufferHost(
@@ -437,9 +439,11 @@ class MegaMoEW4A16Frontend:
             return
         import cutlass.cute as cute
         import cuda.bindings.driver as cuda
-        from common.host_utils import get_cutedsl_target_arch
-        from moe_nvfp4_swapab.topk_reduce import TopkReduce
-        from src.token_comm import CombineFormat
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+            get_cutedsl_target_arch,
+            TopkReduce,
+            CombineFormat,
+        )
 
         def compact(tensor):
             return self._to_cute(tensor, static_layout=True).mark_compact_shape_dynamic(
@@ -522,7 +526,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
-    from .knob_cache import resolve_knobs
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import resolve_knobs
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
     # lookup; an explicit dict (including {}) bypasses cache and defaults.

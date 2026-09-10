@@ -14,7 +14,7 @@ from cutlass.cutlass_dsl import (
 )
 
 from .fc1_fc2_fuse_sched import BlockPhase
-from moe_nvfp4_swapab.moe_utils import (
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     mbarrier_arrive_expect_tx_on_peer,
     store_i32_to_peer_cluster_smem_async,
 )

@@ -12,7 +12,7 @@ from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 @pytest.fixture
 def shim():
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import w4a16_mega_moe
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import w4a16_mega_moe
 
     return w4a16_mega_moe
 
@@ -69,7 +69,7 @@ def test_clc_config_and_bundle_have_distinct_compile_keys():
     import dataclasses
 
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
         MegaMoEW4A16Config,
         MegaMoEW4A16Frontend,
     )
@@ -98,7 +98,7 @@ def test_clc_config_and_bundle_have_distinct_compile_keys():
 @pytest.mark.parametrize("bundle", (0, -1, 1.5, True))
 def test_clc_rejects_invalid_bundle_before_compile(bundle):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
         MegaMoEW4A16Config,
     )
 
@@ -175,7 +175,7 @@ def symm_factory(monkeypatch):
     # These tests assert built-in defaults; cache lookup has its own isolated tests.
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "0")
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
         get_symm_buffer_for_w4a16_mega_moe,
     )
 
@@ -296,7 +296,7 @@ def test_tmem_config_preserves_public_geometry_and_swapped_knobs(
     hidden, intermediate, tile
 ):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
         MegaMoEW4A16Config,
         MegaMoEW4A16Frontend,
     )
@@ -354,7 +354,7 @@ def test_frontend_validates_shared_nvfp4_layout_before_compile(
     weight_dtype, scale_dtype
 ):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
         MegaMoEW4A16Config,
         MegaMoEW4A16Frontend,
         MegaMoEW4A16Inputs,
@@ -420,10 +420,10 @@ def test_tmem_kernel_preserves_public_knob_contract(
     symm_factory, hidden, intermediate, tile, cluster, mode, clamp, epi_flags
 ):
     import cutlass
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_w4a16.megamoe_kernel import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16.megamoe_kernel import (
         Sm100W4A16MegaMoEKernel,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_w4a16.epilogue import (
+    from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16.epilogue import (
         W4A16Epilogue,
     )
 

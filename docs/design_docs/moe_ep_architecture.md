@@ -43,6 +43,10 @@ pre-quantized weights can be supplied instead.
 
 ### W4A16 MegaMoE
 
+The implementation lives in `flashinfer/moe_ep/cute_dsl/megamoe/nvfp4_w4a16/`,
+with its frontend beside the kernel modules. Vendored MegaMoE implementations
+remain under `kernel_src/`.
+
 Select `Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` to keep activations and
 communication in BF16 while decoding NVFP4 expert weights online. For `E`
 local experts, hidden size `H`, and intermediate size `I`, supply:
@@ -126,8 +130,9 @@ prequantized activation fields (`scales`, `fc1_alpha`, `fc2_alpha`, and
 `fc1_norm_const`). Routing IDs are int32/int64, and routing scores are FP32
 and applied after the BF16 FC2 result. The initial backend supports SwiGLU,
 hidden sizes divisible by 32, intermediate sizes divisible by 64, and
-`top_k <= min(32, num_experts)`. Its final top-k reduction is separate from
-the fused dispatch/GEMM/combine kernel.
+`top_k <= min(32, num_experts)`. Its final top-k reduction is separate from the MegaMoE launches. Static and
+atomic scheduling fuse dispatch, both GEMMs, and combine; CLC uses separate
+dispatch and finish launches around fused FC1/FC2 compute.
 
 `PrequantizedMoEWeights` global scales are optional keyword-only additions.
 The W4A16 backend applies them after FP32 accumulation. For numerical tests

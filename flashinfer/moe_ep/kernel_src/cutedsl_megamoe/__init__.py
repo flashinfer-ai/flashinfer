@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""CuTeDSL MegaMoE implementations (NVFP4, MXFP8, BF16, and W4A16).
+"""CuTeDSL MegaMoE implementations (NVFP4, MXFP8, and BF16).
 
-This package is the single public boundary FlashInfer ``moe_ep`` imports from.
+This package is the public boundary for the verbatim MegaMoE kernel drop.
 It exposes the symmetric-buffer allocators and fused-launch entry points and
 talks only to the ``shim`` package (which adapts the raw kernel sources under
 ``src/``).
@@ -11,7 +11,7 @@ Layout::
 
     __init__.py  public API for moe_ep (this file); talks only to shim/
     shim/        thin adapters over the raw kernel sources (comm, nvfp4, mxfp8)
-    src/         vendor precisions plus owned moe_nvfp4_w4a16/ (see VENDOR.md)
+    src/         verbatim vendor kernel sources (see VENDOR.md)
 
 Usage::
 
@@ -29,13 +29,21 @@ from __future__ import annotations
 # packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
+    _CompiledMega,
+    _compute_peer_offsets,
+    bootstrap_dist,
+    free_sym_tensor,
+    resolve_gate_up_clamp,
+    sym_zeros,
+    _autotune_knobs_impl,
+    _CollectiveGraphTimingError,
+    is_valid,
     COMBINE_FORMAT_NAMES,
     CORRECTNESS_KNOBS,
     MegaMoEMxfp8SymmBuffer,
     MegaMoEBf16SymmBuffer,
     MegaMoESymmBuffer,
     autotune_bf16_mega_moe,
-    autotune_w4a16_mega_moe,
     autotune_knobs,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
@@ -75,7 +83,6 @@ from .shim import (
     bf16_mega_moe,
     mxfp8_quantize_per_block_32,
     nvfp4_candidates,
-    w4a16_candidates,
     nvfp4_mega_launch_thunk,
     nvfp4_mega_moe,
     nvfp4_quantize_per_block_16,
@@ -93,6 +100,34 @@ from .shim import (
 # backend + verification tests still reach them only through this boundary (the
 # access happens inside their functions).  See ``shim/kernel_helpers.py``.
 _LAZY_HELPERS = (
+    "Contract",
+    "FunctionMapping",
+    "GpuReleaseFlagBatchTracker",
+    "MoESchedConsumer",
+    "MoESchedExtension",
+    "MoESchedulerBase",
+    "MoESchedulerParamsBase",
+    "MoEWorkTileInfo",
+    "Space",
+    "SymBufferDeviceBase",
+    "SymBufferHost",
+    "TokenCommArgs",
+    "TokenInPullTokenBackPush",
+    "TokenSrcMetadata",
+    "TopkReduce",
+    "WorkTileState",
+    "_DEFAULT_SCHED_EXT",
+    "compute_expert_token_count_from_sizes",
+    "compute_expert_token_range",
+    "eval_function_mapping",
+    "fmax",
+    "fmin",
+    "get_cutedsl_target_arch",
+    "iket",
+    "mbarrier_arrive_expect_tx_on_peer",
+    "rewrite_tensor_shape",
+    "spin_wait",
+    "store_i32_to_peer_cluster_smem_async",
     "CombineFormat",
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
@@ -101,22 +136,8 @@ _LAZY_HELPERS = (
     "compute_megamoe_reference_mxfp8",
 )
 
-_W4A16_EXPORTS = (
-    "MegaMoEW4A16Config",
-    "MegaMoEW4A16Frontend",
-    "MegaMoEW4A16Inputs",
-    "MegaMoEW4A16SymmBuffer",
-    "get_symm_buffer_for_w4a16_mega_moe",
-    "w4a16_mega_launch_thunk",
-    "w4a16_mega_moe",
-)
-
 
 def __getattr__(name):  # PEP 562
-    if name in _W4A16_EXPORTS:
-        from . import shim
-
-        return getattr(shim, name)
     if name in _LAZY_HELPERS:
         from .shim import kernel_helpers
 
@@ -128,7 +149,43 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
-    *_W4A16_EXPORTS,
+    "_CompiledMega",
+    "_compute_peer_offsets",
+    "bootstrap_dist",
+    "free_sym_tensor",
+    "resolve_gate_up_clamp",
+    "sym_zeros",
+    "_autotune_knobs_impl",
+    "_CollectiveGraphTimingError",
+    "is_valid",
+    "Contract",
+    "FunctionMapping",
+    "GpuReleaseFlagBatchTracker",
+    "MoESchedConsumer",
+    "MoESchedExtension",
+    "MoESchedulerBase",
+    "MoESchedulerParamsBase",
+    "MoEWorkTileInfo",
+    "Space",
+    "SymBufferDeviceBase",
+    "SymBufferHost",
+    "TokenCommArgs",
+    "TokenInPullTokenBackPush",
+    "TokenSrcMetadata",
+    "TopkReduce",
+    "WorkTileState",
+    "_DEFAULT_SCHED_EXT",
+    "compute_expert_token_count_from_sizes",
+    "compute_expert_token_range",
+    "eval_function_mapping",
+    "fmax",
+    "fmin",
+    "get_cutedsl_target_arch",
+    "iket",
+    "mbarrier_arrive_expect_tx_on_peer",
+    "rewrite_tensor_shape",
+    "spin_wait",
+    "store_i32_to_peer_cluster_smem_async",
     "COMBINE_FORMAT_NAMES",
     "CombineFormat",
     "MegaMoEBf16SymmBuffer",
@@ -142,7 +199,6 @@ __all__ = [
     "TransformedWeights",
     "autotune_knobs",
     "autotune_bf16_mega_moe",
-    "autotune_w4a16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
     "bootstrap_paths",
@@ -176,7 +232,6 @@ __all__ = [
     "bf16_mega_moe",
     "mxfp8_quantize_per_block_32",
     "nvfp4_candidates",
-    "w4a16_candidates",
     "nvfp4_mega_launch_thunk",
     "nvfp4_mega_moe",
     "nvfp4_quantize_per_block_16",

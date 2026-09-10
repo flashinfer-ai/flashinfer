@@ -16,14 +16,14 @@ from cutlass.cutlass_dsl import Int64
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.typing import AddressSpace
 
-from moe_nvfp4_swapab.contract import (
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     Contract,
     FunctionMapping,
     Space,
     eval_function_mapping,
 )
-from src.token_comm import TokenSrcMetadata
-from src.sym_buffer import SymBufferDeviceBase
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import TokenSrcMetadata
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import SymBufferDeviceBase
 
 
 class Region:
@@ -33,20 +33,28 @@ class Region:
     Bottom = 1
 
 
-class _TmemTranspose16x32Core:
-    """Physical implementation of the 16x32 -> 32x16 TMEM in-place transpose.
+class TmemTranspose16x32:
+    """Public 16x32 -> 32x16 TMEM in-place transpose.
 
-    The transpose is a fixed sequence of tcgen05 32-bit element atoms; each
-    32-bit slot is opaque to it (an fp32 swiglu-fold value for fc1, or a packed
-    ``(bf16, bf16)`` pair for fc2 -- the physical (lane_idx, elem_idx)
-    distribution is identical either way).  The (thread, reg) -> (tmem_dp,
-    tmem_col) input / output mapping is documented on the ``TmemTranspose16x32``
-    subclass, which is the public entry point.
+    The per-thread RMEM ``(lane_idx, elem_idx) -> (tmem_dp, tmem_col)`` mapping
+    is fixed by the underlying atom sequence and is identical for fc1 (each slot
+    is an fp32 swiglu-fold value, ``tmem_col`` = intermediate-output index) and
+    fc2 (each slot is a packed bf16x2, ``tmem_col`` = hidden-pair index).  Only
+    the ``tmem_col`` semantic name differs between the two uses; the physical
+    distribution below is the single source of truth.
 
-    Per-thread RMEM coordinate convention:
+    Input distribution -- what each (lane_idx, elem_idx) reg holds on entry
+    (i.e. straight after the 16-dp x 32-col source LDTM, or as fed in via
+    ``reg_tensor`` / ``load_subtile_raw_acc`` for skip-R1.Load mode):
 
-      - ``lane_idx`` -- warp lane id (= thread index within warp), in [0, 32).
-      - ``elem_idx`` -- per-thread reg index, in [0, 16).
+        tmem_dp  = elem_idx * 2 + (lane_idx // 2) % 2          # in [0, 32)
+        tmem_col = (lane_idx % 2) * 8 + lane_idx // 4          # in [0, 16)
+
+    Output distribution -- after all four rounds, the 32-dp x 16-col result has
+    each lane owning one full dp-row of 16 cols:
+
+        tmem_dp  = lane_idx                                    # in [0, 32)
+        tmem_col = elem_idx                                    # in [0, 16)
     """
 
     _PermR1 = (0, 8, 2, 10, 4, 12, 6, 14, 1, 9, 3, 11, 5, 13, 7, 15)
@@ -60,7 +68,7 @@ class _TmemTranspose16x32Core:
     def _tmem_layout(num_lanes: int, num_cols: int) -> cute.Layout:
         return cute.make_layout(
             (((num_lanes, num_cols), 1),),
-            stride=(((_TmemTranspose16x32Core._TmemRowStride, 1), 0),),
+            stride=(((TmemTranspose16x32._TmemRowStride, 1), 0),),
         )
 
     @staticmethod
@@ -106,11 +114,11 @@ class _TmemTranspose16x32Core:
         """
         atom_ld16x64 = cute.make_copy_atom(
             tcgen05.Ld16x64bOp(tcgen05.Repetition.x16),
-            _TmemTranspose16x32Core._io_dtype,
+            TmemTranspose16x32._io_dtype,
         )
 
         ptr = tmem_subtile_tensor.iterator
-        half_lane_off = 16 * _TmemTranspose16x32Core._TmemRowStride
+        half_lane_off = 16 * TmemTranspose16x32._TmemRowStride
 
         # 4 source 16-lane x 32-col views over the (32, 64) subtile region:
         #   first  half (cols 0..31): top  lanes 0..15  / bot lanes 16..31
@@ -122,45 +130,45 @@ class _TmemTranspose16x32Core:
         # alignment-unknown, tripping the atom's verifier.
         first_top_view = cute.make_tensor(
             ptr,
-            _TmemTranspose16x32Core._tmem_layout(16, 32),
+            TmemTranspose16x32._tmem_layout(16, 32),
         )
         first_bot_view = cute.make_tensor(
             ptr + half_lane_off,
-            _TmemTranspose16x32Core._tmem_layout(16, 32),
+            TmemTranspose16x32._tmem_layout(16, 32),
         )
         second_top_view = cute.make_tensor(
             ptr + 32,
-            _TmemTranspose16x32Core._tmem_layout(16, 32),
+            TmemTranspose16x32._tmem_layout(16, 32),
         )
         second_bot_view = cute.make_tensor(
             ptr + 32 + half_lane_off,
-            _TmemTranspose16x32Core._tmem_layout(16, 32),
+            TmemTranspose16x32._tmem_layout(16, 32),
         )
 
-        first_top = cute.make_rmem_tensor((16,), _TmemTranspose16x32Core._io_dtype)
-        first_bot = cute.make_rmem_tensor((16,), _TmemTranspose16x32Core._io_dtype)
-        second_top = cute.make_rmem_tensor((16,), _TmemTranspose16x32Core._io_dtype)
-        second_bot = cute.make_rmem_tensor((16,), _TmemTranspose16x32Core._io_dtype)
+        first_top = cute.make_rmem_tensor((16,), TmemTranspose16x32._io_dtype)
+        first_bot = cute.make_rmem_tensor((16,), TmemTranspose16x32._io_dtype)
+        second_top = cute.make_rmem_tensor((16,), TmemTranspose16x32._io_dtype)
+        second_bot = cute.make_rmem_tensor((16,), TmemTranspose16x32._io_dtype)
 
         cute.copy(
             atom_ld16x64,
             first_top_view,
-            _TmemTranspose16x32Core._rmem_copy_view(first_top, 16),
+            TmemTranspose16x32._rmem_copy_view(first_top, 16),
         )
         cute.copy(
             atom_ld16x64,
             first_bot_view,
-            _TmemTranspose16x32Core._rmem_copy_view(first_bot, 16),
+            TmemTranspose16x32._rmem_copy_view(first_bot, 16),
         )
         cute.copy(
             atom_ld16x64,
             second_top_view,
-            _TmemTranspose16x32Core._rmem_copy_view(second_top, 16),
+            TmemTranspose16x32._rmem_copy_view(second_top, 16),
         )
         cute.copy(
             atom_ld16x64,
             second_bot_view,
-            _TmemTranspose16x32Core._rmem_copy_view(second_bot, 16),
+            TmemTranspose16x32._rmem_copy_view(second_bot, 16),
         )
 
         return (first_top, first_bot, second_top, second_bot)
@@ -356,31 +364,6 @@ class _TmemTranspose16x32Core:
         self.r4_load_bot()
         self.r4_perm()
         return self.output
-
-
-class TmemTranspose16x32(_TmemTranspose16x32Core):
-    """Public 16x32 -> 32x16 TMEM in-place transpose.
-
-    The per-thread RMEM ``(lane_idx, elem_idx) -> (tmem_dp, tmem_col)`` mapping
-    is fixed by the underlying atom sequence and is identical for fc1 (each slot
-    is an fp32 swiglu-fold value, ``tmem_col`` = intermediate-output index) and
-    fc2 (each slot is a packed bf16x2, ``tmem_col`` = hidden-pair index).  Only
-    the ``tmem_col`` semantic name differs between the two uses; the physical
-    distribution below is the single source of truth.
-
-    Input distribution -- what each (lane_idx, elem_idx) reg holds on entry
-    (i.e. straight after the 16-dp x 32-col source LDTM, or as fed in via
-    ``reg_tensor`` / ``load_subtile_raw_acc`` for skip-R1.Load mode):
-
-        tmem_dp  = elem_idx * 2 + (lane_idx // 2) % 2          # in [0, 32)
-        tmem_col = (lane_idx % 2) * 8 + lane_idx // 4          # in [0, 16)
-
-    Output distribution -- after all four rounds, the 32-dp x 16-col result has
-    each lane owning one full dp-row of 16 cols:
-
-        tmem_dp  = lane_idx                                    # in [0, 32)
-        tmem_col = elem_idx                                    # in [0, 16)
-    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -621,7 +604,7 @@ def fc2_f2fp(
 
 @cute.jit
 def fc2_stg_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, **_):
-    return _TmemTranspose16x32Core.load_subtile_raw_acc(tmem_subtile_tensor)
+    return TmemTranspose16x32.load_subtile_raw_acc(tmem_subtile_tensor)
 
 
 @cute.jit
