@@ -14,6 +14,7 @@
 
 import dataclasses
 import importlib
+import inspect
 import math
 from types import SimpleNamespace
 
@@ -2375,6 +2376,112 @@ def test_t1_unbounded_softplus_auto_falls_back_to_cute_on_unservable_arch(
     untouched[state_indices.to(torch.long)] = False
     torch.testing.assert_close(
         actual_state[untouched], actual_before[untouched], atol=0, rtol=0
+    )
+
+
+def test_facade_backend_defaults_are_pinned():
+    """The top-level facade defaults to ``"auto"``, the decode facade to ``"cute-dsl"``.
+
+    The top-level default is unreleased and was ratified only once ``"auto"``
+    decode became total (#5037); the decode facade's default is released, so the
+    two must not be convergence-refactored into one value by accident.
+    """
+    top_level = importlib.import_module("flashinfer.kda").recurrent_kda
+    assert inspect.signature(top_level).parameters["backend"].default == "auto"
+    assert inspect.signature(recurrent_kda).parameters["backend"].default == "cute-dsl"
+
+
+@pytest.mark.parametrize("num_heads", [64, 16])
+def test_defaulted_top_level_decode_matches_explicit_cute_dsl_when_cake_cannot_serve(
+    flash_kda_device, monkeypatch, num_heads
+):
+    """Pin the defaulted top-level spelling, not just an explicit ``backend="auto"``.
+
+    The other fallback tests here reach the decode facade with ``"auto"`` passed
+    by hand. This one omits ``backend`` on the phase-neutral facade, which is the
+    call a caller actually writes and the one ratifying the default commits to.
+    """
+    num_sequences = 2
+    top_level = importlib.import_module("flashinfer.kda").recurrent_kda
+    generator = torch.Generator(device=flash_kda_device).manual_seed(4936 + num_heads)
+    state_slots = 2 * num_sequences + 1
+    case = _make_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        num_value_heads=num_heads,
+        num_tokens=1,
+        seed=4936 + num_heads,
+    )
+    case.update(
+        beta_is_logit=True,
+        A_log=(
+            torch.rand(
+                num_heads,
+                dtype=torch.float32,
+                device=flash_kda_device,
+                generator=generator,
+            )
+            - 1.5
+        ),
+        dt_bias=torch.randn(
+            num_heads * _D,
+            dtype=torch.float32,
+            device=flash_kda_device,
+            generator=generator,
+        ),
+        use_gate_in_kernel=True,
+        lower_bound=None,
+        ssm_state_indices=(
+            2 * torch.arange(num_sequences, dtype=torch.int32, device=flash_kda_device)
+            + 1
+        ),
+        # Cake has no l2norm-off T=1 specialization, so this forces the fallback.
+        use_qk_l2norm_in_kernel=False,
+    )
+    logical_initial = torch.randn(
+        (state_slots, num_heads, _D, _D),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+        generator=generator,
+    )
+
+    expected_state = logical_initial.clone()
+    expected_output, expected_state_result = top_level(
+        **_call_kwargs(
+            baseline_case := dict(case),
+            state=expected_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    frozen_calls = []
+    run_frozen = recurrent_module._run_flash_kda_decode
+
+    def track_frozen_call(variant, **kwargs):
+        frozen_calls.append(variant)
+        return run_frozen(variant, **kwargs)
+
+    monkeypatch.setattr(recurrent_module, "_run_flash_kda_decode", track_frozen_call)
+    actual_state = logical_initial.clone()
+    actual_output, actual_state_result = top_level(
+        **_call_kwargs(
+            dict(baseline_case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        ),
+    )
+
+    assert frozen_calls == []
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state_result.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=0, rtol=0
     )
 
 
