@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from flashinfer.jit.cake_fused_kda_decode import (
     cake_fused_kda_decode_is_available,
+    get_cake_fused_kda_decode_variant,
 )
 from flashinfer.utils import get_compute_capability
 
@@ -81,6 +82,14 @@ def _boundary_shapes():
             high_min,
         ):
             if num_rows > 0:
+                shapes.add((num_heads, num_rows))
+        thresholds = [592, 666, 888, 962]
+        if num_heads <= 24:
+            thresholds.append(222)
+        if num_heads == 12:
+            thresholds.append(604)
+        for threshold in thresholds:
+            for num_rows in (threshold // num_heads, threshold // num_heads + 1):
                 shapes.add((num_heads, num_rows))
     return tuple(sorted(shapes))
 
@@ -158,6 +167,7 @@ _VARIANT_CASES = (
     ("direct_positive_f32", 24, 7, torch.float32, "page", "positive"),
     ("direct_f32", 24, 7, torch.float32, "page", "null"),
     ("direct_bf16", 24, 7, torch.bfloat16, "page", "positive"),
+    ("wide512_vector4_positive_f32", 12, 24, torch.float32, "page", "positive"),
 )
 
 
@@ -419,6 +429,7 @@ def _run_and_check_cake(
     lower_bound=-5.0,
     norm_eps=1e-5,
     preallocate_output=False,
+    factory_only=False,
 ):
     reference_conv_state = _clone_strided(inputs["conv_state"])
     reference_state = _clone_strided(inputs["state"])
@@ -456,7 +467,19 @@ def _run_and_check_cake(
     }
     if preallocate_output:
         kwargs["output"] = torch.empty_like(expected)
-    actual = fused_kda_decode(**kwargs)
+    if factory_only:
+        target = {
+            (10, 0): "sm100a",
+            (10, 3): "sm103a",
+        }[get_compute_capability(inputs["x"].device)]
+        variant = get_cake_fused_kda_decode_variant(expected_variant, target)
+        kwargs.pop("backend")
+        kwargs.pop("state_indices_mode")
+        kwargs["output"] = torch.empty_like(expected)
+        _impl._run_cake_variant(variant, **kwargs)
+        actual = kwargs["output"]
+    else:
+        actual = fused_kda_decode(**kwargs)
 
     assert len(routed_variants) == 1
     if expected_variant is not None:
@@ -479,7 +502,7 @@ def _run_and_check_cake(
     ),
     [pytest.param(*case, id=case[0]) for case in _VARIANT_CASES],
 )
-def test_cake_fused_kda_decode_all_registered_routes(
+def test_cake_fused_kda_decode_all_registered_factories(
     monkeypatch,
     variant_name,
     num_heads,
@@ -495,7 +518,12 @@ def test_cake_fused_kda_decode_all_registered_routes(
         layout=layout,
         slot_class=slot_class,
     )
-    _run_and_check_cake(monkeypatch, inputs, expected_variant=variant_name)
+    _run_and_check_cake(
+        monkeypatch,
+        inputs,
+        expected_variant=variant_name,
+        factory_only=variant_name in ("direct_positive_f32", "pr_eval_h32_f32"),
+    )
 
 
 @pytest.mark.parametrize(

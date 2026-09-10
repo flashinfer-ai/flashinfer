@@ -184,17 +184,9 @@ def test_cake_targets_share_sources_but_have_distinct_build_identities():
     sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
-    assert len(sm100_variants) == len(sm103_variants) == 44
+    assert len(sm100_variants) == len(sm103_variants) == 46
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
-        expected_flags = sm100.extra_cuda_cflags
-        if sm100.name in (
-            "compact_async_f32_wide_slot_offsets",
-            "compact_async_pr_eval_h96_f32_wide_slot_offsets",
-        ):
-            expected_flags += ("-Xptxas=--minnctapersm=3",)
-        assert (
-            replace(sm100, target="sm103a", extra_cuda_cflags=expected_flags) == sm103
-        )
+        assert replace(sm100, target="sm103a") == sm103
         assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
         sm100_uri = cake_jit.get_cake_fused_kda_decode_uri(sm100.name, "sm100a")
         sm103_uri = cake_jit.get_cake_fused_kda_decode_uri(sm103.name, "sm103a")
@@ -232,9 +224,80 @@ def test_cake_selector_resolves_requested_target_registry(target):
     assert variant in cake_jit.get_cake_fused_kda_decode_variants(target)
 
 
+def _select_positive_route(target, heads, rows, *, lower_bound=-5.0, wide=False):
+    hidden = heads * 128
+    conv_stride = 9 * hidden + 2 * heads * 128 * 128
+    state_stride = conv_stride // 2
+    slots = (2**31 // state_stride + 2) if wide else rows + 1
+    return cake_jit.select_cake_fused_kda_decode_variant(
+        target=target,
+        num_heads=heads,
+        num_rows=rows,
+        num_slots=slots,
+        state_dtype="float32",
+        state_indices_mode="positive_unique",
+        lower_bound=lower_bound,
+        norm_eps=1e-5,
+        x_row_stride=3 * hidden + 17,
+        conv_slot_stride=conv_stride,
+        beta_row_stride=heads + 1,
+        state_slot_stride=state_stride,
+        output_gate_row_stride=hidden + 7,
+    )
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("heads", "rows", "expected"),
+    (
+        (12, 18, "wide512_positive_f32"),
+        (12, 19, "wide512_vector4_positive_f32"),
+        (12, 24, "wide512_vector4_positive_f32"),
+        (12, 25, "compact_async_positive_f32"),
+        (24, 9, "wide512_positive_f32"),
+        (24, 10, "wide512_vector4_positive_f32"),
+        (24, 12, "wide512_vector4_positive_f32"),
+        (24, 13, "compact_async_positive_f32"),
+        (32, 9, "wide512_positive_f32"),
+        (48, 6, "wide512_positive_f32"),
+        (96, 3, "wide512_positive_f32"),
+        (12, 50, "wide512_positive_f32"),
+        (12, 51, "high_work_positive_pr_eval_h12_f32"),
+        (12, 55, "high_work_positive_pr_eval_h12_f32"),
+        (12, 56, "wide512_positive_f32"),
+        (12, 74, "wide512_positive_f32"),
+        (12, 75, "high_work_positive_pr_eval_h12_f32"),
+        (12, 80, "high_work_positive_pr_eval_h12_f32"),
+        (12, 81, "wide512_positive_f32"),
+        (24, 24, "wide512_positive_f32"),
+        (24, 25, "high_work_positive_pr_eval_h24_f32"),
+        (24, 28, "wide512_positive_f32"),
+        (32, 18, "wide512_positive_f32"),
+        (32, 19, "high_work_positive_pr_eval_h32_f32"),
+        (32, 21, "wide512_positive_f32"),
+        (32, 31, "wide512_positive_f32"),
+        (32, 32, "high_work_positive_pr_eval_h32_f32"),
+        (48, 13, "high_work_positive_pr_eval_h48_f32"),
+        (96, 10, "high_work_positive_h96_pr_strides_f32"),
+    ),
+)
+def test_positive_f32_producer_and_partial_wave_routes(target, heads, rows, expected):
+    variant = _select_positive_route(target, heads, rows)
+    assert variant is not None
+    assert variant.name == expected
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_new_positive_routes_preserve_wide_offsets_and_runtime_config(target):
+    variant = _select_positive_route(target, 12, 24, wide=True)
+    assert variant.name == "wide512_vector4_positive_f32_wide_slot_offsets"
+    variant = _select_positive_route(target, 12, 51, lower_bound=-20.0)
+    assert variant.name == "high_work_positive_f32"
+
+
 @pytest.mark.parametrize(("target", "minor"), (("sm100a", 0), ("sm103a", 3)))
 @pytest.mark.parametrize(
-    ("name", "sm103_min_blocks"),
+    ("name", "min_blocks"),
     (
         ("wide512_f32_wide_slot_offsets", False),
         ("compact_async_f32_wide_slot_offsets", True),
@@ -242,7 +305,7 @@ def test_cake_selector_resolves_requested_target_registry(target):
     ),
 )
 def test_cake_jit_spec_uses_exact_target_flags(
-    monkeypatch, tmp_path, target, minor, name, sm103_min_blocks
+    monkeypatch, tmp_path, target, minor, name, min_blocks
 ):
     monkeypatch.setattr(
         jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, f"{minor}a")}
@@ -261,7 +324,7 @@ def test_cake_jit_spec_uses_exact_target_flags(
         in spec.extra_cuda_cflags
     )
     expected_occupancy_flags = (
-        ["-Xptxas=--minnctapersm=3"] if target == "sm103a" and sm103_min_blocks else []
+        ["-Xptxas=--minnctapersm=3"] if min_blocks else []
     )
     assert [
         flag

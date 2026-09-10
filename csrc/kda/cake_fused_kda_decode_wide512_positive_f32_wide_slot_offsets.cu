@@ -550,7 +550,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 
 extern "C" {
 
-__global__ __launch_bounds__(512) void
+__global__ __launch_bounds__(512, 2) void
 kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
 {
     const int tid = threadIdx.x;

@@ -128,7 +128,12 @@ _VARIANT_CASES = {
     "direct_positive_f32": (24, 7, "float32", "page", "positive"),
     "direct_f32": (24, 7, "float32", "page", "null"),
     "direct_bf16": (24, 7, "bfloat16", "page", "positive"),
+    "wide512_vector4_positive_f32": (12, 24, "float32", "page", "positive"),
 }
+
+# These factories remain independently executable after the production
+# dispatcher moved positive-unique FP32 fallback traffic to wide CTAs.
+_FACTORY_ONLY_VARIANTS = frozenset(("direct_positive_f32", "pr_eval_h32_f32"))
 
 
 def _canonical_json_sha256(value):
@@ -632,6 +637,10 @@ def _select_routes(torch, side, selector, variants):
         else:
             kwargs["state_indices_mode"] = "positive_unique"
         selected = selector(**kwargs)
+        if selected is None:
+            raise RuntimeError(
+                f"production dispatcher has no route for H={num_heads}, rows={num_rows}"
+            )
         records.append(
             {
                 "shape_index": index,
@@ -687,18 +696,21 @@ def _worker(args):
 
     api = _worker_imports(args.side)
     variants = api["variants"]()
-    if len(variants) != 44:
-        raise RuntimeError("equivalence worker requires exactly 44 variants")
+    expected_count = 44 if args.side == "predecessor" else 2 * len(_VARIANT_CASES)
+    if len(variants) != expected_count:
+        raise RuntimeError(
+            f"{args.side} worker requires exactly {expected_count} variants"
+        )
     route_records = _select_routes(torch, args.side, api["select"], variants)
     details_root = Path(args.output).resolve().parent / f"{args.side}-details"
     details_root.mkdir(mode=0o700)
     result_variants = []
     for index, variant in enumerate(variants):
         _record_progress(
-            f"{args.side}: variant {index + 1}/44 {variant.name}: starting"
+            f"{args.side}: variant {index + 1}/{expected_count} {variant.name}: starting"
         )
         print(
-            f"[{args.side}] {index + 1}/44 fresh-JIT and execute {variant.name}",
+            f"[{args.side}] {index + 1}/{expected_count} fresh-JIT and execute {variant.name}",
             flush=True,
         )
         predecessor_source = None
@@ -816,11 +828,21 @@ def _worker(args):
         else:
             selector_kwargs["state_indices_mode"] = state_indices_mode
         selected_variant = api["select"](**selector_kwargs)
-        if selected_variant is None or selected_variant.name != variant.name:
+        factory_only = (
+            args.side == "current"
+            and variant.name.removesuffix("_wide_slot_offsets")
+            in _FACTORY_ONLY_VARIANTS
+        )
+        if selected_variant is None or (
+            not factory_only and selected_variant.name != variant.name
+        ):
             raise RuntimeError(
                 f"execution fixture selected {getattr(selected_variant, 'name', None)!r}, "
                 f"expected {variant.name!r}"
             )
+        # `module` was freshly built for this exact named variant above.
+        # Execute its real binding even if the live host dispatcher now uses
+        # another schedule; the independent production route is recorded below.
         module.run(
             tensors["x"],
             tensors["weight"],
@@ -881,9 +903,16 @@ def _worker(args):
                 "peak_allocated_bytes": peak_allocated_bytes,
                 "object_sha256": _file_sha256(object_path),
                 "library_sha256": _file_sha256(library),
+                "execution_binding": "explicit_named_factory",
+                "production_variant": selected_variant.name,
+                "production_selects_executed_factory": (
+                    selected_variant.name == variant.name
+                ),
             }
         )
-        _record_progress(f"{args.side}: variant {index + 1}/44 {variant.name}: sealed")
+        _record_progress(
+            f"{args.side}: variant {index + 1}/{expected_count} {variant.name}: sealed"
+        )
         del module, tensors
         torch.cuda.empty_cache()
 

@@ -27,6 +27,9 @@ static_assert(sizeof(uint64_t) == 8, "FlashInfer requires an LP64 CUDA host ABI"
 typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) FlashInferTensorMap { uint64_t opaque[16]; };
+struct __align__(64) FlashInferTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(FlashInferTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(FlashInferTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 template <int N>
 struct __align__(128) FlashInferTensorMapPack { FlashInferTensorMap maps[N]; };
 
@@ -176,6 +179,150 @@ __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
 }
 
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
+
+__device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rn.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rn_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rz_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rz_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rz.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rm_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rm.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rm_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rm.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rp_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rp.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 add_f32x2_rp_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("add.rp.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rn.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rn_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rz_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rz_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rz.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rm_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rm.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rm_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rm.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rp_noftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rp.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 mul_f32x2_rp_ftz(float2 a, float2 b) {
+    float2 r;
+    asm("mul.rp.ftz.f32x2 %0, %1, %2;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(const unsigned long long*)&a),
+          "l"(*(const unsigned long long*)&b));
+    return r;
+}
 
 __device__ __forceinline__ float2 fma_f32x2_rn_noftz(float2 a, float2 b, float2 c) {
     float2 r;
@@ -404,7 +551,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(512, 2) void
-kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+kernel_cake_fused_kda_decode_wide512_vector4_positive_f32_wide_slot_offsets(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, float* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -454,73 +601,115 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
     float r_q[8];
     float r_k[8];
     float r_decay[8];
-    if (tid_0 < 192) {
-        int qkv_idx = tid_0 / 64;
-        int channel_pair = tid_0 - qkv_idx * 64;
-        int channel = channel_pair * 2;
-        int channel_base = qkv_idx * hidden + head * 128 + channel;
-        int conv_base = slot * conv_slot_stride + channel_base;
-        {
-            uint32_t _bf16x2_bits_0;
-            _bf16x2_bits_0 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base);
-            state_carriers[0] = _bf16x2_bits_0;
+    if (tid_0 < 96) {
+        int qkv_idx = tid_0 / 32;
+        int channel_lane = tid_0 - qkv_idx * 32;
+        int channel_start = channel_lane * 4;
+        int channel_base = qkv_idx * hidden + head * 128 + channel_start;
+        #pragma unroll
+        for (int width_idx = 0; width_idx < 4; width_idx++) {
+            int weight_base = (qkv_idx * 4 + width_idx) * hidden + head * 128 + channel_start;
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(weight + weight_base);
+                state_regs[width_idx * 4 + 0] = _v4.x;
+                state_regs[width_idx * 4 + 1] = _v4.y;
+                state_regs[width_idx * 4 + 2] = _v4.z;
+                state_regs[width_idx * 4 + 3] = _v4.w;
+            }
         }
-        {
-            uint32_t _bf16x2_bits_1;
-            _bf16x2_bits_1 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + qkv_size);
-            state_carriers[1] = _bf16x2_bits_1;
-        }
-        {
-            uint32_t _bf16x2_bits_2;
-            _bf16x2_bits_2 = *reinterpret_cast<const uint32_t*>(conv_state + conv_base + 2 * qkv_size);
-            state_carriers[2] = _bf16x2_bits_2;
+        long long conv_base = (long long)slot * (long long)conv_slot_stride + (long long)channel_base;
+        #pragma unroll
+        for (int history_idx = 0; history_idx < 3; history_idx++) {
+            {
+                uint2 _vld_1;
+                _vld_1 = *reinterpret_cast<const uint2*>(conv_state + conv_base + (long long)(history_idx * qkv_size));
+                uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
+                #pragma unroll
+                for (int _pair = 0; _pair < 2; _pair++) {
+                    asm volatile(
+                        "{\n\t"
+                        "shl.b32 %0, %2, 16;\n\t"
+                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        "}\n"
+                        : "=f"((&state_regs[16 + history_idx * 4 + _pair * 2])[0]), "=f"((&state_regs[16 + history_idx * 4 + _pair * 2])[1])
+                        : "r"(_vpairs_1[_pair]));
+                }
+            }
         }
         int x_base = row * x_row_stride + channel_base;
-        r_q[6] = (float)x[x_base];
-        r_q[7] = (float)x[x_base + 1];
         #pragma unroll
-        for (int _pair = 0; _pair < 3; _pair++) {
-            asm volatile(
-                "{\n\t"
-                "shl.b32 %0, %2, 16;\n\t"
-                "and.b32 %1, %2, 0xffff0000;\n\t"
-                "}\n"
-                : "=f"((&r_q[_pair * 2])[0]), "=f"((&r_q[_pair * 2])[1])
-                : "r"(state_carriers[_pair]));
+        for (int channel_idx = 0; channel_idx < 4; channel_idx++) {
+            r_q[channel_idx] = (float)x[x_base + channel_idx];
         }
-        float weight0_c0 = weight[qkv_idx * 4 * hidden + head * 128 + channel];
-        float weight0_c1 = weight[qkv_idx * 4 * hidden + head * 128 + channel + 1];
-        float weight1_c0 = weight[(qkv_idx * 4 + 1) * hidden + head * 128 + channel];
-        float weight1_c1 = weight[(qkv_idx * 4 + 1) * hidden + head * 128 + channel + 1];
-        float weight2_c0 = weight[(qkv_idx * 4 + 2) * hidden + head * 128 + channel];
-        float weight2_c1 = weight[(qkv_idx * 4 + 2) * hidden + head * 128 + channel + 1];
-        float weight3_c0 = weight[(qkv_idx * 4 + 3) * hidden + head * 128 + channel];
-        float weight3_c1 = weight[(qkv_idx * 4 + 3) * hidden + head * 128 + channel + 1];
-        float mixed0 = r_q[0] * weight0_c0;
-        float mixed1 = r_q[1] * weight0_c1;
-        mixed0 += r_q[2] * weight1_c0;
-        mixed1 += r_q[3] * weight1_c1;
-        mixed0 += r_q[4] * weight2_c0;
-        mixed1 += r_q[5] * weight2_c1;
-        mixed0 += r_q[6] * weight3_c0;
-        mixed1 += r_q[7] * weight3_c1;
+        float2 _f2_0 = make_float2(state_regs[16], state_regs[17]);
+        float2 _f2_1 = make_float2(state_regs[0], state_regs[1]);
+        float2 _mul_f32x2_0;
+        asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_0), "l"(*(const unsigned long long*)&_f2_1));
+        float2 acc_pair0 = _mul_f32x2_0;
+        float2 _f2_2 = make_float2(state_regs[18], state_regs[19]);
+        float2 _f2_3 = make_float2(state_regs[2], state_regs[3]);
+        float2 _mul_f32x2_1;
+        asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&_f2_2), "l"(*(const unsigned long long*)&_f2_3));
+        float2 acc_pair1 = _mul_f32x2_1;
+        float2 _f2_4 = make_float2(state_regs[20], state_regs[21]);
+        float2 _f2_5 = make_float2(state_regs[4], state_regs[5]);
+        acc_pair0 = fma_f32x2_rn_ftz(_f2_4, _f2_5, acc_pair0);
+        float2 _f2_6 = make_float2(state_regs[22], state_regs[23]);
+        float2 _f2_7 = make_float2(state_regs[6], state_regs[7]);
+        acc_pair1 = fma_f32x2_rn_ftz(_f2_6, _f2_7, acc_pair1);
+        float2 _f2_8 = make_float2(state_regs[24], state_regs[25]);
+        float2 _f2_9 = make_float2(state_regs[8], state_regs[9]);
+        acc_pair0 = fma_f32x2_rn_ftz(_f2_8, _f2_9, acc_pair0);
+        float2 _f2_10 = make_float2(state_regs[26], state_regs[27]);
+        float2 _f2_11 = make_float2(state_regs[10], state_regs[11]);
+        acc_pair1 = fma_f32x2_rn_ftz(_f2_10, _f2_11, acc_pair1);
+        float2 _f2_12 = make_float2(r_q[0], r_q[1]);
+        float2 _f2_13 = make_float2(state_regs[12], state_regs[13]);
+        acc_pair0 = fma_f32x2_rn_ftz(_f2_12, _f2_13, acc_pair0);
+        float2 _f2_14 = make_float2(r_q[2], r_q[3]);
+        float2 _f2_15 = make_float2(state_regs[14], state_regs[15]);
+        acc_pair1 = fma_f32x2_rn_ftz(_f2_14, _f2_15, acc_pair1);
         float _tanh_approx_0;
-        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(mixed0 * 0.5f));
-        float silu0 = mixed0 * (_tanh_approx_0 * 0.5f + 0.5f);
+        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(acc_pair0.x * 0.5f));
+        float silu0 = acc_pair0.x * (_tanh_approx_0 * 0.5f + 0.5f);
         float _tanh_approx_1;
-        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(mixed1 * 0.5f));
-        float silu1 = mixed1 * (_tanh_approx_1 * 0.5f + 0.5f);
+        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(acc_pair0.y * 0.5f));
+        float silu1 = acc_pair0.y * (_tanh_approx_1 * 0.5f + 0.5f);
+        float _tanh_approx_2;
+        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_2) : "f"(acc_pair1.x * 0.5f));
+        float silu2 = acc_pair1.x * (_tanh_approx_2 * 0.5f + 0.5f);
+        float _tanh_approx_3;
+        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(acc_pair1.y * 0.5f));
+        float silu3 = acc_pair1.y * (_tanh_approx_3 * 0.5f + 0.5f);
         int qk_segment = (3 - qkv_idx) / 2;
-        int smem_channel = channel + channel / 8 * 4 * qk_segment;
-        sMixed[qkv_idx * 192 + smem_channel] = (float)(__nv_bfloat16)silu0;
-        sMixed[qkv_idx * 192 + smem_channel + 1] = (float)(__nv_bfloat16)silu1;
+        int smem_channel_start = channel_start + channel_start / 8 * 4 * qk_segment;
+        int smem_qkv_base = qkv_idx * 192 + smem_channel_start;
+        sMixed[smem_qkv_base] = (float)(__nv_bfloat16)silu0;
+        sMixed[smem_qkv_base + 1] = (float)(__nv_bfloat16)silu1;
+        sMixed[smem_qkv_base + 2] = (float)(__nv_bfloat16)silu2;
+        sMixed[smem_qkv_base + 3] = (float)(__nv_bfloat16)silu3;
         if (is_live != 0) {
-            conv_state[conv_base] = r_q[2];
-            conv_state[conv_base + 1] = r_q[3];
-            conv_state[conv_base + qkv_size] = r_q[4];
-            conv_state[conv_base + qkv_size + 1] = r_q[5];
-            conv_state[conv_base + 2 * qkv_size] = r_q[6];
-            conv_state[conv_base + 2 * qkv_size + 1] = r_q[7];
+            {
+                uint2 _pk2;
+                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                _pk[0] = __floats2bfloat162_rn(state_regs[20 + 0], state_regs[20 + 1]);
+                _pk[1] = __floats2bfloat162_rn(state_regs[20 + 2], state_regs[20 + 3]);
+                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base]) = _pk2;
+            }
+            {
+                uint2 _pk2;
+                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                _pk[0] = __floats2bfloat162_rn(state_regs[24 + 0], state_regs[24 + 1]);
+                _pk[1] = __floats2bfloat162_rn(state_regs[24 + 2], state_regs[24 + 3]);
+                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base + (long long)qkv_size]) = _pk2;
+            }
+            {
+                uint2 _pk2;
+                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                _pk[0] = __floats2bfloat162_rn(r_q[0 + 0], r_q[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(r_q[0 + 2], r_q[0 + 3]);
+                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base + (long long)(2 * qkv_size)]) = _pk2;
+            }
         }
     }
     if (tid_0 >= 384) {
@@ -531,9 +720,9 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
         float gate = (float)raw_gate[gate_idx] + dt_bias[head * 128 + k_idx];
         float decay_log2 = 0.0f;
         if (use_lower_bound != 0) {
-            float _tanh_approx_2;
-            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_2) : "f"(A * gate * 0.5f));
-            decay_log2 = lower_bound_log2 * (_tanh_approx_2 * 0.5f + 0.5f);
+            float _tanh_approx_4;
+            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(A * gate * 0.5f));
+            decay_log2 = lower_bound_log2 * (_tanh_approx_4 * 0.5f + 0.5f);
         } else {
             float softplus = gate;
             if (gate <= 20.0f) {
@@ -549,48 +738,48 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
         float _exp2_0 = approx_exp2(decay_log2);
         sGateDecay[gate_smem_idx] = _exp2_0;
         float output_gate_value = (float)output_gate[row * output_gate_row_stride + head * 128 + k_idx];
-        float _tanh_approx_3;
-        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(output_gate_value * 0.5f));
-        sOutputScale[k_idx] = norm_weight[k_idx] * (_tanh_approx_3 * 0.5f + 0.5f);
+        float _tanh_approx_5;
+        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_5) : "f"(output_gate_value * 0.5f));
+        sOutputScale[k_idx] = norm_weight[k_idx] * (_tanh_approx_5 * 0.5f + 0.5f);
         if (tid_0 == 384) {
             float beta_raw = (float)raw_beta[row * beta_row_stride + head];
-            float _tanh_approx_4;
-            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(beta_raw * 0.5f));
-            sBeta[0] = _tanh_approx_4 * 0.5f + 0.5f;
+            float _tanh_approx_6;
+            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_6) : "f"(beta_raw * 0.5f));
+            sBeta[0] = _tanh_approx_6 * 0.5f + 0.5f;
         }
     }
-    int state_head_base = slot * state_slot_stride + head * 128 * 128;
-    int state_group_base = state_head_base + state_owner_row_base * 128 + k_start;
+    long long state_head_base = (long long)slot * (long long)state_slot_stride + (long long)(head * 128 * 128);
+    long long state_group_base = state_head_base + (long long)(state_owner_row_base * 128) + (long long)k_start;
     #pragma unroll
     for (int local_row = 0; local_row < 4; local_row++) {
         {
-            unsigned _ldv8_3_0;
-            unsigned _ldv8_3_1;
-            unsigned _ldv8_3_2;
-            unsigned _ldv8_3_3;
-            unsigned _ldv8_3_4;
-            unsigned _ldv8_3_5;
-            unsigned _ldv8_3_6;
-            unsigned _ldv8_3_7;
+            unsigned _ldv8_2_0;
+            unsigned _ldv8_2_1;
+            unsigned _ldv8_2_2;
+            unsigned _ldv8_2_3;
+            unsigned _ldv8_2_4;
+            unsigned _ldv8_2_5;
+            unsigned _ldv8_2_6;
+            unsigned _ldv8_2_7;
             asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(state + (state_group_base + local_row * 128))) : "memory");
-            state_regs[local_row * 8 + 0] = __uint_as_float(_ldv8_3_0);
-            state_regs[local_row * 8 + 1] = __uint_as_float(_ldv8_3_1);
-            state_regs[local_row * 8 + 2] = __uint_as_float(_ldv8_3_2);
-            state_regs[local_row * 8 + 3] = __uint_as_float(_ldv8_3_3);
-            state_regs[local_row * 8 + 4] = __uint_as_float(_ldv8_3_4);
-            state_regs[local_row * 8 + 5] = __uint_as_float(_ldv8_3_5);
-            state_regs[local_row * 8 + 6] = __uint_as_float(_ldv8_3_6);
-            state_regs[local_row * 8 + 7] = __uint_as_float(_ldv8_3_7);
+                : "=r"(_ldv8_2_0), "=r"(_ldv8_2_1), "=r"(_ldv8_2_2), "=r"(_ldv8_2_3), "=r"(_ldv8_2_4), "=r"(_ldv8_2_5), "=r"(_ldv8_2_6), "=r"(_ldv8_2_7) : "l"((const void*)(state + (state_group_base + (long long)(local_row * 128)))) : "memory");
+            state_regs[local_row * 8 + 0] = __uint_as_float(_ldv8_2_0);
+            state_regs[local_row * 8 + 1] = __uint_as_float(_ldv8_2_1);
+            state_regs[local_row * 8 + 2] = __uint_as_float(_ldv8_2_2);
+            state_regs[local_row * 8 + 3] = __uint_as_float(_ldv8_2_3);
+            state_regs[local_row * 8 + 4] = __uint_as_float(_ldv8_2_4);
+            state_regs[local_row * 8 + 5] = __uint_as_float(_ldv8_2_5);
+            state_regs[local_row * 8 + 6] = __uint_as_float(_ldv8_2_6);
+            state_regs[local_row * 8 + 7] = __uint_as_float(_ldv8_2_7);
         }
     }
     __syncthreads();
-    float2 _f2_0 = make_float2(0.0f, 0.0f);
-    float2 q_sq_pair = _f2_0;
-    float2 _f2_1 = make_float2(0.0f, 0.0f);
-    float2 k_sq_pair = _f2_1;
-    float2 _f2_2 = make_float2(0.0f, 0.0f);
-    float2 qk_pair = _f2_2;
+    float2 _f2_16 = make_float2(0.0f, 0.0f);
+    float2 q_sq_pair = _f2_16;
+    float2 _f2_17 = make_float2(0.0f, 0.0f);
+    float2 k_sq_pair = _f2_17;
+    float2 _f2_18 = make_float2(0.0f, 0.0f);
+    float2 qk_pair = _f2_18;
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         r_q[i] = 0.0f;
@@ -600,10 +789,10 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
     for (int i_pair = 0; i_pair < 4; i_pair++) {
         int i0 = i_pair * 2;
         int i1 = i0 + 1;
-        float2 _f2_3 = make_float2(sMixed[qk_smem_start + i0], sMixed[qk_smem_start + i1]);
-        float2 q_pair = _f2_3;
-        float2 _f2_4 = make_float2(sMixed[192 + qk_smem_start + i0], sMixed[192 + qk_smem_start + i1]);
-        float2 k_pair = _f2_4;
+        float2 _f2_19 = make_float2(sMixed[qk_smem_start + i0], sMixed[qk_smem_start + i1]);
+        float2 q_pair = _f2_19;
+        float2 _f2_20 = make_float2(sMixed[192 + qk_smem_start + i0], sMixed[192 + qk_smem_start + i1]);
+        float2 k_pair = _f2_20;
         r_q[i0] = q_pair.x;
         r_q[i1] = q_pair.y;
         r_k[i0] = k_pair.x;
@@ -658,29 +847,29 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
     #pragma unroll
     for (int value_tile = 0; value_tile < 1; value_tile++) {
         int tile_base = value_tile * 128;
-        int state_tile_base = state_group_base + tile_base * 128;
+        long long state_tile_base = state_group_base + (long long)(tile_base * 128);
         if (value_tile > 0) {
             #pragma unroll
             for (int local_row_1 = 0; local_row_1 < 4; local_row_1++) {
                 {
-                    unsigned _ldv8_4_0;
-                    unsigned _ldv8_4_1;
-                    unsigned _ldv8_4_2;
-                    unsigned _ldv8_4_3;
-                    unsigned _ldv8_4_4;
-                    unsigned _ldv8_4_5;
-                    unsigned _ldv8_4_6;
-                    unsigned _ldv8_4_7;
+                    unsigned _ldv8_3_0;
+                    unsigned _ldv8_3_1;
+                    unsigned _ldv8_3_2;
+                    unsigned _ldv8_3_3;
+                    unsigned _ldv8_3_4;
+                    unsigned _ldv8_3_5;
+                    unsigned _ldv8_3_6;
+                    unsigned _ldv8_3_7;
                     asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(state + (state_tile_base + local_row_1 * 128))) : "memory");
-                    state_regs[local_row_1 * 8 + 0] = __uint_as_float(_ldv8_4_0);
-                    state_regs[local_row_1 * 8 + 1] = __uint_as_float(_ldv8_4_1);
-                    state_regs[local_row_1 * 8 + 2] = __uint_as_float(_ldv8_4_2);
-                    state_regs[local_row_1 * 8 + 3] = __uint_as_float(_ldv8_4_3);
-                    state_regs[local_row_1 * 8 + 4] = __uint_as_float(_ldv8_4_4);
-                    state_regs[local_row_1 * 8 + 5] = __uint_as_float(_ldv8_4_5);
-                    state_regs[local_row_1 * 8 + 6] = __uint_as_float(_ldv8_4_6);
-                    state_regs[local_row_1 * 8 + 7] = __uint_as_float(_ldv8_4_7);
+                        : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(state + (state_tile_base + (long long)(local_row_1 * 128)))) : "memory");
+                    state_regs[local_row_1 * 8 + 0] = __uint_as_float(_ldv8_3_0);
+                    state_regs[local_row_1 * 8 + 1] = __uint_as_float(_ldv8_3_1);
+                    state_regs[local_row_1 * 8 + 2] = __uint_as_float(_ldv8_3_2);
+                    state_regs[local_row_1 * 8 + 3] = __uint_as_float(_ldv8_3_3);
+                    state_regs[local_row_1 * 8 + 4] = __uint_as_float(_ldv8_3_4);
+                    state_regs[local_row_1 * 8 + 5] = __uint_as_float(_ldv8_3_5);
+                    state_regs[local_row_1 * 8 + 6] = __uint_as_float(_ldv8_3_6);
+                    state_regs[local_row_1 * 8 + 7] = __uint_as_float(_ldv8_3_7);
                 }
             }
         }
@@ -690,14 +879,14 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
             int local_row_b = local_row_a + 1;
             int local_row_c = local_row_a + 2;
             int local_row_d = local_row_a + 3;
-            float2 _f2_5 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_a = _f2_5;
-            float2 _f2_6 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_b = _f2_6;
-            float2 _f2_7 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_c = _f2_7;
-            float2 _f2_8 = make_float2(0.0f, 0.0f);
-            float2 state_key_pair_d = _f2_8;
+            float2 _f2_21 = make_float2(0.0f, 0.0f);
+            float2 state_key_pair_a = _f2_21;
+            float2 _f2_22 = make_float2(0.0f, 0.0f);
+            float2 state_key_pair_b = _f2_22;
+            float2 _f2_23 = make_float2(0.0f, 0.0f);
+            float2 state_key_pair_c = _f2_23;
+            float2 _f2_24 = make_float2(0.0f, 0.0f);
+            float2 state_key_pair_d = _f2_24;
             #pragma unroll
             for (int i_pair_2 = 0; i_pair_2 < 4; i_pair_2++) {
                 int i0_2 = i_pair_2 * 2;
@@ -706,26 +895,26 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
                 int reg_offset_b = local_row_b * 8 + i0_2;
                 int reg_offset_c = local_row_c * 8 + i0_2;
                 int reg_offset_d = local_row_d * 8 + i0_2;
-                float2 _f2_9 = make_float2(r_decay[i0_2], r_decay[i1_2]);
-                float2 decay_pair = _f2_9;
-                float2 _f2_10 = make_float2(r_k[i0_2], r_k[i1_2]);
-                float2 key_pair = _f2_10;
-                float2 _f2_11 = make_float2(state_regs[reg_offset_a], state_regs[reg_offset_a + 1]);
-                float2 _mul_f32x2_0;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_11), "l"(*(const unsigned long long*)&decay_pair));
-                float2 state_pair_a = _mul_f32x2_0;
-                float2 _f2_12 = make_float2(state_regs[reg_offset_b], state_regs[reg_offset_b + 1]);
-                float2 _mul_f32x2_1;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&_f2_12), "l"(*(const unsigned long long*)&decay_pair));
-                float2 state_pair_b = _mul_f32x2_1;
-                float2 _f2_13 = make_float2(state_regs[reg_offset_c], state_regs[reg_offset_c + 1]);
+                float2 _f2_25 = make_float2(r_decay[i0_2], r_decay[i1_2]);
+                float2 decay_pair = _f2_25;
+                float2 _f2_26 = make_float2(r_k[i0_2], r_k[i1_2]);
+                float2 key_pair = _f2_26;
+                float2 _f2_27 = make_float2(state_regs[reg_offset_a], state_regs[reg_offset_a + 1]);
                 float2 _mul_f32x2_2;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_2) : "l"(*(const unsigned long long*)&_f2_13), "l"(*(const unsigned long long*)&decay_pair));
-                float2 state_pair_c = _mul_f32x2_2;
-                float2 _f2_14 = make_float2(state_regs[reg_offset_d], state_regs[reg_offset_d + 1]);
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_2) : "l"(*(const unsigned long long*)&_f2_27), "l"(*(const unsigned long long*)&decay_pair));
+                float2 state_pair_a = _mul_f32x2_2;
+                float2 _f2_28 = make_float2(state_regs[reg_offset_b], state_regs[reg_offset_b + 1]);
                 float2 _mul_f32x2_3;
-                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_3) : "l"(*(const unsigned long long*)&_f2_14), "l"(*(const unsigned long long*)&decay_pair));
-                float2 state_pair_d = _mul_f32x2_3;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_3) : "l"(*(const unsigned long long*)&_f2_28), "l"(*(const unsigned long long*)&decay_pair));
+                float2 state_pair_b = _mul_f32x2_3;
+                float2 _f2_29 = make_float2(state_regs[reg_offset_c], state_regs[reg_offset_c + 1]);
+                float2 _mul_f32x2_4;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_4) : "l"(*(const unsigned long long*)&_f2_29), "l"(*(const unsigned long long*)&decay_pair));
+                float2 state_pair_c = _mul_f32x2_4;
+                float2 _f2_30 = make_float2(state_regs[reg_offset_d], state_regs[reg_offset_d + 1]);
+                float2 _mul_f32x2_5;
+                asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_5) : "l"(*(const unsigned long long*)&_f2_30), "l"(*(const unsigned long long*)&decay_pair));
+                float2 state_pair_d = _mul_f32x2_5;
                 state_regs[reg_offset_a] = state_pair_a.x;
                 state_regs[reg_offset_a + 1] = state_pair_a.y;
                 state_regs[reg_offset_b] = state_pair_b.x;
@@ -799,14 +988,14 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
             float delta_key_scale_b = delta_b * k_scale;
             float delta_key_scale_c = delta_c * k_scale;
             float delta_key_scale_d = delta_d * k_scale;
-            float2 _f2_15 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_a = _f2_15;
-            float2 _f2_16 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_b = _f2_16;
-            float2 _f2_17 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_c = _f2_17;
-            float2 _f2_18 = make_float2(0.0f, 0.0f);
-            float2 state_query_pair_d = _f2_18;
+            float2 _f2_31 = make_float2(0.0f, 0.0f);
+            float2 state_query_pair_a = _f2_31;
+            float2 _f2_32 = make_float2(0.0f, 0.0f);
+            float2 state_query_pair_b = _f2_32;
+            float2 _f2_33 = make_float2(0.0f, 0.0f);
+            float2 state_query_pair_c = _f2_33;
+            float2 _f2_34 = make_float2(0.0f, 0.0f);
+            float2 state_query_pair_d = _f2_34;
             #pragma unroll
             for (int i_pair_3 = 0; i_pair_3 < 4; i_pair_3++) {
                 int i0_3 = i_pair_3 * 2;
@@ -815,16 +1004,16 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
                 int reg_offset_b_1 = local_row_b * 8 + i0_3;
                 int reg_offset_c_1 = local_row_c * 8 + i0_3;
                 int reg_offset_d_1 = local_row_d * 8 + i0_3;
-                float2 _f2_19 = make_float2(r_q[i0_3], r_q[i1_3]);
-                float2 query_pair = _f2_19;
-                float2 _f2_20 = make_float2(state_regs[reg_offset_a_1], state_regs[reg_offset_a_1 + 1]);
-                state_query_pair_a = fma_f32x2_rn_ftz(_f2_20, query_pair, state_query_pair_a);
-                float2 _f2_21 = make_float2(state_regs[reg_offset_b_1], state_regs[reg_offset_b_1 + 1]);
-                state_query_pair_b = fma_f32x2_rn_ftz(_f2_21, query_pair, state_query_pair_b);
-                float2 _f2_22 = make_float2(state_regs[reg_offset_c_1], state_regs[reg_offset_c_1 + 1]);
-                state_query_pair_c = fma_f32x2_rn_ftz(_f2_22, query_pair, state_query_pair_c);
-                float2 _f2_23 = make_float2(state_regs[reg_offset_d_1], state_regs[reg_offset_d_1 + 1]);
-                state_query_pair_d = fma_f32x2_rn_ftz(_f2_23, query_pair, state_query_pair_d);
+                float2 _f2_35 = make_float2(r_q[i0_3], r_q[i1_3]);
+                float2 query_pair = _f2_35;
+                float2 _f2_36 = make_float2(state_regs[reg_offset_a_1], state_regs[reg_offset_a_1 + 1]);
+                state_query_pair_a = fma_f32x2_rn_ftz(_f2_36, query_pair, state_query_pair_a);
+                float2 _f2_37 = make_float2(state_regs[reg_offset_b_1], state_regs[reg_offset_b_1 + 1]);
+                state_query_pair_b = fma_f32x2_rn_ftz(_f2_37, query_pair, state_query_pair_b);
+                float2 _f2_38 = make_float2(state_regs[reg_offset_c_1], state_regs[reg_offset_c_1 + 1]);
+                state_query_pair_c = fma_f32x2_rn_ftz(_f2_38, query_pair, state_query_pair_c);
+                float2 _f2_39 = make_float2(state_regs[reg_offset_d_1], state_regs[reg_offset_d_1 + 1]);
+                state_query_pair_d = fma_f32x2_rn_ftz(_f2_39, query_pair, state_query_pair_d);
             }
             float state_query_dot_a = state_query_pair_a.x + state_query_pair_a.y;
             float state_query_dot_b = state_query_pair_b.x + state_query_pair_b.y;
@@ -882,20 +1071,20 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
                 int reg_offset_b_2 = local_row_b * 8 + i0_4;
                 int reg_offset_c_2 = local_row_c * 8 + i0_4;
                 int reg_offset_d_2 = local_row_d * 8 + i0_4;
-                float2 _f2_24 = make_float2(r_k[i0_4], r_k[i1_4]);
-                float2 key_pair_1 = _f2_24;
-                float2 _f2_25 = make_float2(delta_key_scale_a, delta_key_scale_a);
-                float2 _f2_26 = make_float2(state_regs[reg_offset_a_2], state_regs[reg_offset_a_2 + 1]);
-                float2 updated_pair_a = fma_f32x2_rn_ftz(_f2_25, key_pair_1, _f2_26);
-                float2 _f2_27 = make_float2(delta_key_scale_b, delta_key_scale_b);
-                float2 _f2_28 = make_float2(state_regs[reg_offset_b_2], state_regs[reg_offset_b_2 + 1]);
-                float2 updated_pair_b = fma_f32x2_rn_ftz(_f2_27, key_pair_1, _f2_28);
-                float2 _f2_29 = make_float2(delta_key_scale_c, delta_key_scale_c);
-                float2 _f2_30 = make_float2(state_regs[reg_offset_c_2], state_regs[reg_offset_c_2 + 1]);
-                float2 updated_pair_c = fma_f32x2_rn_ftz(_f2_29, key_pair_1, _f2_30);
-                float2 _f2_31 = make_float2(delta_key_scale_d, delta_key_scale_d);
-                float2 _f2_32 = make_float2(state_regs[reg_offset_d_2], state_regs[reg_offset_d_2 + 1]);
-                float2 updated_pair_d = fma_f32x2_rn_ftz(_f2_31, key_pair_1, _f2_32);
+                float2 _f2_40 = make_float2(r_k[i0_4], r_k[i1_4]);
+                float2 key_pair_1 = _f2_40;
+                float2 _f2_41 = make_float2(delta_key_scale_a, delta_key_scale_a);
+                float2 _f2_42 = make_float2(state_regs[reg_offset_a_2], state_regs[reg_offset_a_2 + 1]);
+                float2 updated_pair_a = fma_f32x2_rn_ftz(_f2_41, key_pair_1, _f2_42);
+                float2 _f2_43 = make_float2(delta_key_scale_b, delta_key_scale_b);
+                float2 _f2_44 = make_float2(state_regs[reg_offset_b_2], state_regs[reg_offset_b_2 + 1]);
+                float2 updated_pair_b = fma_f32x2_rn_ftz(_f2_43, key_pair_1, _f2_44);
+                float2 _f2_45 = make_float2(delta_key_scale_c, delta_key_scale_c);
+                float2 _f2_46 = make_float2(state_regs[reg_offset_c_2], state_regs[reg_offset_c_2 + 1]);
+                float2 updated_pair_c = fma_f32x2_rn_ftz(_f2_45, key_pair_1, _f2_46);
+                float2 _f2_47 = make_float2(delta_key_scale_d, delta_key_scale_d);
+                float2 _f2_48 = make_float2(state_regs[reg_offset_d_2], state_regs[reg_offset_d_2 + 1]);
+                float2 updated_pair_d = fma_f32x2_rn_ftz(_f2_47, key_pair_1, _f2_48);
                 state_regs[reg_offset_a_2] = updated_pair_a.x;
                 state_regs[reg_offset_a_2 + 1] = updated_pair_a.y;
                 state_regs[reg_offset_b_2] = updated_pair_b.x;
@@ -907,56 +1096,56 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
             }
             if (is_live != 0) {
                 {
-                    unsigned _stv8_5_0 = __float_as_uint(state_regs[local_row_a * 8 + 0]);
-                    unsigned _stv8_5_1 = __float_as_uint(state_regs[local_row_a * 8 + 1]);
-                    unsigned _stv8_5_2 = __float_as_uint(state_regs[local_row_a * 8 + 2]);
-                    unsigned _stv8_5_3 = __float_as_uint(state_regs[local_row_a * 8 + 3]);
-                    unsigned _stv8_5_4 = __float_as_uint(state_regs[local_row_a * 8 + 4]);
-                    unsigned _stv8_5_5 = __float_as_uint(state_regs[local_row_a * 8 + 5]);
-                    unsigned _stv8_5_6 = __float_as_uint(state_regs[local_row_a * 8 + 6]);
-                    unsigned _stv8_5_7 = __float_as_uint(state_regs[local_row_a * 8 + 7]);
+                    unsigned _stv8_4_0 = __float_as_uint(state_regs[local_row_a * 8 + 0]);
+                    unsigned _stv8_4_1 = __float_as_uint(state_regs[local_row_a * 8 + 1]);
+                    unsigned _stv8_4_2 = __float_as_uint(state_regs[local_row_a * 8 + 2]);
+                    unsigned _stv8_4_3 = __float_as_uint(state_regs[local_row_a * 8 + 3]);
+                    unsigned _stv8_4_4 = __float_as_uint(state_regs[local_row_a * 8 + 4]);
+                    unsigned _stv8_4_5 = __float_as_uint(state_regs[local_row_a * 8 + 5]);
+                    unsigned _stv8_4_6 = __float_as_uint(state_regs[local_row_a * 8 + 6]);
+                    unsigned _stv8_4_7 = __float_as_uint(state_regs[local_row_a * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state + (state_tile_base + local_row_a * 128))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + (long long)(local_row_a * 128)))), "r"(_stv8_4_0), "r"(_stv8_4_1), "r"(_stv8_4_2), "r"(_stv8_4_3), "r"(_stv8_4_4), "r"(_stv8_4_5), "r"(_stv8_4_6), "r"(_stv8_4_7) : "memory");
                 }
                 {
-                    unsigned _stv8_6_0 = __float_as_uint(state_regs[local_row_b * 8 + 0]);
-                    unsigned _stv8_6_1 = __float_as_uint(state_regs[local_row_b * 8 + 1]);
-                    unsigned _stv8_6_2 = __float_as_uint(state_regs[local_row_b * 8 + 2]);
-                    unsigned _stv8_6_3 = __float_as_uint(state_regs[local_row_b * 8 + 3]);
-                    unsigned _stv8_6_4 = __float_as_uint(state_regs[local_row_b * 8 + 4]);
-                    unsigned _stv8_6_5 = __float_as_uint(state_regs[local_row_b * 8 + 5]);
-                    unsigned _stv8_6_6 = __float_as_uint(state_regs[local_row_b * 8 + 6]);
-                    unsigned _stv8_6_7 = __float_as_uint(state_regs[local_row_b * 8 + 7]);
+                    unsigned _stv8_5_0 = __float_as_uint(state_regs[local_row_b * 8 + 0]);
+                    unsigned _stv8_5_1 = __float_as_uint(state_regs[local_row_b * 8 + 1]);
+                    unsigned _stv8_5_2 = __float_as_uint(state_regs[local_row_b * 8 + 2]);
+                    unsigned _stv8_5_3 = __float_as_uint(state_regs[local_row_b * 8 + 3]);
+                    unsigned _stv8_5_4 = __float_as_uint(state_regs[local_row_b * 8 + 4]);
+                    unsigned _stv8_5_5 = __float_as_uint(state_regs[local_row_b * 8 + 5]);
+                    unsigned _stv8_5_6 = __float_as_uint(state_regs[local_row_b * 8 + 6]);
+                    unsigned _stv8_5_7 = __float_as_uint(state_regs[local_row_b * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state + (state_tile_base + local_row_b * 128))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + (long long)(local_row_b * 128)))), "r"(_stv8_5_0), "r"(_stv8_5_1), "r"(_stv8_5_2), "r"(_stv8_5_3), "r"(_stv8_5_4), "r"(_stv8_5_5), "r"(_stv8_5_6), "r"(_stv8_5_7) : "memory");
                 }
                 {
-                    unsigned _stv8_7_0 = __float_as_uint(state_regs[local_row_c * 8 + 0]);
-                    unsigned _stv8_7_1 = __float_as_uint(state_regs[local_row_c * 8 + 1]);
-                    unsigned _stv8_7_2 = __float_as_uint(state_regs[local_row_c * 8 + 2]);
-                    unsigned _stv8_7_3 = __float_as_uint(state_regs[local_row_c * 8 + 3]);
-                    unsigned _stv8_7_4 = __float_as_uint(state_regs[local_row_c * 8 + 4]);
-                    unsigned _stv8_7_5 = __float_as_uint(state_regs[local_row_c * 8 + 5]);
-                    unsigned _stv8_7_6 = __float_as_uint(state_regs[local_row_c * 8 + 6]);
-                    unsigned _stv8_7_7 = __float_as_uint(state_regs[local_row_c * 8 + 7]);
+                    unsigned _stv8_6_0 = __float_as_uint(state_regs[local_row_c * 8 + 0]);
+                    unsigned _stv8_6_1 = __float_as_uint(state_regs[local_row_c * 8 + 1]);
+                    unsigned _stv8_6_2 = __float_as_uint(state_regs[local_row_c * 8 + 2]);
+                    unsigned _stv8_6_3 = __float_as_uint(state_regs[local_row_c * 8 + 3]);
+                    unsigned _stv8_6_4 = __float_as_uint(state_regs[local_row_c * 8 + 4]);
+                    unsigned _stv8_6_5 = __float_as_uint(state_regs[local_row_c * 8 + 5]);
+                    unsigned _stv8_6_6 = __float_as_uint(state_regs[local_row_c * 8 + 6]);
+                    unsigned _stv8_6_7 = __float_as_uint(state_regs[local_row_c * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state + (state_tile_base + local_row_c * 128))), "r"(_stv8_7_0), "r"(_stv8_7_1), "r"(_stv8_7_2), "r"(_stv8_7_3), "r"(_stv8_7_4), "r"(_stv8_7_5), "r"(_stv8_7_6), "r"(_stv8_7_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + (long long)(local_row_c * 128)))), "r"(_stv8_6_0), "r"(_stv8_6_1), "r"(_stv8_6_2), "r"(_stv8_6_3), "r"(_stv8_6_4), "r"(_stv8_6_5), "r"(_stv8_6_6), "r"(_stv8_6_7) : "memory");
                 }
                 {
-                    unsigned _stv8_8_0 = __float_as_uint(state_regs[local_row_d * 8 + 0]);
-                    unsigned _stv8_8_1 = __float_as_uint(state_regs[local_row_d * 8 + 1]);
-                    unsigned _stv8_8_2 = __float_as_uint(state_regs[local_row_d * 8 + 2]);
-                    unsigned _stv8_8_3 = __float_as_uint(state_regs[local_row_d * 8 + 3]);
-                    unsigned _stv8_8_4 = __float_as_uint(state_regs[local_row_d * 8 + 4]);
-                    unsigned _stv8_8_5 = __float_as_uint(state_regs[local_row_d * 8 + 5]);
-                    unsigned _stv8_8_6 = __float_as_uint(state_regs[local_row_d * 8 + 6]);
-                    unsigned _stv8_8_7 = __float_as_uint(state_regs[local_row_d * 8 + 7]);
+                    unsigned _stv8_7_0 = __float_as_uint(state_regs[local_row_d * 8 + 0]);
+                    unsigned _stv8_7_1 = __float_as_uint(state_regs[local_row_d * 8 + 1]);
+                    unsigned _stv8_7_2 = __float_as_uint(state_regs[local_row_d * 8 + 2]);
+                    unsigned _stv8_7_3 = __float_as_uint(state_regs[local_row_d * 8 + 3]);
+                    unsigned _stv8_7_4 = __float_as_uint(state_regs[local_row_d * 8 + 4]);
+                    unsigned _stv8_7_5 = __float_as_uint(state_regs[local_row_d * 8 + 5]);
+                    unsigned _stv8_7_6 = __float_as_uint(state_regs[local_row_d * 8 + 6]);
+                    unsigned _stv8_7_7 = __float_as_uint(state_regs[local_row_d * 8 + 7]);
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(state + (state_tile_base + local_row_d * 128))), "r"(_stv8_8_0), "r"(_stv8_8_1), "r"(_stv8_8_2), "r"(_stv8_8_3), "r"(_stv8_8_4), "r"(_stv8_8_5), "r"(_stv8_8_6), "r"(_stv8_8_7) : "memory");
+                        :: "l"((void*)(state + (state_tile_base + (long long)(local_row_d * 128)))), "r"(_stv8_7_0), "r"(_stv8_7_1), "r"(_stv8_7_2), "r"(_stv8_7_3), "r"(_stv8_7_4), "r"(_stv8_7_5), "r"(_stv8_7_6), "r"(_stv8_7_7) : "memory");
                 }
             }
             if (lane_group == 0) {
@@ -978,8 +1167,8 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
         output_values[3] = (float)recurrence_pair1.y;
         float sum_squares = 0.0f;
         #pragma unroll
-        for (int channel_idx = 0; channel_idx < 4; channel_idx++) {
-            float value = output_values[channel_idx];
+        for (int channel_idx_1 = 0; channel_idx_1 < 4; channel_idx_1++) {
+            float value = output_values[channel_idx_1];
             sum_squares += value * value;
         }
         float _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, sum_squares, 16);
@@ -1000,11 +1189,11 @@ kernel_cake_fused_kda_decode_wide512_positive_f32(__nv_bfloat16* __restrict__ x,
             : "=r"(*reinterpret_cast<uint32_t*>(&output_scales[0])), "=r"(*reinterpret_cast<uint32_t*>(&output_scales[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&output_scales[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&output_scales[(0) + 3]))
             : "r"(sOutputScale_addr + (unsigned int)(lane_1 * 16)));
         #pragma unroll
-        for (int channel_idx_1 = 0; channel_idx_1 < 4; channel_idx_1++) {
+        for (int channel_idx_2 = 0; channel_idx_2 < 4; channel_idx_2++) {
             if (is_live != 0) {
-                output_values[channel_idx_1] = output_values[channel_idx_1] * inverse_rms * output_scales[channel_idx_1];
+                output_values[channel_idx_2] = output_values[channel_idx_2] * inverse_rms * output_scales[channel_idx_2];
             } else {
-                output_values[channel_idx_1] = 0.0f;
+                output_values[channel_idx_2] = 0.0f;
             }
         }
         {

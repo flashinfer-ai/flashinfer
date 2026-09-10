@@ -500,7 +500,7 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "name": "wide512_positive_f32_wide_slot_offsets",
         "target": "sm100a",
         "body": "cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets.cu",
-        "source_sha256": "49b79b77ae28dcfc8690b9a16c6d26bfedc20288bde231916e21ba4951fd5c01",
+        "source_sha256": "30c935b217f9b0816ae08e39670bc9eeaefa8236fbd6d0939da0483ab5583a81",
         "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets",
         "abi_kind": "standard",
         "state_dtype": "float32",
@@ -590,7 +590,7 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "name": "wide512_positive_f32",
         "target": "sm100a",
         "body": "cake_fused_kda_decode_wide512_positive_f32.cu",
-        "source_sha256": "da41a7edfdbd0897d914065f73fd7afc89d7a73530e9a3067d43fa6b59b69a70",
+        "source_sha256": "8007333b792d6326013fbbad4b5e03d43a1102e0679e5163632228e7caf32813",
         "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_positive_f32",
         "abi_kind": "standard",
         "state_dtype": "float32",
@@ -3586,6 +3586,96 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
             },
         ),
     },
+    {
+        "name": "wide512_vector4_positive_f32",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_wide512_vector4_positive_f32.cu",
+        "source_sha256": "b2f7be76d44fe4a2619b60c271bd08ba7c7fd930aec7509d6606bf8cd1ac9a30",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_vector4_positive_f32",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 3712,
+        "eligibility": (
+            {
+                "heads": [12],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [24],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "wide512_vector4_positive_f32_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_wide512_vector4_positive_f32_wide_slot_offsets.cu",
+        "source_sha256": "dabef8ba748408cd154e802db322d82132040065bd6cd16753c11c5e10fad03d",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_vector4_positive_f32_wide_slot_offsets",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 3712,
+        "eligibility": (
+            {
+                "heads": [12],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [24],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
 )
 
 
@@ -3628,7 +3718,7 @@ def get_cake_fused_kda_decode_variants(
                 f"{source_sha256} != {item['source_sha256']}"
             )
         extra_cuda_cflags = tuple(item["extra_cuda_cflags"])
-        if target == "sm103a" and name in (
+        if name in (
             "compact_async_f32_wide_slot_offsets",
             "compact_async_pr_eval_h96_f32_wide_slot_offsets",
         ):
@@ -3744,10 +3834,14 @@ def _eligibility_matches(
     lower_bound: float | None,
     norm_eps: float,
     strides: dict[str, int],
+    check_row_bounds: bool = True,
 ) -> bool:
-    if num_heads not in rule.heads or num_rows < rule.minimum_rows:
+    if num_heads not in rule.heads:
         return False
-    if rule.maximum_rows is not None and num_rows > rule.maximum_rows:
+    if check_row_bounds and (
+        num_rows < rule.minimum_rows
+        or (rule.maximum_rows is not None and num_rows > rule.maximum_rows)
+    ):
         return False
     if state_indices_mode not in rule.state_indices_modes:
         return False
@@ -3761,6 +3855,33 @@ def _eligibility_matches(
     return all(
         expected is None or strides[name] == expected for name, expected in rule.strides
     )
+
+
+def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
+    """Choose positive-unique FP32 schedules by resident-CTA wave capacity."""
+
+    sm_count = 148
+    work_items = num_heads * num_rows
+    if 2 * sm_count < work_items <= 3 * sm_count:
+        return ("compact_async_pr_eval_h96_f32", "compact_async_positive_f32")
+    partial_wave = work_items % (2 * sm_count)
+    high_work = (num_heads == 32 and num_rows >= 32) or (
+        work_items >= 8 * sm_count
+    ) or (
+        work_items > 4 * sm_count
+        and 0 < partial_wave <= sm_count // 2
+        and (num_heads != 12 or partial_wave >= num_heads)
+    )
+    if high_work:
+        return (
+            f"high_work_positive_pr_eval_h{num_heads}_f32",
+            "high_work_positive_h96_pr_strides_f32",
+            "high_work_positive_h96_f32",
+            "high_work_positive_f32",
+        )
+    if num_heads <= 24 and 3 * sm_count < 2 * work_items <= 4 * sm_count:
+        return ("wide512_vector4_positive_f32",)
+    return ("wide512_positive_f32",)
 
 
 def select_cake_fused_kda_decode_variant(
@@ -3829,11 +3950,22 @@ def select_cake_fused_kda_decode_variant(
         if variants is None
         else tuple(variants)
     )
+    positive_f32_variants = (
+        _positive_f32_variants(num_heads, num_rows)
+        if state_dtype == "float32" and state_indices_mode == "positive_unique"
+        else None
+    )
     for variant in available:
         if (
             variant.target != target
             or variant.state_dtype != state_dtype
             or variant.slot_offset_bits != required_slot_offset_bits
+        ):
+            continue
+        if (
+            positive_f32_variants is not None
+            and variant.name.removesuffix("_wide_slot_offsets")
+            not in positive_f32_variants
         ):
             continue
         if any(
@@ -3845,6 +3977,7 @@ def select_cake_fused_kda_decode_variant(
                 lower_bound=lower_bound,
                 norm_eps=norm_eps,
                 strides=strides,
+                check_row_bounds=positive_f32_variants is None,
             )
             for rule in variant.eligibility
         ):
