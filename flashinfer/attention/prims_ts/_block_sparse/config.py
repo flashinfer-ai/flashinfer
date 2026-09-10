@@ -23,6 +23,7 @@ import torch
 from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
+from ..sage import SAGE_QK_DTYPES, SageAttentionParams, validate_sage_params
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
@@ -87,6 +88,13 @@ class _BlockSparseCompileKey:
     # A dense key keeps the Q-tile and KV-route selection; its configuration
     # reads none of the routing fields above.
     use_block_sparse: bool = True
+    # The output dtype follows ``dtype_key`` unless Sage attention publishes a
+    # 16-bit output from 8-bit Q/K/V.
+    out_dtype_key: str | None = None
+    # Sage attention block sizes and the V mean add-back; zero K block means off.
+    sage_q_block_size: int = 0
+    sage_k_block_size: int = 0
+    sage_v_mean: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,6 +133,9 @@ class _BlockSparseStaticProfile:
     use_kv_valid_bits: bool
     max_blocks_per_row: int | None
     page_size: int | None = None
+    sage_q_block_size: int = 0
+    sage_k_block_size: int = 0
+    sage_v_mean: bool = False
 
 
 def _select_block_sparse_kv_route_size(
@@ -308,6 +319,13 @@ def _validate_matching_dtypes(
     kv_dtype: torch.dtype,
     output_dtype: torch.dtype,
 ) -> str:
+    """Validate the 16-bit dtype rule of a plan without Sage attention."""
+
+    if any(dtype in SAGE_QK_DTYPES for dtype in (q_dtype, kv_dtype)):
+        raise NotImplementedError(
+            "8-bit Q/K/V require sage=SageAttentionParams(...); without Sage "
+            "attention block-sparse supports only torch.float16 and torch.bfloat16"
+        )
     if not (q_dtype == kv_dtype == output_dtype):
         raise ValueError("block-sparse requires matching Q, K/V, and output dtypes")
     if q_dtype not in _SUPPORTED_DTYPES:
@@ -355,8 +373,15 @@ def _validate_block_sparse_static_profile(
     output_dtype: torch.dtype | None,
     max_blocks_per_row: object = _CAPACITY_UNSET,
     page_size: int | None = None,
+    sage: SageAttentionParams | None = None,
 ) -> _BlockSparseStaticProfile:
-    """Validate static policy before any device work or BSR inspection."""
+    """Validate static policy before any device work or BSR inspection.
+
+    With ``sage`` the 8-bit dtype rules of Sage attention replace the matching
+    16-bit rule, the output defaults to bfloat16, the block sizes must select a
+    streamed Keeps profile (Q64/KV256 or Q128/KV128), and the scale block sizes
+    are validated against the selected Q tile.
+    """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
@@ -406,9 +431,34 @@ def _validate_block_sparse_static_profile(
         raise ValueError("causal block-sparse requires seq_len_q <= seq_len_kv")
     if kv_dtype is None:
         kv_dtype = q_dtype
-    if output_dtype is None:
-        output_dtype = q_dtype
-    dtype_key = _validate_matching_dtypes(q_dtype, kv_dtype, output_dtype)
+    if sage is None:
+        if output_dtype is None:
+            output_dtype = q_dtype
+        dtype_key = _validate_matching_dtypes(q_dtype, kv_dtype, output_dtype)
+    else:
+        if output_dtype is None:
+            output_dtype = torch.bfloat16
+        if kv_block_size % 64 != 0 or q_tile_size < 64:
+            raise ValueError(
+                "Sage attention requires the Q64/KV256 or Q128/KV128 profile: "
+                "kv_block_size must be a multiple of 64 and "
+                "q_block_size * Hq / Hkv at least 64; got "
+                f"kv_block_size={kv_block_size} and a Q{q_tile_size} tile"
+            )
+        validate_sage_params(
+            sage,
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tile_size_q=q_tile_size,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=output_dtype,
+        )
+        dtype_key = _dtype_key(q_dtype)
     kv_route_size = _select_block_sparse_kv_route_size(
         q_tile_size=q_tile_size,
         kv_block_size=kv_block_size,
@@ -443,6 +493,9 @@ def _validate_block_sparse_static_profile(
         use_kv_valid_bits=use_kv_valid_bits,
         max_blocks_per_row=validated_max_blocks_per_row,
         page_size=page_size,
+        sage_q_block_size=0 if sage is None else sage.q_block_size,
+        sage_k_block_size=0 if sage is None else sage.k_block_size,
+        sage_v_mean=sage is not None and sage.v_mean is not None,
     )
 
 
@@ -452,6 +505,9 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
     from ..kernels.fmha_decode.fmha_decode_config import make_decode_config
 
     dtype = _cutlass_dtype(key.dtype_key)
+    out_dtype = _cutlass_dtype(
+        key.dtype_key if key.out_dtype_key is None else key.out_dtype_key
+    )
     q_tile_size = _select_block_sparse_q_tile_size(
         q_block_size=key.q_block_size,
         heads_q_per_kv=key.num_qo_heads // key.num_kv_heads,
@@ -478,6 +534,14 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
             config_args["use_block_sparse_proxy_routes"] = True
     if key.use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
+    if key.sage_k_block_size > 0:
+        config_args.update(
+            {
+                "sage_q_block_size": key.sage_q_block_size,
+                "sage_k_block_size": key.sage_k_block_size,
+                "sage_v_mean": key.sage_v_mean,
+            }
+        )
     layout_args: dict[str, object]
     if key.page_size is None:
         layout_args = {"qkv_layout": "contiguousKv"}
@@ -495,7 +559,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         num_heads_q=key.num_qo_heads,
         num_heads_kv=key.num_kv_heads,
         qkv_dtype=dtype,
-        o_dtype=dtype,
+        o_dtype=out_dtype,
         split_kv_mode="disabled",
         splits_kv=1,
         mask_type=key.mask_type,
@@ -524,6 +588,10 @@ def _resolve_block_sparse_launch_spec(
     use_proxy_routes: bool = False,
     page_size: int | None = None,
     use_block_sparse: bool = True,
+    out_dtype_key: str | None = None,
+    sage_q_block_size: int = 0,
+    sage_k_block_size: int = 0,
+    sage_v_mean: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -597,6 +665,10 @@ def _resolve_block_sparse_launch_spec(
         use_proxy_routes=use_proxy_routes,
         page_size=page_size,
         use_block_sparse=use_block_sparse,
+        out_dtype_key=out_dtype_key,
+        sage_q_block_size=sage_q_block_size,
+        sage_k_block_size=sage_k_block_size,
+        sage_v_mean=sage_v_mean,
     )
     try:
         config = _make_block_sparse_config(compile_key)

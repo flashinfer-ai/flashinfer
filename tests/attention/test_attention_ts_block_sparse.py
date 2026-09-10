@@ -48,11 +48,13 @@ from flashinfer.attention.prims_ts._block_sparse.prepared import (
 )
 
 from tests.attention.prims_ts_test_utils import (
+    FP8 as _FP8,
     HEAD_DIM as _HEAD_DIM,
     Patterns as _Patterns,
     REQUIRES_PRIMTS_GPU as _REQUIRES_PRIMTS_GPU,
     make_bsr,
     make_exact_block_bits,
+    make_sage_params,
     pack_token_mask,
     token_mask_valid_sets,
     widest_bsr_row,
@@ -616,6 +618,10 @@ def _plan_state_stub(**overrides: object) -> SimpleNamespace:
         "route_workspace": None,
         "max_blocks_per_row": None,
         "page_size": None,
+        "tile_size_q": 8,
+        "sage": None,
+        "sage_launch_args": (),
+        "sage_tensors": (),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -1571,6 +1577,75 @@ def test_block_sparse_static_profile_accepts_supported_gqa_groups(
     profile = _validate_static_block_sparse_heads(num_qo_heads, num_kv_heads)
 
     assert profile.q_tile_size == expected_q_tile
+
+
+def _validate_static_profile_geometry(
+    *,
+    q_block_size: int,
+    kv_block_size: int,
+    num_qo_heads: int = 1,
+    sage: prims_ts.SageAttentionParams | None = None,
+    q_dtype: torch.dtype = torch.float16,
+    kv_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> block_sparse_module._BlockSparseStaticProfile:
+    return block_sparse_module._validate_block_sparse_static_profile(
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=512,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=1,
+        head_dim=_HEAD_DIM,
+        q_block_size=q_block_size,
+        kv_block_size=kv_block_size,
+        use_kv_valid_bits=False,
+        mask_type="dense",
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        output_dtype=output_dtype,
+        max_blocks_per_row=2,
+        sage=sage,
+    )
+
+
+@pytest.mark.parametrize(
+    ("q_block_size", "kv_block_size", "num_qo_heads"),
+    (
+        # kv_block_size=32 selects the Swaps Q32 tile and the KV128 route.
+        pytest.param(64, 32, 1, id="fine-kv-block"),
+        # A Q8 MHA tile is a Swaps profile even with a coarse KV block.
+        pytest.param(8, 64, 1, id="small-q-tile"),
+    ),
+)
+def test_sage_static_profile_names_the_block_sizes_of_a_swaps_profile(
+    q_block_size: int, kv_block_size: int, num_qo_heads: int
+) -> None:
+    """Sage rejects Swaps profiles in wrapper terms before any kernel lookup."""
+
+    sage = make_sage_params(
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=512,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=1,
+    )
+    with pytest.raises(ValueError, match="kv_block_size must be a multiple of 64"):
+        _validate_static_profile_geometry(
+            q_block_size=q_block_size,
+            kv_block_size=kv_block_size,
+            num_qo_heads=num_qo_heads,
+            sage=sage,
+            q_dtype=_FP8,
+        )
+
+
+def test_static_profile_points_8_bit_dtypes_without_sage_at_sage_params() -> None:
+    with pytest.raises(NotImplementedError, match="sage=SageAttentionParams"):
+        _validate_static_profile_geometry(
+            q_block_size=64,
+            kv_block_size=64,
+            q_dtype=_FP8,
+        )
 
 
 def test_paged_block_sparse_static_profile_accepts_token_q_blocks() -> None:

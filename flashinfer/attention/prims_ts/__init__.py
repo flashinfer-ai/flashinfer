@@ -48,9 +48,11 @@ from .q_token_kv_block_sparse_metadata import (
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
+from .sage import SageAttentionParams
 
 __all__ = [
     "BlockSparseTSWrapper",
+    "SageAttentionParams",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",
     "block_sparse_attention_with_paged_kv_cache",

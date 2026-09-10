@@ -91,6 +91,9 @@ Block-Sparse FMHA
     block_sparse_attention
     block_sparse_attention_with_paged_kv_cache
 
+.. autoclass:: SageAttentionParams
+    :members:
+
 .. autoclass:: BlockSparseTSWrapper
     :members:
 
