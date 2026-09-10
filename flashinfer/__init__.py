@@ -166,19 +166,6 @@ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
-from .kda_backward import (
-    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
-)
-from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
-from .kda_training import (
-    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
-)
-from .kda_training import (
-    recurrent_kda_training_backward as recurrent_kda_training_backward,
-)
-from .kda_training import (
-    recurrent_kda_training_forward as recurrent_kda_training_forward,
-)
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )
@@ -186,6 +173,7 @@ from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
+from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
