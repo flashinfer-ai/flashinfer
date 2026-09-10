@@ -8,11 +8,11 @@
 
 """Cold-L2 CUPTI benchmark for the paired recurrent-KDA training API.
 
-The forward timing includes the exact checkpoint-producing route plus the
-full-FP32-state recurrence that produces the public final state. Its token
-output is private on C16 and public on C32; row-split directly produces both
-public outputs. The backward timing consumes the already-saved context and
-therefore excludes forward recomputation.
+The only reportable latency is one callback containing the public forward
+immediately followed by backward on that forward's saved context. It is not a
+sum of separately measured forward and backward medians. The output, final
+state, and all eight gradients are checked against the pinned FLA peer before
+either callback is timed.
 """
 
 import argparse
@@ -43,10 +43,10 @@ class _Shape:
     num_qk_heads: int
     num_v_heads: int
     seed: int
+    layout: str = "packed"
 
 
-_PRIMARY_SHAPES = {
-    "packed_1024x8_h96": _Shape((1024,) * 8, 96, 96, 819208),
+_PORTFOLIO_SHAPES = {
     "portfolio_01_hq4_hv8_t32768": _Shape((3200,) * 9 + (3968,), 4, 8, 24001),
     "portfolio_02_hq2_hv8_t18432": _Shape((2000,) * 8 + (2432,), 2, 8, 24002),
     "portfolio_03_hq4_hv4_t32768": _Shape((2656,) * 11 + (3552,), 4, 4, 24003),
@@ -63,16 +63,37 @@ _PRIMARY_SHAPES = {
     "portfolio_14_hq2_hv4_t32768": _Shape((3200,) * 9 + (3968,), 2, 4, 24014),
     "portfolio_15_hq4_hv8_t32768": _Shape((2656,) * 11 + (3552,), 4, 8, 24015),
     "portfolio_16_hq2_hv8_t18432": _Shape((1648,) * 10 + (1952,), 2, 8, 24016),
+    "fixed_b8_t1024_h96": _Shape((1024,) * 8, 96, 96, 36072, "fixed"),
+    "fixed_b8_t2048_h96": _Shape((2048,) * 8, 96, 96, 37096, "fixed"),
+    "fixed_b8_t4096_h96": _Shape((4096,) * 8, 96, 96, 39144, "fixed"),
+    "fixed_b8_t8192_h96": _Shape((8192,) * 8, 96, 96, 43240, "fixed"),
+    "fixed_b8_t16384_h96": _Shape((16384,) * 8, 96, 96, 51432, "fixed"),
 }
 
-_FALLBACK_SHAPES = {
-    "fallback_grouped_c32_mixed": _Shape((17, 33, 65), 4, 8, 24005),
-    "fallback_row_split_mixed": _Shape((17, 33), 1, 1, 24018),
-    "fallback_high_head_c32_mixed": _Shape((17, 33), 16, 16, 24017),
+_SELECTOR_SHAPES = {
+    "fixed_b8_t4096_h4": _Shape((4096,) * 8, 4, 4, 46004, "fixed"),
+    "fixed_b8_t4096_h8": _Shape((4096,) * 8, 8, 8, 46008, "fixed"),
+    "packed_512_1024_1536_2048_2560_h96": _Shape(
+        (512, 1024, 1536, 2048, 2560), 96, 96, 7685096
+    ),
+    "fixed_b2_t1024_h96": _Shape((1024,) * 2, 96, 96, 47102, "fixed"),
+    "fixed_b4_t2048_h96": _Shape((2048,) * 4, 96, 96, 47204, "fixed"),
+    "fixed_b1_t512_h8": _Shape((512,), 8, 8, 47512, "fixed"),
+    "fixed_b4_t1024_h96": _Shape((1024,) * 4, 96, 96, 47104, "fixed"),
+    "fixed_b5_t2048_h96": _Shape((2048,) * 5, 96, 96, 47205, "fixed"),
+    "fixed_b1_t1024_h8": _Shape((1024,), 8, 8, 48024, "fixed"),
+    "packed_512_1024_h32": _Shape((512, 1024), 32, 32, 48512),
+    "packed_511_1025_h32": _Shape((511, 1025), 32, 32, 48511),
+    "fixed_b1_t17_h1": _Shape((17,), 1, 1, 48017, "fixed"),
 }
 
-_SHAPES = _PRIMARY_SHAPES | _FALLBACK_SHAPES
-_PRIMARY_SHAPE_NAMES = tuple(_PRIMARY_SHAPES)
+_ROUTE_COVERAGE_SHAPES = {
+    "grouped_c32_t4097_hq1_hv8": _Shape((4097,), 1, 8, 24105),
+    "grouped_row_17_33_65_hq4_hv8": _Shape((17, 33, 65), 4, 8, 24005),
+}
+
+_SHAPES = _PORTFOLIO_SHAPES | _SELECTOR_SHAPES | _ROUTE_COVERAGE_SHAPES
+assert len(_SHAPES) == 35
 
 _FLA_BASELINE_COMMIT = "97bcb883dafd3fa5b859917184e4abfb1c4e8a71"
 
@@ -96,11 +117,28 @@ def _require_timing_dependencies() -> tuple[str, str]:
     return cupti_version, pyelftools_version
 
 
-def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor]:
+def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor | None]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    total_tokens = sum(shape.seq_lens)
-    qk_shape = (1, total_tokens, shape.num_qk_heads, 128)
-    value_shape = (1, total_tokens, shape.num_v_heads, 128)
+    if shape.layout == "fixed":
+        if len(set(shape.seq_lens)) != 1:
+            raise ValueError("fixed layout requires uniform sequence lengths")
+        batch_size = len(shape.seq_lens)
+        sequence_length = shape.seq_lens[0]
+        qk_shape = (batch_size, sequence_length, shape.num_qk_heads, 128)
+        value_shape = (batch_size, sequence_length, shape.num_v_heads, 128)
+        cu_seqlens = None
+        cu_seqlens_cpu = None
+    elif shape.layout == "packed":
+        total_tokens = sum(shape.seq_lens)
+        qk_shape = (1, total_tokens, shape.num_qk_heads, 128)
+        value_shape = (1, total_tokens, shape.num_v_heads, 128)
+        cu_seqlens_cpu = torch.tensor(
+            [0, *torch.tensor(shape.seq_lens).cumsum(0).tolist()],
+            dtype=torch.int64,
+        )
+        cu_seqlens = cu_seqlens_cpu.to(device="cuda")
+    else:
+        raise ValueError(f"unsupported layout: {shape.layout}")
     state_shape = (len(shape.seq_lens), shape.num_v_heads, 128, 128)
 
     def bf16(shape, multiplier=1.0):
@@ -123,11 +161,8 @@ def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor]:
         * 0.1,
         "initial_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.02,
-        "cu_seqlens": torch.tensor(
-            [0, *torch.tensor(shape.seq_lens).cumsum(0).tolist()],
-            dtype=torch.int64,
-            device="cuda",
-        ),
+        "cu_seqlens": cu_seqlens,
+        "cu_seqlens_cpu": cu_seqlens_cpu,
         "do": bf16(value_shape, 0.1),
         "dfinal_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.1,
@@ -153,7 +188,7 @@ def _median_ms(fn, warmup_ms: int, bench_ms: int) -> tuple[float, list[float]]:
     return float(np.median(samples)), samples
 
 
-def _prepare_fla_full_dag(inputs):
+def _prepare_fla_paired(inputs):
     os.environ["FLA_FLASH_KDA"] = "0"
     import fla
     from fla.ops.kda import chunk_kda
@@ -184,9 +219,9 @@ def _prepare_fla_full_dag(inputs):
     leaves["dt_bias"] = (
         inputs["dt_bias"].detach().reshape(-1).clone().requires_grad_(True)
     )
-    cu_seqlens_cpu = inputs["cu_seqlens"].detach().cpu()
+    cu_seqlens_cpu = inputs["cu_seqlens_cpu"]
 
-    def run_fla_full_dag():
+    def run_fla_paired():
         output, final_state = chunk_kda(
             leaves["q"],
             leaves["k"],
@@ -208,13 +243,28 @@ def _prepare_fla_full_dag(inputs):
             dt_bias=leaves["dt_bias"],
             chunk_size=32,
         )
-        return torch.autograd.grad(
+        gradients = torch.autograd.grad(
             (output, final_state),
             tuple(leaves[name] for name in names),
             grad_outputs=(inputs["do"], inputs["dfinal_state"]),
         )
+        gradients = (
+            *gradients[:-2],
+            gradients[-2].reshape_as(inputs["dt_bias"]),
+            gradients[-1],
+        )
+        return output, final_state, gradients
 
-    return run_fla_full_dag, getattr(fla, "__version__", "unknown"), fla_commit
+    return run_fla_paired, getattr(fla, "__version__", "unknown"), fla_commit
+
+
+def _assert_paired_close(public_result, reference_result) -> None:
+    public_output, public_final, public_gradients = public_result
+    reference_output, reference_final, reference_gradients = reference_result
+    torch.testing.assert_close(public_output, reference_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(public_final, reference_final, atol=1e-2, rtol=1e-2)
+    for public, reference in zip(public_gradients, reference_gradients, strict=True):
+        torch.testing.assert_close(public, reference, atol=1e-2, rtol=1e-2)
 
 
 def _benchmark_shape(
@@ -243,6 +293,7 @@ def _benchmark_shape(
         inputs["cu_seqlens"],
         out=output,
         final_state_out=final_state,
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     gradients = (
         torch.empty_like(inputs["q"]),
@@ -259,8 +310,8 @@ def _benchmark_shape(
     )
     torch.cuda.synchronize()
 
-    def run_forward():
-        return recurrent_kda_training_forward(
+    def run_paired():
+        paired_output, paired_final, paired_context = recurrent_kda_training_forward(
             inputs["q"],
             inputs["k"],
             inputs["v"],
@@ -273,52 +324,51 @@ def _benchmark_shape(
             out=output,
             final_state_out=final_state,
             context_out=context,
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
+        paired_gradients = recurrent_kda_training_backward(
+            paired_context,
+            inputs["do"],
+            inputs["dfinal_state"],
+            out=gradients,
+        )
+        return paired_output, paired_final, paired_gradients
 
-    def run_backward():
-        return recurrent_kda_training_backward(
-            context, inputs["do"], inputs["dfinal_state"], out=gradients
-        )
+    fla_paired = None
+    fla_version = None
+    fla_commit = None
+    if not skip_fla:
+        fla_paired, fla_version, fla_commit = _prepare_fla_paired(inputs)
+        _assert_paired_close(run_paired(), fla_paired())
+        torch.cuda.synchronize()
 
-    def run_full_dag():
-        recurrent_kda_training_forward(
-            inputs["q"],
-            inputs["k"],
-            inputs["v"],
-            inputs["g"],
-            inputs["beta"],
-            inputs["A_log"],
-            inputs["dt_bias"],
-            inputs["initial_state"],
-            inputs["cu_seqlens"],
-            out=output,
-            final_state_out=final_state,
-            context_out=context,
-        )
-        return recurrent_kda_training_backward(
-            context, inputs["do"], inputs["dfinal_state"], out=gradients
-        )
-
-    forward_ms, forward_samples = _median_ms(run_forward, warmup_ms, bench_ms)
-    backward_ms, backward_samples = _median_ms(run_backward, warmup_ms, bench_ms)
-    full_dag_ms, full_dag_samples = _median_ms(run_full_dag, warmup_ms, bench_ms)
+    paired_ms, paired_samples = _median_ms(run_paired, warmup_ms, bench_ms)
     result = {
         "shape": name,
-        "suite": "primary" if name in _PRIMARY_SHAPES else "fallback",
+        "suite": (
+            "portfolio"
+            if name in _PORTFOLIO_SHAPES
+            else "selector"
+            if name in _SELECTOR_SHAPES
+            else "route_coverage"
+        ),
         "seed": seed,
+        "layout": shape.layout,
+        "physical_batch_size": int(inputs["q"].shape[0]),
         "seq_lens": list(shape.seq_lens),
         "total_tokens": sum(shape.seq_lens),
         "num_sequences": len(shape.seq_lens),
         "num_qk_heads": shape.num_qk_heads,
         "num_v_heads": shape.num_v_heads,
         "route": context._route.tag,
-        "forward_median_ms": forward_ms,
-        "backward_median_ms": backward_ms,
-        "full_dag_median_ms": full_dag_ms,
-        "forward_samples_ms": forward_samples,
-        "backward_samples_ms": backward_samples,
-        "full_dag_samples_ms": full_dag_samples,
-        "forward_uses_private_fp32_final_state_recurrence": True,
+        "paired_median_ms": paired_ms,
+        "paired_samples_ms": paired_samples,
+        "paired_api_boundary": "forward_then_saved_context_backward",
+        "separate_forward_backward_medians_reported": False,
+        "forward_output_dtype": str(output.dtype),
+        "forward_final_state_dtype": str(final_state.dtype),
+        "backward_gradient_dtypes": [str(value.dtype) for value in gradients],
+        "forward_context_reused_across_samples": True,
         "backward_recomputes_forward": False,
         "cupti_python": cupti_version,
         "pyelftools": pyelftools_version,
@@ -328,30 +378,33 @@ def _benchmark_shape(
         "cuda_event_fallback": False,
         "warmup_ms": warmup_ms,
         "bench_ms": bench_ms,
-        "forward_sample_count": len(forward_samples),
-        "backward_sample_count": len(backward_samples),
-        "full_dag_sample_count": len(full_dag_samples),
+        "paired_sample_count": len(paired_samples),
         "fla_baseline_skipped": skip_fla,
         "reportable": not skip_fla,
     }
     if not skip_fla:
-        fla_full_dag, fla_version, fla_commit = _prepare_fla_full_dag(inputs)
-        fla_full_dag_ms, fla_full_dag_samples = _median_ms(
-            fla_full_dag, warmup_ms, bench_ms
-        )
-        delta_ms = full_dag_ms - fla_full_dag_ms
+        assert fla_paired is not None
+        fla_paired_ms, fla_paired_samples = _median_ms(fla_paired, warmup_ms, bench_ms)
+        delta_ms = paired_ms - fla_paired_ms
         result.update(
             {
-                "fla_full_dag_median_ms": fla_full_dag_ms,
-                "fla_full_dag_samples_ms": fla_full_dag_samples,
-                "full_dag_delta_ms_vs_fla": delta_ms,
-                "full_dag_delta_percent_vs_fla": 100.0 * delta_ms / fla_full_dag_ms,
-                "full_dag_speedup_vs_fla": fla_full_dag_ms / full_dag_ms,
+                "fla_paired_median_ms": fla_paired_ms,
+                "fla_paired_samples_ms": fla_paired_samples,
+                "paired_delta_ms_vs_fla": delta_ms,
+                "paired_delta_percent_vs_fla": 100.0 * delta_ms / fla_paired_ms,
+                "paired_speedup_vs_fla": fla_paired_ms / paired_ms,
                 "fla_chunk_size": 32,
                 "fla_flash_kda": os.environ["FLA_FLASH_KDA"],
                 "fla_version": fla_version,
                 "fla_commit": fla_commit,
-                "fla_full_dag_sample_count": len(fla_full_dag_samples),
+                "fla_paired_sample_count": len(fla_paired_samples),
+                "correctness_gate": {
+                    "output": True,
+                    "final_state": True,
+                    "all_eight_gradients": True,
+                    "atol": 1e-2,
+                    "rtol": 1e-2,
+                },
             }
         )
     return result
@@ -373,7 +426,7 @@ def main() -> None:
     parser.add_argument(
         "--all-shapes",
         action="store_true",
-        help="benchmark the required H96 row and all 16 production portfolio rows",
+        help="benchmark all 35 portfolio, selector, and route-coverage shapes",
     )
     parser.add_argument("--json", type=Path)
     parser.add_argument(
@@ -389,11 +442,7 @@ def main() -> None:
     if capability not in {(10, 0), (10, 3)}:
         raise RuntimeError("the training benchmark requires SM100a or SM103a")
     cupti_version, pyelftools_version = _require_timing_dependencies()
-    names = (
-        list(_PRIMARY_SHAPE_NAMES)
-        if args.all_shapes
-        else (args.shape or ["packed_1024x8_h96"])
-    )
+    names = list(_SHAPES) if args.all_shapes else (args.shape or ["fixed_b8_t1024_h96"])
     results = [
         _benchmark_shape(
             name,
@@ -422,6 +471,9 @@ def main() -> None:
         "bench_ms": args.bench_ms,
         "fla_baseline_skipped": args.skip_fla,
         "reportable": not args.skip_fla,
+        "paired_api_boundary": "forward_then_saved_context_backward",
+        "separate_forward_backward_medians_reported": False,
+        "shape_count": len(names),
         "results": results,
     }
     print(json.dumps(report, indent=2))

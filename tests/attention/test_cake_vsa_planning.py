@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import hashlib
+import math
+import sys
+import types
 
 import pytest
 import torch
@@ -66,9 +70,9 @@ def test_cake_vsa_manifest_v2_inventory_and_digests():
     source_records = cake_vsa._manifest_source_records(manifest)
 
     assert manifest["schema"] == "cake-vsa-block-sparse-source-export-v2"
-    assert len(manifest["profiles"]) == 9
-    assert len(source_records) == 27
-    assert len({path for path, _ in source_records}) == 27
+    assert len(manifest["profiles"]) == 10
+    assert len(source_records) == 30
+    assert len({path for path, _ in source_records}) == 30
     identity = hashlib.sha256(
         "".join(
             f"{source_path}\0{digest}\n"
@@ -229,6 +233,87 @@ def test_direct_q2k_ignores_inactive_padding_indices(monkeypatch):
     assert plan["q2k_num"] is q2k_num
 
 
+@pytest.mark.parametrize(
+    "row_counts,expected_profile",
+    [
+        ([[24, 24], [24, 24]], "blk64_persistent"),
+        ([[24, 28], [24, 28]], "blk64_persistent_ws_m64n256"),
+        ([[25, 28], [28, 28]], "blk64_persistent"),
+    ],
+)
+def test_blk64_profile_uses_actual_mixed_row_average(
+    monkeypatch, row_counts, expected_profile
+):
+    q2k_indices = torch.arange(32, dtype=torch.int32).expand(2, 2, 32).contiguous()
+    q2k_num = torch.tensor(row_counts, dtype=torch.int32)
+
+    plan = _plan_on_cpu(
+        monkeypatch,
+        q2k_indices=q2k_indices,
+        q2k_num=q2k_num,
+        N=32 * 64,
+    )
+
+    assert plan["blk64_selected_blocks_total"] == sum(map(sum, row_counts))
+    assert plan["blk64_profile"] == expected_profile
+
+
+def test_blk64_partial_active_kv_block_uses_ordinary_profile(monkeypatch):
+    q2k_indices = torch.arange(32, dtype=torch.int32).expand(2, 2, 32).contiguous()
+    q2k_num = torch.full((2, 2), 28, dtype=torch.int32)
+    kv_block_lens = torch.full((32,), 64, dtype=torch.int32)
+    kv_block_lens[0] = 63
+
+    plan = _plan_on_cpu(
+        monkeypatch,
+        q2k_indices=q2k_indices,
+        q2k_num=q2k_num,
+        kv_block_lens=kv_block_lens,
+        N=32 * 64,
+    )
+
+    assert plan["blk64_profile"] == "blk64_persistent"
+
+
+def test_run_blk64_loads_the_profile_cached_by_planning(monkeypatch):
+    loaded = []
+    launched = []
+    module = types.SimpleNamespace(run=lambda *args: launched.append(args))
+    monkeypatch.setattr(
+        cake_vsa,
+        "_load_module",
+        lambda profile, arch: loaded.append((profile, arch)) or module,
+    )
+    monkeypatch.setattr(cake_vsa, "_arch_for_device", lambda _device: "sm_100a")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: types.SimpleNamespace(multi_processor_count=8),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tvm_ffi",
+        types.SimpleNamespace(use_torch_stream=contextlib.nullcontext),
+    )
+    tensor = torch.empty((1,))
+    plan = {
+        "blk64_profile": "blk64_persistent_ws_m64n256",
+        "mb": 2,
+        "num_qo_heads": 2,
+        "sm_scale": 0.5,
+        "head_dim": 128,
+        "q2k_indices": torch.empty((2, 2, 8), dtype=torch.int32),
+        "q2k_num": torch.full((2, 2), 8, dtype=torch.int32),
+        "kv_block_lens": torch.full((8,), 64, dtype=torch.int32),
+        "M": 128,
+    }
+
+    cake_vsa._run_blk64(plan, tensor, tensor, tensor, tensor, tensor, False)
+
+    assert loaded == [("blk64_persistent_ws_m64n256", "sm_100a")]
+    assert len(launched) == 1
+
+
 @pytest.mark.parametrize("bad_length", [0, 65])
 def test_kv_block_lens_rejects_entries_outside_block(monkeypatch, bad_length):
     kv_block_lens = torch.full((4,), 64, dtype=torch.int32)
@@ -285,6 +370,82 @@ def test_fp16_gqa_metadata_uses_each_kv_head_group(monkeypatch):
     assert tuple(q2k.shape) == (2, 256, 1)
     torch.testing.assert_close(q2k[0], torch.zeros_like(q2k[0]))
     torch.testing.assert_close(q2k[1], torch.full_like(q2k[1], 3))
+
+
+def test_fp16_direct_call_matches_generated_ffi_abi(monkeypatch):
+    launched = []
+    module = types.SimpleNamespace(run=lambda *args: launched.append(args))
+    monkeypatch.setattr(cake_vsa, "_load_module", lambda *_args: module)
+    monkeypatch.setattr(cake_vsa, "_arch_for_device", lambda _device: "sm_100a")
+    monkeypatch.setitem(
+        sys.modules,
+        "tvm_ffi",
+        types.SimpleNamespace(use_torch_stream=contextlib.nullcontext),
+    )
+
+    q = torch.empty((256, 4, 128), dtype=torch.float16)
+    k = torch.empty((512, 2, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    out = torch.empty_like(q)
+    stats = torch.empty((256, 4), dtype=torch.float32)
+    q2k = torch.empty((2, 256, 2), dtype=torch.int32)
+    cu_q = torch.tensor([0, 256], dtype=torch.int32)
+    cu_k = torch.tensor([0, 512], dtype=torch.int32)
+    q_offsets = torch.zeros((1,), dtype=torch.int32)
+    kv_lens = torch.tensor([512], dtype=torch.int32)
+    page_table = torch.zeros((1,), dtype=torch.int32)
+    scale_dummy = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
+    monkeypatch.setattr(
+        cake_vsa,
+        "_fp16_metadata",
+        lambda *_args: (
+            q2k,
+            cu_q,
+            cu_k,
+            q_offsets,
+            kv_lens,
+            page_table,
+            scale_dummy,
+            2,
+        ),
+    )
+    plan = {
+        "M": 256,
+        "num_qo_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 128,
+        "sm_scale": 0.125,
+    }
+
+    cake_vsa._run_fp16(plan, q, k, v, out, stats, True)
+
+    assert len(launched) == 1
+    args = launched[0]
+    assert len(args) == 32
+    expected_tensors = (
+        q,
+        k,
+        scale_dummy,
+        v,
+        scale_dummy,
+        out,
+        stats,
+        stats,
+        q2k,
+        cu_q,
+        cu_k,
+        q_offsets,
+        kv_lens,
+        page_table,
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(args[:14], expected_tensors, strict=True)
+    )
+    assert args[14:23] == (256, 4, 2, 2, 1, 0, 0, 0, 0)
+    assert args[23] == pytest.approx(0.125 / math.log(2.0))
+    assert args[24:29] == (1.0, 1.0, 1.0, 1, 0)
+    assert args[29:] == (1, 4, 1)
 
 
 def test_ultrasparse_route_rejects_non_six_topk_before_launch(monkeypatch):

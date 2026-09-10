@@ -1282,6 +1282,9 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
         compile_count += 1
         return original_compile(*args, **kwargs)
 
+    # Pin the disk cache off: a populated cache would satisfy the reuse
+    # property with zero compiles, breaking the count-based assertion.
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
     gdn_decode_mtp._get_compiled_mtp_kernel.cache_clear()
     gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
     monkeypatch.setattr(cute, "compile", counted_compile)
@@ -3106,6 +3109,7 @@ def test_output_state_indices(batch_size: int, state_dtype: str):
         initial_state=pool_under_test,
         initial_state_indices=read_indices,
         output_state_indices=write_indices,
+        backend="flashinfer",
     )
 
     # Reference: direct state path (gather from read slots)
@@ -3121,6 +3125,7 @@ def test_output_state_indices(batch_size: int, state_dtype: str):
         b=b,
         scale=1.0,
         use_qk_l2norm=True,
+        backend="flashinfer",
     )
 
     atol = 1e-3
@@ -3196,6 +3201,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
         use_qk_l2norm=True,
         initial_state=pool1,
         initial_state_indices=indices,
+        backend="flashinfer",
     )
 
     # With output_state_indices == initial_state_indices
@@ -3214,6 +3220,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
         initial_state=pool2,
         initial_state_indices=indices,
         output_state_indices=indices,
+        backend="flashinfer",
     )
     atol = 1e-3
     rtol = 1e-3

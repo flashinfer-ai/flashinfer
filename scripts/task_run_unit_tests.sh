@@ -146,6 +146,12 @@ main() {
         if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
             FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
         fi
+
+        echo "=========================================="
+        echo "INSTALLED PYTHON PACKAGES"
+        echo "=========================================="
+        python -m pip list --disable-pip-version-check
+        echo ""
     fi
 
     # test_utils.sh defines the obsolete variables for its legacy callers. They

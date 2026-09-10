@@ -25,10 +25,59 @@ class TestKernelRequiresWeights:
         assert kernel_requires_weights(IdentityConfig(kernel_name="identity")) is False
 
     def test_fused_moe_requires_moe_config(self) -> None:
-        from flashinfer.moe_ep import FusedMoeKernelConfig
+        from flashinfer.moe_ep import FusedMoeKernelConfig, IdentityConfig
+        from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+            FusedMoeSplitKernelBackend,
+        )
 
         with pytest.raises(TypeError):
             FusedMoeKernelConfig()  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            FusedMoeSplitKernelBackend(IdentityConfig())  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "variant,cute_dsl,valid",
+        [("mxfp4", True, True), ("nvfp4", True, False), ("mxfp4", False, False)],
+    )
+    def test_mxfp8_dispatch_requires_cute_dsl_mxfp4(
+        self, variant, cute_dsl, valid
+    ) -> None:
+        import flashinfer.fused_moe as fm
+        from flashinfer.moe_ep import (
+            BootstrapConfig,
+            FleetParams,
+            FusedMoeKernelConfig,
+            kernel_requires_weights,
+        )
+        from flashinfer.moe_ep.core.kernel.registry import create_split_kernel
+        from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+        moe = fm.MoEConfig(
+            routing=fm.RoutingConfig(num_experts=2, top_k=1),
+            quant=fm.QuantConfig(
+                variant=(
+                    fm.QuantVariant.MXFP4
+                    if variant == "mxfp4"
+                    else fm.QuantVariant.NVFP4
+                )
+            ),
+            experts=fm.ExpertConfig(intermediate_size=128, local_num_experts=2),
+            backend=fm.BackendOptions(
+                candidates=((fm.CuteDslConfig() if cute_dsl else fm.TrtllmFp4Config()),)
+            ),
+        )
+        config = FusedMoeKernelConfig(moe_config=moe, mxfp8_dispatch=True)
+        assert kernel_requires_weights(config)
+        kernel = create_split_kernel(config)
+        args = (
+            BootstrapConfig(world_size=1, rank=0),
+            FleetParams(num_experts=2, max_tokens_per_rank=1, token_hidden_size=256),
+        )
+        if valid:
+            kernel.validate_init(*args)
+        else:
+            with pytest.raises(MoEEpConfigError, match="mxfp8_dispatch"):
+                kernel.validate_init(*args)
 
 
 class TestIdentitySplitKernel:
