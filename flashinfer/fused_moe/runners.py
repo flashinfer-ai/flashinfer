@@ -3296,8 +3296,8 @@ def _cutile_fp4_config_rejection_reason(
     problem: _CuTileGemmProblem, config: tuple[int, int, int]
 ) -> str | None:
     tile_n, tile_k, _ = config
-    if tile_n % 128 != 0 or tile_k % 64 != 0:
-        return "FP4 grouped GEMM requires tile_n divisible by 128 and tile_k by 64"
+    if tile_n % 128 != 0:
+        return "FP4 grouped GEMM requires tile_n divisible by 128"
     effective_tile_n = (
         tile_n // 2
         if problem.stage == 1 and problem.fused_epilogue and problem.is_gated
@@ -3327,6 +3327,7 @@ class _CuTileFp4Runner(CuTileBf16Runner):
     """Shared adapter for cuTile FP4-weight MoE pipelines."""
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    # Dispatch and kernels use the weight/activation pair, never the legacy variant.
     quant_dispatch_is_pair_keyed = True
     _block_sizes = (16, 32, 64, 128)
 
@@ -3511,10 +3512,18 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             block_size=block_size,
             fuse_gemm1=False,
         )
+        # Preserve existing NVFP4 W4A4 stage-cache entries.
+        precision_key = (
+            ("cutile_w4a4_stage",)
+            if self._precision_name == "NVFP4" and self._activation_fp4
+            else (
+                "cutile_fp4_stage",
+                self._precision_name,
+                "a4" if self._activation_fp4 else "a16",
+            )
+        )
         return (
-            "cutile_fp4_stage",
-            self._precision_name,
-            "a4" if self._activation_fp4 else "a16",
+            *precision_key,
             self._device_arch,
             self._num_sms,
             stage,
@@ -3630,6 +3639,12 @@ class _CuTileFp4Runner(CuTileBf16Runner):
         gemm1_runner = _CuTileStageRunner(self, 1, block_size, fallback)
         gemm2_runner = _CuTileStageRunner(self, 2, block_size, fallback)
         activation_name = self.config.activation.type.name.lower()
+        name_suffix = f"_{activation_name}"
+        if not (self._precision_name == "NVFP4" and self._activation_fp4):
+            name_suffix = (
+                f"_{self._precision_name.lower()}_"
+                f"{'a4' if self._activation_fp4 else 'a16'}{name_suffix}"
+            )
         return _factorized_cutile_tactics(
             self,
             inputs,
@@ -3638,10 +3653,7 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             gemm2_runner,
             fallback[1:5],
             fallback[5:8],
-            name_suffix=(
-                f"_{self._precision_name.lower()}_"
-                f"{'a4' if self._activation_fp4 else 'a16'}_{activation_name}"
-            ),
+            name_suffix=name_suffix,
         )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
@@ -3711,7 +3723,9 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             raise ValueError(
                 f"cuTile {self._precision_name} block-scale shapes "
                 f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != "
-                f"expected {expected_s1}/{expected_s2}."
+                f"expected {expected_s1}/{expected_s2}. "
+                "Prepare weights with device set to the target execution GPU; "
+                "scale layouts differ between SM89/90 and SM12x."
             )
         if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
             raise TypeError(

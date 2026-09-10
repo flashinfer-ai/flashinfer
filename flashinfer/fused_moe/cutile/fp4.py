@@ -212,6 +212,7 @@ def _encode_fp4_groups(
     IS_MXFP4: ConstBool,
 ):
     amax = ct.max(ct.abs(groups), axis=2)
+    # FP4 quantization assumes finite inputs; non-finite values have no encoding.
     if IS_MXFP4:
         scale_exponent = ct.ceil(ct.log2(ct.maximum(amax / 6.0, _E8M0_TINY)))
         # E8M0 encodes the unbiased power-of-two exponent plus 127.
@@ -486,6 +487,15 @@ def _input_quantize_config(
         for tile_k in (256, 128, 64, 32)
         if tile_k % scale_block_size == 0 and k % tile_k == 0
     )
+    # Odd multiples of 32 need a 32-wide tile to cover the final scale group.
+    if max_tile_k == 32:
+        if scale_row_major:
+            return (16 if rows < 4 * num_sms else 64), 32, 4
+        if rows <= 8:
+            return 2, 32, 0
+        if rows <= 32:
+            return 4, 32, 0
+        return 16, 32, 4
     if scale_row_major:
         if max_tile_k == 256:
             return 8, 256, 4
@@ -552,6 +562,8 @@ def _quantize(
     tile_m, tile_k, occupancy = _input_quantize_config(
         rows, k, num_sms, scale_row_major, scale_block_size
     )
+    if k % tile_k != 0:
+        raise ValueError(f"FP4 quantization tile_k={tile_k} must divide K={k}.")
     base_kernel = (
         _quantize_fp4_i64 if needs_int64_indexing(x, q, scale) else _quantize_fp4
     )
@@ -771,9 +783,9 @@ def _launch_activation_quantize(
             f"cuTile FP4 activation width must be divisible by {scale_block_size}, got "
             f"{intermediate_size}."
         )
-    if tile_i not in (64, 128) or intermediate_size % tile_i != 0:
+    if tile_i not in (32, 64, 128) or intermediate_size % tile_i != 0:
         raise ValueError(
-            f"cuTile FP4 activation tile {tile_i} must be 64 or 128 and "
+            f"cuTile FP4 activation tile {tile_i} must be 32, 64, or 128 and "
             f"divide intermediate_size={intermediate_size}."
         )
     expected_scale_shape = (
@@ -824,7 +836,7 @@ def _activation_quantize_config(
     work = rows * intermediate_size
     occupancy = 4 if scale_row_major or work >= num_sms * 4096 else 2
     # A 64-wide tile was robust in cold-L2 sweeps for the separate epilogue.
-    return 64, occupancy
+    return (64 if intermediate_size % 64 == 0 else 32), occupancy
 
 
 def _launch_unfused_activation_quantize(
@@ -1246,6 +1258,7 @@ def _grouped_gemm_w4a16_impl(
                     ct.permute(dequantized_weight, (1, 0)),
                     accumulator,
                 )
+            # Preserve the BF16 GEMM boundary used by the unfused activation path.
             values = ct.astype(accumulator * alpha, OUT.dtype)
             if ACTIVATION_TYPE != _DISABLE_FUSED_ACTIVATION:
                 values = _apply_ungated_activation(

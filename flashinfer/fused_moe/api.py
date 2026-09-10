@@ -1127,7 +1127,12 @@ class CuTileNvfp4Config:
         source_format: str = "modelopt",
         device=None,
     ):
-        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
         from .prepare import prepare_cutile_nvfp4_weights
 
         return prepare_cutile_nvfp4_weights(
@@ -1189,7 +1194,12 @@ class CuTileMxfp4Config:
         activation: Optional[ActivationConfig] = None,
         device=None,
     ):
-        """Build the shared ``cutile_mxfp4`` weight view."""
+        """Build the shared ``cutile_mxfp4`` weight view.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
         from .prepare import prepare_cutile_mxfp4_weights
 
         return prepare_cutile_mxfp4_weights(

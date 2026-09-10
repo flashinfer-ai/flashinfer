@@ -104,6 +104,8 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         dest="quant_variant",
         choices=("bf16", "nvfp4", "nvfp4_w4a16", "mxfp4", "mxfp4_w4a16"),
         default="bf16",
+        help="Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations "
+        "(not the legacy QuantVariant.MXFP4 preset with MXFP8 activations).",
     )
     parser.add_argument(
         "--activation-type",
@@ -497,7 +499,7 @@ def run_unified_moe_test(args):
         if reference is not None:
             # Quantized modes are compared with the original BF16 weights, so
             # their tolerance includes the expected FP4 weight error.
-            rtol, atol = (3e-2, 5e-1) if args.quant_variant == "bf16" else (0.25, 2.0)
+            rtol, atol = (3e-2, 5e-1) if args.quant_variant == "bf16" else (0.25, 1.0)
             try:
                 torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
                 refcheck_passed = True

@@ -1300,11 +1300,13 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
 
 
 @cutile_mxfp4_required
-def test_cutile_mxfp4_supports_dimensions_divisible_by_32():
-    activation = ReLU2()
-    hidden_size, intermediate_size = 192, 160
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+@pytest.mark.parametrize("num_tokens", (4, 33))
+def test_cutile_mxfp4_supports_dimensions_divisible_by_32(activation, num_tokens):
+    hidden_size, intermediate_size = 160, 160
     activations, weights, expected = _make_mxfp4_case(
         activation,
+        num_tokens=num_tokens,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
@@ -1334,9 +1336,37 @@ def test_cutile_mxfp4_supports_dimensions_divisible_by_32():
         runner.build()
         inputs = runner.pack_inputs(activations, weights)
         output = runner.forward(
-            inputs, tactic=(32, 1, 128, 128, 2, 128, 128, 2)
+            inputs, tactic=(32, int(not activation.is_gated), 128, 128, 2, 128, 128, 2)
         ).clone()
         torch.testing.assert_close(output, expected, rtol=0.25, atol=1.0)
+
+
+@cutile_mxfp4_required
+@pytest.mark.parametrize("scale_row_major", (False, True))
+def test_cutile_mxfp4_quantization_covers_tail(scale_row_major):
+    from flashinfer.fused_moe.cutile import fp4
+
+    # Exercise each row-count regime, including the row-major occupancy cutoff.
+    for rows in (1, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 1024):
+        x = torch.randn(rows, 160, dtype=torch.bfloat16, device="cuda")
+        expected_q, expected_scale, _ = _quantize_weights(x, scale_block_size=32)
+        padded_rows = (rows + 127) // 128 * 128
+        q = torch.full((padded_rows, 80), 0xA5, dtype=torch.uint8, device="cuda")
+        scale = torch.empty(
+            (padded_rows, 5) if scale_row_major else (5, padded_rows),
+            dtype=torch.float8_e8m0fnu,
+            device="cuda",
+        )
+        scale.view(torch.uint8).fill_(255)
+        fp4._quantize(x, q, scale, scale_block_size=32, scale_row_major=scale_row_major)
+        torch.testing.assert_close(q[:rows], expected_q, rtol=0, atol=0)
+        actual_scale = scale[:rows] if scale_row_major else scale[:, :rows].T
+        torch.testing.assert_close(
+            actual_scale.view(torch.uint8),
+            expected_scale.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
 
 
 @cutile_nvfp4_required
