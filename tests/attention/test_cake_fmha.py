@@ -337,9 +337,7 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
         "USE_SCALE_PTR": 0,
     }
 
-    sink_binding = (
-        f"bindings/cake_fmha_decode_native_bf16_sink_peer_clc_{manifest_arch}_binding.cu"
-    )
+    sink_binding = f"bindings/cake_fmha_decode_native_bf16_sink_peer_clc_{manifest_arch}_binding.cu"
     launch_override = sink_member["launch_override"]
     arch_override = launch_override["by_arch"][manifest_arch]
     assert arch_override["binding_source"] == sink_binding
@@ -350,8 +348,7 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     assert body == get_cake_fmha_csrc_dir() / sink_member["sources"][manifest_arch]
     assert binding == get_cake_fmha_csrc_dir() / sink_binding
     assert (
-        arch_override["binding_sha256"]
-        == manifest["artifacts"][sink_binding]["sha256"]
+        arch_override["binding_sha256"] == manifest["artifacts"][sink_binding]["sha256"]
     )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True

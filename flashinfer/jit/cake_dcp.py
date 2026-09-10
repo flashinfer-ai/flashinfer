@@ -367,7 +367,6 @@ def load_dcp_spec_fp8_module(
     return module
 
 
-
 def _get_d256_csrc_dir() -> Path:
     installed = jit_env.FLASHINFER_CSRC_DIR / "dcp"
     if installed.exists():
@@ -382,7 +381,6 @@ def _get_d256_csrc_dir() -> Path:
         f"  - {installed}\n"
         f"  - {checkout}"
     )
-
 
 
 def _validate_fp8_d256_specialization(
@@ -416,7 +414,6 @@ def _validate_fp8_d256_specialization(
         )
 
 
-
 def get_dcp_spec_fp8_d256_uri(
     target: DcpSpecTarget,
     batch_size: int,
@@ -440,7 +437,6 @@ def get_dcp_spec_fp8_d256_uri(
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}_cp{cp_world}"
         f"_split{num_split}_retain0"
     )
-
 
 
 @functools.cache
@@ -491,7 +487,6 @@ def gen_dcp_spec_fp8_d256_module(
     return spec
 
 
-
 @functools.cache
 def load_dcp_spec_fp8_d256_module(
     target: DcpSpecTarget,
@@ -513,7 +508,6 @@ def load_dcp_spec_fp8_d256_module(
     ).build_and_load()
     logger.info(f"Loaded D256 FP8 DCP speculative FMHA module: {module}")
     return module
-
 
 
 __all__ = [

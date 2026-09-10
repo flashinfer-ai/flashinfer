@@ -311,7 +311,9 @@ def _validate_core_inputs(
     group_ratio = num_qo_heads // num_kv_heads
     if head_dim == _HEAD_DIM:
         if not 1 <= group_ratio <= 8:
-            raise ValueError(f"DCP head group ratio must be in [1, 8], got {group_ratio}")
+            raise ValueError(
+                f"DCP head group ratio must be in [1, 8], got {group_ratio}"
+            )
     elif (
         num_qo_heads != 16
         or num_kv_heads != 1
@@ -453,16 +455,27 @@ def run_dcp_spec_decode(
         head_dim = query.shape[-1]
         if head_dim == _D256_HEAD_DIM:
             module = load_dcp_spec_fp8_d256_module(
-                target, batch_size, q_len_per_req, num_qo_heads,
-                num_kv_heads, cp_world, num_split,
+                target,
+                batch_size,
+                q_len_per_req,
+                num_qo_heads,
+                num_kv_heads,
+                cp_world,
+                num_split,
             )
         else:
             retain_kv_l2 = int(
                 cp_world > 1 and local_blocks <= _FP8_RETAIN_KV_L2_MAX_BLOCKS
             )
             module = load_dcp_spec_fp8_module(
-                target, batch_size, q_len_per_req, num_qo_heads,
-                num_kv_heads, cp_world, num_split, retain_kv_l2,
+                target,
+                batch_size,
+                q_len_per_req,
+                num_qo_heads,
+                num_kv_heads,
+                cp_world,
+                num_split,
+                retain_kv_l2,
             )
         if num_split == 1:
             partial_o = out
