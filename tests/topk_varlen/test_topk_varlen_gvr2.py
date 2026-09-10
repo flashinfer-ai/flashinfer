@@ -1630,6 +1630,44 @@ def test_gvr2_release_cached_resources():
     assert release_gvr2_resources() == 0
 
 
+def test_gvr2_release_without_loaded_host_is_a_no_op():
+    """`release_gvr2_resources` in a process that never ran gvr_2: returns 0
+    without importing the gvr_2 host module (and so without importing the
+    optional CuTe-DSL kernel modules on installations that lack them), while
+    the device-argument contract still holds ("cpu" raises). Runs in a fresh
+    interpreter because this process has the host loaded."""
+    import os
+    import subprocess
+    import sys
+
+    import flashinfer
+
+    code = (
+        "import sys; import flashinfer.topk_varlen as t\n"
+        "H = 'flashinfer.topk_varlen.kernels.gvr2_topk_host'\n"
+        "assert H not in sys.modules\n"
+        "assert t.release_gvr2_resources() == 0\n"
+        "assert t.release_gvr2_resources(0) == 0\n"
+        "assert H not in sys.modules, 'release imported the gvr_2 host'\n"
+        "try:\n    t.release_gvr2_resources('cpu')\nexcept ValueError as e:\n"
+        "    assert 'expected a CUDA device' in str(e)\nelse:\n    raise SystemExit('cpu accepted')\n"
+        "print('OK')\n"
+    )
+    root = os.path.dirname(os.path.dirname(os.path.abspath(flashinfer.__file__)))
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**os.environ, "PYTHONPATH": root},
+    )
+    assert r.returncode == 0 and r.stdout.strip().endswith("OK"), (
+        r.stdout,
+        r.stderr[-2000:],
+    )
+
+
 @requires_gvr2
 def test_gvr2_release_rejects_non_cuda_device():
     """A non-CUDA device argument must raise, never redirect the cleanup to a

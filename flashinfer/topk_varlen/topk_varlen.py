@@ -59,6 +59,7 @@ Backend choices
 
 import functools
 import math
+import sys
 import warnings
 from typing import Literal, Optional, Tuple
 
@@ -1105,9 +1106,12 @@ def release_gvr2_resources(device=None) -> int:
     """Release the ``gvr_2`` backend's lazily created per-device caches.
 
     ``top_k_varlen(backend="gvr_2")`` keeps, per device, one default workspace
-    slab per CUDA stream it has run on (20,973,568 bytes each, at most 32 per
-    device) and one hint-free anchor table per ``top_k`` (grown by doubling).
-    They are created by eager launches and live for the process. This call
+    slab per raw CUDA stream handle it has run on (20,973,568 bytes each; as
+    many as there are distinct stream handles that ran an eager slab-using
+    launch) and one hint-free anchor table per ``top_k`` (grown by doubling).
+    They are created by eager launches and live for the process. Returns 0
+    without importing the kernel modules if the ``gvr_2`` host was never
+    loaded in this process (nothing can be cached then). This call
     synchronizes ``device`` (default: the current device; an int, a
     ``torch.device`` or a device string — CUDA only, anything else raises
     ``ValueError``), drops them all and returns the number of bytes released
@@ -1127,9 +1131,25 @@ def release_gvr2_resources(device=None) -> int:
     same warm-up rule as the first capture. Explicit ``workspace=`` buffers
     passed by the caller are never touched.
     """
-    from .kernels import gvr2_topk_host
-
-    return gvr2_topk_host.release_cached_resources(device)
+    if device is not None:  # same argument contract whether or not the host is loaded
+        dev = (
+            torch.device("cuda", device)
+            if isinstance(device, int)
+            else torch.device(device)
+        )
+        if dev.type != "cuda":
+            raise ValueError(
+                f"release_gvr2_resources: expected a CUDA device, got {dev!r}"
+            )
+    # The caches live in the gvr_2 host module; if it was never imported in
+    # this process no gvr_2 launch has happened and nothing can be cached.
+    # Looking it up in sys.modules (instead of importing `.kernels`, whose
+    # package __init__ eagerly imports the optional CuTe-DSL kernel modules)
+    # keeps this a no-op on installations without nvidia-cutlass-dsl.
+    host = sys.modules.get(f"{__package__}.kernels.gvr2_topk_host")
+    if host is None:
+        return 0
+    return host.release_cached_resources(device)
 
 
 # ---------------------------------------------------------------------------
@@ -1676,12 +1696,15 @@ def top_k_varlen(
             the graph pool. Graphs captured on the SAME stream share that
             stream's slab and must not be replayed concurrently with each
             other; pass a private ``"gvr2_workspace"`` for that pattern.
-            Slabs are keyed by the raw CUDA stream handle, and PyTorch hands
-            out ``torch.cuda.Stream()`` objects from a pool of 32 per
-            priority, so the default slabs are bounded at 32 x 21 MB per
-            device (and two ``Stream`` objects may share one slab when the
-            pool wraps — they also share the raw stream, so their launches
-            are ordered). The slabs and the hint-free anchor tables live for
+            Slabs are keyed by the raw CUDA stream handle: there is one 21 MB
+            slab per distinct handle that has run an eager slab-using launch.
+            PyTorch hands out ``torch.cuda.Stream()`` objects from a fixed
+            pool per device and priority (two ``Stream`` objects may share one
+            slab when the pool wraps — they also share the raw stream, so
+            their launches are ordered), but stream handles created outside
+            that pool (external streams, other priorities) each add a slab,
+            so the total is not bounded by the pool size. The slabs and the
+            hint-free anchor tables live for
             the process unless released with
             ``flashinfer.topk_varlen.release_gvr2_resources(device)``, which
             synchronizes the device, drops them and returns the bytes freed;

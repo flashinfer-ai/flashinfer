@@ -983,11 +983,12 @@ def route_bands(
 # ===========================================================================
 # ==== workspace ============================================================
 # ===========================================================================
-"""Per-device workspace slab for the multi-CTA SPLIT path.
+"""Default workspace slabs for the multi-CTA SPLIT path.
 
 Semantics:
-  * ONE zero-initialised slab workspace per device, lazily allocated through
-    the torch caching allocator;
+  * ONE zero-initialised slab per (device index, raw CUDA stream handle),
+    lazily allocated through the torch caching allocator by the first EAGER
+    slab-using launch on that stream (never under CUDA-graph capture);
   * keep-alive store: module dict `_ws_keep` (tensor refcount = keep-alive);
   * double-checked locking: lock-free hot-path load (a GIL-atomic dict get
     plays an acquire load), slow path re-checks under a mutex;
@@ -996,8 +997,16 @@ Semantics:
     input checks, so a CPU logits tensor dies here with "device index out of
     range: -1").
 
-Concurrent STREAMS on one device that may both take the multi-CTA SPLIT path
-must pass their own workspace via run_ws().
+Concurrent streams on one device each get their own slab, so launches that
+overlap in time (distinct streams, graphs captured on different streams and
+replayed together) never share mutable scratch; a caller-provided workspace
+(run_ws() / `workspace=`) is optional, not required for concurrency. Two
+graphs captured on the SAME stream share that stream's slab and are correct
+as long as they replay in stream order. The number of slabs equals the number
+of distinct stream handles that have run an eager slab-using launch:
+`torch.cuda.Stream()` recycles handles from a fixed pool (32 per device and
+priority), but externally created / foreign stream handles are not bounded by
+that pool; `release_cached_resources()` frees them all.
 
 Size: workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
     = 2048 + 160*16384*8 = 20,973,568 B.
