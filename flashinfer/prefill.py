@@ -1946,11 +1946,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        variant_owns_mask: bool = False,
         block_extend: bool = False,
         block_size: Optional[int] = None,
         q_offsets_buf: Optional[torch.Tensor] = None,
         kv_offsets_buf: Optional[torch.Tensor] = None,
-        variant_owns_mask: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -2019,6 +2019,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+        variant_owns_mask : bool
+            If ``True``, the attention variant supplied through ``jit_args`` computes the
+            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
+            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
+            KV tile instead of only on the causal/window boundary tiles, and no
+            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
+            Requires ``jit_args``, because the default attention variant dereferences the
+            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
+            ``backend="fa2"`` (the SM90 batch prefill kernels reject
+            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
+            (multi-item scoring), which selects a different mask mode.
+            Defaults to ``False``.
         block_extend : bool
             Whether to enable the Block Extend mask. Requires ``block_size`` and
             is supported only by the ``fa2`` and ``fa3`` backends.
@@ -2034,18 +2046,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             offsets. Required when both CUDA Graph mode and
             :attr:`block_extend` are enabled; its dtype must match the indptr
             dtype.
-        variant_owns_mask : bool
-            If ``True``, the attention variant supplied through ``jit_args`` computes the
-            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
-            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
-            KV tile instead of only on the causal/window boundary tiles, and no
-            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
-            Requires ``jit_args``, because the default attention variant dereferences the
-            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
-            ``backend="fa2"`` (the SM90 batch prefill kernels reject
-            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
-            (multi-item scoring), which selects a different mask mode.
-            Defaults to ``False``.
         """
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
@@ -3951,11 +3951,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        variant_owns_mask: bool = False,
         block_extend: bool = False,
         block_size: Optional[int] = None,
         q_offsets_buf: Optional[torch.Tensor] = None,
         kv_offsets_buf: Optional[torch.Tensor] = None,
-        variant_owns_mask: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -4013,6 +4013,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+        variant_owns_mask : bool
+            If ``True``, the attention variant supplied through ``jit_args`` computes the
+            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
+            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
+            KV tile instead of only on the causal/window boundary tiles, and no
+            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
+            Requires ``jit_args``, because the default attention variant dereferences the
+            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
+            ``backend="fa2"`` (the SM90 batch prefill kernels reject
+            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
+            (multi-item scoring), which selects a different mask mode.
+            Defaults to ``False``.
         block_extend : bool
             Whether to enable the Block Extend mask. Requires ``block_size`` and
             is supported only by the ``fa2`` and ``fa3`` backends.
@@ -4028,19 +4040,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             offsets. Required when both CUDA Graph mode and
             :attr:`block_extend` are enabled; its dtype must match the indptr
             dtype.
-
-        variant_owns_mask : bool
-            If ``True``, the attention variant supplied through ``jit_args`` computes the
-            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
-            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
-            KV tile instead of only on the causal/window boundary tiles, and no
-            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
-            Requires ``jit_args``, because the default attention variant dereferences the
-            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
-            ``backend="fa2"`` (the SM90 batch prefill kernels reject
-            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
-            (multi-item scoring), which selects a different mask mode.
-            Defaults to ``False``.
         """
         _check_kv_layout(kv_layout)
 
