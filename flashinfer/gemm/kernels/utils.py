@@ -203,9 +203,7 @@ def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tac
 
     def score(tactic):
         tile, cluster, swap_ab, _, _, _ = tactic
-        return _score_mm_fp4_tactic(
-            m, n, real_k, sm_count, tile, cluster, swap_ab
-        )
+        return _score_mm_fp4_tactic(m, n, real_k, sm_count, tile, cluster, swap_ab)
 
     return sorted(valid_tactics, key=score, reverse=True)[:max_tactics]
 
