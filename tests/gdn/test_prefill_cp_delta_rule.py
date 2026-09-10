@@ -27,7 +27,6 @@ from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
 from flashinfer.utils import (
     get_compute_capability,
-    is_sm8x_supported,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
@@ -62,7 +61,7 @@ elif torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda")):
         cp_delta_rule_prefill_dsl_sm120 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm120 as cp_delta_rule_t_precompute_dsl,
     )
-elif torch.cuda.is_available() and is_sm8x_supported(torch.device("cuda")):
+elif torch.cuda.is_available() and get_compute_capability(torch.device("cuda"))[0] == 8:
     # Ported one stage at a time. What is not here yet stays None, so the tests
     # for it skip rather than reaching for a name that does not exist -- and a
     # half-ported pipeline is never assembled by accident.
@@ -90,7 +89,7 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
 FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
-if torch.cuda.is_available() and is_sm8x_supported(torch.device("cuda")):
+if torch.cuda.is_available() and get_compute_capability(torch.device("cuda"))[0] == 8:
     # The HMMA fixup hands its math warps extra registers with `setmaxnreg`,
     # which SM8x does not have. It is not built there, so there is no kind to
     # parametrize over rather than a kind that raises.
@@ -113,7 +112,7 @@ def _skip_if_cp_unsupported(*stages):
             pytest.skip(
                 f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
-    elif is_sm8x_supported(device):
+    elif get_compute_capability(device)[0] == 8:
         pass
     elif not (is_sm90a_supported(device) or is_sm12x_supported(device)):
         pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, or SM12x")
@@ -574,13 +573,31 @@ def test_cp_delta_rule_fixup(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
-@pytest.mark.parametrize("chunk_len", [64, 128])
-@pytest.mark.parametrize("gate_baseline", [0.9, 0.9995])
+@pytest.mark.parametrize(
+    "num_q_heads, num_k_heads, num_v_heads, dtype, chunk_len, seq_lens, gate_baseline",
+    [
+        # Equal head counts across the sweep the stage is tuned for.
+        *[
+            (1, 1, 1, dtype, chunk_len, [chunk_len, chunk_len], gate)
+            for dtype in ("float16", "bfloat16")
+            for chunk_len in (64, 128)
+            for gate in (0.9, 0.9995)
+        ],
+        # Distinct head counts, so a shift in the argument order shows up
+        # instead of being hidden by three equal numbers. The ragged sequence
+        # lengths keep the chunk boundary off the sequence boundary.
+        (4, 1, 1, "bfloat16", 64, [96, 64], 0.99),
+        (1, 1, 4, "bfloat16", 64, [96, 64], 0.99),
+    ],
+)
 def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     qkv_factory,
+    num_q_heads,
+    num_k_heads,
+    num_v_heads,
     dtype,
     chunk_len,
+    seq_lens,
     gate_baseline,
     seed=int(os.environ.get("SEED", "0")),
 ):
@@ -589,126 +606,16 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     _seed_all(seed)
     device = torch.device("cuda")
     dtype = getattr(torch, dtype)
-    num_heads = 1
     head_size = 128
     cp_chunk_len = chunk_len
-    seq_lens = [chunk_len, chunk_len]
     total_seqlen = sum(seq_lens)
     max_seqlen = max(seq_lens)
     cu_values = [0]
     for seq_len in seq_lens:
         cu_values.append(cu_values[-1] + seq_len)
     cu_seqlens = torch.tensor(cu_values, dtype=torch.int64, device=device)
-    scale = 1.0
-
-    with torch.device(device):
-        q, k, v = qkv_factory(
-            seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype
-        )
-    k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
-    q = q.contiguous()
-    v = v.contiguous()
-    alpha = _make_gates(total_seqlen, num_heads, gate_baseline, device)
-    beta = _make_gates(total_seqlen, num_heads, gate_baseline, device)
-
-    t = cp_delta_rule_t_precompute_dsl(
-        k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen
-    )
-    local_transfer, local_state = cp_delta_rule_mn_precompute_dsl(
-        k,
-        v,
-        t,
-        alpha,
-        cu_seqlens,
-        total_seqlen,
-        cp_chunk_len=cp_chunk_len,
-        max_seqlen=max_seqlen,
-    )
-    fixed_state = cp_delta_rule_fixup_dsl(
-        local_transfer, local_state, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len
-    )
-
-    our_o = torch.empty_like(q)
-    our_state = torch.empty(
-        len(seq_lens),
-        num_heads,
-        head_size,
-        head_size,
-        dtype=torch.float32,
-        device=device,
-    )
-    cp_delta_rule_prefill_dsl(
-        our_o,
-        our_state,
-        q,
-        k,
-        v,
-        t,
-        fixed_state,
-        alpha,
-        scale,
-        cu_seqlens,
-        total_seqlen,
-        cp_chunk_len=cp_chunk_len,
-        max_seqlen=max_seqlen,
-    )
-    torch.cuda.synchronize()
-
-    ref_o = torch.empty_like(q)
-    ref_state = torch.empty(
-        len(seq_lens),
-        num_heads,
-        head_size,
-        head_size,
-        dtype=torch.float32,
-        device=device,
-    )
-    chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        scale,
-        None,
-        True,
-        cu_seqlens,
-        True,
-        output=ref_o,
-        output_state=ref_state,
-        use_cp=False,
-    )
-    torch.cuda.synchronize()
-
-    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
-    torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize(
-    "num_q_heads, num_k_heads, num_v_heads", [(4, 1, 1), (1, 1, 4)]
-)
-def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
-    qkv_factory,
-    num_q_heads,
-    num_k_heads,
-    num_v_heads,
-    seed=int(os.environ.get("SEED", "0")),
-):
-    """The same, with the four head counts distinct so an argument shift shows."""
-    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
-    _seed_all(seed)
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    head_size = 128
-    cp_chunk_len = 64
-    seq_lens = [96, 64]
-    total_seqlen = sum(seq_lens)
-    max_seqlen = max(seq_lens)
-    cu_values = [0]
-    for seq_len in seq_lens:
-        cu_values.append(cu_values[-1] + seq_len)
-    cu_seqlens = torch.tensor(cu_values, dtype=torch.int64, device=device)
+    # The gates and the outputs are indexed by the wider of the two head
+    # counts; with all counts equal this is that same count.
     num_sab_heads = max(num_q_heads, num_v_heads)
     scale = 1.0
 
@@ -719,8 +626,8 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
     k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
     q = q.contiguous()
     v = v.contiguous()
-    alpha = _make_gates(total_seqlen, num_sab_heads, 0.99, device)
-    beta = _make_gates(total_seqlen, num_sab_heads, 0.99, device)
+    alpha = _make_gates(total_seqlen, num_sab_heads, gate_baseline, device)
+    beta = _make_gates(total_seqlen, num_sab_heads, gate_baseline, device)
 
     t = cp_delta_rule_t_precompute_dsl(
         k, beta, cu_seqlens, total_seqlen, max_seqlen=max_seqlen

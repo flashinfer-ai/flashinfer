@@ -26,7 +26,7 @@ import pytest
 from .reference_delta_rule import exclusive_cumsum, blockwise_delta_rule
 
 from flashinfer.utils import (
-    is_sm8x_supported,
+    get_compute_capability,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
@@ -46,7 +46,7 @@ def _skip_if_unsupported():
     elif (
         is_sm12x_supported(device)
         or is_sm90a_supported(device)
-        or is_sm8x_supported(device)
+        or get_compute_capability(device)[0] == 8
     ):
         pass  # No additional CUDA version requirement
     else:
