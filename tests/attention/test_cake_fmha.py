@@ -2448,12 +2448,11 @@ def test_cake_fmha_aot_registers_each_exact_blackwell_target(monkeypatch) -> Non
         False,
         False,
     )
-    assert {spec.name for spec in specs} == {
-        "spdlog",
-        "cudnn",
+    # Other AOT providers can independently register Blackwell modules.
+    assert sorted(spec.name for spec in specs if spec.name.startswith("cake-")) == [
         "cake-sm100a",
         "cake-sm103a",
-    }
+    ]
 
 
 @pytest.mark.skipif(
