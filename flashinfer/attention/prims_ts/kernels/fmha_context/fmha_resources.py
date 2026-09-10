@@ -314,7 +314,7 @@ class FmhaConfig:
     # Skip softmax: each softmax warp compares its K/V tile row maxima with the
     # running maxima. When every row of the warp bounds its tile contribution
     # below the request threshold, the warp keeps its running statistics,
-    # publishes a zero P tile without exponentiation, and votes in SMEM so the
+    # publishes a zero P tile without exp2, and votes in SMEM so the
     # MMA task can also skip the PV MMA once all four softmax warps of the
     # instance voted to skip.
     enable_skip_softmax: bool = False
@@ -2507,7 +2507,7 @@ class TmemSPResource(MemoryResource):
         Rows past the request's Q length are TMA padding: zero-filled for
         fixed storage and NaN-filled for 16-bit packed storage. Their scores
         carry no information, so they abstain from the warp vote instead of
-        blocking the valid rows of a partial query tile.
+        blocking the valid rows of a partial Q tile.
         """
         seq_coord, _, batch_coord = _resolve_work_tile_coords(
             self.cfg, stage_info.work_tile.tile_idx
@@ -2648,7 +2648,7 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # The skip specialization carries the exact running maximum, which
             # stays -inf until a row meets its first valid key; the P store,
-            # row-sum, and statistics work substitute zero where needed.
+            # row-sum reduction, and stats store substitute zero where needed.
             return old_row_max, self._skip_softmax_row_max(
                 stage_info, row_max, tile_row_max
             )
@@ -2683,7 +2683,7 @@ class TmemSPResource(MemoryResource):
 
         A lane wants to skip when ``exp2`` of its scaled tile-versus-running
         maximum gap is below the request threshold, the same bound trtllm-gen
-        applies before its softmax and PV work. Comparing in the log2 domain
+        applies before its softmax and PV MMA. Comparing in the log2 domain
         keeps a ``-inf`` running maximum (no valid key yet) and a zero
         threshold from ever admitting a skip, and a fully masked tile skips
         only once the row already has a finite maximum. Every valid row of
@@ -2723,7 +2723,7 @@ class TmemSPResource(MemoryResource):
         tmem_p_addr = self.tmem_p_addr_cached + stage_col_offset
         s_data = _tmem_sp_sdata.pop(id(self))
         if cutlass.const_expr(self.cfg.enable_skip_softmax):
-            # Exponentiate against zero while the exact running maximum is
+            # Apply exp2 against a zero maximum while the exact running maximum is
             # still -inf so masked scores become exact zeros instead of NaN.
             row_max_safe = row_max
             if row_max == -Float32.inf:
@@ -2748,7 +2748,7 @@ class TmemSPResource(MemoryResource):
 
     @cute.jit
     def _store_zero_p(self, tmem_p_addr: TmemAddr) -> None:
-        """Publish an all-zero probability tile for a skipped K/V tile.
+        """Publish an all-zero P tile for a skipped K/V tile.
 
         The PV MMA still consumes this P tile when another softmax warp of the
         same instance did not skip, so the skipped rows must contribute zero.
@@ -2777,7 +2777,7 @@ class TmemSPResource(MemoryResource):
         scale_softmax_log2: SoftmaxScalar,
         s_data: SoftmaxChunks,
     ) -> SoftmaxRowSumContribution:
-        """Exponentiate one loaded S tile into P and store it to TMEM."""
+        """Apply exp2 to one loaded S tile, producing P, and store it to TMEM."""
         tmem_shape = "32x32b"
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x

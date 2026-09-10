@@ -1901,11 +1901,11 @@ class BatchPrefillTSWrapper:
             Skip-softmax threshold in the ordinary softmax domain. ``None``
             selects the dense kernel. Any provided value, including zero,
             selects the skip-enabled kernel: a 128-key K/V tile is skipped for
-            a 32-row query group when every row of the group satisfies
+            the 32 Q rows owned by one softmax warp when every valid row satisfies
             ``exp(sm_scale * (tile_max - running_max)) < threshold``. Skipped
             tiles contribute zero probability mass and leave the running
-            maximum unchanged, and the PV MMA is bypassed once all four groups
-            of a 128-row query tile skip. A scalar applies to every request
+            maximum unchanged, and the PV MMA is skipped once all four softmax
+            warps of a Q/KV instance skip. A scalar applies to every request
             and is fixed for the plan and for any CUDA graph that captures
             it. A contiguous CUDA ``float32[B]`` tensor gives request ``b``
             its own threshold and is retained as a live input: its storage

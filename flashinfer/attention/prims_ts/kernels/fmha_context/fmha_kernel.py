@@ -47,7 +47,7 @@ Feature Support Matrix:
   | `S_q` / `S_kv`   | Query-paired causal requires `S_q <= S_kv`; arbitrary positive tails are supported             |
   | GQA              | Must satisfy `h_q % h_kv == 0`; causal GQA can use head-paired scheduling                    |
   | Sliding window   | `mask_type="causal", window_left=N`; left window only                                        |
-  | Skip softmax     | Optional per-request threshold; skipped K/V tiles bypass exp2, P conversion, and PV MMA     |
+  | Skip softmax     | Optional per-request threshold; skipped K/V tiles omit exp2, P conversion, and PV MMA       |
   | Scheduler modes  | Query-paired: static CTAs, persistent, CLC; head-paired: persistent, CLC                      |
 
 ASCII Flow Chart:
@@ -2407,7 +2407,7 @@ class FmhaTs:
         extent fits one 128-token tile (default: False).
     enable_skip_softmax : bool, optional
         Compile the skip-softmax specialization. Each softmax warp skips the
-        exponentiation, P conversion, and row-sum work of a K/V tile whose
+        exp2, P conversion, and row-sum reduction of a K/V tile whose
         scaled score gap to the running maximum is below the per-request
         threshold, and the MMA task skips the PV MMA once every softmax warp of
         the instance voted to skip. The launch then requires the

@@ -23,7 +23,7 @@ The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
 The FMHA context APIs accept an optional `skip_softmax_threshold`. It selects a
-skip-softmax specialization that bypasses the softmax and PV work of K/V tiles
+skip-softmax specialization that skips the softmax and PV MMA of K/V tiles
 whose scores cannot contribute more than the threshold relative to the running
 maximum; see the context guide for the exact contract, the scalar versus
 per-request tensor forms, and their CUDA Graph semantics.

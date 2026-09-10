@@ -3135,7 +3135,7 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
 # ---------------------------------------------------------------------------
 
 _SKIP_SOFTMAX_KV_TILE = 128
-_SKIP_SOFTMAX_ROW_GROUP = 32
+_SKIP_SOFTMAX_WARP_ROWS = 32
 
 
 @torch.no_grad()
@@ -3145,9 +3145,9 @@ def _skip_softmax_reference(
 ) -> torch.Tensor:
     """Emulate the kernel's warp-level skip-softmax algorithm in FP32.
 
-    The kernel decides per 128-key K/V tile and per 32-row query group whether
-    ``exp(sm_scale * (tile_max - running_max)) < threshold`` holds for every
-    valid row of the group; TMA padding rows past the request abstain. A
+    The kernel decides per 128-key K/V tile and per softmax warp (32 Q rows)
+    whether ``exp(sm_scale * (tile_max - running_max)) < threshold`` holds for
+    every valid row of the warp; TMA padding rows past the request abstain. A
     skipped tile adds no probability mass and leaves the running maximum
     unchanged. Fully masked rows have a ``-inf`` tile maximum, so a row
     without any valid key yet compares ``NaN`` and never votes to skip. This
@@ -3194,24 +3194,24 @@ def _skip_softmax_reference(
         scores = torch.einsum("qhd,khd->hqk", q, k_pad) * case.sm_scale
         scores = scores.masked_fill(~visible[None], float("-inf"))
         out = torch.zeros((q_length, num_heads, head_dim), device=device)
-        for row_begin in range(0, q_length, _SKIP_SOFTMAX_ROW_GROUP):
-            row_end = min(row_begin + _SKIP_SOFTMAX_ROW_GROUP, q_length)
-            group_scores = scores[:, row_begin:row_end]
-            group_visible = visible[row_begin:row_end]
-            group_rows = row_end - row_begin
+        for row_begin in range(0, q_length, _SKIP_SOFTMAX_WARP_ROWS):
+            row_end = min(row_begin + _SKIP_SOFTMAX_WARP_ROWS, q_length)
+            warp_scores = scores[:, row_begin:row_end]
+            warp_visible = visible[row_begin:row_end]
+            warp_rows = row_end - row_begin
             running_max = torch.full(
-                (num_heads, group_rows), float("-inf"), device=device
+                (num_heads, warp_rows), float("-inf"), device=device
             )
             row_sum = torch.zeros_like(running_max)
-            acc = torch.zeros((num_heads, group_rows, head_dim), device=device)
+            acc = torch.zeros((num_heads, warp_rows, head_dim), device=device)
             for tile_idx in range(num_k_tiles):
                 k_begin = tile_idx * _SKIP_SOFTMAX_KV_TILE
                 k_end = k_begin + _SKIP_SOFTMAX_KV_TILE
-                if not bool(group_visible[:, k_begin:k_end].any()):
+                if not bool(warp_visible[:, k_begin:k_end].any()):
                     # Whether skipped or computed, a fully masked tile
                     # contributes nothing and keeps every running statistic.
                     continue
-                tile_scores = group_scores[:, :, k_begin:k_end]
+                tile_scores = warp_scores[:, :, k_begin:k_end]
                 tile_max = tile_scores.amax(dim=-1)
                 # exp(-inf) = 0 skips a masked row once it has a finite
                 # maximum; exp(NaN) and exp(inf) never compare below.
@@ -3310,7 +3310,7 @@ def _run_skip_softmax_paged(
 
 
 def test_attention_ts_context_skip_softmax_oracle_tracks_tile_decisions():
-    """Cold tiles are skipped per 32-row group and hot tiles reset the maximum."""
+    """Cold tiles are skipped per softmax warp and hot tiles reset the maximum."""
 
     case = _make_context_case(
         q_lengths=(64,),
@@ -3578,7 +3578,7 @@ def test_attention_ts_context_skip_softmax_matches_emulated_reference(
     )
     # Random N(0, 0.2) inputs keep every tile-versus-running maximum gap far
     # inside exp(gap) in [0.7, 1.4], so a threshold of 2 skips every K/V tile
-    # after a group's first one with a wide decision margin.
+    # after a softmax warp's first one with a wide decision margin.
     threshold = 2.0
     actual = _run_skip_softmax(case, threshold, use_wrapper=use_wrapper)
     expected = _skip_softmax_reference(case, thresholds=(threshold,) * len(q_lengths))

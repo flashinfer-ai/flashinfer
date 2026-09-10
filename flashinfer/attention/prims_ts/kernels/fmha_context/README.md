@@ -81,10 +81,10 @@ remain internal to the kernel.
 `skip_softmax_threshold` selects the skip-softmax specialization of the same
 kernel. `None` compiles the dense kernel. Any provided value, including zero,
 compiles the skip-enabled kernel, whose decision runs once per 128-key K/V
-tile for each 32-row query group of a softmax warp:
+tile for the 32 Q rows owned by one softmax warp:
 
 ```text
-skip the tile for the group  <=>  for every row of the group,
+skip the tile for the warp  <=>  for every valid row of the warp,
     exp(sm_scale * (tile_max - running_max)) < skip_softmax_threshold
 ```
 
@@ -93,12 +93,12 @@ converts it to the log2 domain once per work tile. `tile_max` is the row's
 largest masked score in the tile and `running_max` is the row's current
 softmax maximum, so a row that has not met a valid key yet never votes to
 skip, and a zero threshold never skips. Only the rows inside the request
-vote; the TMA padding rows of a partial query tile abstain. A skipped tile
+vote; the TMA padding rows of a partial Q tile abstain. A skipped tile
 contributes zero probability mass: the warp publishes an all-zero P tile
-without exponentiation, keeps its running maximum and denominator, and votes
-in shared memory. When all four softmax warps of a 128-row query tile skip,
+without exp2, keeps its running maximum and denominator, and votes
+in SMEM. When all four softmax warps of a Q/KV instance skip,
 the MMA task also skips that tile's PV MMA. K and V tiles are still loaded, so
-the saving is in softmax and tensor-core work rather than in memory traffic.
+the saving is in softmax and PV MMA work rather than in memory traffic.
 Skipping is an approximation chosen by the caller: larger thresholds skip
 more tiles and deviate further from dense attention.
 

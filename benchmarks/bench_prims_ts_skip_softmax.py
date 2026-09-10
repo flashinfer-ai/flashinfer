@@ -21,7 +21,7 @@ at several thresholds on one fixed-shape problem per configuration. Random
 N(0, 0.2) inputs keep every K/V tile's scaled score gap to the running maximum
 inside roughly exp(gap) in [0.7, 1.4], so ``threshold=0`` measures the cost of
 the skip machinery without any skipping, ``threshold=1`` skips a data-dependent
-subset of tiles, and ``threshold=2`` skips every tile after a query group's
+subset of tiles, and ``threshold=2`` skips every tile after a softmax warp's
 first one, which bounds the attainable speedup.
 
 Example:
