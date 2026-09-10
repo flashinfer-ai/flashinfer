@@ -545,6 +545,61 @@ def test_gvr2_warmup_varlen_on_stream_enables_capture_on_that_stream_only():
 
 
 @requires_gvr2
+def test_gvr2_release_between_quiescent_multithreaded_phases_is_exact():
+    """`release_gvr2_resources` under its documented contract in a threaded
+    program: eight threads launch on eight streams, all of them park at a
+    barrier (quiescent: nothing in flight, nothing being issued), the main
+    thread releases the device's slabs and anchor tables, and the threads
+    resume with hint-free launches on the same streams. Every result stays
+    exact, every slab and the table are recreated, and a second release frees
+    at least the same number of slabs."""
+    from flashinfer.topk_varlen import release_gvr2_resources
+
+    threads_n = 8
+    k, work = _split_inputs(threads_n, seed=91)
+    dev = torch.cuda.current_device()
+    streams = [torch.cuda.Stream() for _ in range(threads_n)]
+    outs = [[torch.full_like(w[3], -7) for _ in range(2)] for w in work]
+    torch.cuda.synchronize()
+    b_quiet, b_resume = _barrier(threads_n + 1), _barrier(threads_n + 1)
+    errors = []
+
+    def worker(i):
+        try:
+            with torch.cuda.stream(streams[i]):
+                _launch(work[i], k, False, out=outs[i][0])  # slab + table
+                streams[i].synchronize()
+                b_quiet.wait()  # main releases while everyone is parked here
+                b_resume.wait()
+                _launch(work[i], k, False, out=outs[i][1])  # recreates them
+                streams[i].synchronize()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
+    for t in ts:
+        t.start()
+    b_quiet.wait()
+    n_slabs = sum(1 for key in _host._ws_keep if key[0] == dev)
+    assert n_slabs >= threads_n
+    freed = release_gvr2_resources()
+    assert freed >= threads_n * _host.workspace_bytes(), (freed, n_slabs)
+    assert not any(key[0] == dev for key in _host._ws_keep)
+    assert (dev, k) not in _host._HINT_FREE
+    b_resume.wait()
+    for t in ts:
+        t.join()
+    torch.cuda.synchronize()
+    assert not errors, errors
+    assert sum(1 for key in _host._ws_keep if key[0] == dev) >= threads_n
+    assert (dev, k) in _host._HINT_FREE
+    for i, w in enumerate(work):
+        for j in range(2):
+            _exact(w[0], w[1], outs[i][j], k, who=f"stream {i} phase {j}")
+    assert release_gvr2_resources() >= threads_n * _host.workspace_bytes()
+
+
+@requires_gvr2
 def test_gvr2_register_family_capture_needs_no_slab_on_a_fresh_stream():
     """The rule is scoped to slab-using plans: a register-family shape warmed
     on the default stream captures on a stream WITHOUT a slab (cleared

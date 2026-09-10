@@ -1108,9 +1108,18 @@ def release_gvr2_resources(device=None) -> int:
     slab per CUDA stream it has run on (20,973,568 bytes each, at most 32 per
     device) and one hint-free anchor table per ``top_k`` (grown by doubling).
     They are created by eager launches and live for the process. This call
-    synchronizes ``device`` (default: the current device), drops them all and
-    returns the number of bytes released to the torch caching allocator
-    (``torch.cuda.empty_cache()`` returns that memory to the driver).
+    synchronizes ``device`` (default: the current device; an int, a
+    ``torch.device`` or a device string — CUDA only, anything else raises
+    ``ValueError``), drops them all and returns the number of bytes released
+    to the torch caching allocator (``torch.cuda.empty_cache()`` returns that
+    memory to the driver).
+
+    The caller must be quiescent on ``device`` for the duration of the call:
+    no ``gvr_2`` call in flight or being issued from any thread, eager or
+    CUDA-graph replay — the same rule as ``torch.cuda.empty_cache()`` versus
+    live tensors. The launch hot paths do not take the cache locks, so a
+    launch issued concurrently could otherwise address a slab this call has
+    just released.
 
     Any CUDA graph captured against a released slab or table would replay on
     freed memory: release only when no such graph will be replayed again, and

@@ -790,6 +790,44 @@ def route_streaming(
 
 _VARLEN_CACHE = {}
 
+# ---------------------------------------------------------------------------
+# first-call gate for compiled DSL kernel objects
+# ---------------------------------------------------------------------------
+# libcute_dsl_runtime's ``cuda_dialect_init_library_once`` (the per-kernel
+# CUDA init that runs inside the FIRST invocation of a compiled kernel) is a
+# double-checked once-init behind ONE process-wide spinlock. In
+# nvidia-cutlass-dsl 4.6.3, 4.7.0 and 4.7.1 the thread that acquires the lock
+# after another thread already initialised the same kernel returns WITHOUT
+# releasing it, so the next first call of ANY other kernel in the process
+# spins forever (fixed in 4.8.0.dev0 / nightlies >= 2026-08-18; reported as
+# DKG issue, see PR #4986). Until the DSL floor is past the fix, concurrent
+# first calls of one kernel object are serialized here; once the first call
+# has returned (the once-init is synchronous inside it) the wrapper costs one
+# list-element load per launch.
+_GATE_LOCK = threading.Lock()
+_GATED = {}  # id(compiled fn) -> (compiled fn kept alive, gated wrapper)
+
+
+def _gate_first_call(raw):
+    """Wrap a compiled DSL kernel object so its first invocation is exclusive."""
+    with _GATE_LOCK:
+        ent = _GATED.get(id(raw))
+        if ent is not None:
+            return ent[1]
+        lock = threading.Lock()
+        warm = [False]
+
+        def gated(*args, _raw=raw, _lock=lock, _warm=warm):
+            if _warm[0]:
+                return _raw(*args)
+            with _lock:
+                out = _raw(*args)
+                _warm[0] = True  # only after a completed first call
+            return out
+
+        _GATED[id(raw)] = (raw, gated)
+        return gated
+
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
@@ -820,8 +858,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
     plan_free = route(num_rows, n_route, npad, k, sms=sms)
     if plan_free["kernel"] == "reg_clus":
-        fn = dev.get_compiled__regclus(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+        fn = _gate_first_call(
+            dev.get_compiled__regclus(
+                tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            )
         )
         lc = ("reg_clus", fn, n_kernel)
         _VARLEN_CACHE[key] = lc
@@ -834,8 +874,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
-        fn = dev.get_compiled__reg(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+        fn = _gate_first_call(
+            dev.get_compiled__reg(
+                tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            )
         )
         rt_f = plan_free["rt"]
         lc = (
@@ -854,13 +896,15 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # Per-row n / short-row handling in-kernel.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
-        fn = dev.get_compiled__clus(
-            tuple(plan_free["tpl"]),
-            scap=rt_f["SCAP"],
-            cmp_=rt_f["CMP"],
-            varlen=True,
-            next_n=next_n,
-            cr_shift=cr_shift,
+        fn = _gate_first_call(
+            dev.get_compiled__clus(
+                tuple(plan_free["tpl"]),
+                scap=rt_f["SCAP"],
+                cmp_=rt_f["CMP"],
+                varlen=True,
+                next_n=next_n,
+                cr_shift=cr_shift,
+            )
         )
         lc = (
             "clus",
@@ -876,7 +920,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+    fn = _gate_first_call(
+        dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+    )
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -1078,30 +1124,52 @@ def release_cached_resources(device=None) -> int:
     """FlashInfer-local: release the lazily created per-device caches — every
     default workspace slab (one per (device, stream), 20,973,568 B each) and
     every hint-free anchor table (current and superseded) — for ``device``
-    (default: the current device). Synchronizes the device first so no
-    in-flight launch still uses them, then drops the references; the memory
-    returns to the torch caching allocator (``torch.cuda.empty_cache()``
-    hands it back to the driver). Returns the number of bytes released.
+    (default: the current device; an int, a ``torch.device`` or a device
+    string, CUDA only). Synchronizes the device, then drops the references
+    under both cache locks; the memory returns to the torch caching
+    allocator (``torch.cuda.empty_cache()`` hands it back to the driver).
+    Returns the number of bytes released.
+
+    CONTRACT — caller quiescence. The launch hot paths read the caches
+    without taking the locks (a lock there would cost every launch), so this
+    call cannot exclude a launch that is being issued concurrently: while it
+    runs, no gvr_2 call on ``device`` may be in flight or issued — no eager
+    call from any thread and no CUDA-graph replay — exactly like
+    ``torch.cuda.empty_cache()`` versus live tensors. Under that contract the
+    device sync retires every launch that could still address a cached
+    object, and the locks make the clear atomic with respect to the slow
+    paths that create objects (a creation either completes before the clear
+    or starts after it; nothing is left half-published).
 
     INVALIDATION: a CUDA graph captured against a released slab or table
     replays on freed memory. Callers release only when no such graph will be
     replayed again, and re-capture after a fresh eager warm-up on the
     capturing stream (the same rule as the first capture)."""
-    d = torch.cuda.current_device() if device is None else torch.device(device).index
-    if d is None:
+    if device is None:
         d = torch.cuda.current_device()
-    torch.cuda.synchronize(d)
+    else:
+        dev = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        if dev.type != "cuda":
+            raise ValueError(
+                f"release_cached_resources: expected a CUDA device, got {dev!r}"
+            )
+        d = dev.index if dev.index is not None else torch.cuda.current_device()
     freed = 0
-    with _mu:
+    with _mu, _HINT_FREE_LOCK:  # lock order: _mu -> _HINT_FREE_LOCK (never nested elsewhere)
+        torch.cuda.synchronize(d)
         for key in [k for k in _ws_keep if k[0] == d]:
             freed += _ws_keep.pop(key).numel() * 4
-    with _HINT_FREE_LOCK:
         for key in [k for k in _HINT_FREE if k[0] == d]:
             freed += _HINT_FREE.pop(key).numel() * 4
-        keep = [t for t in _HINT_FREE_KEEP if t.device.index == d]
-        for t in keep:
-            freed += t.numel() * 4
-            _HINT_FREE_KEEP.remove(t)
+        # partition by device index — never tensor equality (`in`/`remove`
+        # would compare tensor contents and raise across devices or shapes)
+        keep = []
+        for t in _HINT_FREE_KEEP:
+            if t.device.index == d:
+                freed += t.numel() * 4
+            else:
+                keep.append(t)
+        _HINT_FREE_KEEP[:] = keep
     return freed
 
 
@@ -1228,7 +1296,7 @@ def _build_launcher(b, n, npad, k):
     rt = rd["rt"]
     if fam in ("reg", "regimg"):
         dev = _device()
-        raw = dev.get_compiled__reg(tpl)
+        raw = _gate_first_call(dev.get_compiled__reg(tpl))
 
         # compiled ABI: (logits, pre_idx, kv_lens, out, n, CMP, QC,
         # smem_total) -- kv_lens is the dead varlen slot in batch-uniform
@@ -1240,7 +1308,7 @@ def _build_launcher(b, n, npad, k):
         return (fn, args, False)
     if fam == "main":
         dev = _device()
-        raw = dev.get_compiled(tpl)
+        raw = _gate_first_call(dev.get_compiled(tpl))
 
         # compiled ABI: (logits, pre_idx, out, ws, n, npad, k, SCAP_, CMP_,
         #                R, SMP, TGT, Q, SS2, TGT2,
@@ -1270,7 +1338,9 @@ def _build_launcher(b, n, npad, k):
         # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
         #       TGT, Q, SS2, TGT2) -- NO workspace; kv_lens is the dead
         # varlen slot in batch-uniform mode (cached dummy tensor)
-        fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
+        fn = _gate_first_call(
+            dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
+        )
         args = (
             rt["n"],
             rt["npad"],
@@ -1293,7 +1363,7 @@ def _build_launcher(b, n, npad, k):
         # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
         # dead varlen slot in batch-uniform mode (cached dummy tensor);
         # smem/k derived in-module
-        fn = dev.get_compiled__regclus(tpl)
+        fn = _gate_first_call(dev.get_compiled__regclus(tpl))
         n_arg = rt["n"]
 
         def _call(lg, pi, idx, _fn=fn, _n=n_arg):

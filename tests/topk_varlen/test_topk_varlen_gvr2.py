@@ -1587,21 +1587,174 @@ def test_gvr2_release_cached_resources():
         torch.cuda.memory_allocated(dev),
         freed,
     )
-    # capture without a fresh warm-up on s: loud, not a silent allocation
+    # capture without a fresh warm-up on s: loud, not a silent allocation.
+    # Hinted capture (a valid pre_idx, so the anchor-table check cannot fire):
+    # the WORKSPACE guard must be the one that raises, and it must not have
+    # allocated a slab from the graph pool.
+    pre = (
+        torch.arange(k, dtype=torch.int32, device=_DEV)
+        .unsqueeze(0)
+        .expand(rows, k)
+        .contiguous()
+    )
     g = torch.cuda.CUDAGraph()
     with (
-        pytest.raises(RuntimeError, match="no slab for this stream|hint-free gvr_2"),
+        pytest.raises(RuntimeError, match="no slab for this stream"),
+        torch.cuda.stream(s),
+        torch.cuda.graph(g, stream=s),
+    ):
+        _run_gvr2(logits, seq, k, pre, out_indices=out)
+    torch.cuda.synchronize()
+    assert not any(key[0] == dev for key in _host._ws_keep), "capture allocated a slab"
+    # hint-free capture after release: the anchor-table guard fires first
+    g = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="hint-free gvr_2: no pre_idx table"),
         torch.cuda.stream(s),
         torch.cuda.graph(g, stream=s),
     ):
         _run_gvr2(logits, seq, k, None, out_indices=out)
     torch.cuda.synchronize()
+    assert not any(key[0] == dev for key in _host._HINT_FREE)
     # eager launch recreates both, and the result is exact
     with torch.cuda.stream(s):
         _run_gvr2(logits, seq, k, None, out_indices=out)
     torch.cuda.synchronize()
     assert (dev, s.cuda_stream) in _host._ws_keep and (dev, k) in _host._HINT_FREE
     _check_varlen_rows(logits, out, seq.tolist(), k)
-    # releasing when nothing is cached is a no-op returning 0
+    # releasing when nothing is cached is a no-op returning 0; int / device /
+    # string spellings of the same CUDA device are all accepted
     release_gvr2_resources(torch.device(_DEV, dev))
+    assert release_gvr2_resources(dev) == 0
+    assert release_gvr2_resources(f"cuda:{dev}") == 0
     assert release_gvr2_resources() == 0
+
+
+@requires_gvr2
+def test_gvr2_release_rejects_non_cuda_device():
+    """A non-CUDA device argument must raise, never redirect the cleanup to a
+    CUDA device: "cpu" is not "the current CUDA device" and "cpu:1" is not
+    CUDA device 1. The caches stay intact."""
+    from flashinfer.topk_varlen import release_gvr2_resources
+
+    rows, n, k = 16, 131072, 512
+    lc = _host._varlen_launcher(rows, n, k, n, 1, 1)
+    if not (lc[0] == "main" and lc[2][5] > 1):
+        pytest.skip(f"shape routes to {lc[0]} (no workspace use) on this device")
+    dev = torch.cuda.current_device()
+    gen = torch.Generator(device=_DEV).manual_seed(92)
+    logits = torch.randn(rows, n, generator=gen, device=_DEV)
+    seq = torch.randint(
+        50000, n, (rows,), generator=gen, device=_DEV, dtype=torch.int32
+    )
+    out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq, k, None, out_indices=out)
+    torch.cuda.synchronize()
+    slabs = sum(1 for key in _host._ws_keep if key[0] == dev)
+    tables = sum(1 for key in _host._HINT_FREE if key[0] == dev)
+    assert slabs and tables
+    for bad in ("cpu", "cpu:1", torch.device("cpu"), torch.device("cpu", 1)):
+        with pytest.raises(ValueError, match="expected a CUDA device"):
+            release_gvr2_resources(bad)
+        assert sum(1 for key in _host._ws_keep if key[0] == dev) == slabs
+        assert sum(1 for key in _host._HINT_FREE if key[0] == dev) == tables
+
+
+@requires_gvr2
+def test_gvr2_release_partitions_kept_tables_without_tensor_equality():
+    """The superseded-table list is partitioned by device index. Tensor
+    equality (`in` / `list.remove`) would compare contents and raise on
+    entries of different shapes or devices; this interleaves superseded tables
+    of two shapes (and, with two GPUs, of two devices) and releases one device
+    at a time."""
+    from flashinfer.topk_varlen import release_gvr2_resources
+
+    dev = torch.cuda.current_device()
+    devices = [dev]
+    if torch.cuda.device_count() > 1:
+        devices.append((dev + 1) % torch.cuda.device_count())
+    with _host._HINT_FREE_LOCK:
+        for d in devices:
+            _host._HINT_FREE.pop((d, 512), None)
+            _host._HINT_FREE.pop((d, 1024), None)
+    for d in devices:
+        for k in (512, 1024):
+            # capacities 8 -> 64 -> 128 -> 256: two superseded tables per k per
+            # device, of different shapes, interleaved across k and devices
+            for b in (8, 100, 200):
+                _host._hint_free_pre_idx(b, k, torch.device("cuda", d))
+    before = {
+        d: sum(1 for t in _host._HINT_FREE_KEEP if t.device.index == d) for d in devices
+    }
+    assert all(v >= 4 for v in before.values()), before
+    freed = release_gvr2_resources(torch.device("cuda", dev))
+    assert freed > 0
+    assert not any(t.device.index == dev for t in _host._HINT_FREE_KEEP)
+    assert not any(key[0] == dev for key in _host._HINT_FREE)
+    for d in devices[1:]:  # the other device's entries are untouched
+        assert sum(1 for t in _host._HINT_FREE_KEEP if t.device.index == d) == before[d]
+        assert (d, 512) in _host._HINT_FREE and (d, 1024) in _host._HINT_FREE
+        release_gvr2_resources(d)
+        assert not any(t.device.index == d for t in _host._HINT_FREE_KEEP)
+
+
+def test_gvr2_first_call_gate_serializes_only_the_first_call():
+    """`_gate_first_call` wraps a compiled kernel object so concurrent FIRST
+    calls are exclusive (the CuTe DSL runtime's once-init lock leak,
+    nvidia-cutlass-dsl <= 4.7.1, needs two threads inside the first call of one
+    kernel to trigger) and later calls run unserialized; a failed first call
+    does not mark the object warm; the same object gets the same wrapper."""
+    import threading
+    import time
+
+    inside = [0]
+    peak = [0]
+    calls = [0]
+    guard = threading.Lock()
+
+    def raw(*args):
+        with guard:
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+            calls[0] += 1
+            n = calls[0]
+        if n == 1:
+            raise RuntimeError("first attempt fails")
+        time.sleep(0.05)
+        with guard:
+            inside[0] -= 1
+        return n
+
+    gated = _host._gate_first_call(raw)
+    assert _host._gate_first_call(raw) is gated
+    with pytest.raises(RuntimeError, match="first attempt fails"):
+        gated()
+    with guard:
+        inside[0] = 0  # the failed attempt never decremented
+    barrier = threading.Barrier(8, timeout=30)
+    results = []
+
+    def worker():
+        barrier.wait()
+        results.append(gated("a", 1))
+
+    ts = [threading.Thread(target=worker) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(30)
+    assert len(results) == 8 and not any(t.is_alive() for t in ts)
+    # the first completed call ran alone (peak 1 while it was the only one
+    # allowed in); after it returned the remaining callers were released
+    first_peak = peak[0]
+    assert first_peak >= 1
+    # warm now: another concurrent round is NOT serialized (several inside at once)
+    inside[0] = 0
+    peak[0] = 0
+    barrier = threading.Barrier(8, timeout=30)
+    ts = [threading.Thread(target=worker) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(30)
+    assert peak[0] > 1, "warm calls must not be serialized"
