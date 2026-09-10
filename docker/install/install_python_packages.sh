@@ -46,6 +46,13 @@ CI_IMAGE_DEPENDENCIES=()
 if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
   mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
 fi
+CUDA_TILE_COMPILE_DEPENDENCIES=()
+if [[ "${CUDA_MAJOR}" == "13" ]]; then
+  mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES < <(
+    PYTHONPATH=/install python3 -c \
+      'from build_utils import get_cuda_tile_compile_dependency_requirements; print(*get_cuda_tile_compile_dependency_requirements(), sep="\n")'
+  )
+fi
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
 # This is to ensure that the torch version is compatible with the CUDA version.
@@ -86,6 +93,10 @@ pip3 install \
   "${CUDA_PYTHON}" \
   "${NVSHMEM4PY}" \
   "${CI_IMAGE_DEPENDENCIES[@]}"
+
+if [[ "${CUDA_MAJOR}" == "13" ]]; then
+  pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"
+fi
 
 # Torch 2.13's cu129/cu130 wheels exact-pin cuDNN 9.20, but current FlashInfer
 # uses cuDNN 9.21-9.24 APIs and 9.20 has a known incomplete sublibrary set.

@@ -159,7 +159,7 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
-            if config.quant.variant not in runner_cls.supported_quant_variants:
+            if not runner_cls.supports_quant(config.quant):
                 continue
             try:
                 # Construction is inside the guard because a runner may reject an
@@ -208,6 +208,11 @@ class MoELayer:
                     f"implemented only by [{supporting}], which must also be "
                     f"configured and supported on this arch."
                 )
+            hint += (
+                f" Note quant weight={config.quant.weight.name}, "
+                f"activation={config.quant.activation.name}, "
+                f"output={config.quant.output.name}."
+            )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
