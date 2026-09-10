@@ -2427,6 +2427,36 @@ class UlyssesLowpSageLayoutSM90:
         )
         return q_logical, k_logical, v_packed, q_scale, k_scale
 
+    def verify_duplicate_scale_slots(
+        self,
+        recv_u8: torch.Tensor,
+        *,
+        batch_size: int,
+        local_sequence: int,
+        local_heads: int,
+        world_size: int,
+    ) -> bool:
+        """Debug/test-only duplicate-slot check on this layout's grid.  Binds
+        the grid AND the byte offsets together -- the free function defaults
+        both to the SM89/SM120 constants."""
+
+        return verify_duplicate_scale_slots(
+            recv_u8,
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            local_heads=local_heads,
+            head_dim=self.HEAD_DIM,
+            world_size=world_size,
+            q_group=self.Q_GROUP,
+            k_group=self.K_GROUP,
+            spec=self.payload_spec(
+                batch_size=batch_size,
+                local_sequence=local_sequence,
+                num_heads=local_heads * world_size,
+                world_size=world_size,
+            ),
+        )
+
     # ── internal SM90 kernel helpers ──────────────────────────────────────────
 
     @staticmethod
@@ -2547,23 +2577,38 @@ def verify_duplicate_scale_slots(
     local_heads: int,
     head_dim: int,
     world_size: int,
+    q_group: int = Q_GROUP,
+    k_group: int = K_GROUP,
+    spec: Optional[Dict[str, Union[int, float]]] = None,
 ) -> bool:
     """Debug/test-only check: every cross-boundary scale slot is bit-identical
     on all sources that carry it.  Runs as a read-only pass after the A2A, so
     there is no concurrent-writer hazard.  Never call on the hot path.
+
+    ``q_group`` / ``k_group`` select the grid the payload was packed with, like
+    the ``group=`` argument on :func:`boundary_descriptors` and
+    :func:`merge_boundary_amax`.  They default to the SM89/SM120 constants;
+    pass ``Q_GROUP_SM90`` / ``K_GROUP_SM90`` for an SM90 payload.  The grid
+    fixes both the scale byte offsets and which global groups straddle a rank
+    edge, so checking an SM90 payload on the SM120 grid reads the wrong bytes
+    and finds no shared groups at all -- the check then passes whatever it is
+    given.  ``spec`` must come from the matching layout when the grid is not
+    the default one; :meth:`UlyssesLowpSageLayoutSM90.verify_duplicate_scale_slots`
+    wires all three together.
     """
 
-    spec = payload_spec(
-        batch_size=batch_size,
-        local_sequence=local_sequence,
-        num_heads=local_heads * world_size,
-        head_dim=head_dim,
-        world_size=world_size,
-    )
+    if spec is None:
+        spec = payload_spec(
+            batch_size=batch_size,
+            local_sequence=local_sequence,
+            num_heads=local_heads * world_size,
+            head_dim=head_dim,
+            world_size=world_size,
+        )
     chunks = recv_u8.view(world_size, -1)
     for group, offset_key, slots_key in (
-        (Q_GROUP, "q_scale_offset", "q_slots_per_source"),
-        (K_GROUP, "k_scale_offset", "k_slots_per_source"),
+        (q_group, "q_scale_offset", "q_slots_per_source"),
+        (k_group, "k_scale_offset", "k_slots_per_source"),
     ):
         offset = int(spec[offset_key])
         slot_count = int(spec[slots_key])
