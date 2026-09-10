@@ -323,12 +323,15 @@ def validate_block_sparse_run(
             state.num_kv_heads,
             state.head_dim,
         )
-        for tensor, name in ((k_summary, "k_summary"), (v_summary, "v_summary")):
+        for tensor, name, dtype in (
+            (k_summary, "k_summary", state.kv_dtype),
+            (v_summary, "v_summary", state.value_dtype),
+        ):
             _validate_bshd_tensor(
                 tensor,
                 name,
                 expected_shape=summary_shape,
-                expected_dtype=state.kv_dtype,
+                expected_dtype=dtype,
                 expected_device=state.device,
             )
     elif k_summary is not None or v_summary is not None:
@@ -362,12 +365,15 @@ def validate_block_sparse_run(
             state.num_kv_heads,
             state.head_dim,
         )
-        for tensor, name in ((kv_storage.k, "k"), (kv_storage.v, "v")):
+        for tensor, name, dtype in (
+            (kv_storage.k, "k", state.kv_dtype),
+            (kv_storage.v, "v", state.value_dtype),
+        ):
             _validate_bshd_tensor(
                 tensor,
                 name,
                 expected_shape=kv_shape,
-                expected_dtype=state.kv_dtype,
+                expected_dtype=dtype,
                 expected_device=state.device,
             )
         k = kv_storage.k
@@ -470,6 +476,7 @@ def validate_block_sparse_run(
             out_dtype=state.output_dtype,
             device=state.device,
             summary_seq_len=num_kv_blocks if use_proxy_routes else None,
+            v_dtype=state.value_dtype,
         )
         overlap_inputs.extend(state.sage_tensors)
 

@@ -102,6 +102,8 @@ class _BlockSparsePlanState:
     kv_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    # The resolved V dtype (the K dtype unless the plan named another one).
+    value_dtype: torch.dtype
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
     page_size: int | None
@@ -308,6 +310,11 @@ def _build_block_sparse_plan_state(
             use_proxy_routes=use_proxy_routes,
             use_block_sparse=use_block_sparse,
             out_dtype_key=(None if sage is None else _dtype_key(static.output_dtype)),
+            v_dtype_key=(
+                None
+                if static.value_dtype == static.kv_dtype
+                else _dtype_key(static.value_dtype)
+            ),
             sage_q_block_size=static.sage_q_block_size,
             sage_k_block_size=static.sage_k_block_size,
             sage_v_mean=static.sage_v_mean,
@@ -341,6 +348,7 @@ def _build_block_sparse_plan_state(
         kv_block_size=static.kv_block_size,
         q_dtype=static.q_dtype,
         kv_dtype=static.kv_dtype,
+        value_dtype=static.value_dtype,
         output_dtype=static.output_dtype,
         use_kv_valid_bits=static.use_kv_valid_bits,
         page_size=static.page_size,

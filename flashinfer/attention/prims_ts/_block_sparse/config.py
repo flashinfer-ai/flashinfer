@@ -91,6 +91,9 @@ class _BlockSparseCompileKey:
     # The output dtype follows ``dtype_key`` unless Sage attention publishes a
     # 16-bit output from 8-bit Q/K/V.
     out_dtype_key: str | None = None
+    # The V dtype follows ``dtype_key`` unless the INT8 Sage recipe pairs INT8
+    # Q/K with E4M3 V.
+    v_dtype_key: str | None = None
     # Sage attention block sizes and the V mean add-back; zero K block means off.
     sage_q_block_size: int = 0
     sage_k_block_size: int = 0
@@ -128,6 +131,8 @@ class _BlockSparseStaticProfile:
     dtype_key: str
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    # The resolved V dtype: the caller's override or, by default, the K dtype.
+    value_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: Literal["dense", "causal"]
     use_kv_valid_bits: bool
@@ -295,8 +300,8 @@ def _dense_contiguous_profile_error(
 
     return ValueError(
         "dense contiguous decode supports Q64/KV256 in float16 or bfloat16, "
-        "Q128/KV128 in float16, and both profiles in float8_e4m3fn with Sage "
-        f"attention scales; got Q{q_tile_size}/KV{kv_route_size} in "
+        "Q128/KV128 in float16, and both profiles in float8_e4m3fn or int8 Q/K "
+        f"with Sage attention scales; got Q{q_tile_size}/KV{kv_route_size} in "
         f"{dtype_key} ({cause})"
     )
 
@@ -310,6 +315,7 @@ def _decode_mode_name(use_block_sparse: bool) -> str:
 def _validate_matching_dtypes(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
+    v_dtype: torch.dtype,
     output_dtype: torch.dtype,
     *,
     use_block_sparse: bool = True,
@@ -317,13 +323,13 @@ def _validate_matching_dtypes(
     """Validate the 16-bit dtype rule of a plan without Sage attention."""
 
     mode = _decode_mode_name(use_block_sparse)
-    if any(dtype in SAGE_QK_DTYPES for dtype in (q_dtype, kv_dtype)):
+    if any(dtype in SAGE_QK_DTYPES for dtype in (q_dtype, kv_dtype, v_dtype)):
         raise NotImplementedError(
             f"8-bit Q/K/V require sage=SageAttentionParams(...) on "
             f"BatchDecodeTSWrapper; without Sage attention {mode} supports only "
             "torch.float16 and torch.bfloat16"
         )
-    if not (q_dtype == kv_dtype == output_dtype):
+    if not (q_dtype == kv_dtype == v_dtype == output_dtype):
         raise ValueError(f"{mode} requires matching Q, K/V, and output dtypes")
     if q_dtype not in _SUPPORTED_DTYPES:
         raise NotImplementedError(
@@ -393,16 +399,18 @@ def _validate_block_sparse_static_profile(
     page_size: int | None = None,
     use_proxy_routes: bool = False,
     sage: SageAttentionParams | None = None,
+    v_dtype: torch.dtype | None = None,
     use_block_sparse: bool = True,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection.
 
+    ``kv_dtype`` is the K dtype and defaults to Q; ``v_dtype`` defaults to K.
     With ``sage`` the 8-bit dtype rules of Sage attention replace the matching
-    16-bit rule, the output defaults to bfloat16, the block sizes must select a
-    streamed Keeps profile (Q64/KV256 or Q128/KV128), and the scale block sizes
-    are validated against the selected Q tile; proxy routes additionally
-    require the summary K scales. ``use_block_sparse`` only names the mode in
-    error messages.
+    16-bit rule (INT8 Q/K name their E4M3 V), the output defaults to bfloat16,
+    the block sizes must select a streamed Keeps profile (Q64/KV256 or
+    Q128/KV128), and the scale block sizes are validated against the selected
+    Q tile; proxy routes additionally require the summary K scales.
+    ``use_block_sparse`` only names the mode in error messages.
     """
 
     mode = _decode_mode_name(use_block_sparse)
@@ -455,11 +463,13 @@ def _validate_block_sparse_static_profile(
         raise ValueError(f"causal {mode} requires seq_len_q <= seq_len_kv")
     if kv_dtype is None:
         kv_dtype = q_dtype
+    if v_dtype is None:
+        v_dtype = kv_dtype
     if sage is None:
         if output_dtype is None:
             output_dtype = q_dtype
         dtype_key = _validate_matching_dtypes(
-            q_dtype, kv_dtype, output_dtype, use_block_sparse=use_block_sparse
+            q_dtype, kv_dtype, v_dtype, output_dtype, use_block_sparse=use_block_sparse
         )
     else:
         if output_dtype is None:
@@ -486,6 +496,7 @@ def _validate_block_sparse_static_profile(
             summary_seq_len=(
                 ceil_div(seq_len_kv, kv_block_size) if use_proxy_routes else None
             ),
+            v_dtype=v_dtype,
         )
         dtype_key = _dtype_key(q_dtype)
     kv_route_size = _select_block_sparse_kv_route_size(
@@ -517,6 +528,7 @@ def _validate_block_sparse_static_profile(
         dtype_key=dtype_key,
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
+        value_dtype=v_dtype,
         output_dtype=output_dtype,
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
@@ -537,6 +549,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
     out_dtype = _cutlass_dtype(
         key.dtype_key if key.out_dtype_key is None else key.out_dtype_key
     )
+    v_dtype = None if key.v_dtype_key is None else _cutlass_dtype(key.v_dtype_key)
     q_tile_size = _select_block_sparse_q_tile_size(
         q_block_size=key.q_block_size,
         heads_q_per_kv=key.num_qo_heads // key.num_kv_heads,
@@ -589,6 +602,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         num_heads_kv=key.num_kv_heads,
         qkv_dtype=dtype,
         o_dtype=out_dtype,
+        v_dtype=v_dtype,
         split_kv_mode="disabled",
         splits_kv=1,
         mask_type=key.mask_type,
@@ -618,6 +632,7 @@ def _resolve_block_sparse_launch_spec(
     page_size: int | None = None,
     use_block_sparse: bool = True,
     out_dtype_key: str | None = None,
+    v_dtype_key: str | None = None,
     sage_q_block_size: int = 0,
     sage_k_block_size: int = 0,
     sage_v_mean: bool = False,
@@ -685,6 +700,7 @@ def _resolve_block_sparse_launch_spec(
         page_size=page_size,
         use_block_sparse=use_block_sparse,
         out_dtype_key=out_dtype_key,
+        v_dtype_key=v_dtype_key,
         sage_q_block_size=sage_q_block_size,
         sage_k_block_size=sage_k_block_size,
         sage_v_mean=sage_v_mean,

@@ -314,6 +314,8 @@ class _Geometry:
     tile_size_q: int = 64
     q_dtype: torch.dtype = _FP8
     kv_dtype: torch.dtype = _FP8
+    # ``None`` exercises the default: V follows the K dtype.
+    v_dtype: torch.dtype | None = None
     out_dtype: torch.dtype = torch.bfloat16
 
 
@@ -352,6 +354,7 @@ def _validate(params: SageAttentionParams, geometry: _Geometry) -> None:
         q_dtype=geometry.q_dtype,
         kv_dtype=geometry.kv_dtype,
         out_dtype=geometry.out_dtype,
+        v_dtype=geometry.v_dtype,
     )
 
 
@@ -434,13 +437,52 @@ def test_sage_params_reject_unsupported_dtypes(
         _validate(_make_params(geometry), geometry)
 
 
-@pytest.mark.parametrize("kv_dtype", (torch.int8, _FP8))
-def test_sage_params_report_int8_as_not_supported_yet(kv_dtype: torch.dtype) -> None:
-    """INT8 Q/K names the missing feature instead of a V dtype mismatch."""
+@pytest.mark.parametrize("out_dtype", (torch.bfloat16, torch.float16))
+def test_sage_params_accept_int8_qk_with_e4m3_v(out_dtype: torch.dtype) -> None:
+    """The INT8 recipe keeps E4M3 V, so V must be named when K is INT8."""
 
-    geometry = _Geometry(q_dtype=torch.int8, kv_dtype=kv_dtype)
-    with pytest.raises(NotImplementedError, match="INT8 Q/K Sage attention"):
+    geometry = _Geometry(
+        q_dtype=torch.int8, kv_dtype=torch.int8, v_dtype=_FP8, out_dtype=out_dtype
+    )
+    _validate(_make_params(geometry), geometry)
+
+
+def test_sage_params_v_dtype_defaults_to_k_dtype() -> None:
+    """Omitting V keeps the E4M3 callers unchanged and rejects INT8 K alone."""
+
+    _validate(_make_params(_Geometry()), _Geometry())
+    geometry = _Geometry(q_dtype=torch.int8, kv_dtype=torch.int8)
+    with pytest.raises(ValueError, match="V in"):
         _validate(_make_params(geometry), geometry)
+
+
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_dtype", "v_dtype", "match"),
+    (
+        (torch.int8, _FP8, _FP8, "Q and K"),
+        (_FP8, torch.int8, _FP8, "Q and K"),
+        (torch.int8, torch.int8, torch.int8, "V in"),
+        (_FP8, _FP8, torch.int8, "V in"),
+        (_FP8, _FP8, torch.float16, "V in"),
+    ),
+)
+def test_sage_params_reject_mixed_8bit_dtypes(
+    q_dtype: torch.dtype, kv_dtype: torch.dtype, v_dtype: torch.dtype, match: str
+) -> None:
+    geometry = _Geometry(q_dtype=q_dtype, kv_dtype=kv_dtype, v_dtype=v_dtype)
+    with pytest.raises(ValueError, match=match):
+        _validate(_make_params(geometry), geometry)
+
+
+@pytest.mark.parametrize("k_block_size", (1, 4))
+def test_sage_params_reject_int8_recipes_with_small_k_blocks(
+    k_block_size: int,
+) -> None:
+    """TensorRT-LLM's ``(int8, fp8, (1, 1, 1))`` and ``(1, 4, 1)`` stay unsupported."""
+
+    geometry = _Geometry(q_dtype=torch.int8, kv_dtype=torch.int8, v_dtype=_FP8)
+    with pytest.raises(ValueError, match="k_block_size"):
+        _validate(_make_params(geometry, k_block_size=k_block_size), geometry)
 
 
 @pytest.mark.parametrize(
@@ -591,10 +633,29 @@ class _DenseSageCase:
     with_mean: bool
     out_dtype: torch.dtype
     mask_type: str = "dense"
+    qk_dtype: torch.dtype = _FP8
 
     @property
     def expected_q_tile(self) -> int:
         return 64 if self.expected_kv_tile == 256 else 128
+
+
+# INT8 Q/K are drawn with this standard deviation and their scales divided by
+# it, so the dequantized inputs match the E4M3 cases' unit-variance values.
+_INT8_INPUT_STD = 40.0
+
+
+def _random_qk(shape, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Random 8-bit Q or K values of one dtype."""
+
+    values = torch.randn(shape, device=device)
+    if dtype == torch.int8:
+        return (values * _INT8_INPUT_STD).round().clamp(-127, 127).to(torch.int8)
+    return values.to(dtype)
+
+
+def _qk_scale_factor(dtype: torch.dtype) -> float:
+    return 1.0 / _INT8_INPUT_STD if dtype == torch.int8 else 1.0
 
 
 _KV256_MHA = dict(
@@ -692,6 +753,36 @@ _DENSE_SAGE_CASES = (
         out_dtype=torch.float16,
         mask_type="causal",
     ),
+    # INT8 Q/K accumulate INT32 scores; the exact dot product leaves input
+    # quantization as the only error, so the FP32 reference applies unchanged.
+    _DenseSageCase(
+        "kv256_int8_k16_q1_bf16",
+        **_KV256_MHA,
+        sage_q_block_size=1,
+        sage_k_block_size=16,
+        with_mean=False,
+        out_dtype=torch.bfloat16,
+        qk_dtype=torch.int8,
+    ),
+    _DenseSageCase(
+        "kv256_gqa4_int8_k64_q16_fp16_mean_causal",
+        **_KV256_GQA,
+        sage_q_block_size=16,
+        sage_k_block_size=64,
+        with_mean=True,
+        out_dtype=torch.float16,
+        mask_type="causal",
+        qk_dtype=torch.int8,
+    ),
+    _DenseSageCase(
+        "q128_int8_k16_q1_bf16_mean",
+        **_Q128_GQA,
+        sage_q_block_size=1,
+        sage_k_block_size=16,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        qk_dtype=torch.int8,
+    ),
 )
 
 
@@ -703,19 +794,23 @@ def _cases_named(cases, *names: str):
 
 
 def _random_sage_inputs(case: _DenseSageCase | _SparseSageCase, device: torch.device):
-    """Random E4M3 Q/K/V with random positive scales in the flat layout.
+    """Random 8-bit Q/K, E4M3 V and random positive scales in the flat layout.
 
     Only the geometry and recipe fields shared by both case types are read.
     """
 
-    q = torch.randn(
-        (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM), device=device
-    ).to(_FP8)
-    k = torch.randn(
+    q = _random_qk(
+        (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM),
+        case.qk_dtype,
+        device,
+    )
+    k = _random_qk(
         (case.batch_size, case.seq_len_kv, case.num_kv_heads, _HEAD_DIM),
-        device=device,
-    ).to(_FP8)
-    v = torch.randn_like(k.float()).to(_FP8)
+        case.qk_dtype,
+        device,
+    )
+    v = torch.randn(k.shape, device=device).to(_FP8)
+    qk_scale_factor = _qk_scale_factor(case.qk_dtype)
 
     def random_scale(shape, low, high):
         return (torch.rand(shape, device=device) * (high - low) + low).contiguous()
@@ -725,16 +820,16 @@ def _random_sage_inputs(case: _DenseSageCase | _SparseSageCase, device: torch.de
             case.num_qo_heads,
             flat_scale_numel(case.batch_size, case.seq_len_q, case.sage_q_block_size),
         ),
-        0.05,
-        0.2,
+        0.05 * qk_scale_factor,
+        0.2 * qk_scale_factor,
     )
     k_scale = random_scale(
         (
             case.num_kv_heads,
             flat_scale_numel(case.batch_size, case.seq_len_kv, case.sage_k_block_size),
         ),
-        0.5,
-        2.0,
+        0.5 * qk_scale_factor,
+        2.0 * qk_scale_factor,
     )
     v_scale = random_scale((case.num_kv_heads, _HEAD_DIM), 0.25, 1.0)
     v_mean = (
@@ -853,6 +948,12 @@ def _sage_dense_reference(
     return output
 
 
+def _v_data_type_kwargs(qk_dtype: torch.dtype) -> dict[str, torch.dtype]:
+    """Name the E4M3 V dtype only for INT8 Q/K; E4M3 callers rely on the default."""
+
+    return {"v_data_type": _FP8} if qk_dtype == torch.int8 else {}
+
+
 def _plan_dense_sage(case: _DenseSageCase, params: SageAttentionParams, device):
     from flashinfer.attention.prims_ts import BatchDecodeTSWrapper
     from flashinfer.attention.prims_ts._block_sparse import config as sparse_config
@@ -872,10 +973,11 @@ def _plan_dense_sage(case: _DenseSageCase, params: SageAttentionParams, device):
             device=device,
             use_block_sparse=False,
             mask_type=case.mask_type,
-            q_data_type=_FP8,
-            kv_data_type=_FP8,
+            q_data_type=case.qk_dtype,
+            kv_data_type=case.qk_dtype,
             o_data_type=case.out_dtype,
             sage=params,
+            **_v_data_type_kwargs(case.qk_dtype),
         )
     finally:
         sparse_config._resolve_block_sparse_launch_spec.cache_clear()
@@ -921,6 +1023,63 @@ def test_dense_sage_matches_dequantized_reference(case: _DenseSageCase) -> None:
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
+@torch.no_grad()
+def test_dense_int8_extreme_scores_stay_in_the_bias_binade() -> None:
+    """The largest INT8 dot products, ``+2**21`` and ``-128 * 127 * 128``, are exact.
+
+    INT32 scores are read as FP32 after accumulating onto ``1.5 * 2**23``, which
+    needs every ``bias + score`` inside ``[2**23, 2**24)``. One K row per head of
+    all ``-128`` against a Q row of all ``-128`` scores exactly ``+2**21``, and a K
+    row of all ``127`` scores ``-2080768``; their scales keep the reference
+    softmax unsaturated so both keys carry visible weight.
+    """
+
+    (case,) = _cases_named(_DENSE_SAGE_CASES, "kv256_int8_k16_q1_bf16")
+    torch.manual_seed(20260909)
+    device = torch.device("cuda", 0)
+    q, k, v, params = _random_sage_inputs(case, device)
+    batch, q_row, k_max_token, k_min_token = 0, 5, 300, 700
+    q[batch, q_row] = -128
+    k[batch, k_max_token] = -128
+    k[batch, k_min_token] = 127
+    scores = torch.einsum("hd,thd->ht", q[batch, q_row].float(), k[batch].float())
+    assert torch.equal(scores[:, k_max_token], torch.full_like(scores[:, 0], 2.0**21))
+    assert torch.equal(
+        scores[:, k_min_token], torch.full_like(scores[:, 0], -2080768.0)
+    )
+    # ``sfQ * sfK * s * sm_scale`` is about +-1.9 for the extreme keys, so the
+    # softmax row keeps most of its mass on the remaining keys.
+    q_slot = flat_scale_slot(
+        batch, q_row, case.seq_len_q, log2_block_size(params.q_block_size)
+    )
+    params.q_scale[:, q_slot] = 1e-3
+    for token in (k_max_token, k_min_token):
+        k_slot = flat_scale_slot(
+            batch, token, case.seq_len_kv, log2_block_size(params.k_block_size)
+        )
+        params.k_scale[:, k_slot] = 1e-2
+    sm_scale = _HEAD_DIM**-0.5
+    expected = _sage_dense_reference(
+        q,
+        k,
+        v,
+        params,
+        sm_scale=sm_scale,
+        mask_type=case.mask_type,
+        kv_tile_size=case.expected_kv_tile,
+    )
+    wrapper = _plan_dense_sage(case, params, device)
+    actual = wrapper.run(q, k, v, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(
+        actual[batch, q_row].float(), expected[batch, q_row], rtol=8e-3, atol=2e-3
+    )
+    torch.testing.assert_close(actual.float(), expected, rtol=8e-3, atol=2e-3)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "q_magnitude",
     (0.25, 1.0),
@@ -931,11 +1090,12 @@ def test_dense_sage_matches_dequantized_reference(case: _DenseSageCase) -> None:
     _cases_named(_DENSE_SAGE_CASES, "kv256_k16_q1_bf16", "q128_k16_q1_bf16_mean"),
     ids=("kv256", "q128"),
 )
+@pytest.mark.parametrize("qk_dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
 @torch.no_grad()
-def test_dense_sage_fp8_recipe_tracks_bf16_attention(
-    case: _DenseSageCase, q_magnitude: float
+def test_dense_sage_recipe_tracks_bf16_attention(
+    case: _DenseSageCase, q_magnitude: float, qk_dtype: torch.dtype
 ) -> None:
-    """Recipe ``(fp8, fp8, (1, 16, 1))`` on BF16 inputs tracks BF16 attention.
+    """Recipes ``(fp8|int8, fp8, (1, 16, 1))`` on BF16 inputs track BF16 attention.
 
     Heavy-tailed inputs follow TensorRT-LLM's recipe test. With Q scaled so the
     logits spread by about one standard deviation, as in trained attention
@@ -944,7 +1104,8 @@ def test_dense_sage_fp8_recipe_tracks_bf16_attention(
     the block-quantization error of that key becomes a full-magnitude output
     error on a fraction of a percent of the elements, and only the cosine
     similarity bound holds. The elementwise bound is therefore a property of
-    the input distribution, not of the kernel.
+    the input distribution, not of the kernel. INT8 uses TensorRT-LLM's
+    ``TypeMax = 126.9`` quantizer and its recipe tolerance.
     """
 
     torch.manual_seed(1)
@@ -954,8 +1115,8 @@ def test_dense_sage_fp8_recipe_tracks_bf16_attention(
     q_bf16 = heavy_tailed(q_shape, device=device, magnitude=q_magnitude)
     k_bf16 = heavy_tailed(kv_shape, device=device)
     v_bf16 = heavy_tailed(kv_shape, device=device)
-    q_fp8, q_scale = quantize_token_blocks(q_bf16, block_size=1, dtype=_FP8)
-    k_fp8, k_scale = quantize_token_blocks(k_bf16, block_size=16, dtype=_FP8)
+    q_quant, q_scale = quantize_token_blocks(q_bf16, block_size=1, dtype=qk_dtype)
+    k_quant, k_scale = quantize_token_blocks(k_bf16, block_size=16, dtype=qk_dtype)
     v_fp8, v_scale, _ = quantize_v_channels(v_bf16)
     params = SageAttentionParams(
         q_scale=q_scale,
@@ -970,6 +1131,7 @@ def test_dense_sage_fp8_recipe_tracks_bf16_attention(
         sage_k_block_size=16,
         with_mean=False,
         out_dtype=torch.bfloat16,
+        qk_dtype=qk_dtype,
     )
     sm_scale = _HEAD_DIM**-0.5
     group_size = case.num_qo_heads // case.num_kv_heads
@@ -981,15 +1143,68 @@ def test_dense_sage_fp8_recipe_tracks_bf16_attention(
     ).permute(0, 2, 1, 3)
 
     wrapper = _plan_dense_sage(recipe_case, params, device)
-    actual = wrapper.run(q_fp8, k_fp8, v_fp8, sm_scale=sm_scale).float()
+    actual = wrapper.run(q_quant, k_quant, v_fp8, sm_scale=sm_scale).float()
     torch.cuda.synchronize()
+    _assert_recipe_close(actual, expected, q_magnitude=q_magnitude, qk_dtype=qk_dtype)
+
+
+def _recipe_elementwise_tolerance(qk_dtype: torch.dtype) -> tuple[float, float]:
+    """TensorRT-LLM's unit-test bounds per recipe: INT8 ``(5e-1, 5e-1)``."""
+
+    if qk_dtype == torch.int8:
+        return 5e-1, 5e-1
+    return 2e-1, 3e-1
+
+
+def _relative_l2_error_per_head(
+    actual: torch.Tensor, expected: torch.Tensor
+) -> torch.Tensor:
+    """Return ``||O - ref||_2 / ||ref||_2`` per (batch, head) of ``[B, S, H, D]``."""
+
+    difference = (actual - expected).permute(0, 2, 1, 3).flatten(2).norm(dim=-1)
+    reference = expected.permute(0, 2, 1, 3).flatten(2).norm(dim=-1)
+    return difference / reference
+
+
+def _recipe_relative_l2_bound(q_magnitude: float, qk_dtype: torch.dtype) -> float:
+    """Per-head relative L2 bound of the recipe tests.
+
+    The INT8 elementwise bound ``(5e-1, 5e-1)`` says nothing about outputs
+    below one in magnitude, so this metric holds every head to a fraction of
+    its norm. The bounds leave about 1.3x to 1.5x headroom over the maxima
+    measured on B200 for both profiles and both route kinds: INT8 reaches
+    0.043 with logits spread by one standard deviation and 0.055 unscaled;
+    E4M3 Q/K, whose three mantissa bits quantize each input about ten times
+    as coarsely, reaches 0.082 and 0.133. A misaddressed scale moves a head
+    by well over half its norm.
+    """
+
+    if qk_dtype == torch.int8:
+        return 0.075
+    return 0.10 if q_magnitude < 1.0 else 0.20
+
+
+def _assert_recipe_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    q_magnitude: float,
+    qk_dtype: torch.dtype,
+) -> None:
+    """Check a recipe output: finite, cosine-close, and elementwise-close for spread logits."""
+
     assert torch.isfinite(actual).all()
     cosine = torch.nn.functional.cosine_similarity(
         actual.flatten(), expected.flatten(), dim=0
     )
     assert cosine > 0.99
+    relative_l2 = _relative_l2_error_per_head(actual, expected)
+    assert relative_l2.max() < _recipe_relative_l2_bound(q_magnitude, qk_dtype), (
+        relative_l2
+    )
     if q_magnitude < 1.0:
-        torch.testing.assert_close(actual, expected, rtol=2e-1, atol=3e-1)
+        rtol, atol = _recipe_elementwise_tolerance(qk_dtype)
+        torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1232,7 @@ class _SparseSageCase:
     use_proxy_routes: bool
     use_token_mask: bool = False
     sparse_format: str = "bsr"
+    qk_dtype: torch.dtype = _FP8
     # "auto" follows the planner; the test shapes are too small for it to
     # pick the persistent grid, so persistent cases force the selection.
     scheduler: str = "auto"
@@ -1142,6 +1358,44 @@ _SPARSE_SAGE_CASES = (
         out_dtype=torch.float16,
         use_proxy_routes=True,
     ),
+    # INT8 Q/K on both routes: the exact route runs the masked INT32 store
+    # path and the proxy route shifts the ragged tail summary in score units.
+    _SparseSageCase(
+        "kv256_int8_exact_k16_q1_bf16_mask",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_q_block_size=1,
+        sage_k_block_size=16,
+        with_mean=False,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=False,
+        use_token_mask=True,
+        qk_dtype=torch.int8,
+    ),
+    _SparseSageCase(
+        "kv256_int8_proxy_bk128_k64_q64_bf16_mean",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=128,
+        sage_q_block_size=64,
+        sage_k_block_size=64,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+        qk_dtype=torch.int8,
+    ),
+    # 33 summaries put the ragged tail summary on lane 0: the shifted score
+    # the max pass writes back is the first element the P pass reloads.
+    _SparseSageCase(
+        "kv256_int8_proxy_tail_lane0_k64_q64_bf16",
+        **{**_SPARSE_KV256_MHA, "seq_len_kv": 2100},
+        kv_block_size=64,
+        sage_q_block_size=64,
+        sage_k_block_size=64,
+        with_mean=False,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+        qk_dtype=torch.int8,
+    ),
     # 100 summaries put the ragged tail summary in atom 1, which the second
     # spatial half of the KV256 softmax owns as its first atom.
     _SparseSageCase(
@@ -1154,13 +1408,25 @@ _SPARSE_SAGE_CASES = (
         out_dtype=torch.bfloat16,
         use_proxy_routes=True,
     ),
+    _SparseSageCase(
+        "q128_gqa8_int8_proxy_k16_q1_fp16",
+        **_SPARSE_Q128_GQA,
+        kv_block_size=64,
+        sage_q_block_size=1,
+        sage_k_block_size=16,
+        with_mean=False,
+        out_dtype=torch.float16,
+        use_proxy_routes=True,
+        qk_dtype=torch.int8,
+    ),
 )
 # The persistent grid resolves every tile through the work tile; cover one
-# KV256 exact, one KV256 proxy and one Q128 case on it.
+# KV256 exact, one KV256 proxy, one Q128 and one INT8 case on it.
 _PERSISTENT_SPARSE_SAGE_CASE_NAMES = (
     "kv256_exact_bk128_k64_q16_fp16_mask",
     "kv256_proxy_k16_q1_bf16_mean",
     "q128_gqa8_proxy_bk128_k32_q4_fp16_mean",
+    "kv256_int8_proxy_bk128_k64_q64_bf16_mean",
 )
 _SPARSE_SAGE_CASES += tuple(
     replace(case, name=f"{case.name}_persistent", scheduler="persistent")
@@ -1233,20 +1499,23 @@ def _random_sparse_sage_inputs(case: _SparseSageCase, device: torch.device):
             case.num_kv_heads,
             _HEAD_DIM,
         )
-        k_summary = torch.randn(summary_shape, device=device).to(_FP8)
+        k_summary = _random_qk(summary_shape, case.qk_dtype, device)
         v_summary = torch.randn(summary_shape, device=device).to(_FP8)
         k_summary_scale = (
-            torch.rand(
-                (
-                    case.num_kv_heads,
-                    flat_scale_numel(
-                        case.batch_size, case.num_kv_blocks, case.sage_k_block_size
+            (
+                torch.rand(
+                    (
+                        case.num_kv_heads,
+                        flat_scale_numel(
+                            case.batch_size, case.num_kv_blocks, case.sage_k_block_size
+                        ),
                     ),
-                ),
-                device=device,
+                    device=device,
+                )
+                * 1.5
+                + 0.5
             )
-            * 1.5
-            + 0.5
+            * _qk_scale_factor(case.qk_dtype)
         ).contiguous()
         params = replace(params, k_summary_scale=k_summary_scale)
         summaries = (k_summary, v_summary)
@@ -1462,10 +1731,11 @@ def _plan_sparse_sage(
                 use_kv_valid_bits=case.use_token_mask,
                 sparse_format=case.sparse_format,
                 use_proxy_routes=case.use_proxy_routes,
-                q_data_type=_FP8,
-                kv_data_type=_FP8,
+                q_data_type=case.qk_dtype,
+                kv_data_type=case.qk_dtype,
                 o_data_type=case.out_dtype,
                 sage=params,
+                **_v_data_type_kwargs(case.qk_dtype),
             )
     finally:
         sparse_config._resolve_block_sparse_launch_spec.cache_clear()
@@ -1517,6 +1787,89 @@ def test_block_sparse_sage_matches_dequantized_reference(case: _SparseSageCase) 
     # about 1e-2 in the output where the dense test's thousand-token rows
     # average them out; a misaddressed scale would move the output by far
     # more than this bound.
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+_INT8_FLOOR_SCALE_CASE = next(
+    case
+    for case in _SPARSE_SAGE_CASES
+    if case.name == "kv256_int8_exact_k16_q1_bf16_mask"
+)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("q_magnitude", (0.0, 0.01), ids=("zero_q", "small_q"))
+@torch.no_grad()
+def test_block_sparse_int8_masked_lanes_carry_no_mass_at_floor_scales(
+    q_magnitude: float,
+) -> None:
+    """Masked INT8 lanes stay at zero mass when their group scale is at the floor.
+
+    Zero K rows (padding) drive a 16-token block's scale down to the quantizer
+    floor ``1e-3 / 126.9``, and a zero or tiny Q token does the same for
+    ``sfQ``. Masked lanes of the INT32 path are rewritten as FP32 ``-FLT_MAX``
+    and must exponentiate to zero regardless of how small ``sfQ * sfK`` gets;
+    an integer sentinel scaled by the multiplier would leak most of a kept
+    lane's weight here. Masked tokens
+    carry a constant V well away from the kept tokens' values so any leaked
+    mass shows up in the output.
+    """
+
+    case = _INT8_FLOOR_SCALE_CASE
+    torch.manual_seed(20260909)
+    device = torch.device("cuda", 0)
+    generator = torch.Generator().manual_seed(20260909)
+    patterns = _sparse_patterns(case, generator)
+    valid_bits, valid_tokens = _sparse_token_mask(case, device)
+    q_shape = (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM)
+    kv_shape = (case.batch_size, case.seq_len_kv, case.num_kv_heads, _HEAD_DIM)
+    q_bf16 = (torch.randn(q_shape, device=device) * q_magnitude).to(torch.bfloat16)
+    k_bf16 = torch.randn(kv_shape, device=device).to(torch.bfloat16)
+    token_block = torch.arange(case.seq_len_kv, device=device) // case.sage_k_block_size
+    k_bf16[:, token_block % 3 == 2] = 0
+    v_bf16 = torch.randn(kv_shape, device=device).to(torch.bfloat16)
+    v_bf16[~valid_tokens] = 4.0
+    q_quant, q_scale = quantize_token_blocks(
+        q_bf16, block_size=case.sage_q_block_size, dtype=torch.int8
+    )
+    k_quant, k_scale = quantize_token_blocks(
+        k_bf16, block_size=case.sage_k_block_size, dtype=torch.int8
+    )
+    v_fp8, v_scale, _ = quantize_v_channels(v_bf16)
+    params = SageAttentionParams(
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        q_block_size=case.sage_q_block_size,
+        k_block_size=case.sage_k_block_size,
+    )
+    sm_scale = _HEAD_DIM**-0.5
+    expected = _sage_sparse_reference(
+        case,
+        q_quant,
+        k_quant,
+        v_fp8,
+        params,
+        None,
+        patterns,
+        valid_tokens,
+        sm_scale=sm_scale,
+    )
+    max_blocks_per_row = widest_bsr_row(patterns)
+    wrapper = _plan_sparse_sage(
+        case, params, device, max_blocks_per_row=max_blocks_per_row
+    )
+    actual = wrapper.run(
+        q_quant,
+        k_quant,
+        v_fp8,
+        kv_valid_bits=valid_bits,
+        sm_scale=sm_scale,
+        **_sparse_routing(case, patterns, device),
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
 
 
@@ -1598,11 +1951,12 @@ def _sparse_bf16_reference(
     ),
     ids=("kv256-exact", "kv256-proxy", "q128-proxy"),
 )
+@pytest.mark.parametrize("qk_dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
 @torch.no_grad()
-def test_block_sparse_sage_fp8_recipe_tracks_bf16_attention(
-    case: _SparseSageCase, q_magnitude: float
+def test_block_sparse_sage_recipe_tracks_bf16_attention(
+    case: _SparseSageCase, q_magnitude: float, qk_dtype: torch.dtype
 ) -> None:
-    """Recipe ``(fp8, fp8, (1, 16, 1))`` tracks BF16 block-sparse attention.
+    """Recipes ``(fp8|int8, fp8, (1, 16, 1))`` track BF16 block-sparse attention.
 
     Proxy summaries are the per-block means of K and V; the summary K is
     quantized like one more K sequence and the summary V with the shared V
@@ -1619,6 +1973,7 @@ def test_block_sparse_sage_fp8_recipe_tracks_bf16_attention(
         with_mean=False,
         out_dtype=torch.bfloat16,
         use_token_mask=False,
+        qk_dtype=qk_dtype,
     )
     patterns = _sparse_patterns(recipe_case, generator)
     q_shape = (case.batch_size, case.seq_len_q, case.num_qo_heads, _HEAD_DIM)
@@ -1626,19 +1981,19 @@ def test_block_sparse_sage_fp8_recipe_tracks_bf16_attention(
     q_bf16 = heavy_tailed(q_shape, device=device, magnitude=q_magnitude)
     k_bf16 = heavy_tailed(kv_shape, device=device)
     v_bf16 = heavy_tailed(kv_shape, device=device)
-    q_fp8, q_scale = quantize_token_blocks(q_bf16, block_size=1, dtype=_FP8)
-    k_fp8, k_scale = quantize_token_blocks(k_bf16, block_size=16, dtype=_FP8)
+    q_quant, q_scale = quantize_token_blocks(q_bf16, block_size=1, dtype=qk_dtype)
+    k_quant, k_scale = quantize_token_blocks(k_bf16, block_size=16, dtype=qk_dtype)
     v_fp8, v_scale, _ = quantize_v_channels(v_bf16)
     summaries = None
     k_summary_scale = None
     if case.use_proxy_routes:
         k_summary_bf16 = block_mean(k_bf16, case.kv_block_size, torch.bfloat16)
         v_summary_bf16 = block_mean(v_bf16, case.kv_block_size, torch.bfloat16)
-        k_summary_fp8, k_summary_scale = quantize_token_blocks(
-            k_summary_bf16, block_size=16, dtype=_FP8
+        k_summary_quant, k_summary_scale = quantize_token_blocks(
+            k_summary_bf16, block_size=16, dtype=qk_dtype
         )
         v_summary_fp8 = quantize_v_channels_with_scale(v_summary_bf16, v_scale)
-        summaries = (k_summary_fp8, v_summary_fp8)
+        summaries = (k_summary_quant, v_summary_fp8)
     params = SageAttentionParams(
         q_scale=q_scale,
         k_scale=k_scale,
@@ -1658,12 +2013,8 @@ def test_block_sparse_sage_fp8_recipe_tracks_bf16_attention(
     run_kwargs = _sparse_routing(recipe_case, patterns, device)
     if summaries is not None:
         run_kwargs.update(k_summary=summaries[0], v_summary=summaries[1])
-    actual = wrapper.run(q_fp8, k_fp8, v_fp8, sm_scale=sm_scale, **run_kwargs).float()
+    actual = wrapper.run(
+        q_quant, k_quant, v_fp8, sm_scale=sm_scale, **run_kwargs
+    ).float()
     torch.cuda.synchronize()
-    assert torch.isfinite(actual).all()
-    cosine = torch.nn.functional.cosine_similarity(
-        actual.flatten(), expected.flatten(), dim=0
-    )
-    assert cosine > 0.99
-    if q_magnitude < 1.0:
-        torch.testing.assert_close(actual, expected, rtol=2e-1, atol=3e-1)
+    _assert_recipe_close(actual, expected, q_magnitude=q_magnitude, qk_dtype=qk_dtype)

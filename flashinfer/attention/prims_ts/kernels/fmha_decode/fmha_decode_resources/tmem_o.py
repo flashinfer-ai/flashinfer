@@ -52,7 +52,7 @@ from .helpers_common import (
     _decode_gen_task_cache,
     _freeze_smem_descriptor,
     _mma_k_step,
-    _mma_kind_for_qkv,
+    _mma_kind_for_pv,
 )
 
 
@@ -264,8 +264,8 @@ class TmemOResource(DecodeGenResourceBase):
         _, mma_m, mma_n, a_major, b_major = _pv_mma_operand_contract_for_config(cfg)
         idesc = prims.Tcgen05InstrDesc.build(
             c_dtype=Float32,
-            a_dtype=cfg.q_dtype,
-            b_dtype=cfg.q_dtype,
+            a_dtype=cfg.value_dtype,
+            b_dtype=cfg.value_dtype,
             a_major=a_major,
             b_major=b_major,
             n_dim=mma_n,
@@ -301,7 +301,7 @@ class TmemOResource(DecodeGenResourceBase):
                         + (k_step % k_steps_per_block) * k_step_desc_units
                     )
                     tcgen05_mma_ws(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         tmem_col,
                         p_operand,
                         iter_v_desc,
@@ -311,7 +311,7 @@ class TmemOResource(DecodeGenResourceBase):
                 else:
                     iter_v_desc = v_desc + Int32(k_step * k_step_desc_units)
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         p_operand,
@@ -372,8 +372,8 @@ class TmemOResource(DecodeGenResourceBase):
             )
             idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
-                a_dtype=cfg.q_dtype,
-                b_dtype=cfg.q_dtype,
+                a_dtype=cfg.value_dtype,
+                b_dtype=cfg.value_dtype,
                 a_major=a_major,
                 b_major=b_major,
                 n_dim=mma_n,
@@ -404,7 +404,7 @@ class TmemOResource(DecodeGenResourceBase):
                     else:
                         a_desc, b_desc = v_desc, p_operand
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         a_desc,
@@ -418,11 +418,11 @@ class TmemOResource(DecodeGenResourceBase):
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
                         v_desc = v_desc + Int32(
-                            (cfg.headdim * 2) if cfg.use_fp8_qkv else 128
+                            (cfg.headdim * 2) if cfg.use_8bit_qkv else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_8bit_qkv
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):
@@ -452,8 +452,8 @@ class TmemOResource(DecodeGenResourceBase):
             )
             idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
-                a_dtype=cfg.q_dtype,
-                b_dtype=cfg.q_dtype,
+                a_dtype=cfg.value_dtype,
+                b_dtype=cfg.value_dtype,
                 a_major=a_major,
                 b_major=b_major,
                 n_dim=mma_n,
@@ -478,7 +478,7 @@ class TmemOResource(DecodeGenResourceBase):
                     else:
                         a_desc, b_desc = v_desc, p_operand
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         a_desc,
@@ -493,11 +493,11 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
                         v_desc = v_desc + Int32(
-                            (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_qkv else 128
+                            (cfg.head_dim_kv_stage * 2) if cfg.use_8bit_qkv else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_8bit_qkv
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):

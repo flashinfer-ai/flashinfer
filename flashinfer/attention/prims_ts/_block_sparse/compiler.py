@@ -238,7 +238,7 @@ def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., obje
     tensor_fakes = [
         fake_compact(config.q_dtype, q_shape),
         fake_compact(config.kv_dtype, kv_shape),
-        fake_compact(config.kv_dtype, kv_shape),
+        fake_compact(config.value_dtype, kv_shape),
         fake_compact(config.out_dtype, q_shape),
     ]
     adapter = dense_contiguous_adapter
@@ -965,7 +965,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.head_dim,
         )
         k_fake = fake_compact(config.kv_dtype, kv_shape, 16)
-        v_fake = fake_compact(config.kv_dtype, kv_shape, 16)
+        v_fake = fake_compact(config.value_dtype, kv_shape, 16)
         exact_bits_fake = fake_compact(
             cutlass.Uint32,
             (
@@ -1055,7 +1055,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.head_dim,
             )
             k_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
+            v_summary_fake = fake_compact(config.value_dtype, summary_shape, 16)
             proxy_prefix = (
                 q_fake,
                 k_fake,
@@ -1078,7 +1078,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.head_dim,
             )
             k_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
+            v_summary_fake = fake_compact(config.value_dtype, summary_shape, 16)
             dynamic_args = (
                 q_fake,
                 k_fake,
@@ -1119,7 +1119,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.value_dtype,
             kv_shape,
             stride=(
                 v_outer_stride,

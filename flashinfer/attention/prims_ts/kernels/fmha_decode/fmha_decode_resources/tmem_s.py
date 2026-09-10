@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Float32, Int32, Uint32
+from cutlass import BFloat16, Boolean, Float32, Int32, Uint32
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -74,8 +74,14 @@ from .helpers_common import (
     _logical_head_batch,
     _logical_q_group_idx,
     _mma_k_step,
-    _mma_kind_for_qkv,
+    _mma_kind_for_qk,
     _neg_max_f32,
+    _qk_accumulator_dtype,
+    INT32_SCORE_BIAS,
+    INT32_SCORE_SEED_MMA_K,
+    INT32_SCORE_SEED_TILE_WORDS,
+    INT32_SCORE_SEED_TILE_LBO,
+    INT32_SCORE_SEED_TILE_SBO,
     _softmax_scale_pair_width,
     _swaps_routed_coordinate,
     _q_row_is_valid_for_seq,
@@ -281,6 +287,10 @@ class TmemSResource(DecodeGenResourceBase):
     sync_barrier_id: Constexpr[int] = 0
     _scratch_alloc: Constexpr[SmemAllocation | None] = None
     _softmax_scratch_u32: cutlass.Array = None
+    # Constant BF16 operand tile of the MMA step that seeds INT32 scores. One
+    # instance owns the tile; the other reads it through this reference.
+    score_seed_owner: Constexpr["TmemSResource | None"] = None
+    _seed_alloc: Constexpr[SmemAllocation | None] = None
     old_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sum_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     new_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -339,7 +349,103 @@ class TmemSResource(DecodeGenResourceBase):
                 size_bytes=scratch_entries * 4,
                 alignment=16,
             )
-        return [self._scratch_alloc]
+        allocations = [self._scratch_alloc]
+        if self.cfg.uses_int32_scores and self.score_seed_owner is None:
+            if self._seed_alloc is None:
+                self._seed_alloc = SmemAllocation(
+                    name=f"{self.name}_scoreSeed",
+                    size_bytes=self._seed_mma_tile_bytes(),
+                    alignment=128,
+                )
+            allocations.append(self._seed_alloc)
+        return allocations
+
+    def _seed_mma_tile_bytes(self) -> int:
+        """Return the byte size of the seeding MMA's shared operand tile.
+
+        A reads the first M rows and B the first N rows of the same tile.
+        """
+        _, mma_m, mma_n = _qk_mma_operand_contract_for_config(self.cfg)
+        return max(mma_m, mma_n) * INT32_SCORE_SEED_MMA_K * 2
+
+    @cute.jit
+    def _seed_mma_tile_words(self, context: ResourceContext) -> cutlass.Array:
+        """Return the seeding MMA's operand tile as a 32-bit SMEM array."""
+        owner = self if self.score_seed_owner is None else self.score_seed_owner
+        return cutlass.Array(
+            context.smem_base.data_ptr() + owner._seed_alloc.offset,
+            dtype=Uint32,
+            shape=(owner._seed_mma_tile_bytes() // 4,),
+            addrspace=3,
+        )
+
+    @cute.jit
+    def fill_score_seed_tiles(self, context: ResourceContext) -> None:
+        """Write the constant operand tile of the score-seeding MMA step once.
+
+        The owning instance's whole CTA fills the tile before the prologue
+        barrier; the proxy fence publishes the generic-proxy stores to the
+        tensor core's reads. A referencing instance has nothing to fill.
+        """
+        if cutlass.const_expr(self.score_seed_owner is not None):
+            return
+        words = self._seed_mma_tile_words(context)
+        num_words = self._seed_mma_tile_bytes() // 4
+        num_threads = self.cfg.threads_per_cta
+        tidx, _, _ = cute.arch.thread_idx()
+        even_word, odd_word = INT32_SCORE_SEED_TILE_WORDS
+        for round_idx in cutlass.range_constexpr(
+            (num_words + num_threads - 1) // num_threads
+        ):
+            word_idx = tidx + Int32(round_idx * num_threads)
+            if word_idx < Int32(num_words):
+                word = Uint32(even_word)
+                if (word_idx & Int32(1)) != Int32(0):
+                    word = Uint32(odd_word)
+                words[word_idx] = word
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _seed_score_bias(self, stage_info: StageInfo, tmem_col) -> None:
+        """Write ``INT32_SCORE_BIAS`` into the S slot with one BF16 MMA step.
+
+        Issued by the elected MMA thread ahead of the INT8 K steps, which
+        accumulate onto the seed's bit pattern in tcgen05 issue order. The
+        step overwrites the accumulator from the constant operand tile and
+        reads no accumulator: one accumulator write at tensor core bandwidth.
+        """
+        cfg = self.cfg
+        # The bias binade relies on ``|score| <= 2**21``, which holds for
+        # 128-wide INT8 dot products.
+        assert cfg.headdim == 128
+        _, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
+        tile_desc = prims.Tcgen05SmemDesc.build(
+            self._seed_mma_tile_words(stage_info.context),
+            leading_byte_offset=INT32_SCORE_SEED_TILE_LBO,
+            stride_byte_offset=INT32_SCORE_SEED_TILE_SBO,
+            layout=prims.Tcgen05SmemSwizzle.NONE,
+        )
+        idesc = prims.Tcgen05InstrDesc.build(
+            c_dtype=Float32,
+            a_dtype=BFloat16,
+            b_dtype=BFloat16,
+            n_dim=mma_n,
+            m_dim=mma_m,
+        )
+        if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
+            tcgen05_mma_ws(
+                prims.Tcgen05MMAKind.F16, tmem_col, tile_desc, tile_desc, idesc, False
+            )
+        else:
+            prims.tcgen05_mma(
+                prims.Tcgen05MMAKind.F16,
+                prims.CTAGroup.CTA_1,
+                tmem_col,
+                tile_desc,
+                tile_desc,
+                idesc,
+                False,
+            )
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Allocate TMEM S score columns for QK MMA output."""
@@ -393,7 +499,7 @@ class TmemSResource(DecodeGenResourceBase):
         MMA-K slice.
         """
         cfg = self.cfg
-        if cutlass.const_expr(not cfg.use_fp8_qkv and crosses_64b_chunk):
+        if cutlass.const_expr(not cfg.use_8bit_qkv and crosses_64b_chunk):
             k_desc = k_desc + Int32(8 * cfg.tile_size_kv - 6)
             if cutlass.const_expr(cfg.tile_size_q >= 16):
                 q_desc = q_desc + Int32(8 * cfg.tile_size_q - 6)
@@ -552,6 +658,47 @@ class TmemSResource(DecodeGenResourceBase):
             result["s_arr"],
         )
 
+    @cute.jit
+    def _qk_tmem_col(self, stage_info: StageInfo, stage_slot_offset: Int32):
+        """Return the TMEM pointer of one producer S slot.
+
+        cutlass's tcgen05_alloc returns the base in tmem_ptr_i32, so add the
+        per-resource column offset before issuing MMA.
+        """
+        task_cache = _decode_gen_task_cache(stage_info)
+        return prims.make_tmem_ptr(
+            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
+            + Int32(self._alloc.offset)
+            + stage_slot_offset,
+            Float32,
+        )
+
+    @cute.jit
+    def _seed_scores(self, stage_info: StageInfo, stage_slot_offset: Int32) -> None:
+        """Seed the acquired S slot as soon as its consumer has released it.
+
+        The seed depends on no K tile, so it is issued before the MMA warp
+        waits for K and its issue latency overlaps that wait instead of
+        delaying the INT8 K steps behind it.
+        """
+        assert self.cfg.uses_int32_scores
+        if prims.elect_sync():
+            self._seed_score_bias(
+                stage_info, self._qk_tmem_col(stage_info, stage_slot_offset)
+            )
+
+    @producer_work
+    @cute.jit
+    def seed_scores_head(self, stage_info: StageInfo) -> None:
+        """Seed the initial S slot before HEAD QK awaits its K tile."""
+        self._seed_scores(stage_info, self._qk_head_stage_slot_offset(stage_info))
+
+    @producer_work
+    @cute.jit
+    def seed_scores_loop(self, stage_info: StageInfo) -> None:
+        """Seed the next producer S slot before LOOP QK awaits its K tile."""
+        self._seed_scores(stage_info, self._qk_loop_stage_slot_offset(stage_info))
+
     @producer_work
     @cute.jit
     def qk_mma_head(
@@ -655,20 +802,11 @@ class TmemSResource(DecodeGenResourceBase):
             q_desc, head_dim_stage_idx
         )
 
-        # TMEM destination: addrspace-6 pointer from base + alloc offset.
-        # cutlass's tcgen05_alloc returns the base in tmem_ptr_i32, so add the
-        # per-resource column offset before issuing MMA.
-        task_cache = _decode_gen_task_cache(stage_info)
-        tmem_col = prims.make_tmem_ptr(
-            task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
-            + Int32(self._alloc.offset)
-            + stage_slot_offset,
-            Float32,
-        )
+        tmem_col = self._qk_tmem_col(stage_info, stage_slot_offset)
 
         q_is_a, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
         idesc = prims.Tcgen05InstrDesc.build(
-            c_dtype=Float32,
+            c_dtype=_qk_accumulator_dtype(cfg),
             a_dtype=cfg.q_dtype,
             b_dtype=cfg.q_dtype,
             n_dim=mma_n,
@@ -677,18 +815,21 @@ class TmemSResource(DecodeGenResourceBase):
 
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             if prims.elect_sync():
-                scale_d = False
+                # INT32 scores accumulate onto the bias that ``_seed_scores``
+                # wrote into this slot ahead of the K wait; FP32 scores
+                # overwrite S with the first slice.
+                scale_d = cfg.uses_int32_scores
                 for ki in cutlass.range_constexpr(cfg.headdim // _mma_k_step(cfg)):
                     # Keeps computes Q x K^T (A=Q, B=K); Swaps computes the
-                    # transposed K x Q^T tile (A=K, B=Q). The first
-                    # instruction overwrites S and later slices accumulate.
+                    # transposed K x Q^T tile (A=K, B=Q). Later slices
+                    # accumulate.
                     if cutlass.const_expr(q_is_a):
                         a_desc, b_desc = q_desc, k_desc
                     else:
                         a_desc, b_desc = k_desc, q_desc
                     if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
                         tcgen05_mma_ws(
-                            _mma_kind_for_qkv(cfg),
+                            _mma_kind_for_qk(cfg),
                             tmem_col,
                             a_desc,
                             b_desc,
@@ -697,7 +838,7 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                     else:
                         prims.tcgen05_mma(
-                            _mma_kind_for_qkv(cfg),
+                            _mma_kind_for_qk(cfg),
                             prims.CTAGroup.CTA_1,
                             tmem_col,
                             a_desc,
@@ -713,6 +854,9 @@ class TmemSResource(DecodeGenResourceBase):
                             crosses_64b_chunk=cfg.headdim == 128 and ki == 3,
                         )
         else:
+            assert not cfg.uses_int32_scores, (
+                "staged head-dim BMM1 does not seed scores"
+            )
             mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step(cfg)
             if prims.elect_sync():
                 # Peel the first MMA so overwrite-vs-accumulate remains a
@@ -722,7 +866,7 @@ class TmemSResource(DecodeGenResourceBase):
                 else:
                     first_a_desc, first_b_desc = k_desc, q_desc
                 prims.tcgen05_mma(
-                    _mma_kind_for_qkv(cfg),
+                    _mma_kind_for_qk(cfg),
                     prims.CTAGroup.CTA_1,
                     tmem_col,
                     first_a_desc,
@@ -737,7 +881,7 @@ class TmemSResource(DecodeGenResourceBase):
             # closed form therefore adds each boundary jump minus that +2.
             # Keeping descriptors out of iter_args avoids staged-D256 spills.
             for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
-                if cutlass.const_expr(cfg.use_fp8_qkv):
+                if cutlass.const_expr(cfg.use_8bit_qkv):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
                 else:
@@ -757,7 +901,7 @@ class TmemSResource(DecodeGenResourceBase):
                     else:
                         iter_a_desc, iter_b_desc = iter_k_desc, iter_q_desc
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_qk(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         iter_a_desc,
@@ -2101,7 +2245,7 @@ class TmemSResource(DecodeGenResourceBase):
         cfg = self.cfg
         # ConsTailWork: denominator update runs after P has been materialized,
         # so the resource-owned local sum matches the P payload consumed by BMM2.
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_8bit_qkv):
             # FP8 uses TmemSoftmaxGlobal to update sums after P
             # quantization, so this stage only copies the corrected sums
             # back into the running state. This keeps the denominator
@@ -2146,7 +2290,7 @@ class TmemSResource(DecodeGenResourceBase):
                 cfg.has_static_dense_full_kv_tiles
                 and cfg.tile_size_q in (16, 32)
                 and not cfg.use_keeps_mma_ab
-                and not cfg.use_fp8_qkv
+                and not cfg.use_8bit_qkv
                 and cfg.q_tiles_are_full
             ):
                 for pair_idx in cutlass.range_constexpr(pair_width):
@@ -2204,7 +2348,10 @@ class TmemSResource(DecodeGenResourceBase):
         row's validity. Masked fragments are written back to TMEM so the P
         pass can reload them without any mask logic. Sage attention reduces
         the quantized scores per scale group and publishes the dequantized
-        row maximum; the scores themselves stay quantized in TMEM.
+        row maximum; the scores themselves stay quantized in TMEM. INT32
+        scores of Int8 Q/K arrive as biased FP32 (see ``INT32_SCORE_BIAS``),
+        so both formats share this code; the bias leaves with the group
+        maxima.
         """
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
@@ -2424,7 +2571,8 @@ class TmemSResource(DecodeGenResourceBase):
                 loaded = _keeps_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(
-                        score_tmem_addr + Int32(fragment_idx * fragment_regs), Float32
+                        score_tmem_addr + Int32(fragment_idx * fragment_regs),
+                        Float32,
                     ),
                     num=fragment_regs,
                     offset=cfg.tile_size_kv // 2,
@@ -2476,6 +2624,8 @@ class TmemSResource(DecodeGenResourceBase):
                     Float32, fragment_regs, space=cutlass.AddressSpace.rmem
                 )
                 for score_idx in cutlass.range_constexpr(fragment_regs):
+                    # Biased INT32 scores have unit spacing, so the tail shift
+                    # below rounds to half a quantized score unit on them.
                     score = Float32(loaded[score_idx])
                     score_is_kept = (
                         (keep_words[fragment_idx] >> Int32(score_idx)) & Uint32(1)
@@ -2573,7 +2723,9 @@ class TmemSResource(DecodeGenResourceBase):
         are scaled with one packed multiply. Masked fragments keep the
         sentinel-seeded chains: a fully masked group must keep the exact
         ``-FLT_MAX`` sentinel, as scaling it would move it off the value the
-        anchor and tail logic compare against.
+        anchor and tail logic compare against. Biased INT32 scores lose their
+        bias here, once per group; the subtraction is exact on their unit
+        spacing and leaves the sentinel unchanged.
         """
         cfg = self.cfg
         groups = cfg.sage_k_groups_per_fragment
@@ -2595,11 +2747,14 @@ class TmemSResource(DecodeGenResourceBase):
                     Float32(scores[first + elem]),
                     ftz=True,
                 )
-            group_maxima[group_idx] = cute.math.max(
+            group_max = cute.math.max(
                 cute.math.max(group_chains[0], group_chains[1], ftz=True),
                 cute.math.max(group_chains[2], group_chains[3], ftz=True),
                 ftz=True,
             )
+            if cutlass.const_expr(cfg.uses_int32_scores):
+                group_max = group_max - Float32(INT32_SCORE_BIAS)
+            group_maxima[group_idx] = group_max
 
         scale_base = fragment_idx * groups
         scaled_maxima = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)

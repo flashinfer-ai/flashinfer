@@ -315,6 +315,23 @@ def _produce_staged_page_offsets(
     _page_offsets_produce(smem_page_offsets, label, section)
 
 
+def _seed_scores(
+    tmem_s: MemoryResource, section: FmhaStage, cfg: FmhaDecodeConfig
+) -> None:
+    """Seed the acquired S slot of an INT32-score QK wave before its K wait.
+
+    The seed MMA reads only constant tiles, so it does not need the K tile;
+    issuing it right after the S acquire lets its issue overlap the K wait
+    instead of extending the INT8 K steps that follow.
+    """
+    if not cfg.uses_int32_scores:
+        return
+    if section == FmhaStage.Head:
+        tmem_s.seed_scores_head()
+    else:
+        tmem_s.seed_scores_loop()
+
+
 def _consume_staged_qk_mma(
     smem_kv: MemoryResource,
     tmem_s: MemoryResource,
@@ -332,6 +349,7 @@ def _consume_staged_qk_mma(
     MMA's accumulator write, so no completion wait is needed before QK.
     """
     tmem_s.acquire()
+    _seed_scores(tmem_s, section, cfg)
     for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
         smem_kv.wait()
         kv_desc = getattr(smem_kv, k_desc_label)()
@@ -2108,10 +2126,10 @@ def create_mma_task_split_kv(
             section: FmhaStage,
         ) -> None:
             """Issue one scheduled QK wave using the selected phase work."""
-            _ = section
             if tmem_stats_done is not None:
                 tmem_stats_done.acquire()
             tmem_s.acquire()
+            _seed_scores(tmem_s, section, cfg)
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 smem_kv.wait()
                 kv_desc = smem_kv.kv_desc()
@@ -2426,9 +2444,9 @@ def create_mma_task_one_inst_qkv(
 
         def qk_mma(q_desc, qk_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance QK wave."""
-            _ = section
             tmem_stats_done.acquire()
             tmem_s.acquire()
+            _seed_scores(tmem_s, section, cfg)
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 smem_k.wait()
                 kv_desc = smem_k.kv_desc()

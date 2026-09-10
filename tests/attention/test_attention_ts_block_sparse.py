@@ -631,6 +631,7 @@ def _plan_state_stub(**overrides: object) -> SimpleNamespace:
         "use_kv_valid_bits": False,
         "q_dtype": torch.float16,
         "kv_dtype": torch.float16,
+        "value_dtype": torch.float16,
         "output_dtype": torch.float16,
         "dummy_kv_valid_bits": None,
         "row_route_offsets": None,
@@ -1616,6 +1617,7 @@ def _validate_static_block_sparse_dtypes(
     *,
     sage: prims_ts.SageAttentionParams | None = None,
     use_proxy_routes: bool = False,
+    v_dtype: torch.dtype | None = None,
 ) -> block_sparse_module._BlockSparseStaticProfile:
     return block_sparse_module._validate_block_sparse_static_profile(
         batch_size=1,
@@ -1630,6 +1632,7 @@ def _validate_static_block_sparse_dtypes(
         mask_type="dense",
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
+        v_dtype=v_dtype,
         output_dtype=output_dtype,
         max_blocks_per_row=2,
         use_proxy_routes=use_proxy_routes,
@@ -1648,8 +1651,129 @@ def test_block_sparse_static_profile_relaxes_dtypes_with_sage(
     )
 
     assert profile.dtype_key == "float8_e4m3fn"
+    assert profile.value_dtype == _FP8
     assert profile.output_dtype == (output_dtype or torch.bfloat16)
     assert profile.sage_k_block_size == 16
+
+
+@pytest.mark.parametrize("output_dtype", (None, torch.float16))
+def test_block_sparse_static_profile_accepts_int8_qk_with_sage(
+    output_dtype: torch.dtype | None,
+) -> None:
+    """INT8 Q/K with E4M3 V is the second Sage recipe; V must be named."""
+
+    profile = _validate_static_block_sparse_dtypes(
+        torch.int8,
+        torch.int8,
+        output_dtype,
+        sage=_make_sparse_sage_params(),
+        v_dtype=_FP8,
+    )
+
+    assert profile.dtype_key == "int8"
+    assert profile.q_dtype == profile.kv_dtype == torch.int8
+    assert profile.value_dtype == _FP8
+    assert profile.output_dtype == (output_dtype or torch.bfloat16)
+    assert profile.sage_k_block_size == 16
+
+
+def test_block_sparse_static_profile_v_dtype_defaults_to_k_dtype() -> None:
+    """Omitting V keeps 16-bit and E4M3 callers unchanged and rejects INT8 alone."""
+
+    profile = _validate_static_block_sparse_dtypes(
+        torch.bfloat16, torch.bfloat16, torch.bfloat16
+    )
+    assert profile.value_dtype == torch.bfloat16
+    with pytest.raises(ValueError, match="V in"):
+        _validate_static_block_sparse_dtypes(
+            torch.int8, torch.int8, None, sage=_make_sparse_sage_params()
+        )
+
+
+@pytest.mark.parametrize(
+    ("kv_dtype", "v_dtype", "with_sage", "error_type", "message"),
+    (
+        pytest.param(
+            torch.int8,
+            torch.int8,
+            False,
+            NotImplementedError,
+            "torch.float16 and torch.bfloat16",
+            id="int8-without-sage",
+        ),
+        pytest.param(
+            torch.float16,
+            torch.bfloat16,
+            False,
+            ValueError,
+            "matching",
+            id="16-bit-v-mismatch",
+        ),
+        pytest.param(
+            _FP8,
+            torch.int8,
+            True,
+            ValueError,
+            "V in",
+            id="int8-v-with-sage",
+        ),
+    ),
+)
+def test_block_sparse_static_profile_rejects_unsupported_v_dtypes(
+    kv_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    with_sage: bool,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    sage = _make_sparse_sage_params() if with_sage else None
+    with pytest.raises(error_type, match=message):
+        _validate_static_block_sparse_dtypes(
+            kv_dtype,
+            kv_dtype,
+            None if with_sage else kv_dtype,
+            sage=sage,
+            v_dtype=v_dtype,
+        )
+
+
+def test_block_sparse_compile_key_builds_int8_sage_config() -> None:
+    """The INT8 key selects the INT32-score kernel with E4M3 V and P."""
+
+    from cutlass import BFloat16, Float8E4M3FN, Int8
+
+    key = block_sparse_config._BlockSparseCompileKey(
+        device_index=0,
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=1000,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=_HEAD_DIM,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_route_size=256,
+        dtype_key="int8",
+        mask_type="dense",
+        use_kv_valid_bits=False,
+        use_persistent_scheduler=False,
+        use_parallel_sparse_kv_loads=False,
+        out_dtype_key="bfloat16",
+        v_dtype_key="float8_e4m3fn",
+        sage_q_block_size=1,
+        sage_k_block_size=16,
+    )
+    cfg = block_sparse_config._make_block_sparse_config(key)
+    assert cfg.q_dtype == cfg.kv_dtype == Int8
+    assert cfg.value_dtype == Float8E4M3FN
+    assert cfg.out_dtype == BFloat16
+    assert cfg.uses_int32_scores
+    assert cfg.use_8bit_qkv
+    fp8_cfg = block_sparse_config._make_block_sparse_config(
+        replace(key, dtype_key="float8_e4m3fn", v_dtype_key=None)
+    )
+    assert fp8_cfg.value_dtype == Float8E4M3FN
+    assert not fp8_cfg.uses_int32_scores
 
 
 @pytest.mark.parametrize(
@@ -1745,6 +1869,7 @@ def _validate_static_profile_geometry(
     use_block_sparse: bool = True,
     q_dtype: torch.dtype = torch.float16,
     kv_dtype: torch.dtype | None = None,
+    v_dtype: torch.dtype | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> block_sparse_module._BlockSparseStaticProfile:
     return block_sparse_module._validate_block_sparse_static_profile(
@@ -1760,6 +1885,7 @@ def _validate_static_profile_geometry(
         mask_type="dense",
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
+        v_dtype=v_dtype,
         output_dtype=output_dtype,
         max_blocks_per_row=2
         if use_block_sparse
@@ -1816,15 +1942,16 @@ def test_sage_profile_error_names_the_block_sizes() -> None:
 
 
 @pytest.mark.parametrize("use_block_sparse", (True, False), ids=("sparse", "dense"))
+@pytest.mark.parametrize("dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
 def test_static_profile_points_8_bit_dtypes_without_sage_at_sage_params(
-    use_block_sparse: bool,
+    use_block_sparse: bool, dtype: torch.dtype
 ) -> None:
     with pytest.raises(NotImplementedError, match="sage=SageAttentionParams"):
         _validate_static_profile_geometry(
             q_block_size=64,
             kv_block_size=64,
             use_block_sparse=use_block_sparse,
-            q_dtype=_FP8,
+            q_dtype=dtype,
         )
 
 
