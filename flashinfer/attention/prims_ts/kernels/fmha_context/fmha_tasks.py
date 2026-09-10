@@ -736,6 +736,7 @@ def create_mma_task(
         split_src = _src_resources(
             *qkv_resources, smem_q, smem_kv, tmem_p0, work_queue=work_queue
         )
+
         @schedule
         def mma_schedule(
             gqkv: GmemQKVResource,

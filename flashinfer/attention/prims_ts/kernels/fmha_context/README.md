@@ -288,7 +288,20 @@ q = torch.randn(1, 8192, 96, 192, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8192, 1, 192, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, 8192, 1, 128, device="cuda", dtype=torch.bfloat16)
 wrapper = BatchPrefillTSWrapper()
-wrapper.plan(q, k, v, mask_type="causal", out_dtype=torch.bfloat16)
+wrapper.plan(
+    device=q.device,
+    batch_size=1,
+    max_seq_len_q=8192,
+    max_kv_len=8192,
+    num_qo_heads=96,
+    num_kv_heads=1,
+    head_dim=192,
+    head_dim_vo=128,
+    q_dtype=q.dtype,
+    kv_dtype=k.dtype,
+    mask_type="causal",
+    out_dtype=torch.bfloat16,
+)
 out = wrapper.run(q, k, v)
 assert out.shape == (1, 8192, 96, 128)
 ```

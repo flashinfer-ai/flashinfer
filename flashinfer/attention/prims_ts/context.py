@@ -1255,7 +1255,9 @@ def _resolve_context_plan_geometry(
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
     _validate_head_dim(head_dim, head_dim, head_dim_vo)
     if head_dim == 192 and window_left > 0:
-        raise NotImplementedError("QK/V=(192, 128) does not support a positive left window")
+        raise NotImplementedError(
+            "QK/V=(192, 128) does not support a positive left window"
+        )
     if not packed and mask_type == "causal" and max_seq_len_q > max_kv_len:
         raise ValueError(
             "bottom-right causal context requires max_seq_len_q <= max_kv_len; "
@@ -2672,7 +2674,9 @@ class BatchPrefillTSWrapper:
             )
         elif validate:
             out = _prepare_out(
-                out, q=q, output_dtype=geometry.output_dtype,
+                out,
+                q=q,
+                output_dtype=geometry.output_dtype,
                 head_dim_vo=geometry.head_dim_vo,
             )
         if validate and caller_provided_out:

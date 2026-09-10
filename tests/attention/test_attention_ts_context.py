@@ -1004,6 +1004,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
+        "head_dim_vo",
         "q_dtype",
         "kv_dtype",
         "out_dtype",
@@ -1033,6 +1034,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "output_scale",
         "validate",
     )
+    assert plan_parameters["head_dim_vo"].default is None
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
     assert run_parameters["variable_window_cta_starts"].kind is (
@@ -1610,7 +1612,7 @@ def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
     monkeypatch.setattr(
         context_module,
         "_prepare_out",
-        lambda out, *, q, output_dtype: out,
+        lambda out, *, q, output_dtype, head_dim_vo=None: out,
     )
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
@@ -1621,6 +1623,7 @@ def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
             max_seq_len_q=1,
             max_seq_len_k=1,
             head_dim=128,
+            head_dim_vo=None,
             output_dtype=torch.int32,
             packed=False,
             mask_type="variable_window",
@@ -5369,6 +5372,33 @@ def test_attention_ts_context_mla_prefill(
     out = torch.empty((*q.shape[:-1], 128), dtype=out_dtype, device="cuda")
     wrapper = BatchPrefillTSWrapper()
     wrapper.plan(
+        device=q.device,
+        batch_size=batch_size,
+        max_seq_len_q=max(q_lens),
+        max_kv_len=max(k_lens),
+        num_qo_heads=hq,
+        num_kv_heads=hkv,
+        head_dim=192,
+        head_dim_vo=128,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        packed=packed,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        out_dtype=out_dtype,
+    )
+    actual = wrapper.run(q, k, v, qo, ko, out=out)
+    assert actual is out
+    assert actual.shape == expected.shape
+    has_fp8 = torch.float8_e4m3fn in (dtype, out_dtype)
+    atol, rtol = (0.13, 0.05) if has_fp8 else (0.01, 0.02)
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+    relative_l2 = torch.linalg.vector_norm(
+        actual.float() - expected
+    ) / torch.linalg.vector_norm(expected)
+    assert relative_l2.item() < (0.05 if has_fp8 else 0.01)
+    allocated = batch_prefill(
         q,
         k,
         v,
@@ -5379,26 +5409,15 @@ def test_attention_ts_context_mla_prefill(
         output_scale=output_scale,
         out_dtype=out_dtype,
     )
-    actual = wrapper.run(q, k, v, out=out)
-    assert actual is out
-    assert actual.shape == expected.shape
-    has_fp8 = torch.float8_e4m3fn in (dtype, out_dtype)
-    atol, rtol = (0.13, 0.05) if has_fp8 else (0.01, 0.02)
-    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
-    relative_l2 = torch.linalg.vector_norm(
-        actual.float() - expected
-    ) / torch.linalg.vector_norm(expected)
-    assert relative_l2.item() < (0.05 if has_fp8 else 0.01)
-    allocated = wrapper.run(q, k, v)
     assert allocated.shape == out.shape and allocated.dtype == out_dtype
     torch.testing.assert_close(allocated.float(), expected, atol=atol, rtol=rtol)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wrapper.run(q, k, v, out=out)
+        wrapper.run(q, k, v, qo, ko, out=out, validate=False)
     out.zero_()
     graph.replay()
     torch.testing.assert_close(out.float(), expected, atol=atol, rtol=rtol)
     with pytest.raises(ValueError, match="out must have shape"):
-        wrapper.run(q, k, v, out=torch.empty_like(q, dtype=torch.bfloat16))
+        wrapper.run(q, k, v, qo, ko, out=torch.empty_like(q, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="v must have"):
-        wrapper.run(q, k, torch.empty_like(k))
+        wrapper.run(q, k, torch.empty_like(k), qo, ko)
