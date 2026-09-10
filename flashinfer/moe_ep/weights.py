@@ -151,8 +151,8 @@ class PrequantizedMoEWeights(MoEWeightPack):
 
     ``w13_global_scale`` and ``w2_global_scale`` are optional per-expert FP32
     weight decode scales (``None`` means one). They are separate from block
-    scales and from activation quantization. A backend must explicitly support
-    them; the W4A16 mega backend applies them after FP32 GEMM accumulation.
+    scales and from activation quantization. The W4A16 mega backend applies
+    them after FP32 GEMM accumulation.
     """
 
     w13: torch.Tensor
@@ -161,15 +161,6 @@ class PrequantizedMoEWeights(MoEWeightPack):
     w2_scale: torch.Tensor
     w13_global_scale: Optional[torch.Tensor] = field(default=None, kw_only=True)
     w2_global_scale: Optional[torch.Tensor] = field(default=None, kw_only=True)
-
-
-def validate_global_scale_support(weights: MoEWeightPack, backend: object) -> None:
-    """Reject unsupported global scales; ``backend`` may name a public helper."""
-    if (
-        weights.w13_global_scale is not None or weights.w2_global_scale is not None
-    ) and not getattr(backend, "supports_global_weight_scales", False):
-        name = backend if isinstance(backend, str) else type(backend).__name__
-        raise ValueError(f"{name} does not support global weight scales")
 
 
 def dummy_moe_weights(

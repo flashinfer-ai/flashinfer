@@ -10,7 +10,7 @@ from typing import Callable, Literal, Optional, Tuple
 
 import torch
 
-from ..comm import (
+from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
@@ -34,7 +34,7 @@ class MegaMoEW4A16Config:
     mma_tiler_mnk: Tuple[int, int, int] = (256, 128, 256)
     cluster_shape_mnk: Tuple[int, int, int] = (2, 1, 1)
     use_2cta_instrs: bool = True
-    load_balance_mode: Literal["static", "atomic_counter"] = "static"
+    load_balance_mode: Literal["static", "atomic_counter", "clc"] = "static"
     group_hint: Optional[int] = None
     force_static_sched: bool = True
     clc_bundle_size: Optional[int] = None
@@ -53,6 +53,13 @@ class MegaMoEW4A16Config:
         # Geometry knobs also arrive as JSON arrays from the benchmark.
         object.__setattr__(self, "mma_tiler_mnk", tuple(self.mma_tiler_mnk))
         object.__setattr__(self, "cluster_shape_mnk", tuple(self.cluster_shape_mnk))
+        if self.load_balance_mode not in ("static", "atomic_counter", "clc"):
+            raise ValueError(
+                f"Unsupported load_balance_mode={self.load_balance_mode!r}."
+            )
+        if self.load_balance_mode == "clc" and self.clc_bundle_size is not None:
+            if type(self.clc_bundle_size) is not int or self.clc_bundle_size < 1:
+                raise ValueError("clc_bundle_size must be a positive integer.")
         if self.apply_topk_in_fc1 or self.in_kernel_fc2_reduce:
             raise ValueError("W4A16 routing scores are applied after FC2.")
         if self.token_back_mode == "standalone_warps":
@@ -141,7 +148,7 @@ class MegaMoEW4A16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated swapped-MMA tuning configuration and invalidate its compile."""
-        from ..tuner import is_valid, with_knobs
+        from .tuner import is_valid, with_knobs
 
         if not is_valid(
             {
@@ -153,7 +160,7 @@ class MegaMoEW4A16Frontend:
             raise ValueError(f"unsupported W4A16 MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
-            from ..comm import ensure_not_capturing
+            from .comm import ensure_not_capturing
 
             ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
@@ -211,7 +218,7 @@ class MegaMoEW4A16Frontend:
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
-        from .kernel import Sm100W4A16MegaMoEKernel
+        from moe_nvfp4_w4a16.megamoe_kernel import Sm100W4A16MegaMoEKernel
 
         c = self.config
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
@@ -515,7 +522,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
-    from ..knob_cache import resolve_knobs
+    from .knob_cache import resolve_knobs
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
     # lookup; an explicit dict (including {}) bypasses cache and defaults.

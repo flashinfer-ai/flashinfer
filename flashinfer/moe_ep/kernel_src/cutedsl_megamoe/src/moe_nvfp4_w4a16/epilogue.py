@@ -1,15 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 FlashInfer contributors.
 # SPDX-License-Identifier: BSD-3-Clause
-"""W4A16 adaptation of the current swapped MegaMoE epilogue.
+"""W4A16 epilogue for the swapped MegaMoE pipeline.
 
 FC1 changes: internal gate16/up16 accumulators receive FP32 expert
 alphas and SwiGLU, then store BF16 directly. Prepared weights share W4A4's
 gate16/up16 ordering and decode directly into operand-A TMEM.
-The current FC2 process pipeline, BF16 return router, and phase-aware
-completion tracker are reused. Its non-overlap subtiles are statically unrolled.
+FC2 owns the BF16 return router and store path, with statically unrolled
+non-overlap subtiles and the common phase-aware completion tracker.
 No activation quantization, scale-factor output, or epilogue SMEM is used.
 """
+
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -17,26 +19,37 @@ import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import Int64
 from cutlass.cute.nvgpu import tcgen05
 
+from . import clc
+from .fc1_fc2_fuse_sched import BlockPhase
 from src.iket_compat import iket
 from common.moe_utils import fmin, fmax
 from src.flag_batch import GpuReleaseFlagBatchTracker
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from moe_nvfp4_swapab.moe_persistent_scheduler import (
     MoESchedConsumer,
     MoESchedExtension,
 )
-from moe_nvfp4_swapab.epilogue_refactor import (
-    NvFp4OptinalEpiArgs,
+from .tmem_epilogue import (
+    W4A16EpiArgs,
     Region,
-    SwapABFc1Epilogue,
-    SwapABFc2Epilogue,
-    SwapABSwigluFp4Epilogue,
     TmemTranspose16x32,
+    EpilogueContext,
+    Fc2OutputRouter,
+    make_bf16_fc2_stg_process_pipeline,
 )
 
 
-class W4A16Epilogue(SwapABSwigluFp4Epilogue):
+class W4A16Epilogue:
     """Current scheduler/return contract with BF16 FC1 and two acc stages."""
+
+    _EpilogueSyncWaitBarId = 1
+    _EpilogueAsyncBarIdBase = 4
+    _EpilogueFc1GateUpInterleave = 16
+    _EpilogueTokenTileSize = 64
+    _EpilogueFc1IntermediateGateUpTileSize = 128
+    _EpilogueFc1IntermediateDownTileSize = 64
+    _EpilogueFc2HiddenTileSize = 128
+    _EpilogueWarpCnt = 4
+    _TmemColsTotal = 512
 
     def __init__(
         self,
@@ -77,34 +90,47 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
             raise ValueError(
                 "W4A16 requires FP32 accumulators and direct BF16 handoffs"
             )
-        # The current base validates its own quantized FC1 helper. Initialize
-        # its geometry with that required dtype, then replace only resources
-        # belonging to our BF16 helper. The FC2 helper receives real BF16 wire.
-        super().__init__(
-            mma_tiler_mnk=mma_tiler_mnk,
-            cluster_shape_mn=cluster_shape_mn,
-            use_2cta_instrs=use_2cta_instrs,
-            sf_vec_size=16,
-            fc1_output_dtype=cutlass.Float4E2M1FN,
-            combine_format=combine_format,
-            non_ubulk_fc2_store=non_ubulk_fc2_store,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            token_back_by_dispatch=token_back_by_dispatch,
-            acc_dtype=acc_dtype,
-            allow_overlap_acc=False,
-            static_expert_shape=static_expert_shape,
-            gate_up_clamp=gate_up_clamp,
-            epi_flag_batch=epi_flag_batch,
-        )
+        self.fc2_use_bulk = False
+        self.reduce_topk_in_kernel = False
+        self.token_back_by_dispatch = token_back_by_dispatch
+        self.combine_format = combine_format
         self.fc1_output_dtype = fc1_output_dtype
+        self.acc_dtype = acc_dtype
         self.fc1_output_sf_dtype = None
         self.sf_vec_size = None
+        self.gate_up_clamp = gate_up_clamp
+        fc1_batch, fc2_batch = (1, 1) if epi_flag_batch is None else epi_flag_batch
+        self.fc1_epi_flag_batch = max(1, min(32, int(fc1_batch)))
+        self.fc2_epi_flag_batch = max(1, min(32, int(fc2_batch)))
+        self.cluster_tile_intermediate_downproj = (
+            self._EpilogueFc1IntermediateDownTileSize * cluster_shape_mn[0]
+        )
+        self.cta_tile_m = self._EpilogueFc2HiddenTileSize
+        self.cta_tile_n = mma_tiler_mnk[1]
+        self.cta_tile_k = mma_tiler_mnk[2]
+        self.static_expert_shape = static_expert_shape
+        self.acc_tmem_cols = self.cta_tile_n
         self.acc_sf_cols = 0
+        self.fc2_hidden_needs_predicate = not (
+            static_expert_shape is not None
+            and static_expert_shape[2] % (self.cta_tile_m * cluster_shape_mn[0]) == 0
+        )
+        self.intermediate_downproj = (
+            static_expert_shape[1] // 2 if static_expert_shape is not None else None
+        )
+        self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
+        self.overlapping_accum = False
+        self.num_acc_stage = 2
+        self.num_acc_pipeline_stages = 2
+        self.overlapped_tmem_cols = 0
         self.epi_smem_bytes = 0
+        self.tmem_acc_layout_py_obj = (
+            (self.cta_tile_m, self.cta_tile_n, self.num_acc_stage),
+            (1 << 16, 1, self.cta_tile_n),
+        )
 
-    # This is the current upstream run loop; its only functional substitution
-    # is W4A16Fc1Epilogue in place of SwapABFc1Epilogue. Keep its stage
-    # selection, release tracker, barriers, and tail flush in sync with it.
+    # Preserve the existing W4A16 stage selection, completion ordering,
+    # release tracker, barriers and tail flush.
     @cute.jit
     def run(
         self,
@@ -121,11 +147,13 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
         fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
         fc1_done_counter: cute.Tensor,  # 1D tensor
         tidx: cutlass.Int32,
-        optional_epi_args: NvFp4OptinalEpiArgs = None,  # Epilogue optinal runtime arguments.
+        optional_epi_args: W4A16EpiArgs = None,  # Epilogue optinal runtime arguments.
         token_comm_args=None,  # Only valid when enable token communication
+        clc_workspace=None,
+        clc_completed=None,
     ):
         if cutlass.const_expr(optional_epi_args is None):
-            optional_epi_args = NvFp4OptinalEpiArgs(
+            optional_epi_args = W4A16EpiArgs(
                 fc1_alpha=None,
                 fc2_alpha=None,
                 fc1_norm_const=None,
@@ -206,30 +234,201 @@ class W4A16Epilogue(SwapABSwigluFp4Epilogue):
             if cutlass.const_expr(self.overlapping_accum):
                 is_odd_turn = cutlass.Int32(1) - is_odd_turn
 
-            work_tile_info = sched_consumer.consume_work()
-
-            # Drain pending FC1 stores before publishing the fc1-done counter.
-            if cur_was_linear1:
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-            # _fence_rel_gpu()
-            wait_only_named_barrier.arrive_and_wait()
-
-            # Publish completion for the work tile snapshotted above.
-            if cur_was_linear1:
-                flag_tracker = fc1_epi.signal_fc1_done(
-                    prev_work_tile_info, work_tile_info, flag_tracker
-                )
+            if cutlass.const_expr(clc_workspace is not None):
+                # Ready work can only be published after all stores are visible.
+                # Acknowledge BEFORE asking for NEXT: the scheduler may be
+                # draining this very tile before it can publish its terminal.
+                if cur_was_linear1:
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                wait_only_named_barrier.arrive_and_wait()
+                if tidx % (32 * self._EpilogueWarpCnt) == 0:
+                    if cur_was_linear1:
+                        in_bound = (
+                            prev_work_tile_info.tile_m_idx
+                            * self._EpilogueFc1IntermediateDownTileSize
+                            < fc1_output.shape[1]
+                        )
+                        clc.complete_fc1(
+                            clc_workspace,
+                            fc1_done_counter,
+                            prev_work_tile_info,
+                            cute.ceil_div(self.static_expert_shape[1], self.cta_tile_m),
+                            in_bound,
+                        )
+                    elif cutlass.const_expr(self.token_back_by_dispatch):
+                        # Preserve inherited FC2 counting, including padded
+                        # feature CTAs. Return expects ceil(H/cluster-M)*C;
+                        # FC1 instead masks padded feature contributions.
+                        cute.arch.atomic_add(
+                            token_comm_args.fc2_done_counter.iterator
+                            + prev_work_tile_info.expert_idx,
+                            cutlass.Int32(1),
+                            sem="release",
+                            scope="gpu",
+                        )
+                    cute.arch.atomic_add(
+                        clc_completed, cutlass.Int32(1), sem="release", scope="cta"
+                    )
+                work_tile_info = sched_consumer.consume_work()
             else:
-                flag_tracker = fc2_epi.signal_fc2_done(
-                    prev_work_tile_info, work_tile_info, flag_tracker
-                )
-        # Tail flush
-        flag_tracker.fire()
+                work_tile_info = sched_consumer.consume_work()
+
+                # Drain pending FC1 stores before publishing the fc1-done counter.
+                if cur_was_linear1:
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                # _fence_rel_gpu()
+                wait_only_named_barrier.arrive_and_wait()
+
+                # Publish completion for the work tile snapshotted above.
+                if cur_was_linear1:
+                    flag_tracker = fc1_epi.signal_fc1_done(
+                        prev_work_tile_info, work_tile_info, flag_tracker
+                    )
+                else:
+                    flag_tracker = fc2_epi.signal_fc2_done(
+                        prev_work_tile_info, work_tile_info, flag_tracker
+                    )
+        if cutlass.const_expr(clc_workspace is None):
+            # Original static/atomic tail flush; CLC publishes immediate flags.
+            flag_tracker.fire()
 
 
-class W4A16Fc2Epilogue(SwapABFc2Epilogue):
-    """Static BF16 subtiles with inherited routing, stores and completion."""
+class W4A16Fc2Epilogue(EpilogueContext):
+    """Static BF16 subtiles with owned routing, stores and completion."""
+
+    def __init__(
+        self,
+        base,
+        tidx,
+        epi_smem_storage,
+        fc2_output,
+        token_comm_args,
+        optional_epi_args,
+    ):
+        self.base = base
+        self.tidx = tidx % (base._EpilogueWarpCnt * 32)
+        self.warp_idx = self.tidx // 32
+        self.lane_idx = self.tidx % 32
+        self.fc2_output = fc2_output
+        self.token_comm_args = token_comm_args
+        self.optional_epi_args = optional_epi_args
+        self.smem_tensor = None
+        self.process_pipeline = make_bf16_fc2_stg_process_pipeline(
+            cta_token_tile_size=base.cta_tile_n,
+            cta_hidden_tile_size=base.cta_tile_m,
+        )
+        self._freeze()
+
+    @cute.jit
+    def signal_fc2_done(self, work_tile_info, next_work_tile_info, flag_tracker):
+        publish: cutlass.Constexpr = self.token_back_by_dispatch
+        if cutlass.const_expr(publish):
+            flag_addr = (
+                self.token_comm_args.fc2_done_counter.iterator
+                + work_tile_info.expert_idx
+            ).toint()
+        else:
+            flag_addr = Int64(0)
+        no_fire: cutlass.Constexpr = not publish
+        return flag_tracker.accumulate(
+            next_work_tile_info.phase, self.fc2_epi_flag_batch, flag_addr, no_fire
+        )
+
+    @cute.jit
+    def _make_output_router(
+        self,
+        work_tile_info,
+    ) -> "Fc2OutputRouter":
+        task_tile_data_row_start = (
+            work_tile_info.cumulative_data_physical_row
+            + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+        )
+        hidden_base_this_cta_tile = work_tile_info.tile_m_idx * cutlass.Int32(
+            self.cta_tile_m
+        )
+        valid_hidden_this_cta_tile = (
+            cutlass.Int32(self.fc2_output.shape[2]) - hidden_base_this_cta_tile
+        )
+        if valid_hidden_this_cta_tile < 0:
+            valid_hidden_this_cta_tile = 0
+        if valid_hidden_this_cta_tile > self._EpilogueFc2HiddenTileSize:
+            valid_hidden_this_cta_tile = self._EpilogueFc2HiddenTileSize
+
+        metadata_u32 = None
+        peer_rank_ptr_mapper = None
+        data_token_base = task_tile_data_row_start
+        if cutlass.const_expr(
+            self.token_comm_args is not None and not self.token_back_by_dispatch
+        ):
+            metadata_u32 = cute.domain_offset(
+                (task_tile_data_row_start, 0),
+                cute.recast_tensor(
+                    self.token_comm_args.token_src_metadata,
+                    cutlass.Uint32,
+                ),
+            )
+            peer_rank_ptr_mapper = self.token_comm_args.peer_rank_ptr_mapper
+            data_token_base = None
+
+        base_outputs = self.fc2_output
+        token_bases = data_token_base
+        output_mappings = self.process_pipeline.store_out_mapping
+
+        return Fc2OutputRouter(
+            metadata=metadata_u32,
+            token_bases=token_bases,
+            base_outputs=base_outputs,
+            hidden_base_this_cta_tile=hidden_base_this_cta_tile,
+            peer_rank_ptr_mapper=peer_rank_ptr_mapper,
+            valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,
+            valid_hidden_this_cta_tile=valid_hidden_this_cta_tile,
+            output_mappings=output_mappings,
+            epi_tid=self.tidx,
+        ).prefetch()
+
+    @cute.jit
+    def run_subtile(
+        self,
+        subtile_idx: cutlass.Int32,
+        # (hidden_tile, token_subtile), fundamentally (epi_tile_m, epi_tile_n)
+        tmem_subtile_tensor: cute.Tensor,
+        preload_acc,
+        fc2_output_router: "Fc2OutputRouter",
+        alpha_val: Optional[cutlass.Float32],
+        release_after_ldtm,
+        acc_pipeline,
+        acc_consumer_state,
+    ):
+        process_pipeline = self.process_pipeline
+        if cutlass.const_expr(preload_acc is None):
+            loaded = process_pipeline.tmem_acc_load(
+                tmem_subtile_tensor=tmem_subtile_tensor,
+                epi=self,
+            )
+            if release_after_ldtm:
+                cute.arch.fence_view_async_tmem_load()
+                acc_pipeline.consumer_release(acc_consumer_state)
+        else:
+            loaded = preload_acc
+
+        casted = process_pipeline.f2fp(
+            *loaded,
+            alpha_val=alpha_val,
+        )
+        # reorder returns a bare RMEM fragment in the store's expected pre-store
+        # distribution; reorder + store are paired 1:1 inside the pipeline.
+        pre_store = process_pipeline.post_f2fp_reorder(
+            casted=casted,
+            tmem_subtile_view=tmem_subtile_tensor,
+        )
+        process_pipeline.store_function(
+            epi=self,
+            subtile=pre_store,
+            subtile_idx=subtile_idx,
+            fc2_output_router=fc2_output_router,
+        )
 
     @cute.jit
     def __call__(
@@ -258,7 +457,7 @@ class W4A16Fc2Epilogue(SwapABFc2Epilogue):
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
 
         # W4A16 rejects overlapping accumulators. Static subtiles make the
-        # inherited STG router indices constants (four issues per subtile),
+        # STG router indices constants (four issues per subtile),
         # allowing its prefetched pointer/valid arrays to stay in registers.
         for i in cutlass.range_constexpr(self.subtile_cnt):
             subtile_idx = cutlass.Int32(i)
@@ -323,8 +522,31 @@ class W4A16Fc2Epilogue(SwapABFc2Epilogue):
         )
 
 
-class W4A16Fc1Epilogue(SwapABFc1Epilogue):
-    """BF16 FC1 body; inherit current immutable wrapper and done signaling."""
+class W4A16Fc1Epilogue(EpilogueContext):
+    """BF16 FC1 body and exact phase-aware done signaling."""
+
+    @cute.jit
+    def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
+        # Only in-bound intermediate_downproj tiles signal; OOB -> null slot.
+        if cutlass.const_expr(
+            self.static_expert_shape is None
+            or self.intermediate_downproj % self.cluster_tile_intermediate_downproj != 0
+        ):
+            in_bound = (
+                work_tile_info.tile_m_idx * self._EpilogueFc1IntermediateDownTileSize
+                < self.fc1_output.shape[1]
+            )
+        else:
+            in_bound = True
+        slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
+        flag_addr = Int64(0)
+        if in_bound:
+            flag_addr = (self.fc1_done_counter.iterator + slot).toint()
+        return flag_tracker.accumulate(
+            next_work_tile_info.phase,
+            self.fc1_epi_flag_batch,
+            flag_addr,
+        )
 
     @cute.jit
     def _swiglu_act(self, t_swiglu, t_up, t_gate, prob=None):
@@ -363,8 +585,7 @@ class W4A16Fc1Epilogue(SwapABFc1Epilogue):
         fc1_done_counter,
         optional_epi_args,
     ):
-        # Bypass the quantized parent's SMEM construction. These are the same
-        # loop-invariant fields consumed by its inherited completion method.
+        # Loop-invariant fields consumed by the BF16 body and completion method.
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32

@@ -4,12 +4,13 @@
 
 ```
 kernel_src/cutedsl_megamoe/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
+├── src/                    ← upstream packages + owned W4A16 precision below
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
 │   ├── moe_bf16_glu/       ← BF16 kernel implementation
-│   └── moe_nvfp4_swapab/   ← NVFP4 kernel implementation
+│   ├── moe_nvfp4_swapab/   ← vendored NVFP4 kernel implementation
+│   └── moe_nvfp4_w4a16/    ← FlashInfer-owned W4A16 kernel (preserve on re-sync)
 ├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
 ├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
 │   ├── _paths.py           ← adds sibling src/ to sys.path (bootstrap_paths); shim glue
@@ -17,6 +18,7 @@ kernel_src/cutedsl_megamoe/
 │   ├── nvfp4.py            ← NVFP4 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── bf16.py             ← BF16 frontend + symm-buffer/launch wrappers (self-contained)
+│   ├── w4a16.py            ← W4A16 frontend + symm-buffer/launch wrappers
 │   ├── kernel_helpers.py   ← SINGLE re-export point for raw-kernel helpers/constants/
 │   │                          reference the FI backend + tests need (drop-audit point)
 │   ├── tuner.py            ← kernel tuning knobs (tactic enumeration + config apply);
@@ -32,10 +34,13 @@ kernel_src/cutedsl_megamoe/
                                against deep_gemm / the kernel-repo tester)
 ```
 
-Core principle: **`src/` is a verbatim copy of the kernel-team drop — no injected
-files, no edits.** Every adaptation (path bootstrap, symbol re-exports, API
-shims) lives in `shim/`. A new drop is a pure replace of `src/`; the only work
-is updating `shim/` to whatever the new `src/` exposes.
+Core principle: **the existing vendored packages under `src/` remain verbatim.**
+The user-authorized exception is the FlashInfer-owned precision package
+`src/moe_nvfp4_w4a16/`, maintained alongside NVFP4/MXFP8/BF16 and preserved during
+re-sync. Do not broaden that exception to edits in vendor siblings. Host
+adaptation remains in `shim/`; W4A16 owns its tensor-core pipeline, scheduler,
+epilogue and workspace. It may share neutral scheduler/communication primitives,
+and its source remains subject to formatting, lint, and type checks.
 
 Layering: `moe_ep` backends import from the package (`__init__.py`) only →
 `__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
@@ -43,7 +48,9 @@ from `src/` via sys.path (`shim/_paths.bootstrap_paths`).
 
 Layer isolation (enforce on every drop — grep before/after):
 - `shim/` is the **only** layer that imports `src/` packages (`common`,
-  `moe_nvfp4_swapab`, `moe_mxfp8_glu`, `moe_bf16_glu`, `src`).
+  `moe_nvfp4_swapab`, `moe_nvfp4_w4a16`, `moe_mxfp8_glu`, `moe_bf16_glu`, `src`).
+  Kernel modules within `src/` may import neutral sibling/common infrastructure;
+  the W4A16 precision does not inherit W4A4 kernel or epilogue implementations.
 - FI backends (`backends/mega/kernel/sm100/{nvfp4_nvfp4,mxfp8_mxfp8,bf16_bf16}_bf16_cutedsl/`)
   import kernel helpers/constants/launch entry points **only** from the
   package `__init__`, never from `src/` directly.
@@ -61,8 +68,8 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's five kernel packages — no injected
-   files, no edits (the drop is a full repo; copy only these four dirs):
+1. **Replace only the five vendored packages** with the new drop, preserving
+   owned `src/moe_nvfp4_w4a16/`. Do not delete or replace the entire `src/` tree:
    ```bash
    rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab} \

@@ -19,8 +19,6 @@ from flashinfer.moe_ep import (
     MoEWeightPack,
     PrequantizedMoEWeights,
     Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-    Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-    SplitConfig,
     UnquantizedMoEWeights,
     preprocess_w4a16_cutedsl_mega_weights,
 )
@@ -160,46 +158,6 @@ def test_global_scales_require_prequantized_weights():
         MoEWeightPack(pack.w13, pack.w2, w13_global_scale=torch.ones(_E))
     with pytest.raises(TypeError, match="no scale planes"):
         UnquantizedMoEWeights(pack.w13, pack.w2, w2_global_scale=torch.ones(_E))
-
-
-@pytest.mark.parametrize("mode", ("mega", "split"))
-def test_existing_backends_reject_global_scales(mode):
-    pack = dataclasses.replace(_pack(), w13_global_scale=torch.ones(_E))
-    backend = (
-        MegaConfig(
-            megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=_I, top_k=2
-            )
-        )
-        if mode == "mega"
-        else SplitConfig()
-    )
-    with pytest.raises(ValueError, match="does not support global weight scales"):
-        _construct(pack, backend)
-
-
-@pytest.mark.parametrize(
-    "name",
-    (
-        "preprocess_mega_weights",
-        "preprocess_bf16_cutedsl_mega_weights",
-        "preprocess_nvfp4_cutedsl_mega_weights",
-        "preprocess_mxfp8_cutedsl_mega_weights",
-        "preprocess_sm120_mxfp8_cutedsl_mega_weights",
-    ),
-)
-@pytest.mark.parametrize("field", ("w13_global_scale", "w2_global_scale"))
-def test_public_preprocessing_rejects_unsupported_global_scales(name, field):
-    # A caller can prepare weights before constructing a layer, then pass only
-    # transformed_weights. Reject here, before imports or transforms can lose
-    # the original pack's global scales and bypass the layer's validation.
-    pack = dataclasses.replace(
-        _pack(), **{field: torch.tensor([1.00390625, 0.71013], dtype=torch.float32)}
-    )
-    with pytest.raises(
-        ValueError, match=f"{name} does not support global weight scales"
-    ):
-        getattr(moe_ep, name)(pack, intermediate_size=_I, hidden_size=_H)
 
 
 def test_workspace_pool_accepts_list_tuning_values():
@@ -462,9 +420,6 @@ def test_prepared_weight_and_sf_bytes_match_w4a4(
             assert pair[0].data_ptr() == triple[0].data_ptr()
             assert pair[1].data_ptr() == triple[1].data_ptr()
             assert pair[0].stride() == triple[0].stride()
-    scaled = dataclasses.replace(source, w13_global_scale=torch.ones(experts))
-    with pytest.raises(ValueError, match="does not support global weight scales"):
-        moe_ep.preprocess_nvfp4_cutedsl_mega_weights(scaled, **kwargs)
 
 
 def test_pretransformed_rejects_materialized_weight_transpose_and_old_sf_shape():

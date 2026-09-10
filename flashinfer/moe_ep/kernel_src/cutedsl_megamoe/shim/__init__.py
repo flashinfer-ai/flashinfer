@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Thin adapters over the raw CuTeDSL kernel sources under ``../src``.
 
-``comm`` holds dist / symmetric-heap / compile helpers; ``nvfp4`` and ``mxfp8``
-each hold their dtype's lazy-compile frontend plus the symmetric-buffer +
+``comm`` holds dist / symmetric-heap / compile helpers; ``nvfp4``, ``mxfp8``,
+``bf16``, and ``w4a16`` hold their dtype's lazy-compile frontend plus buffer +
 fused-launch wrappers.  The parent :mod:`..api` re-exports the curated subset
 that FlashInfer ``moe_ep`` consumes.
 """

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from ......weights import MoEWeightPack, validate_global_scale_support
+from ......weights import MoEWeightPack
 
 if TYPE_CHECKING:
     import torch
@@ -45,7 +45,6 @@ def preprocess_mega_weights(
     hidden_size: int,
 ) -> TransformedMegaWeights:
     """Convert canonical BF16 weights to the kernel's K-major layouts."""
-    validate_global_scale_support(weights, "preprocess_bf16_cutedsl_mega_weights")
     import torch
 
     expected_w13 = (weights.w13.shape[0], 2 * intermediate_size, hidden_size)

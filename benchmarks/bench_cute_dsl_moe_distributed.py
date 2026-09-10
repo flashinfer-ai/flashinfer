@@ -2064,9 +2064,6 @@ def main():
         and not args.ncu_megamoe_kernel
     ):
         parser.error("MegaMoE NCU capture requires --ncu-megamoe-kernel")
-    if args.iters < 1 or args.warmup < 0:
-        parser.error("--iters must be positive and --warmup must be non-negative")
-
     if not 1 <= args.num_gpus <= 8:
         parser.error("--num-gpus must be between 1 and 8")
     if CFG.num_experts % args.num_gpus != 0:
@@ -2088,8 +2085,6 @@ def main():
         tokens = [32, 4096]
     else:
         tokens = DISTRIBUTED_TOKEN_COUNTS
-    if not tokens or any(value < 1 for value in tokens):
-        parser.error("--num-tokens must contain positive global token counts")
     if (
         args.mode == "profile_ncu"
         and "w4a16_megamoe" in variant_names

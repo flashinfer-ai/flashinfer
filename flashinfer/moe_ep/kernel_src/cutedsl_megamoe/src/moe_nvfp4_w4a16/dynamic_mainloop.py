@@ -9,17 +9,53 @@ the matching non-leader TMA-B shift and valid-token epilogue mapping; changing
 only the MMA descriptor is insufficient for a two-CTA kernel.
 """
 
+from typing import Optional
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm, builtin
 
-from moe_nvfp4_swapab.dynamic_mainloop import (
-    _align16,
-    _as_value,
-    _smem_desc_to_i64,
-    _tmem_ptr_to_i32,
-    compute_non_leader_cta_load_shift,
-)
+
+def _align16(x):
+    """Round Int32 SSA ``x`` up to a multiple of 16 (mask off bottom 4 bits)."""
+    return (Int32(x) + Int32(15)) & Int32(-16)
+
+
+@dsl_user_op
+def compute_non_leader_cta_load_shift(
+    *,
+    valid_tokens_in_tile,  # Int32 SSA
+    mma_tiler_n: int,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int32:
+    """Token offset that non-leader CTA's TMA-B read must shift by under 2cta.
+
+    Under dynamic UMMA + 2cta:
+      - MMA splits N at align16(valid) / 2
+      - TMA static partition splits at mma_tiler_n / 2
+
+    The result ∈ (-mma_tiler_n/2, 0]; apply via
+    ``cute.domain_offset((shift, 0, 0), real_b)`` on non-leader CTA only.
+    """
+    return (_align16(valid_tokens_in_tile) >> Int32(1)) - Int32(mma_tiler_n // 2)
+
+
+def _smem_desc_to_i64(smem_desc_value: ir.Value) -> ir.Value:
+    """Bit-cast cute_nvgpu.smem_desc value -> i64."""
+    i64_ty = ir.IntegerType.get_signless(64)
+    return builtin.unrealized_conversion_cast([i64_ty], [smem_desc_value])
+
+
+def _tmem_ptr_to_i32(tmem_ptr_value: ir.Value) -> ir.Value:
+    """Bit-cast cute.ptr<tmem> -> i32."""
+    i32_ty = ir.IntegerType.get_signless(32)
+    return builtin.unrealized_conversion_cast([i32_ty], [tmem_ptr_value])
+
+
+def _as_value(it) -> ir.Value:
+    """Unwrap to underlying ir.Value (cute Pointer has .value)."""
+    return it.value if hasattr(it, "value") else it
 
 
 def bf16_static_idesc(umma_m: int) -> int:

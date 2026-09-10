@@ -32,8 +32,6 @@ if TYPE_CHECKING:
 
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
 class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
-    supports_global_weight_scales = True
-
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_nvfp4_bf16_cutedsl"

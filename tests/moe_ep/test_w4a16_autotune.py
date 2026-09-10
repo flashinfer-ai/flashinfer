@@ -281,7 +281,7 @@ def test_cached_c1_geometry_and_cluster_change_preserve_lifecycle(factory):
 
 
 def test_catalog_winner_restores_scheduler_depth_and_invalidates_compile(factory):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         w4a16_candidates,
     )
 

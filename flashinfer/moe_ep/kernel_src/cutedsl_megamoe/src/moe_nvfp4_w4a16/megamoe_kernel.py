@@ -9,7 +9,7 @@ dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
 The swapped Mega scheduler and BF16 dispatch/combine remain one kernel.
 """
 
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -26,20 +26,25 @@ from cutlass.utils import blockscaled_layout as blockscaled_utils
 from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16_kernel import (
     Sm100W4A16GroupedGemmKernel,
 )
-from moe_bf16_glu.megamoe_kernel_bf16 import (
-    Sm100MegaMoEBf16Kernel,
-    _layout_regions,
-)
-from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
-from moe_nvfp4_swapab.custom_ext import SwapABSwigluFp4Fc12SchedExtension
-from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
+from .workspace import _RegionSpec, _layout_regions, _round_up
+from common.host_utils import get_cutedsl_target_arch
+from cutlass.cute.typing import AddressSpace
+from cutlass.cutlass_dsl import Int64
+from src.token_comm import CombineFormat, TokenSrcMetadata
+from .custom_ext import W4A16Fc12SchedExtension
+from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
 from moe_nvfp4_swapab.moe_utils import spin_wait
 from src.token_comm import TokenInPullTokenBackPush
 from src.token_comm import TokenCommArgs as ExtractedTokenCommArgs
 
-from moe_nvfp4_swapab.epilogue_refactor import NvFp4OptinalEpiArgs
-from .epilogue import W4A16Epilogue
-from . import dynamic_mainloop
+from .epilogue import W4A16Epilogue, W4A16EpiArgs
+from . import dynamic_mainloop, clc
+from .clc_transport import ClcTransport
+
+# Communication ABI: one packed i64 provenance record and two signal slots.
+_TokenMetadataBytes = TokenSrcMetadata.nbytes
+_GridSyncSlotCount = 2
+_NvlinkSlotCount = 2
 
 
 class _ScaledTokenCommArgs:
@@ -115,34 +120,61 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         )
 
 
-class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
+class Sm100W4A16MegaMoEKernel:
     """BF16 dispatch and compute with online-decoded NVFP4 expert weights."""
 
-    _make_typed_view = staticmethod(Sm100MegaMoEBf16Kernel._make_typed_view)
-
-    def __init__(self, *, local_rank, **kwargs):
-        kwargs = dict(kwargs)
-        kwargs.pop("ab_dtype", None)
-        kwargs.pop("generate_c", None)
-        kwargs.pop("use_stg_fc1", None)
-        ikr = kwargs.pop("fc2_in_kernel_topk_reduce", False)
-        token_back_mode = kwargs.get("token_back_mode", "epi_warps")
-        by_dispatch = kwargs.pop(
-            "token_back_by_dispatch", token_back_mode == "reuse_dispatch_warps"
-        )
-        if (
-            ikr
-            or kwargs.get("in_kernel_fc2_reduce", False)
-            or kwargs.get("apply_topk_in_fc1", False)
+    def __init__(
+        self,
+        *,
+        local_rank,
+        mma_tiler_mnk,
+        cluster_shape_mnk,
+        use_2cta_instrs,
+        group_hint,
+        token_padding_block,
+        static_expert_shape,
+        world_size,
+        num_topk,
+        max_tokens_per_rank,
+        hidden,
+        load_balance_mode="static",
+        force_static_sched=True,
+        clc_bundle_size=None,
+        num_sched_stages=None,
+        ab_dtype=cutlass.BFloat16,
+        acc_dtype=cutlass.Float32,
+        fc2_in_kernel_topk_reduce=False,
+        in_kernel_fc2_reduce=False,
+        token_back_by_dispatch=None,
+        token_back_mode="epi_warps",
+        apply_topk_in_fc1=False,
+        gate_up_clamp=None,
+        epi_flag_batch=(1, 1),
+        flag_batch=1,
+        combine_format=None,
+        non_ubulk_fc2_store=True,
+        scenario="2Dx3D",
+    ):
+        if not force_static_sched or scenario != "2Dx3D":
+            raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
+        if load_balance_mode not in ("static", "atomic_counter", "clc"):
+            raise ValueError("Unsupported W4A16 load_balance_mode.")
+        self.use_clc_scheduler = load_balance_mode == "clc"
+        self._clc_bundle_size = 1 if clc_bundle_size is None else clc_bundle_size
+        if self.use_clc_scheduler and (
+            type(self._clc_bundle_size) is not int or self._clc_bundle_size < 1
         ):
+            raise ValueError("clc_bundle_size must be a positive integer.")
+        if fc2_in_kernel_topk_reduce or in_kernel_fc2_reduce or apply_topk_in_fc1:
             raise ValueError("W4A16 MegaMoE uses external post-FC2 routing.")
         if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
             raise ValueError(
                 "W4A16 supports epi_warps or reuse_dispatch_warps token return."
             )
-        if by_dispatch != (token_back_mode == "reuse_dispatch_warps"):
+        by_dispatch = token_back_mode == "reuse_dispatch_warps"
+        if token_back_by_dispatch is not None and token_back_by_dispatch != by_dispatch:
             raise ValueError("token_back_by_dispatch must match token_back_mode.")
-        if kwargs["mma_tiler_mnk"] not in (
+        if mma_tiler_mnk not in (
             (128, 64, 256),
             (128, 128, 256),
             (256, 64, 256),
@@ -151,81 +183,163 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             raise ValueError(
                 "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
             )
-        if kwargs["cluster_shape_mnk"] != (2, 1, 1) and not (
-            kwargs["cluster_shape_mnk"] == (1, 1, 1)
-            and kwargs["mma_tiler_mnk"] == (128, 64, 256)
+        if cluster_shape_mnk != (2, 1, 1) and not (
+            cluster_shape_mnk == (1, 1, 1) and mma_tiler_mnk == (128, 64, 256)
         ):
             raise ValueError(
                 "W4A16 requires cluster (2,1,1), or (1,1,1) for M128/N64/K256."
             )
-        if kwargs["use_2cta_instrs"] != (kwargs["mma_tiler_mnk"][0] == 256):
+        if use_2cta_instrs != (mma_tiler_mnk[0] == 256):
             raise ValueError("W4A16 MMA M128/M256 requires one/two-CTA instructions.")
-        _, gateup, hidden = kwargs["static_expert_shape"]
+        if static_expert_shape is None or hidden != static_expert_shape[2]:
+            raise ValueError("W4A16 requires static_expert_shape matching hidden.")
+        _, gateup, _ = static_expert_shape
         if hidden % 32 or gateup % 128:
             raise ValueError("W4A16 requires H%32=0 and I%64=0.")
-        # Match local W4A16's ceil-div local_tile K extent. A/B descriptors
-        # retain logical K; TMA zero-fills the last packed/BF16 input tile.
+        if token_padding_block <= 0 or mma_tiler_mnk[1] % token_padding_block:
+            raise ValueError("Token padding must divide the routed-token tile.")
+        if combine_format is None:
+            combine_format = CombineFormat.parse("bf16")
+        if (
+            ab_dtype is not cutlass.BFloat16
+            or acc_dtype is not cutlass.Float32
+            or combine_format.act_dtype is not cutlass.BFloat16
+            or combine_format.is_quantized
+            or not non_ubulk_fc2_store
+        ):
+            raise ValueError(
+                "W4A16 requires BF16 activation/return and FP32 accumulation."
+            )
+
+        self.mma_tiler_mnk = self.mma_tiler = mma_tiler_mnk
+        self.cluster_shape_mn = cluster_shape_mnk[:2]
+        self.use_2cta_instrs = use_2cta_instrs
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
+        )
+        self.static_expert_shape = static_expert_shape
+        self.force_static_sched = force_static_sched
+        self.clc_bundle_size = clc_bundle_size
+        self.num_sched_stages = num_sched_stages or 3
+        self.group_hint = group_hint
+        self.token_padding_block = token_padding_block
+        self.sf_padding_block = 1
+        # CLC uses the same publication records, but owns its task generator.
+        self.load_balance_mode = (
+            "atomic_counter" if self.use_clc_scheduler else load_balance_mode
+        )
+        self.scenario = scenario
+        self.arch = get_cutedsl_target_arch()
+        self.ab_dtype = self.fc2_output_dtype = cutlass.BFloat16
+        self.acc_dtype = cutlass.Float32
+        self.combine_format = combine_format
+        self.non_ubulk_fc2_store = True
+        self.fc2_in_kernel_topk_reduce = self.in_kernel_fc2_reduce = False
+        self.apply_topk_in_fc1 = False
+        self.gate_up_clamp = gate_up_clamp
+        self.epi_flag_batch = epi_flag_batch
+        self.flag_batch = flag_batch
+
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.num_topk = num_topk
+        self.max_tokens_per_rank = max_tokens_per_rank
+        self.hidden = hidden
+        self.num_experts_per_rank = static_expert_shape[0]
+        self.num_total_experts = world_size * self.num_experts_per_rank
+        self.intermediate_gateup = gateup
+        self.intermediate_downproj = gateup // 2
+        self.hidden_bytes = 2 * hidden
+        self.sf_uint32_per_token = 0
+        self.cluster_tile_tokens = mma_tiler_mnk[1] * cluster_shape_mnk[1]
         self._fc1_k_tiles = (hidden + 255) // 256
         self._fc2_k_tiles = (gateup // 2 + 255) // 256
-        if kwargs["token_padding_block"] > kwargs["mma_tiler_mnk"][1]:
-            raise ValueError("Token padding must not exceed the routed-token tile.")
-        kwargs["sf_padding_block"] = 1
-        super().__init__(fc2_output_dtype=cutlass.BFloat16, **kwargs)
-        self.num_sched_stages = self.num_sched_stages or 3
-        self.local_rank = local_rank
-        self.ab_dtype = cutlass.BFloat16
-        self.fc2_in_kernel_topk_reduce = False
-        self.generate_c = False
-        self.use_stg_fc1 = False
-        self.hidden_bytes = 2 * self.hidden
-        self.sf_uint32_per_token = 0
-        self.sf_padding_block = 1
-        # Reuse the local W4A16 same-K-tile split across two transform groups.
+
+        # Five independent warpgroup roles, including exactly two decoders.
+        self.epilogue_warp_id = (0, 1, 2, 3)
+        self.mma_warp_id = 4
+        self.tma_a_warp_id = 5
+        self.tma_b_warp_id = 6
+        self.sched_warp_id = 7
+        self.dispatch_warp_id = (8, 9, 10, 11)
         self.num_transform_warpgroups = 2
-        self.num_transform_warps = 4 * self.num_transform_warpgroups
-        self.transform_warp_id = tuple(range(12, 12 + self.num_transform_warps))
-        self.threads_per_cta = 32 * (12 + self.num_transform_warps)
-        # Mirror swapped Mega's per-expert completion threshold. Every FC2
-        # feature CTA publishes, including the padded CTA of a partial cluster.
+        self.num_transform_warps = 8
+        self.transform_warp_id = tuple(range(12, 20))
+        self.threads_per_cta = 640
+        self.tmem_alloc_sync_bar_id = 2
+        self.tmem_dealloc_sync_bar_id = 3
+        self.token_back_mode = token_back_mode
+        self.token_back_by_dispatch = by_dispatch
+        self.token_back_standalone = False
+        self.token_back_warp_id = None
+        self.token_back_schedule_mode = (
+            self.load_balance_mode if by_dispatch else "static"
+        )
+
+        # Workspace and transport start in BF16 form. No FP4 activation
+        # constructor or intermediate quantization state is instantiated.
+        (
+            self.pool_token_capacity,
+            self.pool_sf_capacity,
+            self.pool_task_tile_capacity,
+        ) = self._pool_shapes()
         cluster_fc2_tile_hidden = (
-            self.mma_tiler[0]
-            * self.cluster_shape_mn[0]
-            // (2 if self.use_2cta_instrs else 1)
+            mma_tiler_mnk[0] * cluster_shape_mnk[0] // (2 if use_2cta_instrs else 1)
         )
         fc2_publishes_per_token_cluster_tile = (
-            (self.hidden + cluster_fc2_tile_hidden - 1) // cluster_fc2_tile_hidden
-        ) * self.cluster_shape_mn[0]
+            (hidden + cluster_fc2_tile_hidden - 1) // cluster_fc2_tile_hidden
+        ) * cluster_shape_mnk[0]
         self.token_comm = TokenInPullTokenBackPush(
-            world_size=self.world_size,
-            num_topk=self.num_topk,
+            world_size=world_size,
+            num_topk=num_topk,
             num_experts_per_rank=self.num_experts_per_rank,
             num_total_experts=self.num_total_experts,
-            hidden=self.hidden,
+            hidden=hidden,
             fc1_token_dtype=cutlass.BFloat16,
-            combine_format=self.combine_format,
-            token_back_by_dispatch=self.token_back_by_dispatch,
+            combine_format=combine_format,
+            token_back_by_dispatch=by_dispatch,
             fc2_publishes_per_token_cluster_tile=fc2_publishes_per_token_cluster_tile,
             token_back_reduce_topk=False,
             token_back_standalone=False,
             sf_uint32_per_token=0,
-            token_padding_block=self.token_padding_block,
+            token_padding_block=token_padding_block,
             sf_padding_block=1,
             cluster_tile_tokens=self.cluster_tile_tokens,
             cluster_shape_mn=self.cluster_shape_mn,
             dispatch_warp_start=8,
-            num_other_warps=8 + self.num_transform_warps,
-            flag_batch=self.flag_batch,
+            num_other_warps=16,
+            flag_batch=flag_batch,
             is_swap_ab=True,
             token_back_schedule_mode=self.token_back_schedule_mode,
         )
-        # Rebuild the initially constructed NVFP4 region metadata for BF16
-        # tokens/intermediates. No GPU storage has been allocated at this point.
-        self._local_region_specs = Sm100MegaMoEBf16Kernel._build_local_region_specs(
-            self
-        )
-        self._shared_region_specs = Sm100MegaMoEBf16Kernel._build_shared_region_specs(
-            self
-        )
+        self._local_region_specs = self._build_local_region_specs()
+        if self.use_clc_scheduler:
+            self._clc_transport = ClcTransport(self.token_comm)
+            row_bound = (
+                self.pool_token_capacity + self.mma_tiler[1] - 1
+            ) // self.mma_tiler[1] + self.num_experts_per_rank
+            cta_features = self.mma_tiler[0] // (2 if self.use_2cta_instrs else 1)
+            cluster_features = cta_features * self.cluster_shape_mn[0]
+            fc1_features = (
+                self.intermediate_gateup + cluster_features - 1
+            ) // cluster_features
+            fc2_features = (self.hidden + cluster_features - 1) // cluster_features
+            self._clc_fc1_features = fc1_features
+            self._clc_fc2_features = fc2_features
+            self._clc_queue_offset, words, self._clc_grid_bundles = clc.workspace_shape(
+                row_bound, fc1_features, fc2_features, self._clc_bundle_size
+            )
+            # All queue state stays in the existing reset prefix. Only the
+            # final fixed transport launch clears it after every late CTA.
+            pos = next(
+                i
+                for i, r in enumerate(self._local_region_specs)
+                if r.name == "l1_token_buffer"
+            )
+            self._local_region_specs.insert(
+                pos, _RegionSpec("clc_workspace", cutlass.Int32, (words,), 16)
+            )
+        self._shared_region_specs = self._build_shared_region_specs()
         self._local_offsets, self._local_total = _layout_regions(
             self._local_region_specs
         )
@@ -241,7 +355,17 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         self.shared_zero_i32_count = shared_leading // 4
 
     def name(self):
-        return "w4a16_" + super().name()
+        m, n, k = self.mma_tiler
+        cm, cn = self.cluster_shape_mn
+        mode = "clc" if self.use_clc_scheduler else self.load_balance_mode
+        return (
+            f"megamoe_w4a16_{m}x{n}x{k}_cluster{cm}x{cn}_{mode}"
+            f"_expert{self.static_expert_shape}_group{self.group_hint}"
+            f"_stages{self.num_sched_stages}_bundle{self.clc_bundle_size}"
+            f"_return{self.token_back_mode}_epiflag{self.epi_flag_batch}"
+            f"_clamp{self.gate_up_clamp}_ep{self.world_size}_topk{self.num_topk}"
+            f"_tokens{self.max_tokens_per_rank}_flag{self.flag_batch}"
+        )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
         mixed = _MegaMixedInput(
@@ -329,9 +453,12 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         return size
 
     def _fit_raw_stages(self, output_tensor, sched_params):
-        sched_storage_cls = sched_params.get_scheduler_type().make_storage_struct(
-            sched_params, SwapABSwigluFp4Fc12SchedExtension, num_drain_warps=0
-        )
+        if self.use_clc_scheduler:
+            sched_storage_cls = clc.make_storage(sched_params, W4A16Fc12SchedExtension)
+        else:
+            sched_storage_cls = sched_params.get_scheduler_type().make_storage_struct(
+                sched_params, W4A16Fc12SchedExtension, num_drain_warps=0
+            )
         comm_storage_cls = self.token_comm_extra_smem_storage_class()
         # CuTe's 227KiB per-block capacity already excludes CUDA's 1KiB
         # reservation from the SM's 228KiB. All user storage is counted below.
@@ -552,6 +679,19 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         )
 
         token_comm_args = _ScaledTokenCommArgs(token_comm_args, fc2_alpha)
+        clc_workspace = None
+        if cutlass.const_expr(self.use_clc_scheduler):
+            clc_workspace = clc.Workspace(
+                self._view_local(local_workspace, "clc_workspace"),
+                self._clc_queue_offset,
+                self._clc_fc2_features,
+            )
+            self._clc_transport.dispatch(
+                token_comm_args,
+                grid=(*self.cluster_shape_mn, max_active_clusters),
+                cluster=(*self.cluster_shape_mn, 1),
+                stream=stream,
+            )
         self._launch_fc12(
             activation=l1_token_buffer_bf16,
             fc1_weight=fc1_weight,
@@ -570,7 +710,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             load_balance_counter=load_balance_counter,
             expert_token_sizes=expert_token_sizes,
             token_comm_args=token_comm_args,
+            clc_workspace=clc_workspace,
         )
+        if cutlass.const_expr(self.use_clc_scheduler):
+            self._clc_transport.finish(
+                token_comm_args,
+                grid=(*self.cluster_shape_mn, max_active_clusters),
+                cluster=(*self.cluster_shape_mn, 1),
+                stream=stream,
+            )
 
     @cute.jit
     def _launch_fc12(
@@ -592,6 +740,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         expert_token_sizes,
         token_comm_args,
         fc1_c=None,
+        clc_workspace=None,
     ):
         e, gateup, h = self.static_expert_shape
         i = gateup // 2
@@ -675,6 +824,11 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
         )
+        if cutlass.const_expr(self.use_clc_scheduler):
+            # Queue readiness/local drain requires immediate completion events;
+            # keep actual helper metadata consistent with the CLC branch.
+            self.epilogue.fc1_epi_flag_batch = 1
+            self.epilogue.fc2_epi_flag_batch = 1
         assert self.epilogue.acc_tmem_cols * self.num_acc_stage == mix.num_acc_tmem_cols
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             cutlass.BFloat16,
@@ -740,6 +894,12 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         self.b_tx_bytes = cute.size_in_bytes(cutlass.BFloat16, b_stage) * cute.size(
             tiled_mma.thr_id.shape
         )
+        if cutlass.const_expr(self.use_clc_scheduler):
+            grid = clc.launch_grid(
+                max(self._clc_grid_bundles, max_active_clusters), self.cluster_shape_mn
+            )
+        else:
+            grid = sched.get_grid_shape(max_active_clusters)
         self.kernel(
             tiled_mma,
             wa1,
@@ -766,8 +926,10 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             mix.smem_layout_b,
             mix.smem_layout_a_transform,
             token_comm_args,
+            clc_workspace,
+            max_active_clusters,
         ).launch(
-            grid=sched.get_grid_shape(max_active_clusters),
+            grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=(*self.cluster_shape_mn, 1),
             stream=stream,
@@ -935,6 +1097,105 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         activation_layout,
         transform_layout,
         token_comm_args,
+        clc_workspace,
+        max_active_clusters: cutlass.Constexpr,
+    ):
+        if cutlass.const_expr(self.use_clc_scheduler):
+            if clc.active_cluster(
+                sched_params,
+                self._clc_fc1_features,
+                self._clc_fc2_features,
+                self._clc_bundle_size,
+                max_active_clusters,
+                self.cluster_shape_mn[0],
+            ):
+                self._compute_body(
+                    mma,
+                    wa1,
+                    wt1,
+                    sa1,
+                    st1,
+                    ba1,
+                    bt1,
+                    wa2,
+                    wt2,
+                    sa2,
+                    st2,
+                    ba2,
+                    bt2,
+                    fc1_output,
+                    fc2_output,
+                    fc1_alpha,
+                    fc1_done,
+                    sched_params,
+                    cluster_layout,
+                    raw_layout,
+                    scale_layout,
+                    scale_tma_layout,
+                    activation_layout,
+                    transform_layout,
+                    token_comm_args,
+                    clc_workspace,
+                )
+        else:
+            self._compute_body(
+                mma,
+                wa1,
+                wt1,
+                sa1,
+                st1,
+                ba1,
+                bt1,
+                wa2,
+                wt2,
+                sa2,
+                st2,
+                ba2,
+                bt2,
+                fc1_output,
+                fc2_output,
+                fc1_alpha,
+                fc1_done,
+                sched_params,
+                cluster_layout,
+                raw_layout,
+                scale_layout,
+                scale_tma_layout,
+                activation_layout,
+                transform_layout,
+                token_comm_args,
+                clc_workspace,
+            )
+
+    @cute.jit
+    def _compute_body(
+        self,
+        mma,
+        wa1,
+        wt1,
+        sa1,
+        st1,
+        ba1,
+        bt1,
+        wa2,
+        wt2,
+        sa2,
+        st2,
+        ba2,
+        bt2,
+        fc1_output,
+        fc2_output,
+        fc1_alpha,
+        fc1_done,
+        sched_params,
+        cluster_layout,
+        raw_layout,
+        scale_layout,
+        scale_tma_layout,
+        activation_layout,
+        transform_layout,
+        token_comm_args,
+        clc_workspace,
     ):
         mix = self.mixed_fc1
         tidx = cute.arch.thread_idx()[0]
@@ -948,7 +1209,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         fc2_threshold = cute.ceil_div(
             self.intermediate_gateup, self.cta_tile_shape_mnk[0]
         )
-        ext = SwapABSwigluFp4Fc12SchedExtension(
+        ext = W4A16Fc12SchedExtension(
             sf_vec_size=16,
             fc1_done_counter_ptr=fc1_done.iterator,
             fc2_spin_threshold=fc2_threshold,
@@ -1026,7 +1287,31 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
         )
         consumer = scheduler.make_consumer()
         early_init = self.load_balance_mode == "atomic_counter"
-        if cutlass.const_expr(early_init):
+        clc_pipe = None
+        clc_claim_pipe = None
+        clc_completed = None
+        if cutlass.const_expr(self.use_clc_scheduler):
+            clc.initialize(scheduler, storage.sched_storage)
+            clc_completed = storage.sched_storage.completed.ptr
+            clc_pipe = pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=storage.sched_storage.clc_mbar.data_ptr(),
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 32 * cute.size(self.cluster_shape_mn)
+                ),
+                tx_count=16,
+                cta_layout_vmnk=cluster_layout,
+                defer_sync=True,
+            )
+            clc_claim_pipe = pipeline.PipelineAsync.create(
+                barrier_storage=storage.sched_storage.claim_mbar.data_ptr(),
+                num_stages=2,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                defer_sync=True,
+            )
+        elif cutlass.const_expr(early_init):
             scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         s_raw = smem.allocate_tensor(
@@ -1061,16 +1346,19 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cute.arch.setmaxregister_decrease(80)
 
         if warp == 7:
-            self.token_comm_hook_sched_warp_pre_init_wait(token_comm_args)
-            if cutlass.const_expr(not early_init):
-                scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
-            scheduler.gen_next_work()
-            while scheduler.current_work.is_valid_tile:
-                ext.prefetch_for_expert(scheduler.current_work.expert_idx)
-                scheduler.publish_work()
+            if cutlass.const_expr(self.use_clc_scheduler):
+                clc.schedule(scheduler, storage.sched_storage, clc_claim_pipe)
+            else:
+                self.token_comm_hook_sched_warp_pre_init_wait(token_comm_args)
+                if cutlass.const_expr(not early_init):
+                    scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
                 scheduler.gen_next_work()
-            scheduler.publish_work()
-            scheduler.produce_tail()
+                while scheduler.current_work.is_valid_tile:
+                    ext.prefetch_for_expert(scheduler.current_work.expert_idx)
+                    scheduler.publish_work()
+                    scheduler.gen_next_work()
+                scheduler.publish_work()
+                scheduler.produce_tail()
 
         if warp == 5:
             state = pipeline.make_pipeline_state(
@@ -1122,9 +1410,10 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             work = consumer.consume_work()
             while work.is_valid_tile:
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
-                    self.token_comm_hook_fc1_tma_b_predispatch_spin(
-                        token_comm_args, work
-                    )
+                    if cutlass.const_expr(not self.use_clc_scheduler):
+                        self.token_comm_hook_fc1_tma_b_predispatch_spin(
+                            token_comm_args, work
+                        )
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1139,14 +1428,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                         self._fc1_k_tiles,
                     )
                 else:
-                    if not work.peek_ready:
-                        spin_wait(
-                            fc1_done.iterator
-                            + work.cumulative_token_block_count
-                            + work.tile_n_idx,
-                            lambda v: v >= fc2_threshold,
-                            fail_sleep_cycles=500,
-                        )
+                    if cutlass.const_expr(not self.use_clc_scheduler):
+                        if not work.peek_ready:
+                            spin_wait(
+                                fc1_done.iterator
+                                + work.cumulative_token_block_count
+                                + work.tile_n_idx,
+                                lambda v: v >= fc2_threshold,
+                                fail_sleep_cycles=500,
+                            )
                     state = self._activation_task(
                         mma,
                         ext,
@@ -1303,13 +1593,15 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 fc2_output=fc2_output,
                 fc1_done_counter=fc1_done,
                 tidx=tidx,
-                optional_epi_args=NvFp4OptinalEpiArgs(
+                optional_epi_args=W4A16EpiArgs(
                     fc1_alpha=fc1_alpha,
                     fc2_alpha=token_comm_args.fc2_alpha,
                     fc1_norm_const=None,
                     topk_scores=None,
                 ),
                 token_comm_args=token_comm_args,
+                clc_workspace=clc_workspace,
+                clc_completed=clc_completed,
             )
             cute.arch.fence_acq_rel_sys()
             tmem.relinquish_alloc_permit()
@@ -1317,13 +1609,388 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
 
         if warp >= 8 and warp < 12:
             cute.arch.setmaxregister_decrease(64)
-            self.token_comm_hook_dispatch_warp_body(
-                token_comm_args,
-                comm_storage,
-                warp_idx=warp,
-                lane_idx=cute.arch.lane_idx(),
-                tidx=tidx,
+            if cutlass.const_expr(self.use_clc_scheduler):
+                if warp == 8:
+                    clc.run(
+                        scheduler,
+                        storage.sched_storage,
+                        clc_workspace,
+                        clc_pipe,
+                        clc_claim_pipe,
+                        self.cluster_shape_mn[0],
+                        self._clc_bundle_size,
+                    )
+            else:
+                self.token_comm_hook_dispatch_warp_body(
+                    token_comm_args,
+                    comm_storage,
+                    warp_idx=warp,
+                    lane_idx=cute.arch.lane_idx(),
+                    tidx=tidx,
+                )
+        if cutlass.const_expr(self.use_clc_scheduler):
+            pipeline.NamedBarrier(
+                barrier_id=8, num_threads=self.threads_per_cta
+            ).arrive_and_wait()
+        else:
+            self.token_comm_hook_kernel_tail(
+                token_comm_args, warp_idx=warp, lane_idx=cute.arch.lane_idx(), tidx=tidx
             )
-        self.token_comm_hook_kernel_tail(
-            token_comm_args, warp_idx=warp, lane_idx=cute.arch.lane_idx(), tidx=tidx
+
+    def _pool_shapes(self) -> Tuple[int, int, int]:
+        """Worst-case pool sizes.
+
+        ``pool_token_capacity``: every received token from any peer can
+        replicate to ``min(num_topk, num_experts_per_rank)`` local
+        experts; worst case is ``world_size * max_tokens_per_rank``
+        tokens received, each replicated up to that bound.  Each of
+        the ``num_experts_per_rank`` experts wastes up to
+        ``token_padding_block - 1`` rows at its tail; round the whole
+        sum up to the pool-layout granularity ``token_padding_block``.
+
+        ``pool_sf_capacity``: same number of expert blocks as the data
+        pool, each padded to ``sf_padding_block`` rows (UTCCP 4x32
+        swizzle that the SF TMA load expects).
+
+        ``pool_task_tile_capacity``: ``ceil(pool_token_capacity,
+        cluster_tile_tokens)``.  C3 makes ``cluster_tile_tokens`` a
+        multiple of ``token_padding_block`` so this stays exact.
+        """
+        world_size = self.world_size
+        max_tokens_per_rank = self.max_tokens_per_rank
+        num_topk = self.num_topk
+        num_experts_per_rank = self.num_experts_per_rank
+        token_padding_block = self.token_padding_block
+        sf_padding_block = self.sf_padding_block
+        cluster_tile_tokens = self.cluster_tile_tokens
+
+        max_recv = world_size * max_tokens_per_rank
+        max_per_token = min(num_topk, num_experts_per_rank)
+        raw = max_recv * max_per_token + num_experts_per_rank * (
+            token_padding_block - 1
+        )
+        pool_token_capacity = _round_up(raw, token_padding_block)
+        pool_sf_capacity = (
+            pool_token_capacity // token_padding_block
+        ) * sf_padding_block
+        # Upper bound for sum_e ceil(valid_e, cluster_tile_tokens).  The
+        # per-expert slack covers each expert's final partial task tile.
+        pool_task_tile_capacity = (
+            pool_token_capacity + cluster_tile_tokens - 1
+        ) // cluster_tile_tokens + num_experts_per_rank
+        return (
+            pool_token_capacity,
+            pool_sf_capacity,
+            pool_task_tile_capacity,
+        )
+
+    def _build_local_region_specs(self) -> List[_RegionSpec]:
+        pool_token_capacity = self.pool_token_capacity
+        pool_task_tile_capacity = self.pool_task_tile_capacity
+        num_experts_per_rank = self.num_experts_per_rank
+        num_total_experts = self.num_total_experts
+        hidden_bytes = self.hidden_bytes
+        intermediate_downproj = self.intermediate_downproj
+        cluster_tile_tokens = self.cluster_tile_tokens
+
+        # fc1_done_counter slot granularity is the cluster tile on the token
+        # (M) axis, plus one boundary slot per expert.
+        fc1_done_slots = (
+            pool_token_capacity + cluster_tile_tokens - 1
+        ) // cluster_tile_tokens + num_experts_per_rank
+
+        # Accumulating-counter prefix: tail_reset_counters bulk-zeros all bytes
+        # before l1_token_buffer so back-to-back launches do not inherit counters.
+        specs: List[_RegionSpec] = [
+            _RegionSpec(
+                "l1_arrival_count",
+                cutlass.Int32,
+                (pool_task_tile_capacity,),
+                16,
+            ),
+            _RegionSpec(
+                "expert_send_count",
+                cutlass.Int64,
+                (num_total_experts,),
+                16,
+            ),
+            _RegionSpec(
+                "grid_sync_counter",
+                cutlass.Int32,
+                (_GridSyncSlotCount,),
+                16,
+            ),
+            _RegionSpec(
+                "fc1_done_counter",
+                cutlass.Int32,
+                (fc1_done_slots,),
+                16,
+            ),
+        ]
+        if self.token_back_by_dispatch:
+            specs.append(
+                _RegionSpec(
+                    "fc2_done_counter",
+                    cutlass.Int32,
+                    (num_experts_per_rank,),
+                    16,
+                )
+            )
+            if self.token_back_schedule_mode == "atomic_counter":
+                specs.append(
+                    _RegionSpec(
+                        "token_back_schedule_counter",
+                        cutlass.Int32,
+                        (1,),
+                        16,
+                    )
+                )
+        if self.load_balance_mode == "atomic_counter":
+            specs.append(
+                _RegionSpec(
+                    "load_balance_counter",
+                    cutlass.Int32,
+                    (1,),
+                    16,
+                )
+            )
+
+        # Data buffers. l1_token_buffer must be the first data region because
+        # __init__ derives local_zero_i32_count from its offset.
+        specs += [
+            # L1 input pool (dispatch_pull writes -> fc1 reads).  Stored as
+            # Uint8 bytes; the BF16 view at the same offset is built in __call__.
+            _RegionSpec(
+                "l1_token_buffer",
+                cutlass.Uint8,
+                (pool_token_capacity, hidden_bytes),
+                128,
+            ),
+            # Persisted across launches; the sense-reversing nvlink barrier rides
+            # this phase counter across non-ncu relaunches.
+            _RegionSpec(
+                "nvlink_barrier_counter",
+                cutlass.Int32,
+                (1,),
+                16,
+            ),
+            _RegionSpec(
+                "l1_topk_weights_buffer",
+                cutlass.Float32,
+                (pool_token_capacity,),
+                16,
+            ),
+            _RegionSpec(
+                "token_src_metadata",
+                cutlass.Uint8,
+                (pool_token_capacity, _TokenMetadataBytes),
+                16,
+            ),
+            # fc1 -> fc2 hand-off buffer in the activation dtype (BFloat16).
+            _RegionSpec(
+                "fc1_output",
+                self.ab_dtype,
+                (pool_token_capacity, intermediate_downproj),
+                128,
+            ),
+        ]
+
+        if self.token_back_by_dispatch:
+            specs.append(
+                _RegionSpec(
+                    "fc2_output_workspace",
+                    cutlass.BFloat16,
+                    (pool_token_capacity, 1, self.hidden),
+                    128,
+                )
+            )
+
+        return specs
+
+    def _build_shared_region_specs(self) -> List[_RegionSpec]:
+        world_size = self.world_size
+        num_topk = self.num_topk
+        max_tokens_per_rank = self.max_tokens_per_rank
+        num_experts_per_rank = self.num_experts_per_rank
+
+        max_slot = max_tokens_per_rank * num_topk
+
+        # Shared counter prefix is bulk-zeroed between tail barriers; keep
+        # src_token_topk_idx as the first data region used to derive the prefix.
+        return [
+            _RegionSpec(
+                "expert_recv_count",
+                cutlass.Int64,
+                (world_size, num_experts_per_rank),
+                16,
+            ),
+            _RegionSpec(
+                "expert_recv_count_sum",
+                cutlass.Int64,
+                (num_experts_per_rank,),
+                16,
+            ),
+            _RegionSpec(
+                "src_token_topk_idx",
+                cutlass.Int32,
+                (num_experts_per_rank, world_size, max_slot),
+                16,
+            ),
+            _RegionSpec(
+                "nvlink_barrier_signal",
+                cutlass.Int32,
+                (_NvlinkSlotCount,),
+                16,
+            ),
+        ]
+
+    def get_workspace_sizes(self) -> Tuple[int, int]:
+        """Return ``(local_ws_bytes, shared_ws_bytes)``."""
+        return self._local_total, self._shared_total
+
+    @staticmethod
+    def _make_typed_view(
+        byte_workspace: cute.Tensor,
+        byte_offset: int,
+        cute_dtype: Any,
+        shape: Tuple[int, ...],
+        stride: Optional[Tuple[int, ...]],
+        assumed_align: int,
+    ) -> cute.Tensor:
+        """Build a typed cute view at ``byte_offset`` of the opaque workspace."""
+        byte_ptr = byte_workspace.iterator + Int64(byte_offset)
+        typed_iter = cute.make_ptr(
+            cute_dtype,
+            byte_ptr.toint(),
+            AddressSpace.gmem,
+            assumed_align=assumed_align,
+        )
+        return cute.make_tensor(typed_iter, cute.make_layout(shape, stride=stride))
+
+    def _view_local(
+        self,
+        local_workspace: cute.Pointer,
+        name: str,
+        *,
+        cute_dtype: Optional[Any] = None,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+    ) -> cute.Tensor:
+        """Partition a region of the local workspace.  With no overrides,
+        uses the region's declared dtype + shape + row-major stride;
+        overrides let dual-view callers build alternate-dtype views at
+        the same byte offset.
+        """
+        return self._partition_region(
+            local_workspace,
+            self._local_offsets,
+            self._local_region_by_name[name],
+            cute_dtype=cute_dtype,
+            shape=shape,
+            stride=stride,
+        )
+
+    def _view_shared(
+        self,
+        shared_workspace: cute.Pointer,
+        name: str,
+        *,
+        cute_dtype: Optional[Any] = None,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+    ) -> cute.Tensor:
+        return self._partition_region(
+            shared_workspace,
+            self._shared_offsets,
+            self._shared_region_by_name[name],
+            cute_dtype=cute_dtype,
+            shape=shape,
+            stride=stride,
+        )
+
+    def _partition_region(
+        self,
+        byte_workspace: cute.Pointer,
+        offsets: Dict[str, int],
+        spec: _RegionSpec,
+        *,
+        cute_dtype: Optional[Any],
+        shape: Optional[Tuple[int, ...]],
+        stride: Optional[Tuple[int, ...]],
+    ) -> cute.Tensor:
+        dt = cute_dtype if cute_dtype is not None else spec.cute_dtype
+        sh = shape if shape is not None else spec.shape
+        st = stride
+        if st is None:
+            if cute_dtype is None and shape is None:
+                st = spec.stride_row_major
+            else:
+                # Derive row-major from the (possibly overridden) shape.
+                out: List[int] = [1]
+                for d in reversed(list(sh)[1:]):
+                    out.append(out[-1] * d)
+                out.reverse()
+                st = tuple(out)
+        return self._make_typed_view(
+            byte_workspace,
+            offsets[spec.name],
+            dt,
+            sh,
+            st,
+            spec.align,
+        )
+
+    def token_comm_extra_smem_storage_class(self) -> type:
+        return self.token_comm.extra_smem_storage_class()
+
+    @cute.jit
+    def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
+        self.token_comm.sched_warp_pre_init_wait(token_comm_args)
+
+    @cute.jit
+    def token_comm_hook_dispatch_warp_body(
+        self,
+        token_comm_args,
+        token_comm_storage,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        self.token_comm.dispatch_warp_body(
+            token_comm_args,
+            token_comm_storage,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+            tidx=tidx,
+        )
+
+    @cute.jit
+    def token_comm_hook_kernel_tail(
+        self,
+        token_comm_args,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        self.token_comm.kernel_tail(
+            token_comm_args,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+            tidx=tidx,
+        )
+
+    def token_comm_hook_fc1_ready_counter_ptr(self, token_comm_args):
+        return self.token_comm.fc1_ready_counter_ptr(token_comm_args)
+
+    @cute.jit
+    def token_comm_hook_fc1_tma_b_predispatch_spin(
+        self,
+        token_comm_args,
+        work_tile_info,
+    ):
+        self.token_comm.fc1_tma_b_predispatch_spin(
+            token_comm_args,
+            work_tile_info,
         )

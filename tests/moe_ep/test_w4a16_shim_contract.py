@@ -65,6 +65,57 @@ def test_config_rejects_ignored_fast_math_option():
         )
 
 
+def test_clc_config_and_bundle_have_distinct_compile_keys():
+    import dataclasses
+
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        MegaMoEW4A16Config,
+        MegaMoEW4A16Frontend,
+    )
+
+    base = MegaMoEW4A16Config(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=4,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=64,
+        intermediate=64,
+    )
+    assert base.load_balance_mode == "static" and base.clc_bundle_size is None
+    configs = [base, dataclasses.replace(base, load_balance_mode="atomic_counter")]
+    configs += [
+        dataclasses.replace(base, load_balance_mode="clc", clc_bundle_size=b)
+        for b in (1, 3)
+    ]
+    keys = [MegaMoEW4A16Frontend(config)._compile_key() for config in configs]
+    assert len(set(keys)) == len(configs)
+    assert all(config.mma_tiler_mnk == base.mma_tiler_mnk for config in configs)
+    assert all(config.epi_flag_batch == base.epi_flag_batch for config in configs)
+
+
+@pytest.mark.parametrize("bundle", (0, -1, 1.5, True))
+def test_clc_rejects_invalid_bundle_before_compile(bundle):
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        MegaMoEW4A16Config,
+    )
+
+    with pytest.raises(ValueError, match="positive integer"):
+        MegaMoEW4A16Config(
+            rank=0,
+            world_size=1,
+            num_tokens_per_rank=4,
+            num_topk=2,
+            num_total_experts=4,
+            hidden=64,
+            intermediate=64,
+            load_balance_mode="clc",
+            clc_bundle_size=bundle,
+        )
+
+
 def test_shim_rejects_ignored_fast_math_option(shim, buffer):
     with pytest.raises(TypeError, match="fast_math"):
         _call(shim, buffer, _output(), fast_math=False)
@@ -245,7 +296,7 @@ def test_tmem_config_preserves_public_geometry_and_swapped_knobs(
     hidden, intermediate, tile
 ):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         MegaMoEW4A16Config,
         MegaMoEW4A16Frontend,
     )
@@ -303,7 +354,7 @@ def test_frontend_validates_shared_nvfp4_layout_before_compile(
     weight_dtype, scale_dtype
 ):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.frontend import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         MegaMoEW4A16Config,
         MegaMoEW4A16Frontend,
         MegaMoEW4A16Inputs,
@@ -369,10 +420,10 @@ def test_tmem_kernel_preserves_public_knob_contract(
     symm_factory, hidden, intermediate, tile, cluster, mode, clamp, epi_flags
 ):
     import cutlass
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.kernel import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_w4a16.megamoe_kernel import (
         Sm100W4A16MegaMoEKernel,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.w4a16.epilogue import (
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.src.moe_nvfp4_w4a16.epilogue import (
         W4A16Epilogue,
     )
 

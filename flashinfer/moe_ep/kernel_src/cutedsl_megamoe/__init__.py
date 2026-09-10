@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""CuTeDSL MegaMoE kernel drop (NVFP4, MXFP8, and BF16).
+"""CuTeDSL MegaMoE implementations (NVFP4, MXFP8, BF16, and W4A16).
 
 This package is the single public boundary FlashInfer ``moe_ep`` imports from.
 It exposes the symmetric-buffer allocators and fused-launch entry points and
@@ -11,7 +11,7 @@ Layout::
 
     __init__.py  public API for moe_ep (this file); talks only to shim/
     shim/        thin adapters over the raw kernel sources (comm, nvfp4, mxfp8)
-    src/         vendored kernel sources from the kernel team
+    src/         vendor precisions plus owned moe_nvfp4_w4a16/ (see VENDOR.md)
 
 Usage::
 
