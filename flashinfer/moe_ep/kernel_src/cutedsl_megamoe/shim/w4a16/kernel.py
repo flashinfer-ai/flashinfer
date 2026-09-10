@@ -295,7 +295,12 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
 
     @staticmethod
     def _make_shared_storage(
-        sched_storage_cls, raw_stages, transform_stages, activation_stages
+        sched_storage_cls,
+        raw_stages,
+        transform_stages,
+        activation_stages,
+        *,
+        share_operand_release=False,
     ):
         @cute.struct
         class SharedStorage:
@@ -304,7 +309,7 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 cutlass.Int64, 2 * transform_stages
             ]
             activation_barriers: cute.struct.MemRange[
-                cutlass.Int64, 2 * activation_stages
+                cutlass.Int64, (1 if share_operand_release else 2) * activation_stages
             ]
             acc_barriers: cute.struct.MemRange[cutlass.Int64, 4]
             sched_storage: sched_storage_cls  # type: ignore[valid-type]
@@ -343,13 +348,24 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                 mixed = self._make_mixed(
                     128, output_tensor, raw_stages, activation_stages
                 )
+                # Both operands are released by the same MMA completion. Share
+                # that event only for equal rings within one MMA CTA group;
+                # larger multicast clusters need independent consumer counts.
+                share_operand_release = (
+                    activation_stages == mixed.num_trans2mma_stage
+                    and cute.size(mixed.cluster_layout_vmnk)
+                    == cute.size(mixed.cluster_layout_vmnk, mode=[0])
+                    and mixed.num_mcast_ctas_b == 1
+                )
                 storage_cls = self._make_shared_storage(
                     sched_storage_cls,
                     raw_stages,
                     mixed.num_trans2mma_stage,
                     activation_stages,
+                    share_operand_release=share_operand_release,
                 )
                 if self._smem_size(storage_cls, comm_storage_cls, mixed) <= capacity:
+                    self._share_operand_release = share_operand_release
                     return mixed, storage_cls, activation_stages
         raise ValueError("W4A16 MegaMoE cannot fit two raw stages in shared memory.")
 
@@ -983,18 +999,42 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
             cta_layout_vmnk=cluster_layout,
             defer_sync=True,
         )
-        activation_pipe = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.activation_barriers.data_ptr(),
-            num_stages=self.num_activation_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, mix.num_mcast_ctas_b
-            ),
-            tx_count=self.b_tx_bytes,
-            cta_layout_vmnk=cluster_layout,
-            mcast_mode_mn=(0, 1),
-            defer_sync=True,
-        )
+        if cutlass.const_expr(self._share_operand_release):
+            # Keep TMA readiness independent of decoded-TMEM readiness, but
+            # reuse the decoded ring's empty event for this same MMA consumer.
+            # This allocates only the TMA full barriers: no second empty ring
+            # is initialized or signalled, and producers still wait separately.
+            activation_full = pipeline.MbarrierArray(
+                barrier_storage=storage.activation_barriers.data_ptr(),
+                num_stages=self.num_activation_stages,
+                agent=(
+                    pipeline.PipelineOp.TmaLoad,
+                    pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                ),
+                tx_count=self.b_tx_bytes,
+            )
+            activation_pipe = pipeline.PipelineTmaUmma(
+                sync_object_full=activation_full,
+                sync_object_empty=transform_pipe.sync_object_empty,
+                num_stages=self.num_activation_stages,
+                producer_mask=None,  # Unused by PipelineTmaUmma.
+                consumer_mask=transform_pipe.consumer_mask,
+                is_leader_cta=leader,
+                cta_group=transform_pipe.cta_group,
+            )
+        else:
+            activation_pipe = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.activation_barriers.data_ptr(),
+                num_stages=self.num_activation_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, mix.num_mcast_ctas_b
+                ),
+                tx_count=self.b_tx_bytes,
+                cta_layout_vmnk=cluster_layout,
+                mcast_mode_mn=(0, 1),
+                defer_sync=True,
+            )
         acc_pipe = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_barriers.data_ptr(),
             num_stages=2,
@@ -1281,7 +1321,8 @@ class Sm100W4A16MegaMoEKernel(Sm100MegaMoEKernel):
                             a_from_tmem=True,
                         )
                         transform_pipe.consumer_release(a_state)
-                        activation_pipe.consumer_release(b_state)
+                        if cutlass.const_expr(not self._share_operand_release):
+                            activation_pipe.consumer_release(b_state)
                         a_state.advance()
                         b_state.advance()
                     acc_pipe.producer_commit(acc_state)
