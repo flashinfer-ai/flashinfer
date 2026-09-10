@@ -96,9 +96,7 @@ def build_jit_cache_provider_matrix(config: dict[str, Any]) -> list[dict[str, st
     return matrix
 
 
-def build_jit_cache_provider_set_matrix(
-    config: dict[str, Any],
-) -> list[dict[str, str]]:
+def build_jit_cache_shim_matrix(config: dict[str, Any]) -> list[dict[str, str]]:
     matrix = []
     for entry in config["jit_cache"]:
         for cpu_architecture in ("x86_64", "aarch64"):
@@ -399,7 +397,7 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path, default=default_root)
     parser.add_argument(
         "--matrix",
-        choices=("providers", "provider-sets"),
+        choices=("providers", "shims"),
         help="Print a compact GitHub Actions matrix after validation",
     )
     args = parser.parse_args()
@@ -415,12 +413,8 @@ def main() -> int:
         print(
             json.dumps(build_jit_cache_provider_matrix(config), separators=(",", ":"))
         )
-    elif args.matrix == "provider-sets":
-        print(
-            json.dumps(
-                build_jit_cache_provider_set_matrix(config), separators=(",", ":")
-            )
-        )
+    elif args.matrix == "shims":
+        print(json.dumps(build_jit_cache_shim_matrix(config), separators=(",", ":")))
     else:
         print(
             "Validated CUDA configuration: "

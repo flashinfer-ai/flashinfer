@@ -42,7 +42,7 @@ jobs:
       release_tag: ${{ steps.set-version.outputs.release_tag }}
       is_pr: ${{ steps.set-version.outputs.is_pr }}
       jit_cache_provider_matrix: ${{ steps.cuda-versions.outputs.providers }}
-      jit_cache_provider_set_matrix: ${{ steps.cuda-versions.outputs.provider_sets }}
+      jit_cache_shim_matrix: ${{ steps.cuda-versions.outputs.shims }}
       python_version: ${{ steps.set-version.outputs.python_version }}
     steps:
       - name: Determine if running in PR mode
@@ -137,7 +137,7 @@ jobs:
         id: cuda-versions
         run: |
           echo "providers=$(python3 ci/validate_cuda_versions.py --matrix providers)" >> "$GITHUB_OUTPUT"
-          echo "provider_sets=$(python3 ci/validate_cuda_versions.py --matrix provider-sets)" >> "$GITHUB_OUTPUT"
+          echo "shims=$(python3 ci/validate_cuda_versions.py --matrix shims)" >> "$GITHUB_OUTPUT"
 
   build-flashinfer-python:
     needs: setup
@@ -307,7 +307,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.setup.outputs.jit_cache_provider_set_matrix) }}
+        include: ${{ fromJSON(needs.setup.outputs.jit_cache_shim_matrix) }}
     runs-on: [self-hosted, linux, "${{ matrix.cpu_architecture == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
     steps:
       - name: Checkout code
@@ -343,7 +343,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.setup.outputs.jit_cache_provider_set_matrix) }}
+        include: ${{ fromJSON(needs.setup.outputs.jit_cache_shim_matrix) }}
     runs-on: [self-hosted, linux, "${{ matrix.cpu_architecture == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
     steps:
       - name: Checkout code
