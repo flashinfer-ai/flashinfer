@@ -4,9 +4,11 @@
 
 This document describes an experimental replacement for the monolithic
 `flashinfer-jit-cache` wheel. The runtime discovery contract, provider build,
-and gated release/nightly paths are implemented, but
-`ci/cuda-versions.json` keeps the legacy wheel as the configured default. The
-provider inventory must be validated on the fork before changing that switch.
+and gated release/nightly paths are implemented. This rollout branch sets
+`ci/cuda-versions.json` to `providers` so pull request and release dry runs
+exercise the split build, assembly, and validation paths. The explicit workflow
+override can still select `legacy` for comparison or rollback; publication
+remains protected by the existing main and tag gates.
 
 ## Problem
 
@@ -306,8 +308,10 @@ JIT disabled. Its SM86 runner is why SM86 appears explicitly in the provider
 inventory; exact provider matching does not treat SM80 as covering SM86.
 
 Provider publication and wheel-index updates occur only after the complete set
-passes. Changing `jit_cache_wheel_format` to `providers` activates the split
-format while retaining the legacy build and runtime fallback as a rollback path.
+passes. The configured `providers` value activates the split path for this
+validation pull request. An explicit `legacy` workflow override retains the
+aggregate-wheel build, and the runtime fallback remains available during the
+rollout.
 
 ## Validation Gates
 
@@ -333,9 +337,10 @@ Before changing release workflows or making shim mode the default:
    until broader coverage is represented explicitly and validated module by
    module.
 8. Exercise the gated release and nightly matrices from the fork, including
-   wheel-index generation. Change the configured format only after the
-   inventories pass. Decide stale-provider uninstall behavior before declaring
-   minimal installation stable.
+   wheel-index generation. Keep publication limited to the existing main and tag
+   gates while the provider inventories are reviewed, then decide whether to
+   retain `providers` as the production default. Decide stale-provider uninstall
+   behavior before declaring minimal installation stable.
 
 ## Open Decisions
 

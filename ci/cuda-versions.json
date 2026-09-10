@@ -9,7 +9,7 @@
       }
     }
   },
-  "jit_cache_wheel_format": "legacy",
+  "jit_cache_wheel_format": "providers",
   "runtime": [
     {
       "label": "cu129",
