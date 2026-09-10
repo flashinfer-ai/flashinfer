@@ -962,6 +962,29 @@ class FmhaDecodeConfig:
         return self.q_dtype_bytes == 1
 
     @property
+    def uses_byte_wide_p_schedule(self) -> bool:
+        """Whether the streamed P pass runs the byte-wide fragment schedule.
+
+        That schedule scales a whole fragment before its first exponential
+        and issues the next fragment's TMEM load once the scale FFMAs have
+        consumed the current scores, so the load reuses the score registers
+        and the loop body stays single; it seeds each probability sum chain
+        with its first pair instead of adding it to zero, which ptxas cannot
+        fold under IEEE semantics; and it carries the running sum as a packed
+        pair folded once after the loop. Only the combination pays off:
+        scaling ahead on its own lengthens the exponent chains, and the load
+        on its own needs a second fragment of registers. The 16-bit profiles
+        measured slower with the same order and keep the fused
+        load-wait-scale-exponentiate body with zero-seeded chains and a
+        scalar sum. The gain depends on the surrounding schedule (it appeared
+        only once the masked max pass shrank), so re-measure it whenever the
+        max pass, the tail pack or the fragment width changes. This is a
+        performance policy that follows the element width, not a dtype
+        requirement.
+        """
+        return self.use_8bit_qkv
+
+    @property
     def use_fp8_output(self) -> bool:
         """Whether final O is stored as FP8 E4M3."""
         return self.out_dtype == Float8E4M3FN

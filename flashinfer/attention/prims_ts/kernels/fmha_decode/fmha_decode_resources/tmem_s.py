@@ -2487,6 +2487,11 @@ class TmemSResource(DecodeGenResourceBase):
         # exponent already carries the right mass. The route kind is uniform
         # across the CTA, so the branch below is uniform as well.
         proxy_max_shift = Float32(0.0)
+        tail_shift = Float32(0.0)
+        tail_fragment_mask = Int32(0)
+        tail_lane: Constexpr[int] = 0
+        static_tail = None
+        shifts_tail: Constexpr[bool] = False
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The route kind and the tail location are the same for every
             # lane; stating that keeps the fold and the load/store branch
@@ -2498,24 +2503,21 @@ class TmemSResource(DecodeGenResourceBase):
                 )
             )
             tail_summary_idx, tail_log2_delta = _proxy_tail_summary(cfg)
-            tail_lane: Constexpr[int] = tail_summary_idx % fragment_regs
-            tail_shift = Float32(0.0)
-            tail_fragment_mask = Int32(0)
+            tail_lane = tail_summary_idx % fragment_regs
+            shifts_tail = tail_log2_delta != 0.0
             if route_is_proxy:
                 inv_scale_softmax_log2 = cute.math.rcp(self.scale_softmax_log2)
                 proxy_max_shift = (
                     Float32(_proxy_log2_block_mass(cfg)) * inv_scale_softmax_log2
                 )
                 tail_shift = Float32(tail_log2_delta) * inv_scale_softmax_log2
-            # The Sage shift below divides by the lane's group scale, so every
-            # fragment copy of it in the masked pass carries a reciprocal and
-            # a scale-array read; a compile-time tail location keeps one copy
-            # and drops the per-fragment origin arithmetic. The 16-bit shift is
-            # one add and keeps the origin-derived location.
-            static_tail = None
-            if cutlass.const_expr(tail_log2_delta != 0.0 and cfg.use_sage_attention):
+            # A compile-time tail location drops the per-fragment origin
+            # arithmetic and lets the masked pass decide whether a fragment
+            # holds the tail from one mask bit. The 16-bit shift is one add
+            # and keeps the origin-derived location.
+            if cutlass.const_expr(shifts_tail and cfg.use_sage_attention):
                 static_tail = _proxy_static_tail_fragment(cfg)
-            if cutlass.const_expr(tail_log2_delta != 0.0):
+            if cutlass.const_expr(shifts_tail):
                 if cutlass.const_expr(static_tail is not None):
                     tail_half, tail_static_fragment = static_tail
                     holds_tail = route_is_proxy
@@ -2582,8 +2584,8 @@ class TmemSResource(DecodeGenResourceBase):
                     self._fold_sage_fragment_max(
                         max_chains,
                         loaded,
-                        fragment_idx=fragment_idx,
-                        sage_scale_arr=sage_scale_arr,
+                        group_scales=sage_scale_arr,
+                        scale_base=fragment_idx * cfg.sage_k_groups_per_fragment,
                         may_be_masked=False,
                     )
                 else:
@@ -2611,79 +2613,55 @@ class TmemSResource(DecodeGenResourceBase):
                         visible_end - fragment_token_base,
                         fragment_regs=fragment_regs,
                     )
-            for fragment_idx in cutlass.range_constexpr(num_fragments):
-                fragment_addr = score_tmem_addr + Int32(fragment_idx * fragment_regs)
-                loaded = _keeps_tcgen05_ld(
-                    cfg,
-                    prims.make_tmem_ptr(fragment_addr, Float32),
-                    num=fragment_regs,
-                    offset=cfg.tile_size_kv // 2,
-                )
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                masked_scores = cutlass.Array(
-                    Float32, fragment_regs, space=cutlass.AddressSpace.rmem
-                )
-                for score_idx in cutlass.range_constexpr(fragment_regs):
-                    # Biased INT32 scores have unit spacing, so the tail shift
-                    # below rounds to half a quantized score unit on them.
-                    score = Float32(loaded[score_idx])
-                    score_is_kept = (
-                        (keep_words[fragment_idx] >> Int32(score_idx)) & Uint32(1)
-                    ) != Uint32(0)
-                    if not score_is_kept:
-                        score = _neg_max_f32()
-                    if cutlass.const_expr(
-                        use_sparse
-                        and cfg.use_block_sparse_proxy_routes
-                        and tail_log2_delta != 0.0
-                        and score_idx == tail_lane
-                        and (static_tail is None or fragment_idx == static_tail[1])
-                    ):
-                        # The final summary's shortfall is a score-unit shift;
-                        # a masked score stays at the sentinel in fp32. Sage
-                        # scores are quantized, so the shift is divided by the
-                        # lane's group scale. The approximate reciprocal is
-                        # within one ulp on a shift far below the score
-                        # resolution, and unlike the correctly rounded one it
-                        # needs no out-of-line slow-path call per fragment.
-                        if (
-                            (tail_fragment_mask >> Int32(fragment_idx)) & Int32(1)
-                        ) != Int32(0):
-                            lane_shift = tail_shift
-                            if cutlass.const_expr(cfg.use_sage_attention):
-                                groups = cfg.sage_k_groups_per_fragment
-                                tail_group: Constexpr[int] = tail_lane // (
-                                    fragment_regs // groups
-                                )
-                                lane_shift = tail_shift * cute.math.rcp(
-                                    Float32(
-                                        sage_scale_arr[
-                                            fragment_idx * groups + tail_group
-                                        ]
-                                    ),
-                                    approx=True,
-                                )
-                            score = score + lane_shift
-                    masked_scores[score_idx] = score
-                    if cutlass.const_expr(not cfg.use_sage_attention):
-                        chain_idx: Constexpr[int] = score_idx % 4
-                        max_chains[chain_idx] = cute.math.max(
-                            max_chains[chain_idx], score, ftz=True
-                        )
+            if cutlass.const_expr(cfg.use_8bit_qkv):
+                # Byte-wide profiles roll the masked fragments so their mask,
+                # shift, fold and write-back exist once per softmax instance;
+                # the keep words and Sage scales rotate down each iteration
+                # like the P pass multipliers, so no runtime selection is
+                # needed. 16-bit profiles keep the unrolled form.
+                groups = cfg.sage_k_groups_per_fragment
+                group_scales = None
                 if cutlass.const_expr(cfg.use_sage_attention):
-                    self._fold_sage_fragment_max(
-                        max_chains,
-                        masked_scores,
-                        fragment_idx=fragment_idx,
-                        sage_scale_arr=sage_scale_arr,
-                        may_be_masked=True,
+                    group_scales = cutlass.Array(
+                        Float32,
+                        sage_scale_arr_size(cfg),
+                        space=cutlass.AddressSpace.rmem,
                     )
-                _keeps_tcgen05_st(
-                    cfg,
-                    prims.make_tmem_ptr(fragment_addr, Float32),
-                    masked_scores.data_ptr().load(count=fragment_regs, alignment=4),
-                    offset=cfg.tile_size_kv // 2,
-                )
+                    for entry in cutlass.range_constexpr(sage_scale_arr_size(cfg)):
+                        group_scales[entry] = Float32(sage_scale_arr[entry])
+                for fragment in cutlass.range(num_fragments, unroll=1):
+                    self._mask_score_fragment(
+                        score_tmem_addr,
+                        Int32(fragment),
+                        keep_word=Uint32(keep_words[0]),
+                        max_chains=max_chains,
+                        group_scales=group_scales,
+                        may_hold_tail=shifts_tail,
+                        tail_fragment_mask=tail_fragment_mask,
+                        tail_shift=tail_shift,
+                        tail_lane=tail_lane,
+                    )
+                    for entry in cutlass.range_constexpr(num_fragments - 1):
+                        keep_words[entry] = Uint32(keep_words[entry + 1])
+                    if cutlass.const_expr(cfg.use_sage_attention):
+                        for entry in cutlass.range_constexpr(
+                            sage_scale_arr_size(cfg) - groups
+                        ):
+                            group_scales[entry] = Float32(group_scales[entry + groups])
+            else:
+                for fragment_idx in cutlass.range_constexpr(num_fragments):
+                    self._mask_score_fragment(
+                        score_tmem_addr,
+                        Int32(fragment_idx),
+                        keep_word=keep_words[fragment_idx],
+                        max_chains=max_chains,
+                        group_scales=None,
+                        may_hold_tail=shifts_tail
+                        and (static_tail is None or fragment_idx == static_tail[1]),
+                        tail_fragment_mask=tail_fragment_mask,
+                        tail_shift=tail_shift,
+                        tail_lane=tail_lane,
+                    )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
 
@@ -2704,20 +2682,98 @@ class TmemSResource(DecodeGenResourceBase):
         return old_max_arr, sum_arr, new_max_arr, s_arr
 
     @cute.jit
+    def _mask_score_fragment(
+        self,
+        score_tmem_addr: Int32,
+        fragment: Int32,
+        *,
+        keep_word: Uint32,
+        max_chains: cutlass.Array,
+        group_scales: cutlass.Array | None,
+        may_hold_tail: Constexpr[bool],
+        tail_fragment_mask: Int32,
+        tail_shift: Float32,
+        tail_lane: Constexpr[int],
+    ) -> None:
+        """Mask one K32 score fragment in place, fold its maximum, write it back.
+
+        Scores whose keep bit is clear become the ``-FLT_MAX`` sentinel. A
+        fragment that holds a proxy route's ragged final summary adds the
+        summary's mass shortfall to that score: a score-unit shift that leaves
+        a masked score at the sentinel in fp32. Sage scores are quantized, so
+        the shift is divided by the lane's group scale (``group_scales`` holds
+        the fragment's scales first); the approximate reciprocal is within one
+        ulp on a shift far below the score resolution and needs no
+        out-of-line slow path. Biased INT32 scores have unit spacing, so the
+        shift rounds to half a quantized score unit on them.
+        """
+        cfg = self.cfg
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragment_addr = score_tmem_addr + fragment * Int32(fragment_regs)
+        loaded = _keeps_tcgen05_ld(
+            cfg,
+            prims.make_tmem_ptr(fragment_addr, Float32),
+            num=fragment_regs,
+            offset=cfg.tile_size_kv // 2,
+        )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        masked_scores = cutlass.Array(
+            Float32, fragment_regs, space=cutlass.AddressSpace.rmem
+        )
+        for score_idx in cutlass.range_constexpr(fragment_regs):
+            score = Float32(loaded[score_idx])
+            score_is_kept = ((keep_word >> Int32(score_idx)) & Uint32(1)) != Uint32(0)
+            if not score_is_kept:
+                score = _neg_max_f32()
+            if cutlass.const_expr(may_hold_tail and score_idx == tail_lane):
+                if ((tail_fragment_mask >> fragment) & Int32(1)) != Int32(0):
+                    lane_shift = tail_shift
+                    if cutlass.const_expr(cfg.use_sage_attention):
+                        groups = cfg.sage_k_groups_per_fragment
+                        tail_group: Constexpr[int] = tail_lane // (
+                            fragment_regs // groups
+                        )
+                        lane_shift = tail_shift * cute.math.rcp(
+                            Float32(group_scales[tail_group]), approx=True
+                        )
+                    score = score + lane_shift
+            masked_scores[score_idx] = score
+            if cutlass.const_expr(not cfg.use_sage_attention):
+                chain_idx: Constexpr[int] = score_idx % 4
+                max_chains[chain_idx] = cute.math.max(
+                    max_chains[chain_idx], score, ftz=True
+                )
+        if cutlass.const_expr(cfg.use_sage_attention):
+            self._fold_sage_fragment_max(
+                max_chains,
+                masked_scores,
+                group_scales=group_scales,
+                scale_base=0,
+                may_be_masked=True,
+            )
+        _keeps_tcgen05_st(
+            cfg,
+            prims.make_tmem_ptr(fragment_addr, Float32),
+            masked_scores.data_ptr().load(count=fragment_regs, alignment=4),
+            offset=cfg.tile_size_kv // 2,
+        )
+
+    @cute.jit
     def _fold_sage_fragment_max(
         self,
         max_chains: cutlass.Array,
         scores,
         *,
-        fragment_idx: Constexpr[int],
-        sage_scale_arr: cutlass.Array,
+        group_scales: cutlass.Array,
+        scale_base: Constexpr[int],
         may_be_masked: Constexpr[bool],
     ) -> None:
         """Fold one fragment's dequantized group maxima into the max chains.
 
         Each compile-time scale group of the fragment is reduced first and
         ``group_max * sfQ * sfK_g`` is folded, so the running maximum is the
-        dequantized one while the scores stay quantized. On the unmasked
+        dequantized one while the scores stay quantized; the fragment's
+        scales start at ``scale_base`` in ``group_scales``. On the unmasked
         path the four chains of a group start from its first four scores, so
         a group of ``n`` scores costs ``n - 1`` maxima, and two group maxima
         are scaled with one packed multiply. Masked fragments keep the
@@ -2725,7 +2781,12 @@ class TmemSResource(DecodeGenResourceBase):
         ``-FLT_MAX`` sentinel, as scaling it would move it off the value the
         anchor and tail logic compare against. Biased INT32 scores lose their
         bias here, once per group; the subtraction is exact on their unit
-        spacing and leaves the sentinel unchanged.
+        spacing and leaves the sentinel unchanged. Each scaled group maximum
+        folds into the max chain ``(scale_base + group) % 4``: the unrolled
+        unmasked pass spreads the fragments over the four chains, while the
+        rolled masked pass rotates its scales and passes ``scale_base=0``, so
+        every fragment folds into the leading chains and the remaining chains
+        keep their seed; the final reduction over all chains is unaffected.
         """
         cfg = self.cfg
         groups = cfg.sage_k_groups_per_fragment
@@ -2756,20 +2817,19 @@ class TmemSResource(DecodeGenResourceBase):
                 group_max = group_max - Float32(INT32_SCORE_BIAS)
             group_maxima[group_idx] = group_max
 
-        scale_base = fragment_idx * groups
         scaled_maxima = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
         if cutlass.const_expr(groups == 2 and not may_be_masked):
             scaled_maxima[0], scaled_maxima[1] = fmul2(
                 (Float32(group_maxima[0]), Float32(group_maxima[1])),
                 (
-                    Float32(sage_scale_arr[scale_base]),
-                    Float32(sage_scale_arr[scale_base + 1]),
+                    Float32(group_scales[scale_base]),
+                    Float32(group_scales[scale_base + 1]),
                 ),
             )
         else:
             for group_idx in cutlass.range_constexpr(groups):
                 scaled_maxima[group_idx] = Float32(group_maxima[group_idx]) * Float32(
-                    sage_scale_arr[scale_base + group_idx]
+                    group_scales[scale_base + group_idx]
                 )
         for group_idx in cutlass.range_constexpr(groups):
             scaled_max = Float32(scaled_maxima[group_idx])
