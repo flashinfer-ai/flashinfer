@@ -1492,8 +1492,8 @@ class FusedMoeLauncher {
   void prepare_moe_runner(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
     bool usePerTokenScalingGemm1 = per_token_scales.has_value() || args->mUseRoutingScalesOnInput;
-    // FIXME(siyuan): currently only nvfp4 x nvfp4 uses per-token scaling in both FC1 and FC2
-    bool usePerTokenScalingGemm2 = per_token_scales.has_value() && mDtypeAct == btg::Dtype::E2m1;
+    bool usePerTokenScalingGemm2 = per_token_scales.has_value() &&
+                                   (mDtypeAct == btg::Dtype::E2m1 || use_per_channel_scaling_gemm2);
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8 and no
     // gemm1 bias, use the weights-only Runner constructor to match the original kernel
     // path and numerics. DSFp8 + biasMn routes through the unified constructor below
@@ -2443,24 +2443,27 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
   void prepare_moe(int64_t& moe_tactic) override {
     FusedMoeLauncher::prepare_moe_common(moe_tactic);
 
-    int32_t max_num_padded_tokens_gemm1 = workspace.total_max_padded_tokens + args->num_experts;
+    int32_t max_num_padded_tokens_gemm1 =
+        tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+            workspace.total_max_padded_tokens, args->intermediate_size,
+            btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
     int32_t max_num_padded_tokens_gemm2 = workspace.total_max_padded_tokens;
 
-    gemm1_output = alloc_tensor(
-        {max_num_padded_tokens_gemm1, intermediate_size_factor * args->intermediate_size}, dl_uint8,
-        hidden_states.device());
-    gemm1_output_scale = alloc_tensor(
-        {intermediate_size_factor * args->intermediate_size / 128, max_num_padded_tokens_gemm1},
-        dl_float32, hidden_states.device());
+    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size}, dl_bfloat16,
+                                hidden_states.device());
+    activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
+                                     dl_uint8, hidden_states.device());
+    activation_output_scale =
+        alloc_tensor({max_num_padded_tokens_gemm1}, dl_float32, hidden_states.device());
 
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
                                 hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
-    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
-    workspace.activation_output = nullptr;
-    workspace.activation_output_scale = nullptr;
+    workspace.gemm1_output_scale = nullptr;
+    workspace.activation_output = activation_output.data_ptr();
+    workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
     workspace.gemm2_output = gemm2_output.data_ptr();
     workspace.gemm2_output_scale = nullptr;
 
@@ -2489,7 +2492,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
   TensorView gemm2_per_channel_weight_scale_;
   TensorView expert_indices_;
   TensorView expert_weights_;
-  Tensor gemm1_output_scale;
+  Tensor activation_output_scale;
 
  public:
   static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
@@ -2513,7 +2516,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
           static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
           /*gemm1BiasType*/ batchedGemm::gemm::BiasType::None,
           /*usePerTokenScalingGemm1*/ true,
-          /*usePerTokenScalingGemm2*/ false,
+          /*usePerTokenScalingGemm2*/ true,
           /*usePerChannelScalingGemm1*/ true,
           /*usePerChannelScalingGemm2*/ true);
 
