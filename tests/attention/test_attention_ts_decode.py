@@ -2294,6 +2294,9 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "out_dtype",
         "page_size",
         "split_kv",
+        "workspace_buffer",
+        "max_kv_len",
+        "validate",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -3962,6 +3965,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_TrustedDecodePlanState",
         (),
         {
+            "output_dtype": torch.bfloat16,
             "use_packed_q": False,
             "workspace": object(),
             "compiled_main": object(),
@@ -4244,6 +4248,7 @@ def test_attention_ts_decode_planned_full_dynamic_uses_owned_seq_lens(
         "_PlannedFullDynamicDecodePlanState",
         (),
         {
+            "output_dtype": torch.bfloat16,
             "use_packed_q": False,
             "workspace": object(),
             "compiled_main": object(),
@@ -4305,12 +4310,19 @@ def test_attention_ts_decode_plan_owned_validation_uses_host_seq_lens() -> None:
         (),
         {
             "num_physical_pages": 1,
+            "k_cache": torch.empty((1, 1, 16, 64)),
             "q": torch.empty((1, 8, 64)),
         },
     )()
     _validate_decode_run_metadata_values(
-        state,
         runtime,
+        planned_seq_lens_host=state.planned_seq_lens_host,
+        max_kv_len=state.max_kv_len,
+        page_size=state.page_size,
+        use_packed_q=state.use_packed_q,
+        seq_len_q=state.seq_len_q,
+        batch_size=state.batch_size,
+        mask_type=state.mask_type,
         seq_lens=cast(torch.Tensor, _NoDeviceReadback()),
         block_tables=torch.tensor(((0,),), dtype=torch.int32),
         qo_indptr=None,
@@ -4502,7 +4514,7 @@ def test_attention_ts_decode_one_shot_rejects_graph_capture(
 
     device = torch.device("cuda")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="cannot derive host plan bounds"):
+    with pytest.raises(RuntimeError, match="CUDA graph capture requires"):
         batch_decode_with_paged_kv_cache(
             torch.empty((1, 8, 64), dtype=torch.float16, device=device),
             torch.empty((1, 2, 1, 32, 64), dtype=torch.float16, device=device),
