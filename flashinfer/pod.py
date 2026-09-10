@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import warnings
 from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple, Union
 
@@ -56,6 +57,41 @@ def get_pod_module(*args):
 def get_batch_pod_module(*args):
     module = gen_batch_pod_module(*args).build_and_load()
     return SimpleNamespace(run_tensor=module.batch_pod_with_kv_cache_tensor)
+
+
+def _check_deprecated_decode_run_args(passed: dict, planned: dict) -> None:
+    """Warn for decode-side settings passed to run() and reject values that
+    differ from plan(); the decode kernel is selected at plan() time, so they
+    can only be validated here."""
+    given = {name: value for name, value in passed.items() if value is not None}
+    if not given:
+        return
+    warnings.warn(
+        f"Passing {sorted(given)} to PODWithPagedKVCacheWrapper.run() is "
+        "deprecated; set the decode-side settings in plan() instead. Scheduled "
+        "for removal in a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    for name, value in given.items():
+        if value != planned[name]:
+            raise ValueError(
+                f"{name}={value!r} differs from the value planned for the decode "
+                f"side ({planned[name]!r}); decode-side settings are fixed by plan()"
+            )
+
+
+def _check_decode_mask_args(
+    custom_mask_d: Optional[torch.Tensor],
+    packed_custom_mask_d: Optional[torch.Tensor],
+    causal_d: bool,
+) -> None:
+    if custom_mask_d is not None or packed_custom_mask_d is not None or causal_d:
+        raise NotImplementedError(
+            "the decode side of PODWithPagedKVCacheWrapper runs non-causal "
+            "attention without a custom mask; custom_mask_d, packed_custom_mask_d "
+            "and causal_d are not supported"
+        )
 
 
 class PODWithPagedKVCacheWrapper:
@@ -320,8 +356,7 @@ class PODWithPagedKVCacheWrapper:
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
         sm_scale : Optional[float]
-            Softmax scale.  If ``None``, defaults to ``1 / sqrt(head_dim)``.  Cached on
-            the wrapper and reused at :meth:`run` time.
+            Softmax scale.  If ``None``, defaults to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             Scale factor applied during RoPE interpolation.  Only consulted when
             ``pos_encoding_mode != "NONE"``.  Defaults to ``1.0`` when ``None``.
@@ -343,6 +378,11 @@ class PODWithPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
+
+        The ``pos_encoding_mode``, ``window_left``, ``sm_scale``, ``rope_scale`` and
+        ``rope_theta`` given here are also the decode-side settings used by
+        :meth:`run`, which has no decode-side overrides.  Logits soft-capping is
+        not supported by this wrapper.
         """
         # Logits soft cap is not supported currently
         batch_size = len(last_page_len)
@@ -473,10 +513,10 @@ class PODWithPagedKVCacheWrapper:
         custom_mask_d: Optional[torch.Tensor] = None,
         packed_custom_mask_d: Optional[torch.Tensor] = None,
         causal_d: bool = False,
-        kv_layout_d: str = "NHD",
-        pos_encoding_mode_d: str = "NONE",
+        kv_layout_d: Optional[str] = None,
+        pos_encoding_mode_d: Optional[str] = None,
         sm_scale_d: Optional[float] = None,
-        window_left_d: int = -1,
+        window_left_d: Optional[int] = None,
         rope_scale_d: Optional[float] = None,
         rope_theta_d: Optional[float] = None,
         q_scale: Optional[float] = None,
@@ -533,27 +573,16 @@ class PODWithPagedKVCacheWrapper:
             limitation of the current POD wrapper (kernel API exists, Python
             wrapper does not yet plumb LSE through the return value).
         custom_mask_d, packed_custom_mask_d : Optional[torch.Tensor]
-            Optional dense / bit-packed custom mask for the decode side.
+            Deprecated and unsupported: the decode side runs without a custom
+            mask, so a value other than ``None`` raises ``NotImplementedError``.
         causal_d : bool
-            Whether to apply a causal mask to the decode side.  Defaults to
-            ``False``.
-        kv_layout_d : str
-            **Currently ignored**: the decode KV layout is always taken from
-            the wrapper's ``kv_layout`` (set in :meth:`__init__`); this
-            argument is accepted for signature symmetry with ``kv_layout_p``
-            but the value is not consulted by the kernel.
-        pos_encoding_mode_d : str
-            **Currently ignored**: overridden by ``self._pos_encoding_mode``
-            from :meth:`plan`.
-        sm_scale_d : Optional[float]
-            **Currently ignored**: overridden by ``self._sm_scale`` from
-            :meth:`plan` (which itself defaults to ``1 / sqrt(head_dim)``).
-        window_left_d : int
-            **Currently ignored**: overridden by ``self._window_left`` from
-            :meth:`plan`.
-        rope_scale_d, rope_theta_d : Optional[float]
-            **Currently ignored**: overridden by ``self._rope_scale`` /
-            ``self._rope_theta`` from :meth:`plan`.
+            Deprecated and unsupported: the decode side runs non-causal
+            attention, so ``True`` raises ``NotImplementedError``.
+        kv_layout_d, pos_encoding_mode_d, sm_scale_d, window_left_d, rope_scale_d, rope_theta_d : optional
+            Deprecated: the decode-side settings are fixed by :meth:`plan` and
+            the layout by :meth:`__init__`.  A value passed here emits a
+            ``DeprecationWarning`` and must equal the planned value
+            (``ValueError`` otherwise); these arguments will be removed.
         q_scale, k_scale, v_scale : Optional[float]
             FP8 calibration scales applied to the decode side.  Folded into the
             decode ``sm_scale`` (``q_scale``, ``k_scale``) or the kernel output
@@ -570,6 +599,15 @@ class PODWithPagedKVCacheWrapper:
             wrapper auto-detects support from the query device.
         *args
             Reserved for forward-compat with future kernel parameters.
+
+        Note
+        ----
+        The decode-side ``pos_encoding_mode``, ``window_left``, ``sm_scale``,
+        ``rope_scale`` and ``rope_theta`` are taken from :meth:`plan`; the
+        ``*_d`` arguments above only validate against them and are deprecated.
+        Logits soft-capping is not supported by this wrapper.  The decode KV
+        layout is fixed by ``kv_layout`` in :meth:`__init__`.  The decode side
+        always runs non-causal attention without a custom mask.
 
         Returns
         -------
@@ -625,28 +663,47 @@ class PODWithPagedKVCacheWrapper:
         _check_cached_qkv_data_type(
             q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
         )
-        # TODO_AK: Where are these coming from?
-        pos_encoding_mode_d = self._pos_encoding_mode
-        window_left_d = self._window_left
-        logits_soft_cap_d = self._logits_soft_cap
-        sm_scale_d = self._sm_scale
-        rope_scale_d = self._rope_scale
-        rope_theta_d = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode_d)
-        # What are the above for and what are the below?
-        if logits_soft_cap_d is None:
-            logits_soft_cap_d = 0.0
-        if sm_scale_d is None:
-            head_dim = q_d.shape[-1]
-            sm_scale_d = 1.0 / math.sqrt(head_dim)
+        planned_pos_encoding_mode: str = self._pos_encoding_mode
+        planned_window_left: int = self._window_left
+        planned_sm_scale: float = (
+            self._sm_scale
+            if self._sm_scale is not None
+            else 1.0 / math.sqrt(q_d.shape[-1])
+        )
+        planned_rope_scale: float = (
+            1.0 if self._rope_scale is None else self._rope_scale
+        )
+        planned_rope_theta: float = (
+            1e4 if self._rope_theta is None else self._rope_theta
+        )
+        _check_deprecated_decode_run_args(
+            {
+                "kv_layout_d": kv_layout_d,
+                "pos_encoding_mode_d": pos_encoding_mode_d,
+                "sm_scale_d": sm_scale_d,
+                "window_left_d": window_left_d,
+                "rope_scale_d": rope_scale_d,
+                "rope_theta_d": rope_theta_d,
+            },
+            {
+                "kv_layout_d": self._kv_layout,
+                "pos_encoding_mode_d": planned_pos_encoding_mode,
+                "sm_scale_d": planned_sm_scale,
+                "window_left_d": planned_window_left,
+                "rope_scale_d": planned_rope_scale,
+                "rope_theta_d": planned_rope_theta,
+            },
+        )
+        _check_decode_mask_args(custom_mask_d, packed_custom_mask_d, causal_d)
+        _check_pos_encoding_mode(planned_pos_encoding_mode)
+        logits_soft_cap_d = (
+            0.0 if self._logits_soft_cap is None else self._logits_soft_cap
+        )
+        decode_sm_scale = planned_sm_scale
         if q_scale is not None:
-            sm_scale_d *= q_scale
+            decode_sm_scale *= q_scale
         if k_scale is not None:
-            sm_scale_d *= k_scale
-        if rope_scale_d is None:
-            rope_scale_d = 1.0
-        if rope_theta_d is None:
-            rope_theta_d = 1e4
+            decode_sm_scale *= k_scale
 
         lse_d = None
         if return_lse_d:
@@ -672,8 +729,8 @@ class PODWithPagedKVCacheWrapper:
             self._indptr_type,
             # head_dim,  # head_dim_qk
             # head_dim,  # head_dim_vo
-            PosEncodingMode[pos_encoding_mode_d].value,
-            window_left_d != -1,  # use_sliding_window
+            PosEncodingMode[planned_pos_encoding_mode].value,
+            planned_window_left != -1,  # use_sliding_window
             logits_soft_cap_d > 0,  # use_logits_soft_cap
         )
         module_getter.run_tensor(
@@ -708,14 +765,14 @@ class PODWithPagedKVCacheWrapper:
             lse_d,
             MaskMode.NON_CAUSAL.value,
             TensorLayout[self._kv_layout].value,
-            window_left_d,
+            planned_window_left,
             None,  # packed_custom_mask
             None,  # mask_indptr_buf
             _get_cache_alibi_slopes_buf(q_d.shape[1], q_d.device),
             logits_soft_cap_d,
-            sm_scale_d,
-            1.0 / rope_scale_d,
-            1.0 / rope_theta_d,
+            decode_sm_scale,
+            1.0 / planned_rope_scale,
+            1.0 / planned_rope_theta,
             enable_pdl,
         )
 
