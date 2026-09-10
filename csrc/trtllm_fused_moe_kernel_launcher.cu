@@ -949,8 +949,12 @@ void cast_fp32_to_bf16(void* output, void const* input, int64_t num_elements, cu
 }  // namespace
 
 // Validate routing_replay_out tensor properties.
-// NOTE: dim0 >= num_tokens is intentionally NOT checked — with CUDA graphs the buffer
-// is pre-allocated at maximum batch size and reused across steps with varying num_tokens.
+// NOTE: dim0 is only bounded from below. The routing kernels write one replay row per
+// token unconditionally (DeepSeek launches numBlocks == num_tokens and writes row
+// blockIdx.x; the custom and llama4 kernels write row tokenIdx), so a buffer with fewer
+// rows than tokens is written past its end. Oversized buffers stay legal: with CUDA
+// graphs the buffer is pre-allocated at maximum batch size and reused across steps with
+// varying num_tokens.
 static void validate_routing_replay_out(TensorView const& replay, TensorView const& hidden_states,
                                         int64_t top_k) {
   TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
@@ -959,6 +963,9 @@ static void validate_routing_replay_out(TensorView const& replay, TensorView con
       << "routing_replay_out must be on the same device as hidden_states";
   TVM_FFI_ICHECK(replay.ndim() == 2) << "routing_replay_out must be 2D [num_tokens, top_k]";
   TVM_FFI_ICHECK(replay.size(1) == top_k) << "routing_replay_out dim1 must equal top_k";
+  TVM_FFI_ICHECK(replay.size(0) >= hidden_states.size(0))
+      << "routing_replay_out dim0 must be >= num_tokens (" << hidden_states.size(0) << "), got "
+      << replay.size(0) << "; the routing kernel writes one replay row per token";
   TVM_FFI_ICHECK((replay.dtype() == DLDataType{kDLInt, 16, 1}))
       << "routing_replay_out must be int16 dtype";
   TVM_FFI_ICHECK(replay.IsContiguous())

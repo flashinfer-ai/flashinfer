@@ -81,8 +81,6 @@ from .jit.flash_kda import (
     gen_flash_kda_m128_n16_checkpoint_module,
     get_flash_kda_generated_variant_ids,
 )
-from .jit.flash_kda_backward import gen_flash_kda_backward_module
-from .jit.flash_kda_training import gen_flash_kda_training_module
 from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_DIRECT_VARIANTS,
     FLASH_KDA_DECODE_VARIANTS,
@@ -548,12 +546,6 @@ def gen_all_modules(
     has_flash_kda_decode_sm103a_direct = sm_capabilities.get(
         "flash_kda_decode_sm103a_direct", False
     )
-    has_flash_kda_backward_sm100a = sm_capabilities.get(
-        "flash_kda_backward_sm100a", False
-    )
-    has_flash_kda_backward_sm103a = sm_capabilities.get(
-        "flash_kda_backward_sm103a", False
-    )
     has_cake_kda_decode_sm100a_legacy = sm_capabilities.get(
         "cake_kda_decode_sm100a_legacy", False
     )
@@ -663,13 +655,6 @@ def gen_all_modules(
             gen_flash_kda_decode_module(variant, "sm103a")
             for variant in FLASH_KDA_DECODE_DIRECT_VARIANTS
         )
-    if has_flash_kda_backward_sm100a:
-        jit_specs.append(gen_flash_kda_backward_module("sm100a"))
-        jit_specs.append(gen_flash_kda_training_module("sm100a"))
-    if has_flash_kda_backward_sm103a:
-        jit_specs.append(gen_flash_kda_backward_module("sm103a"))
-        jit_specs.append(gen_flash_kda_training_module("sm103a"))
-
     # The Cake-owned direct T1 kernels follow the same legacy/family/exact
     # target policy as the provenanced FlashKDA decode portfolio.
     if has_cake_kda_decode_sm100a_legacy:
@@ -733,6 +718,7 @@ def gen_all_modules(
                 for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
                 for dtype in BLACKWELL_BGMV_MOE_DTYPES
             )
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_sm90:
@@ -777,7 +763,8 @@ def gen_all_modules(
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
-            jit_specs.append(gen_cake_fused_moe_warp_decode_module())
+        if sm_capabilities.get("sm103a_exact", False):
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
         if has_sm107:
             jit_specs.append(gen_fp4_quantization_sm107_module())
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
@@ -1230,14 +1217,6 @@ def detect_sm_capabilities():
             flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
         )
         and cuda_version >= Version("12.9"),
-        "flash_kda_backward_sm103a": bool(
-            flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
-        )
-        and cuda_version >= Version("12.9"),
-        "flash_kda_backward_sm100a": (
-            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
-            and cuda_version >= Version("12.8")
-        ),
         "cake_kda_decode_sm100a_legacy": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
             and Version("12.8") <= cuda_version < Version("12.9")

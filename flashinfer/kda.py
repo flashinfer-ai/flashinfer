@@ -34,19 +34,6 @@ from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from .jit import flash_kda_indexed as _flash_kda_indexed
 from .api_logging import flashinfer_api
-from .kda_backward import (
-    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
-)
-from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
-from .kda_training import (
-    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
-)
-from .kda_training import (
-    recurrent_kda_training_backward as recurrent_kda_training_backward,
-)
-from .kda_training import (
-    recurrent_kda_training_forward as recurrent_kda_training_forward,
-)
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
