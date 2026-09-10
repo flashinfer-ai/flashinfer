@@ -39,6 +39,9 @@ from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
 )
+from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import autotune_v2 as autotune_v2
+from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
@@ -66,6 +69,7 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .decode import sm110_gqa_decode as sm110_gqa_decode
 from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
 from .cake_dcp import (
     get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
@@ -118,14 +122,19 @@ from .fused_moe import (
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
+        cute_dsl_fused_moe as cute_dsl_fused_moe,
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper as CuteDslMoEWrapper,
         cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
+        CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
+        cute_dsl_fused_moe_bf16 as cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+
+
 # The fused GDN decode step is surfaced here like the other GDN APIs; the
 # code lives under flashinfer/gdn_kernels/experimental/ (see its README),
 # but "experimental" describes the file location, not the import path.
@@ -177,6 +186,7 @@ from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
+from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
@@ -224,6 +234,9 @@ from .page import (
 )
 from .page import (
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+from .page import (
+    nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,
 )
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper

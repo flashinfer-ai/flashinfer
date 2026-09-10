@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import warnings
+
 # Unified MoE API
 from .api import (  # noqa: F401
     # Typed activation values
@@ -32,6 +34,7 @@ from .api import (  # noqa: F401
     B12xNvfp4Config,
     B12xW4A16Config,
     BackendOptions,
+    CakeWarpDecodeConfig,
     CuteDslConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
@@ -42,6 +45,8 @@ from .api import (  # noqa: F401
     CutlassNvfp4Config,
     CutlassW4A16Config,
     CutlassW4A8Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
@@ -49,6 +54,7 @@ from .api import (  # noqa: F401
     MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     TrtllmBf16Config,
@@ -66,6 +72,7 @@ from .da_runtime import (  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -75,7 +82,9 @@ from .runners import (  # noqa: F401
     CutlassNvfp4Runner,
     CutlassW4A16Runner,
     CutlassW4A8Runner,
-    CuteDslNvfp4Runner,
+    CuTileBf16Runner,
+    CuTileNvfp4Runner,
+    CuteDslRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -101,6 +110,8 @@ from .core import (
     trtllm_fp4_block_scale_routed_moe,
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_block_scale_routed_moe,
+    trtllm_fp8_per_channel_scale_moe,
+    trtllm_fp8_per_channel_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
     trtllm_moe_allocate_routing_metadata,
@@ -161,17 +172,32 @@ from .monomoe import (  # noqa: F401
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
     from .cute_dsl import (
-        cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe,
         CuteDslMoEWrapper,
+        cute_dsl_fused_moe_nvfp4,
         cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
+        cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper,
     )
 
     _cute_dsl_available = True
 except ImportError:
     _cute_dsl_available = False
+
+
+def __getattr__(name: str):
+    if name == "CuteDslNvfp4Runner":
+        warnings.warn(
+            "CuteDslNvfp4Runner is deprecated; use CuteDslRunner instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CuteDslRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Typed activation values
@@ -192,6 +218,8 @@ __all__ = [
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",
+    "CakeWarpDecodeConfig",
+    "CakeWarpDecodeRunner",
     "CuteDslConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
@@ -211,8 +239,13 @@ __all__ = [
     "CutlassW4A16Runner",
     "CutlassW4A8Config",
     "CutlassW4A8Runner",
+    "CuTileBf16Config",
+    "CuTileBf16Runner",
+    "CuTileNvfp4Config",
+    "CuTileNvfp4Runner",
     "ExecutionConfig",
     "ExpertConfig",
+    "CuteDslRunner",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
@@ -233,6 +266,7 @@ __all__ = [
     "TrtllmFp8PerTensorRunner",
     "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
+    "QuantFormat",
     "QuantVariant",
     "RoutingConfig",
     "TrtllmBf16Config",
@@ -263,6 +297,8 @@ __all__ = [
     "trtllm_fp4_block_scale_routed_moe",
     "trtllm_fp8_block_scale_moe",
     "trtllm_fp8_block_scale_routed_moe",
+    "trtllm_fp8_per_channel_scale_moe",
+    "trtllm_fp8_per_channel_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_fp8_per_tensor_scale_routed_moe",
     "trtllm_mxint4_block_scale_moe",
@@ -290,10 +326,13 @@ __all__ = [
 # Add CuteDSL exports if available
 if _cute_dsl_available:
     __all__ += [
+        "cute_dsl_fused_moe",
         "cute_dsl_fused_moe_nvfp4",
-        "CuteDslMoEWrapper",
         "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMoEWrapper",
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "cute_dsl_fused_moe_bf16",
+        "CuteDslBf16MoEWrapper",
     ]

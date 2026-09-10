@@ -79,6 +79,7 @@ def _make_problem():
 def _build_moe_config(variant_str):
     from flashinfer.fused_moe.api import (
         BackendOptions,
+        CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
@@ -92,6 +93,7 @@ def _build_moe_config(variant_str):
     variant, backend = {
         "bf16": (QuantVariant.BF16, TrtllmBf16Config()),
         "nvfp4": (QuantVariant.NVFP4, TrtllmFp4Config()),
+        "w4a8": (QuantVariant.MXFP4, CuteDslConfig()),
     }[variant_str]
     return MoEConfig(
         routing=RoutingConfig(num_experts=NUM_EXPERTS, top_k=TOP_K),
@@ -276,6 +278,65 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     # at the gemm1→gemm2 round-trip dominate; 51/131072 cells past 5e-2).
     torch.testing.assert_close(yk, yr, rtol=5e-2, atol=0.15)
     assert rel_l2.item() < 0.05
+
+
+@pytest.mark.arch_blackwell
+def test_split_w4a8_kernel_matches_direct_runner():
+    import torch
+
+    import flashinfer.fused_moe as fm
+    import flashinfer.moe_ep as ep
+
+    _require_backend(fm.CuteDslConfig)
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("CuTe-DSL W4A8 is not supported on SM107")
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTeDSL is not available")
+
+    from dataclasses import replace
+
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+        FusedMoeSplitKernelBackend,
+    )
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    x, w13, w2, _, _ = _make_problem()
+    cfg = _build_moe_config("w4a8")
+    fleet = ep.FleetParams(
+        num_experts=NUM_EXPERTS,
+        max_tokens_per_rank=NUM_TOKENS // NUM_EXPERTS,
+        token_hidden_size=HIDDEN,
+    )
+    backend = FusedMoeSplitKernelBackend(ep.FusedMoeKernelConfig(moe_config=cfg))
+    assert backend._transformed_weights is None
+    assert backend.pack_dispatch_payload(x) is x
+    backend.validate_init(ep.BootstrapConfig(world_size=1, rank=0), fleet)
+    weights = backend.preprocess_weights(ep.MoEWeightPack(w13=w13, w2=w2), fleet)
+    assert backend._transformed_weights is weights
+
+    expert = x.view(NUM_EXPERTS, -1, HIDDEN)
+    actual = backend.compute(
+        ep.SplitKernelContext(
+            expert_tensors=expert,
+            num_tokens=NUM_TOKENS,
+            fleet_params=fleet,
+        )
+    ).reshape(NUM_TOKENS, HIDDEN)
+
+    x_q, x_sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
+    ids = torch.arange(NUM_EXPERTS, device="cuda", dtype=torch.int32)
+    ids = ids.repeat_interleave(expert.shape[1]).reshape(-1, 1)
+    act = fm.MoEActivationPack(
+        hidden_states_q=x_q,
+        hidden_states_scale=x_sf.view(torch.uint8).reshape(NUM_TOKENS, HIDDEN // 32),
+        topk_ids=ids,
+        topk_weights=torch.ones(NUM_TOKENS, 1, device="cuda"),
+    )
+    ref_cfg = replace(cfg, routing=replace(cfg.routing, top_k=1))
+    expected = fm.MoELayer(ref_cfg)(act, weights)
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize(

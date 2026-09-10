@@ -36,6 +36,7 @@ from flashinfer.quantization.fp8_quantization import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
+from tests.moe.utils import assert_trtllm_packed_call_contract
 
 
 def _build_per_tensor_fp8_runner(config):
@@ -132,6 +133,7 @@ def _block_fp8_reference(
     gemm1_beta=None,
     gemm1_clamp_limit=None,
     activation=None,
+    narrow_routing_weights=True,
 ):
     """Dequantized block-FP8 MoE reference.
 
@@ -139,7 +141,9 @@ def _block_fp8_reference(
     per-expert SwiGLU OA controls; leaving all three unset reproduces plain SwiGLU.
     """
     activation = activation or SwiGLU()
-    weights = weights.to(torch.bfloat16).float()
+    if narrow_routing_weights:
+        weights = weights.to(torch.bfloat16)
+    weights = weights.float()
     has_oa = (
         gemm1_alpha is not None
         or gemm1_beta is not None
@@ -297,9 +301,55 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
-    direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    inputs = runner.pack_inputs(pack, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
+    direct = runner.forward(inputs, tactic=-1)
     _assert_fp8_close(direct, reference)
     _assert_fp8_close(layer(pack, weights), reference)
+
+
+@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_block_fp8_unpacked_routing_forwards_inputs_and_matches_reference(
+    variant, weights_dtype
+):
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    packed, weights, config, (x, w1, w2) = _make_block_fp8_case(
+        variant, expert_offset=8, local_experts=8
+    )
+    ids = packed.topk_ids
+    route_weights = packed.topk_weights.to(weights_dtype)
+    unpacked = MoEActivationPack(
+        hidden_states_q=packed.hidden_states_q,
+        hidden_states_scale=packed.hidden_states_scale,
+        topk_ids=ids,
+        topk_weights=route_weights,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    reference = _block_fp8_reference(
+        x,
+        w1,
+        w2,
+        ids,
+        route_weights,
+        variant,
+        expert_offset=8,
+        narrow_routing_weights=False,
+    )
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    inputs = runner.pack_inputs(unpacked, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _assert_fp8_close(runner.forward(inputs, tactic=-1), reference)
+    _assert_fp8_close(layer(unpacked, weights), reference)
 
 
 @pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))
@@ -506,7 +556,7 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     runner = layer.runners[0]
     inputs = runner.pack_inputs(act_pack, weights)
     routing_replay = torch.empty_like(expected_ids, dtype=torch.int16)
-    runner._static_kwargs["routing_replay_out"] = routing_replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=routing_replay)
     actual = runner.forward(inputs, tactic=-1)
     torch.testing.assert_close(
         torch.sort(routing_replay.to(torch.int32), dim=-1).values,
@@ -917,6 +967,7 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
 
     runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
     direct_out = runner.forward(inputs)
     _assert_per_tensor_fp8_close(direct_out, ref)
 
@@ -1038,7 +1089,7 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
     )
-    runner._static_kwargs["routing_replay_out"] = replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=replay)
     runner.forward(inputs)
     torch.testing.assert_close(
         replay.to(torch.int32).sort(dim=-1).values,

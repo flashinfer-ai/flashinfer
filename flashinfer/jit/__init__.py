@@ -103,6 +103,39 @@ from .fp4_kv_dequantization import (
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .cake_kda import (
+    cake_kda_affine_is_available as cake_kda_affine_is_available,
+)
+from .cake_kda import (
+    gen_cake_kda_affine_module as gen_cake_kda_affine_module,
+)
+from .cake_kda import (
+    gen_cake_kda_m128_unbounded_softplus_module as gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_kda import (
+    get_cake_kda_affine_module as get_cake_kda_affine_module,
+)
+from .cake_kda import (
+    get_cake_kda_prefill_module as get_cake_kda_prefill_module,
+)
+from .cake_kda import (
+    load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_fused_moe_warp_decode import (
+    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
+)
+from .cake_fused_moe_warp_decode import (
+    gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
+)
+from .cake_fused_moe_warp_decode import (
+    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
+)
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,
 )
