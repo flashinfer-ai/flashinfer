@@ -1418,9 +1418,7 @@ def build_context_task_manager(
     stats_done_0_deps = [] if cfg.stats_via_smem else [tmem_stats_done_0]
     # One entry when K and V share the buffer, and
     # two otherwise (e.g. when K/V are different dtypes)
-    smem_kv_resources = (
-        (smem_kv, smem_v) if cfg.split_kv_pipelines else (smem_kv,)
-    )
+    smem_kv_resources = (smem_kv, smem_v) if cfg.split_kv_pipelines else (smem_kv,)
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]] = {
         smem_q: scheduler_deps(gmem_qkv),
         smem_kv: scheduler_deps(*smem_kv_deps),
@@ -1812,7 +1810,9 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     # K and V share the same head_dim and head_dim_per_stage_kv, so their
     # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
     cadence = cfg.num_head_dim_stages_k
-    n_stages = min(cfg.kv_stage, budget_bytes // (k_stage_footprint + v_stage_footprint))
+    n_stages = min(
+        cfg.kv_stage, budget_bytes // (k_stage_footprint + v_stage_footprint)
+    )
     if n_stages < cadence:
         raise ValueError(
             f"split K/V staging requires at least {cadence} stages per ring "
@@ -2049,9 +2049,7 @@ def _configure_head_paired_tma_copy_metadata(
         raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
     cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
     cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
-    cfg.tma_copy_v_granu_elems = (
-        cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
-    )
+    cfg.tma_copy_v_granu_elems = cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
     cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
     output_inner_dim_size = cfg.epi_tile[1] * o_dtype.width // 8

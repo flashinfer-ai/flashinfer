@@ -376,7 +376,7 @@ def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> No
             f"got Q {q.dtype} and K {k.dtype}"
         )
     # V may keep its own dtype only for the supported QK-BF16/PV-FP8 path.
-    qk_bf16_pv_fp8 = (q.dtype == torch.bfloat16 and v.dtype == torch.float8_e4m3fn)
+    qk_bf16_pv_fp8 = q.dtype == torch.bfloat16 and v.dtype == torch.float8_e4m3fn
     if v.dtype != q.dtype and not qk_bf16_pv_fp8:
         raise NotImplementedError(
             "attention-ts context requires Q, K, and V to use the same dtype "

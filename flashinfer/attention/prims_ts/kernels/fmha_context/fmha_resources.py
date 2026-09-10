@@ -1228,9 +1228,7 @@ def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
             else cfg.tma_copy_v_iters
         )
         leading_byte_offset = cfg.tma_copy_v_bytes // tma_copy_v_iters
-    stride_byte_offset = (
-        cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_v_iters
-    )
+    stride_byte_offset = cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_v_iters
     return leading_byte_offset, stride_byte_offset
 
 
@@ -4510,9 +4508,7 @@ class TmemOResource(MemoryResource):
                 * self.cfg.v_dtype.width
                 // 8
             )
-            v_chunk_bytes = (
-                self.cfg.tma_copy_v_bytes // self.cfg.tma_copy_v_stage_iters
-            )
+            v_chunk_bytes = self.cfg.tma_copy_v_bytes // self.cfg.tma_copy_v_stage_iters
             head_dim_stage_bytes_v = v_chunk_bytes * tma_copy_iters_per_head_dim_stage
 
             # Select O buffer and P offset at trace time (compile-time constant)
