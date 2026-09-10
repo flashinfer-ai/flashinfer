@@ -200,7 +200,7 @@ run_on_host() {
         -e FLASHINFER_DEV_RELEASE_SUFFIX="${FLASHINFER_DEV_RELEASE_SUFFIX}" \
         -e FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}" \
         -e FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
-        -e FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS="${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}" \
+        -e FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS}" \
         -e FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG="${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-}" \
         -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS}" \
         -e HOST_GID="${host_gid}" \
@@ -272,7 +272,7 @@ run_in_container() {
     echo "CUDA: $(/usr/local/cuda/bin/nvcc --version | tail -n 1)"
     echo "PyTorch index: ${PYTORCH_INDEX}"
     echo "Architecture: $(uname -m)"
-    echo "Monolithic matrix targets: ${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}"
+    echo "Configured provider targets: ${FLASHINFER_JIT_CACHE_PROVIDER_ARCHS}"
     echo "MAX_JOBS: ${MAX_JOBS}"
     echo "NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
     echo "Memory budget per job: ${MEM_PER_JOB} GB"

@@ -283,6 +283,30 @@ def test_jit_cache_version_rejects_unbounded_prefix(monkeypatch):
         jit_env._check_jit_cache_version("flashinfer-jit-cache", "0.6.10+cu130")
 
 
+def test_aot_provider_discovery_skips_incompatible_provider(
+    monkeypatch, caplog, tmp_path
+):
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.18")
+    monkeypatch.setattr(jit_env, "has_flashinfer_jit_cache", lambda: True)
+    stale_provider = SimpleNamespace(
+        provider_id="sm90a",
+        distribution="flashinfer-jit-cache-sm90a",
+        version="0.6.17+cu130",
+        jit_cache_dir=tmp_path,
+        cuda_architectures=frozenset({"sm90a"}),
+        modules=frozenset({"attention_module"}),
+    )
+    shim = SimpleNamespace(
+        __version__="0.6.18+cu130",
+        get_jit_cache_providers=lambda: (stale_provider,),
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer_jit_cache", shim)
+
+    assert jit_env._get_aot_providers() == ()
+    assert "Ignoring incompatible flashinfer jit-cache provider" in caplog.text
+
+
 def test_jit_cache_build_setup_preserves_indexes_and_cleans_constraint(tmp_path):
     common_script = (
         Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"

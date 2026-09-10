@@ -152,7 +152,15 @@ def _get_aot_providers() -> Tuple[AOTProvider, ...]:
     _check_jit_cache_version("flashinfer-jit-cache", flashinfer_jit_cache.__version__)
     providers = []
     for provider in flashinfer_jit_cache.get_jit_cache_providers():
-        _check_jit_cache_version(provider.distribution, provider.version)
+        try:
+            _check_jit_cache_version(provider.distribution, provider.version)
+        except RuntimeError as error:
+            logger.warning(
+                "Ignoring incompatible flashinfer jit-cache provider %s: %s",
+                provider.distribution,
+                error,
+            )
+            continue
         providers.append(
             AOTProvider(
                 provider_id=provider.provider_id,

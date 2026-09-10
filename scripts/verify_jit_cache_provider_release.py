@@ -98,6 +98,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def load_wheels(wheelhouse: Path) -> dict[str, Wheel]:
+    """Load one wheel for each canonical distribution in a wheelhouse."""
+    wheels = {}
+    for path in sorted(wheelhouse.glob("*.whl")):
+        wheel = Wheel.open(path)
+        distribution = canonicalize_distribution(wheel.distribution)
+        require(
+            distribution not in wheels,
+            f"Duplicate wheel distribution: {distribution}",
+        )
+        wheels[distribution] = wheel
+    return wheels
+
+
 def main() -> int:
     args = parse_args()
     expected_providers = set(args.providers)
@@ -106,12 +120,7 @@ def main() -> int:
         "Expected provider list contains duplicates",
     )
 
-    wheels = {
-        canonicalize_distribution(wheel.distribution): wheel
-        for wheel in (
-            Wheel.open(path) for path in sorted(args.wheelhouse.glob("*.whl"))
-        )
-    }
+    wheels = load_wheels(args.wheelhouse)
     expected_distributions = {
         "flashinfer-jit-cache",
         *(f"flashinfer-jit-cache-{provider}" for provider in expected_providers),

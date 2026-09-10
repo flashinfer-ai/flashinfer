@@ -402,6 +402,7 @@ jobs:
 
       - name: Upload provider and shim wheels to wheel release
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
         run: |

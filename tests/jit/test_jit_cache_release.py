@@ -89,6 +89,29 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
         cuda_config_module.validate_cuda_config(invalid_config, REPO_ROOT)
 
 
+def test_release_verifier_rejects_duplicate_wheel_distributions(
+    monkeypatch, tmp_path, release_verifier_module
+):
+    wheel_type = release_verifier_module.Wheel
+    for filename in ("shim-one.whl", "shim-two.whl"):
+        (tmp_path / filename).touch()
+
+    def fake_open(path):
+        return wheel_type(
+            path=path,
+            distribution="flashinfer-jit-cache",
+            version="0.6.16+cu130",
+            requirements=(),
+            contents=(),
+            metadata_path="flashinfer_jit_cache-0.6.16.dist-info/METADATA",
+        )
+
+    monkeypatch.setattr(release_verifier_module.Wheel, "open", staticmethod(fake_open))
+
+    with pytest.raises(ValueError, match="Duplicate wheel distribution"):
+        release_verifier_module.load_wheels(tmp_path)
+
+
 def test_release_verifier_requires_exact_provider_set(release_verifier_module):
     shim = release_verifier_module.Wheel(
         path=Path(
