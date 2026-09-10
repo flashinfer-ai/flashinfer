@@ -16,10 +16,10 @@ limitations under the License.
 
 Two sections:
 
-  * CPU-only config/dataclass tests (no GPU or JIT). These track the actual MVP
-    API surface (single-knob ``QuantVariant``, explicit
-    ``BackendOptions(candidates=(...))``); see
-    ``docs/design_docs/flashinfer_moe_api.md`` §10 CR1.
+  * CPU-only config/dataclass tests (no GPU or JIT). These track the actual
+    API surface (three-axis ``QuantConfig`` / ``QuantFormat``, deprecated
+    ``QuantVariant`` presets, explicit ``BackendOptions(candidates=(...))``);
+    see ``docs/design_docs/flashinfer_moe_api.md``.
 
   * SM100 (Blackwell) GPU tests for ``MoELayer`` + Packs, parametrized per
     ``QuantVariant`` via ``VariantSpec`` (currently NVFP4 + BF16, pre-routed
@@ -38,7 +38,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import TuningConfig, autotune
 from flashinfer.autotuner.autotuner import ProfilingCacheKey
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
@@ -73,6 +73,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     RoutingInputMode,
@@ -88,7 +89,11 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4Config,
     TrtllmMxInt4RoutedRunner,
 )
-from flashinfer.fused_moe.runners import MoERunner
+from flashinfer.fused_moe.runners import (
+    MoERunner,
+    _TrtllmLaunchState,
+    _TrtllmPackedInputs,
+)
 from flashinfer.fused_moe.core import _fake_trtllm_moe_output
 from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
 from flashinfer.utils import get_compute_capability
@@ -108,7 +113,10 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     compute_reference_moe_fp4,
     create_moe_tensors,
 )
-from tests.moe.utils import create_relu2_moe_tensors  # noqa: E402
+from tests.moe.utils import (  # noqa: E402
+    assert_trtllm_packed_call_contract,
+    create_relu2_moe_tensors,
+)
 
 
 def test_noaux_tc_ref_excludes_unselected_groups_with_negative_scores():
@@ -145,6 +153,10 @@ class TestEnumRepr:
 
     @pytest.mark.parametrize("member", list(ActivationType))
     def test_activation_repr(self, member):
+        assert eval(repr(member)) == member
+
+    @pytest.mark.parametrize("member", list(QuantFormat))
+    def test_quant_format_repr(self, member):
         assert eval(repr(member)) == member
 
     @pytest.mark.parametrize("member", list(QuantVariant))
@@ -211,6 +223,47 @@ class TestTrtllmFakeOutputContract:
         assert result[0].shape == (4, 32)
         assert result[1].shape == (8,)
         assert result[2].shape == (17, 64)
+
+
+def test_trtllm_synthetic_packed_calls_keep_their_launch_state():
+    """Exercise launch-state isolation without requiring a TRTLLM GPU."""
+
+    class RecordingInner:
+        def __init__(self):
+            self.call_ids = []
+
+        def forward(self, inputs, **kwargs):
+            self.call_ids.append(kwargs["call_id"])
+            return inputs[0]
+
+    runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
+    runner._built = True
+    runner._support_checked = True
+    runner.config = SimpleNamespace(
+        finalize=SimpleNamespace(do_finalize=True),
+    )
+    runner._inner = RecordingInner()
+
+    def pack(call_id):
+        return _TrtllmPackedInputs(
+            [torch.tensor([call_id])],
+            tuning_config=TuningConfig(),
+            launch_state=_TrtllmLaunchState({"call_id": call_id}),
+        )
+
+    first = pack(1)
+    second = pack(2)
+    assert_trtllm_packed_call_contract(runner, first)
+    assert_trtllm_packed_call_contract(runner, second)
+
+    runner.forward(first)
+    runner.forward(second)
+    runner.forward(first)
+
+    assert runner._inner.call_ids == [1, 2, 1]
+    assert isinstance(hash(first.launch_state), int)
+    with pytest.raises(TypeError):
+        first.launch_state.static_kwargs["call_id"] = 3
 
 
 # ---------------------------------------------------------------------------
@@ -285,10 +338,19 @@ class TestReprRoundTrip:
         )
         assert _eval_repr(cfg) == cfg
 
-    @pytest.mark.parametrize("variant", list(QuantVariant))
+    @pytest.mark.parametrize(
+        "variant", [v for v in QuantVariant if v is not QuantVariant.W4A16]
+    )
     def test_quant_config(self, variant):
         cfg = QuantConfig(variant=variant)
         assert _eval_repr(cfg) == cfg
+
+    def test_quant_config_w4a16_pairs(self):
+        for cfg in (
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        ):
+            assert _eval_repr(cfg) == cfg
 
     def test_activation_config(self):
         for cfg in (
@@ -443,14 +505,142 @@ class TestBackendOptions:
 
 class TestQuantConfig:
     def test_default_is_bf16(self):
-        assert QuantConfig().variant == QuantVariant.BF16
+        cfg = QuantConfig()
+        assert cfg.variant == QuantVariant.BF16
+        assert cfg.pair == (QuantFormat.BF16, QuantFormat.BF16)
+        assert cfg.output is QuantFormat.BF16
 
     def test_explicit_variant(self):
-        assert QuantConfig(variant=QuantVariant.NVFP4).variant == QuantVariant.NVFP4
+        cfg = QuantConfig(variant=QuantVariant.NVFP4)
+        assert cfg.variant == QuantVariant.NVFP4
+        assert cfg.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
 
-    @pytest.mark.parametrize("variant", list(QuantVariant))
+    @pytest.mark.parametrize(
+        "variant", [v for v in QuantVariant if v is not QuantVariant.W4A16]
+    )
     def test_all_variants_constructible(self, variant):
         assert QuantConfig(variant=variant).variant is variant
+
+    def test_w4a16_variant_is_rejected(self):
+        with pytest.raises(ValueError, match="QuantVariant.W4A16 is ambiguous"):
+            QuantConfig(variant=QuantVariant.W4A16)
+
+    def test_w4a16_pairs_reverse_map(self):
+        mx = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+        nv = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16)
+        assert mx.variant is QuantVariant.W4A16
+        assert nv.variant is QuantVariant.W4A16
+        assert mx.weight is QuantFormat.MXFP4
+        assert nv.weight is QuantFormat.NVFP4
+        assert mx.activation is QuantFormat.BF16
+        assert nv.activation is QuantFormat.BF16
+
+    def test_mxfp4_variant_expands_to_mxfp8_activation(self):
+        cfg = QuantConfig(variant=QuantVariant.MXFP4)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"weight": QuantFormat.MXFP4},
+            {"weight": QuantFormat.NVFP4},
+            {"activation": QuantFormat.BF16},
+        ],
+    )
+    def test_omitted_axis_defaults_to_bf16(self, kwargs):
+        cfg = QuantConfig(**kwargs)
+        expected = (
+            kwargs.get("weight", QuantFormat.BF16),
+            kwargs.get("activation", QuantFormat.BF16),
+        )
+        assert cfg.pair == expected
+        assert cfg.output is QuantFormat.BF16
+
+    def test_weight_only_mxfp4_is_w4a16(self):
+        cfg = QuantConfig(weight=QuantFormat.MXFP4)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.BF16)
+        assert cfg.variant is QuantVariant.W4A16
+
+    def test_knobs_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            QuantConfig(QuantFormat.MXFP4, QuantFormat.MXFP8, QuantFormat.BF16, None)
+        cfg = QuantConfig(QuantFormat.MXFP4, QuantFormat.MXFP8, QuantFormat.BF16)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+
+    def test_explicit_pair_with_default_output(self):
+        cfg = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.BF16)
+        assert cfg.variant is QuantVariant.W4A16
+        assert cfg.output is QuantFormat.BF16
+
+    def test_rejects_torch_dtype(self):
+        with pytest.raises(TypeError, match="must be a QuantFormat"):
+            QuantConfig(output=torch.bfloat16)
+
+    def test_variant_with_matching_pair_is_allowed(self):
+        cfg = QuantConfig(
+            variant=QuantVariant.NVFP4,
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+        )
+        assert cfg.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"weight": QuantFormat.MXFP4, "activation": QuantFormat.MXFP8},
+            {"weight": QuantFormat.NVFP4},
+        ],
+    )
+    def test_variant_conflicting_with_pair_is_rejected(self, kwargs):
+        with pytest.raises(ValueError, match="conflicts"):
+            QuantConfig(variant=QuantVariant.NVFP4, **kwargs)
+
+    def test_variant_with_default_bf16_pair_is_overridden(self):
+        # BF16×BF16 is indistinguishable from the omitted default, so the
+        # deprecated preset wins (documented exception).
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            cfg = QuantConfig(
+                variant=QuantVariant.NVFP4,
+                weight=QuantFormat.BF16,
+                activation=QuantFormat.BF16,
+            )
+        assert cfg.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+
+    def test_variant_emits_deprecation_warning(self):
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            QuantConfig(variant=QuantVariant.NVFP4)
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            QuantConfig.from_variant(QuantVariant.NVFP4)
+        with pytest.warns(DeprecationWarning, match="from_variant"):
+            QuantConfig.from_variant(QuantVariant.W4A16, w4a16_weight=QuantFormat.NVFP4)
+
+    def test_replace_on_w4a16_pair_and_pair_change(self):
+        w4a16 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+        out = dataclasses.replace(w4a16, output=QuantFormat.FP16)
+        assert out.pair == w4a16.pair and out.variant is QuantVariant.W4A16
+        changed = dataclasses.replace(
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            weight=QuantFormat.MXFP4,
+            activation=QuantFormat.MXFP8,
+        )
+        assert changed.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        assert changed.variant is QuantVariant.MXFP4
+
+    def test_replace_keeps_derived_variant_consistent(self):
+        cfg = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        replaced = dataclasses.replace(cfg, output=QuantFormat.FP16)
+        assert replaced.pair == cfg.pair
+        assert replaced.variant is QuantVariant.NVFP4
+        assert replaced.output is QuantFormat.FP16
+
+    def test_from_variant_w4a16_defaults_to_mxfp4(self):
+        mx = QuantConfig.from_variant(QuantVariant.W4A16)
+        nv = QuantConfig.from_variant(
+            QuantVariant.W4A16, w4a16_weight=QuantFormat.NVFP4
+        )
+        assert mx.pair == (QuantFormat.MXFP4, QuantFormat.BF16)
+        assert nv.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
 
 
 # ---------------------------------------------------------------------------
@@ -1028,9 +1218,9 @@ class TestMoERunnerSupport:
             SiTU,
         )
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
-            QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
-            QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
-            QuantVariant.W4A16: (SwiGLU,),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
         }
         assert TrtllmBf16RoutedRunner.supported_activation_classes == (
             SwiGLU,
@@ -1041,8 +1231,8 @@ class TestMoERunnerSupport:
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
-            QuantVariant.DeepSeekFp8: (SwiGLU,),
-            QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
@@ -1090,7 +1280,9 @@ class TestMoERunnerSupport:
     )
     def test_cute_dsl_quant_variants_supported(self, variant):
         runner = CuteDslRunner.__new__(CuteDslRunner)
-        runner.config = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig.from_variant(variant, w4a16_weight=QuantFormat.NVFP4)
+        )
         assert runner.check_support() is None
 
     def test_cute_dsl_w4a8_rejected_on_rubin(self, monkeypatch):
@@ -1220,23 +1412,61 @@ class TestMoERunnerSupport:
 
     def test_missing_per_quant_capability_entry_is_rejected(self):
         # A runner declaring per-quant activation support must declare it for
-        # every variant it accepts; an unmapped variant must not fall back to
+        # every MMA pair it accepts; an unmapped pair must not fall back to
         # the permissive class default.
         class _UnmappedRunner(TrtllmFp4RoutedRunner):
-            supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = (
-                QuantVariant.NVFP4,
-                QuantVariant.MXFP4,
+            supported_quant_variants: ClassVar[
+                tuple[tuple[QuantFormat, QuantFormat], ...]
+            ] = (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
             )
             supported_activation_classes_by_quant: ClassVar[dict] = {
-                QuantVariant.NVFP4: (SwiGLU,),
+                (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU,),
             }
 
         runner = _UnmappedRunner.__new__(_UnmappedRunner)
         runner.config = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.MXFP4), activation=GeGLU()
         )
-        with pytest.raises(NotImplementedError, match="no entry for QuantVariant"):
+        with pytest.raises(NotImplementedError, match="no entry for weight="):
             runner.check_support()
+
+    def test_pair_without_legacy_variant_is_rejected_until_dispatch_migrates(self):
+        # A pair with no QuantVariant (e.g. MXFP4×MXFP4) can be declared, but
+        # runner build / weight preparation still dispatch on QuantVariant, so
+        # check_support must fail fast instead of passing and breaking later.
+        class _Mxfp4xMxfp4Runner(TrtllmFp4RoutedRunner):
+            supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP4),)
+            supported_activation_classes_by_quant = {
+                (QuantFormat.MXFP4, QuantFormat.MXFP4): (SwiGLU,),
+            }
+
+        runner = _Mxfp4xMxfp4Runner.__new__(_Mxfp4xMxfp4Runner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)
+        )
+        assert runner.config.quant.variant is None
+        with pytest.raises(NotImplementedError, match="no QuantVariant mapping"):
+            runner.check_support()
+
+    def test_moe_layer_rejects_unsupported_output_format(self, monkeypatch):
+        from flashinfer.fused_moe import layer as layer_module
+
+        monkeypatch.setattr(
+            layer_module, "get_compute_capability", lambda device: (9, 0)
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=4, top_k=2),
+            quant=QuantConfig(output=QuantFormat.FP16),
+            experts=ExpertConfig(intermediate_size=256),
+            backend=BackendOptions(candidates=(CutlassBf16Config(),)),
+        )
+        with pytest.raises(
+            RuntimeError, match=r"none of the configured backends"
+        ) as exc:
+            MoELayer(config, device=torch.device("cpu"))
+        assert "output=FP16" in str(exc.value)
 
     @pytest.mark.parametrize(
         "runner_type,variant",
@@ -1252,6 +1482,14 @@ class TestMoERunnerSupport:
         runner = runner_type.__new__(runner_type)
         runner.config = cfg
         with pytest.raises(NotImplementedError, match=f"QuantVariant.{variant.name}"):
+            runner.check_support()
+
+    def test_unsupported_output_format_rejected(self):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.NVFP4, output=QuantFormat.FP16)
+        )
+        with pytest.raises(NotImplementedError, match="output=FP16"):
             runner.check_support()
 
     @pytest.mark.parametrize(
@@ -1360,7 +1598,7 @@ class TestMoERunnerSupport:
     def test_fp4_sm107_variant_support_after_reland(self, monkeypatch, variant):
         import flashinfer.utils as utils
 
-        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        cfg = self._nvfp4_swiglu(quant=QuantConfig.from_variant(variant))
         runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
         runner.config = cfg
         runner.device = torch.device("cuda")
@@ -1369,7 +1607,7 @@ class TestMoERunnerSupport:
 
     def test_moe_runner_quant_support_check(self):
         class Runner(MoERunner):
-            supported_quant_variants = (QuantVariant.NVFP4,)
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
             supported_activation_classes = (SwiGLU,)
 
             def get_valid_tactics(self, inputs, profile):
@@ -1384,7 +1622,7 @@ class TestMoERunnerSupport:
 
     def test_moe_runner_without_activation_capability_is_rejected(self):
         class Runner(MoERunner):
-            supported_quant_variants = (QuantVariant.NVFP4,)
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
 
             def get_valid_tactics(self, inputs, profile):
                 return []
@@ -1928,7 +2166,7 @@ def _make_packs_and_config(
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig.from_variant(variant, w4a16_weight=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=local_num_experts,
@@ -2135,7 +2373,15 @@ BF16_ATOL = 3e-2
 
 
 def _bf16_dense_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    *,
+    narrow_routing_weights=True,
 ):
     """fp32 dense MoE authority for the bf16 path.
 
@@ -2146,7 +2392,9 @@ def _bf16_dense_reference(
     LOCAL experts; a token routed to global id ``g`` uses local weight
     ``g - expert_offset``.
     """
-    final_scales = final_scales.to(torch.bfloat16).float()
+    if narrow_routing_weights:
+        final_scales = final_scales.to(torch.bfloat16)
+    final_scales = final_scales.float()
     x32 = x.float()
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -2173,6 +2421,8 @@ def _make_bf16_packs_and_config(
     local_expert_offset: int = 0,
     max_tokens: int | None = None,
     seed: int = 42,
+    routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
+    routing_weights_dtype: torch.dtype = torch.float32,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for the bf16 path.
 
@@ -2214,19 +2464,20 @@ def _make_bf16_packs_and_config(
     selected_experts = (
         torch.topk(logits, top_k, dim=-1).indices + local_expert_offset
     ).to(torch.int32)
-    # Snap gate weights to the bf16 grid: pack_inputs truncates them to bf16 bits
-    # for the packed top-k ids, so unsnapped fp32 scales would add rounding noise
-    # the reference cannot see.
     final_scales = torch.rand(num_tokens, top_k, device=device)
-    final_scales = (
-        (final_scales / final_scales.sum(-1, keepdim=True)).to(torch.bfloat16).float()
-    )
+    final_scales = final_scales / final_scales.sum(-1, keepdim=True)
+    if routing_input_mode is RoutingInputMode.PackedPrecomputed:
+        # Packed IDs truncate weights to BF16 bits, so the reference must see
+        # the same values. Unpacked FP32 routing intentionally preserves the
+        # full caller-provided precision.
+        final_scales = final_scales.to(torch.bfloat16).float()
 
     act_pack = MoEActivationPack(
         hidden_states_q=x,  # raw bf16 on this path
         hidden_states_scale=None,  # unused by trtllm_bf16_routed
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        topk_weights=final_scales.to(routing_weights_dtype),
+        routing_input_mode=routing_input_mode,
     )
 
     weight_pack = MoEWeightPack()
@@ -2255,6 +2506,130 @@ def _make_bf16_packs_and_config(
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
     return act_pack, weight_pack, config, {"x": x, "w1": w1, "w2": w2}
+
+
+@sm100_required
+def test_trtllm_interleaved_real_packs_keep_their_launch_state():
+    """A real later pack must not replace the kwargs paired with an earlier call."""
+
+    class RecordingInner:
+        def __init__(self):
+            self.gemm1_weights = []
+
+        def forward(self, inputs, **kwargs):
+            self.gemm1_weights.append(kwargs["gemm1_weights"])
+            return inputs[0]
+
+    first_act, first_weights, config, _ = _make_bf16_packs_and_config(
+        4,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=4,
+        top_k=2,
+        max_tokens=8,
+        seed=1,
+    )
+    second_act, second_weights, _, _ = _make_bf16_packs_and_config(
+        4,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=4,
+        top_k=2,
+        max_tokens=8,
+        seed=2,
+    )
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner, config, first_act.hidden_states_q.device
+    )
+
+    first = runner.pack_inputs(first_act, first_weights)
+    second = runner.pack_inputs(second_act, second_weights)
+    first_gemm1 = first_weights.get_view(runner.backend_key)["gemm1_weights"]
+    second_gemm1 = second_weights.get_view(runner.backend_key)["gemm1_weights"]
+
+    assert_trtllm_packed_call_contract(runner, first)
+    assert_trtllm_packed_call_contract(runner, second)
+    assert first.launch_state.static_kwargs["gemm1_weights"] is first_gemm1
+    assert second.launch_state.static_kwargs["gemm1_weights"] is second_gemm1
+    assert first.tuning_config is not second.tuning_config
+
+    recording_inner = RecordingInner()
+    runner._inner = recording_inner
+    runner.forward(first)
+    runner.forward(second)
+    runner.forward(first)
+
+    assert len(recording_inner.gemm1_weights) == 3
+    assert recording_inner.gemm1_weights[0] is first_gemm1
+    assert recording_inner.gemm1_weights[1] is second_gemm1
+    assert recording_inner.gemm1_weights[2] is first_gemm1
+    assert isinstance(hash(first.launch_state), int)
+    with pytest.raises(TypeError):
+        first.launch_state.static_kwargs["gemm1_weights"] = second_gemm1
+
+
+@sm100_required
+def test_trtllm_dual_stream_packed_calls_match_reference():
+    """One runner may launch distinct packed calls concurrently on two streams."""
+    cases = [
+        _make_bf16_packs_and_config(
+            64,
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=4,
+            top_k=2,
+            max_tokens=64,
+            seed=seed,
+        )
+        for seed in (1, 2)
+    ]
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner,
+        cases[0][2],
+        cases[0][0].hidden_states_q.device,
+    )
+    packed_calls = [
+        runner.pack_inputs(act_pack, weight_pack)
+        for act_pack, weight_pack, _, _ in cases
+    ]
+    references = [
+        _bf16_dense_reference(
+            tensors["x"],
+            tensors["w1"],
+            tensors["w2"],
+            act_pack.topk_ids,
+            act_pack.topk_weights,
+            intermediate_size=256,
+        )
+        for act_pack, _, _, tensors in cases
+    ]
+
+    producer = torch.cuda.current_stream()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    gate_stream = torch.cuda.Stream()
+    launch_gate = torch.cuda.Event()
+    with torch.cuda.stream(gate_stream):
+        gate_stream.wait_stream(producer)
+        torch.cuda._sleep(1_000_000)
+        launch_gate.record()
+    for stream in streams:
+        stream.wait_stream(producer)
+        stream.wait_event(launch_gate)
+
+    for _ in range(16):
+        for stream, packed in zip(streams, packed_calls, strict=True):
+            with torch.cuda.stream(stream):
+                runner.forward(packed, tactic=-1)
+    for stream in streams:
+        stream.synchronize()
+
+    for packed, reference in zip(packed_calls, references, strict=True):
+        torch.testing.assert_close(
+            packed[0].float(),
+            reference,
+            rtol=BF16_RTOL,
+            atol=BF16_ATOL,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2312,11 +2687,50 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
         act_pack.topk_weights,
         tensors["w2"].shape[-1],  # intermediate_size, derived not hardcoded
         expert_offset=expert_offset,
+        narrow_routing_weights=(
+            act_pack.routing_input_mode is not RoutingInputMode.UnpackedPrecomputed
+        ),
     )
 
 
 def _bf16_check(out, ref, label):
     torch.testing.assert_close(out.float(), ref, rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@sm100_required
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_bf16_unpacked_routing_forwards_inputs_and_matches_reference(weights_dtype):
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    act, weights, config, tensors = _make_bf16_packs_and_config(
+        64,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=8,
+        top_k=2,
+        local_num_experts=4,
+        local_expert_offset=4,
+        max_tokens=64,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        routing_weights_dtype=weights_dtype,
+    )
+    ids = act.topk_ids
+    route_weights = act.topk_weights
+    reference = _bf16_ref(act, tensors, expert_offset=4)
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner, config, act.hidden_states_q.device
+    )
+    inputs = runner.pack_inputs(act, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _bf16_check(runner.forward(inputs, tactic=-1), reference, "bf16 direct")
+    _bf16_check(MoELayer(config)(act, weights), reference, "bf16 layer")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2638,6 +3052,7 @@ class TestTrtllmRoutedPackingContract:
         from flashinfer.fused_moe.core import MoeRunnerInputs
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
+        assert_trtllm_packed_call_contract(runner, inputs)
         topk_ids = MoeRunnerInputs.from_list(inputs).topk_ids
 
         # Upper 16 bits hold the GLOBAL expert id — NOT offset-shifted.
@@ -2653,7 +3068,10 @@ class TestTrtllmRoutedPackingContract:
         )
         assert torch.equal(topk_ids & 0xFFFF, expected_bits)
         # The offset travels to the kernel as a separate argument.
-        assert runner._static_kwargs["local_expert_offset"] == local_expert_offset
+        assert (
+            inputs.launch_state.static_kwargs["local_expert_offset"]
+            == local_expert_offset
+        )
 
 
 @sm100_required
@@ -2700,16 +3118,15 @@ class TestTrtllmFp4UnpackedContract:
             ),
         )
 
-        moe_inputs = MoeRunnerInputs.from_list(
-            runner.pack_inputs(act_pack, weight_pack)
-        )
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
         assert moe_inputs.topk_ids is ids
         assert moe_inputs.expert_weights is weights
         assert (
-            runner._static_kwargs["routing_input_mode"]
+            inputs.launch_state.static_kwargs["routing_input_mode"]
             == RoutingInputMode.UnpackedPrecomputed
         )
-        assert runner._static_kwargs["local_expert_offset"] == 32
+        assert inputs.launch_state.static_kwargs["local_expert_offset"] == 32
 
     @pytest.mark.parametrize(
         "activation",
@@ -2785,7 +3202,7 @@ class TestTrtllmFp4UnpackedContract:
 
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         assert moe_inputs.per_token_scale is act_pack.per_token_scale
-        assert runner._static_kwargs["per_token_scale"] is act_pack.per_token_scale
+        assert "per_token_scale" not in inputs.launch_state.static_kwargs
         assert runner._inner.use_per_token_scaling is True
         for _ in range(3):
             runner.forward(inputs, tactic=-1)
@@ -2975,9 +3392,8 @@ class TestTrtllmFromLogitsPackingContract:
             ),
         )
 
-        moe_inputs = MoeRunnerInputs.from_list(
-            runner.pack_inputs(act_pack, weight_pack)
-        )
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
 
         # Kernel-filled OUTPUT buffers: bf16 weights (gh #3595), int32 ids.
         assert moe_inputs.expert_weights.dtype == torch.bfloat16, (
@@ -2990,7 +3406,8 @@ class TestTrtllmFromLogitsPackingContract:
         # Logits thread through unchanged; mode reaches the kernel kwargs.
         assert moe_inputs.routing_logits is routing_logits
         assert (
-            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+            inputs.launch_state.static_kwargs["routing_input_mode"]
+            == RoutingInputMode.FromLogits
         )
 
     def _make_bf16_from_logits_inputs(self, logits_dtype):
@@ -3019,12 +3436,15 @@ class TestTrtllmFromLogitsPackingContract:
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
     def test_bf16_expert_weights_buffer_is_bf16(self, logits_dtype):
-        runner, _, moe_inputs, logits = self._make_bf16_from_logits_inputs(logits_dtype)
+        _runner, inputs, moe_inputs, logits = self._make_bf16_from_logits_inputs(
+            logits_dtype
+        )
         assert moe_inputs.routing_logits is logits
         assert moe_inputs.topk_ids.dtype == torch.int32
         assert moe_inputs.expert_weights.dtype == torch.bfloat16
         assert (
-            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+            inputs.launch_state.static_kwargs["routing_input_mode"]
+            == RoutingInputMode.FromLogits
         )
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
@@ -3301,7 +3721,9 @@ class TestFusedSharedExpertsConfig:
 class TestFusedSharedExpertsBackendGating:
     """Backends must opt in before ``check_support()`` accepts S > 0."""
 
-    def _shared_cfg(self, variant):
+    def _shared_cfg(self, quant):
+        if isinstance(quant, QuantVariant):
+            quant = QuantConfig.from_variant(quant)
         return MoEConfig(
             routing=RoutingConfig(
                 num_experts=64,
@@ -3311,7 +3733,7 @@ class TestFusedSharedExpertsBackendGating:
                 topk_group=4,
                 routed_scaling_factor=2.5,
             ),
-            quant=QuantConfig(variant=variant),
+            quant=quant,
             experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=2),
         )
 
@@ -3338,9 +3760,11 @@ class TestFusedSharedExpertsBackendGating:
         for runner_cls in set(_BACKEND_RUNNERS.values()):
             if runner_cls.supports_fused_shared_experts:
                 continue
-            variant = runner_cls.supported_quant_variants[0]
+            pair = runner_cls.supported_quant_variants[0]
             runner = runner_cls.__new__(runner_cls)
-            runner.config = self._shared_cfg(variant)
+            runner.config = self._shared_cfg(
+                QuantConfig(weight=pair[0], activation=pair[1])
+            )
             with pytest.raises(
                 NotImplementedError, match="does not support fused shared experts"
             ):

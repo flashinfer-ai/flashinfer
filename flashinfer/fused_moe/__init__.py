@@ -34,6 +34,7 @@ from .api import (  # noqa: F401
     B12xNvfp4Config,
     B12xW4A16Config,
     BackendOptions,
+    CakeWarpDecodeConfig,
     CuteDslConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
@@ -53,6 +54,7 @@ from .api import (  # noqa: F401
     MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
+    QuantFormat,
     QuantVariant,
     RoutingConfig,
     TrtllmBf16Config,
@@ -70,6 +72,7 @@ from .da_runtime import (  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -176,6 +179,8 @@ try:
         CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
+        cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper,
     )
 
     _cute_dsl_available = True
@@ -213,6 +218,8 @@ __all__ = [
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",
+    "CakeWarpDecodeConfig",
+    "CakeWarpDecodeRunner",
     "CuteDslConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
@@ -259,6 +266,7 @@ __all__ = [
     "TrtllmFp8PerTensorRunner",
     "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
+    "QuantFormat",
     "QuantVariant",
     "RoutingConfig",
     "TrtllmBf16Config",
@@ -325,4 +333,6 @@ if _cute_dsl_available:
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "cute_dsl_fused_moe_bf16",
+        "CuteDslBf16MoEWrapper",
     ]

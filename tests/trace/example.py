@@ -15,6 +15,7 @@ Requires a CUDA-capable GPU.
 Results:
 - We would get these example json files under fi_trace_out directory:
 bmm_mxfp8_N128_K128.json
+cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
@@ -48,14 +49,15 @@ linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
+minimax_h3_mxfp8_pre_attention_p8_hdst7_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
-prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
-prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4.json
+prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mono_moe_topk8_h2048_i512.json
@@ -135,6 +137,7 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
+from flashinfer.cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
@@ -151,6 +154,32 @@ from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# MiniMax-H3 uses a prepared, caller-owned API. Emit its definition from meta
+# tensors so generating the trace fixture does not compile all exact-shape CUDA
+# stages or allocate the 115 MiB prepacked weight on the current GPU.
+_mh_M, _mh_P = 1, 8
+MiniMaxH3Mxfp8PreAttention.run.fi_trace(
+    save_dir=SAVE_DIR,
+    x=torch.empty((_mh_M, 5376), dtype=torch.bfloat16, device="meta"),
+    x_norm_weight=torch.empty((5376,), dtype=torch.bfloat16, device="meta"),
+    adaln_scale=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
+    adaln_shift=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
+    adaln_index=torch.empty((_mh_M,), dtype=torch.int32, device="meta"),
+    qkv_weight_q=torch.empty((21504, 5376), dtype=torch.float8_e4m3fn, device="meta"),
+    qkv_weight_sf=torch.empty(
+        (21504 * (5376 // 32),), dtype=torch.uint8, device="meta"
+    ),
+    q_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
+    k_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
+    rope_cos_sin=torch.empty((_mh_M, 96), dtype=torch.bfloat16, device="meta"),
+    out_q=torch.empty(
+        (_mh_P, _mh_M, 56 // _mh_P, 3, 128),
+        dtype=torch.float8_e4m3fn,
+        device="meta",
+    ),
+    out_sf=torch.empty((_mh_P, 512), dtype=torch.uint8, device="meta"),
+)
 
 print(f"\nAuto-dumping fi_trace JSON files to {SAVE_DIR}/\n")
 
@@ -990,6 +1019,41 @@ with contextlib.suppress(Exception):
         renormalize=True,
     )
 
+# ── SM90 CuTe-DSL fused MoE (Qwen3-30B-A3B: E=128, topk=8, h=2048, i=768) ───
+# Unquantized bf16, pre-routed. SM90-only and JIT-built, so wrapped in
+# suppress(): the trace JSON dumps before the kernel launches, so the
+# definition files appear even when the kernel can't run here.
+with contextlib.suppress(Exception):
+    _s9_T, _s9_H, _s9_I, _s9_E, _s9_K = 128, 2048, 768, 128, 8
+    _s9_x = torch.randn(_s9_T, _s9_H, dtype=torch.bfloat16, device=device)
+    _s9_w13 = torch.randn(_s9_E, 2 * _s9_I, _s9_H, dtype=torch.bfloat16, device=device)
+    _s9_w2 = torch.randn(_s9_E, _s9_H, _s9_I, dtype=torch.bfloat16, device=device)
+    _s9_scores = torch.rand(_s9_T, _s9_E, device=device)
+    _s9_wt, _s9_ids = torch.topk(_s9_scores, _s9_K, dim=-1)
+    _s9_scales = (_s9_wt / _s9_wt.sum(dim=-1, keepdim=True)).float()
+    # Frameworks repack [gate; up]-concatenated w13 into the kernel's
+    # 32-column up/gate interleave once at weight load.
+    _s9_w1 = (
+        torch.stack(
+            (
+                _s9_w13[:, _s9_I:].reshape(_s9_E, _s9_I // 32, 32, _s9_H),
+                _s9_w13[:, :_s9_I].reshape(_s9_E, _s9_I // 32, 32, _s9_H),
+            ),
+            dim=2,
+        )
+        .reshape(_s9_E, 2 * _s9_I, _s9_H)
+        .contiguous()
+    )
+    flashinfer.fused_moe.cute_dsl_fused_moe_bf16(
+        _s9_x,
+        _s9_ids.to(torch.int32),
+        _s9_scales,
+        _s9_w1,
+        _s9_w2,
+        num_experts=_s9_E,
+        top_k=_s9_K,
+    )
+
 # ── MoE FP8 (256 experts, 32 local, h=7168, i=2048) ─────────────────────────
 # routing_method_type: 0=Default, 1=Renormalize, 2=DeepSeekV3,
 #                      3=Llama4,   4=RenormalizeNaive, 5=TopK
@@ -1515,6 +1579,43 @@ with contextlib.suppress(Exception):
         _nqsm_v_scale,
     )
 
+# nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
+with contextlib.suppress(Exception):
+    from flashinfer import nvfp4_quantize_append_paged_mla_kv_cache
+
+    _nqam_CKV, _nqam_KPE, _nqam_PS = 512, 64, 4
+    _nqam_nnz = 4
+    _nqam_ckv_cache = torch.zeros(
+        4, _nqam_PS, _nqam_CKV // 2, dtype=torch.uint8, device=device
+    )
+    _nqam_ckv_sf = torch.zeros(
+        4, _nqam_PS, _nqam_CKV // 16, dtype=torch.float8_e4m3fn, device=device
+    )
+    _nqam_kpe_cache = torch.zeros(
+        4, _nqam_PS, _nqam_KPE, dtype=torch.float8_e4m3fn, device=device
+    )
+    _nqam_ckv = torch.randn(_nqam_nnz, _nqam_CKV, dtype=torch.bfloat16, device=device)
+    _nqam_kpe = torch.randn(_nqam_nnz, _nqam_KPE, dtype=torch.bfloat16, device=device)
+    _nqam_bidx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
+    _nqam_pos = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=device)
+    _nqam_kv_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    _nqam_kv_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    _nqam_last = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    nvfp4_quantize_append_paged_mla_kv_cache(
+        _nqam_ckv,
+        _nqam_kpe,
+        _nqam_bidx,
+        _nqam_pos,
+        _nqam_ckv_cache,
+        _nqam_ckv_sf,
+        _nqam_kpe_cache,
+        _nqam_kv_idx,
+        _nqam_kv_indptr,
+        _nqam_last,
+        1.0,
+        1.0,
+    )
+
 # SegmentGEMMWrapper: small per-segment matmul.
 with contextlib.suppress(Exception):
     ws = torch.empty(WORKSPACE, dtype=torch.uint8, device=device)
@@ -1736,26 +1837,16 @@ with contextlib.suppress(Exception):
         device=device,
     )
     _pts_v = torch.randn_like(_pts_k)
-    _pts_indptr = torch.arange(
-        0,
-        _pts_num_pages + 1,
-        _pts_pages_per_request,
-        dtype=torch.int32,
-        device=device,
-    )
     _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
-    _pts_last_page_len = torch.full(
-        (_pts_B,), _pts_PS, dtype=torch.int32, device=device
-    )
+    _pts_block_tables = _pts_indices.view(_pts_B, _pts_pages_per_request)
     _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
     _pts_cache = (_pts_k, _pts_v)
 
     _attention_ts_decode(
         _pts_q,
         _pts_cache,
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_block_tables,
+        _pts_seq_lens,
         seq_len_q=_pts_SQ,
         mask_type="causal",
     )
@@ -1779,8 +1870,7 @@ with contextlib.suppress(Exception):
         _pts_q,
         _pts_cache,
         _pts_workspace,
-        _pts_indptr,
-        _pts_indices,
+        _pts_block_tables,
         _pts_seq_lens,
         _pts_SK,
         seq_len_q=_pts_SQ,
@@ -1790,30 +1880,36 @@ with contextlib.suppress(Exception):
 
     _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
     _pts_wrapper.plan(
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_q.device,
+        _pts_B,
         _pts_Hq,
         _pts_Hkv,
         _pts_D,
         _pts_PS,
-        seq_len_q=_pts_SQ,
+        _pts_SK,
+        max_seq_len_q=_pts_SQ,
+        packed_query=False,
         q_data_type=_pts_q.dtype,
         kv_data_type=_pts_k.dtype,
         o_data_type=torch.bfloat16,
         mask_type="causal",
-        max_kv_len=_pts_SK,
+        workspace_buffer=_pts_workspace,
     )
-    _pts_wrapper.run(_pts_q, _pts_cache)
+    _pts_wrapper.run(
+        _pts_q,
+        _pts_cache,
+        _pts_seq_lens,
+        _pts_block_tables,
+    )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
-        batch_decode_mla_with_paged_kv_cache as _attention_ts_mla_decode,
-        get_prims_ts_batch_decode_mla_workspace_size as _prims_ts_mla_ws_size,
-        prims_ts_batch_decode_with_kv_cache_mla as _prims_ts_mla_decode,
+        batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
+        get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
+        prims_ts_batch_mla_decode_with_kv_cache as _prims_ts_mla_decode,
     )
 
     _pmla_B, _pmla_SQ, _pmla_SK, _pmla_PS = 4, 4, 2048, 32
@@ -1882,20 +1978,27 @@ with contextlib.suppress(Exception):
 
     _pmla_wrapper = _PrimTSMLADecodeWrapper()
     _pmla_wrapper.plan(
-        _pmla_block_tables,
-        _pmla_seq_lens,
+        _pmla_q.device,
+        _pmla_B,
         _pmla_H,
         _pmla_CKV,
         _pmla_KPE,
         _pmla_PS,
-        seq_len_q=_pmla_SQ,
+        _pmla_SK,
+        max_seq_len_q=_pmla_SQ,
+        packed_query=False,
         q_data_type=_pmla_q.dtype,
         kv_data_type=_pmla_cache.dtype,
         o_data_type=torch.bfloat16,
         mask_type="causal",
-        max_kv_len=_pmla_SK,
+        workspace_buffer=_pmla_workspace,
     )
-    _pmla_wrapper.run(_pmla_q, _pmla_cache)
+    _pmla_wrapper.run(
+        _pmla_q,
+        _pmla_cache,
+        _pmla_block_tables,
+        _pmla_seq_lens,
+    )
 
 # trtllm_batch_decode_with_kv_cache with block-sparse attention (per-KV-head
 # page tables and seq lens; SM100/103 only).

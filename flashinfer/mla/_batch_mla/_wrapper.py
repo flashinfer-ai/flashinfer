@@ -19,6 +19,10 @@ from ...trace.templates.attention import mla_paged_decode_trace
 from ...utils import determine_mla_backend, get_compute_capability
 from ._backends._capabilities import MLAPlanCapabilities
 from ._backends.cutlass_backend import _BatchMLAPagedAttentionCutlassBackend
+from ._backends.cutile_backend import (
+    _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES,
+    _BatchMLAPagedAttentionCutileBackend,
+)
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
 from ._backends.fa3_backend import _BatchMLAPagedAttentionFa3Backend
 from ._contracts import (
@@ -65,6 +69,7 @@ _BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "fa2": _BatchMLAPagedAttentionFa2Backend,
     "fa3": _BatchMLAPagedAttentionFa3Backend,
     "cutlass": _BatchMLAPagedAttentionCutlassBackend,
+    "cutile": _BatchMLAPagedAttentionCutileBackend,
 }
 
 _MIRRORED_BACKEND_ATTRS = (
@@ -109,10 +114,10 @@ class BatchMLAPagedAttentionWrapper:
     projections are absorbed before attention. For the non-absorbed MLA
     prefill path, use the appropriate prefill wrapper instead.
 
-    The planned-wrapper surface owns FA2, FA3, and CUTLASS planning and
-    execution. Call :meth:`plan` once with canonical metadata before invoking
-    :meth:`run`; the plan captures the supported input/output contract and the
-    concrete backend's metadata representation.
+    The planned-wrapper surface owns FA2, FA3, CUTLASS, and cuTile planning
+    and execution. Call :meth:`plan` once with canonical metadata before
+    invoking :meth:`run`; the plan captures the supported input/output contract
+    and the concrete backend's metadata representation.
 
     See :ref:`MLA Page Layout <mla-page-layout>` for the paged KV-cache layout
     and the `FlashInfer MLA blog post
@@ -133,14 +138,21 @@ class BatchMLAPagedAttentionWrapper:
         if major < 10:
             return
         cls._blackwell_auto_fallback_warned = True
+        if (major, minor) in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
+            in_wrapper_alternative = (
+                "backend='cutile' is the native in-wrapper cuda.tile alternative."
+            )
+        else:
+            in_wrapper_alternative = (
+                "backend='cutlass' is the closest in-wrapper alternative but may be "
+                "slower than this fallback for decode shapes."
+            )
         warnings.warn(
             f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
             f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
             f"and gives poor MLA decode performance. For decode, use "
             f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
-            f"(Blackwell-native trtllm-gen); backend='cutlass' is the closest "
-            f"in-wrapper alternative but may be slower than this fallback for "
-            f"decode shapes.",
+            f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
             UserWarning,
             stacklevel=3,
         )
@@ -238,11 +250,14 @@ class BatchMLAPagedAttentionWrapper:
         kv_len_arr : Optional[torch.Tensor]
             Caller-reserved ``int32`` buffer of shape ``[batch_size]`` for CSR
             KV lengths. Used only with CUDA graphs.
-        backend : {"auto", "fa2", "fa3", "cutlass"}
+        backend : {"auto", "fa2", "fa3", "cutlass", "cutile"}
             Requested concrete backend. ``"auto"`` selects the architecture
             default exposed by :func:`flashinfer.utils.determine_mla_backend`.
             Explicit CUTLASS callers should plan with canonical dense metadata;
             its historical planless ``run`` path remains deprecated.
+            Explicit cuTile callers should plan packed or split FP16/BF16
+            DeepSeek MLA decode inputs with canonical dense or CSR metadata.
+            cuTile is not selected automatically.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -259,7 +274,8 @@ class BatchMLAPagedAttentionWrapper:
             self._backend = backend
         else:
             raise ValueError(
-                "backend must be one of 'auto', 'fa2', 'fa3', or 'cutlass', "
+                "backend must be one of 'auto', 'fa2', 'fa3', 'cutlass', or "
+                "'cutile', "
                 f"got {backend!r}."
             )
         self._planned_backend: Optional[_PlannedBackend] = None
@@ -324,7 +340,7 @@ class BatchMLAPagedAttentionWrapper:
     ) -> None: ...
 
     # Legacy flat-metadata compatibility: canonical dense page-table metadata,
-    # native for CUTLASS. This keyword-only form is deprecated.
+    # native for CUTLASS and cuTile. This keyword-only form is deprecated.
     @overload
     def plan(
         self,
@@ -389,7 +405,8 @@ class BatchMLAPagedAttentionWrapper:
         ``MLAPlanMetadata.dual(...)`` may be used when both representations
         already exist; the planner verifies that they describe the same
         requests and page mapping before publishing the plan. FA2 and FA3
-        consume CSR metadata natively, while CUTLASS consumes dense metadata.
+        consume CSR metadata natively, while CUTLASS and cuTile consume dense
+        metadata.
 
         Metadata tensors may be on CPU or the wrapper device. They are
         normalized to the device required by the selected backend; tensors on
@@ -594,13 +611,20 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Enforce CUDA graph replanning constraints
         # ---------------------------------------------------------------------------
+        planned_backend_name = getattr(
+            getattr(self, "_planned_backend", None), "_backend", None
+        )
         if (
             self._use_cuda_graph
             and getattr(self, "_planned_backend", None) is not None
-            and getattr(self._planned_backend, "_backend", None) == "cutlass"
+            and planned_backend_name in ("cutlass", "cutile")
         ):
+            graph_backend_name = (
+                "CUTLASS" if planned_backend_name == "cutlass" else "cuTile"
+            )
             raise RuntimeError(
-                "CUDA graph CUTLASS plans cannot replan because dense metadata "
+                f"CUDA graph {graph_backend_name} plans cannot replan because "
+                "dense metadata "
                 "pointers must remain stable."
             )
 
@@ -826,8 +850,13 @@ class BatchMLAPagedAttentionWrapper:
         profiler_buffer : Optional[torch.Tensor]
             Backend profiler output buffer.
         kv_len, page_table : Optional[torch.Tensor]
-            CUTLASS metadata aliases. A planned CUTLASS request may omit them;
-            the deprecated unplanned CUTLASS path requires both.
+            CUTLASS/cuTile metadata aliases. A planned request may omit them;
+            the deprecated unplanned CUTLASS path requires both. Runtime
+            metadata is a trusted hot-path input: every length must be
+            nonnegative and fit within its page-table row, every live page ID
+            must index ``kv_cache``, and callers must not mutate either tensor
+            while a launch is in flight. These values are not synchronized to
+            the host for validation so that CUDA-graph capture remains valid.
         return_lse_base_on_e : bool
             Return natural-log rather than base-2 LSE values.
         o_scale : Optional[float]

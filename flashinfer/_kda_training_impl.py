@@ -1216,6 +1216,53 @@ def recurrent_kda_training_forward(
 
     Packed calls require ``cu_seqlens_cpu``, a trusted CPU mirror of the CUDA
     ``cu_seqlens`` tensor used for host-side route and metadata planning.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Contiguous BF16 queries with shape ``[B, T, Hqk, 128]``. Packed calls
+        use a physical batch size of one.
+    k : torch.Tensor
+        Contiguous BF16 keys with the same shape as ``q``.
+    v : torch.Tensor
+        Contiguous BF16 values with shape ``[B, T, Hv, 128]``, where ``Hv``
+        is an integer multiple of ``Hqk``.
+    g : torch.Tensor
+        Contiguous BF16 raw gate values with the same shape as ``v``.
+    beta : torch.Tensor
+        Contiguous BF16 raw beta values with shape ``[B, T, Hv]``.
+    A_log : torch.Tensor
+        Contiguous FP32 state-transition parameters with shape ``[Hv]``.
+    dt_bias : torch.Tensor
+        Contiguous FP32 step-size biases with shape ``[Hv, 128]``.
+    initial_state : torch.Tensor
+        Contiguous FP32 initial states with shape
+        ``[num_sequences, Hv, 128, 128]``.
+    cu_seqlens : torch.Tensor, optional
+        Contiguous CUDA int64 cumulative sequence lengths for packed input.
+        Omit for fixed-length input.
+    scale : float, optional
+        Attention scale. The training kernel currently requires
+        ``1 / sqrt(128)``; ``None`` selects that value.
+    lower_bound : float
+        Gate lower bound. The training kernel currently requires ``-5.0``.
+    out : torch.Tensor, optional
+        Caller-owned contiguous BF16 output buffer with the same shape as
+        ``v``.
+    final_state_out : torch.Tensor, optional
+        Caller-owned contiguous FP32 final-state buffer with the same shape as
+        ``initial_state``.
+    context_out : RecurrentKDATrainingContext, optional
+        Same-shape context to reuse on the CUDA stream that created it.
+    cu_seqlens_cpu : torch.Tensor, optional
+        Trusted contiguous CPU int64 mirror of ``cu_seqlens``. Required for
+        packed input and must be omitted for fixed-length input.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, RecurrentKDATrainingContext]
+        Token output, final recurrent state, and the saved route context
+        required by :func:`recurrent_kda_training_backward`.
     """
 
     args = (
@@ -1616,7 +1663,30 @@ def recurrent_kda_training_backward(
     dfinal_state: torch.Tensor,
     out: Optional[Sequence[torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, ...]:
-    r"""Differentiate a saved route context without rerunning forward recurrence."""
+    r"""Differentiate a saved route context without rerunning forward recurrence.
+
+    Parameters
+    ----------
+    context : RecurrentKDATrainingContext
+        Context returned by :func:`recurrent_kda_training_forward`. It must be
+        used on the original forward stream and must not have been modified.
+    do : torch.Tensor
+        Contiguous BF16 gradient of the token output, with the same shape as
+        the forward ``v`` tensor.
+    dfinal_state : torch.Tensor
+        Contiguous FP32 gradient of the final recurrent state, with the same
+        shape as the forward ``initial_state`` tensor.
+    out : Sequence[torch.Tensor], optional
+        Eight caller-owned gradient buffers for ``q``, ``k``, ``v``, ``g``,
+        ``beta``, ``A_log``, ``dt_bias``, and ``initial_state``, in that order.
+
+    Returns
+    -------
+    tuple[torch.Tensor, ...]
+        The eight gradients in the order described by ``out``. Q, K, V, G,
+        and beta gradients are BF16; parameter and initial-state gradients are
+        FP32.
+    """
 
     # Route helpers invoke run_training_backward or the route-specific FFI symbol.
 

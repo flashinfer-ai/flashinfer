@@ -21,6 +21,9 @@
 # PrimTS speculative MLA decode
 --routine BatchMLAPagedAttentionWrapper --backends prims-ts trtllm-native --page_size 32 --batch_size 4 --s_qo 4 --s_kv 4096 --num_qo_heads 32 --num_kv_heads 1 --head_dim_ckv 512 --head_dim_kpe 64 -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --case_tag "PrimTS-MLA-decode-SQ4"
 
+# DeepSeek-V4 sparse MLA long-query prefill on SM100/SM103
+--routine trtllm_batch_decode_sparse_mla_dsv4 --backends trtllm-gen --page_size 256 --compressed_page_size 64 --batch_size 1 --s_qo 16384 --s_kv 16384 --num_qo_heads 16 --num_kv_heads 1 --head_dim_qk 512 --head_dim_vo 512 --swa_topk 128 --compressed_topk 1920 --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 --out_dtype bfloat16 --no_cuda_graph --refcheck -vv --generate_repro_command --case_tag "DeepSeek-V4-sparse-MLA-prefill"
+
 ## FP8 bmm
 --routine bmm_fp8 --batch_size 64 --m 4 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
 
