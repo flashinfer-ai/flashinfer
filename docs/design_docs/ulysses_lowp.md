@@ -139,7 +139,9 @@ capability() -> bool
 ```
 
 Returns `True` when the compiled kernel's `Q_GROUP`, `K_GROUP`, and
-`HEAD_DIM` constants match the Python-side values and the device is SM120.
+`HEAD_DIM` constants match the Python-side values and the device is SM89 or
+SM120. `capability()` covers that grid only; SM90 has its own module and its
+own probe, `UlyssesLowpSageLayoutSM90.is_supported()`.
 Import succeeds on all platforms; callers that depend on the lowp path
 should gate on `capability()` rather than catching import errors.
 
@@ -206,7 +208,9 @@ scales from the same gathered stats buffer.
 
 The kernel byte-anchoring is validated under `sm_120a` (RTX PRO 6000
 Blackwell; `compute_120f` FMA semantics). JIT compilation pins
-`-gencode sm_120a` on SM 12.0 devices. AOT prebuilds for SM120 only.
+`-gencode sm_120a` on SM 12.0 devices. The SM90 grid lives in a separate
+translation unit pinned to `-gencode sm_90a`. AOT prebuilds both, each gated on
+the matching capability.
 
 `head_dim == 128` is a hard requirement. `world_size ∈ {2, 4, 6, 8}` is the
 tested range (P = 6 is admissible).
@@ -224,10 +228,28 @@ This module does not provide:
 - **Multi-node or cross-NIC paths.** The payload layout is designed for
   intra-node NVLink all-to-all. Cross-node payload compression or alternate
   quantization formats are out of scope.
-- **Hopper (SM 9.0) native WGMMA kernel support.** The scale granularity
-  (Q_GROUP=32 / K_GROUP=64) is matched to the `_qattn_sm89`
-  grid used by SageAttention2 on both SM89 and SM120. A future layout variant
-  targeting the SM90 WGMMA kernel (Q per-16-token, K per-128-token) would
-  require new kernel instances and is not part of this PR.
 - **Dynamic sequence lengths within a batch.** All batch entries share the
   same `S`; variable-length packing is not implemented.
+
+### Hopper (SM 9.0)
+
+SM90 is supported through a second layout, `UlyssesLowpSageLayoutSM90`, backed
+by its own translation unit (`csrc/ulysses_lowp_sm90.cu`, `-gencode sm_90a`).
+It exists because SageAttention2's SM90 WGMMA kernel uses a different scale
+granularity and a different CTA_K:
+
+| | Q_GROUP | K_GROUP | CTA_K | V pad | boundary-merge alignment |
+|---|---|---|---|---|---|
+| SM89 / SM120 | 32 | 64 | 64 | 64 | 64 |
+| SM90 | 16 | 128 | 128 | 128 | 128 |
+
+Consumers select the layout themselves -- the module-level functions, and
+`capability()`, remain pinned to the SM89/SM120 grid and raise or report
+`supported=False` on SM90. Every grid-dependent quantity is derived from the
+layout's `Q_GROUP` / `K_GROUP` (`scale_widths()`, `payload_spec()`,
+`required_alignment()`, `verify_duplicate_scale_slots()`), so the two grids
+share one implementation and cannot drift.
+
+The SM90 kernels have no CI coverage: `tests/comm/test_ulysses_lowp.py` gates
+its device tests on SM120, and the arithmetic contracts that do run in CI
+(`scale_widths`, `payload_spec`) are structural only.
