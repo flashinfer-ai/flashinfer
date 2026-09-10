@@ -12,7 +12,6 @@ import weakref
 import torch
 import pytest
 
-
 COMMON_PLAN_KWARGS = dict(
     num_heads=16,
     head_dim_ckv=4,
@@ -1860,6 +1859,7 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
         )
     )
 
+    wrapper._cuda_graph_plan_update_stream = 17
     failing_module = None
 
     class _FailsAfterPlanningStarts(_FakeBatchMLAModule):
@@ -1892,6 +1892,7 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
             **common,
         )
 
+    assert wrapper._cuda_graph_plan_update_stream == 17
     assert failing_module is not None
     assert failing_module.int_workspace_arg is int_workspace
     assert failing_module.pin_workspace_arg is not pin_workspace
@@ -1949,6 +1950,7 @@ def test_cuda_graph_replan_keeps_only_current_backend_and_stable_graph_storage(
     )
     old_backend_refs = []
     for index in range(32):
+        wrapper._cuda_graph_plan_update_stream = 17
         old_backend_refs.append(weakref.ref(wrapper._planned_backend))
         previous_pin_workspace = (
             wrapper._planned_backend._pin_memory_int_workspace_buffer
@@ -1963,6 +1965,7 @@ def test_cuda_graph_replan_keeps_only_current_backend_and_stable_graph_storage(
             ),
             **common,
         )
+        assert getattr(wrapper, "_cuda_graph_plan_update_stream", None) is None
         assert (
             wrapper._planned_backend._pin_memory_int_workspace_buffer
             is not previous_pin_workspace

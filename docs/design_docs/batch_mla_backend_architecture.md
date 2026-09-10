@@ -582,6 +582,10 @@ cross-stream updates and concurrent updates on one wrapper are rejected when
 detectable. Cross-stream replay is unsupported: replay is external to the
 wrapper, so its stream cannot be observed or validated and same-stream ordering
 is a caller obligation. `run()` performs no update work.
+Successful `plan()` resets the stream binding for the new plan; failed
+replanning preserves the old binding. Before switching streams through a full
+replan, finish the old updates and graph replays, then recapture `run()` for the
+new plan.
 
 The three host control tensors, `qo_indptr`, `kv_indptr`, and `kv_len_arr`, must
 be contiguous CPU `torch.int32` tensors. `kv_indices` must be contiguous
@@ -674,6 +678,12 @@ public `plan()` / `update_cuda_graph_plan()` / `run()` lifecycle is the
 replacement. No compatibility attribute is removed in this release; removal
 requires a separate future proposal and evidence that the applicable support
 policy no longer includes consumers that use the bridge.
+
+The private fast-plan bridge is unsupported on wrappers constructed with
+`enable_cuda_graph_plan_update=True`. Its CPU planner rewrites the pinned
+workspace prefix that can still source an in-flight public update. Sharing a
+CUDA stream does not order those CPU writes against the pending H2D transfer.
+Use separate, default-off wrappers for legacy private planning.
 
 Trace and Trace Apply integration preserve the public wrapper identity and
 plan-owned metadata capture. The MLA trace template normalizes structural

@@ -323,6 +323,9 @@ stream on the wrapper device, even if backend delegation later fails.  Each
 corresponding graph replay must execute on that same stream.  Cross-stream
 replay and concurrent use are unsupported, and the wrapper cannot observe or
 validate the stream used by an external replay.
+Successful ``plan()`` starts a new stream-binding lifecycle; a failed plan
+preserves the previous binding.  Before replanning on another stream, finish
+the old updates and replays, then recapture ``run()`` for the new plan.
 
 The update accepts only complete CSR ``MLAPlanMetadata``.  ``qo_indptr``,
 ``kv_indptr``, and ``kv_len_arr`` are host control tensors and must be
@@ -361,6 +364,10 @@ deprecated in documentation only in this release.  It emits no runtime warning
 because untouched older SGLang accesses ``_cached_module`` and can promote
 ``DeprecationWarning`` to an exception.  The public ``plan()`` /
 ``update_cuda_graph_plan()`` / ``run()`` lifecycle is the replacement.
+The private fast-plan bridge must not be used on a wrapper constructed with
+``enable_cuda_graph_plan_update=True``.  Its CPU planner writes the same pinned
+workspace used by pending public updates; using the same CUDA stream does not
+order those CPU writes.  Keep legacy callers on separate, default-off wrappers.
 Removing these private compatibility attributes requires a separately
 announced future change and evidence that the applicable support policy no
 longer includes callers that depend on them.
