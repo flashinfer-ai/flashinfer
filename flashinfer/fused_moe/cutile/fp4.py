@@ -938,6 +938,27 @@ def _decode_e2m1_bytes(packed, tile_n: ConstInt, tile_k: ConstInt):
     return ct.reshape(values, (tile_n, tile_k))
 
 
+def _decode_e2m1_bytes_to_bf16(packed, tile_n: ConstInt, tile_k: ConstInt):
+    low = ct.expand_dims(packed & 0xF, axis=2)
+    high = ct.expand_dims(packed >> 4, axis=2)
+    selector = ct.reshape(ct.arange(2, dtype=ct.int32), (1, 1, 2))
+    codes = ct.where(selector == 0, low, high)
+    magnitude_code = ct.astype(codes & 0x7, ct.int32)
+    # All E2M1 values are exact in BF16. Constructing their BF16 bits avoids
+    # an FP32 select chain before the BF16 MMA input boundary.
+    magnitude_bits = ct.where(
+        magnitude_code == 0,
+        0,
+        0x3EC0 + (magnitude_code << 6) + ct.where(magnitude_code > 1, 0x40, 0),
+    )
+    sign_bits = ct.astype(codes & 0x8, ct.int32) << 12
+    values = ct.bitcast(
+        ct.astype(magnitude_bits, ct.uint16) | ct.astype(sign_bits, ct.uint16),
+        ct.bfloat16,
+    )
+    return ct.reshape(values, (tile_n, tile_k))
+
+
 def _decode_e4m3_bytes(bits):
     exponent = (bits >> 3) & 0xF
     mantissa = bits & 0x7
@@ -959,6 +980,7 @@ def _load_w4a16_weight_tile(
     tile_k: ConstInt,
     scale_block_size: ConstInt,
     is_mxfp4: ConstBool,
+    decode_to_bf16: ConstBool,
 ):
     groups_per_tile = tile_k // scale_block_size
     weight_bytes = ct.reshape(
@@ -972,19 +994,22 @@ def _load_w4a16_weight_tile(
         ),
         (tile_n, tile_k // 2),
     )
-    weight = _decode_e2m1_bytes(weight_bytes, tile_n, tile_k)
-    weight_scale_swizzled = ct.reshape(
+    if decode_to_bf16:
+        weight = _decode_e2m1_bytes_to_bf16(weight_bytes, tile_n, tile_k)
+    else:
+        weight = _decode_e2m1_bytes(weight_bytes, tile_n, tile_k)
+    weight_scale_linear = ct.reshape(
         ct.load(
             weight_scale,
-            index=(expert, n_block, k_tile, 0, 0),
-            shape=(1, tile_n // 128, groups_per_tile // 4, 32, 16),
+            index=(expert, n_block, k_tile),
+            shape=(1, tile_n, groups_per_tile),
             padding_mode=ct.PaddingMode.ZERO,
             latency=3,
             allow_tma=True,
         ),
-        (tile_n // 128, groups_per_tile // 4, 32, 16),
+        (tile_n, groups_per_tile),
     )
-    decoded_scale = ct.permute(_unswizzle_32_4_4(weight_scale_swizzled), (1, 0))
+    decoded_scale = ct.permute(weight_scale_linear, (1, 0))
     if is_mxfp4:
         decoded_scale = ct.exp2(ct.astype(decoded_scale, ct.int32) - 127)
     else:
@@ -1123,6 +1148,7 @@ def _grouped_gemm_w4a16_impl(
     ACTIVATION_PARAM3: ConstFloat,
     IS_MXFP4: ConstBool,
     USE_NATIVE_FP4: ConstBool,
+    DECODE_TO_BF16: ConstBool,
     SHARDED_GLOBAL_SCALE: ConstBool,
     USE_INT64: ConstBool,
 ):
@@ -1204,6 +1230,7 @@ def _grouped_gemm_w4a16_impl(
                         TILE_K,
                         SCALE_BLOCK_SIZE,
                         IS_MXFP4,
+                        DECODE_TO_BF16,
                     )
                 # FP4 values and both supported FP8 scale formats are exactly
                 # representable in BF16, which is also the MMA input boundary.
@@ -1265,6 +1292,7 @@ def _grouped_gemm_w4a16(
     ACTIVATION_PARAM3: ConstFloat,
     IS_MXFP4: ConstBool,
     USE_NATIVE_FP4: ConstBool,
+    DECODE_TO_BF16: ConstBool,
     SHARDED_GLOBAL_SCALE: ConstBool,
 ):
     _grouped_gemm_w4a16_impl(
@@ -1291,6 +1319,7 @@ def _grouped_gemm_w4a16(
         ACTIVATION_PARAM3,
         IS_MXFP4,
         USE_NATIVE_FP4,
+        DECODE_TO_BF16,
         SHARDED_GLOBAL_SCALE,
         False,
     )
@@ -1321,6 +1350,7 @@ def _grouped_gemm_w4a16_i64(
     ACTIVATION_PARAM3: ConstFloat,
     IS_MXFP4: ConstBool,
     USE_NATIVE_FP4: ConstBool,
+    DECODE_TO_BF16: ConstBool,
     SHARDED_GLOBAL_SCALE: ConstBool,
 ):
     _grouped_gemm_w4a16_impl(
@@ -1347,6 +1377,7 @@ def _grouped_gemm_w4a16_i64(
         ACTIVATION_PARAM3,
         IS_MXFP4,
         USE_NATIVE_FP4,
+        DECODE_TO_BF16,
         SHARDED_GLOBAL_SCALE,
         True,
     )
@@ -2103,8 +2134,9 @@ def _grouped_gemm_w4a16_launch(
         n_blocks = (n + config.tile_n - 1) // config.tile_n
         grid_m = _persistent_grid_m(x, grid_m, n_blocks)
 
-    major, _ = torch.cuda.get_device_capability(x.device)
+    major, minor = torch.cuda.get_device_capability(x.device)
     use_native_fp4 = major >= 10
+    decode_to_bf16 = (major, minor) == (9, 0)
     weight_scale_input = weight_scale
     if not use_native_fp4:
         # FP8 scale types are not legal cuTile dtypes on all pre-SM100 GPUs.
@@ -2145,6 +2177,7 @@ def _grouped_gemm_w4a16_launch(
             ),
             scale_block_size == _MXFP4_BLOCK_SIZE,
             use_native_fp4,
+            decode_to_bf16,
             weight_global_scale.ndim == 2,
         ),
     )

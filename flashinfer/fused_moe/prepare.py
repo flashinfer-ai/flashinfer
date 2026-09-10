@@ -1403,6 +1403,27 @@ def _swizzle_cutile_fp4_scales(
     )
 
 
+def _prepare_cutile_fp4_scales(
+    scale: torch.Tensor,
+    *,
+    scale_block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Select the FP4 scale layout for the target architecture.
+
+    SM89/SM90 only run the W4A16 path, so retaining logical row-major scales
+    avoids undoing the W4A4 scaled-MMA swizzle in every GEMM tile. SM12x keeps
+    the swizzle so one prepared view remains usable by both W4A4 and W4A16.
+    Both layouts retain the checkpoint scale dtype and element count (apart
+    from the padding required by the W4A4 layout).
+    """
+    if device.type == "cuda":
+        major, _ = torch.cuda.get_device_capability(device)
+        if major < 10:
+            return scale.contiguous()
+    return _swizzle_cutile_fp4_scales(scale, scale_block_size=scale_block_size)
+
+
 def prepare_cutile_nvfp4_weights(
     w1_fp4: torch.Tensor,
     w1_block_scale: torch.Tensor,
@@ -1422,9 +1443,8 @@ def prepare_cutile_nvfp4_weights(
 
     Packed values use two E2M1 elements per byte along K. Block scales are
     E4M3 with a 16-element K group, and global scales are per expert or, for a
-    gated GEMM1, optionally per ``[up, gate]`` shard. W4A4 weights retain their
-    logical dimensions while their scaled-MMA layout pads outer scale rows to
-    a multiple of 128.
+    gated GEMM1, optionally per ``[up, gate]`` shard. On SM12x, the shared
+    W4A4/W4A16 scaled-MMA layout pads outer scale rows to a multiple of 128.
     """
     from .api import _CUTILE_SUPPORTED_ACTIVATIONS
 
@@ -1433,7 +1453,7 @@ def prepare_cutile_nvfp4_weights(
         raise ValueError(f"unsupported cuTile NVFP4 activation {activation_type!r}.")
     if hidden_size % 64 != 0 or intermediate_size % 64 != 0:
         raise ValueError(
-            "cuTile W4A4 requires hidden_size and intermediate_size divisible by 64."
+            "cuTile NVFP4 requires hidden_size and intermediate_size divisible by 64."
         )
     if device is None:
         device = w1_fp4.device
@@ -1519,11 +1539,15 @@ def prepare_cutile_nvfp4_weights(
         "w2_scale": w2_block_scale.contiguous(),
         "w2_global_scale": w2_global_scale.contiguous(),
     }
-    result["w1_scale"] = _swizzle_cutile_fp4_scales(
-        result["w1_scale"], scale_block_size=16
+    result["w1_scale"] = _prepare_cutile_fp4_scales(
+        result["w1_scale"],
+        scale_block_size=16,
+        device=device,
     )
-    result["w2_scale"] = _swizzle_cutile_fp4_scales(
-        result["w2_scale"], scale_block_size=16
+    result["w2_scale"] = _prepare_cutile_fp4_scales(
+        result["w2_scale"],
+        scale_block_size=16,
+        device=device,
     )
     return result
 
@@ -1540,11 +1564,12 @@ def prepare_cutile_mxfp4_weights(
     activation_type: ActivationType = ActivationType.Swiglu,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build one MXFP4 weight view shared by cuTile W4A4 and W4A16.
+    """Build an architecture-native MXFP4 weight view for cuTile.
 
     Packed values remain checkpoint-native E2M1 pairs. Logical UE8M0 scales
-    use 32-element K groups and are converted once to the scaled-MMA layout;
-    the W4A16 kernel reads that same layout and unswizzles it on load.
+    use 32-element K groups. SM12x converts them once to the scaled-MMA layout
+    shared by W4A4 and W4A16; SM89/SM90 retain a compact row-major layout for
+    W4A16.
     """
     from .api import _CUTILE_SUPPORTED_ACTIVATIONS
 
@@ -1609,15 +1634,19 @@ def prepare_cutile_mxfp4_weights(
 
     return {
         "w1": w1_fp4.contiguous(),
-        "w1_scale": _swizzle_cutile_fp4_scales(
-            w1_block_scale.contiguous(), scale_block_size=32
+        "w1_scale": _prepare_cutile_fp4_scales(
+            w1_block_scale.contiguous(),
+            scale_block_size=32,
+            device=device,
         ),
         "w1_global_scale": torch.ones(
             num_local_experts, dtype=torch.float32, device=device
         ),
         "w2": w2_fp4.contiguous(),
-        "w2_scale": _swizzle_cutile_fp4_scales(
-            w2_block_scale.contiguous(), scale_block_size=32
+        "w2_scale": _prepare_cutile_fp4_scales(
+            w2_block_scale.contiguous(),
+            scale_block_size=32,
+            device=device,
         ),
         "w2_global_scale": torch.ones(
             num_local_experts, dtype=torch.float32, device=device

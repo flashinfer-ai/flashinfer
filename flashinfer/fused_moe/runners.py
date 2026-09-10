@@ -3687,20 +3687,26 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             )
         w1_scale_groups = hidden_size // self._scale_block_size
         w2_scale_groups = intermediate_size // self._scale_block_size
-        expected_s1: tuple[int, ...] = (
+        linear_s1: tuple[int, ...] = (num_experts, w1_rows, w1_scale_groups)
+        linear_s2: tuple[int, ...] = (num_experts, hidden_size, w2_scale_groups)
+        swizzled_s1: tuple[int, ...] = (
             num_experts,
             (w1_rows + 127) // 128,
             (w1_scale_groups + 3) // 4,
             32,
             16,
         )
-        expected_s2: tuple[int, ...] = (
+        swizzled_s2: tuple[int, ...] = (
             num_experts,
             (hidden_size + 127) // 128,
             (w2_scale_groups + 3) // 4,
             32,
             16,
         )
+        if self._device_arch < 100:
+            expected_s1, expected_s2 = linear_s1, linear_s2
+        else:
+            expected_s1, expected_s2 = swizzled_s1, swizzled_s2
         if tuple(w1_scale.shape) != expected_s1 or tuple(w2_scale.shape) != expected_s2:
             raise ValueError(
                 f"cuTile {self._precision_name} block-scale shapes "

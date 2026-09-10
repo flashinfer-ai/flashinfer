@@ -839,6 +839,21 @@ def test_prepare_cutile_mxfp4_weights_uses_shared_padded_scale_layout():
         )
 
 
+def test_prepare_cutile_fp4_scales_uses_compact_layout_before_sm100(monkeypatch):
+    from flashinfer.fused_moe.prepare import _prepare_cutile_fp4_scales
+
+    scales = torch.arange(2 * 192 * 6, dtype=torch.uint8).reshape(2, 192, 6)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
+
+    prepared = _prepare_cutile_fp4_scales(
+        scales, scale_block_size=32, device=torch.device("cuda")
+    )
+
+    assert prepared.shape == scales.shape
+    assert prepared.numel() == scales.numel()
+    torch.testing.assert_close(prepared, scales)
+
+
 def test_cutile_fp4_activation_modes_share_prepared_weight_keys():
     assert CuTileNvfp4Runner.backend_key == CuTileNvfp4Bf16Runner.backend_key
     assert CuTileMxfp4Runner.backend_key == CuTileMxfp4Bf16Runner.backend_key
@@ -1237,6 +1252,10 @@ def test_cutile_fp4_weight_view_supports_a4_and_a16(weight_format, activation):
     supported_modes = [mode for mode in modes if mode[0].supported(arch)]
     if not supported_modes:
         pytest.skip(f"cuTile {weight_format} does not support SM{arch}")
+    prepared_view = weights.get_view(modes[0][1].backend_key)
+    expected_scale_ndim = 3 if arch < 100 else 5
+    assert prepared_view["w1_scale"].ndim == expected_scale_ndim
+    assert prepared_view["w2_scale"].ndim == expected_scale_ndim
     packed_weight_ids = set()
     for config_type, runner_type, quant_pair in supported_modes:
         config = _fp4_config(
