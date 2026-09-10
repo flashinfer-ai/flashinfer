@@ -52,9 +52,9 @@ from flashinfer.utils import get_compute_capability
 
 
 def quant_id(quant: QuantConfig) -> str:
-    """Pytest id for a QuantConfig MMA pair: ``NVFP4`` or ``NVFP4xBF16``."""
+    """Pytest id for a QuantConfig MMA pair, e.g. ``NVFP4xNVFP4`` or ``NVFP4xBF16``."""
     weight, activation = quant.pair
-    return weight.name if weight is activation else f"{weight.name}x{activation.name}"
+    return f"{weight.name}x{activation.name}"
 
 
 def parametrize_id(val: object) -> str | None:

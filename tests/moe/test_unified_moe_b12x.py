@@ -208,7 +208,7 @@ class TestB12xUnifiedValidation:
                 QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
             ),
         ),
-        ids=["NVFP4", "NVFP4xBF16"],
+        ids=["NVFP4xNVFP4", "NVFP4xBF16"],
     )
     @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
     def test_b12x_accepts_implemented_activations(
@@ -325,7 +325,10 @@ class TestB12xUnifiedValidation:
                 QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             ),
         ),
-        ids=["NVFP4-runner-NVFP4xBF16-quant", "NVFP4xBF16-runner-NVFP4-quant"],
+        ids=[
+            "NVFP4xNVFP4-runner-NVFP4xBF16-quant",
+            "NVFP4xBF16-runner-NVFP4xNVFP4-quant",
+        ],
     )
     def test_quantization_backend_mismatch_rejected(
         self, runner_type, backend, variant
@@ -802,7 +805,7 @@ class TestUnifiedB12xConformance:
                 192,
             ),
         ),
-        ids=["NVFP4-t8", "NVFP4-t128", "NVFP4xBF16-t32"],
+        ids=["NVFP4xNVFP4-t8", "NVFP4xNVFP4-t128", "NVFP4xBF16-t32"],
     )
     def test_ragged_intermediate(
         self, variant, activation, num_tokens, intermediate_size
@@ -903,7 +906,7 @@ class TestUnifiedB12xConformance:
                 64,
             ),
         ),
-        ids=["NVFP4-silu", "NVFP4-relu2", "NVFP4xBF16-silu"],
+        ids=["NVFP4xNVFP4-silu", "NVFP4xNVFP4-relu2", "NVFP4xBF16-silu"],
     )
     def test_cuda_graph(
         self,
@@ -960,7 +963,7 @@ class TestUnifiedB12xConformance:
                 "compressed_tensors",
             ),
         ),
-        ids=["NVFP4-modelopt", "NVFP4xBF16-modelopt", "NVFP4xBF16-compressed"],
+        ids=["NVFP4xNVFP4-modelopt", "NVFP4xBF16-modelopt", "NVFP4xBF16-compressed"],
     )
     def test_matches_legacy_wrapper(self, variant, source_format):
         from flashinfer.fused_moe import B12xMoEWrapper
