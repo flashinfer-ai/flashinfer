@@ -980,6 +980,7 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
+        "workspace_size": Var(description="Optional caller scratch size in bytes."),
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
@@ -998,6 +999,11 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         {
             "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
             "seq_lens_kv": Tensor(["batch_size"], dtype="int32"),
+            "workspace_buffer": Tensor(
+                ["workspace_size"], dtype="uint8", optional=True
+            ),
+            "max_kv_len": Scalar("int32", optional=True),
+            "validate": Scalar("bool", optional=True),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
@@ -1632,6 +1638,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
+        "workspace_size": Var(description="Optional caller scratch size in bytes."),
         "batch_size": Var(description="Number of MLA decode requests."),
         "num_heads": Const(abbrev="h"),
         "head_dim_qk": Const(abbrev="d_qk"),
@@ -1680,6 +1687,10 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             ),
             "max_seq_len_q": Scalar("int32", optional=True),
             "max_kv_len": Scalar("int32", optional=True),
+            "workspace_buffer": Tensor(
+                ["workspace_size"], dtype="uint8", optional=True
+            ),
+            "validate": Scalar("bool", optional=True),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
             "mask_type": Scalar("string", optional=True),
