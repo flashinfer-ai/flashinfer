@@ -540,7 +540,7 @@ def bf16_mxfp8_mega_moe(
         if y is not None:
             y.copy_(out)
     else:
-        # Reduce straight into the caller's buffer
+        # Reduce straight into the result buffer
         out = y if y is not None else symm_buffer.reduced_output[:n, 0]
         torch.sum(result, dim=1, out=out)
 
