@@ -3260,7 +3260,7 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "name": "direct_bf16_wide_slot_offsets",
         "target": "sm100a",
         "body": "cake_fused_kda_decode_direct_bf16_wide_slot_offsets.cu",
-        "source_sha256": "babd4ba703a9780c774162ba301321970456df374f15ed1199f850f59250f27b",
+        "source_sha256": "5807b7a14c16753a0188e2f05f7e072d9d6e11dd3466f53124bfec9091fd3514",
         "kernel_symbol": "kernel_cake_fused_kda_decode_direct_bf16_wide_slot_offsets",
         "abi_kind": "standard",
         "state_dtype": "bfloat16",

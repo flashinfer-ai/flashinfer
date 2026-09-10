@@ -602,6 +602,7 @@ kernel_cake_fused_kda_decode_direct_bf16_wide_slot_offsets(__nv_bfloat16* __rest
     is_live = ((requested_slot > 0) ? 1 : 0);
     float state_regs[32];
     unsigned int state_carriers[4];
+    unsigned int next_state_carriers[16];
     float r_q[8];
     float r_k[8];
     float r_decay[8];
@@ -855,7 +856,7 @@ kernel_cake_fused_kda_decode_direct_bf16_wide_slot_offsets(__nv_bfloat16* __rest
             #pragma unroll
             for (int local_row_1 = 0; local_row_1 < 4; local_row_1++) {
                 {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(state + state_tile_base + (long long)(local_row_1 * 128));
+                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(next_state_carriers + local_row_1 * 4);
                     uint4* _vdst_3 = reinterpret_cast<uint4*>(&state_carriers[0]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -982,6 +983,19 @@ kernel_cake_fused_kda_decode_direct_bf16_wide_slot_offsets(__nv_bfloat16* __rest
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 4], state_regs[local_row_b * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 6], state_regs[local_row_b * 8 + 7]);
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_b * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                }
+            }
+            if (value_tile == 0 && row_group == 0) {
+                #pragma unroll
+                for (int next_row = 0; next_row < 4; next_row++) {
+                    {
+                        const uint4* _vptr_4 = reinterpret_cast<const uint4*>(state + state_group_base + 8192 + (long long)(next_row * 128));
+                        uint4* _vdst_4 = reinterpret_cast<uint4*>(&next_state_carriers[next_row * 4]);
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vdst_4[_blk] = _vptr_4[_blk];
+                        }
+                    }
                 }
             }
             recurrence_value_a = state_query_pair_a.x + state_query_pair_a.y;
