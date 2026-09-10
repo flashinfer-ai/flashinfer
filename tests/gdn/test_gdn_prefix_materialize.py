@@ -531,3 +531,99 @@ def test_randomized_stress(ring_slots, seed):
     assert torch.equal(got_state[2 * B :], before[2 * B :]), (
         "an unindexed slot was written"
     )
+
+
+# ---------------------------------------------------------------------------
+# Paged (block-strided) serving pools: dense inner dims, padded slot stride.
+# ---------------------------------------------------------------------------
+def _padded_view(t, pad_elems):
+    """Rebuild `t` as a strided view with `pad_elems` of dead space per slot.
+
+    This is the vLLM-style paged layout: slot contents identical, slot-to-slot
+    stride larger than the slot. The pad region is poisoned with NaN-ish bytes
+    so a kernel that strays into it produces loudly wrong values, and we also
+    assert afterwards that the pad was never written.
+    """
+    per = t[0].numel()
+    buf = torch.empty(t.shape[0] * (per + pad_elems), dtype=t.dtype, device=t.device)
+    buf.fill_(float("nan") if t.dtype.is_floating_point else -1)
+    view = buf.as_strided(t.shape, (per + pad_elems,) + tuple(t.stride()[1:]))
+    view.copy_(t)
+    return view, buf
+
+
+@pytest.mark.parametrize("pad", [8, 256])  # multiples of 8 keep 16 B alignment
+@pytest.mark.parametrize("ring_slots", RING_DEPTHS)
+def test_padded_slot_stride_pools(ring_slots, pad):
+    """Paged pools: every big tensor a strided view, results match contiguous.
+
+    Two different pads run in one session, so the compile cache must hold a
+    correct specialization PER layout (static descriptors bake the stride);
+    a stale-cubin mixup would fail one of the two parametrizations.
+    """
+    _skip_if_not_sm90_or_later()
+    hist = [15, 12, 9, 7]
+    bases = [11, 5, 0, 9]
+    counts = _i32([15, 5, 0, -1])  # full, partial, copy, skipped
+    state, kc, uc, gc = _make_pool(8, hist, bases, seed=41, ring_slots=ring_slots)
+    src, dst = _i32([0, 1, 2, 3]), _i32([4, 5, 6, 7])
+
+    # Ground truth on the contiguous tensors.
+    ref_state = state.clone()
+    materialize_ref(
+        [ref_state], [kc], [uc], [gc], src[None, :], dst[None, :], _i32(bases), counts
+    )
+
+    state_v, state_buf = _padded_view(state, pad)
+    kc_v, _ = _padded_view(kc, pad)
+    uc_v, _ = _padded_view(uc, pad)
+    gc_v, _ = _padded_view(gc, pad)
+    assert not state_v.is_contiguous()
+    pad_before = state_buf.clone()
+
+    gdn_prefix_materialize(state_v, src, dst, kc_v, uc_v, gc_v, _i32(bases), counts)
+    torch.cuda.synchronize()
+
+    _assert_close(ref_state, state_v, [4, 5, 6])
+    assert torch.equal(state_v[7], state[7]), "skipped row's destination changed"
+    # The dead space between slots must be untouched (NaN poison intact).
+    per = state[0].numel()
+    for s in range(8):
+        gap = state_buf[s * (per + pad) + per : (s + 1) * (per + pad)]
+        ref_gap = pad_before[s * (per + pad) + per : (s + 1) * (per + pad)]
+        assert torch.equal(gap.view(torch.int16), ref_gap.view(torch.int16)), (
+            f"kernel wrote into the pad after slot {s}"
+        )
+
+
+def test_inner_stride_rejected():
+    """Non-density in an INNER dim must be a loud error, never accepted.
+
+    The kernel hardcodes dense ring-row/feature addressing; a faithfully
+    described inner-strided view would be read wrongly and silently. The
+    wrapper must refuse it.
+    """
+    _skip_if_not_sm90_or_later()
+    state, kc, uc, gc = _make_pool(4, [8], [0], seed=42)
+    # state with a padded HEAD stride (inner dim 1) -- dense slots, gapped heads.
+    buf = torch.zeros(4 * HV * (V * K + 64), dtype=state.dtype, device=DEV)
+    bad = buf.as_strided((4, HV, V, K), (HV * (V * K + 64), V * K + 64, K, 1))
+    with pytest.raises(ValueError, match="dim 1 has stride"):
+        gdn_prefix_materialize(
+            bad, _i32([0]), _i32([1]), kc, uc, gc, _i32([0]), _i32([2])
+        )
+
+
+def test_noncontiguous_metadata_rejected():
+    """Strided metadata is refused: it is not covered by the compile cache
+    key, so a baked-in view layout could be silently reused by a later call."""
+    _skip_if_not_sm90_or_later()
+    state, kc, uc, gc = _make_pool(4, [8, 8], [0, 0], seed=43)
+    table = torch.zeros(2, 2, dtype=torch.int32, device=DEV)
+    strided_count = table[:, 0]  # shape (2,), stride 2 -> non-contiguous
+    strided_count.fill_(2)
+    assert not strided_count.is_contiguous()
+    with pytest.raises(ValueError, match="count must be contiguous"):
+        gdn_prefix_materialize(
+            state, _i32([0, 1]), _i32([2, 3]), kc, uc, gc, _i32([0, 0]), strided_count
+        )

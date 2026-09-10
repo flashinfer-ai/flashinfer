@@ -736,10 +736,65 @@ def gdn_prefix_materialize(
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     grid_ctas = min(B * HV, sms * 8)
 
+    # Paged serving pools (vLLM-style) are strided VIEWS: inner dims dense but
+    # the dim-0 slot stride padded up to a page. The kernel supports exactly
+    # that shape of non-contiguity -- pool/head strides are read from the
+    # descriptor layout -- and nothing more: ring-row and feature strides are
+    # hardcoded dense in the kernel, so a tensor strided in an INNER dim would
+    # be described faithfully and then read wrongly, silently. Validate the
+    # boundary here so unsupported layouts stay a loud error.
+    def _check_pool_layout(t, name):
+        if t.is_contiguous():
+            return
+        dense = 1
+        for i in range(t.dim() - 1, 0, -1):
+            if t.stride(i) != dense:
+                raise ValueError(
+                    f"{name}: only the slot (dim-0) stride may be padded; "
+                    f"dim {i} has stride {t.stride(i)}, expected dense {dense}"
+                )
+            dense *= t.shape[i]
+        if t.stride(0) < dense:
+            raise ValueError(f"{name}: overlapping slot stride {t.stride(0)}")
+        # 16-byte alignment: the state TMA box and the u/k 16 B cp.async loads
+        # index from slot-relative offsets, so every slot must start aligned.
+        if t.dtype != torch.float32 and (t.stride(0) * t.element_size()) % 16:
+            raise ValueError(
+                f"{name}: padded slot stride must keep slots 16-byte aligned "
+                f"(stride {t.stride(0)} elements x {t.element_size()} B)"
+            )
+
+    for _n, _t in (
+        ("state", state),
+        ("k_cache", k_cache),
+        ("u_cache", u_cache),
+        ("g_cache", g_cache),
+    ):
+        _check_pool_layout(_t, _n)
+    for _n, _t in (
+        ("src_slots", src_slots),
+        ("dst_slots", dst_slots),
+        ("cache_base", cache_base),
+        ("count", count),
+        ("active_request_indices", active_request_indices),
+        ("num_active", num_active),
+    ):
+        # Metadata takes the same descriptor path but is NOT in the compile
+        # cache key; a strided view here would bake B and its stride into a
+        # cubin that a later call could silently reuse. Cheap to require.
+        if not _t.is_contiguous():
+            raise ValueError(f"{_n} must be contiguous (got a strided view)")
+
     def mk_dyn(t):
-        return from_dlpack(t, assumed_align=16).mark_compact_shape_dynamic(
-            mode=0, stride_order=tuple(range(t.dim())), divisibility=1
-        )
+        cute_tensor = from_dlpack(t, assumed_align=16)
+        if t.is_contiguous():
+            return cute_tensor.mark_compact_shape_dynamic(
+                mode=0, stride_order=tuple(range(t.dim())), divisibility=1
+            )
+        # Padded slot stride (validated above): keep the exact layout static
+        # and specialize on it via the cache key below. mode-0 stays static
+        # too, so each distinct paged layout compiles once.
+        return cute_tensor
 
     args = [
         mk_dyn(state),
@@ -774,6 +829,19 @@ def gdn_prefix_materialize(
         int(min_blocks_per_mp),
         str(state.dtype),
         str(k_cache.dtype),
+        # Non-contiguous (paged) tensors use STATIC descriptors, so their
+        # exact layout is baked into the cubin -- key on it. Empty for the
+        # all-contiguous case, preserving the single shared specialization.
+        tuple(
+            (str(n), tuple(t.shape), tuple(t.stride()))
+            for n, t in (
+                ("state", state),
+                ("k_cache", k_cache),
+                ("u_cache", u_cache),
+                ("g_cache", g_cache),
+            )
+            if not t.is_contiguous()
+        ),
     )
     if cache_key not in _CACHE:
         _CACHE[cache_key] = cute.compile(
