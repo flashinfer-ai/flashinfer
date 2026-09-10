@@ -288,6 +288,7 @@ run_mega() {
 
 # The rank-major source bundle has an exact eight-rank contract. Keep this
 # separate from the four-rank mega/all targets and do not honor NPROC_MULTIRANK.
+# See docs/design_docs/moe_ep_bf16_rank_major_gpu_tests.md for requirements.
 run_bf16_rank_major() {
   "${PY}" -c '
 import platform
