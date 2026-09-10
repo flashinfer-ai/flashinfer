@@ -20,6 +20,7 @@ from tests.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
+from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 from functools import partial
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache
@@ -262,6 +263,115 @@ def test_batch_decode_tensor_cores_equal_kv_strides_bf16_group_size_5():
     expected = torch.einsum("bhk,bkhd->bhd", torch.softmax(logits, dim=-1), v_dense)
 
     torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-2)
+
+
+def test_batch_decode_lazy_stride_router():
+    """Prewarm and capture the independently strided tensor-core decode path."""
+    torch.manual_seed(42)
+    batch_size, kv_len, page_size = 2, 97, 16
+    num_qo_heads, num_kv_heads, head_dim = 40, 8, 128
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_equal = torch.randn_like(k)
+    v_unequal = make_padded_paged_kv_view(v_equal, "NHD")
+    assert k.stride() == v_equal.stride()
+    assert k.stride() != v_unequal.stride()
+
+    kv_indptr = (
+        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    workspace = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace,
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty_like(kv_indptr),
+        paged_kv_indices_buffer=torch.empty_like(kv_indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(last_page_len),
+        backend="fa2",
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    equal_output = wrapper.run(q, (k, v_equal), enable_pdl=False).clone()
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+    unequal_output = wrapper.run(q, (k, v_unequal), enable_pdl=False).clone()
+
+    graph_output = torch.empty_like(equal_output)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            wrapper.run(
+                q,
+                (k, v_unequal),
+                out=graph_output,
+                enable_pdl=False,
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(
+            q,
+            (k, v_unequal),
+            out=graph_output,
+            enable_pdl=False,
+        )
+    graph_output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert tuple(wrapper._plan_info) == plan_info
+
+    k_dense = k.view(batch_size, pages_per_request * page_size, num_kv_heads, head_dim)[
+        :, :kv_len
+    ]
+    v_dense = v_equal.view(
+        batch_size, pages_per_request * page_size, num_kv_heads, head_dim
+    )[:, :kv_len]
+    group_size = num_qo_heads // num_kv_heads
+    k_dense = k_dense.repeat_interleave(group_size, dim=2).float()
+    v_dense = v_dense.repeat_interleave(group_size, dim=2).float()
+    logits = torch.einsum("bhd,bkhd->bhk", q.float(), k_dense) * head_dim**-0.5
+    expected = torch.einsum("bhk,bkhd->bhd", torch.softmax(logits, dim=-1), v_dense)
+
+    torch.testing.assert_close(equal_output.float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(unequal_output.float(), expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(graph_output.float(), expected, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])

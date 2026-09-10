@@ -20,6 +20,7 @@ from tests.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
+from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 
 import flashinfer
 from flashinfer.utils import has_flashinfer_jit_cache
@@ -228,6 +229,106 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
         )
 
     torch.testing.assert_close(o_multi_level, o_two_level, rtol=1e-3, atol=1e-3)
+
+
+def test_shared_prefix_and_cascade_lazy_stride_router():
+    """Share one routed FA2 namespace across cascade and shared-prefix prefill."""
+    torch.manual_seed(42)
+    batch_size, qo_len, shared_kv_len, unique_kv_len = 2, 8, 16, 16
+    page_size = 16
+    num_qo_heads, num_kv_heads, head_dim = 4, 2, 128
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    k_cache = torch.randn(
+        1 + batch_size,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v_cache_equal = torch.randn_like(k_cache)
+    v_cache_unequal = make_padded_paged_kv_view(v_cache_equal, "NHD")
+    k_shared = k_cache[0, :shared_kv_len]
+    v_shared = v_cache_equal[0, :shared_kv_len]
+
+    qo_indptr_top = torch.tensor(
+        [0, batch_size * qo_len], dtype=torch.int32, device="cuda"
+    )
+    qo_indptr_bottom = (
+        torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * qo_len
+    )
+    shared_kv_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    shared_kv_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+    shared_last_page_len = torch.tensor(
+        [shared_kv_len], dtype=torch.int32, device="cuda"
+    )
+    unique_kv_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    unique_kv_indices = torch.arange(
+        1, 1 + batch_size, dtype=torch.int32, device="cuda"
+    )
+    unique_last_page_len = torch.full(
+        (batch_size,), unique_kv_len, dtype=torch.int32, device="cuda"
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    cascade = flashinfer.MultiLevelCascadeAttentionWrapper(2, workspace, "NHD")
+    cascade.plan(
+        [qo_indptr_top, qo_indptr_bottom],
+        [shared_kv_indptr, unique_kv_indptr],
+        [shared_kv_indices, unique_kv_indices],
+        [shared_last_page_len, unique_last_page_len],
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=False,
+    )
+    shared_prefix = flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
+        workspace, "NHD"
+    )
+    shared_prefix.begin_forward(
+        qo_indptr_bottom,
+        unique_kv_indptr,
+        unique_kv_indices,
+        unique_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+    )
+    modules = [wrapper._cached_module for wrapper in cascade._batch_prefill_wrappers]
+    assert modules[0] is modules[1]
+    assert shared_prefix._batch_prefill_wrapper._cached_module is modules[0]
+    cascade_plans = [
+        tuple(wrapper._plan_info) for wrapper in cascade._batch_prefill_wrappers
+    ]
+    shared_prefix_plan = tuple(shared_prefix._batch_prefill_wrapper._plan_info)
+
+    equal_cache = (k_cache, v_cache_equal)
+    unequal_cache = (k_cache, v_cache_unequal)
+    cascade_equal = cascade.run(q, equal_cache)
+    prefix_equal = shared_prefix.forward(
+        q, k_shared, v_shared, equal_cache, causal=False
+    )
+    cascade.prewarm_paged_kv_stride_variant("independent")
+    shared_prefix.prewarm_paged_kv_stride_variant("independent")
+    cascade_unequal = cascade.run(q, unequal_cache)
+    prefix_unequal = shared_prefix.forward(
+        q, k_shared, v_shared, unequal_cache, causal=False
+    )
+
+    assert [
+        tuple(wrapper._plan_info) for wrapper in cascade._batch_prefill_wrappers
+    ] == cascade_plans
+    assert tuple(shared_prefix._batch_prefill_wrapper._plan_info) == shared_prefix_plan
+    torch.testing.assert_close(cascade_equal, prefix_equal, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(cascade_unequal, prefix_equal, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(prefix_unequal, prefix_equal, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("seed", [0])

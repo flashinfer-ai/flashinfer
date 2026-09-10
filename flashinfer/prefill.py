@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -25,6 +26,7 @@ import torch
 from .api_logging import flashinfer_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .jit import (
+    MissingJITCacheError,
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
@@ -35,6 +37,10 @@ from .jit import (
     get_batch_prefill_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
+)
+from .jit.attention.modules import (
+    _gen_batch_prefill_independent_paged_module,
+    _gen_batch_prefill_primary_module,
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .page import get_seq_lens
@@ -455,13 +461,80 @@ def get_single_prefill_module(backend, *args):
     return SimpleNamespace(run=run_single_prefill)
 
 
+class _LazyBatchPrefillIndependentModule:
+    """Load one independent-stride batch-prefill module on first eager use."""
+
+    def __init__(self, spec: Any) -> None:
+        self._spec = spec
+        self._lock = threading.Lock()
+        self._module: Optional[Any] = None
+
+    @property
+    def is_loaded(self) -> bool:
+        """Whether this holder already has an in-process loaded module."""
+        return self._module is not None
+
+    @staticmethod
+    def _check_not_capturing() -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "The lazy independent paged-KV-stride module cannot be compiled "
+                "or loaded during CUDA graph capture. Call "
+                "prewarm_paged_kv_stride_variant('independent') after plan() "
+                "and before capture."
+            )
+
+    def get(self) -> Any:
+        """Return the loaded module, building it once outside graph capture."""
+        module = self._module
+        if module is not None:
+            return module
+
+        self._check_not_capturing()
+        with self._lock:
+            module = self._module
+            if module is not None:
+                return module
+            self._check_not_capturing()
+            try:
+                module = self._spec.build_and_load()
+            except MissingJITCacheError as exc:
+                raise MissingJITCacheError(
+                    "Unequal K/V data strides require FlashInfer's lazy "
+                    "independent paged module, which is not included in the "
+                    "default JIT cache. Use equal-stride K/V tensors, enable "
+                    "local JIT and call "
+                    "prewarm_paged_kv_stride_variant('independent') after "
+                    "plan(), or install a compatible independent-module cache "
+                    "package when one becomes available.",
+                    spec=exc.spec,
+                ) from exc
+            self._module = module
+            return module
+
+    def prewarm(self) -> None:
+        """Eagerly load the independent module for later graph capture."""
+        self.get()
+
+
 @functools.cache
 def get_batch_prefill_module(backend, *args):
+    lazy_independent_module: Optional[_LazyBatchPrefillIndependentModule] = None
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
+    elif backend == "fa2":
+        uri = get_batch_prefill_uri(backend, *args)
+        module = _gen_batch_prefill_primary_module(backend, *args).build_and_load()
+        lazy_independent_module = _LazyBatchPrefillIndependentModule(
+            _gen_batch_prefill_independent_paged_module(backend, *args)
+        )
+        plan_func = module.plan
+        workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
@@ -748,7 +821,12 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
-            paged_run_func(
+            if tuple(paged_k_cache.stride()) == tuple(paged_v_cache.stride()):
+                routed_paged_run_func = paged_run_func
+            else:
+                assert lazy_independent_module is not None
+                routed_paged_run_func = lazy_independent_module.get().paged_run
+            routed_paged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -896,11 +974,23 @@ def get_batch_prefill_module(backend, *args):
     #
     # Note that plan is not part of model logic. It should not be included in
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+    def prewarm_paged_kv_stride_variant(variant: str = "independent") -> None:
+        """Load the requested lazy paged-KV-stride variant before graph capture."""
+        if variant != "independent":
+            raise ValueError(f"variant must be 'independent', got {variant!r}")
+        if lazy_independent_module is None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is available only for standard FA2 "
+                f"batch-prefill modules, got backend={backend!r}."
+            )
+        lazy_independent_module.prewarm()
+
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
+        prewarm_paged_kv_stride_variant=prewarm_paged_kv_stride_variant,
     )
 
 
@@ -2753,6 +2843,32 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
+
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Load a lazy paged-KV-stride variant after :meth:`plan`.
+
+        Call this method before CUDA graph capture when a planned standard FA2
+        wrapper will receive K and V tensors with different data strides.
+        """
+        if (
+            getattr(self, "_plan_info", None) is None
+            or getattr(self, "_cached_module", None) is None
+        ):
+            raise RuntimeError(
+                "plan() must complete before prewarming a paged-KV-stride variant."
+            )
+        if self._jit_module is not None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is not supported for a custom JIT module."
+            )
+        if self._backend != "fa2":
+            raise RuntimeError(
+                "Paged-KV-stride prewarm requires a standard FA2 plan, "
+                f"got backend={self._backend!r}."
+            )
+        assert self._cached_module is not None
+        self._cached_module.prewarm_paged_kv_stride_variant(variant)
 
     begin_forward = plan
 

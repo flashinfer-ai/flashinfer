@@ -20,6 +20,10 @@ import numpy
 import pytest
 import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.test_helpers.paged_kv import (
+    get_closure_value,
+    make_padded_paged_kv_view,
+)
 
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
@@ -399,6 +403,385 @@ def test_batch_prefill_equal_kv_strides_bf16():
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("disable_split_kv", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_batch_prefill_lazy_stride_router_plan_reuse(
+    kv_layout, disable_split_kv, head_dim
+):
+    """Reuse one equal-primary plan across equal/unequal/equal paged runs."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 2, 17, 97, 16
+    num_qo_heads, num_kv_heads = 8, 2
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if kv_layout == "NHD":
+        cache_shape = (total_pages, page_size, num_kv_heads, head_dim)
+        to_dense = lambda cache: cache.reshape(-1, num_kv_heads, head_dim)
+    else:
+        cache_shape = (total_pages, num_kv_heads, page_size, head_dim)
+        to_dense = lambda cache: cache.permute(0, 2, 1, 3).reshape(
+            -1, num_kv_heads, head_dim
+        )
+
+    k = torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16) / 4
+    v_equal = torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16) / 4
+    v_unequal = make_padded_paged_kv_view(v_equal, kv_layout)
+    assert k.shape == v_equal.shape == v_unequal.shape
+    assert k.stride() == v_equal.stride()
+    assert k.stride() != v_unequal.stride()
+
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout,
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        fixed_split_size=None if disable_split_kv else 64,
+        disable_split_kv=disable_split_kv,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    outputs = [
+        wrapper.run(q, cache) for cache in ((k, v_equal), (k, v_unequal), (k, v_equal))
+    ]
+    assert tuple(wrapper._plan_info) == plan_info
+
+    expected_batches = []
+    group_size = num_qo_heads // num_kv_heads
+    for batch_idx in range(batch_size):
+        q_i = q[batch_idx * qo_len : (batch_idx + 1) * qo_len].float()
+        page_slice = slice(
+            batch_idx * pages_per_request,
+            (batch_idx + 1) * pages_per_request,
+        )
+        k_i = to_dense(k[page_slice])[:kv_len].repeat_interleave(group_size, dim=1)
+        v_i = to_dense(v_equal[page_slice])[:kv_len].repeat_interleave(
+            group_size, dim=1
+        )
+        logits = torch.einsum("qhd,khd->hqk", q_i, k_i.float()) * head_dim**-0.5
+        q_pos = torch.arange(qo_len, device="cuda").unsqueeze(1)
+        k_pos = torch.arange(kv_len, device="cuda").unsqueeze(0)
+        logits.masked_fill_(
+            ~(k_pos <= q_pos + (kv_len - qo_len)).unsqueeze(0), float("-inf")
+        )
+        expected_batches.append(
+            torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), v_i.float())
+        )
+    expected = torch.cat(expected_batches)
+    for output in outputs:
+        torch.testing.assert_close(output.float(), expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(outputs[0], outputs[2], rtol=1e-2, atol=1e-2)
+
+
+def test_batch_prefill_lazy_stride_router_nvfp4(monkeypatch):
+    """Route on data strides while preserving independent NVFP4 scale strides."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 1, 17, 33, 16
+    num_qo_heads, num_kv_heads, head_dim = 4, 2, 128
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    packed_shape = (total_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_scale = create_nvfp4_kv(packed_shape, "cuda")
+    v_packed, v_sf, v_scale = create_nvfp4_kv(packed_shape, "cuda")
+    v_packed_unequal = make_padded_paged_kv_view(v_packed, "NHD")
+    k_sf_unequal = make_padded_paged_kv_view(k_sf, "NHD", padding_heads=1)
+    v_sf_unequal = make_padded_paged_kv_view(v_sf, "NHD", padding_heads=3)
+    assert k_packed.stride() == v_packed.stride()
+    assert k_packed.stride() != v_packed_unequal.stride()
+    assert k_sf_unequal.stride() != v_sf_unequal.stride()
+
+    qo_indptr = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, pages_per_request], device="cuda", dtype=torch.int32)
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32
+    )
+    custom_mask = torch.tril(
+        torch.ones(qo_len, kv_len, device="cuda", dtype=torch.bool),
+        diagonal=kv_len - qo_len,
+    ).flatten()
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        "NHD",
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask=custom_mask,
+        q_data_type=torch.float16,
+        kv_data_type=torch.uint8,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    holder = get_closure_value(
+        wrapper._cached_module.paged_run, "lazy_independent_module"
+    )
+
+    def unexpected_supplement_route():
+        raise AssertionError("scale stride asymmetry must not select the supplement")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(holder, "get", unexpected_supplement_route)
+        equal_output = wrapper.run(
+            q,
+            (k_packed, v_packed),
+            kv_cache_sf=(k_sf_unequal, v_sf_unequal),
+            k_scale=k_scale.item(),
+            v_scale=v_scale.item(),
+        )
+
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+    unequal_output = wrapper.run(
+        q,
+        (k_packed, v_packed_unequal),
+        kv_cache_sf=(k_sf_unequal, v_sf_unequal),
+        k_scale=k_scale.item(),
+        v_scale=v_scale.item(),
+    )
+    assert holder.is_loaded
+    assert tuple(wrapper._plan_info) == plan_info
+    torch.testing.assert_close(unequal_output, equal_output, rtol=1e-3, atol=1e-3)
+
+
+def test_batch_prefill_lazy_stride_router_ragged_primary(monkeypatch):
+    """Keep ragged execution on the full equal-primary module."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len = 2, 7, 11
+    num_qo_heads, num_kv_heads, head_dim = 4, 2, 64
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    k = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v = torch.randn_like(k)
+    qo_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * kv_len
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        "NHD",
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=True,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    holder = get_closure_value(
+        wrapper._cached_module.paged_run, "lazy_independent_module"
+    )
+
+    def unexpected_supplement_route():
+        raise AssertionError("ragged execution must remain on the primary module")
+
+    monkeypatch.setattr(holder, "get", unexpected_supplement_route)
+    output = wrapper.run(q, k, v)
+    for batch_idx in range(batch_size):
+        query_slice = slice(batch_idx * qo_len, (batch_idx + 1) * qo_len)
+        kv_slice = slice(batch_idx * kv_len, (batch_idx + 1) * kv_len)
+        expected = flashinfer.single_prefill_with_kv_cache(
+            q[query_slice], k[kv_slice], v[kv_slice], causal=True, backend="fa2"
+        )
+        torch.testing.assert_close(output[query_slice], expected, rtol=1e-3, atol=1e-3)
+
+
+def _make_lazy_stride_router_graph_case():
+    batch_size, qo_len, kv_len, page_size = 2, 17, 97, 16
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_equal = torch.randn_like(k)
+    v_unequal = make_padded_paged_kv_view(v_equal, "NHD")
+    qo_indptr = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    kv_indptr = (
+        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        "NHD",
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        fixed_split_size=64,
+    )
+    return wrapper, q, k, v_equal, v_unequal
+
+
+def test_batch_prefill_lazy_stride_router_cuda_graph():
+    """A post-plan prewarm makes the unequal route capture/replay safe."""
+    torch.manual_seed(42)
+    wrapper, q, k, v_equal, v_unequal = _make_lazy_stride_router_graph_case()
+    plan_info = tuple(wrapper._plan_info)
+    equal_output = wrapper.run(q, (k, v_equal), enable_pdl=False)
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+
+    graph_output = torch.empty_like(equal_output)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            wrapper.run(
+                q,
+                (k, v_unequal),
+                out=graph_output,
+                enable_pdl=False,
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(
+            q,
+            (k, v_unequal),
+            out=graph_output,
+            enable_pdl=False,
+        )
+    graph_output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.isfinite(graph_output).all()
+    assert tuple(wrapper._plan_info) == plan_info
+    torch.testing.assert_close(graph_output, equal_output, rtol=1e-2, atol=1e-2)
+
+
+def test_batch_prefill_lazy_stride_router_torch_compile():
+    """Dynamo guards both stride families without rebuilding on equal return."""
+    torch.manual_seed(42)
+    wrapper, q, k, v_equal, v_unequal = _make_lazy_stride_router_graph_case()
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+    expected = wrapper.run(q, (k, v_equal), enable_pdl=False)
+    torch._dynamo.reset()
+    from torch._dynamo.utils import guard_failures
+
+    guard_failures.clear()
+    compiled_graphs = []
+
+    def counting_backend(graph_module, _example_inputs):
+        compiled_graphs.append(graph_module)
+        return graph_module.forward
+
+    def run_for_compile(q_arg, k_arg, v_arg, out_arg):
+        return wrapper.run(
+            q_arg,
+            (k_arg, v_arg),
+            out=out_arg,
+            enable_pdl=False,
+        ).clone()
+
+    compiled_run = torch.compile(
+        run_for_compile,
+        backend=counting_backend,
+        fullgraph=False,
+        dynamic=False,
+    )
+    graph_counts = []
+    for v_cache in (v_equal, v_equal, v_unequal, v_unequal, v_equal):
+        actual = compiled_run(q, k, v_cache, torch.empty_like(expected))
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        graph_counts.append(len(compiled_graphs))
+    failures = [str(reason) for reason in guard_failures[run_for_compile.__code__]]
+    assert len(failures) == 1 and "stride mismatch" in failures[0]
+    assert len(compiled_graphs) == 1
+    assert graph_counts[1] == graph_counts[0]
+    assert graph_counts[3] == graph_counts[2]
+    assert graph_counts[4] == graph_counts[3]
 
 
 @pytest.mark.parametrize("causal", [False, True])
