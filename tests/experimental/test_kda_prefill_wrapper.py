@@ -22,6 +22,7 @@ eager path it wraps, and that captured graphs replay against fixed addresses.
 """
 
 import importlib
+import inspect
 
 import pytest
 import torch
@@ -103,11 +104,21 @@ def test_prefill_wrapper_run_forwards_planned_buffers(cuda_device, monkeypatch):
         for key, value in tensors.items()
     }
 
+    tensors["scale"] = 0.125
+    tensors["output_final_state"] = True
+
     assert wrapper.run(**tensors) is sentinel
     assert calls[0]["cu_seqlens"] is wrapper._cu_seqlens_buf
     assert calls[0]["seq_order"] is wrapper._seq_order_buf
     assert calls[0]["prefill_workspace"] is wrapper._workspace
     assert calls[0]["backend"] == "cute-dsl"
+
+    # Every parameter of run must reach recurrent_kda, so that dropping one
+    # from the handoff fails here rather than silently changing behaviour.
+    forwarded = set(inspect.signature(RecurrentKDAPrefillWrapper.run).parameters)
+    assert forwarded - {"self"} <= set(calls[0])
+    for name, value in tensors.items():
+        assert calls[0][name] is value or calls[0][name] == value
     assert wrapper._workspace._cute_dsl_cu_chunks is wrapper._cu_chunks_buf
     assert wrapper._workspace._cute_dsl_generate_planned_metadata is True
 
@@ -423,3 +434,41 @@ def test_cute_dsl_cuda_graph_replay_updates_offsets_and_indexed_checkpoints(
     )
     assert torch.count_nonzero(state_pool[[0, 2]]) == 0
     assert torch.isnan(checkpoint_pool[[1, 4, 5]]).all()
+
+
+def test_prefill_wrapper_rejects_invalid_plans_and_out_of_order_runs(
+    cuda_device, monkeypatch
+):
+    """The validation that moved to the planner must still reject bad input."""
+
+    wrapper = RecurrentKDAPrefillWrapper(cuda_device)
+    tensors = {
+        key: value.to(cuda_device) if isinstance(value, torch.Tensor) else value
+        for key, value in cpu_route_tensors(token_count=3).items()
+    }
+
+    with pytest.raises(RuntimeError, match="call plan before run"):
+        wrapper.run(**tensors)
+
+    with pytest.raises(TypeError, match="cu_seqlens must be a torch.Tensor"):
+        wrapper.plan([0, 1, 3])
+
+    for bad in (
+        torch.tensor([0.0, 1.0, 3.0], device=cuda_device),
+        torch.tensor([[0, 1, 3]], device=cuda_device),
+        torch.tensor([0], device=cuda_device),
+        torch.tensor([0, 1, 2, 3], device=cuda_device)[::2],
+    ):
+        with pytest.raises(ValueError, match="at least two entries"):
+            wrapper.plan(bad)
+
+    monkeypatch.setattr(kda_api, "recurrent_kda", lambda **kwargs: None)
+    wrapper.plan(torch.tensor([0, 1, 3], device=cuda_device))
+    wrapper.run(**tensors)
+    with pytest.raises(ValueError, match="q token count is fixed"):
+        wrapper.run(**{**tensors, "q": tensors["q"][:, :2]})
+
+    fresh = RecurrentKDAPrefillWrapper(cuda_device)
+    fresh.plan(torch.tensor([0, 1, 3], device=cuda_device))
+    with pytest.raises(ValueError, match="q must be a rank-4 tensor"):
+        fresh.run(**{**tensors, "q": tensors["q"][0]})
