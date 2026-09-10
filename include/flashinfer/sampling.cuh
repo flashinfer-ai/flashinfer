@@ -339,7 +339,6 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        // Keep max/output scaling identical: do not contract multiplication into FMA.
         logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       }
 
