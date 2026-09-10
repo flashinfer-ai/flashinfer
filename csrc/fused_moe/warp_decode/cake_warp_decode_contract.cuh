@@ -240,6 +240,17 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
   }
 
   if (IsGeometry(shape, 2048, 1536, 60, 4)) {
+    if (shape.num_tokens >= 20) {
+      return {true,
+              Geometry::kH2048I1536E60K4,
+              RouteLayout::kGpuPacked,
+              RoutePacker::kGeneral,
+              Fc1Schedule::kPersistentDeviceWorkfeed,
+              Fc2Schedule::kRouteParallelK256,
+              128,
+              4,
+              kPackedWorkfeedCtas};
+    }
     return {true,
             Geometry::kH2048I1536E60K4,
             RouteLayout::kDirect,
@@ -304,6 +315,13 @@ static_assert(SelectSm100aSchedule(E512Shape(23)).route_layout == RouteLayout::k
 static_assert(SelectSm100aSchedule(E60Shape(1)).fc1 == Fc1Schedule::kStatic);
 static_assert(SelectSm100aSchedule(E60Shape(2)).fc1 == Fc1Schedule::kPersistent);
 static_assert(SelectSm100aSchedule(E60Shape(11)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm100aSchedule(E60Shape(19)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm100aSchedule(E60Shape(20)).route_layout == RouteLayout::kGpuPacked);
+static_assert(SelectSm100aSchedule(E60Shape(20)).route_packer == RoutePacker::kGeneral);
+static_assert(SelectSm100aSchedule(E60Shape(20)).fc1 ==
+              Fc1Schedule::kPersistentDeviceWorkfeed);
+static_assert(SelectSm100aSchedule(E60Shape(20)).fc2 == Fc2Schedule::kRouteParallelK256);
+static_assert(SelectSm100aSchedule(E60Shape(20)).workfeed_ctas == 152);
 static_assert(SelectSm100aSchedule(E192SiluShape(32)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSm100aSchedule(E192SiluShape(1)).fc1 == Fc1Schedule::kStatic);
 static_assert(SelectSm100aSchedule(E192SiluShape(2)).fc1 == Fc1Schedule::kPersistent);
