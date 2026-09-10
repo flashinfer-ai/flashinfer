@@ -221,7 +221,7 @@ def _make_context_kernel(
     scheduler: _ContextScheduler,
     page_size: int | None = None,
     max_num_pages_per_seq_kv: int | None = None,
-    skip_softmax: bool = False,
+    enable_skip_softmax: bool = False,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -266,7 +266,7 @@ def _make_context_kernel(
         h_r=num_qo_heads // num_kv_heads,
         enable_skip_correction=True,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
-        skip_softmax=skip_softmax,
+        enable_skip_softmax=enable_skip_softmax,
         **paged_kwargs,
     )
 
@@ -1214,7 +1214,7 @@ def _make_context_scheduler_probe(
         scheduler="static_persistent",
         page_size=page_size,
         max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
-        skip_softmax=geometry.skip_softmax,
+        enable_skip_softmax=geometry.skip_softmax,
     )
     with torch.cuda.device(geometry.device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
@@ -1394,7 +1394,7 @@ def _get_compiled_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
-        skip_softmax=skip_softmax,
+        enable_skip_softmax=skip_softmax,
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1623,7 +1623,7 @@ def _get_compiled_paged_context(
         scheduler=scheduler,
         page_size=page_size,
         max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
-        skip_softmax=skip_softmax,
+        enable_skip_softmax=skip_softmax,
     )
     fmha.cfg.has_varlen = True
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths

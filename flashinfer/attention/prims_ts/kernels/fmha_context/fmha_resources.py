@@ -317,7 +317,7 @@ class FmhaConfig:
     # publishes a zero P tile without exponentiation, and votes in SMEM so the
     # MMA task can also skip the PV MMA once all four softmax warps of the
     # instance voted to skip.
-    skip_softmax: bool = False
+    enable_skip_softmax: bool = False
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -2359,7 +2359,7 @@ class TmemSPResource(MemoryResource):
         # Initialize to establish DSL type; real values are set per work tile.
         self.tmem_s_addr_cached = Int32(0)
         self.tmem_p_addr_cached = Int32(0)
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             self._smem_skip_softmax_vote = _skip_softmax_vote_view(
                 self.cfg, self.skip_softmax_vote_alloc, stage_info
             )
@@ -2412,7 +2412,7 @@ class TmemSPResource(MemoryResource):
         scale_softmax_log2 = Float32(0.0)
         if cutlass.const_expr(self.scale_softmax_log2 is not None):
             scale_softmax_log2 = Float32(self.scale_softmax_log2[0])
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             self.scale_softmax_log2_cached = scale_softmax_log2
         return scale_softmax_log2
 
@@ -2645,7 +2645,7 @@ class TmemSPResource(MemoryResource):
             row_vector = cutlass.Vector.from_elements(row_values, self.cfg.qk_acc_dtype)
             tile_row_max = row_vector.reduce("max")
         _tmem_sp_sdata[id(self)] = s_data
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # The skip specialization carries the exact running maximum, which
             # stays -inf until a row meets its first valid key; the P store,
             # row-sum, and statistics work substitute zero where needed.
@@ -2722,7 +2722,7 @@ class TmemSPResource(MemoryResource):
         """Apply exp2 softmax P, fold the PV P scale, and store P to TMEM."""
         tmem_p_addr = self.tmem_p_addr_cached + stage_col_offset
         s_data = _tmem_sp_sdata.pop(id(self))
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # Exponentiate against zero while the exact running maximum is
             # still -inf so masked scores become exact zeros instead of NaN.
             row_max_safe = row_max
@@ -3624,7 +3624,7 @@ class TmemSPResource(MemoryResource):
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Tail stage for softmax group 0: identity row_max, no S load."""
         row_max_safe = row_max
-        if cutlass.const_expr(not self.cfg.skip_softmax):
+        if cutlass.const_expr(not self.cfg.enable_skip_softmax):
             if row_max == -Float32.inf:
                 row_max_safe = Float32(0.0)
         _ = stage_info
@@ -3655,7 +3655,7 @@ class TmemSPResource(MemoryResource):
     ) -> SoftmaxScalar:
         """Accumulate row_sum from vector P fragments or their scalar sum."""
         _ = stage_info
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # A skipped tile publishes zero probabilities and keeps the running
             # maximum, so the accumulated denominator is unchanged.
             warp_skips = _tmem_sp_skips.pop(id(self))
@@ -3687,7 +3687,7 @@ class TmemSPResource(MemoryResource):
     ) -> Float32:
         """Return the base-2 exponent rescaling the previous row sum."""
         acc_scale_log2 = scale_softmax_log2 * (old_row_max - row_max)
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # Both maxima are -inf until the row meets a valid key. The row
             # sum is still zero there, so any finite exponent keeps it zero.
             if row_max == -Float32.inf:
@@ -4120,7 +4120,7 @@ class TmemStatsResource(MemoryResource):
           scale = exp2(scale_log2 * (old_max - new_max))
         and to forward row_sum to SmemO for the final normalization.
         """
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             # The skip specialization carries exact -inf maxima for rows
             # without a valid key. Their O rows are still zero, so publish
             # zeros to keep the correction scale finite.
@@ -4323,7 +4323,7 @@ class TmemOResource(MemoryResource):
         self.tmem_p_base_cached = Int32(0)
         self.p_stage_idx_cached = Int32(0)
         self.skips_pv_cached = Boolean(False)
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             self._smem_skip_softmax_vote = _skip_softmax_vote_view(
                 self.cfg, self.skip_softmax_vote_alloc, stage_info
             )
@@ -4377,7 +4377,7 @@ class TmemOResource(MemoryResource):
         _ = stage_info
         self.tmem_p_base_cached = tmem_p_base
         self.p_stage_idx_cached = p_stage_idx
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             self.skips_pv_cached = self._skip_softmax_votes_skip(inst_idx=0)
 
     @cute.jit
@@ -4452,7 +4452,7 @@ class TmemOResource(MemoryResource):
         # Skip softmax: every softmax warp of this instance published a zero P
         # tile, so the PV MMA would add nothing to O.
         skips_pv = False
-        if cutlass.const_expr(self.cfg.skip_softmax):
+        if cutlass.const_expr(self.cfg.enable_skip_softmax):
             if cutlass.const_expr(
                 self.cfg.single_qkv_instance and self.cfg.has_tmem_p_pipeline
             ):

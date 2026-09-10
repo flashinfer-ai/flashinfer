@@ -1093,7 +1093,7 @@ def create_softmax_task(
                         sp.init_softmax_work_tile_state()
                     )
                     vec.init_store_work_tile_state()
-                    if tmem_sp.cfg.skip_softmax:
+                    if tmem_sp.cfg.enable_skip_softmax:
                         sp.cache_skip_softmax_state()
                     if tmem_sp.uses_varlen_q_offset_cache:
                         q_offset = sp.cache_q_offset()
@@ -1575,7 +1575,7 @@ def create_softmax_task(
             # Recompute per-tile SP/Vec TMEM state.
             old_row_max, row_max, row_sum, q_offset = sp.init_softmax_work_tile_state()
             vec.init_store_work_tile_state()
-            if tmem_sp.cfg.skip_softmax:
+            if tmem_sp.cfg.enable_skip_softmax:
                 sp.cache_skip_softmax_state()
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()

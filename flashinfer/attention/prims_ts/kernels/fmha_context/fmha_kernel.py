@@ -695,7 +695,7 @@ def build_context_task_manager(
     it. ``output_scale`` multiplies the final O store; FP8 output can fold the
     V dequant scale and output quant scale into it. ``skip_softmax_threshold``
     is the ``float32[B]`` per-request skip-softmax threshold consumed only by
-    ``cfg.skip_softmax`` specializations; the softmax resource converts it to
+    ``cfg.enable_skip_softmax`` specializations; the softmax resource converts it to
     the log2 domain once per work tile. ``seq_len_q`` is the fixed-layout Q
     length those specializations use to let padding rows abstain from the
     skip vote; packed layouts derive it from ``cum_seqlen_q``.
@@ -1083,7 +1083,7 @@ def build_context_task_manager(
     # stage of each instance. The MMA task reads the four words of an instance
     # after the matching P-ready wait.
     skip_softmax_vote_alloc: SmemAllocation | None = None
-    if cfg.skip_softmax:
+    if cfg.enable_skip_softmax:
         skip_softmax_vote_alloc = SmemAllocation(
             "smem_skip_softmax_vote",
             dtype=cutlass.Int32,
@@ -1699,7 +1699,7 @@ def _infer_single_instance_kv_stages(
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes += cutlass.Int128.width // 8
-    if cfg.skip_softmax:
+    if cfg.enable_skip_softmax:
         control_bytes += cfg.skip_softmax_vote_words * cutlass.Int32.width // 8
     fixed_barrier_stages = sum(
         _context_pipeline_stage_counts(
@@ -2405,7 +2405,7 @@ class FmhaTs:
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
         extent fits one 128-token tile (default: False).
-    skip_softmax : bool, optional
+    enable_skip_softmax : bool, optional
         Compile the skip-softmax specialization. Each softmax warp skips the
         exponentiation, P conversion, and row-sum work of a K/V tile whose
         scaled score gap to the running maximum is below the per-request
@@ -2435,7 +2435,7 @@ class FmhaTs:
         num_tokens_per_page: int = 32,
         max_num_pages_per_seq_kv: int = 1,
         causal_single_kv_tile: bool = False,
-        skip_softmax: bool = False,
+        enable_skip_softmax: bool = False,
         exhaustive_deadlock_race_check: bool = True,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
@@ -2492,7 +2492,7 @@ class FmhaTs:
         if d > 128:
             cfg.num_qkv_instances = 1
         cfg.use_paged_kv = use_paged_kv
-        cfg.skip_softmax = skip_softmax
+        cfg.enable_skip_softmax = enable_skip_softmax
         single_instance_persistent = (
             is_persistent and cfg.single_qkv_instance and not head_paired
         )
@@ -2665,7 +2665,9 @@ class FmhaTs:
                 or variable_window_cta_starts is None
             ):
                 raise ValueError("VariableWindow requires start and end tensors")
-        if cutlass.const_expr(cfg.skip_softmax and skip_softmax_threshold is None):
+        if cutlass.const_expr(
+            cfg.enable_skip_softmax and skip_softmax_threshold is None
+        ):
             raise ValueError(
                 "skip-softmax context requires the per-request threshold tensor"
             )
