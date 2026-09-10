@@ -346,6 +346,7 @@ def recurrent_kda_decode_kernel(
     HAS_DT_BIAS: cutlass.Constexpr[int],
     USE_LOWER_BOUND: cutlass.Constexpr[int],
     USE_CU_SEQLENS: cutlass.Constexpr[int],
+    HAS_SSM_STATE_INDICES: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
     TILE_ROWS: cutlass.Constexpr[int],
     DOT_REDUCTION_SCHEDULE: cutlass.Constexpr[int],
@@ -389,7 +390,7 @@ def recurrent_kda_decode_kernel(
         padded_o_head[v_offset + tidx] = cutlass.BFloat16(0.0)
 
     init_seq_idx = batch_idx
-    if USE_CU_SEQLENS == 1:
+    if USE_CU_SEQLENS == 1 or HAS_SSM_STATE_INDICES == 1:
         init_raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS].to(cutlass.Int32)
         if NUM_TOKENS > 1 and HAS_NUM_ACCEPTED_TOKENS == 1:
             nat_raw = gNumAcceptedTokens[batch_idx].to(cutlass.Int32)
@@ -461,6 +462,14 @@ def recurrent_kda_decode_kernel(
             is_active = raw_slot >= 0 and has_token
             token_offset = token_offset if has_token else cutlass.Int32(0)
             seq_idx = cutlass.Int32(0) if raw_slot < 0 else raw_slot
+        elif HAS_SSM_STATE_INDICES == 1:
+            # Dense tokens stay on batch_idx; ssi remaps the state pool slot and
+            # skips negative padding entries (CUDA-graph null slots).
+            raw_slot = gSsmStateIndices[batch_idx * NUM_TOKENS + token_t].to(
+                cutlass.Int32
+            )
+            seq_idx = cutlass.Int32(0) if raw_slot < 0 else raw_slot
+            is_active = raw_slot >= 0
         else:
             seq_idx = batch_idx
             is_active = seq_len > 0
@@ -1073,6 +1082,7 @@ def recurrent_kda_launch(
     HAS_DT_BIAS: cutlass.Constexpr[int],
     USE_LOWER_BOUND: cutlass.Constexpr[int],
     USE_CU_SEQLENS: cutlass.Constexpr[int],
+    HAS_SSM_STATE_INDICES: cutlass.Constexpr[int],
     NUM_TOKENS: cutlass.Constexpr[int],
     TILE_ROWS: cutlass.Constexpr[int],
     DOT_REDUCTION_SCHEDULE: cutlass.Constexpr[int],
@@ -1109,6 +1119,7 @@ def recurrent_kda_launch(
         HAS_DT_BIAS,
         USE_LOWER_BOUND,
         USE_CU_SEQLENS,
+        HAS_SSM_STATE_INDICES,
         NUM_TOKENS,
         TILE_ROWS,
         DOT_REDUCTION_SCHEDULE,
@@ -1217,6 +1228,7 @@ def _get_compiled_kernel(
     DOT_REDUCTION_SCHEDULE,
     ZERO_PADDED_OUTPUT,
     HAS_NUM_ACCEPTED_TOKENS,
+    HAS_SSM_STATE_INDICES,
 ):
     """Compile a register-tile specialization."""
     return cute.compile(
@@ -1228,6 +1240,7 @@ def _get_compiled_kernel(
         HAS_DT_BIAS,
         USE_LOWER_BOUND,
         USE_CU_SEQLENS,
+        HAS_SSM_STATE_INDICES,
         NUM_TOKENS,
         TILE_ROWS,
         DOT_REDUCTION_SCHEDULE,
@@ -2165,13 +2178,12 @@ def run_recurrent_kda(
         if (
             initial_state is not None
             and not initial_state.is_contiguous()
+            and ssm_state_indices is None
             and backend != "cake"
-            # Only the indexed Cake convention tolerates a non-contiguous pool: it
-            # passes the pool through and gathers via ``ssi``. Without indices it
-            # would copy, so the check still applies to the "auto" candidate.
-            and not (
-                auto_unbounded_softplus_candidate and ssm_state_indices is not None
-            )
+            # Indexed dense decode and Cake pass the pool through (via ``ssi`` or
+            # identity). Without indices the wrapper would .contiguous()-copy, so
+            # the check still applies to the plain "auto" / cute-dsl candidate.
+            and not auto_unbounded_softplus_candidate
         ):
             raise ValueError(
                 "non-contiguous initial_state requires cu_seqlens: without cu_seqlens "
@@ -2191,14 +2203,11 @@ def run_recurrent_kda(
             )
         if initial_state is None:
             state = torch.zeros(B, HV, V, K, device=device, dtype=torch.bfloat16)
-        elif ssm_state_indices is not None and (
-            backend == "cake" or auto_unbounded_softplus_candidate
-        ):
+        elif ssm_state_indices is not None:
+            # Pool + ssi for every backend: negative slots stay padding (no Python
+            # gather/scatter wrap-around). Matches the cu_seqlens / Cake contract.
             state = initial_state
             ssi = ssm_state_indices.to(torch.int32).contiguous().view(-1)
-        elif ssm_state_indices is not None:
-            state = initial_state[ssm_state_indices].contiguous()
-            copy_back_indices = ssm_state_indices
         elif backend == "cake" or auto_unbounded_softplus_candidate:
             state = initial_state
         else:
@@ -2382,16 +2391,11 @@ def run_recurrent_kda(
             auto_unbounded_softplus
             and cu_seqlens_i32 is None
             and initial_state is not None
+            and ssm_state_indices is None
         ):
-            # The state convention above was chosen before the variant was known.
-            # Cake was not selected after all, so restore CuTe's convention before
-            # falling through to it.
-            if ssm_state_indices is not None:
-                state = initial_state[ssm_state_indices].contiguous()
-                copy_back_indices = ssm_state_indices
-                ssi = None
-            else:
-                state = initial_state.contiguous()
+            # Cake-candidate used a pass-through pool; CuTe without indices needs
+            # a contiguous buffer. Indexed dense already keeps pool + ssi.
+            state = initial_state.contiguous()
     if flash_kda_decode_variant is not None:
         _run_flash_kda_decode(
             flash_kda_decode_variant,
@@ -2420,6 +2424,7 @@ def run_recurrent_kda(
         USE_CU = 1 if cu_seqlens_i32 is not None else 0
         ZERO_PADDED_OUTPUT = 1 if zero_padded_output else 0
         HAS_NAT = 1 if num_accepted_tokens is not None else 0
+        HAS_SSI = 1 if ssi is not None else 0
         tile_rows, reduction_schedule = _select_kernel_schedule(
             K,
             NUM_TOKENS,
@@ -2440,6 +2445,7 @@ def run_recurrent_kda(
             reduction_schedule,
             ZERO_PADDED_OUTPUT,
             HAS_NAT,
+            HAS_SSI,
         )
         compiled(
             q,
