@@ -18,6 +18,10 @@
 
 #include <cuda_runtime.h>
 
+#include <mutex>
+#include <utility>
+#include <vector>
+
 #include "../common/params.h"
 #include "../common/static_switch.h"
 #include "../compute/epilogue/lse_writer.cuh"
@@ -29,6 +33,44 @@
 #include "flashinfer/utils.cuh"
 
 namespace qk_mxfp8_pv_nvfp4_attention {
+
+namespace detail {
+
+inline int get_device_sm_count(int device_id) {
+  static std::mutex mutex;
+  static std::vector<std::pair<int, int>> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto const& entry : cache) {
+    if (entry.first == device_id) {
+      return entry.second;
+    }
+  }
+
+  int num_sms = 0;
+  FLASHINFER_CUDA_CHECK(
+      cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+  cache.emplace_back(device_id, num_sms);
+  return num_sms;
+}
+
+inline void ensure_dynamic_smem_attribute(void* kernel, int smem_size, int device_id) {
+  using CacheKey = std::pair<void*, int>;
+  static std::mutex mutex;
+  static std::vector<CacheKey> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  CacheKey const key{kernel, device_id};
+  for (auto const& entry : cache) {
+    if (entry == key) {
+      return;
+    }
+  }
+
+  FLASHINFER_CUDA_CHECK(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  cache.push_back(key);
+}
+
+}  // namespace detail
 
 inline constexpr int kStagesNonCausal = 2;
 inline constexpr int kStagesCausal = 1;
@@ -109,26 +151,15 @@ void run_flash_fwd_with_scheduler(Flash_fwd_params& params, cudaStream_t stream)
 
   int smem_size = sizeof(typename Kernel_traits::SharedStorage);
   if (smem_size >= 48 * 1024) {
-    static bool const smem_attr_set = [&]() {
-      FLASHINFER_CUDA_CHECK(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      return true;
-    }();
-    (void)smem_attr_set;
+    detail::ensure_dynamic_smem_attribute(kernel, smem_size, params.device_id);
   }
 
   static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
 
-  params.m_block_divmod = cutlass::FastDivmod(num_blocks_m);
-  params.total_blocks = num_blocks_m * params.h * params.b;
-
-  int device_id = 0;
-  FLASHINFER_CUDA_CHECK(cudaGetDevice(&device_id));
-  int num_sms = 0;
-  FLASHINFER_CUDA_CHECK(
-      cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id));
+  int const total_blocks = num_blocks_m * params.h * params.b;
+  int const num_sms = detail::get_device_sm_count(params.device_id);
   int scheduler_sms = num_sms;
-  if (params.total_blocks <= num_sms * 8) {
+  if (total_blocks <= num_sms * 8) {
     scheduler_sms *=
         Is_causal ? kPersistentGridMultiplierCausal : kPersistentGridMultiplierNonCausal;
   }

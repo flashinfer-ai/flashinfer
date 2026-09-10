@@ -503,8 +503,9 @@ void scaled_fp4_quant(TensorView input, TensorView output, TensorView output_sf,
     stride_h_output = output.stride(2);
     stride_h_output_sf = output_sf.stride(2);
 
-    CHECK_QUANT_SHAPE(output, batch_size, num_tokens, num_heads, head_dim / 2);
-    CHECK_QUANT_SHAPE(output_sf, batch_size, num_tokens, num_heads, head_dim / 16);
+    int const padded_num_tokens = ((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    CHECK_QUANT_SHAPE(output, batch_size, padded_num_tokens, num_heads, head_dim / 2);
+    CHECK_QUANT_SHAPE(output_sf, batch_size, padded_num_tokens, num_heads, head_dim / 16);
   } else {
     num_tokens = input.size(2);
     num_heads = input.size(1);
@@ -515,8 +516,9 @@ void scaled_fp4_quant(TensorView input, TensorView output, TensorView output_sf,
     stride_h_output = output.stride(1);
     stride_h_output_sf = output_sf.stride(1);
 
-    CHECK_QUANT_SHAPE(output, batch_size, num_heads, num_tokens, head_dim / 2);
-    CHECK_QUANT_SHAPE(output_sf, batch_size, num_heads, num_tokens, head_dim / 16);
+    int const padded_num_tokens = ((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE;
+    CHECK_QUANT_SHAPE(output, batch_size, num_heads, padded_num_tokens, head_dim / 2);
+    CHECK_QUANT_SHAPE(output_sf, batch_size, num_heads, padded_num_tokens, head_dim / 16);
   }
 
   auto input_dtype = input.dtype();

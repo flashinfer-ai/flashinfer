@@ -212,7 +212,7 @@ struct CollectiveEpilogueFwd {
 
   CUTLASS_DEVICE void store_tail() { tma_store_wait<0>(); }
 
-  // Write 0 to output and -inf to LSE
+  // Write zero to output and the +infinity empty-row sentinel to LSE.
   CUTLASS_DEVICE void store_zero(Params const& epilogue_params, int thread_idx,
                                  cute::tuple<int32_t, int32_t, int32_t> const& block_coord) {
     auto [m_block, bidh, bidb] = block_coord;
@@ -220,11 +220,6 @@ struct CollectiveEpilogueFwd {
                             epilogue_params.stride_O);
     Tensor gO = local_tile(mO(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}),
                            make_coord(m_block, _0{}));  // (M, K)
-    auto shape_LSE = select<0, 2, 3>(epilogue_params.shape_O);
-    Tensor mLSE =
-        make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), shape_LSE, epilogue_params.stride_LSE);
-    Tensor gLSE = local_tile(mLSE(_, bidh, bidb), Shape<Int<kBlockM>>{}, make_coord(m_block));
-
     GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
@@ -245,8 +240,12 @@ struct CollectiveEpilogueFwd {
                            /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
         get<0>(epilogue_params.shape_O) - m_block * kBlockM);
-    static_assert(kBlockM <= NumMmaThreads);
-    if (thread_idx < get<0>(shape_LSE) - m_block * kBlockM) {
+    auto shape_LSE = select<0, 2, 3>(epilogue_params.shape_O);
+    if (epilogue_params.ptr_LSE != nullptr && thread_idx < kBlockM &&
+        thread_idx < get<0>(shape_LSE) - m_block * kBlockM) {
+      Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), shape_LSE,
+                                epilogue_params.stride_LSE);
+      Tensor gLSE = local_tile(mLSE(_, bidh, bidb), Shape<Int<kBlockM>>{}, make_coord(m_block));
       gLSE(thread_idx) = INFINITY;
     }
   }

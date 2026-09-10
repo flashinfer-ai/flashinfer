@@ -184,8 +184,17 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_trace_output_dtype_precedence():
 
     default_defn = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd.fi_trace(**kwargs)
     assert default_defn["outputs"]["out"]["dtype"] == "bfloat16"
+    assert default_defn["inputs"]["sm_scale"]["optional"] is True
+    assert default_defn["inputs"]["softmax_scale"]["optional"] is True
     assert default_defn["inputs"]["unpadded_q_len"]["dtype"] == "int32"
     assert default_defn["inputs"]["unpadded_k_len"]["dtype"] == "int32"
+
+    alias_kwargs = dict(kwargs)
+    alias_kwargs["softmax_scale"] = alias_kwargs.pop("sm_scale")
+    alias_defn = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd.fi_trace(
+        **alias_kwargs
+    )
+    assert alias_defn["inputs"]["softmax_scale"]["dtype"] == "float32"
 
     dtype_defn = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd.fi_trace(
         **kwargs, out_dtype=torch.float16

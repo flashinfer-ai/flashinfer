@@ -178,6 +178,46 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_lse_specialization(causal):
 
 
 @torch.inference_mode()
+def test_qk_mxfp8_pv_nvfp4_attention_sm120_fully_masked_causal_rows():
+    _require_sm120()
+    torch.manual_seed(9)
+    qo_len, kv_len = 257, 65
+    q = torch.randn((1, 4, qo_len, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 2, kv_len, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    quantized = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv(q, k, v)
+
+    call_kwargs = {
+        "causal": True,
+        "unpadded_q_len": qo_len,
+        "unpadded_k_len": kv_len,
+    }
+    out_only = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
+        *quantized, **call_kwargs
+    )
+    out, lse = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
+        *quantized, return_lse=True, **call_kwargs
+    )
+
+    empty_rows = qo_len - kv_len
+    torch.testing.assert_close(out_only, out, rtol=0, atol=4e-3)
+    assert torch.count_nonzero(out[:, :, :empty_rows]) == 0
+    assert torch.isposinf(lse[:, :, :empty_rows]).all()
+
+    ref, ref_lse = _reference_attention(q, k, v, True, 128**-0.5)
+    actual_valid = out[:, :, empty_rows:qo_len].float()
+    ref_valid = ref[:, :, empty_rows:]
+    cosine = F.cosine_similarity(
+        actual_valid.flatten(), ref_valid.flatten(), dim=0
+    ).item()
+    assert cosine >= 0.985
+    assert (actual_valid - ref_valid).abs().mean().item() <= 0.07
+    assert (
+        lse[:, :, empty_rows:qo_len] - ref_lse[:, :, empty_rows:]
+    ).abs().max() <= 0.15
+
+
+@torch.inference_mode()
 def test_qk_mxfp8_pv_nvfp4_attention_sm120_caller_buffers_and_scale_alias():
     _require_sm120()
     torch.manual_seed(11)
@@ -226,6 +266,33 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_quantized_shapes():
     assert q_scale.dtype == torch.uint8
     assert k_scale.dtype == torch.uint8
     assert v_scale_t.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("tensor_layout", [0, 1], ids=["nhd", "hnd"])
+@torch.inference_mode()
+def test_qk_mxfp8_pv_nvfp4_attention_sm120_scaled_fp4_quant_padded_output(
+    tensor_layout,
+):
+    _require_sm120()
+    batch, num_heads, num_tokens, padded_tokens, head_dim = 1, 2, 129, 256, 128
+    if tensor_layout == 0:
+        input_shape = (batch, num_tokens, num_heads, head_dim)
+        output_shape = (batch, padded_tokens, num_heads, head_dim // 2)
+        scale_shape = (batch, padded_tokens, num_heads, head_dim // 16)
+        tail = (slice(None), slice(num_tokens, None))
+    else:
+        input_shape = (batch, num_heads, num_tokens, head_dim)
+        output_shape = (batch, num_heads, padded_tokens, head_dim // 2)
+        scale_shape = (batch, num_heads, padded_tokens, head_dim // 16)
+        tail = (slice(None), slice(None), slice(num_tokens, None))
+
+    x = torch.randn(input_shape, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(output_shape, device="cuda", dtype=torch.uint8)
+    output_sf = torch.empty(scale_shape, device="cuda", dtype=torch.float8_e4m3fn)
+    module = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120.get_qk_mxfp8_pv_nvfp4_attention_sm120_module()
+    module.scaled_fp4_quant(x, output, output_sf, tensor_layout)
+
+    assert torch.count_nonzero(output[tail]) == 0
 
 
 @torch.inference_mode()

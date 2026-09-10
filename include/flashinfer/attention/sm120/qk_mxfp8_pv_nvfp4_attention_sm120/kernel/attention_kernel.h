@@ -96,8 +96,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
   }
 
-  // Every active consumer warp-group participates in wait/release for each
-  // stage.  The M64 specialization uses one group; M128 uses two.
+  // Both consumer warp groups participate in wait/release for each stage.
   static constexpr int NumAllConsumerThreads = Ktraits::kNumConsumerWarGroups * NumMmaThreads;
 
   PipelineParams pipeline_params_v;
@@ -152,19 +151,12 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
       PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
       PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
 
-      int work_idx = 0;
-
       for (auto work_tile_info = scheduler.get_initial_work();
            work_tile_info.is_valid(scheduler_params);
            work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
-        int tile_count_semaphore = 0;
-
         collective_mainloop.load(mainloop_params, scheduler_params, pipeline_q, pipeline_k,
                                  pipeline_v, smem_pipe_write_q, smem_pipe_write_k,
-                                 smem_pipe_write_v, shared_storage, work_tile_info, work_idx,
-                                 tile_count_semaphore);
-
-        work_idx++;
+                                 smem_pipe_write_v, shared_storage, work_tile_info);
       }
 
       collective_mainloop.load_tail(pipeline_q, pipeline_k, pipeline_v, smem_pipe_write_q,
@@ -175,10 +167,17 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
            work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
         barrier_o.wait();
 
-        collective_epilogue.tma_store(shared_storage, epilogue_params, work_tile_info,
-                                      scheduler_params, threadIdx.x);
-
-        collective_epilogue.store_tail();
+        auto block_coord = work_tile_info.get_block_coord(scheduler_params);
+        int const m_block = get<0>(block_coord);
+        bool skip_store = false;
+        if constexpr (Is_causal) {
+          skip_store = collective_mainloop.get_n_block_max(mainloop_params, m_block) <= 0;
+        }
+        if (!skip_store) {
+          collective_epilogue.tma_store(shared_storage, epilogue_params, work_tile_info,
+                                        scheduler_params, threadIdx.x);
+          collective_epilogue.store_tail();
+        }
 
         barrier_o.arrive();
       }
@@ -208,8 +207,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     PipelineState smem_pipe_read_k, smem_pipe_read_v;
     PipelineStateQ smem_pipe_read_q;
     // Scheme A: both WGs start at stage 0, advance by 1 (normal)
-
-    int work_idx = 0;
 
     bool const defer_q_release = [&] {
       if constexpr (std::is_same_v<TileScheduler,
@@ -246,14 +243,15 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
       int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block);
 
       if (Is_causal && n_block_max <= 0) {
+        barrier_o.wait();
         collective_epilogue.store_zero(epilogue_params, consumer_thread_idx, block_coord);
+        barrier_o.arrive();
         continue;
       }
 
       collective_mainloop.mma(mainloop_params, pipeline_q, pipeline_k, pipeline_v, smem_pipe_read_q,
                               smem_pipe_read_k, smem_pipe_read_v, tOrO, softmax_fused, n_block_max,
-                              mma_thread_idx, work_idx, m_block, wg_id, shared_storage,
-                              defer_q_release);
+                              mma_thread_idx, m_block, wg_id, shared_storage, defer_q_release);
 
       if (defer_q_release) {
         q_release_deferred = true;
@@ -275,8 +273,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
             epilogue_params.stride_LSE, softmax_fused, mainloop_params.softmax_scale_log2,
             tiled_mma_pv, mma_thread_idx, m_block * kBlockM + wg_id * kBlockMPerWG, bidh, bidb);
       }
-
-      ++work_idx;
     }
 
     if (defer_q_release && q_release_deferred) {

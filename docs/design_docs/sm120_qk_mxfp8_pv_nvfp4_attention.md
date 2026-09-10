@@ -1,5 +1,7 @@
 # SM120 QK MXFP8 / PV NVFP4 Attention
 
+**Scope**: Normative quantization recipe and public API contract for the SM120/SM121 QK MXFP8 / PV NVFP4 attention path.
+
 This document specifies the low-precision recipe and public contract of
 `qk_mxfp8_pv_nvfp4_attention_sm120`. The implementation is an inference-only
 forward kernel for SM120 and SM121 with head dimension 128.

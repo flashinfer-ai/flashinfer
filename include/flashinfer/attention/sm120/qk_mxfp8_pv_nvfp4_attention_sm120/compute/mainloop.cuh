@@ -395,8 +395,7 @@ struct CollectiveMainloopFwd {
                            MainloopPipelineQ pipeline_q, MainloopPipeline pipeline_k,
                            MainloopPipeline pipeline_v, PipelineStateQ& smem_pipe_write_q,
                            PipelineState& smem_pipe_write_k, PipelineState& smem_pipe_write_v,
-                           SharedStorage& shared_storage, WorkTileInfo work_tile_info,
-                           int& work_idx, int& tile_count_semaphore) {
+                           SharedStorage& shared_storage, WorkTileInfo work_tile_info) {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
@@ -404,6 +403,11 @@ struct CollectiveMainloopFwd {
     int const kv_head = mainloop_params.group_size_fastdiv.divide(bidh);
 
     int n_block_max = get_n_block_max(mainloop_params, m_block);
+    if constexpr (Is_causal) {
+      if (n_block_max <= 0) {
+        return;
+      }
+    }
 
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q_storage().begin()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.begin()), SmemLayoutK{});
@@ -519,7 +523,6 @@ struct CollectiveMainloopFwd {
         ++smem_pipe_write_v;
       }
     }
-    ++work_idx;
   }
 
   /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
@@ -552,7 +555,7 @@ struct CollectiveMainloopFwd {
                           SoftmaxFused& softmax_fused,
                           int n_block_count,  // total N-blocks
                           int thread_idx,     // 0-127 (per-WG MMA thread)
-                          int work_idx, int m_block,
+                          int m_block,
                           int wg_id,  // 0 or 1
                           SharedStorage& shared_storage, bool defer_q_release = false,
                           TmaRefill tma_refill = {}) {
@@ -753,18 +756,6 @@ struct CollectiveMainloopFwd {
                               col_limit_causal(int(get<0>(tScS(i))), n_block_local))) {
             tSrS_local(i) = -INFINITY;
           }
-        }
-      }
-    };
-
-    auto apply_tail_mask_noncausal = [&](auto& tSrS_local, int tail_valid_cols) {
-      Tensor cS = cute::make_identity_tensor(make_shape(Int<kBlockMPerWG>{}, Int<kBlockN>{}));
-      Tensor tScS = thread_mma_qk.partition_C(cS);
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(tSrS_local); ++i) {
-        if (qk_mxfp8_pv_nvfp4_attention::qk_acc_col_to_k_col(int(get<1>(tScS(i)))) >=
-            tail_valid_cols) {
-          tSrS_local(i) = -INFINITY;
         }
       }
     };
@@ -1041,6 +1032,7 @@ struct CollectiveMainloopFwd {
     }
 
     bool is_first_compute = true;
+    clear(tOrO_store);
 
     // Causal tiles use the conventional online-softmax path. Both
     // consumer warp groups traverse every K/V tile for their own M64 rows.
@@ -1076,11 +1068,7 @@ struct CollectiveMainloopFwd {
       tma_refill.refill_k(tile_idx);
 
       // Apply the logical mask before the online-softmax update.
-      if constexpr (Is_causal) {
-        apply_mask(tSrS_local, n_block);
-      } else if (tile_idx == 0) {
-        apply_tail_mask_noncausal(tSrS_local, int(unpadded_seqlen_k - n_block * kBlockN));
-      }
+      apply_mask(tSrS_local, n_block);
 
       if (is_first_compute) {
         softmax_fused.template online_softmax_with_quant</*FirstTile=*/true,

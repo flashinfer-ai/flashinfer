@@ -246,6 +246,8 @@ def _nvidia_smi_snapshot() -> dict[str, str] | None:
         "temperature_c",
         "power_w",
     )
+    if len(values) != len(keys):
+        return None
     return dict(zip(keys, values, strict=True))
 
 

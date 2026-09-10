@@ -107,7 +107,8 @@ qk_mxfp8_pv_nvfp4_attention_sm120_fwd_trace = TraceTemplate(
             ["batch_size", "num_kv_heads", "padded_kv_len", "scale_head_dim"]
         ),
         "v_scale_t": Tensor(["batch_size", "num_kv_heads", "head_dim", "scale_kv_len"]),
-        "sm_scale": Scalar("float32"),
+        "sm_scale": Scalar("float32", optional=True),
+        "softmax_scale": Scalar("float32", optional=True),
         "causal": Scalar("bool"),
         "out": Tensor(
             ["batch_size", "num_qo_heads", "padded_qo_len", "head_dim"],

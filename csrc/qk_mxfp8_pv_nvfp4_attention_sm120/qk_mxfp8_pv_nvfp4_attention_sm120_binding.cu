@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cutlass/numeric_types.h>
 #include <flashinfer/attention/sm120/qk_mxfp8_pv_nvfp4_attention_sm120/api/launcher.h>
@@ -78,8 +77,6 @@ void check_same_device(TensorView ref, TensorView x, const char* name) {
       << name << " must be on the same device as q_fp8";
 }
 
-int round_multiple(int x, int m) { return (x + m - 1) / m * m; }
-
 void set_params_fprop(FlashFwdParams& params, TensorView q, TensorView k, TensorView v,
                       TensorView q_scale, TensorView k_scale, TensorView v_scale, TensorView out,
                       ffi::Optional<TensorView> maybe_lse, float sm_scale, bool causal,
@@ -110,28 +107,15 @@ void set_params_fprop(FlashFwdParams& params, TensorView q, TensorView k, Tensor
   params.k_batch_stride = k.stride(0);
   params.v_batch_stride = v.stride(0) * 2;
 
-  params.sfq_row_stride = q_scale.stride(-2);
-  params.sfk_row_stride = k_scale.stride(-2);
-  params.sfv_row_stride = v_scale.stride(-2);
-  params.sfq_head_stride = q_scale.stride(-3);
-  params.sfk_head_stride = k_scale.stride(-3);
-  params.sfv_head_stride = v_scale.stride(-3);
-  params.sfq_batch_stride = q_scale.stride(0);
-  params.sfk_batch_stride = k_scale.stride(0);
-  params.sfv_batch_stride = v_scale.stride(0);
-
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-2);
   params.o_head_stride = out.stride(-3);
   params.o_batch_stride = out.stride(0);
 
-  params.cu_seqlens_q = nullptr;
-  params.cu_seqlens_k = nullptr;
-  params.seqused_k = nullptr;
-  params.p_ptr = nullptr;
   params.softmax_lse_ptr =
       maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
 
+  params.device_id = q.device().device_id;
   params.b = batch;
   params.h = num_qo_heads;
   params.h_k = num_kv_heads;
@@ -140,32 +124,12 @@ void set_params_fprop(FlashFwdParams& params, TensorView q, TensorView k, Tensor
   params.seqlen_k = seq_len_k;
   params.unpadded_seqlen_q = static_cast<int>(unpadded_q_len);
   params.unpadded_seqlen_k = static_cast<int>(unpadded_k_len);
-  params.seqlen_q_rounded = round_multiple(seq_len_q, 128);
-  params.seqlen_k_rounded = round_multiple(seq_len_k, 128);
   params.d = head_dim;
-  params.d_rounded = head_dim;
-  params.head_divmod = cutlass::FastDivmod(num_qo_heads);
 
-  params.scale_softmax = sm_scale;
   params.scale_softmax_log2 = sm_scale * 1.4426950408889634f;
-  __half scale_softmax_log2_half = __float2half(params.scale_softmax_log2);
-  __half2 scale_softmax_log2_half2 =
-      __halves2half2(scale_softmax_log2_half, scale_softmax_log2_half);
-  params.scale_softmax_log2_half2 = reinterpret_cast<uint32_t&>(scale_softmax_log2_half2);
-
-  params.p_dropout = 1.f;
-  params.p_dropout_in_uint8_t = 255;
-  params.rp_dropout = 1.f;
-  params.scale_softmax_rp_dropout = sm_scale;
 
   params.is_causal = causal;
-  params.per_block_mean = false;
-  params.seqlen_s = 0;
-  params.window_size_left = -1;
-  params.window_size_right = causal ? 0 : -1;
-  params.is_seqlens_k_cumulative = true;
   params.is_bf16 = out.dtype() == dl_bfloat16;
-  params.tile_count_semaphore = nullptr;
 }
 
 template <bool ReturnLSE, bool IsBF16>
@@ -234,11 +198,17 @@ void fwd(TensorView q_fp8, TensorView k_fp8, TensorView v_fp4_t, TensorView q_sc
       << "out must be bfloat16 or float16";
 
   ffi::CUDADeviceGuard device_guard(q_fp8.device().device_id);
-  cudaDeviceProp props;
-  cudaError_t status = cudaGetDeviceProperties(&props, q_fp8.device().device_id);
+  int cc_major = 0;
+  int cc_minor = 0;
+  cudaError_t status = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor,
+                                              q_fp8.device().device_id);
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "cudaGetDeviceProperties failed: " << cudaGetErrorString(status);
-  TVM_FFI_ICHECK(props.major == 12 && (props.minor == 0 || props.minor == 1))
+      << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
+  status = cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor,
+                                  q_fp8.device().device_id);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cudaDeviceGetAttribute(minor) failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(cc_major == 12 && (cc_minor == 0 || cc_minor == 1))
       << "QK MXFP8 / PV NVFP4 attention requires compute capability 12.0 or 12.1";
 
   const int64_t batch = q_fp8.size(0);

@@ -76,9 +76,9 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0> {
     alignas(16) typename cutlass::PipelineTmaAsync<1>::SharedStorage pipeline_q;
     alignas(16) typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_k;
     alignas(16) typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline_v;
-    alignas(16) typename qk_mxfp8_pv_nvfp4_attention::OrderedSequenceBarrierVarGroupSize<
-        EpiStages, 2>::SharedStorage barrier_o;
-    int tile_count_semaphore;
+    alignas(16)
+        typename qk_mxfp8_pv_nvfp4_attention::OrderedSequenceBarrier<EpiStages, 2, 1>::SharedStorage
+        barrier_o;
   };
 };
 
@@ -104,9 +104,9 @@ struct Flash_fwd_kernel_traits {
   static constexpr bool SmoothQ = true;
 
   static_assert(kHeadDim % 32 == 0, "Head dim must be multiple of 32");
-  static_assert(kBlockM == 64 || kBlockM == 128, "BlockM must be 64 or 128");
+  static_assert(kBlockM == 128, "Only BlockM 128 is supported");
 
-  static constexpr int kNWarps = kBlockM == 128 ? 12 : 8;
+  static constexpr int kNWarps = 12;
   static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
   static constexpr int kBlockMPerWG = kBlockM / 2;  // 64
   static constexpr int kNumConsumerWarGroups = 2;
@@ -305,7 +305,7 @@ struct Flash_fwd_kernel_traits {
 
   // Epilogue barrier
   using EpilogueBarrier =
-      typename qk_mxfp8_pv_nvfp4_attention::OrderedSequenceBarrierVarGroupSize<EpiStages, 2>;
+      typename qk_mxfp8_pv_nvfp4_attention::OrderedSequenceBarrier<EpiStages, 2, 1>;
 
   // Ping-pong math order barrier between Consumer0 and Consumer1
 };

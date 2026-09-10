@@ -53,7 +53,9 @@ template <class TiledMma, class GapFn, class TA, class ALayout, class TB, class 
 CUTE_HOST_DEVICE void gemm_fp8_interleaved(TiledMma const&, Tensor<TC, CLayout>& C,
                                            Tensor<TA, ALayout> const& A,
                                            Tensor<TB, BLayout> const& B, GapFn&& gap_fn) {
-  using MMAOp = cute::SM120::BLOCKSCALED::SM120_16x32x32_TN_VS_FP8;
+  using MMAOp = typename TiledMma::Atom::MMA_Op;
+  static_assert(std::is_same_v<MMAOp, cute::SM120::BLOCKSCALED::SM120_16x32x32_TN_VS_FP8>,
+                "gemm_fp8_interleaved only supports the SM120 16x32x32 FP8 MMA atom");
   mma_unpack_fp8_interleaved(MMA_Traits<MMAOp>{}, C, A, B, C, static_cast<GapFn&&>(gap_fn));
 }
 
