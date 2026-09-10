@@ -24,8 +24,9 @@ from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 
 import cutlass.utils as utils
-from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN, Int8
 
+from ...sage import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
     _select_block_sparse_q_tile_size,
@@ -100,6 +101,18 @@ _GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
 _CONTIGUOUS_GROUPED_KEEPS_PROFILES = {
     _GROUPED_KEEPS_MAIN_PROFILE,
     (BFloat16, BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
+}
+# Sage attention recipes: 8-bit Q/K/V dequantized with per-block and
+# per-channel scales into a 16-bit output. They run the contiguous Keeps
+# resource recipes above and are keyed apart by ``use_sage_attention``, since
+# ``(E4M3, E4M3, F16)`` without scales is the static-only FP8 profile below.
+_SAGE_GROUPED_KEEPS_PROFILES = {
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 128, 0, 2, 2),
+}
+# (Q, K, output) dtype triples of the Sage recipes; V is E4M3 in every one.
+_SAGE_DTYPE_RECIPES = {
+    (profile[0], profile[1], profile[3]) for profile in _SAGE_GROUPED_KEEPS_PROFILES
 }
 _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
@@ -191,17 +204,15 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
 _KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
 
 
-def _kv256_supports_dtypes(q_dtype: type, kv_dtype: type, out_dtype: type) -> bool:
-    """Whether the Q64/KV256 profile is qualified for one dtype combination.
-
-    16-bit profiles keep one dtype for Q, K/V and O. FP8 Q/K/V publishes
-    either FP8 or FP16 output, matching the FP8 D128 Keeps profiles.
-    """
-    if q_dtype != kv_dtype:
-        return False
-    if q_dtype in (Float16, BFloat16):
-        return out_dtype == q_dtype
-    return q_dtype == Float8E4M3FN and out_dtype in (Float8E4M3FN, Float16)
+# ``(Q, K/V, O)`` dtype recipes of the Q64/KV256 profile without Sage
+# attention: 16-bit profiles keep one dtype throughout, and FP8 Q/K/V
+# publishes FP8 or FP16 output, matching the FP8 D128 Keeps profiles.
+_KV256_DTYPE_RECIPES = {
+    (Float16, Float16, Float16),
+    (BFloat16, BFloat16, BFloat16),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN),
+    (Float8E4M3FN, Float8E4M3FN, Float16),
+}
 
 
 # Public cost-model collection uses the FP8 proxy for every source dtype. The
@@ -1174,6 +1185,13 @@ class FmhaDecodeConfig:
     use_attention_sinks: bool = False
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
+    # Sage attention: 8-bit Q/K with one dequantization scale per token block
+    # and E4M3 V with one scale per channel. A nonzero K block size enables
+    # the feature; the Q block size is a power of two up to ``tile_size_q``.
+    # ``sage_v_mean`` adds a per-channel V mean back after normalization.
+    sage_q_block_size: int = 0
+    sage_k_block_size: int = 0
+    sage_v_mean: bool = False
     # Nonzero means each K/V stage covers only this many head-dim columns.
     # H256 SwapsMmaAb uses 128-column stages to keep TMA and TMEM layouts valid.
     head_dim_per_stage_kv: int = 0
@@ -1486,6 +1504,14 @@ class FmhaDecodeConfig:
                 f"q_dtype ({self.q_dtype}) must match k_dtype ({self.k_dtype}); "
                 "mixed Q/K element types are not supported"
             )
+        if (
+            self.use_sage_attention
+            and (self.q_dtype, self.k_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES
+        ):
+            raise ValueError(
+                "Sage attention requires Float8E4M3FN Q, K and V with Float16 "
+                "or BFloat16 output"
+            )
 
     def validate_boolean_fields(self) -> None:
         """Require every boolean config field to carry a real Python bool."""
@@ -1552,18 +1578,87 @@ class FmhaDecodeConfig:
                 "or up to two for QToken-KvBlock-Sparse-Attention"
             )
 
+    def _require_direct_output_grid(self) -> None:
+        """Reject the launch features block-sparse and Sage attention exclude.
+
+        Both publish each Q tile's output directly from the CTA that computes
+        it, without split-KV reductions, variable-Q packing, sliding windows
+        or attention sinks.
+        """
+        if (
+            self.use_variable_seqlens_q
+            or self.use_sliding_window_causal
+            or self.use_attention_sinks
+            or self.use_split_kv
+            or self.use_cluster_smem_reduction
+            or self.use_separate_reduction_kernel
+        ):
+            raise ValueError(
+                "block-sparse and Sage attention support the direct-output grid "
+                "only, without split-KV, variable-Q, sliding-window, or "
+                "attention-sink features"
+            )
+
+    def validate_sage_profile(self) -> None:
+        """Validate the qualified host profile of a Sage attention launch.
+
+        The scale block sizes follow the recipe: ``sage_k_block_size`` is one
+        of ``SAGE_K_BLOCK_SIZES`` and ``sage_q_block_size`` is a power of two
+        no larger than the Q tile. The launch needs contiguous K/V with
+        ``headdim=128``, a streamed two-instance Keeps profile and the
+        direct-output grid. Without Sage attention the other recipe fields
+        must stay unset. The dtype recipe is validated by ``validate_dtypes``.
+        """
+        if not self.use_sage_attention:
+            if self.sage_q_block_size != 0 or self.sage_v_mean:
+                raise ValueError(
+                    "sage_q_block_size and sage_v_mean require sage_k_block_size"
+                )
+            return
+        if self.sage_k_block_size not in SAGE_K_BLOCK_SIZES:
+            raise ValueError(
+                f"sage_k_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
+                f"got {self.sage_k_block_size}"
+            )
+        q_block_size = self.sage_q_block_size
+        if not is_power_of_two(q_block_size) or q_block_size > self.tile_size_q:
+            raise ValueError(
+                "sage_q_block_size must be a power of two no larger than "
+                f"tile_size_q ({self.tile_size_q}), got {q_block_size}"
+            )
+        if self.use_paged_kv or self.headdim != 128:
+            raise ValueError("Sage attention requires contiguous K/V with headdim=128")
+        if self.use_block_sparse:
+            raise ValueError("Sage attention does not support block-sparse routes yet")
+        if not self.streams_tmem_p_fragments:
+            raise ValueError(
+                "Sage attention requires a two-instance Keeps profile: "
+                "Q64/KV256 or Q128/KV128"
+            )
+        if self.use_persistent_scheduler:
+            raise ValueError(
+                "Sage attention supports the static grid only; the persistent "
+                "scheduler is unsupported"
+            )
+        self._require_direct_output_grid()
+
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
-        """Validate the qualified host profile for block-sparse."""
+        """Validate the qualified host profile of a block-sparse launch.
+
+        The route policy fields are checked for every launch. A block-sparse
+        launch then needs the direct-output grid, matching 16-bit IO unless
+        Sage attention dequantizes 8-bit inputs, and a route geometry that
+        agrees with the contiguous Keeps or SwapsMmaAb profile it selects.
+        """
         if self.use_block_sparse_proxy_routes and not self.use_block_sparse:
             raise ValueError("proxy routes require block-sparse attention")
         if self.use_block_sparse_proxy_routes and self.mask_type != DENSE:
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
+        if self.use_parallel_sparse_kv_loads and not self.use_block_sparse:
+            raise ValueError("sparse execution policy requires block-sparse attention")
         if not self.use_block_sparse:
-            if self.use_parallel_sparse_kv_loads:
-                raise ValueError(
-                    "sparse execution policy requires block-sparse attention"
-                )
             return
+        self._require_direct_output_grid()
 
         if not (self.q_dtype == self.k_dtype == self.v_dtype == self.out_dtype):
             raise ValueError(
@@ -1626,18 +1721,6 @@ class FmhaDecodeConfig:
                 "parallel sparse K/V loads require two-instance SwapsMmaAb "
                 "with KV block size 8 or 16"
             )
-        if self.use_variable_seqlens_q:
-            raise ValueError("block-sparse does not support variable-Q sequences")
-        if self.use_sliding_window_causal:
-            raise ValueError("block-sparse does not support sliding window attention")
-        if self.use_attention_sinks:
-            raise ValueError("block-sparse does not support attention sinks")
-        if (
-            self.use_split_kv
-            or self.use_cluster_smem_reduction
-            or self.use_separate_reduction_kernel
-        ):
-            raise ValueError("block-sparse does not support split-KV reduction")
 
     def compile_signature(self) -> tuple[tuple[str, object], ...]:
         """Key and reconstruct the batch-dynamic callable in the decode cache.
@@ -1731,6 +1814,32 @@ class FmhaDecodeConfig:
             self.num_insts_kv,
             self.o_stages,
         )
+
+    @property
+    def _uses_contiguous_grouped_keeps_recipe(self) -> bool:
+        """Whether the dtype and staging key is a contiguous grouped-Keeps recipe.
+
+        Sage attention selects its own recipe table because the same 8-bit
+        dtypes without scales name the static-only FP8 profile.
+        """
+        profiles = (
+            _SAGE_GROUPED_KEEPS_PROFILES
+            if self.use_sage_attention
+            else _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+        )
+        return self._grouped_keeps_profile_key in profiles
+
+    @property
+    def _kv256_dtypes_qualified(self) -> bool:
+        """Whether the Q64/KV256 profile is qualified for this dtype combination.
+
+        Sage attention qualifies through its own recipe table, since the same
+        8-bit dtypes without scales name the static-only FP8 profile; every
+        other launch qualifies through the KV256 dtype rule.
+        """
+        if self.use_sage_attention:
+            return self._uses_contiguous_grouped_keeps_recipe
+        return (self.q_dtype, self.k_dtype, self.out_dtype) in _KV256_DTYPE_RECIPES
 
     @property
     def uses_guarded_fixed_q1_grouped_keeps(self) -> bool:
@@ -1945,16 +2054,17 @@ class FmhaDecodeConfig:
         the MMA warp start its PV k-slice before the row is complete, at the
         cost of one barrier round per fragment.
 
-        Streaming is limited to the two-instance profiles whose route loop
-        waits on the K/V loads, where the earlier PV start hides load
-        latency: Q64/KV256 and block-sparse Q128/KV128, in 16-bit and FP8.
-        Dense 16-bit Q128/KV128 keeps the complete row because its route loop
-        is not load-bound, so the per-fragment barriers are not compensated.
-        Every two-instance FP8 profile whose softmax stats already travel
-        through SMEM streams, dense Q128/KV128 included, so the FP8 P pipeline
-        has one form; the streamed layout overlays P on S from its first
-        column, which a profile with standalone TMEM stats (D64) cannot do,
-        so that profile keeps the complete-row P.
+        A two-instance TMEM-P profile streams in three cases: KV256 tiles,
+        block-sparse routes, and byte-wide K/V whose softmax stats travel
+        through SMEM (dense FP8 Q128/KV128 included, so the FP8 P pipeline
+        has one form). The first two have a route loop that waits on the K/V
+        loads, where the earlier PV start hides load latency. Dense 16-bit
+        Q128/KV128 is not load-bound, so its per-fragment barriers would not
+        be compensated and it keeps the complete row, as does the D64
+        profile, whose standalone TMEM stats keep P from overlaying S from
+        its first column. Sage attention depends on streaming, because its
+        scales enter through the streamed fragment passes, rather than
+        causing it.
         """
         if not self.uses_two_inst_tmem_p:
             return False
@@ -1982,6 +2092,28 @@ class FmhaDecodeConfig:
             and not self.use_fp8_qkv
             and (self.tile_size_kv == 256 or self.use_block_sparse)
         )
+
+    @property
+    def use_sage_attention(self) -> bool:
+        """Whether Q/K scores carry per-block scales and V per-channel scales."""
+        return self.sage_k_block_size > 0
+
+    @property
+    def uses_int32_scores(self) -> bool:
+        """Whether BMM1 accumulates INT8 Q/K into INT32 scores."""
+        return self.use_sage_attention and self.q_dtype == Int8
+
+    @property
+    def sage_k_groups_per_fragment(self) -> int:
+        """Return the K scale groups inside one streamed K32 score fragment.
+
+        A fragment holds ``softmax_score_fragment_regs`` consecutive KV tokens,
+        so a 16-token K block splits it into two compile-time groups; larger
+        blocks share one scale across the whole fragment.
+        """
+        if not self.use_sage_attention:
+            return 1
+        return max(1, self.softmax_score_fragment_regs // self.sage_k_block_size)
 
     @property
     def matches_kv256_task_topology(self) -> bool:
@@ -2208,9 +2340,7 @@ class FmhaDecodeConfig:
                 or not self.groups_tokens_heads_q
                 or self.tile_size_q != 64
                 or self.headdim != 128
-                or not _kv256_supports_dtypes(
-                    self.q_dtype, self.k_dtype, self.out_dtype
-                )
+                or not self._kv256_dtypes_qualified
                 # FP8 Keeps recipes exclude attention sinks, as the paged FP8
                 # Q64/Q128 profiles do.
                 or (self.use_fp8_qkv and self.use_attention_sinks)
@@ -2249,7 +2379,7 @@ class FmhaDecodeConfig:
         if self.use_block_sparse:
             return profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
         if (
-            profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+            self._uses_contiguous_grouped_keeps_recipe
             and direct
             and not self.use_paged_kv
             and not any(
@@ -2261,6 +2391,8 @@ class FmhaDecodeConfig:
             )
         ):
             return True
+        if self.use_sage_attention:
+            return False
 
         if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
             fixed_q1 = (
@@ -3981,6 +4113,7 @@ def _validate_profile_support(
         raise ValueError(
             "heads_q_per_kv metadata must equal num_heads_q / num_heads_kv"
         )
+    cfg.validate_sage_profile()
     cfg.validate_block_sparse_profile(heads_q_per_kv=heads_q_per_kv)
     if use_groups_tokens_heads_q:
         make_q_tile_geometry(
@@ -4151,12 +4284,9 @@ def _validate_profile_support(
         )
         if (
             cfg.q_dtype == Float8E4M3FN
-            and cfg.out_dtype
-            not in (
-                Float16,
-                Float8E4M3FN,
-            )
+            and cfg.out_dtype not in (Float16, Float8E4M3FN)
             and not fp8_q_token_kv_block_sparse_bf16_output
+            and not cfg.use_sage_attention
         ):
             raise ValueError(
                 "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"

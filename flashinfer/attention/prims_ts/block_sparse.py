@@ -75,6 +75,7 @@ from ._block_sparse.runtime import (
     validate_paged_kv_storage as _validate_paged_kv_storage,
 )
 from .decode import PagedKVCache, _resolve_cuda_device, _validate_runtime_device
+from .sage import SageAttentionConfig, SageAttentionParams
 
 
 class _BlockSparseWrapperBase:
@@ -162,6 +163,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
+        sage_config: SageAttentionConfig | None = None,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -191,9 +193,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         prepares each pattern once. K/V values still have every physical head.
 
         MHA, GQA, and MQA are supported with ``Hq / Hkv`` a power of two no
-        greater than 32 and ``D=128``. Q, K, V, and O use one matching
-        ``torch.float16`` or ``torch.bfloat16`` dtype. Runtime tensor shapes
-        are documented by :meth:`run`.
+        greater than 32 and ``D=128``. Without Sage attention, Q, K, V, and O
+        use one matching ``torch.float16`` or ``torch.bfloat16`` dtype.
+        Runtime tensor shapes are documented by :meth:`run`.
 
         ``q_block_size`` may be any positive signed-Int32 value for which a
         physical Q tile stays within one BSR row. Equivalently,
@@ -221,6 +223,15 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         One revision has one mutable route workspace, so its runs must be
         ordered on one stream or externally synchronized. Unordered concurrent
         runs require distinct wrappers.
+
+        ``sage_config`` enables Sage attention on a dense plan whose block sizes select
+        a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
+        ``torch.float8_e4m3fn`` dequantized with one scale per token block, V
+        is ``torch.float8_e4m3fn`` with one scale per channel, and the output
+        is ``torch.bfloat16`` (the default) or ``torch.float16``.
+        :class:`SageAttentionConfig` fixes the scale block sizes and whether a
+        V mean is added back; every :meth:`run` supplies the scale tensors as
+        :class:`SageAttentionParams`.
         """
 
         if use_block_sparse:
@@ -261,6 +272,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             max_blocks_per_row=(
                 max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
             ),
+            sage=sage_config,
             use_block_sparse=use_block_sparse,
         )
         if use_proxy_routes and static.mask_type != "dense":
@@ -280,7 +292,6 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 plan_stream=plan_stream,
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
-                use_block_sparse=use_block_sparse,
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
@@ -302,6 +313,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
         validate: bool = True,
+        sage: SageAttentionParams | None = None,
     ) -> torch.Tensor:
         """Launch the current plan on the caller's current CUDA stream.
 
@@ -314,7 +326,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         enqueued asynchronously on the caller's current CUDA stream.
 
         A dense contiguous plan attends over the whole K/V sequence and rejects
-        every routing argument below; all of them must remain ``None``.
+        every routing argument below; all of them must remain ``None``. A Sage
+        plan consumes the scale tensors of this run as ``sage``, validated for
+        shape, dtype, device and contiguity; a plan without Sage rejects them.
 
         ``validate=True`` performs structural and plan-geometry validation
         without reading tensor values; it is the safe public default.
@@ -381,6 +395,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         validate : bool
             Whether to validate tensor structure and plan geometry before
             launching. Defaults to ``True``.
+        sage : SageAttentionParams, optional
+            Per-run Q/K block scales and V channel scales in the layout of the
+            planned :class:`SageAttentionConfig`. Required by a Sage plan and
+            rejected otherwise.
 
         Returns
         -------
@@ -408,6 +426,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             kv_valid_bits=kv_valid_bits,
             sm_scale=sm_scale,
             out=out,
+            sage=sage,
         )
         run_stream = torch.cuda.current_stream(state.device)
         return self._launch_validated_run(state, run_args, run_stream)
@@ -434,6 +453,8 @@ def block_sparse_attention(
     share_pattern_across_kv_heads: bool = False,
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
+    sage: SageAttentionParams | None = None,
+    sage_config: SageAttentionConfig | None = None,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
@@ -443,6 +464,10 @@ def block_sparse_attention(
     width. Bitmask inputs use the structural KV-block count as a conservative
     capacity bound. With ``use_block_sparse=False`` the call plans the dense
     mode of :meth:`BlockSparseTSWrapper.plan` instead and takes Q/K/V only.
+    ``sage`` runs Sage attention with the scale tensors of this call; the
+    recipe is ``sage_config`` or, when omitted, the default
+    :class:`SageAttentionConfig` with a V mean exactly when ``sage`` carries
+    one.
     Planning cannot happen inside CUDA Graph capture; plan a wrapper outside
     capture and capture only ``run()`` instead.
 
@@ -493,6 +518,16 @@ def block_sparse_attention(
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
         Must not overlap any live input; storage overlap is not checked.
+        Without ``out`` the output takes the Q dtype, or bfloat16 with
+        ``sage``.
+    sage : SageAttentionParams, optional
+        Per-run Q/K block scales and V channel scales of a Sage launch; see
+        :meth:`BlockSparseTSWrapper.run`.
+    sage_config : SageAttentionConfig, optional
+        The Sage recipe to plan; see :meth:`BlockSparseTSWrapper.plan`. It
+        requires ``sage`` and defaults to the recipe with the block sizes of
+        :class:`SageAttentionConfig` and ``v_mean`` set when ``sage.v_mean``
+        is present.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -504,6 +539,10 @@ def block_sparse_attention(
         The compact output tensor; identical to ``out`` when provided.
     """
 
+    if sage_config is not None and sage is None:
+        raise ValueError("sage_config requires the sage scale tensors of this call")
+    if sage is not None and sage_config is None:
+        sage_config = SageAttentionConfig(v_mean=sage.v_mean is not None)
     for tensor, name in ((q, "q"), (k, "k"), (v, "v")):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
@@ -534,7 +573,8 @@ def block_sparse_attention(
         mask_type=mask_type,
         q_dtype=q.dtype,
         kv_dtype=k.dtype,
-        output_dtype=q.dtype if out is None else out.dtype,
+        output_dtype=None if out is None else out.dtype,
+        sage=sage_config,
     )
     if use_proxy_routes and static.mask_type != "dense":
         raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -596,6 +636,7 @@ def block_sparse_attention(
         kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
         share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
+        sage_config=sage_config,
     )
     return wrapper.run(
         q,
@@ -609,6 +650,7 @@ def block_sparse_attention(
         kv_valid_bits=kv_valid_bits,
         sm_scale=sm_scale,
         out=out,
+        sage=sage,
     )
 
 

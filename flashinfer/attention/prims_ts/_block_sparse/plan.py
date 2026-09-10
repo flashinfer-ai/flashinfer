@@ -24,6 +24,8 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from ..decode import _dtype_key
+from ..sage import SageAttentionConfig
 from .common import (
     _SIGNED_INT32_MAX,
     _block_sparse_proxy_summary_geometry,
@@ -109,6 +111,9 @@ class _BlockSparsePlanState:
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
     page_size: int | None
+    # The compile-time Sage recipe; every run supplies the matching scale
+    # tensors. ``None`` runs 16-bit attention without Sage.
+    sage: SageAttentionConfig | None
 
     # Only an unmasked block-sparse specialization needs a shape-correct ABI
     # placeholder. A dense contiguous plan runs without a prepare kernel and
@@ -188,10 +193,7 @@ def _record_block_sparse_plan_ready_event(
 
 
 def _block_sparse_route_capacity(
-    static: _BlockSparseStaticProfile,
-    *,
-    use_block_sparse: bool,
-    use_proxy_routes: bool,
+    static: _BlockSparseStaticProfile, *, use_proxy_routes: bool
 ) -> tuple[int, int]:
     """Return ``(prepared rows, route capacity per row)`` of one plan.
 
@@ -199,7 +201,7 @@ def _block_sparse_route_capacity(
     the routes that carry the summary sequence to every row's exact routes.
     """
 
-    if not use_block_sparse:
+    if not static.use_block_sparse:
         return 0, 0
     assert static.max_blocks_per_row is not None
     num_rows = (
@@ -232,7 +234,6 @@ def _build_block_sparse_plan_state(
     plan_stream: torch.cuda.Stream,
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
-    use_block_sparse: bool = True,
 ) -> _BlockSparsePlanState:
     """Build one format- and route-specialized plan atomically.
 
@@ -243,7 +244,7 @@ def _build_block_sparse_plan_state(
     if static.page_size is not None:
         assert sparse_format == "bsr" and not use_proxy_routes
     num_rows, max_row_route_capacity = _block_sparse_route_capacity(
-        static, use_block_sparse=use_block_sparse, use_proxy_routes=use_proxy_routes
+        static, use_proxy_routes=use_proxy_routes
     )
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
@@ -265,7 +266,9 @@ def _build_block_sparse_plan_state(
             max_row_route_capacity=max_row_route_capacity,
             sparse_format=sparse_format,
             use_proxy_routes=use_proxy_routes,
-            use_block_sparse=use_block_sparse,
+            use_block_sparse=static.use_block_sparse,
+            out_dtype_key=_dtype_key(static.output_dtype),
+            sage=static.sage,
         )
         policy = (
             *spec.policy,
@@ -275,7 +278,7 @@ def _build_block_sparse_plan_state(
         dummy_kv_valid_bits = None
         row_route_offsets = None
         route_workspace = None
-        if use_block_sparse:
+        if static.use_block_sparse:
             route_layout = _BlockSparseRouteLayout.create(
                 kv_route_size=static.kv_route_size,
                 kv_block_size=static.kv_block_size,
@@ -298,7 +301,7 @@ def _build_block_sparse_plan_state(
         ready_event = _record_block_sparse_plan_ready_event(plan_stream)
 
     return _BlockSparsePlanState(
-        use_block_sparse=use_block_sparse,
+        use_block_sparse=static.use_block_sparse,
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         device=device,
@@ -315,6 +318,7 @@ def _build_block_sparse_plan_state(
         output_dtype=static.output_dtype,
         use_kv_valid_bits=static.use_kv_valid_bits,
         page_size=static.page_size,
+        sage=static.sage,
         dummy_kv_valid_bits=dummy_kv_valid_bits,
         row_route_offsets=row_route_offsets,
         route_workspace=route_workspace,

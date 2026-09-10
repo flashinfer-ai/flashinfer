@@ -33,7 +33,7 @@ pytest.importorskip(
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float8E4M3FN, Int32
+from cutlass import BFloat16, Float16, Float8E4M3FN, Int8, Int32
 from cutlass.cute.runtime import make_ptr
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 
@@ -100,6 +100,7 @@ from tests.attention.prims_ts_test_utils import (
     FP8 as _FP8,
     assert_decode_smem_within_capacity,
     dense_stream_columns,
+    make_sage_decode_config,
 )
 
 
@@ -3668,6 +3669,92 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert q128_fp8_sparse.fragment_p_packed_cols == 8
     assert q128_fp8_sparse.pv_mma_steps_per_fragment == 1
     assert not q128_fp8_sparse.defers_softmax_anchor_updates
+
+
+@pytest.mark.parametrize("tile_size_q", (64, 128))
+@pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
+    tile_size_q: int, o_dtype, mask_type: str
+) -> None:
+    """Sage runs the two streamed Keeps profiles with a 16-bit dequantized output."""
+
+    cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q,
+        tile_size_kv=256 if tile_size_q == 64 else 128,
+        o_dtype=o_dtype,
+        mask_type=mask_type,
+    )
+    assert cfg.use_sage_attention
+    assert cfg.streams_tmem_p_fragments
+    assert cfg.use_fp8_qkv
+    assert cfg.out_dtype == o_dtype
+    assert not cfg.defers_softmax_anchor_updates
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        pytest.param(
+            {"qkv_dtype": Float16, "o_dtype": Float16},
+            "Float8E4M3FN Q, K and V",
+            id="16-bit-qkv",
+        ),
+        pytest.param({"qkv_dtype": Int8}, "Unsupported q_dtype", id="int8-qk"),
+        pytest.param(
+            {"sage_args": {"use_persistent_scheduler": True}},
+            "persistent",
+            id="persistent",
+        ),
+        pytest.param(
+            {
+                "sage_args": {"use_split_kv": True, "splits_kv": 2, "max_splits_kv": 2},
+                "split_kv_mode": "gmem_reduction",
+                "splits_kv": 2,
+            },
+            "split-KV",
+            id="split-kv",
+        ),
+        pytest.param(
+            {"qkv_layout": "pagedKv", "num_tokens_per_page": 128},
+            "contiguous K/V",
+            id="paged-kv",
+        ),
+        pytest.param(
+            {"o_dtype": Float8E4M3FN}, "Float16 or BFloat16 output", id="fp8-output"
+        ),
+        pytest.param(
+            {"sage_args": {"sage_k_block_size": 8}}, "sage_k_block_size", id="k-block-8"
+        ),
+        pytest.param(
+            {"sage_args": {"sage_q_block_size": 3}}, "sage_q_block_size", id="q-block-3"
+        ),
+        pytest.param(
+            {"sage_args": {"sage_q_block_size": 128}},
+            "sage_q_block_size",
+            id="q-block-128",
+        ),
+        pytest.param(
+            {
+                "o_dtype": Float16,
+                "sage_args": {"sage_k_block_size": 0, "sage_v_mean": True},
+            },
+            "require sage_k_block_size",
+            id="v-mean-without-k-block",
+        ),
+    ),
+)
+def test_attention_ts_decode_sage_profile_rejects_unsupported_dtypes_and_recipes(
+    overrides: dict[str, object], match: str
+) -> None:
+    """The Sage profile rejects dtypes and recipes outside its contract.
+
+    It takes E4M3 Q, K and V, a 16-bit output, contiguous single-split K/V on
+    the static grid and the documented scale block sizes.
+    """
+
+    with pytest.raises(ValueError, match=match):
+        make_sage_decode_config(tile_size_q=64, tile_size_kv=256, **overrides)
 
 
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (

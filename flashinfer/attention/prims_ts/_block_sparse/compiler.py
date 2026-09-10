@@ -22,6 +22,7 @@ import torch
 from flashinfer.utils import ceil_div
 
 from .common import _num_sparse_pattern_heads
+from ..sage import sage_adapter_slots, sage_scale_shapes
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -113,6 +114,11 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         row_route_offsets: cute.Tensor | None,
         route_workspace: cute.Tensor | None,
         max_blocks_per_row: cutlass.Int32,
+        # The Sage scale slots, in ``SAGE_ADAPTER_SLOTS`` order.
+        q_scale: cute.Tensor | None,
+        k_scale: cute.Tensor | None,
+        v_scale: cute.Tensor | None,
+        v_mean: cute.Tensor | None,
         sm_scale: cutlass.Float32,
         stream: cuda_drv.CUstream,
         static_config: cutlass.Constexpr[FmhaDecodeConfig],
@@ -181,6 +187,20 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         else:
             null_i32 = cute.make_ptr(Int32, 0, mem_space=cutlass.AddressSpace.gmem)
             null_f32 = cute.make_ptr(Float32, 0, mem_space=cutlass.AddressSpace.gmem)
+            sage_kwargs = {}
+            if cutlass.const_expr(static_config.use_sage_attention):
+                # Scale tensors are [heads, flat slots]; the head stride is
+                # the flat slot count of one head.
+                sage_kwargs = {
+                    "q_scale_iter": q_scale.iterator,
+                    "k_scale_iter": k_scale.iterator,
+                    "v_scale_iter": v_scale.iterator,
+                    "v_mean_iter": (
+                        v_mean.iterator if static_config.sage_v_mean else null_f32
+                    ),
+                    "q_scale_head_stride": Int32(q_scale.shape[1]),
+                    "k_scale_head_stride": Int32(k_scale.shape[1]),
+                }
             fmha_decode_launch(
                 problem_shape,
                 q.iterator,
@@ -218,6 +238,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 v_page_stride=Int64(0),
                 v_head_stride=Int64(0),
                 v_token_stride=Int64(0),
+                **sage_kwargs,
             )
 
     @cute.jit
@@ -364,6 +385,24 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 4,
             )
             route_workspace_fake = fake_compact(Int32, (cute.sym_int(),), 4)
+        sage_fakes: tuple[object | None, ...] = (None, None, None, None)
+        if key.sage is not None:
+            # The scale shapes of this plan fill the adapter slots the same
+            # way ``sage_launch_args`` binds the run's tensors; a recipe
+            # without a V mean leaves that slot ``None``.
+            shapes = sage_scale_shapes(
+                key.sage,
+                batch_size=key.batch_size,
+                seq_len_q=key.seq_len_q,
+                seq_len_kv=key.seq_len_kv,
+                num_qo_heads=key.num_qo_heads,
+                num_kv_heads=key.num_kv_heads,
+                head_dim=key.head_dim,
+            )
+            sage_fakes = tuple(
+                None if shape is None else fake_compact(Float32, shape)
+                for shape in sage_adapter_slots(shapes)
+            )
         tensor_adapter = contiguous_adapter
         dynamic_args = (
             q_fake,
@@ -379,6 +418,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             row_route_offsets_fake,
             route_workspace_fake,
             Int32(0),
+            *sage_fakes,
             Float32(1.0),
         )
     else:
