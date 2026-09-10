@@ -55,7 +55,7 @@ def test_dense_padded_ssm_state_indices_no_wrap(
     seq_heads = B * H
     assert (route == "one-warp") == (seq_heads >= 128), (route, seq_heads)
 
-    recurrent_kda(
+    _out, final_state = recurrent_kda(
         q=q,
         k=k,
         v=v,
@@ -69,6 +69,8 @@ def test_dense_padded_ssm_state_indices_no_wrap(
         ssm_state_indices=ssi,
         backend=backend,
     )
+    assert final_state is state_pool
+    assert tuple(final_state.shape) == (n_slots, H, D, D)
 
     last_delta = (state_pool[-1].float() - before[-1].float()).abs().max().item()
     assert last_delta == 0.0, (
