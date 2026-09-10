@@ -24,7 +24,6 @@ decode and speculative decode retain the backend exposed by
 ``flashinfer.kda_decode``.
 """
 
-import threading
 from typing import Literal, Optional
 
 import torch
@@ -33,20 +32,7 @@ from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from .jit import flash_kda_indexed as _flash_kda_indexed
-from .api_logging import flashinfer_api
-from .kda_backward import (
-    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
-)
-from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
-from .kda_training import (
-    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
-)
-from .kda_training import (
-    recurrent_kda_training_backward as recurrent_kda_training_backward,
-)
-from .kda_training import (
-    recurrent_kda_training_forward as recurrent_kda_training_forward,
-)
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
@@ -678,6 +664,18 @@ def recurrent_kda(
 class RecurrentKDAPrefillWrapper:
     """Plan-and-run wrapper for packed recurrent-KDA prefill.
 
+    .. warning::
+        ``RecurrentKDAPrefillWrapper`` is experimental: it provides no
+        compatibility guarantees and may change or be removed without
+        deprecation.  It has not appeared in a release; the plan-and-run shape
+        is expected to change as the ``recurrent_kda`` surface is unified.  See
+        `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for
+        the graduation plan and
+        `#4936 <https://github.com/flashinfer-ai/flashinfer/issues/4936>`_ for
+        the wider unification audit.  Calling ``plan`` or ``run`` is the opt-in
+        and needs no environment variable; the planning implementation lives in
+        ``flashinfer.experimental.kda_prefill_wrapper``.
+
     Compute capability 10.0 and 10.3 only.  ``run`` forces ``backend="cute-dsl"``
     and always passes the ``seq_order`` it planned, and the CC 12.0 backend
     supports neither, so a CC 12.0 caller should use
@@ -699,24 +697,19 @@ class RecurrentKDAPrefillWrapper:
     launched by ``run`` may still be reading the wrapper's planned buffers.
     """
 
+    #: Mechanical identification: the decorators only mark ``plan`` and ``run``.
+    is_experimental = True
+
     def __init__(
         self,
         device: torch.device | str,
     ) -> None:
-        self.device = torch.device(device)
-        if self.device.type != "cuda":
-            raise ValueError("RecurrentKDAPrefillWrapper requires a CUDA device")
-        if self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        self._workspace = _kda_prefill.RecurrentKDAPrefillWorkspace(self.device)
-        self._cu_seqlens_buf: Optional[torch.Tensor] = None
-        self._seq_order_buf: Optional[torch.Tensor] = None
-        self._cu_chunks_buf: Optional[torch.Tensor] = None
-        self._num_sequences: Optional[int] = None
-        self._total_tokens: Optional[int] = None
-        self._planned = False
-        self._lock = threading.Lock()
+        from .experimental.kda_prefill_wrapper import RecurrentKDAPrefillPlanner
 
+        self._impl = RecurrentKDAPrefillPlanner(device)
+        self.device = self._impl.device
+
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def plan(
         self,
         cu_seqlens: torch.Tensor,
@@ -731,54 +724,9 @@ class RecurrentKDAPrefillWrapper:
         repeated offsets for zero-length sequences.
         """
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "RecurrentKDAPrefillWrapper.plan must run outside CUDA graph capture"
-            )
-        if not isinstance(cu_seqlens, torch.Tensor):
-            raise TypeError("cu_seqlens must be a torch.Tensor")
-        if (
-            cu_seqlens.dtype not in (torch.int32, torch.int64)
-            or cu_seqlens.ndim != 1
-            or not cu_seqlens.is_contiguous()
-            or cu_seqlens.numel() < 2
-        ):
-            raise ValueError(
-                "cu_seqlens must be a contiguous int32 or int64 tensor with "
-                "at least two entries"
-            )
-        if cu_seqlens.is_cuda and cu_seqlens.device != self.device:
-            raise ValueError(
-                f"cu_seqlens must be on {self.device} or CPU, got {cu_seqlens.device}"
-            )
+        self._impl.plan(cu_seqlens, non_blocking=non_blocking)
 
-        num_sequences = cu_seqlens.numel() - 1
-
-        with self._lock:
-            if self._num_sequences is None:
-                self._num_sequences = num_sequences
-                self._cu_seqlens_buf = torch.empty(
-                    num_sequences + 1, dtype=torch.int64, device=self.device
-                )
-                self._seq_order_buf = torch.empty(
-                    num_sequences, dtype=torch.int32, device=self.device
-                )
-                self._cu_chunks_buf = torch.empty(
-                    num_sequences + 1, dtype=torch.int32, device=self.device
-                )
-            elif num_sequences != self._num_sequences:
-                raise ValueError(
-                    "the number of sequences is fixed after the first plan call: "
-                    f"expected {self._num_sequences}, got {num_sequences}"
-                )
-            assert self._cu_seqlens_buf is not None
-            assert self._seq_order_buf is not None
-            assert self._cu_chunks_buf is not None
-            self._cu_seqlens_buf.copy_(cu_seqlens, non_blocking=non_blocking)
-            self._workspace.__dict__["_cute_dsl_cu_chunks"] = self._cu_chunks_buf
-            self._workspace.__dict__["_cute_dsl_generate_planned_metadata"] = True
-            self._planned = True
-
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def run(
         self,
         q: torch.Tensor,
@@ -807,30 +755,7 @@ class RecurrentKDAPrefillWrapper:
     ):
         """Run packed recurrent-KDA prefill using the most recent plan."""
 
-        with self._lock:
-            if not self._planned:
-                raise RuntimeError("call plan before run")
-            token_count = q.shape[0] * q.shape[1] if q.ndim == 4 else None
-            if self._total_tokens is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "warm RecurrentKDAPrefillWrapper.run once before CUDA "
-                        "graph capture"
-                    )
-                if token_count is None:
-                    raise ValueError("q must be a rank-4 tensor")
-                self._total_tokens = token_count
-            elif token_count != self._total_tokens:
-                raise ValueError(
-                    "q token count is fixed after the first run: "
-                    f"expected {self._total_tokens}, got "
-                    f"{token_count if token_count is not None else 'invalid rank'}"
-                )
-            cu_seqlens = self._cu_seqlens_buf
-            seq_order = self._seq_order_buf
-        assert cu_seqlens is not None
-        assert seq_order is not None
-        return recurrent_kda(
+        return self._impl.run(
             q=q,
             k=k,
             v=v,
@@ -844,15 +769,11 @@ class RecurrentKDAPrefillWrapper:
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel,
             lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
             output=output,
             beta_is_logit=beta_is_logit,
-            ssm_state_indices=ssm_state_indices,
-            seq_order=seq_order,
-            prefill_workspace=self._workspace,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            backend="cute-dsl",
+            ssm_state_indices=ssm_state_indices,
         )
