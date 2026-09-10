@@ -2709,8 +2709,8 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         "page_offsets_warp_idx": 13,
         "load_warp_idx": 16,
         # FP8's predicated TMA helper constructs coordinates in every load
-        # lane, so Q1 needs only one producer warpgroup. BF16 TMA is elected
-        # lane only and retains two producer warpgroups. Grouped routes keep
+        # lane, so Q1 needs only one producer warpgroup. BF16 distributes page
+        # fragments across two producer warpgroups. Grouped routes keep
         # their qualified two-warpgroup schedule for both dtypes.
         "load_num_warps": (
             4 if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn" else 8

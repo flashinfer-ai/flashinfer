@@ -636,6 +636,45 @@ class QTokenKvBlockSparsePagedTSWrapper:
         storage triggers a new preparation outside capture. ``sm_scale`` and
         ``v_scale`` are live launch scalars, so frameworks may update Q/K and V
         dequantization scales without rebuilding the capacity plan.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Packed ``[total_q, Hq, D]`` or fixed ``[B, Nq, G, Hq, D]`` query,
+            with the planned device, dtype and head geometry.
+        paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
+            Separate HND K/V caches shaped
+            ``[num_pages, Hkv, page_size, D]``.
+        block_table : torch.Tensor
+            Dense CUDA Int32 physical-page table
+            ``[num_requests, max_storage_pages]``.
+        indexer_block_ids : torch.Tensor
+            Contiguous CUDA Int32 logical block IDs
+            ``[num_query_tokens, block_topk]``, including the distinct
+            completed-block prefix described above. The causal tail is added
+            by the metadata builder.
+        token_to_request : torch.Tensor
+            CUDA Int32 request ID for each flattened query token.
+        query_positions : torch.Tensor
+            CUDA Int32 or Int64 zero-based causal position for each query token.
+        qo_indptr : torch.Tensor, optional
+            CUDA Int32 packed-route offsets. Required for packed Q and omitted
+            for fixed Q; each route must stay within one request and contain
+            at most the planned ``seq_len_q`` tokens.
+        sm_scale : float, optional
+            Softmax scale, defaulting to ``head_dim**-0.5``. Include Q/K
+            dequantization scales here when using FP8 inputs.
+        v_scale : float, optional
+            Value-cache dequantization scale applied to the output,
+            defaulting to one.
+        out : torch.Tensor, optional
+            Caller-owned output with Q's logical shape and the planned output
+            dtype. When omitted, the wrapper retains and reuses its output.
+
+        Returns
+        -------
+        torch.Tensor
+            Attention output in Q's logical layout; returns ``out`` when given.
         """
 
         config = self._require_config()

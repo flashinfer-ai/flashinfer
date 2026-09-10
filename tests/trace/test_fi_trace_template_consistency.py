@@ -1013,6 +1013,42 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         fi_trace(wrapper.run, **wrapper_kwargs)
 
 
+@pytest.mark.parametrize("storage_page_size", (2, 6))
+def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
+    storage_page_size,
+):
+    """Trace selection must reject invalid extents before dumping a definition."""
+    from flashinfer.attention.prims_ts.decode import (
+        batch_decode_with_paged_kv_cache,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+
+    q = torch.empty(1, 8, 64, dtype=torch.bfloat16)
+    k = torch.empty(1, 2, storage_page_size, 64, dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    block_tables = torch.zeros(1, 1, dtype=torch.int32)
+    seq_lens = torch.ones(1, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="larger than and divisible"):
+        batch_decode_with_paged_kv_cache.fi_trace(
+            q=q,
+            paged_kv_cache=(k, v),
+            block_tables=block_tables,
+            seq_lens_kv=seq_lens,
+            page_size=4,
+        )
+    with pytest.raises(ValueError, match="larger than and divisible"):
+        prims_ts_batch_decode_with_kv_cache.fi_trace(
+            query=q,
+            kv_cache=(k, v),
+            workspace_buffer=torch.empty(4096, dtype=torch.uint8),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=4,
+            page_size=4,
+        )
+
+
 def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
     """An omitted out override must retain the wrapper plan's output dtype."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
