@@ -1976,6 +1976,20 @@ class FmhaDecodeConfig:
         return self.use_keeps_mma_ab and not self.keeps_separates_tmem_s_and_stats
 
     @property
+    def splits_kv_tile_256_tail_columns(self) -> bool:
+        """Whether the KV256 tail splits the output columns between spatial halves.
+
+        With one exchange slot per correction lane (9 KiB more than the
+        row-owner exchange, which the byte-wide K/V ring leaves free), each
+        lane publishes the D32 fragment its peer owns and merges and stores
+        its own 64 of the 128 output columns, so all four correction warps
+        store and the tail needs five named barriers instead of nine. 16-bit
+        K/V keeps the row-owner exchange because its ring already fills the
+        SMEM budget.
+        """
+        return self.tile_size_kv == 256 and self.use_8bit_qkv
+
+    @property
     def keeps_loop_correction_chunk_regs(self) -> int:
         """Return FP32 registers corrected by one Keeps TMEM pair."""
         if self.tile_size_q == 64:

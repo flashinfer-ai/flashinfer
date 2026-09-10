@@ -97,8 +97,9 @@ from .tmem_softmax_stats import TmemSoftmaxLocalResource
 
 _KV_TILE_256_CORRECTION_THREADS = 128
 _KV_TILE_256_LOGICAL_OUTPUT_ROWS = 64
-# One D32 fragment per logical output row, padded by four floats so adjacent
-# rows fall on different bank groups.
+# One D32 fragment slot, padded by four floats so adjacent slots fall on
+# different bank groups. The row-owner exchange (16-bit K/V) has one slot per
+# logical output row; the column-owner exchange (byte-wide K/V) has one per lane.
 _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE = 36
 _KV_TILE_256_STATS_PER_THREAD = 4
 
@@ -169,10 +170,20 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
 
     def _kv_tile_256_exchange_entries(self) -> int:
-        """Return 128 lane-local stats plus one D32 fragment per output row."""
+        """Return the KV256 exchange floats.
+
+        Every lane owns four stats slots, then one padded D32 fragment slot per
+        logical output row (the row-owner exchange) or per lane (the
+        column-owner exchange of the byte-wide tail).
+        """
+        fragment_slots = (
+            _KV_TILE_256_CORRECTION_THREADS
+            if self.cfg.splits_kv_tile_256_tail_columns
+            else _KV_TILE_256_LOGICAL_OUTPUT_ROWS
+        )
         return (
             _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
-            + _KV_TILE_256_LOGICAL_OUTPUT_ROWS * _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE
+            + fragment_slots * _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE
         )
 
     def _init_placeholder_state(self) -> None:
@@ -321,11 +332,13 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
         if self.cfg.tile_size_kv == 256 and self._kv_tile_256_exchange_alloc is None:
             # Tail correction exchanges all lane-local stats, then pipelines
-            # D32 fragments through 64 logical output rows one fragment at a
-            # time. Upper lanes publish one spatial half while lower lanes
-            # retain the matching fragment in registers. The buffer is
-            # dedicated, so the shared KV ring keeps streaming the next tile's
-            # routes while the tail runs.
+            # D32 fragments one at a time: through 64 logical output rows
+            # (upper lanes publish one spatial half while lower lanes retain
+            # the matching fragment in registers and store every column) or,
+            # with byte-wide K/V, through one slot per lane (each lane
+            # publishes the fragment its peer owns and stores its own 64
+            # columns). The buffer is dedicated, so the shared KV ring keeps
+            # streaming the next tile's routes while the tail runs.
             self._kv_tile_256_exchange_alloc = SmemAllocation(
                 name=f"{self.name}_kvTile256Exchange",
                 size_bytes=self._kv_tile_256_exchange_entries() * 4,
@@ -922,11 +935,11 @@ class TmemCorrResource(DecodeGenResourceBase):
     def _apply_sage_channel_scales(
         self,
         output_vals: cutlass.Array,
-        norm_scale: Float32,
+        norm_scale: Float32 | None,
         *,
         first_col: Int32,
         count: Constexpr[int],
-    ) -> Float32:
+    ) -> Float32 | None:
         """Dequantize ``count`` normalized output columns per V channel in place.
 
         Sage attention multiplies column ``c`` by ``norm_scale * sfV[c]`` and
@@ -935,6 +948,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         scale. The scales come from the SMEM copy staged by
         ``init_epilogue_state``. Without Sage attention the values and
         ``norm_scale`` pass through untouched.
+
+        ``None`` is the unit scale on both sides. The packed multiply is a
+        library call that no compiler folds for a constant one, so the unit
+        scale has to be known here to be skipped; the KV256 tail otherwise
+        pays one ``FMUL2`` per output pair for it.
         """
         cfg = self.cfg
         if cutlass.const_expr(not cfg.use_sage_attention):
@@ -947,24 +965,24 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
         for pair_idx in cutlass.range_constexpr(count // 2):
             val_base = pair_idx * 2
+            column_scales = (v_scales[val_base], v_scales[val_base + 1])
+            if cutlass.const_expr(norm_scale is not None):
+                column_scales = fmul2((norm_scale, norm_scale), column_scales)
             scaled = ffma2(
                 (output_vals[val_base], output_vals[val_base + 1]),
-                fmul2(
-                    (norm_scale, norm_scale),
-                    (v_scales[val_base], v_scales[val_base + 1]),
-                ),
+                column_scales,
                 (v_means[val_base], v_means[val_base + 1]),
             )
             output_vals[val_base] = scaled[0]
             output_vals[val_base + 1] = scaled[1]
-        return Float32(1.0)
+        return None
 
     @cute.jit
     def _store_final_o_columns(
         self,
         final_o_dst,
         output_vals: cutlass.Array,
-        norm_scale: Float32,
+        norm_scale: Float32 | None,
         *,
         count: Constexpr[int],
         sector_aligned: cutlass.Boolean,
@@ -975,9 +993,10 @@ class TmemCorrResource(DecodeGenResourceBase):
         8-byte store. 16-bit output packs pairs; sixteen columns fill one
         32-byte sector and go out as a single 256-bit store when the
         destination is sector aligned, otherwise every eight columns use one
-        16-byte store. Callers choose ``count`` per path: the KV256 tail owns
-        whole rows per lane and pays for half-written sectors, while the
-        split-KV reducers write eight-column fragments.
+        16-byte store. Callers choose ``count`` per path: the KV256 tail lanes
+        own whole rows (16-bit K/V) or 64-column half rows (byte-wide K/V) and
+        pay for half-written sectors, while the split-KV reducers write
+        eight-column fragments. A ``None`` scale packs the values as they are.
         """
         cfg = self.cfg
         assert count % 8 == 0
@@ -1023,20 +1042,19 @@ class TmemCorrResource(DecodeGenResourceBase):
     def _pack_fp8_output_quads(
         self,
         output_vals: cutlass.Array,
-        norm_scale: Float32,
+        norm_scale: Float32 | None,
         first_col: Constexpr[int],
     ) -> cutlass.Array:
         """Scale eight output columns from ``first_col`` into two FP8 registers."""
         final_pairs = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
         for pair_idx in cutlass.range_constexpr(4):
             val_base = pair_idx * 2
-            pair = fmul2(
-                (norm_scale, norm_scale),
-                (
-                    output_vals[first_col + val_base],
-                    output_vals[first_col + val_base + 1],
-                ),
+            pair = (
+                output_vals[first_col + val_base],
+                output_vals[first_col + val_base + 1],
             )
+            if cutlass.const_expr(norm_scale is not None):
+                pair = fmul2((norm_scale, norm_scale), pair)
             final_pairs[val_base] = pair[0]
             final_pairs[val_base + 1] = pair[1]
         fp8_regs = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
@@ -1052,20 +1070,16 @@ class TmemCorrResource(DecodeGenResourceBase):
     def _pack_final_o_regs(
         self,
         output_vals: cutlass.Array,
-        norm_scale: Float32,
+        norm_scale: Float32 | None,
         count: Constexpr[int],
     ) -> cutlass.Array:
         """Scale ``count`` output columns and pack them as 16-bit pairs."""
         cfg = self.cfg
         final_regs = cutlass.Array(Int32, count // 2, space=cutlass.AddressSpace.rmem)
         for reg_idx in cutlass.range_constexpr(count // 2):
-            pair = fmul2(
-                (norm_scale, norm_scale),
-                (
-                    output_vals[reg_idx * 2],
-                    output_vals[reg_idx * 2 + 1],
-                ),
-            )
+            pair = (output_vals[reg_idx * 2], output_vals[reg_idx * 2 + 1])
+            if cutlass.const_expr(norm_scale is not None):
+                pair = fmul2((norm_scale, norm_scale), pair)
             if cutlass.const_expr(cfg.use_bf16_output):
                 final_regs[reg_idx] = _pack_float2_to_bf16(pair[0], pair[1])
             else:
@@ -2472,7 +2486,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         *,
         base_addr0: Int32,
         base_addr1: Int32,
-        fragment_col: Constexpr[int],
+        fragment_col: Int32,
         weight00: Float32,
         weight10: Float32,
     ):
@@ -2509,7 +2523,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         own_vals: cutlass.Array,
         peer_vals,
         *,
-        fragment_col: Constexpr[int],
+        fragment_col: Int32,
         dst_row_base: Int64,
         norm_scale: Float32,
         valid_output_row: cutlass.Boolean,
@@ -2558,7 +2572,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         own_vals: cutlass.Array,
         peer_vals,
         *,
-        fragment_col: Constexpr[int],
+        fragment_col: Int32,
         partial_row_base: Int64,
         partial_scale: Float32,
         valid_output_row: cutlass.Boolean,
@@ -2743,39 +2757,52 @@ class TmemCorrResource(DecodeGenResourceBase):
 
         if cutlass.const_expr(cfg.use_split_kv):
             if valid_output_row:
-                if cutlass.const_expr(cfg.use_separate_reduction_kernel):
-                    stats_row = self._gmem_partial_row_offset(
-                        logical_kv_idx,
-                        cta_idx_kv,
-                        logical_output_row_idx,
-                    )
-                    stats_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint() + stats_row * Int64(4),
-                        mem_space=1,
-                        dtype=Float32,
-                    )
-                    stats_ptr.store(
-                        self._separate_partial_lse(global_max, denominator),
-                        alignment=4,
-                    )
-                else:
-                    stats_row = self._gmem_partial_row_offset(
-                        logical_kv_idx,
-                        cta_idx_kv,
-                        logical_output_row_idx,
-                    )
-                    stats_ptr = cutlass.inttoptr(
-                        self.partial_stats_ptr.toint() + stats_row * Int64(2 * 4),
-                        mem_space=1,
-                        dtype=Float32,
-                    )
-                    stats_ptr.store(
-                        cutlass.Vector.from_elements(
-                            (global_max, denominator),
-                            Float32,
-                        ),
-                        alignment=8,
-                    )
+                self._store_kv_tile_256_partial_stats(
+                    logical_kv_idx,
+                    cta_idx_kv,
+                    logical_output_row_idx,
+                    global_max,
+                    denominator,
+                )
+
+    @cute.jit
+    def _store_kv_tile_256_partial_stats(
+        self,
+        logical_kv_idx: Int32,
+        cta_idx_kv: Int32,
+        logical_output_row_idx: Int32,
+        global_max: Float32,
+        denominator: Float32,
+    ) -> None:
+        """Write one logical row's split-KV stats record."""
+        stats_row = self._gmem_partial_row_offset(
+            logical_kv_idx,
+            cta_idx_kv,
+            logical_output_row_idx,
+        )
+        if cutlass.const_expr(self.cfg.use_separate_reduction_kernel):
+            stats_ptr = cutlass.inttoptr(
+                self.partial_stats_ptr.toint() + stats_row * Int64(4),
+                mem_space=1,
+                dtype=Float32,
+            )
+            stats_ptr.store(
+                self._separate_partial_lse(global_max, denominator),
+                alignment=4,
+            )
+        else:
+            stats_ptr = cutlass.inttoptr(
+                self.partial_stats_ptr.toint() + stats_row * Int64(2 * 4),
+                mem_space=1,
+                dtype=Float32,
+            )
+            stats_ptr.store(
+                cutlass.Vector.from_elements(
+                    (global_max, denominator),
+                    Float32,
+                ),
+                alignment=8,
+            )
 
     @cute.jit
     def _kv_tile_256_tail_epilogue(
@@ -2796,9 +2823,12 @@ class TmemCorrResource(DecodeGenResourceBase):
 
         The standard decode schedule still owns the two temporal instances.
         KV256 adds one physical spatial split per instance. Correction exchanges
-        their stats, stages one spatial half through its dedicated SMEM
-        exchange one D32 fragment at a time, then publishes the ordinary
-        logical Q64xD128 output.
+        their stats, then merges the halves through its dedicated SMEM exchange
+        one D32 fragment at a time and publishes the ordinary logical Q64xD128
+        output: with 16-bit K/V the upper lanes publish and the lower lanes
+        store whole rows (row-owner mode); with byte-wide K/V every lane
+        publishes the fragment its peer owns and stores its own 64 columns
+        (column-owner mode, ``cfg.splits_kv_tile_256_tail_columns``).
         """
         cfg = self.cfg
         assert cfg.headdim == 128
@@ -2843,28 +2873,77 @@ class TmemCorrResource(DecodeGenResourceBase):
         weight00 = Float32(0.0)
         weight10 = Float32(0.0)
         denominator = Float32(0.0)
-        if uses00:
-            weight00 = cute.math.exp2(
-                self.scale_softmax_log2 * (max00 - global_max),
-                fastmath=True,
-            )
-            denominator += sum00 * weight00
-        if uses10:
-            weight10 = cute.math.exp2(
-                self.scale_softmax_log2 * (max10 - global_max),
-                fastmath=True,
-            )
-            denominator += sum10 * weight10
-        if uses01:
-            denominator += sum01 * cute.math.exp2(
-                self.scale_softmax_log2 * (max01 - global_max),
-                fastmath=True,
-            )
-        if uses11:
-            denominator += sum11 * cute.math.exp2(
-                self.scale_softmax_log2 * (max11 - global_max),
-                fastmath=True,
-            )
+        if cutlass.const_expr(cfg.splits_kv_tile_256_tail_columns):
+            # Both lanes of a row normalize their own columns in the staged
+            # tail, so the denominator is accumulated in one fixed order
+            # (lower spatial half first, then inst0 before inst1). The two
+            # halves then agree bitwise with each other and with the fragment
+            # exchange, where only the lower lane sums, own half first.
+            weight01 = Float32(0.0)
+            weight11 = Float32(0.0)
+            if uses00:
+                weight00 = cute.math.exp2(
+                    self.scale_softmax_log2 * (max00 - global_max),
+                    fastmath=True,
+                )
+            if uses10:
+                weight10 = cute.math.exp2(
+                    self.scale_softmax_log2 * (max10 - global_max),
+                    fastmath=True,
+                )
+            if uses01:
+                weight01 = cute.math.exp2(
+                    self.scale_softmax_log2 * (max01 - global_max),
+                    fastmath=True,
+                )
+            if uses11:
+                weight11 = cute.math.exp2(
+                    self.scale_softmax_log2 * (max11 - global_max),
+                    fastmath=True,
+                )
+            if exchange_idx < Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS):
+                if uses00:
+                    denominator += sum00 * weight00
+                if uses10:
+                    denominator += sum10 * weight10
+                if uses01:
+                    denominator += sum01 * weight01
+                if uses11:
+                    denominator += sum11 * weight11
+            else:
+                if uses01:
+                    denominator += sum01 * weight01
+                if uses11:
+                    denominator += sum11 * weight11
+                if uses00:
+                    denominator += sum00 * weight00
+                if uses10:
+                    denominator += sum10 * weight10
+        else:
+            # Row-owner mode keeps this block verbatim so the 16-bit kernel
+            # stays byte-identical; do not merge it with the branch above.
+            if uses00:
+                weight00 = cute.math.exp2(
+                    self.scale_softmax_log2 * (max00 - global_max),
+                    fastmath=True,
+                )
+                denominator += sum00 * weight00
+            if uses10:
+                weight10 = cute.math.exp2(
+                    self.scale_softmax_log2 * (max10 - global_max),
+                    fastmath=True,
+                )
+                denominator += sum10 * weight10
+            if uses01:
+                denominator += sum01 * cute.math.exp2(
+                    self.scale_softmax_log2 * (max01 - global_max),
+                    fastmath=True,
+                )
+            if uses11:
+                denominator += sum11 * cute.math.exp2(
+                    self.scale_softmax_log2 * (max11 - global_max),
+                    fastmath=True,
+                )
 
         base_addr0 = tmem_row_base + Int32(
             o_base_col + tail_o_stage_idx_0 * cfg.tmem_o_stage_cols
@@ -2884,28 +2963,46 @@ class TmemCorrResource(DecodeGenResourceBase):
             splits_kv = self._runtime_splits_kv(stage_info)
             cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
 
-        self._kv_tile_256_merge_spatial_output(
-            exchange=exchange,
-            exchange_idx=exchange_idx,
-            base_addr0=base_addr0,
-            base_addr1=base_addr1,
-            logical_h_k_idx=logical_h_k_idx,
-            logical_b_idx=logical_b_idx,
-            logical_kv_idx=logical_kv_idx,
-            cta_idx_kv=cta_idx_kv,
-            logical_q_group_idx=logical_q_group_idx,
-            q_row_offset=q_row_offset,
-            weight00=weight00,
-            weight10=weight10,
-            denominator=denominator,
-            global_max=global_max,
-        )
+        if cutlass.const_expr(cfg.splits_kv_tile_256_tail_columns):
+            self._kv_tile_256_merge_owned_columns(
+                exchange=exchange,
+                exchange_idx=exchange_idx,
+                base_addr0=base_addr0,
+                base_addr1=base_addr1,
+                logical_h_k_idx=logical_h_k_idx,
+                logical_b_idx=logical_b_idx,
+                logical_kv_idx=logical_kv_idx,
+                cta_idx_kv=cta_idx_kv,
+                logical_q_group_idx=logical_q_group_idx,
+                q_row_offset=q_row_offset,
+                weight00=weight00,
+                weight10=weight10,
+                denominator=denominator,
+                global_max=global_max,
+            )
+        else:
+            self._kv_tile_256_merge_spatial_output(
+                exchange=exchange,
+                exchange_idx=exchange_idx,
+                base_addr0=base_addr0,
+                base_addr1=base_addr1,
+                logical_h_k_idx=logical_h_k_idx,
+                logical_b_idx=logical_b_idx,
+                logical_kv_idx=logical_kv_idx,
+                cta_idx_kv=cta_idx_kv,
+                logical_q_group_idx=logical_q_group_idx,
+                q_row_offset=q_row_offset,
+                weight00=weight00,
+                weight10=weight10,
+                denominator=denominator,
+                global_max=global_max,
+            )
 
         if cutlass.const_expr(
             cfg.use_split_kv and not cfg.use_separate_reduction_kernel
         ):
             # Every correction lane joins the generic fused-GMEM completion
-            # protocol after the low 64 lanes publish one full D128 row each.
+            # protocol after every logical row's partial has been published.
             counter_q_groups = self._multi_cta_counter_q_groups(self.h_r)
             counter_group_idx = logical_kv_idx * counter_q_groups + logical_q_group_idx
             self._reduce_fused_gmem_partials(
@@ -2919,11 +3016,170 @@ class TmemCorrResource(DecodeGenResourceBase):
                 warp_grp_thread_idx,
             )
 
-        # The next persistent work tile may reuse this exchange allocation.
-        prims.barrier_cta_sync(
-            self.store_barrier_id,
-            thread_count=cfg.correction_barrier_threads,
+        if cutlass.const_expr(not cfg.splits_kv_tile_256_tail_columns):
+            # The next persistent work tile may reuse this exchange allocation.
+            # The column-owner tail closed its last round with this barrier.
+            prims.barrier_cta_sync(
+                self.store_barrier_id,
+                thread_count=cfg.correction_barrier_threads,
+            )
+
+    @cute.jit
+    def _kv_tile_256_merge_owned_columns(
+        self,
+        *,
+        exchange: cutlass.Array,
+        exchange_idx: Int32,
+        base_addr0: Int32,
+        base_addr1: Int32,
+        logical_h_k_idx: Int32,
+        logical_b_idx: Int32,
+        logical_kv_idx: Int32,
+        cta_idx_kv: Int32,
+        logical_q_group_idx: Int32,
+        q_row_offset: Int32,
+        weight00: Float32,
+        weight10: Float32,
+        denominator: Float32,
+        global_max: Float32,
+    ) -> None:
+        """Merge and store the 64 output columns each lane owns, one D32 at a time.
+
+        Lanes below 64 own columns [0, 64) of their logical row and lanes
+        64..127 own [64, 128); the peer lane (index xor 64) holds the other
+        spatial partial of the same row. Each round every lane publishes the
+        temporal combination of the D32 its peer owns into its own slot,
+        combines its own D32 from TMEM, adds the peer's published fragment
+        exactly as the row-owner exchange does, and writes the direct or
+        split-KV output. All four correction warps store instead of two, and
+        one slot per lane needs one publish barrier per round plus one reuse
+        barrier between rounds instead of two barriers per fragment.
+        """
+        cfg = self.cfg
+        output_exchange_base = Int32(
+            _KV_TILE_256_CORRECTION_THREADS * _KV_TILE_256_STATS_PER_THREAD
         )
+        # Lane index bit 6 selects the spatial half, and the same bit value is
+        # the first column of the 64-column half that lane owns because the
+        # logical row count equals headdim / 2.
+        half_cols = cfg.headdim // 2
+        assert half_cols == _KV_TILE_256_LOGICAL_OUTPUT_ROWS
+        exchange_row_idx = exchange_idx & Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS - 1)
+        peer_idx = exchange_idx ^ Int32(_KV_TILE_256_LOGICAL_OUTPUT_ROWS)
+        owned_col_base = exchange_idx & Int32(half_cols)
+        peer_col_base = owned_col_base ^ Int32(half_cols)
+        own_slot = output_exchange_base + exchange_idx * Int32(
+            _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE
+        )
+        peer_slot = output_exchange_base + peer_idx * Int32(
+            _KV_TILE_256_EXCHANGE_FRAGMENT_STRIDE
+        )
+        logical_output_row_idx = q_row_offset + exchange_row_idx
+        valid_output_row = _q_row_is_valid_for_seq(
+            cfg,
+            self.h_r,
+            logical_q_group_idx,
+            exchange_row_idx,
+            self.seq_len_q,
+        )
+
+        if cutlass.const_expr(cfg.use_split_kv):
+            partial_scale = Float32(1.0)
+            if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+                partial_scale = self._separate_partial_norm_scale(denominator)
+            elif cutlass.const_expr(cfg.use_8bit_qkv):
+                # Fused partials are narrowed to 16 bits unnormalized, so
+                # remove the 448 P scale here; the reducer restores it.
+                partial_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
+            partial_row_base = self._gmem_partial_row_offset(
+                logical_kv_idx,
+                cta_idx_kv,
+                logical_output_row_idx,
+            ) * Int64(cfg.headdim * 2)
+        else:
+            dst_row_base = Int64(0)
+            norm_scale = Float32(1.0)
+            # Row strides are multiples of 32 bytes for D128, so sector-wide
+            # stores are legal exactly when the output base pointer is.
+            o_is_32b_aligned = (self.o_ptr.toint() & Int64(31)) == Int64(0)
+            if valid_output_row:
+                # The direct tail normalizes the FP32 accumulators, so the
+                # FP8 P scale in O and in the denominator cancel.
+                dst_row_base, norm_scale = self._softmax_output_row_state(
+                    logical_h_k_idx,
+                    logical_b_idx,
+                    logical_output_row_idx,
+                    denominator,
+                    global_max,
+                    restores_fp8_partial_scale=False,
+                )
+
+        # The rounds run as a rolled loop so the tail body exists once in the
+        # instruction stream: all four correction warps execute it beside the
+        # softmax warps' rolled fragment loops, and an unrolled copy per round
+        # measurably starves those warps of instruction fetch.
+        for round_idx in cutlass.range(cfg.headdim // 64, unroll=1):
+            fragment_offset = Int32(round_idx) * Int32(32)
+            published_vals = self._kv_tile_256_temporal_fragment(
+                base_addr0=base_addr0,
+                base_addr1=base_addr1,
+                fragment_col=peer_col_base + fragment_offset,
+                weight00=weight00,
+                weight10=weight10,
+            )
+            (exchange.data_ptr() + own_slot).store(published_vals, alignment=16)
+            own_vals = self._kv_tile_256_temporal_fragment(
+                base_addr0=base_addr0,
+                base_addr1=base_addr1,
+                fragment_col=owned_col_base + fragment_offset,
+                weight00=weight00,
+                weight10=weight10,
+            )
+            # Every lane's published fragment becomes visible to its peer.
+            prims.barrier_cta_sync(
+                self.store_barrier_id,
+                thread_count=cfg.correction_barrier_threads,
+            )
+            peer_vals = (exchange.data_ptr() + peer_slot).load(count=32, alignment=16)
+            if cutlass.const_expr(not cfg.use_split_kv):
+                self._store_kv_tile_256_direct_fragment(
+                    own_vals,
+                    peer_vals,
+                    fragment_col=owned_col_base + fragment_offset,
+                    dst_row_base=dst_row_base,
+                    norm_scale=norm_scale,
+                    valid_output_row=valid_output_row,
+                    o_is_32b_aligned=o_is_32b_aligned,
+                )
+            else:
+                self._store_kv_tile_256_partial_fragment(
+                    own_vals,
+                    peer_vals,
+                    fragment_col=owned_col_base + fragment_offset,
+                    partial_row_base=partial_row_base,
+                    partial_scale=partial_scale,
+                    valid_output_row=valid_output_row,
+                )
+            # The slot is reused by the next round's publish, and after the
+            # last round by the next work tile's stats exchange and Sage V
+            # scale staging: every lane finishes reading before either.
+            prims.barrier_cta_sync(
+                self.store_barrier_id,
+                thread_count=cfg.correction_barrier_threads,
+            )
+
+        if cutlass.const_expr(cfg.use_split_kv):
+            # One stats record per logical row: the lower spatial half writes it.
+            if valid_output_row and exchange_idx < Int32(
+                _KV_TILE_256_LOGICAL_OUTPUT_ROWS
+            ):
+                self._store_kv_tile_256_partial_stats(
+                    logical_kv_idx,
+                    cta_idx_kv,
+                    logical_output_row_idx,
+                    global_max,
+                    denominator,
+                )
 
     @cute.jit
     def _keeps_tail_epilogue(
@@ -3413,7 +3669,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 # The per-instance scales above already normalized the row.
                 self._apply_sage_channel_scales(
                     final_vals,
-                    Float32(1.0),
+                    None,
                     first_col=col_base + Int32(chunk_col),
                     count=8,
                 )
