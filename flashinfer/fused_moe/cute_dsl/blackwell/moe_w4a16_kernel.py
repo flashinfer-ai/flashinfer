@@ -439,6 +439,21 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
     @cute.jit
+    def _finish_transform_stage(
+        self,
+        a_load2trans_pipeline: pipeline.PipelineTmaAsync,
+        trans2mma_pipeline: pipeline.PipelineAsyncUmma,
+        cur_a_load2trans_consumer_state: pipeline.PipelineState,
+        trans2mma_producer_state: pipeline.PipelineState,
+    ) -> None:
+        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
+        a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
+        trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+
+    @cute.jit
     def _transform_tile(
         self,
         a_load2trans_pipeline: pipeline.PipelineTmaAsync,
@@ -537,14 +552,12 @@ class Sm100W4A16GroupedGemmKernel:
                 tAsA_transform[a_transform_stage_coord],
                 dst_copy_a,
             )
-            if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.TMEM
-            ):
-                cute.arch.fence_view_async_tmem_store()
-            else:
-                cute.arch.fence_proxy("async.shared", space="cta")
-            a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
-            trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+            self._finish_transform_stage(
+                a_load2trans_pipeline,
+                trans2mma_pipeline,
+                cur_a_load2trans_consumer_state,
+                trans2mma_producer_state,
+            )
             trans2mma_producer_state.advance()
             if trans2mma_producer_state.count < k_tile_cnt:
                 peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(

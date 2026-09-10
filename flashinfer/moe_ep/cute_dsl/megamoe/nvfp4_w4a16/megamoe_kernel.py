@@ -120,6 +120,20 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
             transform_stages * cols_per_a,
         )
 
+    @cute.jit
+    def _finish_transform_stage(
+        self,
+        a_load2trans_pipeline: pipeline.PipelineTmaAsync,
+        trans2mma_pipeline: pipeline.PipelineAsyncUmma,
+        cur_a_load2trans_consumer_state: pipeline.PipelineState,
+        trans2mma_producer_state: pipeline.PipelineState,
+    ) -> None:
+        # All raw/SF reads precede the final warp-wide TMEM store issue.
+        # Raw SMEM can return before those independent TMEM stores complete.
+        a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
+        cute.arch.fence_view_async_tmem_store()
+        trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+
 
 class Sm100W4A16MegaMoEKernel:
     """BF16 dispatch and compute with online-decoded NVFP4 expert weights."""
