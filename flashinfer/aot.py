@@ -733,6 +733,7 @@ def gen_all_modules(
                 for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
                 for dtype in BLACKWELL_BGMV_MOE_DTYPES
             )
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_sm90:
@@ -777,7 +778,8 @@ def gen_all_modules(
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
-            jit_specs.append(gen_cake_fused_moe_warp_decode_module())
+        if sm_capabilities.get("sm103a_exact", False):
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
         if has_sm107:
             jit_specs.append(gen_fp4_quantization_sm107_module())
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
