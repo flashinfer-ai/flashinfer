@@ -10,22 +10,37 @@
     ],
     "k": 8192,
     "m_multiple": 128,
-    "n": 2048,
+    "n_by_world_size": {
+      "2": [
+        2048
+      ],
+      "4": [
+        2048
+      ],
+      "8": [
+        2048
+      ]
+    },
     "world_sizes": [
       2,
-      4
+      4,
+      8
     ]
   },
-  "kernel_count": 8,
+  "kernel_count": 12,
   "kernel_symbols": [
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1",
     "kernel_cake_blackwell_all_gather_matmul_float16_ws2",
     "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2",
     "kernel_cake_blackwell_all_gather_matmul_float16_ws4",
-    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4"
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4",
+    "kernel_cake_blackwell_all_gather_matmul_float16_ws8",
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8"
   ],
   "launch": {
     "barrier": {
@@ -40,7 +55,7 @@
     "main": {
       "block_threads": 192,
       "dynamic_smem_bytes": 197632,
-      "grid_x": "(min(M, 2432) / 128) * 8"
+      "grid_x": "(min(M, 2432) / 128) * (N / 256)"
     }
   },
   "route_coverage": {
@@ -63,9 +78,19 @@
         "bfloat16": "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4",
         "float16": "kernel_cake_blackwell_all_gather_matmul_float16_ws4"
       }
+    },
+    "ws8": {
+      "barrier": [
+        "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0",
+        "kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1"
+      ],
+      "main": {
+        "bfloat16": "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8",
+        "float16": "kernel_cake_blackwell_all_gather_matmul_float16_ws8"
+      }
     }
   },
   "schema_version": 1,
-  "source_sha256": "b393d3730e845f6ae4eb642e76ac3486661ee2fd396c6830167c330457b641ab",
+  "source_sha256": "6ba37efcba102135f0155ef5e162143ad71bc27e52699c9aae05b9d9ace99433",
   "tma_abi": "pointer"
 }

@@ -21,12 +21,14 @@ reduced with the wrong operator. The multi-GPU tests can only observe the
 consequences, and one of the consequences is a hang.
 """
 
+import inspect
 import json
 
 import pytest
 import torch
 
 from flashinfer.autotuner import _json_to_tactic, _tactic_to_json, make_bucket_mapper
+from flashinfer.comm import pcie_ipc_policy as policy
 from flashinfer.comm import pcie_ipc_tuning as tuning
 from flashinfer.comm.pcie_ipc_ar import PcieIpcAllReduceWorkspace
 from flashinfer.comm.pcie_ipc_policy import (
@@ -69,21 +71,44 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
 
     # World size 8: the block-partitioned kernel needs blocks % 4 == 0.
     rejected = set(grid) - set(tuning.candidate_tactics(8))
-    assert rejected == {
+    expected_rejected = {
         (int(IpcVariant.STAGED), b, t)
         for b in tuning.TUNE_BLOCKS
         if b % 4 != 0
         for t in tuning.TUNE_THREADS
+    } | {
+        # `blocks` is the sub-chunk depth on the copy-engine variants, so
+        # anything past CE_MAX_PIECES names a depth that does not exist; and
+        # their add kernel's thread count is fixed rather than searched.
+        (int(v), b, t)
+        for v in (IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND)
+        for b in tuning.TUNE_BLOCKS
+        for t in tuning.TUNE_THREADS
+        if b > policy.CE_MAX_PIECES or t != policy.CE_THREADS
     }
+    assert rejected == expected_rejected
 
     # World size 4: no FLAT_STAGED, and threads must be at least world_size
     # (which every entry in the grid already satisfies).
     rejected4 = set(grid) - set(tuning.candidate_tactics(4))
-    assert all(t[0] == int(IpcVariant.FLAT_STAGED) for t in rejected4)
+    # The island schedule is a 4+4 decomposition, so world size 4 rejects it.
+    assert all(
+        t[0] in (int(IpcVariant.FLAT_STAGED), int(IpcVariant.COPY_ENGINE_ISLAND))
+        or (
+            t[0] == int(IpcVariant.COPY_ENGINE_RING)
+            and (t[1] > policy.CE_MAX_PIECES or t[2] != policy.CE_THREADS)
+        )
+        for t in rejected4
+    )
 
-    # World size 2: only the two variants that name a TP2 kernel.
+    # World size 2: only the two variants the launcher admits there. Its check
+    # is a whitelist of variant numbers, so the copy-engine ring is excluded
+    # like everything else -- naming a launcher of its own does not exempt it.
     for tactic in tuning.candidate_tactics(2):
-        assert tactic[0] in (int(IpcVariant.UNSTAGED), int(IpcVariant.STAGED))
+        assert tactic[0] in (
+            int(IpcVariant.UNSTAGED),
+            int(IpcVariant.STAGED),
+        )
 
 
 # Every distinct winner in the tuned caches of the two fabrics this operator
@@ -142,6 +167,98 @@ _MEASURED_WINNERS = {
         (3, 1, 64),
     ),
 }
+
+
+# Prefill winners a real tactic search chose on rootcplx-noswitch, bf16:
+# (world_size, payload_bytes) -> tactic. These are what the prefill screen in
+# candidate_tactics must not throw away; _MEASURED_WINNERS above carries no
+# payload, so it cannot police a screen that only applies above one.
+_MEASURED_PREFILL_WINNERS = (
+    (4, 1536 * 4096 * 2, (2, 4, 1024)),
+    (4, 3072 * 4096 * 2, (2, 8, 1024)),
+    (4, 6144 * 4096 * 2, (2, 8, 1024)),
+    (4, 12288 * 4096 * 2, (2, 8, 1024)),
+    (8, 1024 * 6144 * 2, (2, 4, 512)),
+    (8, 2048 * 6144 * 2, (2, 4, 512)),
+    (8, 4096 * 6144 * 2, (2, 12, 512)),
+    (8, 8192 * 6144 * 2, (2, 4, 1024)),
+    # Below: pcieswitch-pairs, where a NUMA node holds two switches with two
+    # GPUs behind each -- three cost levels, not two -- and TP4 wants a much
+    # higher block count. These are extra points on a second fabric, not
+    # corrections to the rows above, which are a different hidden size.
+    (4, 1024 * 6144 * 2, (2, 128, 1024)),
+    (4, 2048 * 6144 * 2, (2, 128, 1024)),
+    (4, 4096 * 6144 * 2, (2, 128, 1024)),
+    (4, 8192 * 6144 * 2, (2, 128, 1024)),
+)
+
+
+def test_survivor_count_is_a_constant_not_a_threshold() -> None:
+    """The truncation must not depend on the timings it sorts by.
+
+    Ranks that return different numbers of tactics do not disagree about which
+    kernel is fastest -- they deadlock, inside a kernel that spins with no
+    timeout, on the autotuner's per-tactic timing reduction. A "keep everything
+    within Nx of the best" rule makes the count a function of measured floats;
+    a fixed count makes it a function of the candidate list, which
+    candidate_tactics already guarantees is group-identical.
+    """
+    assert isinstance(tuning.TUNE_SURVIVORS, int)
+    assert tuning.TUNE_SURVIVORS > 0
+    src = inspect.getsource(tuning.PcieIpcAllReduceRunner.get_valid_tactics)
+    assert "[:TUNE_SURVIVORS]" in src, (
+        "the survivor list must be truncated by the constant, not by a "
+        "predicate over the measured times"
+    )
+    # The seed has to stay at the head: the autotuner breaks ties toward the
+    # earlier element, so its position is what decides an exact tie.
+    assert "return [TABLE_TACTIC] + kept" in src
+
+
+def test_timings_are_reduced_with_max(monkeypatch) -> None:
+    """MAX, and reduced at all -- a rank-local ranking is the deadlock above."""
+    seen = {}
+
+    class _FakeDist:
+        class ReduceOp:
+            MAX = "max"
+
+        @staticmethod
+        def all_reduce(tensor, op=None, group=None):
+            seen["op"] = op
+
+    monkeypatch.setattr(tuning, "dist", _FakeDist)
+    tuning.reduce_timings(torch.tensor([1.0, 2.0]), group=None)
+    assert seen["op"] == _FakeDist.ReduceOp.MAX
+
+
+def test_the_prefill_screen_keeps_every_measured_prefill_winner() -> None:
+    """A screened-out winner is one the tuner can never choose again.
+
+    The screen exists to stop prefill tuning spending its time on candidates
+    orders of magnitude off the winner. It pays for itself only while it keeps
+    every configuration a real search actually picked.
+    """
+    for world_size, payload, winner in _MEASURED_PREFILL_WINNERS:
+        assert payload >= tuning.PREFILL_SCREEN_BYTES, (
+            f"{payload} is below the screen; this row proves nothing"
+        )
+        tactics = tuning.candidate_tactics(world_size, numel=payload // 2, elem_size=2)
+        assert winner in tactics, (
+            f"world_size={world_size} payload={payload}: the screen dropped "
+            f"{winner}, which a search measured as the winner"
+        )
+
+
+def test_the_prefill_screen_only_applies_above_its_threshold() -> None:
+    """Below the threshold, and with no shape at all, nothing is screened."""
+    full = tuning.candidate_tactics(8)
+    small = tuning.candidate_tactics(8, numel=1024, elem_size=2)
+    assert small == full
+    big = tuning.candidate_tactics(8, numel=tuning.PREFILL_SCREEN_BYTES, elem_size=2)
+    assert set(big) < set(full), "the screen removed nothing at prefill size"
+    for _variant, _blocks, threads in big:
+        assert threads >= tuning.PREFILL_MIN_THREADS
 
 
 def test_the_grid_can_express_every_measured_winner() -> None:
@@ -439,10 +556,29 @@ def test_workspace_capacity_filters_buckets() -> None:
     )
 
 
+def test_pinning_a_searched_dimension_moved_the_tune_version() -> None:
+    """A narrowed legal set must not reuse the previous version's cache keys.
+
+    The version is the first element of cache_key_extras, so leaving it alone
+    keeps old keys matching. cache_covers_workspace then reports the workspace
+    as tuned, _warn_if_untuned stays silent because it is gated on that, and
+    resolve_tuned_config quietly drops each newly-illegal entry to the seed --
+    a partial, unsignalled loss on whichever shapes happen to be affected.
+
+    Fixing the copy-engine thread count is exactly such a narrowing: a cache
+    written when it was searched can hold threads=512 on those variants.
+    """
+    assert tuning.PCIE_IPC_TUNE_VERSION >= 3
+    stale = IpcLaunchConfig(blocks=1, threads=512, variant=IpcVariant.COPY_ENGINE_RING)
+    assert not policy._is_launchable(8, stale, 128), (
+        "this is the configuration whose rejection motivated the bump"
+    )
+
+
 def test_custom_op_name_is_stable() -> None:
     """It is baked into every persisted cache key; renaming it orphans the file."""
     assert tuning.PCIE_IPC_CUSTOM_OP == "flashinfer::pcie_ipc_all_reduce"
-    assert tuning.PCIE_IPC_TUNE_VERSION == 1
+    assert tuning.PCIE_IPC_TUNE_VERSION == 3
 
 
 def test_pack_config_is_injective_over_the_candidate_space() -> None:
