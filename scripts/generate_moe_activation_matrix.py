@@ -29,8 +29,6 @@ ActivationMatrixRow = tuple[
 
 def _quant_label(pair: tuple[QuantFormat, QuantFormat]) -> str:
     weight, activation = pair
-    if weight is activation:
-        return weight.name
     return f"{weight.name}×{activation.name}"
 
 

@@ -237,7 +237,6 @@ def _make_runtime_case(
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
-    ids=quant_id,
 )
 def test_trtllm_mxfp4_unified_matches_reference(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -521,10 +520,6 @@ _FP4_PREP_SHAPE_CASES = [
 @pytest.mark.parametrize(
     "variant,activation",
     _FP4_PREP_SHAPE_CASES,
-    ids=[
-        f"{quant_id(quant)}-{type(activation).__name__}"
-        for quant, activation in _FP4_PREP_SHAPE_CASES
-    ],
 )
 def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activation):
     _xfail_w4a16_sm103(variant)
@@ -548,7 +543,6 @@ def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activati
         QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
     ),
-    ids=quant_id,
 )
 def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
     _xfail_w4a16_sm103(variant)
@@ -689,7 +683,6 @@ def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
-    ids=quant_id,
 )
 def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -727,7 +720,6 @@ def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantConfig):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
-    ids=quant_id,
 )
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 def test_trtllm_mxfp4_unpacked_matches_packed(
@@ -754,7 +746,6 @@ def test_trtllm_mxfp4_unpacked_matches_packed(
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
-    ids=quant_id,
 )
 def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -781,7 +772,6 @@ def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantConfig):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
-    ids=quant_id,
 )
 def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
@@ -806,7 +796,6 @@ def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantConfig):
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
     ],
-    ids=quant_id,
 )
 @pytest.mark.parametrize(
     "hidden_size,intermediate_size",

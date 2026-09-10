@@ -755,9 +755,10 @@ has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
 The class-level matrix below is generated from the registered runner classes.
-The Quantization column is the MMA pair ``weight×activation``, so the two
-W4A16 encodings appear as ``MXFP4×BF16`` (TRTLLM / CUTLASS SM90) and
-``NVFP4×BF16`` (CuTe-DSL / b12x). Regenerate its contents with:
+The Quantization column is always the MMA pair ``weight×activation``
+(``NVFP4×NVFP4``, not ``NVFP4``). The two W4A16 encodings appear as
+``MXFP4×BF16`` (TRTLLM / CUTLASS SM90) and ``NVFP4×BF16`` (CuTe-DSL / b12x).
+Regenerate its contents with:
 
 ```bash
 python scripts/generate_moe_activation_matrix.py --write
@@ -766,30 +767,30 @@ python scripts/generate_moe_activation_matrix.py --write
 <!-- BEGIN GENERATED MOE ACTIVATION MATRIX -->
 | Backend | Config | Quantization | Typed activations |
 | --- | --- | --- | --- |
-| `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
+| `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
-| `cake` | `CakeWarpDecodeConfig` | `NVFP4` | `SwiGLU`, `SiLU` |
+| `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
-| `cute_dsl` | `CuteDslConfig` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
-| `cutile_bf16` | `CuTileBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_bf16` | `CutlassBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cutile_bf16` | `CuTileBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_bf16` | `CutlassBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_humming` | `CutlassHummingConfig` | `MXFP4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16` | `SwiGLU`, `ReLU2` |
+| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU` |
-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
-| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
+| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
@@ -1036,11 +1037,6 @@ kernel); (5) tighten the quantized-numeric net via the QuantSpec scale policy
 
 ### QuantConfig three-axis formats (2026-09)
 
-The single-knob `QuantVariant` (Decision Log, 2026-05-31 / CR1) collapsed dtype +
-granularity into one enum. `W4A16` then grew two weight encodings (MXFP4 on
-TRTLLM/CUTLASS SM90, NVFP4 on CuTe-DSL/b12x), and `MXFP4` already meant
-MXFP4×MXFP8 rather than MXFP4×MXFP4.
-
 `QuantConfig` now has three `QuantFormat` axes: `weight`, `activation`, and
 `output`. `QuantConfig` itself is structural only (members must be
 `QuantFormat`; no `torch.dtype` coercion). Legal combinations are runner
@@ -1052,6 +1048,9 @@ An omitted axis is BF16 (unquantized): `QuantConfig()` is BF16×BF16 and
 `QuantConfig(weight=QuantFormat.MXFP4)` is MXFP4×BF16; MXFP4×MXFP8 needs both
 axes. Axes describe the MMA numeric format, not the dtype of the tensor that
 crosses the Python API.
+`output` defaults to BF16 and every current runner declares
+`supported_output_formats == (BF16,)`, so the activation matrix is keyed by the
+`weight×activation` pair only.
 
 ### Explicit Non-Goals For This MVP
 

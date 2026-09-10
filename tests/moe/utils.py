@@ -57,6 +57,15 @@ def quant_id(quant: QuantConfig) -> str:
     return weight.name if weight is activation else f"{weight.name}x{activation.name}"
 
 
+def parametrize_id(val: object) -> str | None:
+    """Id for ``pytest_make_parametrize_id``; ``None`` leaves pytest's default."""
+    if isinstance(val, QuantConfig):
+        return quant_id(val)
+    if isinstance(val, ActivationConfig):
+        return type(val).__name__
+    return None
+
+
 def assert_trtllm_packed_call_contract(runner, inputs) -> None:
     """Check the metadata contract shared by TRTLLM unified runner packers."""
     from flashinfer.fused_moe.runners import _TrtllmPackedInputs

@@ -34,7 +34,7 @@ from __future__ import annotations
 import functools
 import struct
 import warnings
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -46,6 +46,9 @@ from ..trace.templates.moe import (
     sm90_mixed_gemm_weight_interleave_trace,
 )
 from ..utils import get_compute_capability, round_up
+
+if TYPE_CHECKING:
+    from .api import QuantConfig
 
 # Module-level permute-index caches. Permute indices depend on weight geometry
 # and layout parameters, so matching keys are safe to reuse across calls.
@@ -459,7 +462,7 @@ def prepare_trtllm_fp4_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
-    quant=None,
+    quant: QuantConfig,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -483,6 +486,8 @@ def prepare_trtllm_fp4_weights(
         ``[num_local_experts, intermediate_size, hidden_size]``.
     w2_bf16 : Tensor
         Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
+    quant : QuantConfig
+        MMA pair: NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16 (TRTLLM W4A16).
     num_local_experts, hidden_size, intermediate_size : int
         Expert geometry.
     device : torch.device, optional
@@ -500,14 +505,12 @@ def prepare_trtllm_fp4_weights(
     """
     from ..fp4_quantization import fp4_quantize
     from ..quantization.fp4_quantization import block_scale_interleave
-    from .api import QuantConfig, QuantFormat
+    from .api import QuantFormat
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
 
-    if quant is None:
-        quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     allowed = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
@@ -662,10 +665,10 @@ def prepare_trtllm_fp4_weights(
 def prepare_trtllm_fp4_activations(
     hidden_states_bf16: torch.Tensor,
     *,
-    quant=None,
+    quant: QuantConfig,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prepare activations for a unified TRTLLM FP4 MMA pair."""
-    from .api import QuantConfig, QuantFormat
+    from .api import QuantFormat
 
     if hidden_states_bf16.ndim != 2:
         raise ValueError(
@@ -677,8 +680,6 @@ def prepare_trtllm_fp4_activations(
             f"hidden_states_bf16 must be torch.bfloat16, got {hidden_states_bf16.dtype}."
         )
 
-    if quant is None:
-        quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     if quant.pair == (QuantFormat.MXFP4, QuantFormat.BF16):
         return hidden_states_bf16, None
     if quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
@@ -778,7 +779,7 @@ def prepare_trtllm_fp8_block_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
-    quant,
+    quant: QuantConfig,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -904,7 +905,7 @@ def prepare_trtllm_fp8_block_weights(
 def prepare_trtllm_fp8_block_activations(
     hidden_states_bf16: torch.Tensor,
     *,
-    quant,
+    quant: QuantConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``[M, H]`` BF16 activations for TRTLLM block-FP8 MoE."""
     from .api import QuantFormat
@@ -2235,7 +2236,7 @@ def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
-    quant=None,
+    quant: QuantConfig,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -2260,10 +2261,8 @@ def prepare_cute_dsl_weights(
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
-    from .api import QuantConfig, QuantFormat
+    from .api import QuantFormat
 
-    if quant is None:
-        quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     allowed = {
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),

@@ -36,7 +36,7 @@ from flashinfer.quantization.fp8_quantization import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
-from tests.moe.utils import assert_trtllm_packed_call_contract, quant_id
+from tests.moe.utils import assert_trtllm_packed_call_contract
 
 
 def _build_per_tensor_fp8_runner(config):
@@ -299,7 +299,6 @@ def _make_block_fp8_case(
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     pack, weights, config, (x, w1, w2) = _make_block_fp8_case(variant)
@@ -321,7 +320,6 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 def test_block_fp8_unpacked_routing_forwards_inputs_and_matches_reference(
@@ -403,7 +401,6 @@ def test_mxfp8_new_activation_layer_and_direct_match_reference(activation):
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
     """The unified runner forwards the SwiGLU OA params from the weight view.
@@ -597,7 +594,6 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 def test_block_fp8_from_logits_matches_prerouted(variant):
     pack, weights, config, _ = _make_block_fp8_case(variant)
@@ -650,7 +646,6 @@ def _deepseek_v3_route(logits, bias, *, top_k, n_group, topk_group, scale):
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
     num_experts = 64
@@ -714,7 +709,6 @@ def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 def test_block_fp8_nonzero_expert_offset(variant):
     offset = 8
@@ -744,7 +738,6 @@ def test_block_fp8_nonzero_expert_offset(variant):
         QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
-    ids=quant_id,
 )
 def test_block_fp8_prerouted_cuda_graph(variant):
     pack, weights, config, _ = _make_block_fp8_case(variant)

@@ -23,3 +23,14 @@ import sys
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    """Give QuantConfig / ActivationConfig parametrize values stable node ids.
+
+    Without this, pytest labels them ``quant0`` / ``activation0``. Explicit
+    ``ids=`` still wins (composite cases like ``NVFP4-t8``).
+    """
+    from tests.moe.utils import parametrize_id
+
+    return parametrize_id(val)

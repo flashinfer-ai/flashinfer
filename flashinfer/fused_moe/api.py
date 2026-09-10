@@ -483,6 +483,11 @@ _CUTLASS_W4A8_ARCHS = (90,)
 _CUTLASS_HUMMING_ARCHS = (90,)
 
 
+# Default MMA pair shared by the FP4 ``prepare_*`` helpers
+# (TrtllmFp4Config, CakeWarpDecodeConfig, CuteDslConfig).
+_NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+
+
 @dataclass(frozen=True)
 class TrtllmFp4Config:
     """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes.
@@ -502,7 +507,7 @@ class TrtllmFp4Config:
         w1_bf16,
         w2_bf16,
         *,
-        quant: Optional[QuantConfig] = None,
+        quant: QuantConfig = _NVFP4_NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
@@ -514,7 +519,7 @@ class TrtllmFp4Config:
 
         Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16 (TRTLLM W4A16).
-        ``None`` defaults to NVFP4×NVFP4.
+        Defaults to NVFP4×NVFP4.
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
 
         .. warning::
@@ -540,12 +545,12 @@ class TrtllmFp4Config:
     def prepare_activations(
         hidden_states_bf16,
         *,
-        quant: Optional[QuantConfig] = None,
+        quant: QuantConfig = _NVFP4_NVFP4,
     ):
         """Prepare activations for NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16.
 
         MXFP4×BF16 (TRTLLM W4A16) returns raw BF16 activations without an
-        activation scale. ``None`` defaults to NVFP4×NVFP4.
+        activation scale. Defaults to NVFP4×NVFP4.
         """
         from .prepare import prepare_trtllm_fp4_activations
 
@@ -590,7 +595,7 @@ class CakeWarpDecodeConfig:
         w1_bf16,
         w2_bf16,
         *,
-        quant: Optional[QuantConfig] = None,
+        quant: QuantConfig = _NVFP4_NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
@@ -604,9 +609,6 @@ class CakeWarpDecodeConfig:
         ``MoEWeightPack.prepare_for("cake", view)``. The same dictionary may
         also be registered for ``"trtllm_fp4_routed"`` without copying.
         """
-        quant = quant or QuantConfig(
-            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
-        )
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             raise ValueError(
                 "Cake warp decode weight preparation requires "
@@ -646,12 +648,9 @@ class CakeWarpDecodeConfig:
     def prepare_activations(
         hidden_states_bf16,
         *,
-        quant: Optional[QuantConfig] = None,
+        quant: QuantConfig = _NVFP4_NVFP4,
     ):
         """Build the shared TRTLLM NVFP4 packed activation view."""
-        quant = quant or QuantConfig(
-            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
-        )
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             raise ValueError(
                 "Cake warp decode activation preparation requires "
@@ -1380,7 +1379,7 @@ class CuteDslConfig:
         w1_bf16,
         w2_bf16,
         *,
-        quant: Optional[QuantConfig] = None,
+        quant: QuantConfig = _NVFP4_NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
@@ -1390,6 +1389,8 @@ class CuteDslConfig:
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
+        Defaults to NVFP4×NVFP4.
         """
         from .prepare import prepare_cute_dsl_weights
 
