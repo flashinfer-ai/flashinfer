@@ -3813,24 +3813,12 @@ class CuteDslRunner(MoERunner):
                 f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
                 "activation scales."
             )
-        if self.config.quant.pair == (
-            QuantFormat.MXFP4,
-            QuantFormat.MXFP8,
-        ) and isinstance(self.config.activation, SiTU):
+        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
             raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if (
-            self.config.quant.pair
-            == (
-                QuantFormat.MXFP4,
-                QuantFormat.MXFP8,
-            )
-            and not self.config.finalize.use_fused_finalize
-        ):
+        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
             raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if self.config.quant.pair == (
-            QuantFormat.MXFP4,
-            QuantFormat.MXFP8,
-        ) and hasattr(self, "device"):
+        if mxfp4_mxfp8 and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
@@ -4794,10 +4782,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self._dtype_act = dtype
         self._dtype_weights = dtype
         self._fp8_quantization_type = fp8_type
-        self._use_shuffled_weight = config.quant.pair == (
-            QuantFormat.MXFP8,
-            QuantFormat.MXFP8,
-        )
+        self._use_shuffled_weight = self._pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
 
         routing = config.routing
         experts = config.experts

@@ -2128,6 +2128,9 @@ SMALL = dict(hidden_size=1024, intermediate_size=512, num_experts=32, top_k=2)
 # ---------------------------------------------------------------------------
 
 
+_NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+
+
 def _make_packs_and_config(
     num_tokens: int,
     *,
@@ -2138,7 +2141,7 @@ def _make_packs_and_config(
     local_num_experts: int | None = None,
     max_tokens: int | None = None,
     activation=None,
-    quant: QuantConfig | None = None,
+    quant: QuantConfig = _NVFP4_NVFP4,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for a given shape.
 
@@ -2147,7 +2150,6 @@ def _make_packs_and_config(
     """
     local_num_experts = local_num_experts or num_experts
     max_tokens = max_tokens or max(num_tokens, 8192)
-    quant = quant or QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     device = torch.device("cuda", torch.cuda.current_device())
 
     activation = activation or SwiGLU()

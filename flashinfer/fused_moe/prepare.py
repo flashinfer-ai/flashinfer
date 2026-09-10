@@ -2524,7 +2524,7 @@ def __getattr__(name: str):
     if name == "prepare_cute_dsl_nvfp4_weights":
         warnings.warn(
             "prepare_cute_dsl_nvfp4_weights is deprecated; use "
-            "prepare_cute_dsl_weights with quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4) instead.",
+            "prepare_cute_dsl_weights with NVFP4×NVFP4 instead.",
             DeprecationWarning,
             stacklevel=2,
         )

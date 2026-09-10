@@ -28,8 +28,9 @@ if _REPO_ROOT not in sys.path:
 def pytest_make_parametrize_id(config, val, argname):
     """Give QuantConfig / ActivationConfig parametrize values stable node ids.
 
-    Without this, pytest labels them ``quant0`` / ``activation0``. Explicit
-    ``ids=`` still wins (composite cases like ``NVFP4xNVFP4-t8``).
+    Without this, pytest labels them ``quant0`` / ``activation0``. Keep an
+    explicit ``ids=`` only when a value is a hook-unknown object or tuple, or
+    when several numeric columns need axis labels.
     """
     from tests.moe.utils import parametrize_id
 
