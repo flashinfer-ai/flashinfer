@@ -764,12 +764,13 @@ def chunk_gated_delta_rule(
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use context parallelism when low-parallelism heuristics
-        match. SM100/SM103 uses the generated GDN CP-only four-stage
-        implementation for structurally supported shapes. Other legal
-        configurations retain the CuTe-DSL implementation.
-        ``"auto"`` enables conservative routing, ``True`` requires CP support,
-        and ``False`` disables CP. Default: ``"auto"``.
+        Whether to use the architecture-specific context-parallel DSL
+        implementation on SM8x, SM90, SM100/SM103 or SM120, where it is
+        supported and low-parallelism heuristics match. SM100/SM103 uses the
+        generated GDN CP-only four-stage implementation for structurally
+        supported shapes; other legal configurations retain the CuTe-DSL
+        implementation. ``"auto"`` enables conservative routing, ``True``
+        requires CP support, and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
         Int32 or int64 tensor of shape ``[num_seqs]``
         (SM8x/SM90/SM100/SM103/SM120). When provided,
