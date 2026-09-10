@@ -1465,7 +1465,7 @@ def get_mm_bf16_cublaslt_module():
     )
 
 
-_CUTE_DSL_BF16_AUTOTUNE_VERSION = 11
+_CUTE_DSL_BF16_AUTOTUNE_VERSION = 12
 # M bound of the CuTe-DSL low-M kernels; larger M runs the cuBLASLt fallback.
 _CUTE_DSL_BF16_MAX_M = 32
 
