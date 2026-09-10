@@ -167,7 +167,7 @@ def should_use_cp_sm80_host(
 #: The V32 fused specialization's measured contract. Everything here was
 #: measured on `1x8192 gva4x16`, in three independent processes, with the
 #: caller handing its bf16 state pool rows in directly. Against the shipped
-#: V64 fused path it is 1.067x-1.094x on all four items -- bare and with the
+#: V64 fused path it is 1.066x-1.093x on all four items -- bare and with the
 #: shipped norm, at the backend and integration boundaries -- which is why it
 #: is selected here. Against Triton it is ahead at the bare backend boundary
 #: (1.010x-1.025x), at parity at the normalized backend boundary
