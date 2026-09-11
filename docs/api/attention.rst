@@ -326,8 +326,20 @@ validate the stream used by an external replay.
 Successful ``plan()`` starts a new stream-binding lifecycle; a failed plan
 preserves the previous binding.  Before replanning on another stream, finish
 the old updates and replays, then recapture ``run()`` for the new plan.
+``plan()`` rejects a stream switch while the bound stream reports pending work,
+using a nonblocking stream query before snapshotting or changing graph buffers.
+Staging-slot events alone do not establish completion of publication or replay.
+The caller must serialize all use of a wrapper; the in-progress flag only
+detects some overlapping calls and is not a thread-safety lock.  Keep externally
+owned CUDA streams alive throughout their bound lifecycle.
 
-The update accepts only complete CSR ``MLAPlanMetadata``.  ``qo_indptr``,
+An opted-in full replan temporarily snapshots the prior schedule and all
+reserved CSR buffers for rollback, including the entire ``kv_indices``
+reservation.  Its temporary memory and copy cost therefore scale with reserved
+capacity, not just the currently used prefix.  This cost belongs to ``plan()``;
+steady ``update_cuda_graph_plan()`` calls do not take these snapshots.
+
+The update requires a CUDA device and complete CSR ``MLAPlanMetadata``.  ``qo_indptr``,
 ``kv_indptr``, and ``kv_len_arr`` are host control tensors and must be
 contiguous CPU ``torch.int32`` tensors.  ``kv_indices`` must be contiguous
 ``torch.int32`` on the wrapper device, must not overlap any capture-reserved

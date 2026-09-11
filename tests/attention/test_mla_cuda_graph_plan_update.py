@@ -79,6 +79,7 @@ def _wrapper(
     wrapper._backend = "fa2"
     wrapper.device = torch.device("cuda:0")
     wrapper._cuda_graph_plan_update_in_progress = False
+    wrapper._cuda_graph_plan_update_stream = None
     return wrapper
 
 
@@ -135,6 +136,52 @@ def test_cuda_graph_plan_update_delegates_once_and_binds_stream(
     assert backend.metadata_calls == [metadata]
     assert wrapper._cuda_graph_plan_update_stream == 17
     assert wrapper._cuda_graph_plan_update_in_progress is False
+
+
+def test_cuda_graph_plan_update_rejects_non_cuda_before_stream_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _RecordingPlannedBackend()
+    wrapper = _wrapper(backend)
+    wrapper.device = torch.device("cpu")
+
+    def unexpected_stream_access(*args, **kwargs):
+        pytest.fail("non-CUDA update reached CUDA stream access")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_stream_access)
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        wrapper.update_cuda_graph_plan(metadata=_metadata())
+    assert not backend.metadata_calls
+
+
+def test_cuda_graph_replan_rejects_detectable_in_progress_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(16, dtype=torch.uint8),
+        backend="fa2",
+        use_cuda_graph=True,
+        enable_cuda_graph_plan_update=True,
+    )
+    wrapper_module = importlib.import_module("flashinfer.mla._batch_mla._wrapper")
+    monkeypatch.setattr(
+        wrapper_module._BACKEND_TYPES["fa2"],
+        "plan_from_wrapper",
+        lambda args: _RecordingPlannedBackend(),
+    )
+    wrapper._cuda_graph_plan_update_in_progress = True
+    with pytest.raises(RuntimeError, match="plan update is in progress"):
+        wrapper.plan(
+            metadata=_metadata(),
+            num_heads=16,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=1,
+            causal=False,
+            sm_scale=0.125,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
 
 
 @pytest.mark.parametrize(
@@ -995,3 +1042,75 @@ def test_real_generated_capture_update_replay_uses_lean_state(
     replacement_stream.synchronize()
     assert wrapper._cuda_graph_plan_update_stream == replacement_stream.cuda_stream
     torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
+
+    # A completed staging event does not cover later publication or replay.
+    # Block a real replay after all slot events completed and require a replan
+    # on another stream to reject before even snapshotting the shared buffers.
+    from cuda.bindings import runtime
+
+    current_backend = wrapper._planned_backend
+    current_state = current_backend._cuda_graph_plan_update_state
+    assert all(slot.completion_event.query() for slot in current_state.slots)
+    release = Event()
+    expired = Event()
+
+    @ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+    def hold_replay(_):
+        if not release.wait(timeout=10):
+            expired.set()
+
+    def unexpected_snapshot(*args, **kwargs):
+        raise RuntimeError("replan reached buffer snapshotting")
+
+    try:
+        (error,) = runtime.cudaLaunchHostFunc(
+            replacement_stream.cuda_stream,
+            ctypes.cast(hold_replay, ctypes.c_void_p).value,
+            0,
+        )
+        assert error == runtime.cudaError_t.cudaSuccess
+        with torch.cuda.stream(replacement_stream):
+            replacement_graph.replay()
+        assert all(slot.completion_event.query() for slot in current_state.slots)
+        assert not replacement_stream.query()
+        with monkeypatch.context() as patch, torch.cuda.stream(stream):
+            patch.setattr(torch.Tensor, "clone", unexpected_snapshot)
+            with pytest.raises(RuntimeError, match="bound CUDA stream.*pending work"):
+                wrapper.plan(
+                    metadata=MLAPlanMetadata.csr(
+                        initial_qo, initial_kv, initial_indices, initial_lengths
+                    ),
+                    **plan_kwargs,
+                )
+        assert wrapper._planned_backend is current_backend
+        assert wrapper._cuda_graph_plan_update_stream == replacement_stream.cuda_stream
+        # Same-stream work is already ordered. Stop at the first snapshot so
+        # this check itself cannot wait behind the gated replay or mutate it.
+        with monkeypatch.context() as patch, torch.cuda.stream(replacement_stream):
+            patch.setattr(torch.Tensor, "clone", unexpected_snapshot)
+            with pytest.raises(
+                RuntimeError, match="replan reached buffer snapshotting"
+            ):
+                wrapper.plan(
+                    metadata=MLAPlanMetadata.csr(
+                        initial_qo, initial_kv, initial_indices, initial_lengths
+                    ),
+                    **plan_kwargs,
+                )
+    finally:
+        release.set()
+        replacement_stream.synchronize()
+    assert not expired.is_set(), "replay gate timed out before the assertions finished"
+    torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
+
+    # Once the old stream is complete, switching streams can publish a new plan.
+    with torch.cuda.stream(stream):
+        wrapper.plan(
+            metadata=MLAPlanMetadata.csr(
+                initial_qo, initial_kv, initial_indices, initial_lengths
+            ),
+            **plan_kwargs,
+        )
+    stream.synchronize()
+    assert wrapper._planned_backend is not current_backend
+    assert wrapper._cuda_graph_plan_update_stream is None
