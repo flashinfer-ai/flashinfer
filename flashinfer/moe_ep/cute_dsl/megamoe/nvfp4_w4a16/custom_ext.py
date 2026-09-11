@@ -27,9 +27,9 @@ PeekReadyBit = 1 << PhaseBits
 
 
 class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
-    """8-field fc12 work tile; slot 3 aliases base k_tile_cnt."""
+    """Seven work fields in an eight-word ring record; slot 4 is reserved."""
 
-    TotalFields = 8  # 4 base + 4 extra (4 new fields beyond the alias)
+    TotalFields = 8
 
     def __init__(
         self,
@@ -37,7 +37,6 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
         tile_m_idx: Int32,
         tile_n_idx: Int32,
         cumulative_data_physical_row: Int32,
-        cumulative_sf_physical_row: Int32,
         cumulative_token_block_count: Int32,
         valid_tokens_in_cta_tile: Int32,
         phase_and_peek: Int32,
@@ -49,7 +48,6 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
             cumulative_data_physical_row,
         )
         self.cumulative_data_physical_row = self.k_tile_cnt
-        self.cumulative_sf_physical_row = cumulative_sf_physical_row
         self.cumulative_token_block_count = cumulative_token_block_count
         self.valid_tokens_in_cta_tile = valid_tokens_in_cta_tile
         # Slot 7 is the packed (BlockPhase | (peek_ready << 16)) field.
@@ -79,7 +77,6 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
         # Base's __extract_mlir_values__ already emits the first 4 slots
         # (slot 3 = self.k_tile_cnt = cumulative_data_physical_row).
         values = super().__extract_mlir_values__()
-        values.extend(extract_mlir_values(self.cumulative_sf_physical_row))
         values.extend(extract_mlir_values(self.cumulative_token_block_count))
         values.extend(extract_mlir_values(self.valid_tokens_in_cta_tile))
         values.extend(extract_mlir_values(self.phase_and_peek))
@@ -88,7 +85,7 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
     def __new_from_mlir_values__(
         self, values: List[ir.Value]
     ) -> "W4A16Fc12WorkTileInfo":
-        assert len(values) == 8
+        assert len(values) == 7
         return type(self)(
             expert_idx=new_from_mlir_values(self.expert_idx, [values[0]]),
             tile_m_idx=new_from_mlir_values(self.tile_m_idx, [values[1]]),
@@ -96,16 +93,13 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
             cumulative_data_physical_row=new_from_mlir_values(
                 self.cumulative_data_physical_row, [values[3]]
             ),
-            cumulative_sf_physical_row=new_from_mlir_values(
-                self.cumulative_sf_physical_row, [values[4]]
-            ),
             cumulative_token_block_count=new_from_mlir_values(
-                self.cumulative_token_block_count, [values[5]]
+                self.cumulative_token_block_count, [values[4]]
             ),
             valid_tokens_in_cta_tile=new_from_mlir_values(
-                self.valid_tokens_in_cta_tile, [values[6]]
+                self.valid_tokens_in_cta_tile, [values[5]]
             ),
-            phase_and_peek=new_from_mlir_values(self.phase_and_peek, [values[7]]),
+            phase_and_peek=new_from_mlir_values(self.phase_and_peek, [values[6]]),
         )
 
     def to_rmem(self) -> cute.Tensor:
@@ -114,7 +108,7 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
         rmem[1] = self.tile_m_idx
         rmem[2] = self.tile_n_idx
         rmem[3] = self.k_tile_cnt  # = cumulative_data_physical_row
-        rmem[4] = self.cumulative_sf_physical_row
+        rmem[4] = Int32(0)  # Keep the scheduler ring stride at eight words.
         rmem[5] = self.cumulative_token_block_count
         rmem[6] = self.valid_tokens_in_cta_tile
         rmem[7] = self.phase_and_peek
@@ -127,7 +121,6 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
             tile_m_idx=rmem[1],  # type: ignore[arg-type]
             tile_n_idx=rmem[2],  # type: ignore[arg-type]
             cumulative_data_physical_row=rmem[3],  # type: ignore[arg-type]
-            cumulative_sf_physical_row=rmem[4],  # type: ignore[arg-type]
             cumulative_token_block_count=rmem[5],  # type: ignore[arg-type]
             valid_tokens_in_cta_tile=rmem[6],  # type: ignore[arg-type]
             phase_and_peek=rmem[7],  # type: ignore[arg-type]
@@ -296,7 +289,6 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
             tile_m_idx=base_work.tile_m_idx,
             tile_n_idx=base_work.tile_n_idx,
             cumulative_data_physical_row=base_work.cumulative_data_physical_row,
-            cumulative_sf_physical_row=base_work.cumulative_sf_physical_row,
             cumulative_token_block_count=base_work.cumulative_token_block_count,
             valid_tokens_in_cta_tile=base_work.valid_tokens_in_cta_tile,
             phase_and_peek=new_phase_and_peek,
@@ -313,15 +305,9 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
         gmem_tensor_in_moe_view: cute.Tensor,
         work_tile_info: W4A16Fc12WorkTileInfo,
     ) -> Tuple[cute.Tensor, Optional[Pointer]]:
-        """Phase-invariant GMEM slice for the 6 operands.
-
-        Weight operands anchor at expert; data and SF operands use separate
-        token offsets because their padding granularities differ.  Caller
-        passes the phase-specific physical tensor.  Desc-ptr is always None.
-        """
+        """Slice expert weights/scales or BF16 token inputs/outputs."""
         expert_idx = work_tile_info.expert_idx
         data_token_offset = work_tile_info.cumulative_data_physical_row
-        sf_token_offset = work_tile_info.cumulative_sf_physical_row
 
         shape = gmem_tensor_in_moe_view.shape
         stride = gmem_tensor_in_moe_view.stride
@@ -333,7 +319,7 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
             real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))  # type: ignore[index]
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "b"):
+        elif cutlass.const_expr(tensor_name in ("b", "c")):
             real = cute.domain_offset(
                 (data_token_offset, 0, 0), gmem_tensor_in_moe_view
             )
@@ -349,59 +335,4 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
             )
             return (real, None)
 
-        elif cutlass.const_expr(tensor_name == "sfb"):
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
-            per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
-            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
-            real = cute.make_tensor(
-                real.iterator, cute.make_layout(sf_layout.shape, stride=stride)
-            )
-            return (real, None)
-
-        elif cutlass.const_expr(tensor_name == "c"):
-            real = cute.domain_offset(
-                (data_token_offset, 0, 0), gmem_tensor_in_moe_view
-            )
-            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))  # type: ignore[index]
-            return (real, None)
-
-        elif cutlass.const_expr(tensor_name == "sfc"):
-            # Linear1 phase only — fc2 has no output SF.  Caller must not
-            # invoke this branch with ``work_tile_info.phase == Linear2``.
-            real = cute.domain_offset((sf_token_offset, 0, 0), gmem_tensor_in_moe_view)
-            per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
-            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
-            real = cute.make_tensor(
-                real.iterator, cute.make_layout(sf_layout.shape, stride=stride)
-            )
-            return (real, None)
-
-        elif cutlass.const_expr(tensor_name == "topk"):
-            # Linear1 phase only — fc2 doesn't consume topk weights (Path A:
-            # topk weight is pre-multiplied into fc1's swiglu fp32 output
-            # before NVFP4 quantize, so fc2 mainloop already reads the
-            # weight-scaled values from fc1's output buffer).
-            #
-            # ``gmem_tensor_in_moe_view`` here is the global per-token
-            # ``topk_scores`` 1D tensor of shape ``(data_total_rows,)``.
-            # Caller passes the global tensor; we shift to the current
-            # expert's slice via ``data_token_offset`` (data-side physical
-            # row offset, same shift used by ``b`` / ``c`` operands).
-            #
-            # Returned view shape is ``(this_expert_padded_rows,)`` (same
-            # length as the input but offset to the right slice).  The
-            # epilogue then indexes it with the **expert-local** token
-            # coord — symmetric with the SFC write pattern.
-            real = cute.domain_offset((data_token_offset,), gmem_tensor_in_moe_view)
-            return (real, None)
-
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")
-
-    # --------------------------------------------------------------
-    # prefetch_for_expert
-    # --------------------------------------------------------------
-
-    @cute.jit
-    def prefetch_for_expert(self, expert_idx: Int32) -> None:
-        """No-op: swap-AB makes every TMA desc tile-invariant in both phases."""
-        pass

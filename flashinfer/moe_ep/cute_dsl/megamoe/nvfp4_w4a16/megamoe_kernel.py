@@ -9,7 +9,7 @@ dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
 Static and atomic schedulers fuse BF16 dispatch, both GEMMs, and combine.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -18,8 +18,6 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.cutlass_dsl import extract_mlir_values, new_from_mlir_values
-from cutlass.base_dsl.dsl import extract_mlir_attributes
 from cutlass.utils import mixed_input_helpers as mixed_input_utils
 from cutlass.utils import blockscaled_layout as blockscaled_utils
 
@@ -46,32 +44,6 @@ from . import dynamic_mainloop
 _TokenMetadataBytes = TokenSrcMetadata.nbytes
 _GridSyncSlotCount = 2
 _NvlinkSlotCount = 2
-
-
-class _ScaledTokenCommArgs:
-    """Keep local FC2 weight scaling separate from the communication ABI."""
-
-    def __init__(self, comm, fc2_alpha):
-        self.comm = comm
-        self.fc2_alpha = fc2_alpha
-
-    def __getattr__(self, name):
-        return getattr(self.comm, name)
-
-    def __extract_mlir_values__(self):
-        return extract_mlir_values(self.comm) + extract_mlir_values(self.fc2_alpha)
-
-    def __extract_mlir_attributes__(self):
-        return extract_mlir_attributes(self.comm) + extract_mlir_attributes(
-            self.fc2_alpha
-        )
-
-    def __new_from_mlir_values__(self, values):
-        n = len(extract_mlir_values(self.comm))
-        return _ScaledTokenCommArgs(
-            new_from_mlir_values(self.comm, values[:n]),
-            new_from_mlir_values(self.fc2_alpha, values[n:]),
-        )
 
 
 class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
@@ -226,20 +198,16 @@ class Sm100W4A16MegaMoEKernel:
             tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
         self.static_expert_shape = static_expert_shape
-        self.force_static_sched = force_static_sched
         self.num_sched_stages = num_sched_stages or 3
         self.group_hint = group_hint
         self.token_padding_block = token_padding_block
-        self.sf_padding_block = 1
         self.load_balance_mode = load_balance_mode
         self.scenario = scenario
         self.arch = get_cutedsl_target_arch()
         self.ab_dtype = self.fc2_output_dtype = cutlass.BFloat16
         self.acc_dtype = cutlass.Float32
         self.combine_format = combine_format
-        self.non_ubulk_fc2_store = True
         self.fc2_in_kernel_topk_reduce = self.in_kernel_fc2_reduce = False
-        self.apply_topk_in_fc1 = False
         self.gate_up_clamp = gate_up_clamp
         self.epi_flag_batch = epi_flag_batch
         self.flag_batch = flag_batch
@@ -254,7 +222,6 @@ class Sm100W4A16MegaMoEKernel:
         self.intermediate_gateup = gateup
         self.intermediate_downproj = gateup // 2
         self.hidden_bytes = 2 * hidden
-        self.sf_uint32_per_token = 0
         self.cluster_tile_tokens = mma_tiler_mnk[1] * cluster_shape_mnk[1]
         self._fc1_k_tiles = (hidden + 255) // 256
         self._fc2_k_tiles = (gateup // 2 + 255) // 256
@@ -274,8 +241,6 @@ class Sm100W4A16MegaMoEKernel:
         self.tmem_dealloc_sync_bar_id = 3
         self.token_back_mode = token_back_mode
         self.token_back_by_dispatch = by_dispatch
-        self.token_back_standalone = False
-        self.token_back_warp_id = None
         self.token_back_schedule_mode = (
             self.load_balance_mode if by_dispatch else "static"
         )
@@ -284,7 +249,6 @@ class Sm100W4A16MegaMoEKernel:
         # constructor or intermediate quantization state is instantiated.
         (
             self.pool_token_capacity,
-            self.pool_sf_capacity,
             self.pool_task_tile_capacity,
         ) = self._pool_shapes()
         cluster_fc2_tile_hidden = (
@@ -589,12 +553,13 @@ class Sm100W4A16MegaMoEKernel:
         # i32 stride=(2,) view onto the i64 ``expert_recv_count_sum`` buffer --
         # low32 bits hold per-expert total token count after _dispatch_barrier;
         # zero-copy alias for sizes-mode scheduling.
-        expert_token_sizes = self._view_shared(
+        expert_token_sizes = self._make_typed_view(
             shared_workspace,
-            "expert_recv_count_sum",
-            cute_dtype=cutlass.Int32,
-            shape=(self.num_experts_per_rank,),
-            stride=(2,),
+            self._shared_offsets["expert_recv_count_sum"],
+            cutlass.Int32,
+            (self.num_experts_per_rank,),
+            (2,),
+            self._shared_region_by_name["expert_recv_count_sum"].align,
         )
         local_zero_prefix = self._make_typed_view(
             local_workspace,
@@ -652,20 +617,17 @@ class Sm100W4A16MegaMoEKernel:
             sm_count=sm_count,
         )
 
-        token_comm_args = _ScaledTokenCommArgs(token_comm_args, fc2_alpha)
         self._launch_fc12(
             activation=l1_token_buffer_bf16,
             fc1_weight=fc1_weight,
             fc1_weight_sf=fc1_weight_sf,
             fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
             fc1_output=fc1_output,
-            fc1_c=fc1_c,
             fc2_weight=fc2_weight,
             fc2_weight_sf=fc2_weight_sf,
             fc2_output=fc2_output_target,
-            topk_scores=l1_topk_weights_buffer,
             fc1_done_counter=fc1_done_counter,
-            offs=None,
             max_active_clusters=max_active_clusters,
             stream=stream,
             load_balance_counter=load_balance_counter,
@@ -680,19 +642,17 @@ class Sm100W4A16MegaMoEKernel:
         fc1_weight,
         fc1_weight_sf,
         fc1_alpha,
+        fc2_alpha,
         fc1_output,
         fc2_weight,
         fc2_weight_sf,
         fc2_output,
-        topk_scores,
         fc1_done_counter,
-        offs,
         max_active_clusters,
         stream,
         load_balance_counter,
         expert_token_sizes,
         token_comm_args,
-        fc1_c=None,
     ):
         e, gateup, h = self.static_expert_shape
         i = gateup // 2
@@ -741,11 +701,9 @@ class Sm100W4A16MegaMoEKernel:
             cluster_shape_mn=self.cluster_shape_mn,
             group_hint=self.group_hint,
             token_padding_block=self.token_padding_block,
-            sf_padding_block=1,
             load_balance_mode=self.load_balance_mode,
             load_balance_counter_ptr=counter_ptr,
             override_num_stages=self.num_sched_stages,
-            is_swap_ab=True,
             expert_token_prefix_sum=None,
             expert_token_sizes=expert_token_sizes,
         )
@@ -868,6 +826,7 @@ class Sm100W4A16MegaMoEKernel:
             mix.smem_layout_b,
             mix.smem_layout_a_transform,
             token_comm_args,
+            fc2_alpha,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -1037,6 +996,7 @@ class Sm100W4A16MegaMoEKernel:
         activation_layout,
         transform_layout,
         token_comm_args,
+        fc2_alpha,
     ):
         mix = self.mixed_fc1
         tidx = cute.arch.thread_idx()[0]
@@ -1168,7 +1128,6 @@ class Sm100W4A16MegaMoEKernel:
                 scheduler.internal_init(warp_idx=warp, sched_warp_id=7)
             scheduler.gen_next_work()
             while scheduler.current_work.is_valid_tile:
-                ext.prefetch_for_expert(scheduler.current_work.expert_idx)
                 scheduler.publish_work()
                 scheduler.gen_next_work()
             scheduler.publish_work()
@@ -1378,7 +1337,6 @@ class Sm100W4A16MegaMoEKernel:
                             k_tile_idx=k_tile,
                             valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
                             mma_tiler_mnk=self.mma_tiler,
-                            a_from_tmem=True,
                         )
                         transform_pipe.consumer_release(a_state)
                         activation_pipe.consumer_release(b_state)
@@ -1392,22 +1350,17 @@ class Sm100W4A16MegaMoEKernel:
         if warp < 4:
             cute.arch.setmaxregister_increase(144)
             self.epilogue.run(
-                epi_smem_storage=None,
                 tmem_ptr=tmem.retrieve_ptr(cutlass.Float32),
                 acc_pipeline=acc_pipe,
                 sched_consumer=consumer,
                 sched_ext=ext,
-                tma_atom_fc1_output=None,
                 fc1_output=fc1_output,
-                fc1_output_sf=None,
                 fc2_output=fc2_output,
                 fc1_done_counter=fc1_done,
                 tidx=tidx,
                 optional_epi_args=W4A16EpiArgs(
                     fc1_alpha=fc1_alpha,
-                    fc2_alpha=token_comm_args.fc2_alpha,
-                    fc1_norm_const=None,
-                    topk_scores=None,
+                    fc2_alpha=fc2_alpha,
                 ),
                 token_comm_args=token_comm_args,
             )
@@ -1428,52 +1381,17 @@ class Sm100W4A16MegaMoEKernel:
             token_comm_args, warp_idx=warp, lane_idx=cute.arch.lane_idx(), tidx=tidx
         )
 
-    def _pool_shapes(self) -> Tuple[int, int, int]:
-        """Worst-case pool sizes.
-
-        ``pool_token_capacity``: every received token from any peer can
-        replicate to ``min(num_topk, num_experts_per_rank)`` local
-        experts; worst case is ``world_size * max_tokens_per_rank``
-        tokens received, each replicated up to that bound.  Each of
-        the ``num_experts_per_rank`` experts wastes up to
-        ``token_padding_block - 1`` rows at its tail; round the whole
-        sum up to the pool-layout granularity ``token_padding_block``.
-
-        ``pool_sf_capacity``: same number of expert blocks as the data
-        pool, each padded to ``sf_padding_block`` rows (UTCCP 4x32
-        swizzle that the SF TMA load expects).
-
-        ``pool_task_tile_capacity``: ``ceil(pool_token_capacity,
-        cluster_tile_tokens)``.  C3 makes ``cluster_tile_tokens`` a
-        multiple of ``token_padding_block`` so this stays exact.
-        """
-        world_size = self.world_size
-        max_tokens_per_rank = self.max_tokens_per_rank
-        num_topk = self.num_topk
-        num_experts_per_rank = self.num_experts_per_rank
-        token_padding_block = self.token_padding_block
-        sf_padding_block = self.sf_padding_block
-        cluster_tile_tokens = self.cluster_tile_tokens
-
-        max_recv = world_size * max_tokens_per_rank
-        max_per_token = min(num_topk, num_experts_per_rank)
-        raw = max_recv * max_per_token + num_experts_per_rank * (
-            token_padding_block - 1
-        )
-        pool_token_capacity = _round_up(raw, token_padding_block)
-        pool_sf_capacity = (
-            pool_token_capacity // token_padding_block
-        ) * sf_padding_block
-        # Upper bound for sum_e ceil(valid_e, cluster_tile_tokens).  The
-        # per-expert slack covers each expert's final partial task tile.
+    def _pool_shapes(self) -> Tuple[int, int]:
+        # Every source token may select every local expert up to top-k. Each
+        # expert adds tail padding, then one partial scheduler tile of slack.
+        raw = self.world_size * self.max_tokens_per_rank * min(
+            self.num_topk, self.num_experts_per_rank
+        ) + self.num_experts_per_rank * (self.token_padding_block - 1)
+        pool_token_capacity = _round_up(raw, self.token_padding_block)
         pool_task_tile_capacity = (
-            pool_token_capacity + cluster_tile_tokens - 1
-        ) // cluster_tile_tokens + num_experts_per_rank
-        return (
-            pool_token_capacity,
-            pool_sf_capacity,
-            pool_task_tile_capacity,
-        )
+            pool_token_capacity + self.cluster_tile_tokens - 1
+        ) // self.cluster_tile_tokens + self.num_experts_per_rank
+        return pool_token_capacity, pool_task_tile_capacity
 
     def _build_local_region_specs(self) -> List[_RegionSpec]:
         pool_token_capacity = self.pool_token_capacity
@@ -1658,75 +1576,24 @@ class Sm100W4A16MegaMoEKernel:
         )
         return cute.make_tensor(typed_iter, cute.make_layout(shape, stride=stride))
 
-    def _view_local(
-        self,
-        local_workspace: cute.Pointer,
-        name: str,
-        *,
-        cute_dtype: Optional[Any] = None,
-        shape: Optional[Tuple[int, ...]] = None,
-        stride: Optional[Tuple[int, ...]] = None,
-    ) -> cute.Tensor:
-        """Partition a region of the local workspace.  With no overrides,
-        uses the region's declared dtype + shape + row-major stride;
-        overrides let dual-view callers build alternate-dtype views at
-        the same byte offset.
-        """
+    def _view_local(self, workspace: cute.Tensor, name: str) -> cute.Tensor:
         return self._partition_region(
-            local_workspace,
-            self._local_offsets,
-            self._local_region_by_name[name],
-            cute_dtype=cute_dtype,
-            shape=shape,
-            stride=stride,
+            workspace, self._local_offsets[name], self._local_region_by_name[name]
         )
 
-    def _view_shared(
-        self,
-        shared_workspace: cute.Pointer,
-        name: str,
-        *,
-        cute_dtype: Optional[Any] = None,
-        shape: Optional[Tuple[int, ...]] = None,
-        stride: Optional[Tuple[int, ...]] = None,
-    ) -> cute.Tensor:
+    def _view_shared(self, workspace: cute.Tensor, name: str) -> cute.Tensor:
         return self._partition_region(
-            shared_workspace,
-            self._shared_offsets,
-            self._shared_region_by_name[name],
-            cute_dtype=cute_dtype,
-            shape=shape,
-            stride=stride,
+            workspace, self._shared_offsets[name], self._shared_region_by_name[name]
         )
 
     def _partition_region(
-        self,
-        byte_workspace: cute.Pointer,
-        offsets: Dict[str, int],
-        spec: _RegionSpec,
-        *,
-        cute_dtype: Optional[Any],
-        shape: Optional[Tuple[int, ...]],
-        stride: Optional[Tuple[int, ...]],
+        self, workspace: cute.Tensor, offset: int, spec: _RegionSpec
     ) -> cute.Tensor:
-        dt = cute_dtype if cute_dtype is not None else spec.cute_dtype
-        sh = shape if shape is not None else spec.shape
-        st = stride
-        if st is None:
-            if cute_dtype is None and shape is None:
-                st = spec.stride_row_major
-            else:
-                # Derive row-major from the (possibly overridden) shape.
-                out: List[int] = [1]
-                for d in reversed(list(sh)[1:]):
-                    out.append(out[-1] * d)
-                out.reverse()
-                st = tuple(out)
         return self._make_typed_view(
-            byte_workspace,
-            offsets[spec.name],
-            dt,
-            sh,
-            st,
+            workspace,
+            offset,
+            spec.cute_dtype,
+            spec.shape,
+            spec.stride_row_major,
             spec.align,
         )

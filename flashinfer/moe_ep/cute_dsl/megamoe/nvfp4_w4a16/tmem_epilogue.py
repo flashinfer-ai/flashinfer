@@ -8,7 +8,7 @@ path are retained. There is no activation quantization or FC1/FC2 core base.
 """
 
 import dataclasses
-from typing import Callable, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -26,15 +26,8 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import TokenSrcMetadata
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import SymBufferDeviceBase
 
 
-class Region:
-    """Codegen-time region tag for a 16x32 sub-region within a 32x32 tile."""
-
-    Top = 0
-    Bottom = 1
-
-
 class TmemTranspose16x32:
-    """Public 16x32 -> 32x16 TMEM in-place transpose.
+    """16x32 -> 32x16 TMEM in-place transpose from register inputs.
 
     The per-thread RMEM ``(lane_idx, elem_idx) -> (tmem_dp, tmem_col)`` mapping
     is fixed by the underlying atom sequence and is identical for fc1 (each slot
@@ -44,8 +37,7 @@ class TmemTranspose16x32:
     distribution below is the single source of truth.
 
     Input distribution -- what each (lane_idx, elem_idx) reg holds on entry
-    (i.e. straight after the 16-dp x 32-col source LDTM, or as fed in via
-    ``reg_tensor`` / ``load_subtile_raw_acc`` for skip-R1.Load mode):
+    (fed through ``reg_tensor`` after LDTM or FC1 activation):
 
         tmem_dp  = elem_idx * 2 + (lane_idx // 2) % 2          # in [0, 32)
         tmem_col = (lane_idx % 2) * 8 + lane_idx // 4          # in [0, 16)
@@ -84,33 +76,10 @@ class TmemTranspose16x32:
     def load_subtile_raw_acc(
         tmem_subtile_tensor: cute.Tensor,
     ) -> Tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor]:
-        """LDTM the entire 32-lane x 64-col raw acc region of one epi
-        subtile into 4 independent (16,) fp32 RMEM tensors.
+        """Load four (16,) FP32 fragments from one 32-lane x 64-column subtile.
 
-        Used by the overlap-acc unroll path in
-        ``_run_fc{1,2}_task_tile`` to extract all raw acc data of the
-        first 2 subtiles up front, so that the acc TMEM can be released
-        to the next mma right after the first subtile's 4 LDTMs (instead
-        of waiting for a full subtile body to complete).
-
-        ``tmem_subtile_tensor`` is the (32 lanes, 64 cols) view onto a
-        single epi subtile's acc TMEM region (already offset by
-        ``warp_lane_offset + acc_stage_col_offset + subtile_col_offset``;
-        see ``SwapABSwigluFp4Epilogue._subtile_local_tmem_tensor``).
-
-        Returns a 4-tuple of (16,) fp32 RMEM tensors, each carrying the
-        (lane_idx, elem_idx) input distribution documented on
-        ``TmemTranspose16x32`` (physically identical for fc1 and fc2):
-
-          [0] gate_lo / first-half top   -- subtile cols 0..31, lanes 0..15
-          [1] up_lo   / first-half bot   -- subtile cols 0..31, lanes 16..31
-          [2] raw_top / second-half top  -- subtile cols 32..63, lanes 0..15
-          [3] raw_bot / second-half bot  -- subtile cols 32..63, lanes 16..31
-
-        4 atom calls of ``Ld16x64bOp(Repetition.x16) Float32`` -- the same
-        atom used by the per-subtile entry LDTM.  Each output is in the
-        ``TmemTranspose16x32`` input distribution and can be fed straight
-        into a transpose as ``reg_tensor`` (skip-R1.Load mode).
+        Returns first-half top/bottom, then second-half top/bottom in the
+        input register distribution documented on this class.
         """
         atom_ld16x64 = cute.make_copy_atom(
             tcgen05.Ld16x64bOp(tcgen05.Repetition.x16),
@@ -176,37 +145,14 @@ class TmemTranspose16x32:
     def __init__(
         self,
         tmem_ptr,
-        region: int,
-        reg_tensor: Optional[cute.Tensor] = None,
+        reg_tensor: cute.Tensor,
     ) -> None:
-        # The whole transpose is built from 32-bit element atoms; _io_dtype
-        # drives _src_regs / output / every LDTM/STTM atom below, so guard the
-        # invariant once here (tautological today, defensive against future
-        # dtype edits).
-        if cutlass.const_expr(self._io_dtype.width != 32):
-            raise TypeError(
-                f"{type(self).__name__} requires a 32-bit _io_dtype (the "
-                f"transpose uses 32-bit element atoms), got {self._io_dtype} "
-                f"(width {self._io_dtype.width})."
-            )
-
         half_lane_off = 16 * self._TmemRowStride
-        if region == Region.Top:
-            src_ptr = tmem_ptr
-            dst_ptr = tmem_ptr
-        elif region == Region.Bottom:
-            src_ptr = tmem_ptr + half_lane_off
-            dst_ptr = tmem_ptr + 16
-        else:
-            raise ValueError("region must be Region.Top or Region.Bottom")
-
-        self.region = region
-
-        self._tmem_src_full = cute.make_tensor(src_ptr, self._tmem_layout(16, 32))
-        self._tmem_dst_full = cute.make_tensor(dst_ptr, self._tmem_layout(32, 16))
-        self._tmem_dst_top = cute.make_tensor(dst_ptr, self._tmem_layout(16, 16))
+        self._tmem_src_full = cute.make_tensor(tmem_ptr, self._tmem_layout(16, 32))
+        self._tmem_dst_full = cute.make_tensor(tmem_ptr, self._tmem_layout(32, 16))
+        self._tmem_dst_top = cute.make_tensor(tmem_ptr, self._tmem_layout(16, 16))
         self._tmem_dst_bot = cute.make_tensor(
-            dst_ptr + half_lane_off, self._tmem_layout(16, 16)
+            tmem_ptr + half_lane_off, self._tmem_layout(16, 16)
         )
 
         self._atom_ld16x64 = cute.make_copy_atom(
@@ -236,39 +182,20 @@ class TmemTranspose16x32:
         # documented on ``TmemTranspose16x32``.
         self.output = cute.make_rmem_tensor((16,), self._io_dtype)
 
-        # skip-R1.Load mode: ``reg_tensor`` must already be in the transpose
-        # input distribution (see ``TmemTranspose16x32`` / produced by
-        # ``load_subtile_raw_acc``); we copy it in lieu of the R1 LDTM.
-        # Weak entry guard (replaces the removed input contract): the transpose
-        # atoms are 32-bit element atoms over exactly 16 regs/lane, so the fed
-        # tensor must be a 32-bit element type (fp32 or packed bf16x2) of size 16.
-        self._reg_tensor = reg_tensor
-        if reg_tensor is not None:
-            if cutlass.const_expr(reg_tensor.element_type.width != 32):
-                raise TypeError(
-                    f"{type(self).__name__} reg_tensor must be a 32-bit element "
-                    f"type (fp32 or packed bf16x2), got element type "
-                    f"{reg_tensor.element_type} (width {reg_tensor.element_type.width})."
-                )
-            if cutlass.const_expr(cute.size(reg_tensor) != 16):
-                raise ValueError(
-                    f"{type(self).__name__} reg_tensor must hold exactly 16 "
-                    f"elements, got {cute.size(reg_tensor)}."
-                )
-            for r in range(16):
-                self._src_regs[r] = reg_tensor[r]
-
-    # -- R1 ------------------------------------------------------------------
-
-    def r1_load(self) -> None:
-        """LDTM src region -> ``_src_regs``.  No-op in skip-R1.Load mode."""
-        if self._reg_tensor is not None:
-            return
-        cute.copy(
-            self._atom_ld16x64,
-            self._tmem_src_full,
-            self._rmem_copy_view(self._src_regs, 16),
-        )
+        # FP32 values and packed BF16 pairs both occupy sixteen 32-bit registers.
+        if cutlass.const_expr(reg_tensor.element_type.width != 32):
+            raise TypeError(
+                f"{type(self).__name__} reg_tensor must be a 32-bit element "
+                f"type (fp32 or packed bf16x2), got element type "
+                f"{reg_tensor.element_type} (width {reg_tensor.element_type.width})."
+            )
+        if cutlass.const_expr(cute.size(reg_tensor) != 16):
+            raise ValueError(
+                f"{type(self).__name__} reg_tensor must hold exactly 16 "
+                f"elements, got {cute.size(reg_tensor)}."
+            )
+        for r in range(16):
+            self._src_regs[r] = reg_tensor[r]
 
     def r1_perm(self) -> None:
         for r in range(16):
@@ -344,13 +271,6 @@ class TmemTranspose16x32:
         for r in range(16):
             self.output[r] = self._src_regs[self._PermR4[r]]
 
-    def r4_store(self) -> None:
-        cute.copy(
-            self._atom_st32x32,
-            self._rmem_copy_view(self.output, 16),
-            self._tmem_dst_full,
-        )
-
     def from_r1_perm_until_last_store(self) -> cute.Tensor:
         self.r1_perm()
         self.r1_store()
@@ -371,10 +291,6 @@ class W4A16EpiArgs:
     # Per-expert FP32 scales.
     fc1_alpha: Optional[cute.Tensor]
     fc2_alpha: Optional[cute.Tensor]
-    fc1_norm_const: Optional[cute.Tensor]
-    # -----------------------------------
-    # Preserved optional argument record; W4A16 applies scores after FC2.
-    topk_scores: Optional[cute.Tensor]
 
 
 class EpilogueContext:
@@ -403,15 +319,6 @@ class EpilogueContext:
 
 
 @dataclasses.dataclass(frozen=True)
-class Bf16Fc2ProcessPipeline:
-    tmem_acc_load: Callable
-    f2fp: Callable
-    post_f2fp_reorder: Callable
-    store_function: Callable
-    store_out_mapping: Contract
-
-
-@dataclasses.dataclass(frozen=True)
 class Fc2OutputRouter:
     """BF16 STG destinations, either local pool rows or per-token peer metadata."""
 
@@ -427,20 +334,8 @@ class Fc2OutputRouter:
     dst_ptrs: Optional[cute.Tensor] = None
     valid: Optional[cute.Tensor] = None
 
-    @property
-    def data_output(self):
-        return self.base_outputs
-
-    @property
-    def data_token_base(self):
-        return self.token_bases
-
-    @property
-    def data_mapping(self):
-        return self.output_mappings
-
     def __post_init__(self):
-        if (self.metadata is None) == (self.data_token_base is None):
+        if (self.metadata is None) == (self.token_bases is None):
             raise ValueError(
                 "Fc2OutputRouter requires exactly one of metadata or a token base."
             )
@@ -457,17 +352,17 @@ class Fc2OutputRouter:
         # get_dst() -- no array, hence no runtime-indexed local-memory spill.
         if cutlass.const_expr(self.metadata is None):
             return self
-        iter_axis = self.data_mapping.domain.names.index("iter_idx")
-        copy_iters: cutlass.Constexpr[int] = self.data_mapping.domain.sizes[iter_axis]
+        iter_axis = self.output_mappings.domain.names.index("iter_idx")
+        copy_iters: cutlass.Constexpr[int] = self.output_mappings.domain.sizes[
+            iter_axis
+        ]
 
         valid = cute.make_rmem_tensor((copy_iters,), cutlass.Int32)
         dst_ptrs = cute.make_rmem_tensor((copy_iters,), cutlass.Int64)
 
-        # Compiler should be able to optimize the same token_copy_group's offset add. (Fundamental cse + strength_reduce)
-        # We should check the SASS to ensure this happens.
         for iter_idx in cutlass.range_constexpr(copy_iters):
             coord = eval_function_mapping(
-                self.data_mapping,
+                self.output_mappings,
                 epi_tid=self.epi_tid,
                 iter_idx=iter_idx,
             )
@@ -483,33 +378,23 @@ class Fc2OutputRouter:
             )
             if token_valid and hidden_valid:
                 valid[iter_idx] = cutlass.Int32(1)
-                if cutlass.const_expr(self.metadata is None):
-                    dst_tokens = self.data_token_base + token_in_tile
-                    dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
-                    # Int64 token coord: dst_tokens*K*H overflows int32 once
-                    # T*K*H exceeds 2^31 (data_output is (token, topk, hidden)).
-                    dst_ptrs[iter_idx] = self.data_output[
-                        Int64(dst_tokens), None, dst_hidden
-                    ].iterator.toint()
-
-                else:
-                    md = TokenSrcMetadata.load(
-                        self.metadata.iterator.toint()
-                        + Int64(token_in_tile) * Int64(TokenSrcMetadata.nbytes)
-                    )
-                    dst_rank = md.src_rank
-                    dst_token = md.src_token
-                    dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
-                    dst_topk = md.src_topk
-                    # Int64 token coord: domain_offset on (token, topk, hidden)
-                    # computes dst_token*K*H, which overflows int32 once T*K*H > 2^31.
-                    dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.ptr_map_to_rank(
-                        cute.domain_offset(
-                            (Int64(dst_token), dst_topk, dst_hidden), self.data_output
-                        ).iterator,
-                        dst_rank,
-                        byte_align=32,
-                    ).toint()
+                md = TokenSrcMetadata.load(
+                    self.metadata.iterator.toint()
+                    + Int64(token_in_tile) * Int64(TokenSrcMetadata.nbytes)
+                )
+                dst_rank = md.src_rank
+                dst_token = md.src_token
+                dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
+                dst_topk = md.src_topk
+                # Int64 token coord: domain_offset on (token, topk, hidden)
+                # computes dst_token*K*H, which overflows int32 once T*K*H > 2^31.
+                dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.ptr_map_to_rank(
+                    cute.domain_offset(
+                        (Int64(dst_token), dst_topk, dst_hidden), self.base_outputs
+                    ).iterator,
+                    dst_rank,
+                    byte_align=32,
+                ).toint()
 
         return dataclasses.replace(
             self,
@@ -532,7 +417,7 @@ class Fc2OutputRouter:
             # invariant base hoists out of the caller's loop via CSE; a
             # constexpr iter folds the per-issue offset into the store.
             coord = eval_function_mapping(
-                self.data_mapping,
+                self.output_mappings,
                 epi_tid=self.epi_tid,
                 iter_idx=iter_idx,
             )
@@ -545,10 +430,10 @@ class Fc2OutputRouter:
                 and hidden_in_tile < cutlass.Int32(self.valid_hidden_this_cta_tile)
             ):
                 pred = cutlass.Int32(1)
-                dst_tokens = self.data_token_base + token_in_tile
+                dst_tokens = self.token_bases + token_in_tile
                 dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
                 # Int64 token coord: dst_tokens*K*H overflows int32 once T*K*H > 2^31.
-                addr = self.data_output[
+                addr = self.base_outputs[
                     Int64(dst_tokens), None, dst_hidden
                 ].iterator.toint()
         else:
@@ -556,7 +441,7 @@ class Fc2OutputRouter:
             addr = self.dst_ptrs[iter_idx]
             pred = self.valid[iter_idx]
         ptr = cute.make_ptr(
-            self.data_output.element_type,
+            self.base_outputs.element_type,
             addr,
             AddressSpace.gmem,
             assumed_align=32,
@@ -568,7 +453,6 @@ class Fc2OutputRouter:
 def fc2_f2fp(
     *tensors,
     alpha_val: Optional[cutlass.Float32] = None,
-    **_,
 ) -> cute.Tensor:
     reorder_dtype = cutlass.BFloat16
     total_size = 0
@@ -603,16 +487,10 @@ def fc2_f2fp(
 
 
 @cute.jit
-def fc2_stg_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, **_):
-    return TmemTranspose16x32.load_subtile_raw_acc(tmem_subtile_tensor)
-
-
-@cute.jit
 def fc2_stg_post_f2fp_reorder(
     *,
     casted: cute.Tensor,  # (subtile_cnt,)
     tmem_subtile_view: cute.Tensor,  # (epi_tile_m, epi_tile_n)
-    **_,
 ):
     if cutlass.const_expr(cute.size(casted) != 64):
         raise NotImplementedError(
@@ -638,24 +516,15 @@ def fc2_stg_post_f2fp_reorder(
         ),
         packed,
     )
-    # Although this works...
-    # packed.store(
-    #     cute.make_tensor(
-    #         casted.iterator,
-    #         cute.make_layout(gather_top_bot_map[0], stride=gather_top_bot_map[1]),
-    #     ).load()
-    # )
     packed_i32 = cute.recast_tensor(packed, cutlass.Float32)  # (32,): 16 i32 per half
 
     # Reuse the 32-bit transpose: each i32 slot carries one packed bf16x2 pair.
     token_0_32_pre_scatter_back = TmemTranspose16x32(
         tmem_subtile_view.iterator,
-        Region.Top,
         reg_tensor=cute.composition(packed_i32, (16,)),
     ).from_r1_perm_until_last_store()
     token_32_64_pre_scatter_back = TmemTranspose16x32(
         tmem_subtile_view.iterator + 32,
-        Region.Top,
         reg_tensor=cute.composition(cute.domain_offset(16, packed_i32), (16,)),
     ).from_r1_perm_until_last_store()
     cute.autovec_copy(
@@ -680,11 +549,9 @@ def fc2_stg_post_f2fp_reorder(
 @cute.jit
 def fc2_stg_store_function(
     *,
-    epi,
     subtile: cute.Tensor,  # BF16 fragment in store order.
     subtile_idx: cutlass.Int32,
     fc2_output_router: Fc2OutputRouter,
-    **_,
 ):
     data_subtile = subtile
     stg_width_elems: cutlass.Constexpr[int] = min(
@@ -722,12 +589,12 @@ def fc2_stg_store_function(
             )
 
 
-def make_bf16_fc2_stg_process_pipeline(*, cta_token_tile_size, cta_hidden_tile_size):
+def make_bf16_fc2_store_mapping(*, cta_token_tile_size, cta_hidden_tile_size):
     assert cta_hidden_tile_size == 128
     assert cta_token_tile_size % 64 == 0
     elems_per_stg = 16
     stgs_per_hidden32 = 2
-    store_out_mapping = Contract(
+    return Contract(
         domain=Space(
             ("epi_tid", "iter_idx"),
             (128, stgs_per_hidden32 * cta_token_tile_size // 32),
@@ -743,11 +610,4 @@ def make_bf16_fc2_stg_process_pipeline(*, cta_token_tile_size, cta_hidden_tile_s
                 + epi_tid // 32 * 32,
             }
         ),
-    )
-    return Bf16Fc2ProcessPipeline(
-        tmem_acc_load=fc2_stg_tmem_acc_load,
-        f2fp=fc2_f2fp,
-        post_f2fp_reorder=fc2_stg_post_f2fp_reorder,
-        store_function=fc2_stg_store_function,
-        store_out_mapping=store_out_mapping,
     )

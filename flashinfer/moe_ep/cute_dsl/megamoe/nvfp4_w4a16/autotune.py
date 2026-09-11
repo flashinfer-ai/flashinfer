@@ -99,15 +99,6 @@ def _autotune_knobs_impl(
     return winner
 
 
-# Default W4A16 tactic fields.
-_SWEEP_BASE: Dict[str, Any] = {
-    "cluster_shape_mnk": (2, 1, 1),
-    "group_hint": 512,
-    "epi_flag_batch": (2, 4),
-    "load_balance_mode": "atomic_counter",
-}
-
-
 def w4a16_candidates() -> List[Dict[str, Any]]:
     """Eight M256 W4A16 tactics with explicit scheduler depth 2.
 
@@ -116,9 +107,11 @@ def w4a16_candidates() -> List[Dict[str, Any]]:
     """
     return [
         dict(
-            _SWEEP_BASE,
-            mma_tiler_mnk=tile,
             cluster_shape_mnk=(2, 1, 1),
+            group_hint=512,
+            epi_flag_batch=(2, 4),
+            load_balance_mode="atomic_counter",
+            mma_tiler_mnk=tile,
             use_2cta_instrs=True,
             flag_batch=flag_batch,
             token_back_mode=token_back,

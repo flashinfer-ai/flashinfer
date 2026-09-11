@@ -60,24 +60,32 @@ def _to_cute(tensor: torch.Tensor, alignment: int):
     ).mark_layout_dynamic(leading_dim=1)
 
 
-def _try_fused_bf16_stage(
+def stage_mega_moe_inputs(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     x: torch.Tensor,
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
-) -> bool:
-    """Stage eligible views and return True; False requests original torch copies.
+) -> None:
+    """Stage eligible views with one kernel, or use the original torch copies.
 
     The fused kernel always masks the entire capacity tail, without a host
     live-count memo. Empty batches use the original single tail-fill operation.
     Strided, misaligned and aliased views keep their existing torch behavior.
     A new specialization first seen during capture also uses torch staging.
     """
+    torch_args = (
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        x,
+        topk_idx_out,
+        topk_weights_out,
+    )
     tensors = (hidden_states, topk_ids, topk_weights, x, topk_idx_out, topk_weights_out)
     if not _supported(tensors):
-        return False
+        return _torch_stage_mega_moe_inputs(*torch_args)
     from ......kernel_src.cutedsl_megamoe import ensure_not_capturing
 
     with torch.cuda.device(hidden_states.device):
@@ -90,7 +98,7 @@ def _try_fused_bf16_stage(
             # first appear during capture. Preserve the original torch path
             # for that graph rather than compiling or requiring extra warmup.
             if torch.cuda.is_current_stream_capturing():
-                return False
+                return _torch_stage_mega_moe_inputs(*torch_args)
             ensure_not_capturing("BF16 staging construction")
             stager = _CompiledStager()
 
@@ -117,17 +125,3 @@ def _try_fused_bf16_stage(
             stager.launch_key = launch_key
             stager.launch_args = args
         stager.compiled(*stager.launch_args)
-        return True
-
-
-def stage_mega_moe_inputs(
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    x: torch.Tensor,
-    topk_idx_out: torch.Tensor,
-    topk_weights_out: torch.Tensor,
-) -> None:
-    args = (hidden_states, topk_weights, topk_ids, x, topk_idx_out, topk_weights_out)
-    if not _try_fused_bf16_stage(*args):
-        _torch_stage_mega_moe_inputs(*args)

@@ -11,8 +11,6 @@ non-overlap subtiles and the common phase-aware completion tracker.
 No activation quantization, scale-factor output, or epilogue SMEM is used.
 """
 
-from typing import Optional
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -29,11 +27,13 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
 )
 from .tmem_epilogue import (
     W4A16EpiArgs,
-    Region,
     TmemTranspose16x32,
     EpilogueContext,
     Fc2OutputRouter,
-    make_bf16_fc2_stg_process_pipeline,
+    fc2_f2fp,
+    fc2_stg_post_f2fp_reorder,
+    fc2_stg_store_function,
+    make_bf16_fc2_store_mapping,
 )
 
 
@@ -41,14 +41,10 @@ class W4A16Epilogue:
     """Current scheduler/return contract with BF16 FC1 and two acc stages."""
 
     _EpilogueSyncWaitBarId = 1
-    _EpilogueAsyncBarIdBase = 4
-    _EpilogueFc1GateUpInterleave = 16
     _EpilogueTokenTileSize = 64
-    _EpilogueFc1IntermediateGateUpTileSize = 128
     _EpilogueFc1IntermediateDownTileSize = 64
     _EpilogueFc2HiddenTileSize = 128
     _EpilogueWarpCnt = 4
-    _TmemColsTotal = 512
 
     def __init__(
         self,
@@ -89,14 +85,7 @@ class W4A16Epilogue:
             raise ValueError(
                 "W4A16 requires FP32 accumulators and direct BF16 handoffs"
             )
-        self.fc2_use_bulk = False
-        self.reduce_topk_in_kernel = False
         self.token_back_by_dispatch = token_back_by_dispatch
-        self.combine_format = combine_format
-        self.fc1_output_dtype = fc1_output_dtype
-        self.acc_dtype = acc_dtype
-        self.fc1_output_sf_dtype = None
-        self.sf_vec_size = None
         self.gate_up_clamp = gate_up_clamp
         fc1_batch, fc2_batch = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(fc1_batch)))
@@ -106,56 +95,32 @@ class W4A16Epilogue:
         )
         self.cta_tile_m = self._EpilogueFc2HiddenTileSize
         self.cta_tile_n = mma_tiler_mnk[1]
-        self.cta_tile_k = mma_tiler_mnk[2]
         self.static_expert_shape = static_expert_shape
         self.acc_tmem_cols = self.cta_tile_n
-        self.acc_sf_cols = 0
-        self.fc2_hidden_needs_predicate = not (
-            static_expert_shape is not None
-            and static_expert_shape[2] % (self.cta_tile_m * cluster_shape_mn[0]) == 0
-        )
         self.intermediate_downproj = (
             static_expert_shape[1] // 2 if static_expert_shape is not None else None
         )
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
-        self.overlapping_accum = False
         self.num_acc_stage = 2
-        self.num_acc_pipeline_stages = 2
-        self.overlapped_tmem_cols = 0
-        self.epi_smem_bytes = 0
         self.tmem_acc_layout_py_obj = (
             (self.cta_tile_m, self.cta_tile_n, self.num_acc_stage),
             (1 << 16, 1, self.cta_tile_n),
         )
 
-    # Preserve the existing W4A16 stage selection, completion ordering,
-    # release tracker, barriers and tail flush.
     @cute.jit
     def run(
         self,
-        epi_smem_storage,
         tmem_ptr: cute.Pointer,
         acc_pipeline,
-        # ── Sched ────────────────────────────────────────────────────────
         sched_consumer: MoESchedConsumer,
         sched_ext: MoESchedExtension,
-        # ── tensors ──────────────────────────────────
-        tma_atom_fc1_output: cute.CopyAtom,
         fc1_output: cute.Tensor,  # Domain of fake (m, n, l)
-        fc1_output_sf: cute.Tensor,  # Domain of fake (m, n, l)
         fc2_output: cute.Tensor,  # MoE domain (token, topk, hidden)
         fc1_done_counter: cute.Tensor,  # 1D tensor
         tidx: cutlass.Int32,
-        optional_epi_args: W4A16EpiArgs = None,  # Epilogue optinal runtime arguments.
+        optional_epi_args: W4A16EpiArgs,
         token_comm_args=None,  # Only valid when enable token communication
     ):
-        if cutlass.const_expr(optional_epi_args is None):
-            optional_epi_args = W4A16EpiArgs(
-                fc1_alpha=None,
-                fc2_alpha=None,
-                fc1_norm_const=None,
-                topk_scores=None,
-            )
         tmem_acc = cute.make_tensor(
             cute.recast_ptr(tmem_ptr, dtype=cutlass.Float32),
             cute.make_layout(
@@ -167,26 +132,22 @@ class W4A16Epilogue:
         fc1_epi = W4A16Fc1Epilogue(
             self,
             tidx,
-            epi_smem_storage,
             sched_ext,
-            tma_atom_fc1_output,
             fc1_output,
-            fc1_output_sf,
             fc1_done_counter,
             optional_epi_args,
         )
         fc2_epi = W4A16Fc2Epilogue(
-            self, tidx, epi_smem_storage, fc2_output, token_comm_args, optional_epi_args
+            self, tidx, fc2_output, token_comm_args, optional_epi_args
         )
 
         acc_consumer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.num_acc_pipeline_stages
+            pipeline.PipelineUserType.Consumer, self.num_acc_stage
         )
         wait_only_named_barrier = pipeline.NamedBarrier(
             barrier_id=self._EpilogueSyncWaitBarId,
             num_threads=32 * self._EpilogueWarpCnt,
         )
-        is_odd_turn = cutlass.Int32(1)
         work_tile_info = sched_consumer.consume_work()
 
         flag_tracker = GpuReleaseFlagBatchTracker(
@@ -197,28 +158,21 @@ class W4A16Epilogue:
         )
 
         while work_tile_info.is_valid_tile:
-            if cutlass.const_expr(self.overlapping_accum):
-                tmem_stage_idx = acc_consumer_state.phase
-            else:
-                tmem_stage_idx = acc_consumer_state.index
+            tmem_stage_idx = acc_consumer_state.index
             tmem_acc_current = tmem_acc[None, None, tmem_stage_idx]
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
-                # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
                 fc1_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
-                    is_odd_turn=is_odd_turn,
                 )
             else:
-                # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
                 fc2_epi(
                     work_tile_info=work_tile_info,
                     tmem_acc_tensor=tmem_acc_current,
                     acc_pipeline=acc_pipeline,
                     acc_consumer_state=acc_consumer_state,
-                    is_odd_turn=is_odd_turn,
                 )
             iket.range_pop()
 
@@ -228,8 +182,6 @@ class W4A16Epilogue:
             )
 
             acc_consumer_state.advance()
-            if cutlass.const_expr(self.overlapping_accum):
-                is_odd_turn = cutlass.Int32(1) - is_odd_turn
 
             work_tile_info = sched_consumer.consume_work()
 
@@ -254,20 +206,16 @@ class W4A16Fc2Epilogue(EpilogueContext):
         self,
         base,
         tidx,
-        epi_smem_storage,
         fc2_output,
         token_comm_args,
         optional_epi_args,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
-        self.warp_idx = self.tidx // 32
-        self.lane_idx = self.tidx % 32
         self.fc2_output = fc2_output
         self.token_comm_args = token_comm_args
         self.optional_epi_args = optional_epi_args
-        self.smem_tensor = None
-        self.process_pipeline = make_bf16_fc2_stg_process_pipeline(
+        self.store_out_mapping = make_bf16_fc2_store_mapping(
             cta_token_tile_size=base.cta_tile_n,
             cta_hidden_tile_size=base.cta_tile_m,
         )
@@ -324,59 +272,40 @@ class W4A16Fc2Epilogue(EpilogueContext):
             peer_rank_ptr_mapper = self.token_comm_args.peer_rank_ptr_mapper
             data_token_base = None
 
-        base_outputs = self.fc2_output
-        token_bases = data_token_base
-        output_mappings = self.process_pipeline.store_out_mapping
-
         return Fc2OutputRouter(
             metadata=metadata_u32,
-            token_bases=token_bases,
-            base_outputs=base_outputs,
+            token_bases=data_token_base,
+            base_outputs=self.fc2_output,
             hidden_base_this_cta_tile=hidden_base_this_cta_tile,
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
             valid_tokens_this_cta_tile=work_tile_info.valid_tokens_in_cta_tile,
             valid_hidden_this_cta_tile=valid_hidden_this_cta_tile,
-            output_mappings=output_mappings,
+            output_mappings=self.store_out_mapping,
             epi_tid=self.tidx,
         ).prefetch()
 
     @cute.jit
     def run_subtile(
         self,
-        subtile_idx: cutlass.Int32,
-        # (hidden_tile, token_subtile), fundamentally (epi_tile_m, epi_tile_n)
-        tmem_subtile_tensor: cute.Tensor,
-        preload_acc,
-        fc2_output_router: "Fc2OutputRouter",
-        alpha_val: Optional[cutlass.Float32],
-        release_after_ldtm,
+        subtile_idx,
+        tmem_subtile_tensor,
+        fc2_output_router,
+        alpha_val,
         acc_pipeline,
         acc_consumer_state,
+        release_after_reorder: cutlass.Constexpr[bool],
     ):
-        process_pipeline = self.process_pipeline
-        if cutlass.const_expr(preload_acc is None):
-            loaded = process_pipeline.tmem_acc_load(
-                tmem_subtile_tensor=tmem_subtile_tensor,
-                epi=self,
-            )
-            if release_after_ldtm:
-                cute.arch.fence_view_async_tmem_load()
-                acc_pipeline.consumer_release(acc_consumer_state)
-        else:
-            loaded = preload_acc
-
-        casted = process_pipeline.f2fp(
-            *loaded,
-            alpha_val=alpha_val,
+        loaded = TmemTranspose16x32.load_subtile_raw_acc(tmem_subtile_tensor)
+        casted = fc2_f2fp(*loaded, alpha_val=alpha_val)
+        pre_store = fc2_stg_post_f2fp_reorder(
+            casted=casted, tmem_subtile_view=tmem_subtile_tensor
         )
-        # reorder returns a bare RMEM fragment in the store's expected pre-store
-        # distribution; reorder + store are paired 1:1 inside the pipeline.
-        pre_store = process_pipeline.post_f2fp_reorder(
-            casted=casted,
-            tmem_subtile_view=tmem_subtile_tensor,
-        )
-        process_pipeline.store_function(
-            epi=self,
+        if cutlass.const_expr(release_after_reorder):
+            # Reorder finishes all accumulator-TMEM scratch use; only
+            # register packing and STG remain.
+            cute.arch.fence_view_async_tmem_load()
+            acc_pipeline.consumer_release(acc_consumer_state)
+        fc2_stg_store_function(
             subtile=pre_store,
             subtile_idx=subtile_idx,
             fc2_output_router=fc2_output_router,
@@ -389,7 +318,6 @@ class W4A16Fc2Epilogue(EpilogueContext):
         tmem_acc_tensor,
         acc_pipeline,
         acc_consumer_state,
-        is_odd_turn,
     ):
         if cutlass.const_expr(self.optional_epi_args.fc2_alpha is not None):
             alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
@@ -417,64 +345,22 @@ class W4A16Fc2Epilogue(EpilogueContext):
         for i in cutlass.range_constexpr(self.subtile_cnt):
             subtile_idx = cutlass.Int32(i)
             if subtile_idx * cutlass.Int32(self._EpilogueTokenTileSize) < valid_tokens:
-                if cutlass.const_expr(i == self.subtile_cnt - 1):
-                    self._run_last_subtile(
-                        subtile_idx=subtile_idx,
-                        tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
-                            None, None, subtile_idx
-                        ],
-                        fc2_output_router=fc2_output_router,
-                        alpha_val=alpha_val,
-                        acc_pipeline=acc_pipeline,
-                        acc_consumer_state=acc_consumer_state,
-                    )
-                else:
-                    self.run_subtile(
-                        subtile_idx=subtile_idx,
-                        tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
-                            None, None, subtile_idx
-                        ],
-                        preload_acc=None,
-                        fc2_output_router=fc2_output_router,
-                        alpha_val=alpha_val,
-                        release_after_ldtm=False,
-                        acc_pipeline=acc_pipeline,
-                        acc_consumer_state=acc_consumer_state,
-                    )
+                self.run_subtile(
+                    subtile_idx=subtile_idx,
+                    tmem_subtile_tensor=tmem_acc_tensor_tiled_by_epi_tile[
+                        None, None, subtile_idx
+                    ],
+                    fc2_output_router=fc2_output_router,
+                    alpha_val=alpha_val,
+                    acc_pipeline=acc_pipeline,
+                    acc_consumer_state=acc_consumer_state,
+                    release_after_reorder=i == self.subtile_cnt - 1,
+                )
             elif cutlass.const_expr(i == self.subtile_cnt - 1):
                 # Includes zero tokens and N128 tiles with only the first
                 # subtile valid. This is the existing valid guard's else arm.
                 cute.arch.fence_view_async_tmem_load()
                 acc_pipeline.consumer_release(acc_consumer_state)
-
-    @cute.jit
-    def _run_last_subtile(
-        self,
-        subtile_idx,
-        tmem_subtile_tensor,
-        fc2_output_router,
-        alpha_val,
-        acc_pipeline,
-        acc_consumer_state,
-    ):
-        # Unlike raw LDTM, post-reorder's return ends all accumulator-TMEM
-        # scratch use. Its result is RMEM; only register packing and STG remain.
-        process_pipeline = self.process_pipeline
-        loaded = process_pipeline.tmem_acc_load(
-            tmem_subtile_tensor=tmem_subtile_tensor, epi=self
-        )
-        casted = process_pipeline.f2fp(*loaded, alpha_val=alpha_val)
-        pre_store = process_pipeline.post_f2fp_reorder(
-            casted=casted, tmem_subtile_view=tmem_subtile_tensor
-        )
-        cute.arch.fence_view_async_tmem_load()
-        acc_pipeline.consumer_release(acc_consumer_state)
-        process_pipeline.store_function(
-            epi=self,
-            subtile=pre_store,
-            subtile_idx=subtile_idx,
-            fc2_output_router=fc2_output_router,
-        )
 
 
 class W4A16Fc1Epilogue(EpilogueContext):
@@ -504,7 +390,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
         )
 
     @cute.jit
-    def _swiglu_act(self, t_swiglu, t_up, t_gate, prob=None):
+    def _swiglu_act(self, t_swiglu, t_up, t_gate):
         # Match the local W4A16 kernel's up * (gate * sigmoid(gate))
         # association before the BF16 FC1 handoff.
         for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
@@ -532,11 +418,8 @@ class W4A16Fc1Epilogue(EpilogueContext):
         self,
         base,
         tidx,
-        epi_smem_storage,
         sched_ext,
-        tma_atom_fc1_output,
         fc1_output,
-        fc1_output_sf,
         fc1_done_counter,
         optional_epi_args,
     ):
@@ -544,7 +427,6 @@ class W4A16Fc1Epilogue(EpilogueContext):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
-        self.lane_idx = self.tidx % 32
         self.sched_ext = sched_ext
         self.fc1_output = fc1_output
         self.fc1_done_counter = fc1_done_counter
@@ -558,7 +440,6 @@ class W4A16Fc1Epilogue(EpilogueContext):
         tmem_acc_tensor,
         acc_pipeline,
         acc_consumer_state,
-        is_odd_turn,
     ):
         real_fc1_output, _ = self.sched_ext.get_gmem_tensor(
             "c", self.fc1_output, work_tile_info
@@ -573,7 +454,6 @@ class W4A16Fc1Epilogue(EpilogueContext):
                 if subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
                     self._run_fc1_bf16_subtile(
                         tmem_acc_tensor,
-                        cutlass.Int32(0),
                         subtile_idx,
                         real_fc1_output,
                         work_tile_info,
@@ -588,7 +468,6 @@ class W4A16Fc1Epilogue(EpilogueContext):
         if last_subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
             self._run_fc1_bf16_subtile(
                 tmem_acc_tensor,
-                cutlass.Int32(0),
                 last_subtile_idx,
                 real_fc1_output,
                 work_tile_info,
@@ -609,7 +488,6 @@ class W4A16Fc1Epilogue(EpilogueContext):
     def _run_fc1_bf16_subtile(
         self,
         tmem_acc_tensor,
-        stage_offset,
         subtile_idx,
         real_fc1_output,
         work_tile_info,
@@ -633,7 +511,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
             cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256
         )
         for half in cutlass.range_constexpr(2):
-            token_col = stage_offset + subtile_idx * 64 + half * 32
+            token_col = subtile_idx * 64 + half * 32
             gate_ptr = tmem_acc_tensor.iterator + cute.assume(
                 (gate_feature << 16) + token_col, divby=16
             )
@@ -671,7 +549,6 @@ class W4A16Fc1Epilogue(EpilogueContext):
             )
             transpose = TmemTranspose16x32(
                 scratch_ptr,
-                Region.Top,
                 reg_tensor=activated,
             )
             transpose.r1_perm()

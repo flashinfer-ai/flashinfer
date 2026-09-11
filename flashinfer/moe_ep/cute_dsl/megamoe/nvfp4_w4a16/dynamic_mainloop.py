@@ -71,7 +71,6 @@ def bf16_static_idesc(umma_m: int) -> int:
 def _issue_bf16_atom(
     *,
     cta_group: int,
-    a_from_tmem: bool,
     accumulator,
     operand_a,
     operand_b,
@@ -82,15 +81,13 @@ def _issue_bf16_atom(
 ):
     # The literal PTX approach mirrors the vendored dynamic-N helper and
     # avoids unstable private NVVM enum bindings. BF16 uses kind::f16.
-    a_text = "[$1]" if a_from_tmem else "$1"
-    a_constraint = "r" if a_from_tmem else "l"
     llvm.inline_asm(
         None,
         [accumulator, operand_a, operand_b, descriptor, accumulate],
         "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $4, 0;\n\t"
         f"tcgen05.mma.cta_group::{cta_group}.kind::f16 "
-        f"[$0], {a_text}, $2, $3, p;\n\t}}\n",
-        f"r,{a_constraint},l,r,r",
+        "[$0], [$1], $2, $3, p;\n\t}\n",
+        "r,r,l,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -108,7 +105,6 @@ def issue_dynamic_bf16_mma_tile(
     k_tile_idx,
     valid_tokens_in_tile,
     mma_tiler_mnk: tuple,
-    a_from_tmem: bool,
     loc=None,
     ip=None,
 ):
@@ -137,14 +133,11 @@ def issue_dynamic_bf16_mma_tile(
         b_atom = b_frag_tile[(None, 0, inner_k)]
         acc_atom = acc_tensor[(None, 0, 0)]
         a_value = _as_value(a_atom.iterator)
-        a_operand = (
-            _tmem_ptr_to_i32(a_value) if a_from_tmem else _smem_desc_to_i64(a_value)
-        )
+        a_operand = _tmem_ptr_to_i32(a_value)
         accumulate = k_tile_idx != 0 if inner_k == 0 else True
         with cute.arch.elect_one():
             _issue_bf16_atom(
                 cta_group=cta_group,
-                a_from_tmem=a_from_tmem,
                 accumulator=_tmem_ptr_to_i32(_as_value(acc_atom.iterator)),
                 operand_a=a_operand,
                 operand_b=_smem_desc_to_i64(_as_value(b_atom.iterator)),

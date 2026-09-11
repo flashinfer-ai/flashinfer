@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """W4A16-owned fused FC1 + FC2 MegaMoE scheduler."""
 
+from copy import copy
+from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -58,193 +60,58 @@ class BlockPhase(IntEnum):
 # =============================================================================
 
 
+@dataclass(eq=False)
 class _FusedFc12SchedState:
-    """Sched warp register-resident state for the (group, phase, expert) state
-    machine.  Field set kept flat so MLIR serialization is one extend per
-    field; nested sub-states would not save anything in this footprint."""
+    """Ordered register state; cumulatives denote the current expert's start."""
 
-    def __init__(
-        self,
-        current_group_idx: Int32,
-        current_group_first_expert: Int32,
-        current_group_last_expert_exclusive: Int32,
-        current_phase: Int32,
-        current_expert_idx: Int32,
-        current_expert_tile_start: Int32,
-        current_expert_tile_end: Int32,
-        current_group_fc1_subphase_end: Int32,
-        current_group_end: Int32,
-        cumulative_fc1_tiles_at_group_end: Int32,
-        cumulative_fc2_tiles_at_group_end: Int32,
-        # Physical-row / token-block running cumulatives.  Each invariant is
-        # "(...)_cumul reflects the
-        # current expert's *start* offset under that padding granularity":
-        #   current_data_cumul        = sum_{e' < current_expert_idx}
-        #                                   round_up(valid_e', params.token_padding_block)
-        #   current_sf_cumul          = sum_{e' < current_expert_idx}
-        #                                   round_up(valid_e', params.sf_padding_block)
-        #   current_token_block_cumul = sum_{e' < current_expert_idx}
-        #                                   ceil_div(valid_e', cluster_tile_m)
-        # Each ``advance_expert_within_phase`` pushes the *previous* expert's
-        # occupation into these before bumping ``current_expert_idx``.
-        current_data_cumul: Int32,
-        current_sf_cumul: Int32,
-        current_token_block_cumul: Int32,
-        # Group-start checkpoints used by ``switch_to_fc2`` to rewind cumul
-        # state from group-end (fc1 phase's last expert) back to group-start
-        # (fc2 phase will re-walk the same experts).  Captured at
-        # ``advance_group`` time *after* pushing the previous group's tail.
-        group_start_data_cumul: Int32,
-        group_start_sf_cumul: Int32,
-        group_start_token_block_cumul: Int32,
-        current_token_block_count: Int32,
-        current_token_offset: Int32,
-        current_this_expert_token_cnt: Int32,
-        current_work_linear_tile_idx: Int32,
-    ):
-        self.current_group_idx = current_group_idx
-        self.current_group_first_expert = current_group_first_expert
-        self.current_group_last_expert_exclusive = current_group_last_expert_exclusive
-        self.current_phase = current_phase
-        self.current_expert_idx = current_expert_idx
-        self.current_expert_tile_start = current_expert_tile_start
-        self.current_expert_tile_end = current_expert_tile_end
-        self.current_group_fc1_subphase_end = current_group_fc1_subphase_end
-        self.current_group_end = current_group_end
-        self.cumulative_fc1_tiles_at_group_end = cumulative_fc1_tiles_at_group_end
-        self.cumulative_fc2_tiles_at_group_end = cumulative_fc2_tiles_at_group_end
-        self.current_data_cumul = current_data_cumul
-        self.current_sf_cumul = current_sf_cumul
-        self.current_token_block_cumul = current_token_block_cumul
-        self.group_start_data_cumul = group_start_data_cumul
-        self.group_start_sf_cumul = group_start_sf_cumul
-        self.group_start_token_block_cumul = group_start_token_block_cumul
-        self.current_token_block_count = current_token_block_count
-        self.current_token_offset = current_token_offset
-        self.current_this_expert_token_cnt = current_this_expert_token_cnt
-        self.current_work_linear_tile_idx = current_work_linear_tile_idx
+    current_group_first_expert: Int32
+    current_group_last_expert_exclusive: Int32
+    current_phase: Int32
+    current_expert_idx: Int32
+    current_expert_tile_start: Int32
+    current_expert_tile_end: Int32
+    current_group_fc1_subphase_end: Int32
+    current_group_end: Int32
+    cumulative_fc1_tiles_at_group_end: Int32
+    cumulative_fc2_tiles_at_group_end: Int32
+    current_data_cumul: Int32
+    current_token_block_cumul: Int32
+    group_start_data_cumul: Int32
+    group_start_token_block_cumul: Int32
+    current_token_block_count: Int32
+    current_this_expert_token_cnt: Int32
+    current_work_linear_tile_idx: Int32
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
-        values = []
-        values.extend(extract_mlir_values(self.current_group_idx))
-        values.extend(extract_mlir_values(self.current_group_first_expert))
-        values.extend(extract_mlir_values(self.current_group_last_expert_exclusive))
-        values.extend(extract_mlir_values(self.current_phase))
-        values.extend(extract_mlir_values(self.current_expert_idx))
-        values.extend(extract_mlir_values(self.current_expert_tile_start))
-        values.extend(extract_mlir_values(self.current_expert_tile_end))
-        values.extend(extract_mlir_values(self.current_group_fc1_subphase_end))
-        values.extend(extract_mlir_values(self.current_group_end))
-        values.extend(extract_mlir_values(self.cumulative_fc1_tiles_at_group_end))
-        values.extend(extract_mlir_values(self.cumulative_fc2_tiles_at_group_end))
-        values.extend(extract_mlir_values(self.current_data_cumul))
-        values.extend(extract_mlir_values(self.current_sf_cumul))
-        values.extend(extract_mlir_values(self.current_token_block_cumul))
-        values.extend(extract_mlir_values(self.group_start_data_cumul))
-        values.extend(extract_mlir_values(self.group_start_sf_cumul))
-        values.extend(extract_mlir_values(self.group_start_token_block_cumul))
-        values.extend(extract_mlir_values(self.current_token_block_count))
-        values.extend(extract_mlir_values(self.current_token_offset))
-        values.extend(extract_mlir_values(self.current_this_expert_token_cnt))
-        values.extend(extract_mlir_values(self.current_work_linear_tile_idx))
-        return values
+        return extract_mlir_values(tuple(vars(self).values()))
 
-    def __new_from_mlir_values__(
-        self, values: List[ir.Value]
-    ) -> "_FusedFc12SchedState":
-        idx = 0
-
-        def _take(obj):
-            nonlocal idx
-            n = len(extract_mlir_values(obj))
-            result = new_from_mlir_values(obj, values[idx : idx + n])
-            idx += n
-            return result
-
-        return _FusedFc12SchedState(
-            current_group_idx=_take(self.current_group_idx),
-            current_group_first_expert=_take(self.current_group_first_expert),
-            current_group_last_expert_exclusive=_take(
-                self.current_group_last_expert_exclusive
-            ),
-            current_phase=_take(self.current_phase),
-            current_expert_idx=_take(self.current_expert_idx),
-            current_expert_tile_start=_take(self.current_expert_tile_start),
-            current_expert_tile_end=_take(self.current_expert_tile_end),
-            current_group_fc1_subphase_end=_take(self.current_group_fc1_subphase_end),
-            current_group_end=_take(self.current_group_end),
-            cumulative_fc1_tiles_at_group_end=_take(
-                self.cumulative_fc1_tiles_at_group_end
-            ),
-            cumulative_fc2_tiles_at_group_end=_take(
-                self.cumulative_fc2_tiles_at_group_end
-            ),
-            current_data_cumul=_take(self.current_data_cumul),
-            current_sf_cumul=_take(self.current_sf_cumul),
-            current_token_block_cumul=_take(self.current_token_block_cumul),
-            group_start_data_cumul=_take(self.group_start_data_cumul),
-            group_start_sf_cumul=_take(self.group_start_sf_cumul),
-            group_start_token_block_cumul=_take(self.group_start_token_block_cumul),
-            current_token_block_count=_take(self.current_token_block_count),
-            current_token_offset=_take(self.current_token_offset),
-            current_this_expert_token_cnt=_take(self.current_this_expert_token_cnt),
-            current_work_linear_tile_idx=_take(self.current_work_linear_tile_idx),
-        )
+    def __new_from_mlir_values__(self, values: List[ir.Value]):
+        return type(self)(*new_from_mlir_values(tuple(vars(self).values()), values))
 
 
+@dataclass(eq=False)
 class _DynamicLoadBalanceState:
-    """Atomic-counter load-balance state.  Set on the scheduler only when
-    ``params.load_balance_mode == 'atomic_counter'``.  ``atomic_res`` caches
-    the first pre-init claim so the first advance site does not issue another
-    atom.add.
-    """
+    """Atomic broadcast state, including the first claim cached before init."""
 
-    def __init__(
-        self,
-        counter_ptr,
-        broadcast_ptr,
-        is_leader_cta: Boolean,
-        producer_state,
-        consumer_state,
-        atomic_res: Int32,
-    ):
-        self.counter_ptr = counter_ptr
-        self.broadcast_ptr = broadcast_ptr
-        self.is_leader_cta = is_leader_cta
-        self.producer_state = producer_state
-        self.consumer_state = consumer_state
-        self.atomic_res = atomic_res
+    counter_ptr: Any
+    broadcast_ptr: Any
+    is_leader_cta: Boolean
+    producer_state: Any
+    consumer_state: Any
+    atomic_res: Int32
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
-        values = []
-        values.extend(extract_mlir_values(self.counter_ptr))
-        values.extend(extract_mlir_values(self.broadcast_ptr))
-        values.extend(extract_mlir_values(self.is_leader_cta))
-        values.extend(extract_mlir_values(self.producer_state))
-        values.extend(extract_mlir_values(self.consumer_state))
-        values.extend(extract_mlir_values(self.atomic_res))
-        return values
+        return extract_mlir_values(tuple(vars(self).values()))
 
-    def __new_from_mlir_values__(
-        self, values: List[ir.Value]
-    ) -> "_DynamicLoadBalanceState":
+    def __new_from_mlir_values__(self, values: List[ir.Value]):
+        # Nested pipeline states rebuild from their own extracted value counts.
+        fields = []
         idx = 0
-
-        def _take(obj):
-            nonlocal idx
-            n = len(extract_mlir_values(obj))
-            result = new_from_mlir_values(obj, values[idx : idx + n])
-            idx += n
-            return result
-
-        return _DynamicLoadBalanceState(
-            counter_ptr=_take(self.counter_ptr),
-            broadcast_ptr=_take(self.broadcast_ptr),
-            is_leader_cta=_take(self.is_leader_cta),
-            producer_state=_take(self.producer_state),
-            consumer_state=_take(self.consumer_state),
-            atomic_res=_take(self.atomic_res),
-        )
+        for field in vars(self).values():
+            count = len(extract_mlir_values(field))
+            fields.append(new_from_mlir_values(field, values[idx : idx + count]))
+            idx += count
+        return type(self)(*fields)
 
 
 # =============================================================================
@@ -274,11 +141,9 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         cluster_shape_mn: Tuple[int, int],
         group_hint: int,
         token_padding_block: int,
-        sf_padding_block: int,
         load_balance_mode: Literal["static", "atomic_counter"] = "static",
         load_balance_counter_ptr=None,
         override_num_stages: Optional[int] = None,
-        is_swap_ab: bool = True,
         # Exactly one of the next two must be non-None (sizes preferred when
         # the host can expose a direct view onto ``expert_recv_count_sum``;
         # prefix_sum required when only a host-precomputed cumsum is
@@ -307,10 +172,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             raise ValueError(
                 f"token_padding_block must be positive, got {token_padding_block}"
             )
-        if sf_padding_block <= 0:
-            raise ValueError(
-                f"sf_padding_block must be positive, got {sf_padding_block}"
-            )
         if (expert_token_sizes is None) == (expert_token_prefix_sum is None):
             raise ValueError(
                 "Exactly one of expert_token_sizes / expert_token_prefix_sum "
@@ -325,11 +186,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             cta_tile_shape_mnk=cta_tile_shape_mnk,
             cluster_shape_mn=cluster_shape_mn,
             override_num_stages=override_num_stages,
-            is_swap_ab=is_swap_ab,
+            is_swap_ab=True,
         )
         self.group_hint = group_hint
         self.token_padding_block = token_padding_block
-        self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
@@ -338,113 +198,47 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
 
-    def get_grid_shape(
-        self,
-        max_active_clusters: int,
-    ) -> Tuple[int, int, int]:
-        if self.is_swap_ab:
-            return (
-                self.cluster_shape_mn[1],
-                self.cluster_shape_mn[0],
-                max_active_clusters,
-            )
+    def get_grid_shape(self, max_active_clusters: int) -> Tuple[int, int, int]:
         return (
-            self.cluster_shape_mn[0],
             self.cluster_shape_mn[1],
+            self.cluster_shape_mn[0],
             max_active_clusters,
         )
 
-    def __extract_mlir_values__(self) -> List[ir.Value]:
-        """Type-discriminated serialization (see ``MoEStaticSchedulerParams``).
-
-        Python int fields supplied via ``static_expert_shape`` skip the
-        MLIR carry and remain inlined codegen-time literals; Int32
-        fields (the dynamic ``fc1_weight.shape`` path) flow through as
-        SSA values as usual.
-
-        Exactly one of ``expert_token_sizes`` / ``expert_token_prefix_sum``
-        is non-None (enforced in ``__init__``); whichever it is gets
-        extended.  ``__new_from_mlir_values__`` reads the same prototype
-        ``self`` to decide which side to consume.
-        """
-        values = []
-        if isinstance(self.expert_cnt, Int32):
-            values.extend(extract_mlir_values(self.expert_cnt))
-        if isinstance(self.intermediate, Int32):
-            values.extend(extract_mlir_values(self.intermediate))
-        if isinstance(self.hidden, Int32):
-            values.extend(extract_mlir_values(self.hidden))
+    def _mlir_fields(self):
+        fields = [
+            name
+            for name in ("expert_cnt", "intermediate", "hidden")
+            if isinstance(getattr(self, name), Int32)
+        ]
         if self.load_balance_mode == "atomic_counter":
-            values.extend(extract_mlir_values(self.load_balance_counter_ptr))
-        if self.expert_token_sizes is not None:
-            values.extend(extract_mlir_values(self.expert_token_sizes))
-        else:
-            values.extend(extract_mlir_values(self.expert_token_prefix_sum))
-        return values
-
-    def __new_from_mlir_values__(
-        self, values: List[ir.Value]
-    ) -> "MoEFusedFc12SchedulerParams":
-        # Bypass __init__: stored cta_tile_shape_mnk / cluster_shape_mn are
-        # already in post-swap form, going through __init__ would double-swap.
-        # Mirrors MoEStaticSchedulerParams.__new_from_mlir_values__.
-        result = MoEFusedFc12SchedulerParams.__new__(MoEFusedFc12SchedulerParams)
-        result.scenario = self.scenario
-        result.is_swap_ab = self.is_swap_ab
-        result.cta_tile_shape_mnk = self.cta_tile_shape_mnk
-        result.cluster_shape_mn = self.cluster_shape_mn
-        result.num_sched_stages = self.num_sched_stages
-        result.group_hint = self.group_hint
-        result.token_padding_block = self.token_padding_block
-        result.sf_padding_block = self.sf_padding_block
-        result.load_balance_mode = self.load_balance_mode
-
-        # Type-discriminated rebind: Python int fields copy from
-        # prototype (``self``), Int32 fields consume from ``values``.
-        idx = 0
-        if isinstance(self.expert_cnt, Int32):
-            result.expert_cnt = new_from_mlir_values(self.expert_cnt, [values[idx]])
-            idx += 1
-        else:
-            result.expert_cnt = self.expert_cnt
-        if isinstance(self.intermediate, Int32):
-            result.intermediate = new_from_mlir_values(self.intermediate, [values[idx]])
-            idx += 1
-        else:
-            result.intermediate = self.intermediate
-        if isinstance(self.hidden, Int32):
-            result.hidden = new_from_mlir_values(self.hidden, [values[idx]])
-            idx += 1
-        else:
-            result.hidden = self.hidden
-        if self.load_balance_mode == "atomic_counter":
-            ptr_len = len(extract_mlir_values(self.load_balance_counter_ptr))
-            result.load_balance_counter_ptr = new_from_mlir_values(
-                self.load_balance_counter_ptr, values[idx : idx + ptr_len]
-            )
-            idx += ptr_len
-        else:
-            result.load_balance_counter_ptr = None
-        # Sizes / prefix_sum: prototype tells us which side carries the
-        # actual tensor; the other side stays None on the result.
-        if self.expert_token_sizes is not None:
-            t_len = len(extract_mlir_values(self.expert_token_sizes))
-            result.expert_token_sizes = new_from_mlir_values(
-                self.expert_token_sizes, values[idx : idx + t_len]
-            )
-            idx += t_len
-            result.expert_token_prefix_sum = None
-        else:
-            t_len = len(extract_mlir_values(self.expert_token_prefix_sum))
-            result.expert_token_prefix_sum = new_from_mlir_values(
-                self.expert_token_prefix_sum, values[idx : idx + t_len]
-            )
-            idx += t_len
-            result.expert_token_sizes = None
-        assert idx == len(values), (
-            f"Fused fc12 sched params type-discrim mismatch: idx={idx} "
-            f"len(values)={len(values)}"
+            fields.append("load_balance_counter_ptr")
+        fields.append(
+            "expert_token_sizes"
+            if self.expert_token_sizes is not None
+            else "expert_token_prefix_sum"
         )
+        return fields
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        return extract_mlir_values(
+            tuple(getattr(self, name) for name in self._mlir_fields())
+        )
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]):
+        # Copy post-swap constants without re-entering the swapping constructor.
+        result = copy(self)
+        idx = 0
+        for name in self._mlir_fields():
+            field = getattr(self, name)
+            count = len(extract_mlir_values(field))
+            setattr(
+                result, name, new_from_mlir_values(field, values[idx : idx + count])
+            )
+            idx += count
+        if self.load_balance_mode == "static":
+            result.load_balance_counter_ptr = None
+        assert idx == len(values), "Fused fc12 scheduler parameter value count mismatch"
         return result
 
 
@@ -574,24 +368,17 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # ``params.cluster_shape_mn`` is scheduler-internal.  Under swap-AB,
         # launch axes map to the opposite internal M/N slots.
-        if const_expr(params.is_swap_ab):
-            cta_id_in_cluster = (
-                Int32(bidy % params.cluster_shape_mn[0]),
-                Int32(bidx % params.cluster_shape_mn[1]),
-                Int32(0),
-            )
-        else:
-            cta_id_in_cluster = (
-                Int32(bidx % params.cluster_shape_mn[0]),
-                Int32(bidy % params.cluster_shape_mn[1]),
-                Int32(0),
-            )
+        cta_id_in_cluster = (
+            Int32(bidy % params.cluster_shape_mn[0]),
+            Int32(bidx % params.cluster_shape_mn[1]),
+            Int32(0),
+        )
 
         # State machine sentinel init.  The 0 values for current_group_end /
         # current_expert_tile_end force gen_next_work's first call to enter
         # advance_group() and advance_expert_within_phase(), which then fill
-        # the rest of the state from offs.  current_group_idx / current_expert_idx
-        # = -1 so that advance_* increments cleanly to 0 on first call.
+        # the rest of the state from counts. current_expert_idx starts at -1
+        # so the first advance increments to expert 0.
         #
         # All cumul fields (current_*_cumul / group_start_*_cumul) start at 0;
         # current_this_expert_token_cnt and current_token_block_count also start
@@ -599,7 +386,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # advance_group call pushes a no-op (round_up(0, ...) = 0) into the
         # cumul state before reading expert 0's valid count.
         fused_state = _FusedFc12SchedState(
-            current_group_idx=Int32(-1),
             current_group_first_expert=Int32(0),
             current_group_last_expert_exclusive=Int32(0),
             current_phase=Int32(BlockPhase.Linear1),
@@ -611,13 +397,10 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cumulative_fc1_tiles_at_group_end=Int32(0),
             cumulative_fc2_tiles_at_group_end=Int32(0),
             current_data_cumul=Int32(0),
-            current_sf_cumul=Int32(0),
             current_token_block_cumul=Int32(0),
             group_start_data_cumul=Int32(0),
-            group_start_sf_cumul=Int32(0),
             group_start_token_block_cumul=Int32(0),
             current_token_block_count=Int32(0),
-            current_token_offset=Int32(0),
             current_this_expert_token_cnt=Int32(0),
             current_work_linear_tile_idx=Int32(bidz),
         )
@@ -648,29 +431,15 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # current_work init must use ext.WorkTileInfo to match the shape that
         # gen_next_work writes; otherwise MLIR serialization slots would differ.
-        if const_expr(params.is_swap_ab):
-            current_work = ext.WorkTileInfo(
-                expert_idx=Int32(WorkTileState.DONE),
-                tile_m_idx=Int32(0),
-                tile_n_idx=Int32(0),
-                cumulative_data_physical_row=Int32(0),
-                cumulative_sf_physical_row=Int32(0),
-                cumulative_token_block_count=Int32(0),
-                valid_tokens_in_cta_tile=Int32(0),
-                phase_and_peek=Int32(BlockPhase.None_),
-            )
-        else:
-            current_work = ext.WorkTileInfo(
-                expert_idx=Int32(WorkTileState.DONE),
-                tile_m_idx=Int32(0),
-                tile_n_idx=Int32(0),
-                cumulative_data_physical_row=Int32(0),
-                cumulative_sf_physical_row=Int32(0),
-                cumulative_token_block_count=Int32(0),
-                valid_tokens_in_cta_cluster_tile=Int32(0),
-                phase_and_peek=Int32(BlockPhase.None_),
-                fc1_counter_index=Int32(0),
-            )
+        current_work = ext.WorkTileInfo(
+            expert_idx=Int32(WorkTileState.DONE),
+            tile_m_idx=Int32(0),
+            tile_n_idx=Int32(0),
+            cumulative_data_physical_row=Int32(0),
+            cumulative_token_block_count=Int32(0),
+            valid_tokens_in_cta_tile=Int32(0),
+            phase_and_peek=Int32(BlockPhase.None_),
+        )
 
         sched_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32)
         sched_consumer_group = pipeline.CooperativeGroup(
@@ -930,34 +699,17 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # Push previous expert into cumul state before bumping expert_idx.
         token_padding = params.token_padding_block
-        sf_padding = params.sf_padding_block
         prev_valid = state.current_this_expert_token_cnt
         state.current_data_cumul = state.current_data_cumul + (
             (prev_valid + Int32(token_padding - 1)) // Int32(token_padding)
         ) * Int32(token_padding)
-        state.current_sf_cumul = state.current_sf_cumul + (
-            (prev_valid + Int32(sf_padding - 1)) // Int32(sf_padding)
-        ) * Int32(sf_padding)
         state.current_token_block_cumul = (
             state.current_token_block_cumul + state.current_token_block_count
         )
 
-        # Refresh current expert token range.
-        #
-        # Two data-source modes (selected at codegen time by which side of
-        # the params Optional pair is non-None):
-        #   - prefix-sum mode: random-access ``offs[i] - offs[i-1]`` gives
-        #     both offset and count in O(1).
-        #   - sizes mode: ``sizes[i]`` gives only the count; the cumulative
-        #     offset is maintained as a running cumul on
-        #     ``state.current_token_offset`` (push prev_valid before bumping
-        #     expert_idx).  This works because ``_advance_expert_within_phase``
-        #     is always called in monotonically-increasing expert order
-        #     (every group advance walks through residual experts of the
-        #     finishing group first, so no random jumps).
+        # Only the count is consumed; either supported source yields it.
         state.current_expert_idx = state.current_expert_idx + Int32(1)
         if cutlass.const_expr(self.params.expert_token_sizes is not None):
-            state.current_token_offset = state.current_token_offset + prev_valid
             this_expert_token_cnt = compute_expert_token_count_from_sizes(
                 self.params.expert_token_sizes,
                 state.current_expert_idx,
@@ -965,13 +717,12 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 ip=ip,
             )
         else:
-            token_offset, this_expert_token_cnt = compute_expert_token_range(
+            _, this_expert_token_cnt = compute_expert_token_range(
                 self.params.expert_token_prefix_sum,
                 state.current_expert_idx,
                 loc=loc,
                 ip=ip,
             )
-            state.current_token_offset = token_offset
         state.current_this_expert_token_cnt = this_expert_token_cnt
         state.current_token_block_count = (
             this_expert_token_cnt + Int32(cluster_tile_m) - 1
@@ -1010,7 +761,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         state.current_this_expert_token_cnt = Int32(0)
         state.current_token_block_count = Int32(0)
         state.current_data_cumul = state.group_start_data_cumul
-        state.current_sf_cumul = state.group_start_sf_cumul
         state.current_token_block_cumul = state.group_start_token_block_cumul
         self._advance_expert_within_phase(loc=loc, ip=ip)
 
@@ -1042,28 +792,22 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
         # Final push; cumul now reflects the next group's first expert start.
         token_padding = params.token_padding_block
-        sf_padding = params.sf_padding_block
         prev_valid = state.current_this_expert_token_cnt
         state.current_data_cumul = state.current_data_cumul + (
             (prev_valid + Int32(token_padding - 1)) // Int32(token_padding)
         ) * Int32(token_padding)
-        state.current_sf_cumul = state.current_sf_cumul + (
-            (prev_valid + Int32(sf_padding - 1)) // Int32(sf_padding)
-        ) * Int32(sf_padding)
         state.current_token_block_cumul = (
             state.current_token_block_cumul + state.current_token_block_count
         )
 
         # --- Step 3: snapshot new group_start cumul checkpoint.
         state.group_start_data_cumul = state.current_data_cumul
-        state.group_start_sf_cumul = state.current_sf_cumul
         state.group_start_token_block_cumul = state.current_token_block_cumul
 
         # --- Step 4: roll group state forward.
         base_fc1 = state.cumulative_fc1_tiles_at_group_end
         base_fc2 = state.cumulative_fc2_tiles_at_group_end
 
-        state.current_group_idx = state.current_group_idx + Int32(1)
         state.current_group_first_expert = state.current_group_last_expert_exclusive
 
         # Greedy walk: accumulate per-expert fc1+fc2 tile counts until fc1
@@ -1183,50 +927,19 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         valid_tokens_in_cta_tile = cutlass.min(remaining_in_expert, Int32(cta_tile_m))
 
         # Swap scheduler-internal M/N back to GEMM-domain M/N on output.
-        if const_expr(params.is_swap_ab):
-            tile_m_idx = cta_intermediate_or_hidden_block_idx
-            tile_n_idx = cta_token_block_idx
-        else:
-            tile_m_idx = cta_token_block_idx
-            tile_n_idx = cta_intermediate_or_hidden_block_idx
+        tile_m_idx = cta_intermediate_or_hidden_block_idx
+        tile_n_idx = cta_token_block_idx
 
         # ext.enrich_work_tile_info may OR the peek bit into phase_and_peek.
-        if const_expr(params.is_swap_ab):
-            return self._ext.WorkTileInfo(
-                expert_idx=state.current_expert_idx,
-                tile_m_idx=tile_m_idx,
-                tile_n_idx=tile_n_idx,
-                cumulative_data_physical_row=state.current_data_cumul,
-                cumulative_sf_physical_row=state.current_sf_cumul,
-                cumulative_token_block_count=state.current_token_block_cumul,
-                valid_tokens_in_cta_tile=valid_tokens_in_cta_tile,
-                phase_and_peek=state.current_phase,
-            )
-        else:
-            fc1_counter_index = cluster_token_block_idx
-            cluster_tile_m = params.cluster_shape_mn[0] * cta_tile_m
-            cluster_start = cluster_token_block_idx * Int32(cluster_tile_m)
-            remaining_cluster = cutlass.max(
-                state.current_this_expert_token_cnt - cluster_start, Int32(0)
-            )
-            valid_tokens_in_cluster_tile = cutlass.min(
-                remaining_cluster, Int32(cluster_tile_m)
-            )
-            # Pack: high 16b = per-CTA tile count, low 16b = cluster-level count.
-            valid_tokens_in_cta_cluster_tile = (
-                valid_tokens_in_cta_tile << Int32(16)
-            ) | valid_tokens_in_cluster_tile
-            return self._ext.WorkTileInfo(
-                expert_idx=state.current_expert_idx,
-                tile_m_idx=tile_m_idx,
-                tile_n_idx=tile_n_idx,
-                cumulative_data_physical_row=state.current_data_cumul,
-                cumulative_sf_physical_row=state.current_sf_cumul,
-                cumulative_token_block_count=state.current_token_block_cumul,
-                valid_tokens_in_cta_cluster_tile=valid_tokens_in_cta_cluster_tile,
-                phase_and_peek=state.current_phase,
-                fc1_counter_index=fc1_counter_index,
-            )
+        return self._ext.WorkTileInfo(
+            expert_idx=state.current_expert_idx,
+            tile_m_idx=tile_m_idx,
+            tile_n_idx=tile_n_idx,
+            cumulative_data_physical_row=state.current_data_cumul,
+            cumulative_token_block_count=state.current_token_block_cumul,
+            valid_tokens_in_cta_tile=valid_tokens_in_cta_tile,
+            phase_and_peek=state.current_phase,
+        )
 
     @dsl_user_op
     @cute.jit
@@ -1241,29 +954,15 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         state = self._fused_state
 
         # Sentinel-by-default work tile; conditionally overwritten by decode.
-        if const_expr(self.params.is_swap_ab):
-            base_work = self._ext.WorkTileInfo(
-                expert_idx=Int32(WorkTileState.DONE),
-                tile_m_idx=Int32(0),
-                tile_n_idx=Int32(0),
-                cumulative_data_physical_row=Int32(0),
-                cumulative_sf_physical_row=Int32(0),
-                cumulative_token_block_count=Int32(0),
-                valid_tokens_in_cta_tile=Int32(0),
-                phase_and_peek=Int32(BlockPhase.None_),
-            )
-        else:
-            base_work = self._ext.WorkTileInfo(
-                expert_idx=Int32(WorkTileState.DONE),
-                tile_m_idx=Int32(0),
-                tile_n_idx=Int32(0),
-                cumulative_data_physical_row=Int32(0),
-                cumulative_sf_physical_row=Int32(0),
-                cumulative_token_block_count=Int32(0),
-                valid_tokens_in_cta_cluster_tile=Int32(0),
-                phase_and_peek=Int32(BlockPhase.None_),
-                fc1_counter_index=Int32(0),
-            )
+        base_work = self._ext.WorkTileInfo(
+            expert_idx=Int32(WorkTileState.DONE),
+            tile_m_idx=Int32(0),
+            tile_n_idx=Int32(0),
+            cumulative_data_physical_row=Int32(0),
+            cumulative_token_block_count=Int32(0),
+            valid_tokens_in_cta_tile=Int32(0),
+            phase_and_peek=Int32(BlockPhase.None_),
+        )
 
         # DSL carry for mutated self and while-condition fields.
         outer_group_end = state.current_group_end
@@ -1375,63 +1074,36 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             self._first_advance_pending = False
         iket.range_pop()
 
-    def __extract_mlir_values__(self) -> List[ir.Value]:
-        values = []
-        values.extend(extract_mlir_values(self.params))
-        values.extend(extract_mlir_values(self.num_persistent_clusters))
-        values.extend(extract_mlir_values(self.cta_id_in_cluster))
-        values.extend(extract_mlir_values(self.current_work))
-        values.extend(extract_mlir_values(self._fused_state))
-        values.extend(extract_mlir_values(self._num_fc1_intermediate_blocks))
-        values.extend(extract_mlir_values(self._num_fc2_hidden_blocks))
+    def _mlir_fields(self):
+        fields = (
+            "params",
+            "num_persistent_clusters",
+            "cta_id_in_cluster",
+            "current_work",
+            "_fused_state",
+            "_num_fc1_intermediate_blocks",
+            "_num_fc2_hidden_blocks",
+        )
         if self.params.load_balance_mode == "atomic_counter":
-            values.extend(extract_mlir_values(self._dynamic_state))
-        values.extend(extract_mlir_values(self._producer_state))
-        return values
+            fields += ("_dynamic_state",)
+        return fields + ("_producer_state",)
 
-    def __new_from_mlir_values__(
-        self, values: List[ir.Value]
-    ) -> "MoEFusedFc12PersistentTileScheduler":
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        return extract_mlir_values(
+            tuple(getattr(self, name) for name in self._mlir_fields())
+        )
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]):
+        # Pipeline/storage references and the first-trace flag remain Python state.
+        result = copy(self)
         idx = 0
-
-        def _take(obj):
-            nonlocal idx
-            n = len(extract_mlir_values(obj))
-            result = new_from_mlir_values(obj, values[idx : idx + n])
-            idx += n
-            return result
-
-        new_params = _take(self.params)
-        new_num_persistent_clusters = _take(self.num_persistent_clusters)
-        new_cta_id_in_cluster = _take(self.cta_id_in_cluster)
-        new_current_work = _take(self.current_work)
-        new_fused_state = _take(self._fused_state)
-        new_num_fc1_intermediate_blocks = _take(self._num_fc1_intermediate_blocks)
-        new_num_fc2_hidden_blocks = _take(self._num_fc2_hidden_blocks)
-        new_dynamic_state = (
-            _take(self._dynamic_state)
-            if self.params.load_balance_mode == "atomic_counter"
-            else None
-        )
-        new_producer_state = _take(self._producer_state)
-
-        result = MoEFusedFc12PersistentTileScheduler.__new__(
-            MoEFusedFc12PersistentTileScheduler
-        )
-        result.params = new_params
-        result.num_persistent_clusters = new_num_persistent_clusters
-        result.cta_id_in_cluster = new_cta_id_in_cluster
-        result.current_work = new_current_work
-        result._fused_state = new_fused_state
-        result._num_fc1_intermediate_blocks = new_num_fc1_intermediate_blocks
-        result._num_fc2_hidden_blocks = new_num_fc2_hidden_blocks
-        result._dynamic_state = new_dynamic_state
-        result._ext = self._ext
-        result._pipeline = self._pipeline
-        result._smem_buf_tensor = self._smem_buf_tensor
-        result._num_sched_stages = self._num_sched_stages
-        result._cluster_pipeline = self._cluster_pipeline
-        result._producer_state = new_producer_state
-        # Python-only attrs: copy from prototype, not MLIR values.
-        result._first_advance_pending = self._first_advance_pending
+        for name in self._mlir_fields():
+            field = getattr(self, name)
+            count = len(extract_mlir_values(field))
+            setattr(
+                result, name, new_from_mlir_values(field, values[idx : idx + count])
+            )
+            idx += count
+        if self.params.load_balance_mode == "static":
+            result._dynamic_state = None
         return result

@@ -95,10 +95,6 @@ class MegaMoEW4A16Config:
             "reuse_dispatch_warps",
         ):
             raise ValueError(f"unsupported token_back_mode={self.token_back_mode!r}.")
-        if self.in_kernel_fc2_reduce and self.token_back_mode == "epi_warps":
-            raise ValueError(
-                "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
-            )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -124,23 +120,17 @@ class MegaMoEW4A16Frontend:
 
     def __init__(self, config: MegaMoEW4A16Config) -> None:
         self._config = config
-        self._gate_up_clamp = config.gate_up_clamp
-        self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
         self._reduce = None
 
     @property
     def config(self) -> MegaMoEW4A16Config:
-        if self._gate_up_clamp == self._config.gate_up_clamp:
-            return self._config
-        return dataclasses.replace(self._config, gate_up_clamp=self._gate_up_clamp)
+        return self._config
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
-        if self._gate_up_clamp != clamp:
-            self._release_workspace()
-            self._gate_up_clamp = clamp
-            self._mega_key = None
-            self._mega = None
+        if self._config.gate_up_clamp != clamp:
+            self.release()
+            self._config = dataclasses.replace(self._config, gate_up_clamp=clamp)
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated swapped-MMA tuning configuration and invalidate its compile."""
@@ -154,21 +144,22 @@ class MegaMoEW4A16Frontend:
             }
         ):
             raise ValueError(f"unsupported W4A16 MegaMoE knobs: {knobs}.")
-        new_config = with_knobs(self.config, knobs)
+        # Clamp changes belong to set_gate_up_clamp, independently of tuning.
+        new_config = with_knobs(
+            self.config, {**knobs, "gate_up_clamp": self.config.gate_up_clamp}
+        )
         if new_config != self._config:
             from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
                 ensure_not_capturing,
             )
 
             ensure_not_capturing("apply_knobs (config change)")
-            self._release_workspace()
+            self.release()
             self._config = new_config
-            self._mega_key = None
-            self._mega = None
 
     def release(self) -> None:
-        self._release_workspace()
-        self._mega_key = None
+        if self._mega is not None:
+            free_sym_tensor(self._mega.shared_workspace)
         self._mega = None
 
     @staticmethod
@@ -184,37 +175,12 @@ class MegaMoEW4A16Frontend:
             leading_dim=cutlass_torch.get_leading_dim(tensor)
         )
 
-    def _compile_key(self) -> tuple:
-        c = self.config
-        return (
-            c.world_size,
-            c.rank,
-            c.num_tokens_per_rank,
-            c.num_topk,
-            c.num_total_experts,
-            c.hidden,
-            c.intermediate,
-            c.mma_tiler_mnk,
-            c.cluster_shape_mnk,
-            c.load_balance_mode,
-            c.group_hint,
-            c.force_static_sched,
-            c.num_sched_stages,
-            c.flag_batch,
-            c.epi_flag_batch,
-            c.in_kernel_fc2_reduce,
-            c.token_back_mode,
-            self._gate_up_clamp,
-            c.apply_topk_in_fc1,
-            c.enable_iket,
-        )
-
     def _ensure_compiled(self, inputs: MegaMoEW4A16Inputs) -> _CompiledMega:
-        key = self._compile_key()
-        if self._mega is not None and self._mega_key == key:
+        # The frozen config changes only through the setters, which release
+        # the previous compilation and its workspace together.
+        if self._mega is not None:
             return self._mega
 
-        self._release_workspace()
         import cutlass
         import cutlass.cute as cute
         from .megamoe_kernel import Sm100W4A16MegaMoEKernel
@@ -250,7 +216,7 @@ class MegaMoEW4A16Frontend:
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
-            gate_up_clamp=self._gate_up_clamp,
+            gate_up_clamp=c.gate_up_clamp,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
         )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
@@ -276,7 +242,6 @@ class MegaMoEW4A16Frontend:
             kwargs["options"] += " iket"
         mega.compiled = cute.compile(kernel, **kwargs)
         self._mega = mega
-        self._mega_key = key
         return mega
 
     def _runtime_kwargs(self, inputs: MegaMoEW4A16Inputs, mega: _CompiledMega) -> dict:
@@ -334,8 +299,6 @@ class MegaMoEW4A16Frontend:
         if mega.launch_key != key:
             mega.launch_kwargs = self._runtime_kwargs(inputs, mega)
             mega.launch_key = key
-        if self.config.in_kernel_fc2_reduce:
-            inputs.combine_output.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync:
             torch.cuda.synchronize()
@@ -346,19 +309,11 @@ class MegaMoEW4A16Frontend:
         mega = self._ensure_compiled(inputs)
         kwargs = self._runtime_kwargs(inputs, mega)
         compiled = mega.compiled
-        if self.config.in_kernel_fc2_reduce:
 
-            def thunk():
-                inputs.combine_output.zero_()
-                compiled(**kwargs)
+        def thunk():
+            compiled(**kwargs)
 
-            return thunk
-        else:
-
-            def thunk():
-                compiled(**kwargs)
-
-            return thunk
+        return thunk
 
     def _validate(self, inputs: MegaMoEW4A16Inputs, num_tokens: int) -> None:
         c = self.config
@@ -419,8 +374,7 @@ class MegaMoEW4A16Frontend:
                 raise ValueError("weight global scales must be FP32 per expert.")
             if not all(t.is_cuda and t.is_contiguous() for t in (scale, alpha)):
                 raise ValueError("weight scales must be contiguous CUDA tensors.")
-        topk_dim = 1 if c.in_kernel_fc2_reduce else c.num_topk
-        if inputs.combine_output.shape != (c.num_tokens_per_rank, topk_dim, c.hidden):
+        if inputs.combine_output.shape != (c.num_tokens_per_rank, c.num_topk, c.hidden):
             raise ValueError("combine_output has an invalid shape.")
 
     def reduce_topk(self, combined, scores, output):
@@ -458,10 +412,6 @@ class MegaMoEW4A16Frontend:
             )
             self._reduce = cute.compile(reducer, *args)
         self._reduce(*args)
-
-    def _release_workspace(self) -> None:
-        if self._mega is not None:
-            free_sym_tensor(self._mega.shared_workspace)
 
 
 @dataclass
@@ -557,7 +507,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     combine_output = sym_zeros(
-        (num_max_tokens, 1 if cfg.in_kernel_fc2_reduce else num_topk, hidden),
+        (num_max_tokens, num_topk, hidden),
         torch.bfloat16,
     )
     return MegaMoEW4A16SymmBuffer(
@@ -625,10 +575,7 @@ def w4a16_mega_moe(
         ),
         num_tokens=n,
     )
-    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        y.copy_(result[:, 0])
-    else:
-        symm_buffer._frontend.reduce_topk(result, symm_buffer.topk_weights[:n], y)
+    symm_buffer._frontend.reduce_topk(result, symm_buffer.topk_weights[:n], y)
     if sync:
         torch.cuda.synchronize()
 
