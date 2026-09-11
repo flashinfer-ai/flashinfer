@@ -36,6 +36,15 @@ from flashinfer.decode import (
 )
 
 
+# The sparse attention specialization targets SM100/SM103. Metadata-only tests
+# below remain CUDA-wide; even workspace sizing can enter the attention resolver.
+_REQUIRES_PRIMS_TS_ATTENTION = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="QToken-KvBlock-Sparse-Attention tests require SM100 or SM103",
+)
+
+
 def get_prims_ts_q_token_kv_block_sparse_workspace_size(
     query: torch.Tensor,
     k_cache: torch.Tensor,
@@ -428,7 +437,7 @@ def test_q_token_kv_block_sparse_workspace_size_rejects_signed_locator_overflow(
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_unified_q_token_kv_block_sparse_workspace_8k_q_128k_kv_owns_metadata_outputs() -> (
     None
 ):
@@ -497,7 +506,7 @@ def test_unified_q_token_kv_block_sparse_workspace_8k_q_128k_kv_owns_metadata_ou
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_packed_q_token_kv_block_sparse_workspace_size_accepts_cpu_route_offsets() -> (
     None
 ):
@@ -1450,7 +1459,10 @@ def test_q_token_kv_block_sparse_sort_union_cuda_graph_reloads_and_invalidates()
 @pytest.mark.parametrize(
     "api",
     (
-        prepare_prims_ts_q_token_kv_block_sparse_attention,
+        pytest.param(
+            prepare_prims_ts_q_token_kv_block_sparse_attention,
+            marks=_REQUIRES_PRIMS_TS_ATTENTION,
+        ),
         prims_ts_q_token_kv_block_sparse_attention,
     ),
 )
@@ -1578,8 +1590,7 @@ def _run_private_q_token_kv_block_sparse_decode(
     return plan.run(query, out=prepared_out)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
     ("group_size", "segment_memberships", "expected_keeps"),
     (
@@ -1719,7 +1730,7 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
     torch.testing.assert_close(output.float(), reference, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 2, 4, 5))
 def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     monkeypatch: pytest.MonkeyPatch,
@@ -1876,7 +1887,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     assert scratch.data_ptr() > q_token_kv_block_sparse_page_indices.data_ptr()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 4))
 def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_copy(
     monkeypatch: pytest.MonkeyPatch,
@@ -1985,7 +1996,7 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
     assert torch.all(output == 3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 4))
 def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     monkeypatch: pytest.MonkeyPatch,
@@ -2083,8 +2094,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     assert torch.all(output == 4)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 2, 4, 5))
 def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
     group_size: int,
@@ -2154,8 +2164,7 @@ def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
     torch.testing.assert_close(fixed_output.reshape_as(packed_output), packed_output)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_q_token_kv_block_sparse_fixed_decode_supports_suggested_padded_final_route() -> (
     None
 ):
@@ -2261,8 +2270,7 @@ def test_q_token_kv_block_sparse_fixed_decode_supports_suggested_padded_final_ro
     )
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_q_token_kv_block_sparse_fixed_multiple_query_groups_match_packed_layout() -> (
     None
 ):
@@ -2358,7 +2366,7 @@ def test_q_token_kv_block_sparse_fixed_multiple_query_groups_match_packed_layout
     torch.testing.assert_close(fixed_output.reshape_as(packed_output), packed_output)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 2, 4, 5))
 def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scratch_disjoint(
     monkeypatch: pytest.MonkeyPatch,
@@ -2591,7 +2599,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         plan.run(*valid_args, out=misaligned_output)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_prepared_packed_q_token_kv_block_sparse_does_not_materialize_route_offsets_on_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2684,8 +2692,7 @@ def test_prepared_packed_q_token_kv_block_sparse_does_not_materialize_route_offs
     )
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 2, 4, 5))
 def test_prepared_q_token_kv_block_sparse_plan_replays_without_counter_reset(
     group_size: int,
@@ -2766,8 +2773,7 @@ def test_prepared_q_token_kv_block_sparse_plan_replays_without_counter_reset(
         ).item()
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_and_graph() -> (
     None
 ):
@@ -2969,8 +2975,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("rows", (1, 2))
 def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(rows: int) -> None:
     """Cover tiny fixed Q1 decode graph buckets."""
@@ -3060,8 +3065,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(rows: int) -> 
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (4, 5))
 def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
     group_size: int,
@@ -3261,8 +3265,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
     )
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cuda_graph() -> (
     None
 ):
@@ -3469,8 +3472,7 @@ def test_q_token_kv_block_sparse_metadata_matches_reference(
     _assert_metadata_matches(actual, expected)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_reference() -> (
     None
 ):
@@ -3603,8 +3605,7 @@ def test_packed_q_token_kv_block_sparse_metadata_handles_partial_request_groups(
     _assert_metadata_matches(actual, expected)
 
 
-@pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("group_size", (1, 2, 4, 5))
 def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
     group_size: int,
