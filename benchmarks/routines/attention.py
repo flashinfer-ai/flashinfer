@@ -1,4 +1,5 @@
 from collections import defaultdict
+import math
 
 import numpy as np
 import torch
@@ -43,6 +44,13 @@ from .flashinfer_benchmark_utils import (
     filter_backends_by_compute_capability,
 )
 
+TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
+    "assumed_active",
+    "device_check",
+    "cpu_mirror",
+)
+TRTLLM_RAGGED_TIMING_METRIC = "cuda_event_eager_per_call_v1"
+
 
 def normalize_backends(backends):
     """
@@ -69,6 +77,20 @@ def normalize_backends(backends):
         else:
             normalized.append(backend)
     return normalized
+
+
+def _trtllm_ragged_row_activity_kwargs(mode, q_seq_lens_cpu, kv_seq_lens_cpu):
+    """Build row-activity arguments for TRTLLM ragged prefill."""
+    if mode == "assumed_active":
+        return {"skip_all_rows_active_check": True}
+    if mode == "device_check":
+        return {}
+    if mode == "cpu_mirror":
+        return {
+            "q_seq_lens_cpu": q_seq_lens_cpu,
+            "kv_seq_lens_cpu": kv_seq_lens_cpu,
+        }
+    raise ValueError(f"Unsupported TRTLLM ragged row activity mode: {mode}")
 
 
 def _drop_backend(backends, backend, reason):
@@ -281,6 +303,8 @@ def run_attention_test(args):
         return testBatchPrefillWithRaggedKVCacheWrapper(args)
     elif args.routine == "BatchMLAPagedAttentionWrapper":
         return testBatchMLAPagedAttentionWrapper(args)
+    elif args.routine == "trtllm_batch_decode_sparse_mla_dsv4":
+        return testTrtllmBatchDecodeSparseMlaDsv4(args)
     else:
         print(f"[ERROR] Unsupported routine: {args.routine}")
         return []
@@ -302,7 +326,7 @@ def parse_attention_args(line, parser):
         type=str,
         required=False,
         nargs="+",
-        default=["fa2"],
+        default=None,
         choices=[
             "fa2",
             "fa2_tc",
@@ -318,8 +342,9 @@ def parse_attention_args(line, parser):
             "cute-dsl",
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
+            "cute-dsl-prims",
         ],
-        help="Kernel backends to test. Default: fa2. prims-ts selects the experimental task-scheduled Blackwell backend for all attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
+        help="Kernel backends to test. Default: fa2, except DSV4 sparse MLA defaults to trtllm-gen. prims-ts selects the experimental task-scheduled Blackwell backend for the wrapper attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
     parser.add_argument(
         "--page_size",
@@ -421,6 +446,21 @@ def parse_attention_args(line, parser):
         help="Use random actual sequence lengths for the query and key and value. Random values are generated between 1 and maximum sequence length. If False, use maximum sequence length.",
     )
     parser.add_argument(
+        "--row_activity_mode",
+        choices=TRTLLM_RAGGED_ROW_ACTIVITY_MODES,
+        default=None,
+        help=(
+            "TRTLLM native ragged prefill only: choose the all-active fast path, "
+            "device-side row check, or CPU sequence-length mirrors."
+        ),
+    )
+    parser.add_argument(
+        "--calls_per_sample",
+        type=int,
+        default=1,
+        help="TRTLLM native ragged prefill only: calls grouped into each timing sample.",
+    )
+    parser.add_argument(
         "--autotune",
         action="store_true",
         default=False,
@@ -458,11 +498,71 @@ def parse_attention_args(line, parser):
             "preserving existing behavior and perf baselines."
         ),
     )
+    parser.add_argument(
+        "--swa_topk",
+        type=int,
+        default=128,
+        help="DSV4 sparse MLA only: fixed sliding-window segment width.",
+    )
+    parser.add_argument(
+        "--compressed_topk",
+        type=int,
+        default=1920,
+        help="DSV4 sparse MLA only: maximum selected compressed-cache rows per query.",
+    )
+    parser.add_argument(
+        "--compressed_kv_len",
+        type=int,
+        default=None,
+        help=(
+            "DSV4 sparse MLA only: logical compressed-cache rows per request "
+            "(default: ceil(s_kv / 4))."
+        ),
+    )
+    parser.add_argument(
+        "--compressed_page_size",
+        type=int,
+        default=64,
+        help="DSV4 sparse MLA only: compressed-cache page size.",
+    )
+    parser.add_argument(
+        "--kv_layout",
+        choices=["HND", "NHD"],
+        default="HND",
+        help="DSV4 sparse MLA only: layout of both KV-cache pools.",
+    )
 
     args = parser.parse_args(line)
 
+    if args.backends is None:
+        args.backends = (
+            ["trtllm-gen"]
+            if args.routine == "trtllm_batch_decode_sparse_mla_dsv4"
+            else ["fa2"]
+        )
+
+    if args.routine == "trtllm_batch_decode_sparse_mla_dsv4" and args.page_size == 0:
+        args.page_size = 256
+    if args.routine == "trtllm_batch_decode_sparse_mla_dsv4":
+        # The sparse tables encode causal visibility; there is no non-causal
+        # mode in this DSV4 generation-form API.
+        args.causal = True
+
     # Normalize backend names (handle deprecated names)
     args.backends = normalize_backends(args.backends)
+    if args.calls_per_sample < 1:
+        raise ValueError("--calls_per_sample must be positive")
+    if args.row_activity_mode is None and args.calls_per_sample != 1:
+        raise ValueError("--calls_per_sample requires --row_activity_mode")
+    if args.row_activity_mode is not None:
+        if args.routine != "BatchPrefillWithRaggedKVCacheWrapper":
+            raise ValueError("--row_activity_mode only supports ragged prefill")
+        if args.backends != ["trtllm-native"]:
+            raise ValueError("--row_activity_mode requires only trtllm-native")
+        if not args.no_cuda_graph or not args.use_cuda_events:
+            raise ValueError(
+                "--row_activity_mode requires --no_cuda_graph and --use_cuda_events"
+            )
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -970,31 +1070,33 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         prims_ts_mask_type = (
             "causal" if not speculative_decode or effective_causal else "dense"
         )
+        # The common fixture intentionally exposes nonstandard outer strides;
+        # PrimTS accepts compact HND pages, so preserve the logical values in a
+        # backend-specific compact cache.
+        prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_q_shape = (
             (batch_size, num_qo_heads, head_dim_qk)
             if s_qo == 1
             else (batch_size, s_qo, num_qo_heads, head_dim_qk)
         )
-        # The common fixture intentionally exposes nonstandard outer strides;
-        # PrimTS accepts compact HND pages, so preserve the logical values in a
-        # backend-specific compact cache.
-        prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
+            device,
+            batch_size,
             num_qo_heads,
             num_kv_heads,
             head_dim_qk,
             page_size,
-            seq_len_q=s_qo,
+            s_kv,
+            max_seq_len_q=s_qo,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=o_data_type,
             mask_type=prims_ts_mask_type,
-            max_kv_len=s_kv,
+            seq_lens=actual_seq_lens_kv.flatten().tolist(),
+            workspace_buffer=workspace_buffer,
         )
 
     backend_outputs = {}
@@ -1080,9 +1182,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             result = backend_wrappers[backend].run(
                 runtime_q,
                 kv_cache,
+                None,
+                block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 out=out,
+                validate=False,
             )
             return result.view_as(q)
         else:
@@ -1133,7 +1238,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 v_arg,
                 workspace_buffer,
                 block_tables,
-                actual_seq_lens_kv,
+                actual_seq_lens_kv.flatten(),
                 ragged_q,
                 speculative_mask,
                 out_arg,
@@ -1169,9 +1274,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             lambda: backend_wrappers["prims-ts"].run(
                 prims_ts_runtime_q,
                 prims_ts_kv_cache,
+                None,
+                block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 out=prims_ts_out,
+                validate=False,
             ),
             prims_ts_out,
         )
@@ -1699,18 +1807,22 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         prims_ts_sm_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers_prims_ts.plan(
-            q,
-            prims_ts_k_cache,
-            prims_ts_v_cache,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
+            device=device,
+            batch_size=batch_size,
+            max_seq_len_q=s_qo,
+            max_kv_len=s_kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=o_data_type,
             page_size=page_size,
             mask_type="causal" if causal else "dense",
             sm_scale=prims_ts_sm_scale,
             output_scale=prims_ts_output_scale,
-            out_dtype=o_data_type,
+            uniform_packed_lengths=not args.random_actual_seq_len,
+            has_q_offset=causal and s_qo != s_kv,
         )
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
@@ -1721,7 +1833,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backend_wrappers[backend] = backend_wrappers_prims_ts
             resolved_backends[backend] = backend
             continue
-        if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa3", "auto", "trtllm-gen", "cute-dsl-prims"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
@@ -1826,6 +1938,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
             )
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                kv_cache,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
             return backend_wrappers[backend].run(
@@ -1914,7 +2034,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 q,
                 k_cache,
                 v_cache,
+                qo_indptr,
+                block_tables,
+                actual_seq_lens_kv_device.flatten(),
                 out=out,
+                validate=False,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -2036,7 +2160,11 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     q,
                     prims_ts_k_cache,
                     prims_ts_v_cache,
+                    qo_indptr,
+                    block_tables,
+                    actual_seq_lens_kv_device.flatten(),
                     out=prims_ts_out,
+                    validate=False,
                 ),
                 prims_ts_out,
             )
@@ -2246,6 +2374,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
+    row_activity_mode = args.row_activity_mode or "cpu_mirror"
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
@@ -2463,6 +2592,14 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     ## The following are for BatchPrefillWithRaggedKVCacheWrapper
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
+    # CPU mirrors for trtllm_ragged_attention_deepseek CUDA graph capture:
+    # its capture path requires per-row lengths without a device sync.
+    actual_seq_lens_q_cpu_flat = (
+        actual_seq_lens_q.reshape(-1).to(torch.int32).cpu().contiguous()
+    )
+    actual_seq_lens_kv_cpu_flat = (
+        actual_seq_lens_kv.reshape(-1).to(torch.int32).cpu().contiguous()
+    )
 
     q_indptr = (
         torch.cat(
@@ -2550,7 +2687,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in [
+            "cutlass",
+            "fa2",
+            "fa3",
+            "trtllm-gen",
+            "cute-dsl-prims",
+        ]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
@@ -2633,11 +2776,16 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         prims_ts_output_scale = _v_scale
         backend_wrappers["prims-ts"] = prims_ts.BatchPrefillTSWrapper()
         backend_wrappers["prims-ts"].plan(
-            q,
-            k,
-            v,
-            qo_indptr=qo_indptr,
-            kv_indptr=kv_indptr,
+            device=q.device,
+            batch_size=batch_size,
+            max_seq_len_q=s_qo,
+            max_kv_len=s_kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            q_dtype=q.dtype,
+            kv_dtype=k.dtype,
+            packed=True,
             mask_type="causal" if causal else "dense",
             sm_scale=prims_ts_sm_scale,
             output_scale=prims_ts_output_scale,
@@ -2691,6 +2839,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             return backend_wrappers[backend].run_return_lse(
                 q, k, v, enable_pdl=args.enable_pdl, out=out
             )[0]
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         elif backend == "cute-dsl":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
@@ -2715,6 +2872,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 return_lse=True,
                 out=out,
                 backend="cute-dsl",
+                q_seq_lens_cpu=actual_seq_lens_q_cpu_flat,
+                kv_seq_lens_cpu=actual_seq_lens_kv_cpu_flat,
             )[0]
         elif backend == "cudnn":
             # cuDNN uses wrapper API
@@ -2768,6 +2927,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 is_causal=causal,
                 return_lse=True,
                 out=out,
+                **_trtllm_ragged_row_activity_kwargs(
+                    row_activity_mode,
+                    actual_seq_lens_q_cpu_flat,
+                    actual_seq_lens_kv_cpu_flat,
+                ),
             )[0]
         elif backend == "trtllm-fmha-v2":
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -2790,7 +2954,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 out_dtype=out_dtype,
             )
         elif backend == "prims-ts":
-            return backend_wrappers[backend].run(q, k, v, out=out)
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                qo_indptr,
+                kv_indptr,
+                out=out,
+                validate=False,
+            )
         else:
             print(f"[ERROR] Backend {backend} not supported")
             return None
@@ -2832,26 +3004,29 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 reference_backend = "fa2"
 
         def run_timed_backend(q_arg, k_arg, v_arg, out_arg):
-            return run_backend_wrapper(
-                cur_backend,
-                q_arg,
-                k_arg,
-                v_arg,
-                workspace_buffer,
-                block_tables,
-                actual_seq_lens_q_device,
-                actual_seq_lens_kv_device,
-                q_indptr,
-                k_indptr,
-                v_indptr,
-                o_indptr,
-                batch_offsets_stats,
-                qo_indptr,
-                kv_indptr,
-                out_arg,
-            )
+            result = None
+            for _ in range(args.calls_per_sample):
+                result = run_backend_wrapper(
+                    cur_backend,
+                    q_arg,
+                    k_arg,
+                    v_arg,
+                    workspace_buffer,
+                    block_tables,
+                    actual_seq_lens_q_device,
+                    actual_seq_lens_kv_device,
+                    q_indptr,
+                    k_indptr,
+                    v_indptr,
+                    o_indptr,
+                    batch_offsets_stats,
+                    qo_indptr,
+                    kv_indptr,
+                    out_arg,
+                )
+            return result
 
-        backend_times[cur_backend] = bench_gpu_time(
+        sample_times = bench_gpu_time(
             fn=run_timed_backend,
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
@@ -2866,6 +3041,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 runtime_out,
             ),
         )
+        backend_times[cur_backend] = [
+            sample_time / args.calls_per_sample for sample_time in sample_times
+        ]
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -2895,7 +3073,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     q,
                     k,
                     v,
+                    qo_indptr,
+                    kv_indptr,
                     out=prims_ts_out,
+                    validate=False,
                 ),
                 prims_ts_out,
             )
@@ -3013,6 +3194,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
                 cur_res["case_tag"] = args.case_tag
+                if args.row_activity_mode is not None:
+                    cur_res["timing_metric"] = TRTLLM_RAGGED_TIMING_METRIC
+                    cur_res["row_activity_mode"] = args.row_activity_mode
+                    cur_res["calls_per_sample"] = args.calls_per_sample
                 res.append(cur_res)
     return res
 
@@ -3302,6 +3487,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {workspace_buffer.shape = }")
 
     # Create wrapper
+    # The shared sampler retains singleton dimensions for other attention
+    # routines, but MLA CSR metadata requires one KV length per request.
+    mla_kv_len_arr = actual_seq_lens_kv.flatten()
     backend_wrappers = {}
     for backend in backends:
         if backend in ["fa2", "fa3", "cutlass"]:
@@ -3311,7 +3499,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
+                kv_len_arr=mla_kv_len_arr,
                 backend=backend,
             )
             if backend != "cutlass":
@@ -3319,7 +3507,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                     qo_indptr=qo_indptr,
                     kv_indptr=kv_indptr,
                     kv_indices=kv_indices,
-                    kv_len_arr=actual_seq_lens_kv,
+                    kv_len_arr=mla_kv_len_arr,
                     num_heads=num_qo_heads,
                     head_dim_ckv=head_dim_ckv,
                     head_dim_kpe=head_dim_kpe,
@@ -3352,18 +3540,20 @@ def testBatchMLAPagedAttentionWrapper(args):
         )
         backend_wrappers["prims-ts"] = prims_ts.BatchMLADecodePagedTSWrapper()
         backend_wrappers["prims-ts"].plan(
-            block_tables,
-            actual_seq_lens_kv.flatten(),
+            device,
+            batch_size,
             num_qo_heads,
             head_dim_ckv,
             head_dim_kpe,
             page_size,
-            seq_len_q=s_qo,
+            s_kv,
+            max_seq_len_q=s_qo,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=torch.bfloat16,
             mask_type="causal",
-            max_kv_len=s_kv,
+            workspace_buffer=workspace_buffer,
         )
 
     direct_out = None
@@ -3401,14 +3591,14 @@ def testBatchMLAPagedAttentionWrapper(args):
         """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
-            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
-            # cute-dsl branches below pass args.enable_pdl to the direct API.
+            # FA2/FA3 use their planned CSR metadata and do not accept the
+            # CUTLASS-only page_table argument. trtllm-native/auto/cute-dsl
+            # branches below pass args.enable_pdl to the direct API.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
                 ckv_cache,
                 kpe_cache,
-                page_table=block_tables,
                 return_lse=False,
             )
         elif backend == "cutlass":
@@ -3506,9 +3696,12 @@ def testBatchMLAPagedAttentionWrapper(args):
                         head_dim_ckv + head_dim_kpe,
                     ),
                     kv_cache,
+                    block_tables,
+                    actual_seq_lens_kv.flatten(),
                     bmm1_scale=sm_scale,
                     bmm2_scale=1.0,
                     out=out,
+                    validate=False,
                 )
                 .reshape(-1, num_qo_heads, head_dim_ckv)
             )
@@ -3655,9 +3848,12 @@ def testBatchMLAPagedAttentionWrapper(args):
                     head_dim_ckv + head_dim_kpe,
                 ),
                 kv_cache,
+                block_tables,
+                actual_seq_lens_kv.flatten(),
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 out=prims_ts_out,
+                validate=False,
             ),
             prims_ts_out,
         )
@@ -3766,3 +3962,429 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
+
+
+_DSV4_HEAD_DIM = 512
+_DSV4_SWA_TOPK = 128
+_DSV4_WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _dsv4_cache_to_flat_rows(cache, kv_layout):
+    if kv_layout == "HND":
+        cache = cache.transpose(1, 2)
+    return cache.reshape(-1, cache.shape[-1])
+
+
+def _dsv4_coprime_strides(lengths):
+    """Choose deterministic, non-unit strides for sparse-index permutations."""
+    strides = []
+    for length in lengths.to("cpu").tolist():
+        if length <= 1:
+            strides.append(1)
+            continue
+        candidate = max(1, length // 2 + 1)
+        if candidate >= length:
+            candidate = 1
+        while math.gcd(candidate, length) != 1:
+            candidate += 1
+            if candidate >= length:
+                candidate = 1
+        strides.append(candidate)
+    return torch.tensor(strides, dtype=torch.int64, device=lengths.device)
+
+
+def _dsv4_make_sparse_indices(
+    *,
+    batch_size,
+    s_qo,
+    s_kv,
+    swa_topk,
+    swa_page_size,
+    compressed_topk,
+    compressed_kv_len,
+    compressed_page_size,
+    device,
+):
+    """Build causal SWA rows plus causal compressed-cache selections."""
+    query_positions = torch.arange(s_kv - s_qo, s_kv, dtype=torch.int64, device=device)
+
+    swa_valid_lens = torch.minimum(
+        query_positions + 1,
+        torch.tensor(swa_topk, dtype=torch.int64, device=device),
+    )
+    swa_columns = torch.arange(swa_topk, dtype=torch.int64, device=device)
+    swa_starts = query_positions - swa_valid_lens + 1
+    swa_local = swa_starts[:, None] + swa_columns[None, :]
+    swa_local = torch.where(
+        swa_columns[None, :] < swa_valid_lens[:, None], swa_local, -1
+    )
+
+    # DSV4's compressed pool stores one row per four raw KV tokens. The active
+    # top-k grows causally during a full-prompt prefill and saturates at the
+    # configured maximum.
+    compressed_available = torch.minimum(
+        torch.div(query_positions + 4, 4, rounding_mode="floor"),
+        torch.tensor(compressed_kv_len, dtype=torch.int64, device=device),
+    ).clamp_min(1)
+    compressed_active_lens = torch.minimum(
+        compressed_available,
+        torch.tensor(compressed_topk, dtype=torch.int64, device=device),
+    )
+    compressed_columns = torch.arange(compressed_topk, dtype=torch.int64, device=device)
+    compressed_strides = _dsv4_coprime_strides(compressed_available)
+    compressed_local = (
+        compressed_columns[None, :] * compressed_strides[:, None]
+        + query_positions[:, None] * 29
+    ) % compressed_available[:, None]
+    compressed_local = torch.where(
+        compressed_columns[None, :] < compressed_active_lens[:, None],
+        compressed_local,
+        -1,
+    )
+
+    swa_rows_per_request = math.ceil(s_kv / swa_page_size) * swa_page_size
+    compressed_rows_per_request = (
+        math.ceil(compressed_kv_len / compressed_page_size) * compressed_page_size
+    )
+    swa_bases = (
+        torch.arange(batch_size, dtype=torch.int64, device=device)
+        * swa_rows_per_request
+    )
+    compressed_bases = (
+        torch.arange(batch_size, dtype=torch.int64, device=device)
+        * compressed_rows_per_request
+    )
+    swa_indices = torch.where(
+        swa_local[None, :, :] >= 0,
+        swa_local[None, :, :] + swa_bases[:, None, None],
+        -1,
+    )
+    compressed_indices = torch.where(
+        compressed_local[None, :, :] >= 0,
+        compressed_local[None, :, :] + compressed_bases[:, None, None],
+        -1,
+    )
+    sparse_indices = torch.cat((swa_indices, compressed_indices), dim=-1)
+    sparse_indices = sparse_indices.reshape(
+        batch_size * s_qo, swa_topk + compressed_topk
+    ).to(torch.int32)
+
+    compressed_active_lens = compressed_active_lens.repeat(batch_size)
+    sparse_topk_lens = (compressed_active_lens + swa_topk).to(torch.int32)
+    active_kv_lens = (swa_valid_lens + compressed_active_lens[:s_qo]).repeat(batch_size)
+    return sparse_indices.contiguous(), sparse_topk_lens.contiguous(), active_kv_lens
+
+
+@torch.inference_mode()
+def _validate_dsv4_sparse_mla_samples(
+    *,
+    query,
+    swa_kv_cache,
+    compressed_kv_cache,
+    sparse_indices,
+    sparse_topk_lens,
+    output,
+    swa_topk,
+    bmm1_scale,
+    bmm2_scale,
+    kv_layout,
+    sample_limit=8,
+):
+    """Check sampled query rows against an independent FP32 attention oracle."""
+    if not torch.isfinite(output.float()).all():
+        raise AssertionError("DSV4 sparse MLA output contains nonfinite values")
+
+    total_q = query.shape[0]
+    sample_rows = sorted(
+        {
+            0,
+            total_q - 1,
+            total_q // 4,
+            total_q // 2,
+            (3 * total_q) // 4,
+        }
+    )[:sample_limit]
+    swa_rows = _dsv4_cache_to_flat_rows(swa_kv_cache, kv_layout)
+    compressed_rows = _dsv4_cache_to_flat_rows(compressed_kv_cache, kv_layout)
+    scale_qk = float(bmm1_scale.item()) if torch.is_tensor(bmm1_scale) else bmm1_scale
+    scale_out = float(bmm2_scale.item()) if torch.is_tensor(bmm2_scale) else bmm2_scale
+    max_abs_error = 0.0
+
+    for query_row in sample_rows:
+        active_len = int(sparse_topk_lens[query_row].item())
+        row_indices = sparse_indices[query_row]
+        swa_indices = row_indices[:swa_topk]
+        swa_indices = swa_indices[swa_indices >= 0].to(torch.int64)
+        compressed_len = max(0, active_len - swa_topk)
+        compressed_indices = row_indices[swa_topk : swa_topk + compressed_len].to(
+            torch.int64
+        )
+        selected_kv = torch.cat(
+            (
+                swa_rows.index_select(0, swa_indices),
+                compressed_rows.index_select(0, compressed_indices),
+            ),
+            dim=0,
+        ).float()
+        scores = torch.matmul(query[query_row].float(), selected_kv.T) * scale_qk
+        expected = torch.matmul(torch.softmax(scores, dim=-1), selected_kv) * scale_out
+        actual = output[query_row].float()
+        max_abs_error = max(
+            max_abs_error, float((actual - expected).abs().max().item())
+        )
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+    return len(sample_rows), max_abs_error
+
+
+def testTrtllmBatchDecodeSparseMlaDsv4(args):
+    """Benchmark the public DSV4 sparse-MLA API on SM100/SM103."""
+    if args.verbose >= 1:
+        print("[INFO] Running testTrtllmBatchDecodeSparseMlaDsv4")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            "[INFO] To reproduce this test case, run the following command: "
+            f"{args.repro_command}"
+        )
+
+    backends = filter_backends_by_compute_capability(
+        list(args.backends), args.routine, device
+    )
+    if not backends:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+    if args.random_actual_seq_len:
+        raise ValueError(
+            "trtllm_batch_decode_sparse_mla_dsv4 does not support "
+            "--random_actual_seq_len"
+        )
+    if args.batch_size <= 0 or args.s_qo <= 0 or args.s_kv <= 0:
+        raise ValueError("batch_size, s_qo, and s_kv must be positive")
+    if args.s_qo > args.s_kv:
+        raise ValueError("DSV4 sparse MLA requires s_qo <= s_kv")
+    if args.num_qo_heads not in (8, 16, 32, 64, 128):
+        raise ValueError("DSV4 sparse MLA num_qo_heads must be one of 8,16,32,64,128")
+    if args.num_kv_heads != 1:
+        raise ValueError("DSV4 sparse MLA requires num_kv_heads=1")
+    if args.head_dim_qk != _DSV4_HEAD_DIM:
+        raise ValueError("DSV4 sparse MLA requires head_dim_qk=512")
+    head_dim_vo = args.head_dim_qk if args.head_dim_vo is None else args.head_dim_vo
+    if head_dim_vo != _DSV4_HEAD_DIM:
+        raise ValueError("DSV4 sparse MLA requires head_dim_vo=512")
+    if args.swa_topk != _DSV4_SWA_TOPK:
+        raise ValueError("DSV4 sparse MLA requires swa_topk=128")
+    if args.page_size <= 0 or args.compressed_page_size <= 0:
+        raise ValueError("page sizes must be positive")
+    compressed_kv_len = (
+        math.ceil(args.s_kv / 4)
+        if args.compressed_kv_len is None
+        else args.compressed_kv_len
+    )
+    if args.compressed_topk <= 0 or compressed_kv_len < args.compressed_topk:
+        raise ValueError("compressed_kv_len must be >= compressed_topk > 0")
+
+    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
+    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
+    if q_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("DSV4 sparse MLA Q supports bfloat16 or fp8_e4m3")
+    if kv_dtype != q_dtype:
+        raise ValueError("DSV4 sparse MLA requires matching Q and KV dtypes")
+    if args.out_dtype not in (None, "bfloat16"):
+        raise ValueError("DSV4 sparse MLA output dtype is bfloat16")
+
+    batch_size = args.batch_size
+    total_q = batch_size * args.s_qo
+    query = (
+        torch.randn(
+            total_q,
+            args.num_qo_heads,
+            _DSV4_HEAD_DIM,
+            dtype=torch.float32,
+            device=device,
+        )
+        .mul_(0.05)
+        .clamp_(-1.0, 1.0)
+        .to(q_dtype)
+    )
+
+    def make_cache(logical_len, page_size):
+        pages_per_request = math.ceil(logical_len / page_size)
+        cache = (
+            torch.randn(
+                batch_size * pages_per_request,
+                page_size,
+                1,
+                _DSV4_HEAD_DIM,
+                dtype=torch.float32,
+                device=device,
+            )
+            .mul_(0.05)
+            .clamp_(-1.0, 1.0)
+            .to(kv_dtype)
+        )
+        if args.kv_layout == "HND":
+            cache = cache.transpose(1, 2).contiguous()
+        return cache
+
+    swa_kv_cache = make_cache(args.s_kv, args.page_size)
+    compressed_kv_cache = make_cache(compressed_kv_len, args.compressed_page_size)
+    sparse_indices, sparse_topk_lens, active_kv_lens = _dsv4_make_sparse_indices(
+        batch_size=batch_size,
+        s_qo=args.s_qo,
+        s_kv=args.s_kv,
+        swa_topk=args.swa_topk,
+        swa_page_size=args.page_size,
+        compressed_topk=args.compressed_topk,
+        compressed_kv_len=compressed_kv_len,
+        compressed_page_size=args.compressed_page_size,
+        device=device,
+    )
+    seq_lens = torch.full((batch_size,), args.s_kv, dtype=torch.int32, device=device)
+    cum_seq_lens_q = torch.arange(
+        0,
+        (batch_size + 1) * args.s_qo,
+        args.s_qo,
+        dtype=torch.int32,
+        device=device,
+    )
+    workspace = torch.empty(_DSV4_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+    output = torch.empty(
+        total_q,
+        args.num_qo_heads,
+        _DSV4_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    qk_scale_value = _DSV4_HEAD_DIM**-0.55
+    bmm1_scale = (
+        torch.tensor([qk_scale_value], dtype=torch.float32, device=device)
+        if q_dtype == torch.float8_e4m3fn
+        else qk_scale_value
+    )
+    bmm2_scale = (
+        torch.tensor([1.0], dtype=torch.float32, device=device)
+        if q_dtype == torch.float8_e4m3fn
+        else 1.0
+    )
+
+    def run_backend(
+        query_arg,
+        swa_cache_arg,
+        compressed_cache_arg,
+        sparse_indices_arg,
+        sparse_topk_lens_arg,
+        seq_lens_arg,
+        cum_seq_lens_q_arg,
+        output_arg,
+    ):
+        return flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=query_arg,
+            swa_kv_cache=swa_cache_arg,
+            workspace_buffer=workspace,
+            sparse_indices=sparse_indices_arg,
+            compressed_kv_cache=compressed_cache_arg,
+            sparse_topk_lens=sparse_topk_lens_arg,
+            seq_lens=seq_lens_arg,
+            out=output_arg,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            kv_layout=args.kv_layout,
+            cum_seq_lens_q=cum_seq_lens_q_arg,
+            max_q_len=args.s_qo,
+            enable_pdl=args.enable_pdl,
+            backend="trtllm-gen",
+        )
+
+    runtime_args = (
+        query,
+        swa_kv_cache,
+        compressed_kv_cache,
+        sparse_indices,
+        sparse_topk_lens,
+        seq_lens,
+        cum_seq_lens_q,
+        output,
+    )
+    if args.refcheck:
+        run_backend(*runtime_args)
+        try:
+            sample_count, max_abs_error = _validate_dsv4_sparse_mla_samples(
+                query=query,
+                swa_kv_cache=swa_kv_cache,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_indices=sparse_indices,
+                sparse_topk_lens=sparse_topk_lens,
+                output=output,
+                swa_topk=args.swa_topk,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                kv_layout=args.kv_layout,
+            )
+            if args.verbose >= 1:
+                print(
+                    f"[INFO] DSV4 sampled FP32 reference passed: {sample_count} "
+                    f"query rows, max_abs_error={max_abs_error:.6g}"
+                )
+        except AssertionError as error:
+            print(f"[ERROR] DSV4 sampled FP32 reference mismatch: {error}")
+            if not args.allow_output_mismatch:
+                raise
+
+    times = bench_gpu_time(
+        fn=run_backend,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        sleep_after_run=False,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=not args.no_cuda_graph,
+        cold_l2_cache=True,
+        input_args=runtime_args,
+    )
+    median_time = float(np.median(times))
+    std_time = float(np.std(times))
+    active_pairs = int(active_kv_lens.sum().item())
+    flops = 4 * active_pairs * args.num_qo_heads * _DSV4_HEAD_DIM
+    logical_bytes = (
+        query.numel() * query.element_size()
+        + active_pairs * _DSV4_HEAD_DIM * torch.empty((), dtype=kv_dtype).element_size()
+        + output.numel() * output.element_size()
+    )
+    tflops = flops / (median_time * 1e9)
+    tb_per_sec = logical_bytes / (median_time * 1e9)
+    print_perf_metrics("trtllm-gen", median_time, std_time, tflops, tb_per_sec)
+
+    result = defaultdict(str)
+    result.update(
+        {
+            "routine": args.routine,
+            "median_time": median_time,
+            "std_time": std_time,
+            "tflops": tflops,
+            "tb_per_sec": tb_per_sec,
+            "backend": "trtllm-gen",
+            "resolved_backend": "trtllm-gen",
+            "page_size": args.page_size,
+            "batch_size": batch_size,
+            "s_qo": args.s_qo,
+            "s_kv": args.s_kv,
+            "num_qo_heads": args.num_qo_heads,
+            "num_kv_heads": args.num_kv_heads,
+            "head_dim_qk": _DSV4_HEAD_DIM,
+            "head_dim_vo": _DSV4_HEAD_DIM,
+            "causal": True,
+            "q_dtype": args.q_dtype,
+            "kv_dtype": args.kv_dtype,
+            "out_dtype": "bfloat16",
+            "avg_actual_seq_len": args.s_kv,
+            "random_actual_seq_len": False,
+            "swa_topk": args.swa_topk,
+            "compressed_topk": args.compressed_topk,
+            "compressed_kv_len": compressed_kv_len,
+            "compressed_page_size": args.compressed_page_size,
+            "kv_layout": args.kv_layout,
+            "case_tag": args.case_tag,
+        }
+    )
+    return [result]

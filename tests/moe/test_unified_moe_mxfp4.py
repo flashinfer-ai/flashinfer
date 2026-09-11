@@ -217,7 +217,7 @@ def _make_runtime_case(
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=global_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig.from_variant(variant),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=expert_offset,
@@ -310,7 +310,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig.from_variant(variant),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
@@ -423,7 +423,7 @@ def _make_fp4_shared_case(variant, num_shared, *, activation=None, shared_scale=
             topk_group=1,
             routed_scaling_factor=2.5,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig.from_variant(variant),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             num_fused_shared_experts=num_shared,
@@ -514,6 +514,10 @@ def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activati
 @pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.MXFP4))
 def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
     _xfail_w4a16_sm103(variant)
+    if get_compute_capability(torch.device("cuda")) == (10, 7) and isinstance(
+        activation, SiTU
+    ):
+        pytest.skip("TRTLLM FP4 SiTU is not implemented on SM107")
     act, weights, config, view, (routing_logits, routing_bias) = _make_fp4_shared_case(
         variant,
         0,
@@ -781,7 +785,7 @@ def test_trtllm_fp4_variant_architecture_gates(
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=8, top_k=2),
-        quant=QuantConfig(variant=variant),
+        quant=QuantConfig.from_variant(variant),
         experts=ExpertConfig(intermediate_size=128),
         activation=SwiGLU(),
     )
