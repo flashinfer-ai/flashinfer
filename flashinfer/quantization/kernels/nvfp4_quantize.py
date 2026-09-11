@@ -58,7 +58,10 @@ from ...cute_dsl.fp4_common import (
 from ...cute_dsl.utils import get_num_sm
 from ..nvfp4_quantization_utils import (
     NVFP44Over6Config,
-    current_nvfp4_4over6_config,
+    NVFP44Over6Setting,
+    NVFP4Recipe,
+    nvfp4_4over6_fp8_input_error,
+    resolve_nvfp4_4over6,
     env_flag_enabled as _env_flag_enabled,
 )
 from ..quantization_cute_dsl_utils import (
@@ -2268,6 +2271,8 @@ def nvfp4_quantize_cute_dsl(
     global_scale: float | torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
 
@@ -2295,6 +2300,13 @@ def nvfp4_quantize_cute_dsl(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -2372,9 +2384,13 @@ def nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = current_nvfp4_4over6_config()
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
-        raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
+        # ``nvfp4_4over6`` is still the caller's unresolved value here, so the
+        # error can name the source.  FlashInfer's own callers forward FROM_ENV
+        # as FROM_ENV rather than as its resolved recipe to keep that true --
+        # see _forward_nvfp4_4over6 in ../fp4_quantization.py.
+        raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, input.dtype)
     is_sm107 = get_compute_capability(input.device) == (10, 7)
     use_tma = (
         _should_use_tma(
@@ -2388,6 +2404,16 @@ def nvfp4_quantize_cute_dsl(
     )
 
     if use_tma:
+        if nvfp4_4over6_config is not None:
+            # Unreachable while the `use_tma` gate above tests the config, but
+            # _get_compiled_kernel_nvfp4_tma has no recipe parameter, so a future
+            # edit to that gate would silently emit standard-NVFP4 numerics.
+            # A raise, not an assert: python -O (PYTHONOPTIMIZE, common in
+            # serving containers) strips asserts and would restore the silence.
+            raise AssertionError(
+                "the TMA NVFP4 kernel cannot express a 4over6 recipe; "
+                f"refusing to silently ignore {nvfp4_4over6_config!r}"
+            )
         tma_row_tile = _TMA_ROW_TILE
         if sf_layout == SF_LAYOUT_LINEAR:
             padded_m = _round_up(m, tma_row_tile)
@@ -2567,8 +2593,14 @@ def nvfp4_quantize_smooth_cute_dsl(
     pre_quant_scale: torch.Tensor,
     global_scale: torch.Tensor,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fuse BF16 channel smoothing into the 128x4 NVFP4 quantizer."""
+    """Fuse BF16 channel smoothing into the 128x4 NVFP4 quantizer.
+
+    ``nvfp4_4over6`` follows the same three-state contract as
+    :func:`nvfp4_quantize_cute_dsl`.
+    """
     from ...utils import device_support_pdl
 
     if input.ndim != 2 or input.dtype != torch.bfloat16 or not input.is_cuda:
@@ -2612,7 +2644,7 @@ def nvfp4_quantize_smooth_cute_dsl(
         SF_LAYOUT_128x4,
         enable_pdl,
         _env_flag_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"),
-        current_nvfp4_4over6_config(),
+        resolve_nvfp4_4over6(nvfp4_4over6),
         global_scale_is_tensor=True,
         smooth_quant=True,
     )
@@ -2638,6 +2670,8 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     global_scale: torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply SwiGLU and NVFP4 quantization using CuTe-DSL.
 
@@ -2654,6 +2688,13 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
         Scale layout: 0 for 128x4, 1 for 8x4, or 2 for linear.
     enable_pdl : bool, optional
         Enable Programmatic Dependent Launch. Auto-detected when None.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -2728,7 +2769,7 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = current_nvfp4_4over6_config()
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     # SwiGLU fusion uses the non-TMA vectorized-load kernels only.
     kernel_fn, block_unit = _get_compiled_kernel_nvfp4(
@@ -2811,6 +2852,8 @@ def nvfp4_quantize_per_token_cute_dsl(
     global_scale_inv: torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -2843,6 +2886,13 @@ def nvfp4_quantize_per_token_cute_dsl(
         Whether to enable Programmatic Dependent Launch. Auto-detected from
         device capability (SM >= 9.0) when ``None``; pass ``False`` to force it
         off.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -2907,7 +2957,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = current_nvfp4_4over6_config()
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     kernel_fn = _get_compiled_kernel_nvfp4_per_token(
         dtype_key,

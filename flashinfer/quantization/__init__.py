@@ -48,6 +48,21 @@ from .fp4_quantization import (
     get_fp4_quantization_module,  # Used by activation.py
 )
 
+# Re-export the NVFP4 4over6 recipe types and helpers.  These spell the
+# ``nvfp4_4over6=`` parameter of the quantization APIs, replacing the
+# process-wide FLASHINFER_NVFP4_4OVER6* environment variables.
+from .nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    NVFP44Over6Setting,
+    NVFP4Recipe,
+    make_nvfp4_global_scale,
+    nvfp4_4over6_code,
+    nvfp4_4over6_from_code,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
+)
+
 # CuTe-DSL kernels (conditionally exported, EXPERIMENTAL)
 # Warning: These are experimental APIs and may change without notice.
 # Import is guarded to handle environments where cutlass is not installed.
@@ -98,6 +113,16 @@ __all__ = [
     "scaled_fp4_grouped_quantize",
     "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
+    # NVFP4 4over6 recipe
+    "NVFP44Over6Config",
+    "NVFP44Over6ErrMode",
+    "NVFP44Over6Setting",
+    "NVFP4Recipe",
+    "make_nvfp4_global_scale",
+    "nvfp4_4over6_code",
+    "nvfp4_4over6_from_code",
+    "nvfp4_e4m3_max",
+    "resolve_nvfp4_4over6",
 ]
 
 if _cute_dsl_available:
