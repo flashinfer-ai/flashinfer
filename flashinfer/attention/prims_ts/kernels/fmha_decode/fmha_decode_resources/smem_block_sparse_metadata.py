@@ -73,6 +73,20 @@ _SOFTMAX_TOKEN_MASK_IS_FULL_FLAG = 1 << 4
 # validity bits and bit 4 keep their existing meaning.
 _SOFTMAX_ROUTE_IS_PROXY_FLAG = 1 << 5
 
+
+@cute.jit
+def _route_is_proxy(route_flags: Int32) -> cutlass.Boolean:
+    """Return whether staged Softmax route flags mark a proxy route.
+
+    Keeps stages the flags as an ``Int32`` word. SWAP forwards them as a
+    bit-preserving ``Uint32`` dataflow token, which the consumer bitcasts
+    before calling.
+    """
+    return cutlass.Boolean(
+        (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
+    )
+
+
 # SWAP origins are at least eight-token aligned, so their low two bits are free
 # while the route is in Softmax's private staging payload. Reusing them avoids
 # adding a word to every pipeline stage for prepared FULL/PROXY route flags.

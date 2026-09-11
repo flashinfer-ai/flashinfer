@@ -82,7 +82,7 @@ from .helpers_common import (
     _softmax_tile_idx,
 )
 from .smem_block_sparse_metadata import (
-    _SOFTMAX_ROUTE_IS_PROXY_FLAG,
+    _route_is_proxy,
     _swaps_forwards_packed_route_full,
 )
 from .helpers_kv_tile_idx import (
@@ -1663,9 +1663,7 @@ class TmemSResource(DecodeGenResourceBase):
 
         route_is_proxy = cutlass.Boolean(False)
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
-            route_is_proxy = cutlass.Boolean(
-                (sparse_route_flags & Uint32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Uint32(0)
-            )
+            route_is_proxy = _route_is_proxy(sparse_route_flags.bitcast(Int32))
         if cutlass.const_expr(use_sparse):
             # Route, KV-tail, uniform-causal, and token validity depend only on
             # K, so one predicate masks the adjacent pair of Q-row registers.
