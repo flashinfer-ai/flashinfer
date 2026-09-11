@@ -51,14 +51,24 @@ namespace cutlass::gemm::collective {
 enum class MixedInputScaleMode {
   kPostMma = 0,
   kPreMmaE8M0,
+  // Post-MMA path where the FP8 activation additionally carries a per-block (K group=32) scale that
+  // is applied together with the weight scale after each K-chunk MMA. Distinct from kPostMma
+  // (per-token only) even though both fold to the upstream post-MMA dispatch policy; the difference
+  // is surfaced to the collective through the trailing ElementActivationScale_ template parameter.
+  kPostMmaActBlockScale,
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// ElementActivationScale_: trailing gate for the MXFP4-weight x MXFP8-activation per-block
+// activation-scale path. Defaults to void so every legacy instantiation (int4a8, mxfp4-bf16,
+// per-token post-MMA, pre-MMA E8M0) stays byte-identical: when it is void, HasActivationScale is
+// false inside the specialization and all activation-scale code is stripped. The builder passes
+// cutlass::bfloat16_t only for MixedInputScaleMode::kPostMmaActBlockScale.
 template <class DispatchPolicy, class TileShape, class ElementA, class StrideA, class ElementB,
           class StrideB, class TiledMma, class GmemTiledCopyA, class SmemLayoutAtomA,
           class SmemCopyAtomA, class TransformA, class GmemTiledCopyB, class SmemLayoutAtomB,
-          class SmemCopyAtomB, class TransformB>
+          class SmemCopyAtomB, class TransformB, class ElementActivationScale_ = void>
 struct CollectiveMmaArrayMixedInput {
   static_assert(cutlass::detail::dependent_false<ElementA>,
                 "Could not find a mainloop specialization.");
