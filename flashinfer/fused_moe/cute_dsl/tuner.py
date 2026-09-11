@@ -78,7 +78,7 @@ def _seeded_activation(shapes, dtype, device):
 
 
 def get_blackwell_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
-    """Get valid Blackwell tactics for GEMM1 (Gather + SwiGLU Fusion).
+    """Get valid Blackwell tactics for GEMM1 (gather + activation fusion).
 
     Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
     """
@@ -179,7 +179,7 @@ VALID_TILE_SIZES: Tuple[int, ...] = (128, 256)
 # Format: (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
 # where mma_tiler = (M, N, K) and mma_inst_shape = (M', N, K')
 def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
-    """Get valid Rubin tactics for GEMM1 (Gather + SwiGLU Fusion).
+    """Get valid Rubin tactics for GEMM1 (gather + activation fusion).
 
     Format: (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
     """
@@ -733,15 +733,34 @@ class CuteDslFusedMoERunner(TunableRunner):
             final_scale_dtype = cutlass.Float16
 
         def _tactic_ok(tactic):
+            """Return whether both GEMM kernels support this tactic and workload."""
             tile_size, gemm1_tactic, gemm2_tactic = tactic
             permuted_m = get_max_num_permuted_tokens(
                 num_tokens, self.top_k, self.num_local_experts, tile_size
             )
 
             if _is_rubin_tactic(tactic):
-                # The Rubin (SM107) kernels only implement the gated (SwiGLU)
-                # activation path; skip Rubin tactics for non-gated activations.
-                if not gated:
+                # SM107 currently supports standard SwiGLU and non-gated
+                # ReLU^2. Other gated formulas remain unsupported on SM107.
+                if self.activation_type not in (
+                    ActivationType.Swiglu,
+                    ActivationType.Relu2,
+                ):
+                    return False
+                if self.activation_type == ActivationType.Swiglu and (
+                    (
+                        self.swiglu_alpha,
+                        self.swiglu_beta,
+                        self.swiglu_limit,
+                    )
+                    != (
+                        DEFAULT_SWIGLU_ALPHA,
+                        DEFAULT_SWIGLU_BETA,
+                        DEFAULT_SWIGLU_LIMIT,
+                    )
+                    or self.situ_beta is not None
+                    or self.situ_linear_beta is not None
+                ):
                     return False
 
                 # The SM107 kernels need cutlass.utils.rubin_helpers, which only
@@ -757,7 +776,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     return False
 
                 from .rubin import (
-                    Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
+                    Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel,
                     Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
                 )
 
@@ -768,7 +787,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     gemm2_tactic
                 )
 
-                gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
+                gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel.can_implement(
                     a_dtype=a_dtype,
                     b_dtype=b_dtype,
                     sf_dtype=sf_dtype,
@@ -778,7 +797,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                     mma_tiler=gemm1_mma_tiler,
                     cluster_shape_mn=gemm1_cluster_shape_mn,
                     m=permuted_m,
-                    n=2 * intermediate_size,
+                    n=gemm1_n,
                     k=hidden_size,
                     l=num_local_experts,
                     a_major="k",

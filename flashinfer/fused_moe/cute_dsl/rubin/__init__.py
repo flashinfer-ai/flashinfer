@@ -20,8 +20,8 @@ This module contains CuteDSL kernels optimized for NVIDIA Rubin architecture.
 These kernels are adapted from TensorRT-LLM.
 """
 
-from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
-    Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
+from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+    Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel,
 )
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
