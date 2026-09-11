@@ -7,6 +7,47 @@ from .api_logging import flashinfer_experimental_api
 
 
 @flashinfer_experimental_api
+def deepseek_v41_small_index_scores(
+    q_data,
+    q_scales,
+    kv_cache,
+    weights,
+    visible,
+    block_table,
+    *,
+    max_context_len,
+    candidates=None,
+    out=None,
+):
+    """Compute short-context MXFP4 index scores with FP32 dot/head reductions.
+
+    Q uses byte data[B,32,64] and E8M0 scales[B,32,4]; K uses the D128
+    physical cache layout from quantize_index_cache. BF16 weights[B,32],
+    int32 visible[B] and block_table[B,pages] share Q's CUDA device.
+    max_context_len is1..128; caller guarantees0<=visible<=max_context_len,
+    finite Q/K/weights and live nonnegative physical pages. Optional int32
+    candidates[B,C] gives1..16 block8 IDs; -1/unreachable columns produce-inf.
+    Output is BF16[B,max_context_len or C*8], with1024-byte row stride alignment
+    for DeepSelect. Reuse out for allocation-free graph calls. This explicit
+    experimental kernel has FP32 accumulation, unlike BF16 partial-sum
+    provider variants; it does not assert checkpoint selection-ID parity.
+    """
+    from .experimental.deepseek_v41.indexer import small_index_scores
+
+    return small_index_scores(
+        q_data,
+        q_scales,
+        kv_cache,
+        weights,
+        visible,
+        block_table,
+        max_context_len=max_context_len,
+        candidates=candidates,
+        out=out,
+    )
+
+
+@flashinfer_experimental_api
 def deepseek_v41_paged_indices(indices, block_table, *, page_size=64, out=None):
     """Map logical int32 [B,Sq,K] token IDs into physical paged cache slots.
 
@@ -20,6 +61,65 @@ def deepseek_v41_paged_indices(indices, block_table, *, page_size=64, out=None):
     from .experimental.deepseek_v41.paging import paged_indices
 
     return paged_indices(indices, block_table, page_size=page_size, out=out)
+
+
+@flashinfer_experimental_api
+def deepseek_v41_token_workspace(scores, *, topk_tokens=512):
+    """Allocate reusable aligned logits, visible lengths and token ID outputs."""
+    from .experimental.deepseek_v41.selection import token_workspace
+
+    return token_workspace(scores, topk_tokens=topk_tokens)
+
+
+@flashinfer_experimental_api
+def deepseek_v41_token_topk(
+    scores, visible, *, candidates=None, topk_tokens=512, workspace=None
+):
+    """Select sorted causal token IDs from dense or candidate-block BF16 scores.
+
+    With candidates=None, score column is the logical token ID and caller
+    guarantees 0 <= visible <= score_width. Otherwise candidates are int32
+    [queries,score_width/8] sorted unique logical block IDs, followed by -1
+    padding; score column c corresponds to candidates[c//8]*8+c%8. Visible is
+    the logical context length. Valid candidates may extend beyond visibility.
+    Their ascending order makes reachable score columns a contiguous prefix.
+    Visible scores must be finite; unreachable output slots are -1. Boundary
+    ties use DeepSelect semantics. No QAT or selection derivative is attached.
+    """
+    from .experimental.deepseek_v41.selection import token_topk
+
+    return token_topk(
+        scores,
+        visible,
+        candidates=candidates,
+        topk_tokens=topk_tokens,
+        workspace=workspace,
+    )
+
+
+@flashinfer_experimental_api
+def deepseek_v41_candidate_workspace(scores, *, topk_blocks=2048):
+    """Allocate reusable candidate block logits, lengths and index output."""
+    from .experimental.deepseek_v41.selection import candidate_workspace
+
+    return candidate_workspace(scores, topk_blocks=topk_blocks)
+
+
+@flashinfer_experimental_api
+def deepseek_v41_candidate_blocks(scores, visible, *, topk_blocks=2048, workspace=None):
+    """Select causal block8 candidates and pin the newest visible block.
+
+    BF16 scores [queries,KV] and int32 visible [queries] are device tensors.
+    Caller guarantees 0 <= visible <= KV and finite visible scores. The explicit
+    DeepSelect provider selects up to topk_blocks, sorts valid block IDs, and
+    pads unreachable slots with -1. Ties follow provider selection semantics;
+    exact Torch index identity is not promised. Reuse workspace for capture.
+    """
+    from .experimental.deepseek_v41.selection import candidate_blocks
+
+    return candidate_blocks(
+        scores, visible, topk_blocks=topk_blocks, workspace=workspace
+    )
 
 
 @flashinfer_experimental_api
@@ -137,3 +237,44 @@ def deepseek_v41_rope(x, freqs, positions, *, inverse=False, out=None):
     from .experimental.deepseek_v41.rope import rope
 
     return rope(x, freqs, positions, inverse=inverse, out=out)
+
+
+@flashinfer_experimental_api
+def deepseek_v41_index_scores_fp32(
+    q_data,
+    q_scales,
+    kv_cache,
+    weights,
+    visible,
+    block_table,
+    *,
+    max_context_len,
+    candidates=None,
+    out=None,
+):
+    """Tiled full/candidate MXFP4 index scores with FP32 dot/head accumulation.
+
+    Q bytes[B,32,64], E8M0 scales[B,32,4], D128 paged index cache, BF16
+    weights[B,32], int32 visible[B] and block_table[B,pages]. Logical context
+    must fit the page table and int32. Optional int32 candidates[B,1..2048]
+    contains block8 IDs; -1 or unreachable positions yield -inf scores.
+    Caller guarantees initialized live pages, 0<=visible<=max_context_len,
+    finite BF16-representable decoded Q/K and finite FP32 logits/weights.
+    Returns BF16[B,max_context_len or C*8], with 1024-byte aligned rows for
+    DeepSelect. Reuse out for allocation-free graph replay. Native Blackwell
+    MXFP4 tensor-core products with FP32 accumulation and an ordered FP32
+    head reduction; no checkpoint-ID or QAT claim.
+    """
+    from .experimental.deepseek_v41.indexer_fp32 import index_scores_fp32
+
+    return index_scores_fp32(
+        q_data,
+        q_scales,
+        kv_cache,
+        weights,
+        visible,
+        block_table,
+        max_context_len=max_context_len,
+        candidates=candidates,
+        out=out,
+    )
