@@ -78,83 +78,44 @@ def deepseek_v41_pack_cache(data, scales, *, page_size=64, out=None, slots=None)
 
 @flashinfer_experimental_api
 def deepseek_v41_decode(
-    q,
-    swa_cache,
-    global_cache,
-    swa_indices,
-    global_indices,
-    sink,
-    *,
-    plan=None,
-    backend="flashmla",
-    arithmetic=None,
+    q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None
 ):
-    """H64/D512 BF16 Q over SWA MXFP8 plus global group16/E4M3 FP4.
+    """SM100 CuTe DSL mixed MXFP8/FP4 decode with BF16 probabilities.
 
-    Select ``backend="frost"`` for the native Blackwell implementation, or
-    ``backend="flashmla"`` for the existing provider (default). Frost accepts
-    ``arithmetic="bf16x3"`` (default) or ``"tf32x3"``; FlashMLA requires None.
-    Returns ``(out, lse, plan)``. Q is
-    ``[batch,query_tokens,64,512]`` and index tensors are physical slot IDs.
-    Returned natural-log LSE excludes the sink. Prepare once before graph
-    capture, then reuse the plan only with identical tensor declarations.
-    Causal visibility is the caller's index contract. No backward is attached.
-    Frost owns reusable output/LSE/workspace through its plan. Replays overwrite
-    these same buffers; copy outputs explicitly if retaining previous steps.
-    Plans are specific to the selected backend and arithmetic recipe.
+    Q is contiguous BF16[B,1,64,512]. Caches are opaque uint8 page pools
+    [pages,64,1,528] (SWA) and [pages,64,1,288] (global). SWA indices are
+    int32[B,1,128]; global indices int32[B,1,K], K a positive multiple of64
+    up to512. Slots -1 and out-of-capacity slots are masked. The caller owns
+    causal visibility and initialization of every valid cache slot. Sink is
+    FP32[64], with finite logits or -inf (disabled). Inputs must be finite
+    after dequantization; no checkpoint or backward parity is claimed.
+
+    Returns (out,lse,plan): BF16 output shaped like Q and FP32 natural-log
+    LSE [B,64,1] excluding the sink. Empty rows give zero output and -inf LSE.
+    Multiplications use BF16 Q/K/V/P; accumulation and softmax use FP32.
+    Prepare once before capture, then reuse plan with identical declarations
+    on its device. Replay overwrites plan-owned output/LSE/workspace; the
+    same plan must not execute concurrently on different streams. Single
+    token decode only; MTP and SM103 are not part of this initial scope.
     """
-    from .experimental.deepseek_v41.decode import dispatch_decode
+    from .experimental.deepseek_v41.decode import decode
 
-    return dispatch_decode(
-        q,
-        swa_cache,
-        global_cache,
-        swa_indices,
-        global_indices,
-        sink,
-        plan=plan,
-        backend=backend,
-        arithmetic=arithmetic,
+    return decode(
+        q, swa_cache, global_cache, swa_indices, global_indices, sink, plan=plan
     )
 
 
 @flashinfer_experimental_api
-def deepseek_v41_window_decode(
-    q,
-    cache,
-    indices,
-    sink,
-    *,
-    plan=None,
-    backend="flashmla",
-    arithmetic=None,
-):
-    """H64/D512 BF16 queries over one V4.1 group32/E8M0 FP8 cache.
+def deepseek_v41_window_decode(q, cache, indices, sink, *, plan=None):
+    """Window-only variant of deepseek_v41_decode, using the same CuTe kernel.
 
-    ``backend="frost"`` selects native Blackwell decode; ``"flashmla"`` remains
-    the default provider. Frost arithmetic is ``"bf16x3"`` (default) or
-    ``"tf32x3"``; FlashMLA requires None. Cache is
-    uint8[pages,page_size,1,528], using quantize_cache's paged layout. Q is
-    BF16[B,Sq,64,512], indices int32[B,Sq,K], sink FP32[64]. Caller owns slot
-    liveness/visibility. Returns(out,lse,plan); natural-log LSE excludes sink.
-    Warm up once and reuse the identical-declaration plan for graph calls.
-    Frost reuses plan-owned output/LSE/workspace; FlashMLA allocates through
-    its provider. Both support CUDA Graph capture after preparation.
-    No backward, projections, RoPE or speculative scheduler is attached.
+    Accepts BF16[B,1,64,512] Q, uint8[pages,64,1,528] cache and
+    int32[B,1,128] physical slot IDs. See deepseek_v41_decode for the plan,
+    arithmetic, validity, output and sink-exclusive LSE contracts.
     """
-    from .experimental.deepseek_v41.decode import dispatch_decode
+    from .experimental.deepseek_v41.decode import decode
 
-    return dispatch_decode(
-        q,
-        cache,
-        None,
-        indices,
-        None,
-        sink,
-        plan=plan,
-        backend=backend,
-        arithmetic=arithmetic,
-    )
+    return decode(q, cache, None, indices, None, sink, plan=plan)
 
 
 @flashinfer_experimental_api
@@ -218,83 +179,3 @@ def deepseek_v41_rope(x, freqs, positions, *, inverse=False, out=None):
     from .experimental.deepseek_v41.rope import rope
 
     return rope(x, freqs, positions, inverse=inverse, out=out)
-
-
-@flashinfer_experimental_api
-def deepseek_v41_decode_fp32(
-    q,
-    swa_cache,
-    global_cache,
-    swa_indices,
-    global_indices,
-    sink,
-    *,
-    workspace=None,
-    out=None,
-    lse=None,
-):
-    """Mixed-cache decode with FP32 probabilities and an explicit TF32x3 PV.
-
-    BF16 Q[B,Sq,64,512], existing packed SWA MXFP8/global group16-E4M3 FP4
-    pages, int32 physical indices[B,Sq,K] and FP32 sink[64]. Index widths
-    are padded multiples of64, at most192 SWA and512 global; -1 is invalid.
-    Global cache/indices may both be None. Caller guarantees live slots,
-    finite decoded values/FP32 logits/sinks and causal selected indices.
-    Returns BF16 output, FP32 natural-log LSE[B,64,Sq] excluding the sink,
-    and reusable workspace dict(partial,max,sum). Reuse all three outputs
-    for allocation-free graph replay. Empty selections give zero output/-inf
-    LSE. This is an explicit inference arithmetic recipe, distinct from the
-    FlashMLA backend; it makes no checkpoint parity or backward claim.
-    """
-    from .experimental.deepseek_v41.decode_fp32 import decode_fp32
-
-    return decode_fp32(
-        q,
-        swa_cache,
-        global_cache,
-        swa_indices,
-        global_indices,
-        sink,
-        workspace=workspace,
-        out=out,
-        lse=lse,
-    )
-
-
-@flashinfer_experimental_api
-def deepseek_v41_decode_bf16x3(
-    q,
-    swa_cache,
-    global_cache,
-    swa_indices,
-    global_indices,
-    sink,
-    *,
-    workspace=None,
-    out=None,
-    lse=None,
-):
-    """Mixed-cache decode with FP32 softmax and three BF16 PV terms.
-
-    Same input/cache/output envelope as deepseek_v41_decode_fp32, with a
-    separate arithmetic recipe: transposed BF16 QK and three-term BF16
-    probability decomposition for TCGen5 PV. This is an explicit inference
-    opt-in, not checkpoint parity or a backward implementation. Workspace
-    uses64-key partials and is not interchangeable with the32-key TF32x3
-    recipe. Allocate once, then reuse it with out/LSE for graph replay.
-    """
-    from .experimental.deepseek_v41.decode_fp32 import decode_fp32
-
-    return decode_fp32(
-        q,
-        swa_cache,
-        global_cache,
-        swa_indices,
-        global_indices,
-        sink,
-        workspace=workspace,
-        out=out,
-        lse=lse,
-        recipe="bf16x3_tcgen",
-        head_tile=None,
-    )

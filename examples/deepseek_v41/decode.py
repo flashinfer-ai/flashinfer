@@ -10,9 +10,7 @@ swa = ds.deepseek_v41_quantize_cache(x, format="swa_mxfp8")
 main = ds.deepseek_v41_quantize_cache(x, format="main_kv_fp4")
 ids = torch.arange(128, device="cuda", dtype=torch.int32).view(1, 1, 128)
 sink = torch.zeros(64, device="cuda")
-out, lse, plan = ds.deepseek_v41_decode(q, swa, main, ids, ids, sink, backend="frost")
+out, lse, plan = ds.deepseek_v41_decode(q, swa, main, ids, ids, sink)
 q.normal_()
-out, lse, _ = ds.deepseek_v41_decode(
-    q, swa, main, ids, ids, sink, backend="frost", plan=plan
-)
-print("Frost decode:", out.shape, lse.shape, plan.backend, plan.arithmetic)
+out, lse, _ = ds.deepseek_v41_decode(q, swa, main, ids, ids, sink, plan=plan)
+print("CuTe DSL decode:", out.shape, lse.shape)
