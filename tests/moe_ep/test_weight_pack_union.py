@@ -47,17 +47,26 @@ def test_factory_returns_unquantized_without_scales():
     assert isinstance(pack, MoEWeightPack)
     assert pack.w13 is w13 and pack.w2 is w2
     assert pack.w13_scale is None and pack.w2_scale is None
+    assert pack.w13_global_scale is None and pack.w2_global_scale is None
 
 
-def test_factory_returns_prequantized_with_both_scales():
+@pytest.mark.parametrize(
+    "global_scale_field", (None, "w13_global_scale", "w2_global_scale")
+)
+def test_factory_returns_prequantized_with_both_scales(global_scale_field):
     w13, w2, s13, s2 = _packed_tensors()
+    alpha = torch.tensor([1.00390625, 0.71013], dtype=torch.float32)
+    globals_ = {} if global_scale_field is None else {global_scale_field: alpha}
     for pack in (
-        MoEWeightPack(w13, w2, s13, s2),  # positional (old signature)
-        MoEWeightPack(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2),  # kwargs
+        MoEWeightPack(w13, w2, s13, s2, **globals_),  # positional (old signature)
+        MoEWeightPack(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2, **globals_),
+        PrequantizedMoEWeights(w13, w2, s13, s2, **globals_),
     ):
         assert type(pack) is PrequantizedMoEWeights
         assert isinstance(pack, MoEWeightPack)
         assert pack.w13_scale is s13 and pack.w2_scale is s2
+        for field in ("w13_global_scale", "w2_global_scale"):
+            assert getattr(pack, field) is globals_.get(field)
 
 
 def test_factory_tolerates_explicit_none_scales():
@@ -74,10 +83,19 @@ def test_factory_tolerates_explicit_none_scales():
         assert pack.w13_scale is None and pack.w2_scale is None
 
 
-def test_direct_unquantized_rejects_real_scales():
-    w13, w2, s13, s2 = _packed_tensors()
+@pytest.mark.parametrize(
+    "field", ("w13_scale", "w2_scale", "w13_global_scale", "w2_global_scale")
+)
+def test_direct_unquantized_rejects_real_scales(field):
+    w13, w2 = _bf16_tensors()
     with pytest.raises(TypeError, match="no scale planes"):
-        UnquantizedMoEWeights(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2)
+        UnquantizedMoEWeights(w13=w13, w2=w2, **{field: torch.ones(E)})
+
+
+@pytest.mark.parametrize("field", ("w13_global_scale", "w2_global_scale"))
+def test_factory_requires_block_scales_with_global_scales(field):
+    with pytest.raises(ValueError, match="pre-quantized"):
+        MoEWeightPack(*_bf16_tensors(), **{field: torch.ones(E)})
 
 
 def test_mixed_scale_state_raises():

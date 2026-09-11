@@ -1219,6 +1219,220 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
     )
 
 
+def _run_nvfp4_routing_rounds(
+    rank,
+    world_size,
+    *,
+    mode,
+    hidden,
+    intermediate,
+    knobs,
+    changing_batches,
+    num_tokens=257,
+):
+    """One public layer reuses its workspace across skew, empty sources and refill."""
+    import dataclasses
+    import torch
+    import torch.distributed as dist
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        PrequantizedMoEWeights,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        ensure_moe_ep_cuda_device,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
+    from .test_nvfp4_cutedsl_kernel_vs_reference import (
+        NVFP4_MODES,
+        _single_rank_problem,
+        _nvfp4_reference_from_weights,
+        _assert_nvfp4_reference,
+    )
+
+    assert mode in NVFP4_MODES, mode
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    num_experts, topk, capacity = 4, 2, num_tokens
+    assert num_experts % world_size == 0
+    local_experts = num_experts // world_size
+    w13, w2 = _make_bf16_weights(
+        rank, num_local_experts=local_experts, hidden=hidden, intermediate=intermediate
+    )
+    # The canonical packed input is shared by both precision modes. Only W4A16
+    # has post-MMA global scales; keep those separate from the decoded weights.
+    q13, s13 = nvfp4_quantize_per_block_16(w13.float().reshape(-1, hidden), 1.0)
+    q2, s2 = nvfp4_quantize_per_block_16(w2.float().reshape(-1, intermediate), 1.0)
+    alpha1, alpha2 = None, None
+    if mode == "w4a16":
+        # Preserve expert-shard views, including their scalar-only alignment.
+        alpha1 = (
+            torch.linspace(0.71013, 1.23017, num_experts, device="cuda") / hidden**0.5
+        )[rank * local_experts : (rank + 1) * local_experts]
+        alpha2 = torch.linspace(1.17019, 0.83023, num_experts, device="cuda")[
+            rank * local_experts : (rank + 1) * local_experts
+        ]
+    weights = PrequantizedMoEWeights(
+        w13=q13.view(torch.uint8).reshape(local_experts, 2 * intermediate, hidden // 2),
+        w2=q2.view(torch.uint8).reshape(local_experts, hidden, intermediate // 2),
+        w13_scale=s13.reshape(local_experts, 2 * intermediate, hidden // 16),
+        w2_scale=s2.reshape(local_experts, hidden, intermediate // 16),
+        w13_global_scale=alpha1,
+        w2_global_scale=alpha2,
+    )
+    configs = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
+    layer = MoEEpMegaLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=hidden,
+        ),
+        weights=weights,
+        backend=MegaConfig(
+            megakernel=configs[mode](
+                intermediate_size=intermediate,
+                top_k=topk,
+                gate_up_clamp=1.5,
+                knobs=knobs,
+            )
+        ),
+    )
+    try:
+        # Gather the actual local expert weights rather than rely on equal RNG
+        # states; an empty input rank still owns experts needed by its peers.
+        global_weights = dataclasses.replace(
+            weights,
+            **{
+                field.name: _all_gather_stack(value).flatten(0, 1)
+                for field in dataclasses.fields(weights)
+                if (value := getattr(weights, field.name)) is not None
+            },
+        )
+        rounds = (("skewed_tiles", num_tokens, True),)
+        if changing_batches:
+            rounds = (
+                ("balanced", 17, False),
+                ("uneven_sources", 5 if rank == 0 else 17, False),
+                ("skewed", 17, True),
+                ("single_token", 1 if rank == 0 else 0, False),
+                ("empty_source", 0 if rank == 0 else 11, False),
+                ("all_empty", 0, False),
+                ("refill", 9, False),
+            )
+        for name, n, skewed in rounds:
+            problem = _single_rank_problem(
+                hidden,
+                intermediate,
+                num_experts=num_experts,
+                topk=topk,
+                num_tokens=n,
+                max_tokens=capacity,
+                seed=73 + rank,
+            )
+            problem["gate_up_clamp"] = 1.5
+            if skewed:
+                problem["topk_ids"][:] = torch.tensor([0, 1], device="cuda")
+            reference = (
+                _nvfp4_reference_from_weights(problem, global_weights, mode=mode)
+                if n
+                else None
+            )
+            tensors = MoEEpTensors(
+                **{
+                    key: problem[key]
+                    for key in ("hidden_states", "topk_ids", "topk_weights")
+                }
+            )
+            dist.barrier()
+            y = layer.forward(tensors)
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert y.dtype == torch.bfloat16 and y.shape == (n, hidden)
+            assert torch.isfinite(y).all(), (mode, name, rank)
+            if n:
+                _assert_nvfp4_reference(y, reference, mode=mode)
+    finally:
+        layer.destroy()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("mode", ["w4a4", "w4a16"])
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
+def test_nvfp4_mega_uneven_sources_and_empty_refill(
+    mode, token_back_mode, load_balance_mode
+):
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode=mode,
+        hidden=256,
+        intermediate=256,
+        knobs={
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": load_balance_mode,
+        },
+        changing_batches=True,
+    )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize(
+    "mode,hidden,intermediate,tile_n",
+    [
+        pytest.param("w4a4", 1600, 832, 128, id="w4a4-tail"),
+        pytest.param("w4a16", 64, 64, 128, id="w4a16-small"),
+        pytest.param("w4a16", 288, 448, 64, id="w4a16-tail"),
+        pytest.param("w4a16", 7200, 2112, 64, id="w4a16-n64-wrap"),
+        pytest.param("w4a16", 7200, 2112, 128, id="w4a16-n128-wrap"),
+        pytest.param("w4a16", 18272, 64, 64, id="w4a16-activation-tail"),
+    ],
+)
+def test_nvfp4_mega_geometry_and_pipeline_tails(
+    mode, hidden, intermediate, tile_n, token_back_mode
+):
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    # 257 routed rows cross a work-tile boundary. Large K wraps both operand
+    # rings; the skinny shape exercises the activation-stage fit and K tail.
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode=mode,
+        hidden=hidden,
+        intermediate=intermediate,
+        knobs={
+            "mma_tiler_mnk": (256, tile_n, 256),
+            "cluster_shape_mnk": (2, 1, 1),
+            "use_2cta_instrs": True,
+            "group_hint": 512,
+            "flag_batch": 4,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": "atomic_counter",
+        },
+        changing_batches=False,
+    )
+
+
 @pytest.mark.arch_blackwell
 def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
     _require_cuda()
