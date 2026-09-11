@@ -172,10 +172,12 @@ class MegaMoEW4A16Frontend:
         self._mega = None
 
     @staticmethod
-    def _to_cute(tensor: torch.Tensor, *, static_layout: bool = False):
+    def _to_cute(
+        tensor: torch.Tensor, *, static_layout: bool = False, assumed_align: int = 16
+    ):
         import cutlass.torch as cutlass_torch
 
-        result = cutlass_torch.from_dlpack(tensor, assumed_align=16)
+        result = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
         if static_layout:
             return result
         return result.mark_layout_dynamic(
@@ -272,11 +274,7 @@ class MegaMoEW4A16Frontend:
         kwargs["options"] = "--ptxas-options='-maxrregcount=96'"
         if c.enable_iket:
             kwargs["options"] += " iket"
-        try:
-            mega.compiled = cute.compile(kernel, **kwargs)
-        except Exception:
-            free_sym_tensor(shared_workspace)
-            raise
+        mega.compiled = cute.compile(kernel, **kwargs)
         self._mega = mega
         self._mega_key = key
         return mega
@@ -298,10 +296,10 @@ class MegaMoEW4A16Frontend:
             "topk_weights": self._to_cute(inputs.topk_weights),
             "fc1_weight": self._to_cute(inputs.fc1_weight),
             "fc1_weight_sf": self._to_cute(inputs.fc1_weight_sf),
-            "fc1_alpha": self._to_cute(inputs.fc1_alpha),
+            "fc1_alpha": self._to_cute(inputs.fc1_alpha, assumed_align=4),
             "fc2_weight": self._to_cute(inputs.fc2_weight),
             "fc2_weight_sf": self._to_cute(inputs.fc2_weight_sf),
-            "fc2_alpha": self._to_cute(inputs.fc2_alpha),
+            "fc2_alpha": self._to_cute(inputs.fc2_alpha, assumed_align=4),
             "fc1_c": None,
             "combine_output": self._to_cute(inputs.combine_output),
             "local_workspace": self._to_cute(mega.local_workspace, static_layout=True),
