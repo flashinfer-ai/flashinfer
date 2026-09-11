@@ -513,6 +513,7 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         head_dim=int(case.q.shape[-1]),
         q_dtype=case.q.dtype,
         kv_dtype=case.k.dtype,
+        pv_dtype=case.v.dtype,
         packed=case.packed,
         mask_type=case.mask_type,
         window_left=case.window_left,
@@ -571,6 +572,7 @@ def _plan_paged_wrapper(
         head_dim=int(reference.q.shape[2]),
         q_dtype=reference.q.dtype,
         kv_dtype=case.k_cache.dtype,
+        pv_dtype=case.v_cache.dtype,
         out_dtype=reference.output_dtype,
         page_size=case.page_size,
         mask_type=reference.mask_type,
@@ -931,6 +933,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "head_dim",
         "q_dtype",
         "kv_dtype",
+        "pv_dtype",
         "out_dtype",
         "page_size",
         "mask_type",
@@ -1014,6 +1017,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "head_dim",
         "q_dtype",
         "kv_dtype",
+        "pv_dtype",
         "out_dtype",
         "packed",
         "mask_type",
@@ -1144,8 +1148,8 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim=128,
-        q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        qk_dtype=torch.float16,
+        pv_dtype=torch.float16,
         output_dtype=torch.float16,
         uniform_packed_lengths=False,
         has_q_offset=False,
@@ -2663,7 +2667,8 @@ def test_attention_ts_context_uses_ldtm_stat_schedule_builds(
 ):
     """Contiguous task graphs build with either statistics path, without JIT."""
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         qk_acc_dtype=Float32,
         pv_acc_dtype=Float32,
         d=head_dim,
@@ -3293,8 +3298,8 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
+        pv_dtype=torch.bfloat16,
         page_size=32,
         window_left=-1,
         output_dtype=torch.bfloat16,
@@ -3507,8 +3512,8 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
+        pv_dtype=torch.bfloat16,
         page_size=32,
         mask_type="dense",
         window_left=-1,
@@ -4226,7 +4231,7 @@ def test_attention_ts_context_qkbf16_pvfp8_accuracy(head_dim: int, mask_type: st
     case = replace(case, v=case.v.to(_FP8))
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
@@ -4251,22 +4256,9 @@ def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
         seed=2026082702 + head_dim,
     )
     wrapper = BatchPrefillPagedTSWrapper()
-    wrapper.plan(
-        case.reference.q,
-        case.k_cache,
-        case.v_cache,
-        case.qo_indptr,
-        case.paged_kv_indptr,
-        case.paged_kv_indices,
-        case.paged_kv_last_page_len,
-        page_size=case.page_size,
-        mask_type=case.reference.mask_type,
-        sm_scale=case.reference.sm_scale,
-        output_scale=case.reference.output_scale,
-        out_dtype=case.reference.output_dtype,
-    )
-    out = wrapper.run(case.reference.q, case.k_cache, case.v_cache)
-    _assert_context_correct(out, case.reference)
+    metadata = _plan_paged_wrapper(wrapper, case)
+    output = _run_paged_wrapper(wrapper, case, metadata)
+    _assert_context_correct(output, case.reference)
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
@@ -4352,7 +4344,8 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
     _plan_paged_wrapper(wrapper, case)
 
     cfg = FmhaTs(
-        in_dtype=BFloat16,
+        in_qk_dtype=BFloat16,
+        in_pv_dtype=BFloat16,
         out_dtype=BFloat16,
         d=head_dim,
         is_persistent=True,
@@ -4578,7 +4571,8 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
     if kv_length == 993:
         assert wrapper._plan_state.geometry.max_kv_len == 993
         cfg = FmhaTs(
-            in_dtype=BFloat16,
+            in_qk_dtype=BFloat16,
+            in_pv_dtype=BFloat16,
             out_dtype=BFloat16,
             d=256,
             is_persistent=True,
@@ -4750,7 +4744,8 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
     assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     cfg = FmhaTs(
-        in_dtype=BFloat16,
+        in_qk_dtype=BFloat16,
+        in_pv_dtype=BFloat16,
         out_dtype=BFloat16,
         d=head_dim,
         is_persistent=True,
