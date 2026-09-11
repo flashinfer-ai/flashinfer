@@ -35,7 +35,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float16, Float8E4M3FN, Int32
 from cutlass.cute.runtime import make_ptr
-from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 
 from flashinfer.attention.prims_ts import (
@@ -92,6 +91,8 @@ from flashinfer.decode import (
     validate_q_token_kv_block_sparse_group_size as validate_prims_ts_q_token_kv_block_sparse_group_size,
 )
 from flashinfer.utils import is_sm100a_supported
+
+from tests.attention.prims_ts_test_utils import assert_decode_smem_within_capacity
 
 
 @pytest.mark.parametrize(
@@ -2547,10 +2548,6 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
     assert "mask:causal" in defn["tags"]
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def _decode_resources_by_name(resource_dependency_graph):
     resources_by_id = {}
     for resource, dependencies in resource_dependency_graph.items():
@@ -2690,15 +2687,6 @@ def _build_decode_resources(cfg):
         smem_allocator,
         tmem_allocator,
     )
-
-
-def _assert_decode_smem_within_capacity(cfg, smem_allocator) -> None:
-    unified_smem_bytes = (
-        _align_up(smem_allocator.total_smem_bytes, 8)
-        + smem_allocator.barrier_smem_bytes
-    )
-    launch_smem_bytes = _align_up(unified_smem_bytes, cfg.stensor_align)
-    assert launch_smem_bytes <= cutlass_utils.get_smem_capacity_in_bytes("sm_100")
 
 
 @pytest.mark.parametrize("page_size", (4, 16, 32, 64, 128))
@@ -3505,7 +3493,7 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     assert resources["smemP1"]._alloc is None
     assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
@@ -3537,7 +3525,7 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
         assert p._fragment_ready_alloc.size_bytes == (
             cfg.num_softmax_score_fragments * 8
         )
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize("persistent", (False, True))
@@ -3696,7 +3684,7 @@ def test_attention_ts_decode_kv256_explicit_pipeline_depth_contract(
     if not persistent:
         resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
         assert resources["smemKv"].pipeline_config.num_stages == 2
-        _assert_decode_smem_within_capacity(cfg, smem_allocator)
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize("persistent", (False, True))
@@ -3726,7 +3714,7 @@ def test_attention_ts_decode_kv256_uses_dedicated_fragment_exchange(
 
     if not persistent:
         _resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
-        _assert_decode_smem_within_capacity(cfg, smem_allocator)
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize(
@@ -3865,7 +3853,7 @@ def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
     assert "tmemStatsDone0" not in resources
     assert "tmemStatsDone1" not in resources
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
@@ -3896,7 +3884,7 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
     assert s.offset <= p.offset
     assert p.offset + p.num_columns <= s.offset + s.num_columns
     assert cfg.tmem_total_cols <= tmem_allocator.total_tmem_columns <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize(
@@ -5919,7 +5907,7 @@ def test_attention_ts_decode_mixed_kv_dtype_resources_build(
     assert "smemK1" not in resources
     assert "smemV1" not in resources
     assert cfg.smem_k_tile_bytes == cfg.smem_v_tile_bytes * 2
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize(
@@ -7608,12 +7596,8 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         block_sparse_attention,
         block_sparse_attention_with_paged_kv_cache,
     )
-    from tests.attention.test_attention_ts_block_sparse import (
-        _Case,
-        _make_bsr,
-        _make_exact_block_bits,
-        _reference,
-    )
+    from tests.attention.prims_ts_test_utils import make_bsr, make_exact_block_bits
+    from tests.attention.test_attention_ts_block_sparse import _Case, _reference
 
     block, mask = 64, "causal"
     torch.manual_seed(45132)
@@ -7656,8 +7640,8 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         return raw, full
 
     raw, full = patterns(0)
-    indptr, indices = _make_bsr(raw)
-    bits = _make_exact_block_bits(raw, sk // block)
+    indptr, indices = make_bsr(raw)
+    bits = make_exact_block_bits(raw, sk // block)
     static = dict(
         device=q.device,
         max_blocks_per_row=2,
@@ -7741,10 +7725,10 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
     with torch.cuda.graph(graph):
         run()
     raw, full = patterns(1)
-    new_indptr, new_indices = _make_bsr(raw)
+    new_indptr, new_indices = make_bsr(raw)
     indptr.copy_(new_indptr)
     indices.copy_(new_indices)
-    bits.copy_(_make_exact_block_bits(raw, sk // block))
+    bits.copy_(make_exact_block_bits(raw, sk // block))
     graph.replay()
     expected = _reference(case, q, k, v, full, valid, dim**-0.5)
     torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)
