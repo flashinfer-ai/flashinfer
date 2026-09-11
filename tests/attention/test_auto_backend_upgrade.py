@@ -33,6 +33,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.cudnn.prefill import _cudnn_supports_direct_seqlens
 from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 
 DTYPE = torch.bfloat16
@@ -45,10 +46,27 @@ def _cutlass_upgrade_arch() -> bool:
     return is_sm100a_supported(dev) or is_sm110a_supported(dev)
 
 
+def _cudnn_upgrade_available() -> bool:
+    """cuDNN is preferred over CUTLASS on SM100a when it can take token indptrs directly."""
+    if not torch.cuda.is_available():
+        return False
+    return is_sm100a_supported(torch.device("cuda")) and _cudnn_supports_direct_seqlens(
+        DTYPE
+    )
+
+
 requires_cutlass_arch = pytest.mark.skipif(
     not _cutlass_upgrade_arch(),
     reason="the auto->cutlass upgrade targets SM100a/SM110a",
 )
+
+requires_cudnn_upgrade = pytest.mark.skipif(
+    not _cudnn_upgrade_available(),
+    reason="the auto->cudnn upgrade needs SM100a and cuDNN 9.24+/frontend 1.25+",
+)
+
+# What `auto` should land on for a shape both kernels serve.
+BLACKWELL_DEFAULT = "cudnn" if _cudnn_upgrade_available() else "cutlass"
 
 
 def _inputs(batch, s_q, s_kv, h_qo, h_kv, d_qk, d_vo, seed=1234):
@@ -134,11 +152,12 @@ def _plan_and_run(
         (128, 128, 192, 128),  # MLA-style rectangular (DeepSeek-V3 prefill dims)
     ],
 )
-def test_auto_upgrades_to_cutlass(h_qo, h_kv, d_qk, d_vo):
-    """On SM100a/SM110a, ``auto`` must reach CUTLASS rather than settling for FA2."""
+def test_auto_upgrades_on_blackwell(h_qo, h_kv, d_qk, d_vo):
+    """On SM100a/SM110a, ``auto`` must leave FA2: cuDNN where it can take token
+    indptrs directly, CUTLASS otherwise."""
     resolved = _plan_only("auto", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
-    assert resolved == "cutlass", (
-        f"auto resolved to {resolved!r}; expected the CUTLASS upgrade for "
+    assert resolved == BLACKWELL_DEFAULT, (
+        f"auto resolved to {resolved!r}; expected {BLACKWELL_DEFAULT!r} for "
         f"h_qo={h_qo} h_kv={h_kv} d_qk={d_qk} d_vo={d_vo}"
     )
 
@@ -161,9 +180,9 @@ def test_auto_upgrades_to_cutlass(h_qo, h_kv, d_qk, d_vo):
 )
 def test_auto_declines_when_semantics_would_be_dropped(tag, plan_kwargs):
     resolved = _plan_only("auto", 4, 1024, 1024, 64, 8, 128, 128, **plan_kwargs)
-    assert resolved != "cutlass", (
-        f"auto upgraded to cutlass with {tag} requested; the CUTLASS run path "
-        f"never receives it, so the result would be silently wrong"
+    assert resolved == "fa2", (
+        f"auto upgraded to {resolved!r} with {tag} requested; neither the CUTLASS "
+        f"nor the cuDNN run path receives it, so the result would be silently wrong"
     )
 
 
@@ -202,7 +221,9 @@ def test_auto_matches_fa2_numerically(h_qo, h_kv, d_qk, d_vo):
     """
     resolved, out_auto = _plan_and_run("auto", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
     _, out_fa2 = _plan_and_run("fa2", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
-    assert resolved == "cutlass", "precondition: this shape should have upgraded"
+    assert resolved == BLACKWELL_DEFAULT, (
+        "precondition: this shape should have upgraded"
+    )
 
     diff = (out_auto.float() - out_fa2.float()).abs()
     denom = out_fa2.float().abs().max().clamp_min(1e-6)
@@ -228,3 +249,147 @@ def test_explicit_backend_is_respected(backend):
     """
     resolved = _plan_only(backend, 4, 1024, 1024, 64, 8, 128, 128)
     assert resolved == backend
+
+
+# ---------------------------------------------------------------------------
+# cuDNN: `auto` hands the caller's token indptrs straight to cuDNN
+# ---------------------------------------------------------------------------
+
+
+def _varlen_inputs(batch, s_max, h_qo, h_kv, d_qk, d_vo, seed=4321):
+    """Random per-request lengths, so the padding mask (driven by the indptrs
+    on the cuDNN direct path) is actually exercised."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(seed)
+    lens = torch.randint(max(1, s_max // 4), s_max + 1, (batch,), generator=g)
+    indptr = torch.zeros(batch + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(lens, 0)
+    total = int(indptr[-1])
+    torch.manual_seed(seed)
+    q = torch.randn(total, h_qo, d_qk, dtype=DTYPE, device=dev)
+    k = torch.randn(total, h_kv, d_qk, dtype=DTYPE, device=dev)
+    v = torch.randn(total, h_kv, d_vo, dtype=DTYPE, device=dev)
+    return q, k, v, indptr.to(dev), lens
+
+
+@requires_cutlass_arch
+def test_auto_falls_back_to_cutlass_without_cudnn_direct_path(monkeypatch):
+    """The preference list is cudnn -> cutlass: when cuDNN cannot take token
+    indptrs directly (old cuDNN, or no cuDNN), `auto` must land on cutlass,
+    never on the host-side element conversion."""
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setattr(prefill_mod, "_cudnn_supports_direct_seqlens", lambda *_: False)
+    resolved = _plan_only("auto", 4, 1024, 1024, 64, 8, 128, 128)
+    assert resolved == "cutlass"
+    # d256: cutlass declines too -> fa2
+    resolved = _plan_only("auto", 4, 1024, 1024, 32, 8, 256, 256)
+    assert resolved == "fa2"
+
+
+def _run_varlen(backend, q, k, v, indptr, h_qo, h_kv, d_qk, d_vo, **plan_kwargs):
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend=backend
+    )
+    wrapper.plan(
+        indptr,
+        indptr,
+        h_qo,
+        h_kv,
+        d_qk,
+        head_dim_vo=d_vo,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        **plan_kwargs,
+    )
+    out, lse = wrapper.run(q, k, v, return_lse=True)
+    torch.cuda.synchronize()
+    return wrapper._backend, out, lse
+
+
+def _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, tag):
+    diff = (out.float() - out_fa2.float()).abs()
+    rel_max = (diff.max() / out_fa2.float().abs().max().clamp_min(1e-6)).item()
+    assert rel_max < 2e-2, f"{tag}: output diverges from fa2, rel_max={rel_max:.3e}"
+    lse_diff = (lse - lse_fa2).abs().max().item()
+    assert lse_diff < 2e-2, (
+        f"{tag}: base-2 LSE diverges from fa2, max_abs={lse_diff:.3e}"
+    )
+
+
+@requires_cudnn_upgrade
+@pytest.mark.parametrize(
+    "h_qo,h_kv,d_qk,d_vo",
+    [
+        (64, 8, 128, 128),
+        (128, 128, 192, 128),
+        (32, 8, 256, 256),  # CUTLASS declines d256; only cuDNN serves it
+    ],
+)
+def test_auto_prefers_cudnn_on_sm100a(h_qo, h_kv, d_qk, d_vo):
+    resolved = _plan_only("auto", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
+    assert resolved == "cudnn", f"auto resolved to {resolved!r}, expected cudnn"
+
+
+@requires_cudnn_upgrade
+@pytest.mark.parametrize(
+    "h_qo,h_kv,d_qk,d_vo", [(64, 8, 128, 128), (128, 128, 192, 128), (32, 8, 256, 256)]
+)
+def test_auto_cudnn_matches_fa2_varlen_with_lse(h_qo, h_kv, d_qk, d_vo):
+    """Same token-unit indptrs to both backends; output AND packed base-2 LSE
+    must agree. Random lengths exercise the cu_seq_len-driven padding mask."""
+    q, k, v, indptr, _ = _varlen_inputs(6, 1024, h_qo, h_kv, d_qk, d_vo)
+    resolved, out, lse = _run_varlen("auto", q, k, v, indptr, h_qo, h_kv, d_qk, d_vo)
+    assert resolved == "cudnn", "precondition: this shape should have upgraded"
+    _, out_fa2, lse_fa2 = _run_varlen("fa2", q, k, v, indptr, h_qo, h_kv, d_qk, d_vo)
+    assert lse.shape == (q.shape[0], h_qo)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "auto(cudnn)")
+
+
+@requires_cudnn_upgrade
+def test_auto_cudnn_keeps_int32_token_indptr_untouched():
+    """The indptr the caller passed is what reaches cuDNN: no element rescale."""
+    q, k, v, indptr, _ = _varlen_inputs(4, 512, 64, 8, 128, 128)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="auto"
+    )
+    wrapper.plan(indptr, indptr, 64, 8, 128, causal=True, q_data_type=DTYPE)
+    assert wrapper._backend == "cudnn" and wrapper._cudnn_token_offsets
+    assert torch.equal(wrapper._qo_indptr_buf, indptr)
+    assert wrapper._qo_indptr_buf.dtype == torch.int32
+    wrapper.run(q, k, v)
+
+
+@requires_cudnn_upgrade
+def test_explicit_cudnn_element_offsets_return_lse():
+    """Explicit backend="cudnn" keeps element-unit indptrs, and return_lse=True
+    must now work (the wrapper's packed [tokens, heads] LSE is addressed through
+    a stats ragged offset)."""
+    h_qo, h_kv, d = 64, 8, 128
+    q, k, v, indptr, lens = _varlen_inputs(6, 1024, h_qo, h_kv, d, d)
+    _, out_fa2, lse_fa2 = _run_varlen("fa2", q, k, v, indptr, h_qo, h_kv, d, d)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cudnn"
+    )
+    wrapper.plan(
+        indptr * h_qo * d,
+        indptr * h_kv * d,
+        h_qo,
+        h_kv,
+        d,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        seq_lens=lens.to(torch.int32).cuda(),
+        seq_lens_q=lens.to(torch.int32).cuda(),
+        max_token_per_sequence=int(lens.max()),
+        max_sequence_kv=int(lens.max()),
+    )
+    out, lse = wrapper.run(q, k, v, return_lse=True)
+    torch.cuda.synchronize()
+    assert lse.shape == (q.shape[0], h_qo)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "explicit cudnn")
