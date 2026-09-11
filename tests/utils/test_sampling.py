@@ -1197,6 +1197,567 @@ def test_sampling_nan_input(batch_size, vocab_size):
     check_result(result, valid)
 
 
+def test_fused_sampling_from_logits_hy3_portable_temperature():
+    """The HY3 API must retain semantics when the SM100 backend is unavailable."""
+    logits = torch.tensor([[0.0, 3.0, 1.0], [4.0, 1.0, 0.0]])
+    noise = torch.zeros_like(logits, dtype=torch.float32)
+    draft = torch.tensor([1, -1], dtype=torch.int64)
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=torch.tensor([1.0, 2.0], dtype=torch.float32),
+        gumbel_noise=noise,
+        draft_token_ids=draft,
+    )
+    assert torch.equal(output, torch.tensor([[2], [0]], dtype=torch.int32))
+
+
+def test_fused_sampling_from_logits_hy3_portable_non_positive_temperature():
+    """Non-positive per-row temperatures disable scaling without division by zero."""
+    logits = torch.full((3, 16), -10.0)
+    logits[:, 9] = 2.0
+    logits[:, 3] = 1.0
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=torch.tensor([0.0, -1.0, 2.0]),
+        gumbel_noise=torch.zeros_like(logits),
+    )
+    assert torch.equal(output, torch.tensor([[9], [9], [9]], dtype=torch.int32))
+
+
+def test_fused_sampling_from_logits_hy3_generated_seed_uses_uint64_bits(monkeypatch):
+    """A signed CUDA generator-state view must retain its uint64 seed bits."""
+    unsigned_seed = (1 << 63) + 123
+    signed_seed = unsigned_seed - (1 << 64)
+    generated_offset = 64
+    monkeypatch.setattr(
+        flashinfer.sampling,
+        "get_seed_and_offset",
+        lambda increment, generator, device: (signed_seed, generated_offset),
+    )
+    logits = torch.tensor([[0.0, 1.0, 2.0], [2.0, 1.0, 0.0]])
+
+    generated = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=1.0,
+    )
+    explicit = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=1.0,
+        seed=unsigned_seed,
+        offset=generated_offset,
+    )
+
+    assert torch.equal(generated, explicit)
+    for invalid_seed in (0, -1):
+        with pytest.raises(ValueError, match="seed must be > 0"):
+            flashinfer.sampling.fused_sampling_from_logits_hy3(
+                logits,
+                temperature=1.0,
+                seed=invalid_seed,
+            )
+    with pytest.raises(ValueError, match=r"seed must be less than 2\*\*64"):
+        flashinfer.sampling.fused_sampling_from_logits_hy3(
+            logits,
+            temperature=1.0,
+            seed=1 << 64,
+        )
+
+
+def test_fused_sampling_from_logits_hy3_uses_signed_ffi_seed_carrier(monkeypatch):
+    """The FFI receives the signed carrier for a high-bit uint64 seed."""
+    unsigned_seed = (1 << 63) + 123
+    signed_seed = unsigned_seed - (1 << 64)
+    captured = {}
+
+    def capture_fused_sampler(*args):
+        """Capture the signed seed passed to the custom-op boundary."""
+        captured["seed"] = args[-3]
+
+    monkeypatch.setattr(
+        flashinfer.sampling,
+        "_hy3_sampler_device_info",
+        lambda device: (True, 1),
+    )
+    monkeypatch.setattr(
+        flashinfer.sampling,
+        "_fused_sampling_from_logits_hy3",
+        capture_fused_sampler,
+    )
+    logits = torch.zeros((1, 120832))
+
+    flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8),
+        out=torch.empty((1, 1), dtype=torch.int32),
+        temperature=1.0,
+        seed=unsigned_seed,
+        offset=0,
+    )
+
+    assert captured["seed"] == signed_seed
+
+
+def test_fused_sampling_from_logits_hy3_remaps_generated_zero_seed(monkeypatch):
+    """A generated zero is remapped without accepting caller-supplied zero."""
+    generated_offset = 64
+    monkeypatch.setattr(
+        flashinfer.sampling,
+        "get_seed_and_offset",
+        lambda increment, generator, device: (0, generated_offset),
+    )
+    logits = torch.tensor([[0.0, 1.0, 2.0], [2.0, 1.0, 0.0]])
+
+    generated = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=1.0,
+    )
+    explicit = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=1.0,
+        seed=1,
+        offset=generated_offset,
+    )
+
+    assert torch.equal(generated, explicit)
+
+
+def test_fused_sampling_from_logits_hy3_portable_batched_penalty_writeback():
+    """Fallback writeback preserves atomic-OR semantics for duplicate slots."""
+    batch_size, vocab_size = 7, 16
+    winners = torch.tensor([1, 2, 2, 9, 5, 6, 7])
+    logits = torch.full((batch_size, vocab_size), -10.0)
+    logits[torch.arange(batch_size), winners] = 10.0
+    penalty_mask = torch.zeros((batch_size, 4), dtype=torch.uint8)
+    penalty_mask[0, 0] = 1
+    slot_id = torch.tensor([0, 0, 0, 1, -1, batch_size, 2], dtype=torch.int32)
+    repetition_penalty = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        penalty_mask=penalty_mask,
+        slot_id=slot_id,
+        repetition_penalty=repetition_penalty,
+        temperature=1.0,
+        gumbel_noise=torch.zeros_like(logits),
+    )
+
+    assert torch.equal(output[:, 0], winners.to(torch.int32))
+    assert penalty_mask[0, 0].item() == 1 | (1 << 1) | (1 << 2)
+    assert penalty_mask[1, 1].item() == 1 << (9 & 7)
+    assert torch.count_nonzero(penalty_mask[2:]).item() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_sampling_from_logits_hy3_temperature(dtype):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 0):
+        pytest.skip("requires an SM100 GPU")
+    device = torch.device("cuda:0")
+    batch_size, vocab_size = 2, 120832
+    # Exercise a valid padded row stride as well as the deterministic external
+    # Gumbel boundary used by the source-parity suite.
+    storage = torch.full(
+        (batch_size, vocab_size + 1), -10.0, dtype=dtype, device=device
+    )
+    logits = storage[:, :vocab_size]
+    logits[0, 17] = 8
+    logits[0, 5] = 7
+    logits[1, 31] = 7
+    logits[1, 6] = 6
+    noise = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
+    workspace = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+    preallocated_output = torch.empty((batch_size, 1), dtype=torch.int32, device=device)
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        workspace_buffer=workspace,
+        out=preallocated_output,
+        temperature=0.75,
+        gumbel_noise=noise,
+    )
+    assert output.data_ptr() == preallocated_output.data_ptr()
+    assert torch.equal(
+        output, torch.tensor([[17], [31]], dtype=torch.int32, device=device)
+    )
+
+    required = flashinfer.sampling._hy3_sampler_workspace_size(
+        batch_size,
+        torch.cuda.get_device_properties(device).multi_processor_count,
+        True,
+        flashinfer.sampling.HY3_SAMPLER_SOFTMAX_NONE,
+    )
+    exact_workspace = torch.empty(required, dtype=torch.uint8, device=device)
+    exact = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        workspace_buffer=exact_workspace,
+        out=preallocated_output,
+        temperature=0.75,
+        gumbel_noise=noise,
+    )
+    assert torch.equal(exact, output)
+
+    non_positive = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        workspace_buffer=exact_workspace,
+        out=preallocated_output,
+        temperature=torch.tensor([0.0, -1.0], dtype=torch.float32, device=device),
+        gumbel_noise=noise,
+    )
+    assert torch.equal(
+        non_positive,
+        torch.tensor([[17], [31]], dtype=torch.int32, device=device),
+    )
+    with pytest.raises(ValueError, match="workspace_buffer is too small"):
+        flashinfer.sampling.fused_sampling_from_logits_hy3(
+            logits,
+            workspace_buffer=exact_workspace[:-1],
+            out=preallocated_output,
+            temperature=0.75,
+            gumbel_noise=noise,
+        )
+    unaligned_storage = torch.empty(required + 1, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="aligned to four bytes"):
+        flashinfer.sampling.fused_sampling_from_logits_hy3(
+            logits,
+            workspace_buffer=unaligned_storage[1:],
+            out=preallocated_output,
+            temperature=0.75,
+            gumbel_noise=noise,
+        )
+
+
+def test_fused_sampling_from_logits_hy3_heavy_penalty_writeback():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 0):
+        pytest.skip("requires an SM100 GPU")
+    device = torch.device("cuda:0")
+    batch_size, vocab_size = 2, 120832
+    logits = torch.full(
+        (batch_size, vocab_size), -10.0, dtype=torch.bfloat16, device=device
+    )
+    logits[0, 11], logits[0, 12] = 8, 5
+    logits[1, 29], logits[1, 30] = 8, 5
+    row_bytes = (vocab_size + 7) // 8
+    penalty_mask = torch.zeros((2, row_bytes), dtype=torch.uint8, device=device)
+    slot_id = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    penalty_mask[1, 11 >> 3] |= 1 << (11 & 7)
+    penalty_mask[0, 29 >> 3] |= 1 << (29 & 7)
+    noise = torch.zeros_like(logits, dtype=torch.float32)
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        penalty_mask=penalty_mask,
+        slot_id=slot_id,
+        repetition_penalty=2.0,
+        temperature=1.0,
+        softmax_policy=flashinfer.sampling.HY3_SAMPLER_SOFTMAX_AFTER_TOP_K,
+        top_k=20,
+        top_p=0.99,
+        max_top_k=32,
+        gumbel_noise=noise,
+    )
+    assert torch.equal(
+        output, torch.tensor([[12], [30]], dtype=torch.int32, device=device)
+    )
+    assert (penalty_mask[1, 12 >> 3] & (1 << (12 & 7))) != 0
+    assert (penalty_mask[0, 30 >> 3] & (1 << (30 & 7))) != 0
+
+
+def _hy3_test_device():
+    if not torch.cuda.is_available():
+        pytest.skip("requires an SM100 GPU")
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device) != (10, 0):
+        pytest.skip("requires an SM100 GPU")
+    return device
+
+
+def _reference_hy3_fused_sampler_candidates(
+    logits,
+    penalty_mask,
+    slot_id,
+    repetition_penalty,
+    temperature,
+    softmax_policy,
+    top_k,
+    max_top_k,
+):
+    """Build the sorted candidate state without calling a FlashInfer sampler."""
+    _batch_size, vocab_size = logits.shape
+    work = logits.float().clone()
+    columns = torch.arange(vocab_size, device=logits.device)
+    packed_mask = penalty_mask.index_select(0, slot_id.long())
+    penalized = ((packed_mask[:, columns >> 3] >> (columns & 7)) & 1).bool()
+    active_penalty = penalized & (repetition_penalty > 0)[:, None]
+    safe_penalty = torch.where(
+        repetition_penalty > 0,
+        repetition_penalty,
+        torch.ones_like(repetition_penalty),
+    )
+    adjusted = torch.where(
+        work > 0,
+        work / safe_penalty[:, None],
+        work * safe_penalty[:, None],
+    )
+    work = torch.where(active_penalty, adjusted, work)
+    work = work / temperature[:, None]
+
+    if softmax_policy == flashinfer.sampling.HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K:
+        work = torch.softmax(work, dim=-1)
+
+    values, tokens = torch.topk(work, max_top_k, dim=-1, sorted=True)
+    requested_k = top_k.long()
+    effective_k = torch.where(
+        requested_k > 0,
+        requested_k.clamp(max=max_top_k),
+        torch.full_like(requested_k, max_top_k),
+    )
+    positions = torch.arange(max_top_k, device=logits.device)[None, :]
+    candidate_valid = positions < effective_k[:, None]
+
+    if softmax_policy == flashinfer.sampling.HY3_SAMPLER_SOFTMAX_AFTER_TOP_K:
+        probabilities = torch.softmax(
+            values.masked_fill(~candidate_valid, float("-inf")), dim=-1
+        )
+    else:
+        probabilities = values
+    sample_values = torch.where(
+        probabilities > 0,
+        probabilities.log(),
+        torch.full_like(probabilities, float("-inf")),
+    )
+    return tokens, probabilities, sample_values, candidate_valid
+
+
+def _reference_hy3_fused_sampler_pick(
+    tokens, probabilities, sample_values, candidate_valid, top_p, gumbel_noise
+):
+    """Apply the fused sampler's exclusive-prefix Top-P and token tie break."""
+    positions = torch.arange(tokens.size(1), device=tokens.device)[None, :]
+    exclusive_probability = probabilities.cumsum(dim=-1) - probabilities
+    keep = candidate_valid & (
+        (top_p <= 0)[:, None]
+        | (positions == 0)
+        | (exclusive_probability < top_p[:, None])
+    )
+    scores = sample_values + gumbel_noise.gather(1, tokens)
+    scores = scores.masked_fill(~keep, float("-inf"))
+    maximum = scores.max(dim=-1, keepdim=True).values
+    vocab_size = gumbel_noise.size(1)
+    tied_tokens = torch.where(
+        scores == maximum, tokens, torch.full_like(tokens, vocab_size)
+    )
+    output = tied_tokens.min(dim=-1).values
+    output = torch.where(output < vocab_size, output, torch.zeros_like(output))
+    return output.to(torch.int32).view(-1, 1), keep
+
+
+@pytest.mark.parametrize(
+    "softmax_policy",
+    [
+        flashinfer.sampling.HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K,
+        flashinfer.sampling.HY3_SAMPLER_SOFTMAX_AFTER_TOP_K,
+    ],
+)
+@pytest.mark.parametrize("batch_size", [2, 8, 32])
+@pytest.mark.parametrize("max_top_k", [32, 64])
+def test_fused_sampling_from_logits_hy3_top_p_boundary_dispatch(
+    max_top_k, batch_size, softmax_policy
+):
+    """Check both heavy dispatch shapes against a self-contained torch oracle."""
+    device = _hy3_test_device()
+    vocab_size = 120832
+    candidate_tokens = torch.arange(64, device=device, dtype=torch.long) * 1733 + 29
+    candidate_logits = torch.linspace(4.0, 0.0, 64, device=device)
+    logits = torch.full(
+        (batch_size, vocab_size), -4.0, dtype=torch.float32, device=device
+    )
+    logits[:, candidate_tokens] = candidate_logits
+
+    row_pattern = torch.arange(batch_size, device=device) % 8
+    top_k_values = torch.tensor(
+        [64, 64, 2, 7, 16, 31, 48, 64], dtype=torch.int64, device=device
+    )
+    temperature_values = torch.tensor(
+        [0.75, 0.9, 1.0, 1.1, 1.2, 1.35, 1.5, 1.75],
+        dtype=torch.float32,
+        device=device,
+    )
+    penalty_values = torch.tensor(
+        [0.0, 1.0, 1.17, 1.43, 1.71, 1.91, 1.29, 2.13],
+        dtype=torch.float32,
+        device=device,
+    )
+    top_k = top_k_values.index_select(0, row_pattern)
+    temperature = temperature_values.index_select(0, row_pattern)
+    repetition_penalty = penalty_values.index_select(0, row_pattern)
+    slot_id = torch.arange(batch_size - 1, -1, -1, dtype=torch.int32, device=device)
+
+    penalty_row_bytes = (vocab_size + 7) // 8
+    initial_penalty_mask = torch.zeros(
+        (batch_size, penalty_row_bytes), dtype=torch.uint8
+    )
+    candidate_tokens_cpu = candidate_tokens.cpu()
+    for row in range(batch_size):
+        token = int(candidate_tokens_cpu[(row * 7) % 32])
+        slot = batch_size - 1 - row
+        initial_penalty_mask[slot, token >> 3] |= 1 << (token & 7)
+    initial_penalty_mask = initial_penalty_mask.to(device)
+
+    tokens, probabilities, sample_values, candidate_valid = (
+        _reference_hy3_fused_sampler_candidates(
+            logits,
+            initial_penalty_mask,
+            slot_id,
+            repetition_penalty,
+            temperature,
+            softmax_policy,
+            top_k,
+            max_top_k,
+        )
+    )
+
+    # Row 0 exercises top_p == 0 (filter disabled). Other rows put top_p in
+    # the middle of one candidate's probability mass, avoiding numerical
+    # ambiguity while checking the exclusive-prefix cutoff on both sides.
+    desired_keep_pattern = [64, 1, 2, 3, 8, 16, 24, 47]
+    top_p = torch.empty(batch_size, dtype=torch.float32, device=device)
+    expected_keep_counts = []
+    for row in range(batch_size):
+        effective_k = min(int(top_k[row]), max_top_k)
+        if row % 8 == 0:
+            top_p[row] = 0.0
+            expected_keep_counts.append(effective_k)
+            continue
+        keep_count = min(desired_keep_pattern[row % 8], effective_k)
+        prefix = probabilities[row, : max(keep_count - 1, 0)].sum()
+        top_p[row] = prefix + probabilities[row, keep_count - 1] * 0.5
+        expected_keep_counts.append(keep_count)
+
+    gumbel_noise = torch.full(
+        (batch_size, vocab_size), -1000.0, dtype=torch.float32, device=device
+    )
+    gumbel_noise[:, candidate_tokens] = (
+        torch.arange(64, dtype=torch.float32, device=device) * 0.5
+    )
+    expected, reference_keep = _reference_hy3_fused_sampler_pick(
+        tokens,
+        probabilities,
+        sample_values,
+        candidate_valid,
+        top_p,
+        gumbel_noise,
+    )
+    assert reference_keep.sum(dim=-1).cpu().tolist() == expected_keep_counts
+
+    penalty_mask = initial_penalty_mask.clone()
+    workspace = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+    preallocated_output = torch.full(
+        (batch_size, 1), -1, dtype=torch.int32, device=device
+    )
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        workspace_buffer=workspace,
+        out=preallocated_output,
+        penalty_mask=penalty_mask,
+        slot_id=slot_id,
+        repetition_penalty=repetition_penalty,
+        temperature=temperature,
+        softmax_policy=softmax_policy,
+        top_k=top_k,
+        top_p=top_p,
+        max_top_k=max_top_k,
+        gumbel_noise=gumbel_noise,
+    )
+    assert output.data_ptr() == preallocated_output.data_ptr()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    output_cpu = output.cpu()
+    penalty_mask_cpu = penalty_mask.cpu()
+    initial_penalty_mask_cpu = initial_penalty_mask.cpu()
+    repetition_penalty_cpu = repetition_penalty.cpu()
+    for row in range(batch_size):
+        slot = batch_size - 1 - row
+        if float(repetition_penalty_cpu[row]) == 0.0:
+            assert torch.equal(penalty_mask_cpu[slot], initial_penalty_mask_cpu[slot])
+            continue
+        sampled = int(output_cpu[row, 0])
+        assert penalty_mask_cpu[slot, sampled >> 3] & (1 << (sampled & 7))
+
+
+@pytest.mark.parametrize(
+    "softmax_policy",
+    [
+        flashinfer.sampling.HY3_SAMPLER_SOFTMAX_NONE,
+        flashinfer.sampling.HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K,
+        flashinfer.sampling.HY3_SAMPLER_SOFTMAX_AFTER_TOP_K,
+    ],
+)
+def test_fused_sampling_from_logits_hy3_partition_tie_order(softmax_policy):
+    """Preserve the source kernel's stable Top-K order across block partitions."""
+    device = _hy3_test_device()
+    batch_size, vocab_size = 32, 120832
+    logits = torch.full(
+        (batch_size, vocab_size),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    early_partition = torch.arange(992, 1024, device=device)
+    late_partition = torch.arange(15872, 15904, device=device)
+    logits[:, early_partition] = 1.0
+    logits[:, late_partition] = 1.0
+
+    # The late-partition tokens have higher sample scores, but the source
+    # 512-thread/8-block stage-1 partition excludes them at the equal-logit
+    # Top-K cutoff.  A geometry change must not silently change that tie set.
+    noise = torch.full_like(logits, -1000.0, dtype=torch.float32)
+    noise[:, early_partition] = torch.arange(32, dtype=torch.float32, device=device)
+    noise[:, late_partition] = 1000.0 + torch.arange(
+        32, dtype=torch.float32, device=device
+    )
+    output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+        logits,
+        temperature=1.0,
+        softmax_policy=softmax_policy,
+        top_k=32,
+        top_p=0.99 if softmax_policy else 0.0,
+        max_top_k=32,
+        gumbel_noise=noise,
+    )
+    expected = torch.full((batch_size, 1), 1023, dtype=torch.int32, device=device)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_fused_sampling_from_logits_hy3_non_default_stream():
+    """The public API must honor the current stream with caller-owned buffers."""
+    device = _hy3_test_device()
+    batch_size, vocab_size = 8, 120832
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        logits = torch.full(
+            (batch_size, vocab_size), -10.0, dtype=torch.float32, device=device
+        )
+        winners = torch.arange(batch_size, dtype=torch.long, device=device) * 997 + 13
+        logits[torch.arange(batch_size, device=device), winners] = 10.0
+        noise = torch.zeros_like(logits, dtype=torch.float32)
+        workspace = torch.empty(1 << 20, dtype=torch.uint8, device=device)
+        preallocated_output = torch.full(
+            (batch_size, 1), -1, dtype=torch.int32, device=device
+        )
+        output = flashinfer.sampling.fused_sampling_from_logits_hy3(
+            logits,
+            workspace_buffer=workspace,
+            out=preallocated_output,
+            temperature=torch.linspace(
+                0.5, 1.5, batch_size, dtype=torch.float32, device=device
+            ),
+            gumbel_noise=noise,
+        )
+        completed = torch.cuda.Event()
+        completed.record(stream)
+    completed.synchronize()
+
+    assert output.data_ptr() == preallocated_output.data_ptr()
+    torch.testing.assert_close(output[:, 0], winners.to(torch.int32), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_sampling_from_logits_freq(128256, gumbel_distribution(0.1))

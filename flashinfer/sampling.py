@@ -21,8 +21,10 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit.sampling import gen_sampling_module
+from .jit.sampling_hy3 import gen_fused_sampling_hy3_module
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
+    fused_sampling_hy3_trace_dispatch,
     min_p_sampling_trace,
     sampling_from_logits_trace,
     sampling_from_probs_trace,
@@ -665,6 +667,90 @@ def get_sampling_module():
     )
 
 
+@functools.cache
+def get_fused_sampling_hy3_module():
+    return gen_fused_sampling_hy3_module().build_and_load()
+
+
+@register_custom_op(
+    "flashinfer::fused_sampling_from_logits_hy3",
+    mutates_args=("workspace_buffer", "output", "penalty_mask"),
+)
+def _fused_sampling_from_logits_hy3(
+    workspace_buffer: torch.Tensor,
+    output: torch.Tensor,
+    logits: torch.Tensor,
+    penalty_mask: Optional[torch.Tensor],
+    slot_id: Optional[torch.Tensor],
+    repetition_penalty: Optional[torch.Tensor],
+    repetition_penalty_val: float,
+    temperature: Optional[torch.Tensor],
+    temperature_val: float,
+    softmax_policy: int,
+    top_k: Optional[torch.Tensor],
+    top_k_val: int,
+    top_p: Optional[torch.Tensor],
+    top_p_val: float,
+    max_top_k: int,
+    gumbel_noise: Optional[torch.Tensor],
+    draft_token_ids: Optional[torch.Tensor],
+    sm_count: int,
+    seed: int,
+    offset: int,
+    temperature_only: bool,
+) -> None:
+    get_fused_sampling_hy3_module().fused_sampling_from_logits_hy3(
+        workspace_buffer,
+        logits,
+        output,
+        penalty_mask,
+        slot_id,
+        repetition_penalty,
+        repetition_penalty_val,
+        temperature,
+        temperature_val,
+        softmax_policy,
+        top_k,
+        top_k_val,
+        top_p,
+        top_p_val,
+        max_top_k,
+        gumbel_noise,
+        draft_token_ids,
+        sm_count,
+        seed,
+        offset,
+        temperature_only,
+    )
+
+
+@register_fake_op("flashinfer::fused_sampling_from_logits_hy3")
+def _fake_fused_sampling_from_logits_hy3(
+    workspace_buffer: torch.Tensor,
+    output: torch.Tensor,
+    logits: torch.Tensor,
+    penalty_mask: Optional[torch.Tensor],
+    slot_id: Optional[torch.Tensor],
+    repetition_penalty: Optional[torch.Tensor],
+    repetition_penalty_val: float,
+    temperature: Optional[torch.Tensor],
+    temperature_val: float,
+    softmax_policy: int,
+    top_k: Optional[torch.Tensor],
+    top_k_val: int,
+    top_p: Optional[torch.Tensor],
+    top_p_val: float,
+    max_top_k: int,
+    gumbel_noise: Optional[torch.Tensor],
+    draft_token_ids: Optional[torch.Tensor],
+    sm_count: int,
+    seed: int,
+    offset: int,
+    temperature_only: bool,
+) -> None:
+    pass
+
+
 def _to_tensor_scalar_tuple(x):
     if isinstance(x, torch.Tensor):
         return (x, 0)
@@ -731,6 +817,485 @@ def _validate_and_convert_seed_offset(
             raise ValueError(f"offset tensor length must be 1 or {batch_size}")
 
     return maybe_seed_arr, seed_val, maybe_offset_arr, offset_val
+
+
+HY3_SAMPLER_SOFTMAX_NONE = 0
+HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K = 1
+HY3_SAMPLER_SOFTMAX_AFTER_TOP_K = 2
+_HY3_SAMPLER_VOCAB_SIZE = 120832
+_HY3_UINT64_MODULUS = 1 << 64
+_HY3_INT64_MAX = (1 << 63) - 1
+
+
+@functools.cache
+def _hy3_sampler_device_info(device: torch.device) -> Tuple[bool, int]:
+    """Cache capability/SM queries; neither belongs on the per-token hot path."""
+    if device.type != "cuda":
+        return False, 0
+    major, minor = torch.cuda.get_device_capability(device)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    return (major, minor) == (10, 0), sm_count
+
+
+def _hy3_sampler_workspace_size(
+    batch_size: int,
+    sm_count: int,
+    temperature_only: bool,
+    softmax_policy: int,
+) -> int:
+    if temperature_only:
+        return batch_size * (sm_count * 8 + 4)
+    # The accepted B200 dispatch uses 1024 candidate slots/request for B<8 and
+    # 512 otherwise. BEFORE_TOP_K additionally stores a max/sum pair per block.
+    candidate_count = batch_size * (1024 if batch_size < 8 else 512)
+    size = candidate_count * 8
+    if softmax_policy == HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K:
+        size += batch_size * (32 if batch_size < 8 else 16) * 8
+    return size
+
+
+def _hy3_sampler_row_value(
+    value: Union[torch.Tensor, float, int],
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=dtype)
+    return torch.full((batch_size,), value, dtype=dtype, device=device)
+
+
+def _fused_sampling_from_logits_hy3_fallback(
+    logits: torch.Tensor,
+    *,
+    penalty_mask: Optional[torch.Tensor],
+    slot_id: Optional[torch.Tensor],
+    repetition_penalty: Union[torch.Tensor, float],
+    temperature: Union[torch.Tensor, float],
+    softmax_policy: int,
+    top_k: Union[torch.Tensor, int],
+    top_p: Union[torch.Tensor, float],
+    max_top_k: int,
+    gumbel_noise: Optional[torch.Tensor],
+    draft_token_ids: Optional[torch.Tensor],
+    seed: int,
+    offset: int,
+    temperature_only: bool,
+) -> torch.Tensor:
+    """Portable HY3 semantics when the optimized SM100 path is unsupported."""
+    batch_size, vocab_size = logits.shape
+    work = logits.float()
+    if gumbel_noise is None:
+        fallback_generator = torch.Generator(device=logits.device)
+        mixed_seed = (int(seed) + 0x9E3779B97F4A7C15 * int(offset)) & (
+            _HY3_UINT64_MODULUS - 1
+        )
+        fallback_generator.manual_seed(mixed_seed)
+        uniform = torch.rand(
+            logits.shape,
+            dtype=torch.float32,
+            device=logits.device,
+            generator=fallback_generator,
+        ).clamp_min_(1e-20)
+        gumbel_noise = -(-uniform.log()).log()
+
+    if temperature_only:
+        temp = _hy3_sampler_row_value(
+            temperature, batch_size, logits.device, torch.float32
+        )
+        work = work / torch.where(temp > 0, temp, torch.ones_like(temp))[:, None]
+        if draft_token_ids is not None:
+            valid = (draft_token_ids >= 0) & (draft_token_ids < vocab_size)
+            rows = torch.arange(batch_size, device=logits.device)
+            tokens = draft_token_ids.clamp(0, max(vocab_size - 1, 0)).long()
+            old = work[rows, tokens]
+            work = work.clone()
+            work[rows, tokens] = torch.where(
+                valid, torch.full_like(old, float("-inf")), old
+            )
+        return (work + gumbel_noise).argmax(dim=-1).to(torch.int32).view(-1, 1)
+
+    work = work.clone()
+    rp = _hy3_sampler_row_value(
+        repetition_penalty, batch_size, logits.device, torch.float32
+    )
+    if penalty_mask is not None and slot_id is not None:
+        valid_slot = (slot_id >= 0) & (slot_id < penalty_mask.size(0))
+        safe_slot = slot_id.clamp(0, max(penalty_mask.size(0) - 1, 0)).long()
+        packed = penalty_mask.index_select(0, safe_slot)
+        columns = torch.arange(vocab_size, device=logits.device)
+        bits = ((packed[:, columns >> 3] >> (columns & 7)) & 1).bool()
+        active = bits & valid_slot[:, None] & (rp > 0)[:, None]
+        penalized = torch.where(work > 0, work / rp[:, None], work * rp[:, None])
+        work = torch.where(active, penalized, work)
+
+    temp = _hy3_sampler_row_value(temperature, batch_size, logits.device, torch.float32)
+    work = work / torch.where(temp > 0, temp, torch.ones_like(temp))[:, None]
+    if softmax_policy == HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K:
+        work = torch.softmax(work, dim=-1)
+
+    candidate_count = min(max_top_k, vocab_size)
+    values, tokens = torch.topk(work, candidate_count, dim=-1, sorted=True)
+    requested_k = _hy3_sampler_row_value(top_k, batch_size, logits.device, torch.int64)
+    effective_k = torch.where(
+        requested_k > 0,
+        requested_k.clamp(max=candidate_count),
+        torch.full_like(requested_k, candidate_count),
+    )
+    positions = torch.arange(candidate_count, device=logits.device)[None, :]
+    candidate_valid = positions < effective_k[:, None]
+
+    probabilities: Optional[torch.Tensor] = None
+    if softmax_policy == HY3_SAMPLER_SOFTMAX_AFTER_TOP_K:
+        probabilities = torch.softmax(
+            values.masked_fill(~candidate_valid, float("-inf")), dim=-1
+        )
+        sample_values = torch.where(
+            probabilities > 0,
+            probabilities.log(),
+            torch.full_like(probabilities, float("-inf")),
+        )
+    elif softmax_policy == HY3_SAMPLER_SOFTMAX_BEFORE_TOP_K:
+        probabilities = values
+        sample_values = torch.where(
+            probabilities > 0,
+            probabilities.log(),
+            torch.full_like(probabilities, float("-inf")),
+        )
+    else:
+        sample_values = values
+
+    keep = candidate_valid
+    if probabilities is not None:
+        thresholds = _hy3_sampler_row_value(
+            top_p, batch_size, logits.device, torch.float32
+        )
+        exclusive = probabilities.cumsum(dim=-1) - probabilities
+        keep = keep & (
+            (thresholds <= 0)[:, None]
+            | (positions == 0)
+            | (exclusive < thresholds[:, None])
+        )
+    scores = sample_values + gumbel_noise.gather(1, tokens)
+    scores = scores.masked_fill(~keep, float("-inf"))
+    maxima = scores.max(dim=-1, keepdim=True).values
+    tied_tokens = torch.where(
+        scores == maxima, tokens, torch.full_like(tokens, vocab_size)
+    )
+    sampled = tied_tokens.min(dim=-1).values
+    sampled = torch.where(sampled < vocab_size, sampled, torch.zeros_like(sampled))
+    output = sampled.to(torch.int32).view(-1, 1)
+
+    if penalty_mask is not None and slot_id is not None:
+        valid_slot = (slot_id >= 0) & (slot_id < penalty_mask.size(0))
+        safe_slot = slot_id.clamp(0, max(penalty_mask.size(0) - 1, 0)).long()
+        token = output[:, 0].long()
+        byte = token >> 3
+        bit_position = token & 7
+        active = valid_slot & (rp > 0)
+
+        # Match the CUDA kernel's atomicOr semantics when multiple rows map to
+        # the same slot and byte.  De-duplicating (byte, bit) pairs prevents a
+        # repeated bit from carrying during the subsequent integer sum.
+        flat_byte = safe_slot * penalty_mask.stride(0) + byte
+        encoded_updates = torch.unique(((flat_byte << 3) | bit_position)[active])
+        update_bytes = encoded_updates >> 3
+        update_bits = (torch.ones_like(encoded_updates) << (encoded_updates & 7)).to(
+            torch.int32
+        )
+        unique_bytes, inverse = torch.unique(update_bytes, return_inverse=True)
+        combined_bits = torch.zeros_like(unique_bytes, dtype=torch.int32)
+        combined_bits.scatter_add_(0, inverse, update_bits)
+
+        flat_penalty_mask = penalty_mask.view(-1)
+        old = flat_penalty_mask.index_select(0, unique_bytes).to(torch.int32)
+        flat_penalty_mask[unique_bytes] = (old | combined_bits).to(torch.uint8)
+    return output
+
+
+@flashinfer_api(trace=fused_sampling_hy3_trace_dispatch)
+def fused_sampling_from_logits_hy3(
+    logits: torch.Tensor,
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    penalty_mask: Optional[torch.Tensor] = None,
+    slot_id: Optional[torch.Tensor] = None,
+    repetition_penalty: Union[torch.Tensor, float] = 0.0,
+    temperature: Union[torch.Tensor, float] = 0.0,
+    softmax_policy: int = HY3_SAMPLER_SOFTMAX_NONE,
+    top_k: Union[torch.Tensor, int] = 0,
+    top_p: Union[torch.Tensor, float] = 0.0,
+    max_top_k: int = 32,
+    gumbel_noise: Optional[torch.Tensor] = None,
+    draft_token_ids: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> torch.Tensor:
+    r"""HY3 fused repetition penalty, temperature, top-k/top-p and sampling.
+
+    The optimized path targets SM100/B200 and HY3's 120832-token vocabulary.
+    Passing
+    external FP32 Gumbel noise provides the deterministic parity boundary.
+    ``workspace_buffer`` and ``out`` can be preallocated to keep addresses
+    stable during CUDA graph replay. Graph replay with random sampling must
+    update an external ``gumbel_noise`` tensor inside the graph; scalar
+    ``seed``/``offset`` values are fixed at capture time. Callers should pass
+    explicit buffers for graph capture and must not share one workspace across
+    concurrently executing streams. The output has shape ``[batch_size, 1]``
+    and dtype ``int32``.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        Rank-2 floating-point logits with shape ``[batch_size, vocab_size]``.
+        The B200 kernel is selected for the HY3 vocabulary size (120832);
+        other supported inputs use the portable PyTorch implementation.
+    workspace_buffer : Optional[torch.Tensor]
+        Optional contiguous 1-D uint8 scratch buffer. Reuse one buffer per
+        concurrently executing CUDA stream.
+    out : Optional[torch.Tensor]
+        Optional contiguous int32 output with shape ``[batch_size, 1]``.
+    penalty_mask : Optional[torch.Tensor]
+        Packed uint8 repetition mask. Each bit marks one vocabulary entry and
+        the sampled entry is set in place.
+    slot_id : Optional[torch.Tensor]
+        Int32 row selector into ``penalty_mask``, shape ``[batch_size]``.
+    repetition_penalty : Union[torch.Tensor, float]
+        Per-row float32 values or one scalar. A positive value requires
+        ``penalty_mask`` and ``slot_id``.
+    temperature : Union[torch.Tensor, float]
+        Per-row float32 values or one scalar temperature. Values greater than
+        zero scale logits; non-positive values disable temperature scaling.
+    softmax_policy : int
+        ``0`` disables softmax, ``1`` applies it before top-k, and ``2``
+        applies it after top-k.
+    top_k : Union[torch.Tensor, int]
+        Per-row int32/int64 values or one scalar top-k cutoff.
+    top_p : Union[torch.Tensor, float]
+        Per-row float32 values or one scalar nucleus threshold.
+    max_top_k : int
+        Compile-time candidate capacity; must be 32 or 64.
+    gumbel_noise : Optional[torch.Tensor]
+        Optional contiguous FP32 noise with the same shape as ``logits``.
+        Providing it gives a deterministic parity boundary.
+    draft_token_ids : Optional[torch.Tensor]
+        Optional int64 IDs excluded by the temperature-only path.
+    generator : Optional[torch.Generator]
+        Generator used to obtain a Philox seed and offset when external noise
+        and an explicit seed are absent.
+    seed : Optional[int]
+        Random seed used by the fused CUDA path. Must be greater than zero
+        when ``gumbel_noise`` is not provided.
+    offset : Optional[int]
+        Random subsequence offset used by the fused CUDA path.
+
+    Returns
+    -------
+    torch.Tensor
+        Sampled int32 IDs with shape ``[batch_size, 1]``.
+    """
+    if logits.ndim != 2 or not logits.dtype.is_floating_point:
+        raise ValueError("logits must be a rank-2 floating-point tensor")
+    batch_size, vocab_size = logits.shape
+    if batch_size <= 0 or vocab_size <= 0:
+        raise ValueError("logits dimensions must be positive")
+    if out is not None and (
+        out.device != logits.device
+        or out.dtype != torch.int32
+        or out.shape != (batch_size, 1)
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous int32 [batch_size, 1] on logits.device"
+        )
+    if workspace_buffer is not None and (
+        workspace_buffer.device != logits.device
+        or workspace_buffer.dtype != torch.uint8
+        or workspace_buffer.ndim != 1
+        or not workspace_buffer.is_contiguous()
+    ):
+        raise ValueError(
+            "workspace_buffer must be contiguous 1D uint8 on logits.device"
+        )
+    if max_top_k not in (32, 64):
+        raise ValueError("max_top_k must be 32 or 64")
+    if softmax_policy not in (0, 1, 2):
+        raise ValueError("softmax_policy must be 0, 1, or 2")
+
+    def check_row_tensor(
+        value: object, name: str, dtypes: Tuple[torch.dtype, ...]
+    ) -> None:
+        if not isinstance(value, torch.Tensor):
+            return
+        if value.device != logits.device or not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous and on logits.device")
+        if value.dtype not in dtypes or value.shape != (batch_size,):
+            raise ValueError(f"{name} has an invalid dtype or shape")
+
+    check_row_tensor(repetition_penalty, "repetition_penalty", (torch.float32,))
+    check_row_tensor(temperature, "temperature", (torch.float32,))
+    check_row_tensor(top_k, "top_k", (torch.int32, torch.int64))
+    check_row_tensor(top_p, "top_p", (torch.float32,))
+    check_row_tensor(slot_id, "slot_id", (torch.int32,))
+    check_row_tensor(draft_token_ids, "draft_token_ids", (torch.int64,))
+    if (penalty_mask is None) != (slot_id is None):
+        raise ValueError("penalty_mask and slot_id must be provided together")
+    if penalty_mask is not None:
+        if (
+            penalty_mask.device != logits.device
+            or penalty_mask.dtype != torch.uint8
+            or penalty_mask.ndim != 2
+            or not penalty_mask.is_contiguous()
+            or penalty_mask.size(0) < batch_size
+            or penalty_mask.size(1) < (vocab_size + 7) // 8
+        ):
+            raise ValueError(
+                "penalty_mask must be contiguous uint8 [rows>=B, bytes>=ceil(V/8)]"
+            )
+        if penalty_mask.stride(0) % 4 != 0:
+            raise ValueError("penalty_mask row stride must be a multiple of four bytes")
+        if penalty_mask.data_ptr() % 4 != 0:
+            raise ValueError("penalty_mask address must be aligned to four bytes")
+    if gumbel_noise is not None and (
+        gumbel_noise.device != logits.device
+        or gumbel_noise.dtype != torch.float32
+        or gumbel_noise.shape != logits.shape
+        or not gumbel_noise.is_contiguous()
+    ):
+        raise ValueError("gumbel_noise must be contiguous float32 with logits.shape")
+
+    def scalar_zero(x: Union[torch.Tensor, float]) -> bool:
+        """Return whether a non-tensor scalar is zero."""
+        return not isinstance(x, torch.Tensor) and float(x) == 0.0
+
+    temperature_only = (
+        penalty_mask is None
+        and scalar_zero(repetition_penalty)
+        and scalar_zero(top_p)
+        and not isinstance(top_k, torch.Tensor)
+        and int(top_k) == 0
+        and softmax_policy == HY3_SAMPLER_SOFTMAX_NONE
+        and (isinstance(temperature, torch.Tensor) or float(temperature) > 0.0)
+    )
+    if draft_token_ids is not None and not temperature_only:
+        raise ValueError("draft_token_ids requires the temperature-only path")
+    has_rp = (
+        isinstance(repetition_penalty, torch.Tensor) or float(repetition_penalty) > 0
+    )
+    has_top_k = isinstance(top_k, torch.Tensor) or int(top_k) > 0
+    has_top_p = isinstance(top_p, torch.Tensor) or float(top_p) > 0
+    if has_rp and penalty_mask is None:
+        raise ValueError("repetition_penalty requires penalty_mask and slot_id")
+    if has_top_p and (not has_top_k or softmax_policy == 0):
+        raise ValueError("top_p requires top_k and softmax_policy != NONE")
+    if softmax_policy != 0 and not has_top_p:
+        raise ValueError("softmax_policy != NONE requires top_p")
+
+    if gumbel_noise is None:
+        if seed is None:
+            seed, generated_offset = get_seed_and_offset(
+                batch_size * max_top_k, generator, logits.device
+            )
+            # CUDA generator state stores the full uint64 seed, while
+            # get_seed_and_offset views it as int64.  Recover the original bit
+            # pattern before applying the positive-seed API contract.  Zero is
+            # valid generator state but reserved by this API, so only the
+            # generated value is remapped; an explicit zero remains invalid.
+            seed = int(seed) & (_HY3_UINT64_MODULUS - 1)
+            if seed == 0:
+                seed = 1
+            if offset is None:
+                offset = generated_offset
+        if int(seed) <= 0:
+            raise ValueError("seed must be > 0 without external gumbel_noise")
+        if int(seed) >= _HY3_UINT64_MODULUS:
+            raise ValueError("seed must be less than 2**64")
+    else:
+        seed = 0 if seed is None else seed
+    offset = 0 if offset is None else offset
+
+    is_sm100, sm_count = _hy3_sampler_device_info(logits.device)
+    use_hy3_kernel = (
+        is_sm100
+        and vocab_size == _HY3_SAMPLER_VOCAB_SIZE
+        and logits.dtype in (torch.float32, torch.bfloat16)
+        and logits.stride(1) == 1
+        and (penalty_mask is None or penalty_mask.stride(0) % 4 == 0)
+    )
+    if not use_hy3_kernel:
+        result = _fused_sampling_from_logits_hy3_fallback(
+            logits,
+            penalty_mask=penalty_mask,
+            slot_id=slot_id,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+            softmax_policy=softmax_policy,
+            top_k=top_k,
+            top_p=top_p,
+            max_top_k=max_top_k,
+            gumbel_noise=gumbel_noise,
+            draft_token_ids=draft_token_ids,
+            seed=int(seed),
+            offset=int(offset),
+            temperature_only=temperature_only,
+        )
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
+
+    workspace_size = _hy3_sampler_workspace_size(
+        batch_size, sm_count, temperature_only, softmax_policy
+    )
+    if workspace_buffer is None:
+        stream_id = torch.cuda.current_stream(logits.device).cuda_stream
+        workspace_buffer = _get_cache_buf(
+            f"fused_sampler_hy3_workspace_{stream_id}", workspace_size, logits.device
+        )
+    elif workspace_buffer.numel() < workspace_size:
+        raise ValueError(
+            f"workspace_buffer is too small: need {workspace_size} bytes, "
+            f"got {workspace_buffer.numel()}"
+        )
+    elif workspace_buffer.data_ptr() % 4 != 0:
+        raise ValueError("workspace_buffer address must be aligned to four bytes")
+    if out is None:
+        out = torch.empty((batch_size, 1), dtype=torch.int32, device=logits.device)
+    rp_tensor, rp_val = _to_tensor_scalar_tuple(repetition_penalty)
+    temp_tensor, temp_val = _to_tensor_scalar_tuple(temperature)
+    top_k_tensor, top_k_val = _to_tensor_scalar_tuple(top_k)
+    top_p_tensor, top_p_val = _to_tensor_scalar_tuple(top_p)
+    ffi_seed = int(seed)
+    if ffi_seed > _HY3_INT64_MAX:
+        # TVM-FFI transports Python integers through signed int64.  C++ then
+        # converts this carrier back to uint64_t without changing its bits.
+        ffi_seed -= _HY3_UINT64_MODULUS
+    _fused_sampling_from_logits_hy3(
+        workspace_buffer,
+        out,
+        logits,
+        penalty_mask,
+        slot_id,
+        rp_tensor,
+        float(rp_val),
+        temp_tensor,
+        float(temp_val),
+        int(softmax_policy),
+        top_k_tensor,
+        int(top_k_val),
+        top_p_tensor,
+        float(top_p_val),
+        max_top_k,
+        gumbel_noise,
+        draft_token_ids,
+        sm_count,
+        ffi_seed,
+        int(offset),
+        temperature_only,
+    )
+    return out
 
 
 @flashinfer_api(trace=softmax_trace)
