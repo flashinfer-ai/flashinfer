@@ -949,14 +949,14 @@ void cast_fp32_to_bf16(void* output, void const* input, int64_t num_elements, cu
 }  // namespace
 
 // Validate routing_replay_out tensor properties.
+// dim0 is only bounded from below: the routing kernels write one replay row
+// per token unconditionally (DeepSeek launches numBlocks == num_tokens and
+// writes row blockIdx.x; the custom and llama4 kernels write row tokenIdx),
+// so a buffer with fewer rows than tokens is written past its end. Oversized
+// buffers stay legal: with CUDA graphs the buffer is pre-allocated at
+// maximum batch size and reused across steps with varying num_tokens.
 // dim1 is the routed top_k even when fused shared experts are enabled; those
-// extra slots are not written. dim0 is only bounded from below: the routing
-// kernels write one replay row per token unconditionally (DeepSeek launches
-// numBlocks == num_tokens and writes row blockIdx.x; the custom and llama4
-// kernels write row tokenIdx), so a buffer with fewer rows than tokens is
-// written past its end. Oversized buffers stay legal: with CUDA graphs the
-// buffer is pre-allocated at maximum batch size and reused across steps with
-// varying num_tokens.
+// extra slots are not written.
 static void validate_routing_replay_out(TensorView const& replay, TensorView const& hidden_states,
                                         int64_t top_k) {
   TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)

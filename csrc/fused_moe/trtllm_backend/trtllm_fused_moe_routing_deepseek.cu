@@ -363,9 +363,9 @@ __global__ void routingMainKernel(KernelParams params) {
 
       // Routing replay is routed-only: [num_tokens, topK] with stride topK.
       // Packed ids/weights use mTotalExpertsPerToken (= topK + fused shared).
+      auto idxReplay = blockIdx.x * params.mTopK + laneIdx;
       if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
-        params.mPtrRoutingReplayOut[int64_t{blockIdx.x} * int64_t{params.mTopK} + laneIdx] =
-            static_cast<int16_t>(expertIdx);
+        params.mPtrRoutingReplayOut[idxReplay] = static_cast<int16_t>(expertIdx);
       }
     }
   }
