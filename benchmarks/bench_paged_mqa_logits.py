@@ -53,10 +53,19 @@ from flashinfer import (
 
 _HEADS = 64  # fp4 pins num_heads=64/head_dim=128; fp8 is parametric --
 _HEAD_DIM = 128  # bench both at the fp4 (DeepSeek indexer) shape
+_FP4_SF_BYTES_PER_TOKEN = _HEAD_DIM // 32  # one UE8M0 per 32-element group
 
 
 def _make_inputs(kind, batch, seq_len, next_n, block_size, device):
-    """Random inputs in the exact layouts the public API requires."""
+    """Random *finite* inputs in the fused layouts the public API requires.
+
+    kv_fused is flat per block -- [all value bytes][all scale bytes] -- NOT
+    per-token [value|scale] rows; the 4-D shape is only a size contract (see
+    the kv_fused docs on fp8_paged_mqa_logits / fp4_paged_mqa_logits).  The
+    two regions are therefore built separately and concatenated, exactly as
+    the API docstring example does.  Timing is data-independent, but finite
+    inputs let bench_one assert finite logits, which catches a wrong layout.
+    """
     ntb_cols = ((seq_len + 127) // 128 * 128) // block_size
     num_blocks = max(batch * ntb_cols, 1)
     seq_lens = torch.full((batch,), seq_len, dtype=torch.int32, device=device)
@@ -70,14 +79,24 @@ def _make_inputs(kind, batch, seq_len, next_n, block_size, device):
         q = torch.randn(
             batch, next_n, _HEADS, _HEAD_DIM, dtype=torch.float32, device=device
         ).to(torch.float8_e4m3fn)
-        kv = torch.randint(
-            0,
-            256,
-            (num_blocks, block_size, 1, _HEAD_DIM + 4),
-            dtype=torch.uint8,
-            device=device,
+        # Region 1: finite e4m3fn values (randn -> fp8 never produces the NaN
+        # codes 0x7F/0xFF that random bytes would).  Region 2: one finite
+        # positive float32 scale per token.
+        kv_vals = torch.randn(
+            num_blocks, block_size, _HEAD_DIM, dtype=torch.float32, device=device
+        ).to(torch.float8_e4m3fn)
+        kv_scales = (
+            torch.rand(num_blocks, block_size, dtype=torch.float32, device=device) + 0.5
         )
+        kv = torch.cat(
+            [
+                kv_vals.view(torch.uint8).flatten(1),
+                kv_scales.view(torch.uint8).flatten(1),
+            ],
+            dim=1,
+        ).view(num_blocks, block_size, 1, _HEAD_DIM + 4)
         return (q, kv, weights, block_tables, seq_lens, seq_len)
+    # Every E2M1 nibble is finite, so random bytes are valid packed FP4 values.
     q = torch.randint(
         0,
         256,
@@ -85,18 +104,27 @@ def _make_inputs(kind, batch, seq_len, next_n, block_size, device):
         dtype=torch.uint8,
         device=device,
     )
-    # UE8M0 exponents near 1.0 (bias 127) in each packed byte keep values finite.
+    # UE8M0 exponent 0x7F == 2^(127-127) == 1.0 in every scale byte keeps the
+    # block-scaled MMA finite (0xFF is NaN; >= 0xF5 overflows the fp32 acc).
     q_sf = torch.full(
         (batch, next_n, _HEADS), 0x7F7F7F7F, dtype=torch.int32, device=device
     )
-    kv = torch.randint(
+    kv_vals = torch.randint(
         0,
         256,
-        (num_blocks, block_size, 1, _HEAD_DIM // 2 + 4),
+        (num_blocks, block_size * (_HEAD_DIM // 2)),
         dtype=torch.uint8,
         device=device,
     )
-    kv[:, :, :, _HEAD_DIM // 2 :] = 0x7F
+    kv_sf = torch.full(
+        (num_blocks, block_size * _FP4_SF_BYTES_PER_TOKEN),
+        0x7F,
+        dtype=torch.uint8,
+        device=device,
+    )
+    kv = torch.cat([kv_vals, kv_sf], dim=1).view(
+        num_blocks, block_size, 1, _HEAD_DIM // 2 + _FP4_SF_BYTES_PER_TOKEN
+    )
     return (q, q_sf, kv, weights, block_tables, seq_lens, seq_len)
 
 
@@ -117,6 +145,16 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device):
     # Warm: JIT compile + schedule-bucket compile happen here, outside timing.
     _call(kind, args, out)
     torch.cuda.synchronize()
+    # The kernels compute every column in [0, seq_len) (the caller masks the
+    # causal tail), so finite inputs must give finite logits there; columns
+    # past seq_len up to the padded pitch are scratch.  A non-finite result
+    # means _make_inputs drifted from the API's fused layout -- abort loudly
+    # (AssertionError is not swallowed by the sweep's skip handling).
+    if not torch.isfinite(out[:, :seq_len]).all():
+        raise AssertionError(
+            f"{kind} bench inputs produced non-finite logits -- _make_inputs is "
+            "no longer in the API's fused kv layout"
+        )
 
     # Graph replay: device work only (the schedule recompute is captured too).
     g = torch.cuda.CUDAGraph()
