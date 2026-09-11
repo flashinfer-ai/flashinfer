@@ -47,15 +47,17 @@ from flashinfer.attention.prims_ts._block_sparse.prepared import (
     _BlockSparseRouteLayout,
 )
 
-
-_REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="PrimTS block-sparse attention requires SM100 or SM103",
+from tests.attention.prims_ts_test_utils import (
+    HEAD_DIM as _HEAD_DIM,
+    Patterns as _Patterns,
+    REQUIRES_PRIMTS_GPU as _REQUIRES_PRIMTS_GPU,
+    make_block_sparse_compile_key,
+    make_bsr,
+    make_exact_block_bits,
+    pack_token_mask,
+    token_mask_valid_sets,
+    widest_bsr_row,
 )
-
-_HEAD_DIM = 128
-_Patterns = tuple[tuple[tuple[tuple[int, ...], ...], ...], ...]
 
 
 @dataclass(frozen=True)
@@ -657,47 +659,6 @@ def _make_patterns(case: _Case) -> _Patterns:
     return tuple(batches)
 
 
-def _make_bsr(patterns: _Patterns) -> tuple[torch.Tensor, torch.Tensor]:
-    flat_indices: list[int] = []
-    pointer_batches: list[list[list[int]]] = []
-    for batch in patterns:
-        pointer_heads: list[list[int]] = []
-        for head in batch:
-            pointers = [len(flat_indices)]
-            for row in head:
-                flat_indices.extend(row)
-                pointers.append(len(flat_indices))
-            pointer_heads.append(pointers)
-        pointer_batches.append(pointer_heads)
-    return (
-        torch.tensor(pointer_batches, device="cuda", dtype=torch.int32),
-        torch.tensor(flat_indices, device="cuda", dtype=torch.int32),
-    )
-
-
-def _make_exact_block_bits(
-    patterns: _Patterns,
-    num_kv_blocks: int,
-) -> torch.Tensor:
-    words_per_row = math.ceil(num_kv_blocks / 32)
-    packed_batches: list[list[list[list[int]]]] = []
-    for batch in patterns:
-        packed_heads: list[list[list[int]]] = []
-        for head in batch:
-            packed_rows: list[list[int]] = []
-            for exact_blocks in head:
-                words = [0] * words_per_row
-                for block_idx in exact_blocks:
-                    words[block_idx // 32] |= 1 << (block_idx % 32)
-                if num_kv_blocks % 32:
-                    # Out-of-range bits are intentionally high: prepare must ignore them.
-                    words[-1] |= (-1 << (num_kv_blocks % 32)) & 0xFFFFFFFF
-                packed_rows.append(words)
-            packed_heads.append(packed_rows)
-        packed_batches.append(packed_heads)
-    return torch.tensor(packed_batches, device="cuda", dtype=torch.uint32)
-
-
 def _summarize_kv(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -712,19 +673,6 @@ def _summarize_kv(
     return torch.stack(k_blocks, dim=1), torch.stack(v_blocks, dim=1)
 
 
-def _pack_token_mask(
-    seq_len_kv: int,
-    valid_by_batch: tuple[frozenset[int], ...],
-) -> torch.Tensor:
-    packed_by_batch: list[list[int]] = []
-    for valid_tokens in valid_by_batch:
-        words = [0] * math.ceil(seq_len_kv / 32)
-        for token_idx in valid_tokens:
-            words[token_idx // 32] |= 1 << (token_idx % 32)
-        packed_by_batch.append(words)
-    return torch.tensor(packed_by_batch, device="cuda", dtype=torch.uint32)
-
-
 def _make_token_mask(
     case: _Case,
 ) -> tuple[torch.Tensor | None, tuple[frozenset[int], ...]]:
@@ -733,17 +681,9 @@ def _make_token_mask(
         return None, tuple(all_tokens for _ in range(case.batch_size))
     if case.token_mask == "full":
         valid_by_batch = tuple(all_tokens for _ in range(case.batch_size))
-        return _pack_token_mask(case.seq_len_kv, valid_by_batch), valid_by_batch
-
-    valid_by_batch = tuple(
-        frozenset(
-            token_idx
-            for token_idx in range(case.seq_len_kv)
-            if (token_idx + batch_idx) % 7 not in (0, 3)
-        )
-        for batch_idx in range(case.batch_size)
-    )
-    return _pack_token_mask(case.seq_len_kv, valid_by_batch), valid_by_batch
+    else:
+        valid_by_batch = token_mask_valid_sets(case.batch_size, case.seq_len_kv)
+    return pack_token_mask(case.seq_len_kv, valid_by_batch), valid_by_batch
 
 
 @torch.no_grad()
@@ -1500,6 +1440,7 @@ def test_block_sparse_bshd_tma_strides_use_int64_for_large_batches() -> None:
         h_k=cutlass.Int32(16384),
         s_k=cutlass.Int32(8192),
         d=cutlass.Int32(128),
+        element_bytes=2,
     )
 
     assert all(type(stride) is cutlass.Int64 for stride in (*q_strides, *kv_strides))
@@ -1574,25 +1515,33 @@ def test_block_sparse_q_tile_groups_effective_q_rows(
     assert q_block_size % (q_tile_size // heads_q_per_kv) == 0
 
 
-def _validate_static_block_sparse_heads(
-    num_qo_heads: int,
-    num_kv_heads: int,
+def _validate_static_profile(
+    **overrides: object,
 ) -> block_sparse_module._BlockSparseStaticProfile:
-    return block_sparse_module._validate_block_sparse_static_profile(
-        batch_size=1,
-        seq_len_q=8,
-        seq_len_kv=64,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=_HEAD_DIM,
-        q_block_size=8,
-        kv_block_size=64,
-        use_kv_valid_bits=False,
-        mask_type="dense",
-        q_dtype=torch.float16,
-        kv_dtype=torch.float16,
-        output_dtype=torch.float16,
-    )
+    """Validate the static profile of an FP16 Q64/KV64 MHA plan over 512 tokens.
+
+    The defaults hold two blocks per row without a token mask; K and the
+    output follow the Q dtype. ``overrides`` replace any validator argument.
+    """
+
+    arguments: dict[str, object] = {
+        "batch_size": 1,
+        "seq_len_q": 64,
+        "seq_len_kv": 512,
+        "num_qo_heads": 1,
+        "num_kv_heads": 1,
+        "head_dim": _HEAD_DIM,
+        "q_block_size": 64,
+        "kv_block_size": 64,
+        "use_kv_valid_bits": False,
+        "mask_type": "dense",
+        "q_dtype": torch.float16,
+        "kv_dtype": None,
+        "output_dtype": None,
+        "max_blocks_per_row": 2,
+    }
+    arguments.update(overrides)
+    return block_sparse_module._validate_block_sparse_static_profile(**arguments)
 
 
 @pytest.mark.parametrize(
@@ -1607,7 +1556,9 @@ def test_block_sparse_static_profile_accepts_supported_gqa_groups(
     num_kv_heads: int,
     expected_q_tile: int,
 ) -> None:
-    profile = _validate_static_block_sparse_heads(num_qo_heads, num_kv_heads)
+    profile = _validate_static_profile(
+        q_block_size=8, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads
+    )
 
     assert profile.q_tile_size == expected_q_tile
 
@@ -1691,7 +1642,9 @@ def test_block_sparse_static_profile_rejects_unsupported_gqa_groups(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        _validate_static_block_sparse_heads(num_qo_heads, num_kv_heads)
+        _validate_static_profile(
+            q_block_size=8, num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads
+        )
 
 
 @pytest.mark.parametrize(
@@ -1734,22 +1687,16 @@ def test_block_sparse_builds_standard_decode_schedule(
     )
 
     cfg = block_sparse_config._make_block_sparse_config(
-        block_sparse_config._BlockSparseCompileKey(
-            device_index=0,
-            batch_size=1,
+        make_block_sparse_compile_key(
             seq_len_q=q_block_size,
             seq_len_kv=4096,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
-            head_dim=_HEAD_DIM,
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
             kv_route_size=kv_route_size,
-            dtype_key="float16",
-            mask_type="dense",
             use_kv_valid_bits=token_mask,
             use_persistent_scheduler=persistent,
-            use_parallel_sparse_kv_loads=False,
         )
     )
     assert cfg.heads_q_per_kv == num_qo_heads // num_kv_heads
@@ -1840,22 +1787,11 @@ def test_decode_schedule_revalidates_mutable_paged_staging_config(
         message = "page-offset staging requires one producer warp"
     else:
         cfg = block_sparse_config._make_block_sparse_config(
-            block_sparse_config._BlockSparseCompileKey(
-                device_index=0,
-                batch_size=1,
+            make_block_sparse_compile_key(
                 seq_len_q=8,
                 seq_len_kv=128,
                 num_qo_heads=8,
-                num_kv_heads=1,
-                head_dim=_HEAD_DIM,
                 q_block_size=8,
-                kv_block_size=64,
-                kv_route_size=256,
-                dtype_key="float16",
-                mask_type="dense",
-                use_kv_valid_bits=False,
-                use_persistent_scheduler=False,
-                use_parallel_sparse_kv_loads=False,
                 page_size=64,
             )
         )
@@ -1873,23 +1809,8 @@ def test_decode_schedule_revalidates_mutable_paged_staging_config(
 
 def test_sparse_paged_staging_does_not_require_a_dense_page_offset_warp() -> None:
     cfg = block_sparse_config._make_block_sparse_config(
-        block_sparse_config._BlockSparseCompileKey(
-            device_index=0,
-            batch_size=1,
-            seq_len_q=8,
-            seq_len_kv=128,
-            num_qo_heads=8,
-            num_kv_heads=1,
-            head_dim=_HEAD_DIM,
-            q_block_size=8,
-            kv_block_size=64,
-            kv_route_size=256,
-            dtype_key="float16",
-            mask_type="dense",
-            use_kv_valid_bits=False,
-            use_persistent_scheduler=False,
-            use_parallel_sparse_kv_loads=False,
-            page_size=64,
+        make_block_sparse_compile_key(
+            seq_len_q=8, seq_len_kv=128, num_qo_heads=8, q_block_size=8, page_size=64
         )
     )
     cfg.page_offsets_num_warps = 2
@@ -1905,19 +1826,15 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
     )
 
     cfg = block_sparse_config._make_block_sparse_config(
-        block_sparse_config._BlockSparseCompileKey(
-            device_index=0,
-            batch_size=1,
+        make_block_sparse_compile_key(
             seq_len_q=128,
             seq_len_kv=2304,
             num_qo_heads=8,
             num_kv_heads=8,
-            head_dim=_HEAD_DIM,
             q_block_size=8,
             kv_block_size=8,
             kv_route_size=128,
             dtype_key="bfloat16",
-            mask_type="dense",
             use_kv_valid_bits=True,
             use_persistent_scheduler=True,
             use_parallel_sparse_kv_loads=True,
@@ -2099,9 +2016,9 @@ def test_q8_sparse_p_discards_dead_paired_instance() -> None:
         scheduler="static",
     )
     patterns: _Patterns = (((tuple(range(16)),),),)
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
     first_half = frozenset(range(64))
-    valid_bits = _pack_token_mask(case.seq_len_kv, (first_half,))
+    valid_bits = pack_token_mask(case.seq_len_kv, (first_half,))
     q = torch.randn((1, 8, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
     k = torch.randn((1, case.seq_len_kv, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
     v = torch.randn_like(k)
@@ -2301,23 +2218,8 @@ def test_block_sparse_config_derives_storage_layout_from_page_size(
     expected_use_paged_kv: bool,
 ) -> None:
     cfg = block_sparse_config._make_block_sparse_config(
-        block_sparse_config._BlockSparseCompileKey(
-            device_index=0,
-            batch_size=1,
-            seq_len_q=64,
-            seq_len_kv=256,
-            num_qo_heads=1,
-            num_kv_heads=1,
-            head_dim=_HEAD_DIM,
-            q_block_size=64,
-            kv_block_size=64,
-            kv_route_size=256,
-            dtype_key="float16",
-            mask_type="dense",
-            use_kv_valid_bits=True,
-            use_persistent_scheduler=False,
-            use_parallel_sparse_kv_loads=False,
-            page_size=page_size,
+        make_block_sparse_compile_key(
+            seq_len_kv=256, use_kv_valid_bits=True, page_size=page_size
         )
     )
 
@@ -3982,7 +3884,7 @@ def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
             ((1, 2), (), (2,)),
         ),
     )
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
     wrapper = block_sparse_module.BlockSparseTSWrapper()
     _plan(
         wrapper,
@@ -4028,7 +3930,7 @@ def test_public_block_sparse_correctness(
     block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     torch.manual_seed(20260716)
     patterns = _make_patterns(case)
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
     valid_bits, valid_by_batch = _make_token_mask(case)
     q = torch.randn(
         (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
@@ -4055,9 +3957,7 @@ def test_public_block_sparse_correctness(
     one_shot_actual = None
 
     try:
-        max_blocks_per_row = max(
-            len(row) for batch in patterns for head in batch for row in head
-        )
+        max_blocks_per_row = widest_bsr_row(patterns)
         wrapper.plan(
             case.batch_size,
             case.seq_len_q,
@@ -4140,9 +4040,11 @@ def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
     block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     torch.manual_seed(2026082602)
     patterns = _make_patterns(case)
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
     num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
-    exact_block_bits = _make_exact_block_bits(patterns, num_kv_blocks)
+    exact_block_bits = make_exact_block_bits(
+        patterns, num_kv_blocks, set_padding_bits=True
+    )
     valid_bits, valid_by_batch = _make_token_mask(case)
     q = torch.randn(
         (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
@@ -4179,9 +4081,7 @@ def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
         ],
         dim=1,
     )
-    max_blocks_per_row = max(
-        len(row) for batch in patterns for head in batch for row in head
-    )
+    max_blocks_per_row = widest_bsr_row(patterns)
     outputs: list[torch.Tensor] = []
 
     try:
@@ -4270,7 +4170,7 @@ def test_public_block_sparse_gqa_correctness(
     block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
     torch.manual_seed(20260814)
     patterns = _make_patterns(case)
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
     valid_bits, valid_by_batch = _make_token_mask(case)
     q = torch.randn(
         (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
@@ -4301,9 +4201,7 @@ def test_public_block_sparse_gqa_correctness(
     wrapper = block_sparse_module.BlockSparseTSWrapper()
 
     try:
-        max_blocks_per_row = max(
-            len(row) for batch in patterns for head in batch for row in head
-        )
+        max_blocks_per_row = widest_bsr_row(patterns)
         wrapper.plan(
             case.batch_size,
             case.seq_len_q,
@@ -4396,8 +4294,8 @@ def test_one_block_sparse_plan_runs_distinct_layer_routes() -> None:
     )
     layer_a_patterns: _Patterns = ((((0,),),),)
     layer_b_patterns: _Patterns = ((((1, 3),),),)
-    layer_a_indptr, layer_a_indices = _make_bsr(layer_a_patterns)
-    layer_b_indptr, layer_b_indices = _make_bsr(layer_b_patterns)
+    layer_a_indptr, layer_a_indices = make_bsr(layer_a_patterns)
+    layer_b_indptr, layer_b_indices = make_bsr(layer_b_patterns)
     assert layer_a_indices.numel() != layer_b_indices.numel()
 
     q = torch.randn((1, 64, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
@@ -4619,9 +4517,9 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
         token_idx for token_idx in range(case.seq_len_kv) if token_idx % 7 not in (0, 3)
     )
 
-    block_indptr, block_indices = _make_bsr(initial_patterns)
-    valid_bits = _pack_token_mask(case.seq_len_kv, (initial_valid,))
-    replay_valid_bits = _pack_token_mask(case.seq_len_kv, (replay_valid,))
+    block_indptr, block_indices = make_bsr(initial_patterns)
+    valid_bits = pack_token_mask(case.seq_len_kv, (initial_valid,))
+    replay_valid_bits = pack_token_mask(case.seq_len_kv, (replay_valid,))
     q = torch.randn((1, 64, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
     k = torch.randn((1, 448, 1, _HEAD_DIM), device="cuda", dtype=case.dtype)
     v = torch.randn_like(k)
@@ -4698,7 +4596,7 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     assert state.route_workspace[0].item() == 2
 
     block_indices.copy_(torch.tensor([1, 2], device="cuda", dtype=torch.int32))
-    valid_bits.copy_(_pack_token_mask(case.seq_len_kv, (initial_valid,)))
+    valid_bits.copy_(pack_token_mask(case.seq_len_kv, (initial_valid,)))
     graph_out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -4730,8 +4628,8 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
     initial_patterns: _Patterns = ((((0,), (3,)),),)
     replay_patterns: _Patterns = ((((0, 1, 2), (1, 2, 3)),),)
     all_tokens = (frozenset(range(case.seq_len_kv)),)
-    block_indptr, initial_indices = _make_bsr(initial_patterns)
-    replay_indptr, replay_indices = _make_bsr(replay_patterns)
+    block_indptr, initial_indices = make_bsr(initial_patterns)
+    replay_indptr, replay_indices = make_bsr(replay_patterns)
     # Reserve the replay's maximum index extent up front. Inspection reads only
     # the two entries referenced by the initial indptr and ignores spare slots.
     block_indices = torch.full_like(replay_indices, -1)
@@ -4843,7 +4741,7 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference(
     block_tables[0, : len(physical_page_ids)] = torch.tensor(
         physical_page_ids, device="cuda", dtype=torch.int32
     )
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
     q = (
         torch.randn(
             (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
@@ -4947,7 +4845,7 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     num_q_rows = math.ceil(case.seq_len_q / case.q_block_size)
     patterns: _Patterns = ((tuple(route_rows[:num_q_rows]),),)
     assert all(route == tuple(sorted(route)) for route in patterns[0][0])
-    block_indptr, block_indices = _make_bsr(patterns)
+    block_indptr, block_indices = make_bsr(patterns)
 
     paged_kv_indices = torch.tensor(
         [8, 1, 6, 3, 9, 0, 7, 2],
@@ -5126,7 +5024,7 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
     )
 
     def padded_bsr(patterns: object) -> tuple[torch.Tensor, torch.Tensor]:
-        indptr, indices = _make_bsr(patterns)
+        indptr, indices = make_bsr(patterns)
         padded = torch.full((max_nnz,), -1, device="cuda", dtype=torch.int32)
         padded[: indices.numel()].copy_(indices)
         return indptr, padded
@@ -5326,7 +5224,7 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     )
 
     def padded_bsr(patterns: object) -> tuple[torch.Tensor, torch.Tensor]:
-        indptr, indices = _make_bsr(patterns)
+        indptr, indices = make_bsr(patterns)
         padded = torch.full((max_nnz,), -1, device="cuda", dtype=torch.int32)
         padded[: indices.numel()].copy_(indices)
         return indptr, padded
@@ -5414,8 +5312,8 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         frozenset(range(96)),
         frozenset(token for token in range(64) if token % 5 != 2),
     )
-    kv_valid_bits_a = _pack_token_mask(case.seq_len_kv, valid_by_batch_a)
-    kv_valid_bits_b = _pack_token_mask(case.seq_len_kv, valid_by_batch_b)
+    kv_valid_bits_a = pack_token_mask(case.seq_len_kv, valid_by_batch_a)
+    kv_valid_bits_b = pack_token_mask(case.seq_len_kv, valid_by_batch_b)
     # Page-table rows per request. Only the live prefix of a row is read: the
     # first request of round A (48 tokens) and the second request of round B
     # (64 tokens) each own one 64-token page, so their trailing entries point
