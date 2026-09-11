@@ -1083,14 +1083,25 @@ def _cached_compile_fp8_kernel(
 #     0 at budget 96.  Budgets 64/48 (12/8 per slot) spill nothing either
 #     but pay more SMEM weight reads and are 2-4% slower than 96.
 #   num_heads=32, next_n=8, budget 96: 1.00 0.85 0.71 / 0.79 0.78 0.63.
+#   num_heads=32, next_n=5, budget 96 (16/slot instead of 32): B200
+#     0.99 0.84 0.76; default spills ~33k local loads + ~22k stores per
+#     launch, 0 at 96.  Rubin ratios 0.88 0.87 0.73, taken while that board
+#     was stuck at idle clocks (absolutes 8x off its ledger) -- direction only.
+#   num_heads=32, next_n=7, budget 96 (12/slot instead of 20): B200
+#     0.91 0.99 0.91; default spills ~14k local loads + ~11k stores, 0 at 96.
+#     Rubin ratios 0.96 0.85 0.74 under the same caveat.
 #   num_heads=32, next_n=4, budget 96: 1.00 1.00 1.01 / 0.90 1.00 0.95
-#     (neutral; at next_n<=3 the formula already stays within 96).
+#     (neutral).  At next_n<=3 the formula already caches all 32 heads per
+#     slot within 96 registers, so the budget compiles the identical kernel.
 #   num_heads=32, next_n=6, fp16 epilogue: the budget does not bind (two
 #     weights per register); two epilogue subtiles: 1.00 1.00 0.95 /
 #     1.00 0.97 0.87 -> (2, None).
 # The rule below encodes exactly that: a 96-register budget for the fp32
-# epilogue at num_heads=32, two subtiles for its fp16 epilogue at next_n=6,
-# the default everywhere else.  Unmeasured shapes get the default.
+# epilogue at num_heads=32 -- every next_n the API admits there (1..8,
+# N <= 256) is covered: identical kernel at 1..3, neutral at 4, measured wins
+# at 5..8 -- two subtiles for its fp16 epilogue at next_n=6, and the default
+# everywhere else, including every num_heads other than 32 and the other
+# fp16 shapes, which were not measured.
 _FP8_EPILOGUE_DEFAULT = (1, None)
 
 

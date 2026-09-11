@@ -104,8 +104,9 @@ _EPI_UNROLL = 4
 # default spills: at num_heads=32, next_n=6 the default caches 24 weights per
 # slot (144 registers) and Nsight Compute shows ~12k local loads / ~8k local
 # stores per launch; 96 registers (16 per slot) removes every spill and runs
-# 8-15% (B200) / 11-35% (Rubin) faster, next_n=8 up to 29% / 37% faster.
-# See _fp8_epilogue_policy in attn_scores.py for the measured table.
+# 8-15% (B200) / 11-35% (Rubin) faster; next_n=5, 7 and 8 spill the same way
+# under the default and gain up to 24%, 9% and 29% on B200 (37% on Rubin at
+# 8).  See _fp8_epilogue_policy in attn_scores.py for the measured table.
 _MAX_W_CACHE_REGS = 160
 
 
