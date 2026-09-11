@@ -4,10 +4,70 @@ from pathlib import Path
 import pytest
 import torch
 
+from flashinfer import prefill
 from flashinfer.jit import core
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.attention import modules as attention_modules
 from flashinfer.jit.attention.modules import gen_customize_batch_prefill_module
+
+
+@pytest.mark.parametrize(
+    "backend,mode",
+    [("fa2", None), ("fa2", "independent"), ("fa3", None), ("fa3", "runtime")],
+)
+def test_custom_prefill_adapter_preserves_stride_specialization(
+    tmp_path, monkeypatch, backend, mode
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(
+        attention_modules.current_compilation_context, "TARGET_CUDA_ARCHS", {(9, 0)}
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "generated")
+    monkeypatch.setattr(jit_env, "FLASHINFER_CSRC_DIR", repo_root / "csrc")
+    # Exercise the cached adapter and real generator; only compilation is stubbed.
+    monkeypatch.setattr(core.JitSpec, "build_and_load", lambda self: self)
+    uri = f"test_custom_prefill_adapter_{backend}_{mode}_{tmp_path.name}"
+    kwargs = (
+        {} if mode is None else {"paged_kv_stride_mode": mode, "module_surface": "full"}
+    )
+    spec = prefill.get_customize_batch_prefill_module(
+        backend,
+        uri,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.int32,
+        128,
+        128,
+        [],
+        [],
+        [],
+        [],
+        "DefaultAttention",
+        "struct DefaultAttention {};",
+        **kwargs,
+    )
+    assert spec.name == uri
+    assert len(spec.sources) == 10
+    generated_dir = tmp_path / "generated" / uri
+    suffix = "_sm90" if backend == "fa3" else ""
+    binding = (generated_dir / f"batch_prefill{suffix}_jit_binding.cu").read_text()
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(paged_run," in binding
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(ragged_run," in binding
+    if backend == "fa2":
+        expected_mode = "INDEPENDENT" if mode == "independent" else "RUNTIME"
+        config = (generated_dir / "batch_prefill_config.inc").read_text()
+        assert (
+            f"#define PAGED_KV_STRIDE_MODE PAGED_KV_STRIDE_MODE_{expected_mode}"
+            in config
+        )
+        for mask in range(4):
+            source = (
+                generated_dir / f"batch_prefill_paged_kernel_mask_{mask}.cu"
+            ).read_text()
+            assert ("/*SAME_KV_STRIDES=*/true" in source) == (mode is None)
+            assert "/*SAME_KV_STRIDES=*/false" in source
 
 
 def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(

@@ -231,8 +231,17 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
     torch.testing.assert_close(o_multi_level, o_two_level, rtol=1e-3, atol=1e-3)
 
 
-def test_shared_prefix_and_cascade_lazy_stride_router():
+def test_shared_prefix_and_cascade_lazy_stride_router(monkeypatch):
     """Share one routed FA2 namespace across cascade and shared-prefix prefill."""
+    wrapper_cls = flashinfer.BatchPrefillWithPagedKVCacheWrapper
+
+    def fa2_wrapper(*args, **kwargs):
+        return wrapper_cls(*args, **kwargs, backend="fa2")
+
+    # Cascade defaults to auto, which selects FA3 on Hopper. This test covers FA2.
+    monkeypatch.setattr(
+        flashinfer.cascade, "BatchPrefillWithPagedKVCacheWrapper", fa2_wrapper
+    )
     torch.manual_seed(42)
     batch_size, qo_len, shared_kv_len, unique_kv_len = 2, 8, 16, 16
     page_size = 16
@@ -301,6 +310,8 @@ def test_shared_prefix_and_cascade_lazy_stride_router():
         head_dim,
         page_size,
     )
+    assert all(wrapper._backend == "fa2" for wrapper in cascade._batch_prefill_wrappers)
+    assert shared_prefix._batch_prefill_wrapper._backend == "fa2"
     modules = [wrapper._cached_module for wrapper in cascade._batch_prefill_wrappers]
     assert modules[0] is modules[1]
     assert shared_prefix._batch_prefill_wrapper._cached_module is modules[0]

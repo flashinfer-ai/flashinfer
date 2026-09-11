@@ -39,6 +39,8 @@ from .jit import (
     setup_cubin_loader,
 )
 from .jit.attention.modules import (
+    BatchPrefillModuleSurface,
+    BatchPrefillPagedKVStrideMode,
     _gen_batch_prefill_independent_paged_module,
     _gen_batch_prefill_primary_module,
 )
@@ -202,6 +204,8 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
+    module_surface: BatchPrefillModuleSurface = "full",
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -223,6 +227,8 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+        module_surface=module_surface,
     ).build_and_load()
 
 
