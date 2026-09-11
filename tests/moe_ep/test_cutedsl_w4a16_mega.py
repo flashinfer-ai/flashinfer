@@ -252,6 +252,7 @@ def _check_numerical(
         # empty source rank still owns experts needed by its peers.
         rounds = (
             ("balanced", 17, False),
+            ("uneven_sources", 5 if bootstrap.rank == 0 else 17, False),
             ("skewed", 17, True),
             ("single_token", 1 if bootstrap.rank == 0 else 0, False),
             ("empty_source", 0 if bootstrap.rank == 0 else 11, False),

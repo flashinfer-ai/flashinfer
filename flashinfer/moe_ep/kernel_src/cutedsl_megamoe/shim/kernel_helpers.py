@@ -81,6 +81,10 @@ _LAZY = {
     "eval_function_mapping": ("moe_nvfp4_swapab.contract", "eval_function_mapping"),
     "fmax": ("common.moe_utils", "fmax"),
     "fmin": ("common.moe_utils", "fmin"),
+    "fns_b32": ("src.ptx_helpers", "fns_b32"),
+    "ldg_f32_raw": ("src.ptx_helpers", "ldg_f32_raw"),
+    "tma_load_1d_raw": ("src.ptx_helpers", "tma_load_1d_raw"),
+    "tma_store_1d": ("src.ptx_helpers", "tma_store_1d"),
     "get_cutedsl_target_arch": ("common.host_utils", "get_cutedsl_target_arch"),
     "iket": ("src.iket_compat", "iket"),
     "mbarrier_arrive_expect_tx_on_peer": (
@@ -142,6 +146,10 @@ __all__ = [
     "eval_function_mapping",  # noqa: F822
     "fmax",  # noqa: F822
     "fmin",  # noqa: F822
+    "fns_b32",  # noqa: F822
+    "ldg_f32_raw",  # noqa: F822
+    "tma_load_1d_raw",  # noqa: F822
+    "tma_store_1d",  # noqa: F822
     "get_cutedsl_target_arch",  # noqa: F822
     "iket",  # noqa: F822
     "mbarrier_arrive_expect_tx_on_peer",  # noqa: F822
