@@ -126,7 +126,17 @@ def check(args, out, lse):
 
 @pytest.mark.parametrize(
     "batch,compressed_k",
-    [(1, 512), (16, 512), (64, 512), (128, 512), (4, 0), (128, 0), (2, 64), (8, 192)],
+    [
+        (1, 512),
+        (16, 512),
+        (64, 512),
+        (128, 512),
+        (256, 512),
+        (4, 0),
+        (128, 0),
+        (2, 64),
+        (8, 192),
+    ],
 )
 def test_decode_changed_graph_and_fp64(batch, compressed_k, monkeypatch):
     gate()
@@ -208,3 +218,23 @@ def test_empty_uninitialized_cache_and_declaration_guards():
         deepseek_v41_decode(args[0], args[1].view(-1, 32, 1, 528), *args[2:])
     with pytest.raises(TypeError):
         deepseek_v41_decode(*args, arithmetic="bf16x3")
+
+
+def test_cache_offsets_above_two_gib():
+    gate()
+    args = make_case(128, 512)
+    main = args[2]
+    # Leave the prefix uninitialized: only the copied tail is a valid slot.
+    # The independent oracle still reads the original small encoded pool.
+    first_page = (2**31 + 64 * 288 - 1) // (64 * 288)
+    large = torch.empty(
+        (first_page + main.shape[0], 64, 1, 288),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    large[first_page:].copy_(main)
+    shifted = args[4] + first_page * 64
+    out, lse, _ = deepseek_v41_decode(
+        args[0], args[1], large, args[3], shifted, args[5]
+    )
+    check(args, out, lse)

@@ -100,6 +100,9 @@ class BlackwellV41MixedCacheDecode:
         compressed_page_size: int = 64,
         compressed_is_fp4: bool = True,
         max_topk: int = 512,
+        dequant_warps: int = 8,
+        dequant_phase_chunks: int = 8,
+        narrow_offsets: bool = False,
     ):
         """Initializes the configuration for a Blackwell Heavily Compressed Attention (HCA) kernel.
 
@@ -200,12 +203,14 @@ class BlackwellV41MixedCacheDecode:
         self.mma_pv_warp_id = 14
         # Dequant group: gathers raw FP8/FP4 rows with plain loads and writes
         # the BF16 K and V tiles that the UMMA warps consume.
-        self.dequant_warp_ids = (15, 16, 17, 18, 19, 20, 21, 22)
+        assert dequant_warps in (8, 16)
+        assert dequant_warps == 8 or not self.use_2cta_instrs
+        self.dequant_warp_ids = tuple(range(15, 15 + dequant_warps))
         # Register allocation rounds the CTA up to a multiple of 4 warps, so a
         # 23-warp launch gets the 24-warp budget (80/lane) but only 23 shares of
         # it. Launch the 24th warp as an idle one at the minimum allocation to
         # keep its 80 - 24 registers in the pool.
-        self.idle_warp_id = 23
+        self.idle_warp_id = 15 + dequant_warps
         self.num_total_compute_warps = self.num_compute_warps + len(
             self.second_compute_warp_ids
         )
@@ -232,14 +237,20 @@ class BlackwellV41MixedCacheDecode:
         # M64/PV128 halves the correction fragment. Its MMA/Q-load warps
         # fit in 32 registers, allowing dequant to use 80 without exceeding
         # the pool: 8*96 + 4*96 + 3*32 + 24 + 8*80 = 1912 <= 1920.
-        # Retain the larger load phase to expose independent global loads.
+        # The 32-warp M64 schedule gives more threads to dequant and reduces
+        # its per-thread row count. Its register pool is 32*64 = 2048:
+        # 8*96 + 4*96 + 3*32 + 24 + 16*48 = 2040.
         self.softmax_reg_num = 96
         self.correction_reg_num = 136 if self.use_2cta_instrs else 96
         self.other_reg_num = 40 if self.use_2cta_instrs else 32
         self.idle_reg_num = 24
-        self.dequant_reg_num = 56 if self.use_2cta_instrs else 80
+        self.dequant_reg_num = (
+            56 if self.use_2cta_instrs else 48 if dequant_warps == 16 else 80
+        )
         # Raw 16-byte chunks each dequant thread keeps in flight per phase.
-        self.dequant_phase_chunks = 8
+        self.dequant_phase_chunks = dequant_phase_chunks
+        # The wrapper proves both complete cache pools fit before narrowing.
+        self.offset_dtype = cutlass.Int32 if narrow_offsets else cutlass.Int64
         # Timing-attribution switch (results are wrong when != 0): 1 = dequant
         # warps only run the pipeline, 2 = loads only, 3 = convert+store only.
         self.dbg_mode = 0
@@ -1848,7 +1859,7 @@ class BlackwellV41MixedCacheDecode:
         )[0].to(cutlass.Float32)
 
     @cute.jit
-    def _load_chunk(self, pool: cute.Tensor, byte_off: cutlass.Int64):
+    def _load_chunk(self, pool: cute.Tensor, byte_off: cutlass.Numeric):
         """One 16-byte vector load (ld.global.v4.b32) of raw cache bytes.
 
         The pool pointer plus a dynamic offset loses its alignment fact, so
@@ -1863,7 +1874,7 @@ class BlackwellV41MixedCacheDecode:
         return hw.load_cache_vector(ptr)
 
     @cute.jit
-    def _load_u16(self, pool: cute.Tensor, byte_off: cutlass.Int64) -> cutlass.Int32:
+    def _load_u16(self, pool: cute.Tensor, byte_off: cutlass.Numeric) -> cutlass.Int32:
         ptr = cute.make_ptr(
             cutlass.Uint16,
             pool.iterator.toint() + byte_off,
@@ -1873,7 +1884,7 @@ class BlackwellV41MixedCacheDecode:
         return hw.load_cache_scale(ptr, cutlass.Uint16)
 
     @cute.jit
-    def _load_u8(self, pool: cute.Tensor, byte_off: cutlass.Int64) -> cutlass.Int32:
+    def _load_u8(self, pool: cute.Tensor, byte_off: cutlass.Numeric) -> cutlass.Int32:
         return hw.load_cache_scale(pool.iterator + byte_off, cutlass.Uint8)
 
     @cute.jit
@@ -1994,10 +2005,10 @@ class BlackwellV41MixedCacheDecode:
         scale_bytes: cutlass.Constexpr,
     ):
         slot = slots[key]
-        page = cutlass.Int64(slot // page_size)
+        page = self.offset_dtype(slot // page_size)
         local = slot % page_size
         data_off = cutlass.select_(
-            slot >= 0, page * page_bytes + local * row_bytes, cutlass.Int64(-1)
+            slot >= 0, page * page_bytes + local * row_bytes, self.offset_dtype(-1)
         )
         scale_off = page * page_bytes + page_size * row_bytes + local * scale_bytes
         return data_off, scale_off
@@ -2049,7 +2060,7 @@ class BlackwellV41MixedCacheDecode:
         page_bytes = pool.shape[1]
         pc = min(self.dequant_phase_chunks, iters)
         row, lane_chunk = self._lane_map(l, rpi)
-        offs = cute.make_rmem_tensor(cute.make_layout(2 * octets), cutlass.Int64)
+        offs = cute.make_rmem_tensor(cute.make_layout(2 * octets), self.offset_dtype)
         for o in cutlass.range_constexpr(octets):
             n = w * rows_per_warp + o * rpi + row
             d, sc = self._row_offsets(

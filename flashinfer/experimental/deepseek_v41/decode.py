@@ -9,7 +9,14 @@ from ._utils import _overlaps
 
 
 @functools.cache
-def _compile(device_index, compressed_k, split):
+def _compile(
+    device_index,
+    compressed_k,
+    split,
+    dequant_warps=8,
+    phase_chunks=8,
+    narrow_offsets=False,
+):
     import cutlass
     import cutlass.cute as cute
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -57,10 +64,14 @@ def _compile(device_index, compressed_k, split):
         window_page_size=64,
         compressed_page_size=64,
         compressed_is_fp4=True,
+        dequant_warps=dequant_warps,
+        dequant_phase_chunks=phase_chunks,
+        narrow_offsets=narrow_offsets,
     )
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_decode",
-        f"h64_s1_c{compressed_k}_split{int(split)}",
+        f"h64_s1_c{compressed_k}_split{int(split)}"
+        f"_dq{dequant_warps}_phase{phase_chunks}_i{32 if narrow_offsets else 64}",
         lambda: cute.compile(
             kernel,
             q,
@@ -181,7 +192,26 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
                 else 1
             )
             split = min(desired, (128 + ck) // 64)
-            kernel = _compile(q.device.index, ck, split > 1)
+            dequant_warps, phase_chunks, narrow_offsets = 8, 8, False
+            if ck == 512 and batch >= 64:
+                # A short load phase limits live registers at moderate batch.
+                # Use int32 byte offsets only with a complete-pool size proof;
+                # the largest valid data/scale address is strictly below 2 GiB.
+                if (
+                    batch <= 128
+                    and max(swa_cache.numel(), global_cache.numel()) < 2**31
+                ):
+                    phase_chunks, narrow_offsets = 2, True
+                elif batch >= 128:
+                    dequant_warps = 16
+            kernel = _compile(
+                q.device.index,
+                ck,
+                split > 1,
+                dequant_warps,
+                phase_chunks,
+                narrow_offsets,
+            )
             workspace = (
                 torch.empty(
                     batch * 64 * split * 513 * 4, device=q.device, dtype=torch.int8
