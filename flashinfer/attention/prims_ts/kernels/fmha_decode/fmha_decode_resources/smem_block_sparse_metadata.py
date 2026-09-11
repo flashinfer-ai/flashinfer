@@ -23,6 +23,7 @@ releases the stage before masking.
 """
 
 from dataclasses import dataclass
+import math
 from typing import ClassVar
 
 import cutlass
@@ -41,6 +42,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...._block_sparse.common import _block_sparse_proxy_summary_geometry
 from ...._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_FULL_FLAG,
     _PREPARED_ROUTE_IS_PROXY_FLAG,
@@ -79,6 +81,33 @@ _SOFTMAX_ROUTE_IS_PROXY_FLAG = 1 << 5
 _SWAPS_PACKED_ROUTE_FLAGS_CLEAR_MASK = ~(
     _PREPARED_ROUTE_IS_FULL_FLAG | _PREPARED_ROUTE_IS_PROXY_FLAG
 )
+
+
+def _proxy_log2_block_mass(cfg: FmhaDecodeConfig) -> float:
+    """Return ``log2`` of the tokens one full proxy summary stands for.
+
+    A proxy summary is the mean K/V of its KV block, so the block behaves like
+    that many identical tokens: the mass enters the softmax as an additive
+    ``log2(mass)`` on the summary's log2-domain logit, in the max pass and in
+    the exponent, and the summary's probability then carries the mass into
+    both the numerator and the denominator with weight one.
+    """
+
+    return math.log2(cfg.kv_block_size)
+
+
+def _proxy_tail_summary(cfg: FmhaDecodeConfig) -> tuple[int, float]:
+    """Return the final summary index and its ``log2(mass)`` shortfall.
+
+    The final KV block may be ragged; its summary stands for fewer tokens, so
+    its logit offset is ``log2(kv_block_size)`` plus the returned non-positive
+    delta. The delta is zero when the sequence ends on a block boundary.
+    """
+
+    num_summaries, tail_mass = _block_sparse_proxy_summary_geometry(
+        cfg.static_seq_len_kv, cfg.kv_block_size
+    )
+    return num_summaries - 1, math.log2(tail_mass) - math.log2(cfg.kv_block_size)
 
 
 @cute.jit
