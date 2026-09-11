@@ -202,7 +202,7 @@ class _BatchMLAPagedAttentionXqaBackend:
             raise _BackendPlanUnsupportedError(reason)
         _validate_xqa_device_capability(args._float_workspace_buffer.device)
         args.require_cuda_graph_dense_metadata("xqa")
-        dense = args.native_device_dense()
+        dense = args.device_dense(table_width_alignment=128 // args.page_size)
         backend = cls(args._float_workspace_buffer)
         backend.plan(
             cum_seq_lens_q=dense.cum_seq_lens_q,
