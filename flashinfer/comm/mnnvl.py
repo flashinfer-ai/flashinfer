@@ -559,8 +559,8 @@ class MnnvlMemory:  # type: ignore[no-redef]
                 if pynvml.nvmlDeviceGetNvLinkCapability(
                     handle, link_idx, pynvml.NVML_NVLINK_CAP_P2P_SUPPORTED
                 ):
-                    available_links += 1
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
+                    available_links += 1
                     if is_active:
                         active_links += 1
             except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):

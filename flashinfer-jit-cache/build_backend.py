@@ -17,6 +17,8 @@ limitations under the License.
 import sys
 import os
 import platform
+import re
+import shutil
 from pathlib import Path
 from setuptools import build_meta as _orig
 from wheel.bdist_wheel import bdist_wheel
@@ -28,6 +30,56 @@ from build_utils import get_build_dependency_requirements, get_git_version
 
 # Skip version check when building flashinfer-jit-cache package
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+
+
+def _wheel_kind() -> str:
+    kind = os.environ.get("FLASHINFER_JIT_CACHE_WHEEL_KIND", "legacy").strip()
+    if kind not in ("legacy", "shim"):
+        raise RuntimeError(
+            f"Invalid FLASHINFER_JIT_CACHE_WHEEL_KIND={kind!r}; "
+            "expected 'legacy' or 'shim'"
+        )
+    return kind
+
+
+def _provider_tag(architecture: str) -> str:
+    normalized = architecture.strip().lower()
+    for prefix in ("compute_", "sm_", "sm"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    normalized = normalized.replace(".", "").replace("_", "")
+    if not re.fullmatch(r"\d{2,3}[af]?", normalized):
+        raise RuntimeError(f"Invalid provider CUDA architecture {architecture!r}")
+    return f"sm{normalized}"
+
+
+def _write_provider_requirements(version: str) -> None:
+    requirements_path = (
+        Path(__file__).parent / "flashinfer_jit_cache" / "_provider_requirements.txt"
+    )
+    requirements = []
+    if _wheel_kind() == "shim":
+        architecture_list = os.environ.get(
+            "FLASHINFER_JIT_CACHE_PROVIDER_ARCHS",
+            os.environ.get("FLASHINFER_CUDA_ARCH_LIST", ""),
+        )
+        if not architecture_list.strip():
+            raise RuntimeError(
+                "A shim build requires FLASHINFER_JIT_CACHE_PROVIDER_ARCHS "
+                "or FLASHINFER_CUDA_ARCH_LIST"
+            )
+        provider_tags = sorted(
+            {_provider_tag(architecture) for architecture in architecture_list.split()}
+        )
+        # Provider lists are literal; sm80 SASS is not a portable baseline.
+        requirements = [
+            f"flashinfer-jit-cache-{provider_tag}=={version}"
+            for provider_tag in provider_tags
+        ]
+    requirements_path.write_text(
+        "\n".join(requirements) + ("\n" if requirements else "")
+    )
 
 
 def _create_build_metadata():
@@ -61,6 +113,7 @@ def _create_build_metadata():
     # If file exists and not in git repo (installing from sdist), keep existing file
     if build_meta_file.exists() and not in_git_repo:
         print("Build metadata file already exists (not in git repo), keeping it")
+        _write_provider_requirements(version)
         return version
 
     # In git repo (editable) or file doesn't exist, create/update it
@@ -70,6 +123,7 @@ def _create_build_metadata():
         f.write(f'__git_version__ = "{git_version}"\n')
 
     print(f"Created build metadata file with version {version}")
+    _write_provider_requirements(version)
     return version
 
 
@@ -157,7 +211,15 @@ def _build_aot_modules():
 
 def _prepare_build():
     """Shared preparation logic for both wheel and editable builds."""
-    _build_aot_modules()
+    _create_build_metadata()
+    if _wheel_kind() == "legacy":
+        _build_aot_modules()
+        return
+
+    # A shim wheel owns discovery and dependency metadata, not binary modules.
+    aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
+    if aot_package_dir.exists():
+        shutil.rmtree(aot_package_dir)
 
 
 class PlatformSpecificBdistWheel(bdist_wheel):
@@ -213,12 +275,16 @@ class _MonkeyPatchBdistWheel:
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
     """Build wheel with custom AOT module compilation."""
-    print("Building flashinfer-jit-cache wheel...")
+    print(f"Building flashinfer-jit-cache {_wheel_kind()} wheel...")
 
     _prepare_build()
 
-    with _MonkeyPatchBdistWheel():
-        return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    if _wheel_kind() == "legacy":
+        with _MonkeyPatchBdistWheel():
+            return _orig.build_wheel(
+                wheel_directory, config_settings, metadata_directory
+            )
+    return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
@@ -227,30 +293,39 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
 
     _prepare_build()
 
-    # Now build the editable install using setuptools
     _orig_build_editable = getattr(_orig, "build_editable", None)
     if _orig_build_editable is None:
         raise RuntimeError("build_editable not supported by setuptools backend")
 
-    result = _orig_build_editable(wheel_directory, config_settings, metadata_directory)
+    if _wheel_kind() == "legacy":
+        with _MonkeyPatchBdistWheel():
+            return _orig_build_editable(
+                wheel_directory, config_settings, metadata_directory
+            )
 
-    return result
+    return _orig_build_editable(wheel_directory, config_settings, metadata_directory)
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     """Prepare metadata with platform-specific wheel tags."""
-    with _MonkeyPatchBdistWheel():
-        return _orig.prepare_metadata_for_build_wheel(
-            metadata_directory, config_settings
-        )
+    if _wheel_kind() == "legacy":
+        with _MonkeyPatchBdistWheel():
+            return _orig.prepare_metadata_for_build_wheel(
+                metadata_directory, config_settings
+            )
+    return _orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
 
 
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
     """Prepare metadata for editable install."""
-    with _MonkeyPatchBdistWheel():
-        return _orig.prepare_metadata_for_build_editable(
-            metadata_directory, config_settings
-        )
+    if _wheel_kind() == "legacy":
+        with _MonkeyPatchBdistWheel():
+            return _orig.prepare_metadata_for_build_editable(
+                metadata_directory, config_settings
+            )
+    return _orig.prepare_metadata_for_build_editable(
+        metadata_directory, config_settings
+    )
 
 
 def get_requires_for_build_wheel(config_settings=None):
