@@ -134,8 +134,8 @@ are 16-byte aligned. All query, cache, metadata, output, and workspace tensors
 must be on one CUDA device. Metadata uses 4-byte-aligned CUDA `torch.int32`;
 the page table is contiguous within each row but may have padding between
 rows. A caller-provided `out` must not overlap Q, K/V page
-storage, run-time metadata, or caller-owned workspace. The launch
-conservatively rejects overlapping storage spans. The API returns O only; LSE
+storage, run-time metadata, or caller-owned workspace. This is an unchecked
+caller precondition in both validation modes. The API returns O only; LSE
 and split-KV statistics are internal scratch.
 
 The fixed table controls logical-to-physical lookup only. Native TMA tensor
@@ -302,8 +302,9 @@ K/V lengths, packed offsets when present, tensors, and output. Plan-owned
 lengths and their specialization predicates were validated by `plan()` and are
 not revalidated against a second length vector. Once the caller has established
 the remaining conditions, `validate=False` avoids explicit checks and host
-metadata reads. Invalid run-owned lengths, page IDs, offsets, or aliases in that
-mode may cause incorrect results or out-of-bounds access. Do not mutate
+metadata reads. Invalid run-owned lengths, page IDs, or offsets in that mode
+may cause incorrect results or out-of-bounds access. Storage overlap is
+unsupported and unchecked in both modes. Do not mutate
 run-owned metadata concurrently with a launch or replay that reads it.
 
 For the standalone workflow, call

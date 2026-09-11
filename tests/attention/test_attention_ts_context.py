@@ -43,10 +43,6 @@ from flashinfer.attention.prims_ts import (
     batch_prefill,
     batch_prefill_with_paged_kv_cache,
 )
-from flashinfer.attention.prims_ts._tensor_aliasing import (
-    _tensor_byte_span,
-    _tensors_overlap,
-)
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
     build_fmha_task_manager,
@@ -658,162 +654,6 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 # CPU-only oracle and public API contract
 # ---------------------------------------------------------------------------
-
-
-def test_attention_ts_context_storage_span_includes_stride_and_offset() -> None:
-    storage = torch.empty(64, dtype=torch.bfloat16)
-    tensor = storage.as_strided((2, 3), (10, 2), storage_offset=3)
-
-    assert _tensor_byte_span(tensor) == (
-        tensor.data_ptr(),
-        tensor.data_ptr() + 15 * tensor.element_size(),
-    )
-
-
-def test_attention_ts_context_paged_views_are_conservatively_bounded() -> None:
-    combined_cache = torch.empty((3, 2, 2, 4), dtype=torch.uint8)
-    k_cache = combined_cache[:, 0]
-    v_cache = combined_cache[:, 1]
-
-    # The views select disjoint elements, but their outer-stride bounding spans
-    # overlap. Treating them as overlapping is safer than under-bounding a
-    # strided paged cache.
-    assert _tensors_overlap(k_cache, v_cache)
-
-
-def test_attention_ts_context_disjoint_storage_slices_do_not_overlap() -> None:
-    storage = torch.empty(16, dtype=torch.float32)
-
-    assert not _tensors_overlap(storage[:4], storage[8:12])
-
-
-def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
-    monkeypatch,
-) -> None:
-    """The contiguous wrapper checks runtime metadata and plan-owned scales."""
-
-    monkeypatch.setattr(
-        context_module, "_validate_runtime_inputs", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_prepare_out",
-        lambda out, *, q, output_dtype: out,
-    )
-    argument_names = (
-        "k",
-        "v",
-        "qo_indptr",
-        "kv_indptr",
-    )
-    plan_owned_names = (
-        "scale_softmax_log2",
-        "output_scale",
-    )
-
-    for aliased_name in (*argument_names, *plan_owned_names):
-        out = torch.empty(8)
-        q = torch.empty(8)
-        arguments = {name: torch.empty(8) for name in argument_names}
-        plan_owned = {name: torch.empty(8) for name in plan_owned_names}
-        empty_i32 = torch.empty(1)
-
-        if aliased_name in arguments:
-            arguments[aliased_name] = out
-        else:
-            plan_owned[aliased_name] = out
-        wrapper = BatchPrefillTSWrapper()
-        wrapper._plan_state = context_module._ContextPlanState(
-            geometry=SimpleNamespace(
-                output_dtype=out.dtype,
-                packed=True,
-                mask_type="dense",
-            ),
-            scale_softmax_log2=plan_owned["scale_softmax_log2"],
-            output_scale=plan_owned["output_scale"],
-            empty_i32=empty_i32,
-            variable_window_padded_starts=None,
-            variable_window_cta_starts=empty_i32,
-            compiled=lambda *_: None,
-            policy=(),
-        )
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            wrapper.run(
-                q,
-                arguments["k"],
-                arguments["v"],
-                arguments["qo_indptr"],
-                arguments["kv_indptr"],
-                out=out,
-            )
-
-
-def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
-    monkeypatch,
-) -> None:
-    """The paged wrapper checks every per-run and plan-owned allocation."""
-
-    monkeypatch.setattr(
-        context_module, "_validate_paged_runtime_inputs", lambda *_: None
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_validate_paged_runtime_metadata",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_prepare_out",
-        lambda out, *, q, output_dtype: out,
-    )
-    argument_names = (
-        "k_cache",
-        "v_cache",
-        "qo_indptr",
-        "block_tables",
-        "seq_lens_kv",
-    )
-    plan_owned_names = (
-        "scale_softmax_log2",
-        "output_scale",
-    )
-
-    for aliased_name in (*argument_names, *plan_owned_names):
-        out = torch.empty(8)
-        q = torch.empty(8)
-        arguments = {name: torch.empty(8) for name in argument_names}
-        plan_owned = {name: torch.empty(8) for name in plan_owned_names}
-
-        if aliased_name in arguments:
-            arguments[aliased_name] = out
-        else:
-            plan_owned[aliased_name] = out
-        wrapper = BatchPrefillPagedTSWrapper()
-        wrapper._plan_state = context_module._PagedContextPlanState(
-            geometry=SimpleNamespace(output_dtype=out.dtype),
-            scale_softmax_log2=plan_owned["scale_softmax_log2"],
-            output_scale=plan_owned["output_scale"],
-            compiled=lambda *_: None,
-            policy=(),
-        )
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            wrapper.run(
-                q,
-                arguments["k_cache"],
-                arguments["v_cache"],
-                arguments["qo_indptr"],
-                arguments["block_tables"],
-                arguments["seq_lens_kv"],
-                out=out,
-            )
 
 
 def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
@@ -1599,58 +1439,6 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
         )
 
 
-def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        context_module, "_validate_runtime_inputs", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
-    monkeypatch.setattr(
-        context_module,
-        "_prepare_out",
-        lambda out, *, q, output_dtype: out,
-    )
-    empty_i32 = torch.empty(1, dtype=torch.int32)
-    wrapper = BatchPrefillTSWrapper()
-    wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(
-            device=torch.device("cpu"),
-            batch_size=1,
-            max_seq_len_q=1,
-            max_seq_len_k=1,
-            head_dim=128,
-            output_dtype=torch.int32,
-            packed=False,
-            mask_type="variable_window",
-        ),
-        scale_softmax_log2=torch.empty(1),
-        output_scale=torch.empty(1),
-        empty_i32=empty_i32,
-        variable_window_padded_starts=None,
-        variable_window_cta_starts=torch.empty(1, dtype=torch.int32),
-        compiled=lambda *_args: None,
-        policy=(),
-    )
-    starts = torch.zeros((1, 1), dtype=torch.int32)
-    ends = torch.zeros_like(starts)
-    out = torch.zeros((1, 1), dtype=torch.int32)
-
-    with pytest.raises(
-        ValueError,
-        match="out must not overlap variable_window_cta_starts storage",
-    ):
-        wrapper.run(
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            variable_window_token_starts=starts,
-            variable_window_token_ends=ends,
-            variable_window_cta_starts=out,
-            out=out,
-        )
-
-
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     monkeypatch,
 ) -> None:
@@ -1953,7 +1741,6 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     monkeypatch.setattr(context_module, "_validate_paged_runtime_metadata", fail)
     monkeypatch.setattr(context_module, "_validate_runtime_scale_tensor", fail)
     monkeypatch.setattr(context_module, "_prepare_out", fail)
-    monkeypatch.setattr(context_module, "_validate_out_does_not_overlap_inputs", fail)
 
     out = torch.empty(1)
     launched = []
@@ -5250,8 +5037,6 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, first)
-    with pytest.raises(ValueError, match="out must not overlap q storage"):
-        _run_wrapper(wrapper, first, out=first.q)
 
     shared_out = torch.full_like(first.q, float("nan"), dtype=first.output_dtype)
     returned = _run_wrapper(wrapper, first, out=shared_out)

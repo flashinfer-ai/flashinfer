@@ -48,8 +48,6 @@ import torch
 
 from flashinfer.api_logging import flashinfer_api
 
-from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
-
 
 if TYPE_CHECKING:
     from .kernels.fmha_context.fmha_resources import FmhaConfig
@@ -2506,9 +2504,10 @@ class BatchPrefillTSWrapper:
         output_scale : torch.Tensor, optional
             Per-run one-element float32 output scale. Defaults to the plan.
         validate : bool
-            Validate the complete runtime contract. Disable only when the
-            caller guarantees dtype, device, shape, stride, alignment, values,
-            aliasing, and lifetime. Defaults to ``True``.
+            Validate tensor structure and metadata values. Disable only when
+            the caller guarantees these contracts. Output must not overlap
+            any live input or plan-owned buffer in either mode; storage
+            overlap and lifetime are caller preconditions. Defaults to ``True``.
         """
 
         state = self._plan_state
@@ -2604,47 +2603,12 @@ class BatchPrefillTSWrapper:
                 device=geometry.device,
             )
 
-        caller_provided_out = out is not None
         if out is None:
             out = torch.empty(
                 tuple(q.shape), dtype=geometry.output_dtype, device=q.device
             )
         elif validate:
             out = _prepare_out(out, q=q, output_dtype=geometry.output_dtype)
-        if validate and caller_provided_out:
-            alias_inputs = [
-                ("q", q),
-                ("k", k),
-                ("v", v),
-                ("scale_softmax_log2", scale_softmax_log2),
-                ("output_scale", output_scale),
-            ]
-            if geometry.packed:
-                alias_inputs.extend(
-                    (("qo_indptr", runtime_qo_indptr), ("kv_indptr", runtime_kv_indptr))
-                )
-            if geometry.mask_type == "variable_window":
-                alias_inputs.extend(
-                    (
-                        ("variable_window_token_starts", runtime_window_starts),
-                        ("variable_window_token_ends", runtime_window_ends),
-                        ("variable_window_cta_starts", runtime_window_cta_starts),
-                    )
-                )
-                if (
-                    variable_window_cta_starts is None
-                    and state.variable_window_padded_starts is not None
-                ):
-                    alias_inputs.append(
-                        (
-                            "variable_window_padded_starts",
-                            state.variable_window_padded_starts,
-                        )
-                    )
-            _validate_out_does_not_overlap_inputs(
-                out,
-                *alias_inputs,
-            )
         state.compiled(
             q,
             k,
@@ -2914,8 +2878,10 @@ class BatchPrefillPagedTSWrapper:
             retained by the plan.
         validate : bool
             Run explicit storage, shape, dtype, device, scale, output, and
-            aliasing validators. Disable only when the caller guarantees the
-            complete runtime contract. Defaults to ``True``.
+            metadata-value validators. Disable only when the caller guarantees
+            these contracts. Output must not overlap any live input or
+            plan-owned buffer in either mode; storage overlap is not checked.
+            Defaults to ``True``.
 
         Returns
         -------
@@ -2954,25 +2920,12 @@ class BatchPrefillPagedTSWrapper:
                 output_scale, "output_scale", device=geometry.device
             )
 
-        caller_provided_out = out is not None
         if out is None:
             out = torch.empty(
                 tuple(q.shape), dtype=geometry.output_dtype, device=q.device
             )
         elif validate:
             out = _prepare_out(out, q=q, output_dtype=geometry.output_dtype)
-        if validate and caller_provided_out:
-            _validate_out_does_not_overlap_inputs(
-                out,
-                ("q", q),
-                ("k_cache", k_cache),
-                ("v_cache", v_cache),
-                ("qo_indptr", qo_indptr),
-                ("block_tables", block_tables),
-                ("seq_lens_kv", seq_lens_kv),
-                ("scale_softmax_log2", scale_softmax_log2),
-                ("output_scale", output_scale),
-            )
         state.compiled(
             q,
             k_cache,
