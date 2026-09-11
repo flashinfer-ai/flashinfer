@@ -2373,10 +2373,16 @@ def test_index_tensors_row_strided_views(variant, offset):
 
 
 def test_out_layout_rejected():
-    """A column-strided out= view is rejected with the allocation recipe.
+    """A column-strided or row-overlapping out= view is rejected with the
+    allocation recipe.
 
-    Previously it passed device/dtype/shape validation and reached the FFI
-    binding, which either errored bare or silently misplaced stores.
+    All three passed device/dtype/shape validation.  The column-strided view
+    reached the FFI binding, which either errored bare or silently misplaced
+    stores.  The overlapping views -- an as_strided() pitch narrower than
+    padded_seq_len, or the zero row stride of an expand()ed row -- ran to
+    completion and returned silently wrong logits, later rows overwriting
+    earlier ones (every store stays inside the view's storage, so nothing
+    faults).
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
@@ -2390,10 +2396,39 @@ def test_out_layout_rejected():
     w = torch.zeros(2, H, device=device, dtype=torch.float32)
     kv = torch.zeros(8, block_size, 1, D + 4, dtype=torch.uint8, device=device)
     q = torch.zeros(2, 1, H, D, device=device).to(torch.float8_e4m3fn)
+    padded = padded_seq_len(ctx)
 
-    base = torch.empty((2, 2 * padded_seq_len(ctx)), device=device, dtype=torch.float32)
+    base = torch.empty((2, 2 * padded), device=device, dtype=torch.float32)
     with pytest.raises(ValueError, match="innermost stride must be 1"):
         fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=base[:, ::2])
+
+    # Pitched: row 1 starts halfway through row 0's padded span.
+    pitched = base.flatten().as_strided((2, padded), (padded // 2, 1))
+    assert pitched.shape == (2, padded) and pitched.stride() == (padded // 2, 1)
+    with pytest.raises(ValueError, match="rows overlap"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=pitched)
+
+    # Zero row stride: both rows alias one row of storage.
+    expanded = torch.empty((1, padded), device=device, dtype=torch.float32).expand(
+        2, padded
+    )
+    assert expanded.stride(0) == 0
+    with pytest.raises(ValueError, match="rows overlap"):
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=expanded)
+
+    # A row slice of a wider buffer has a LARGER row stride and stays accepted:
+    # the check must not tighten the contract beyond distinct rows.
+    wide_rows = base[:, :padded]
+    assert wide_rows.stride(0) == 2 * padded
+    exact = torch.empty((2, padded), device=device, dtype=torch.float32)
+    ref = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=exact)
+    got = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, out=wide_rows)
+    assert got.data_ptr() == wide_rows.data_ptr() and torch.equal(got, ref)
+
+    # A single row has nothing to collide with, whatever its stride(0) reads.
+    fp8_paged_mqa_logits(
+        q[:1], kv, w[:1], bt[:1], cl[:1], ctx, out=base.flatten()[:padded].view(1, -1)
+    )
 
 
 def test_inputs_foreign_device_rejected_paged():

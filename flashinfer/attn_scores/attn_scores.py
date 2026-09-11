@@ -488,7 +488,11 @@ def _validate_out(
     The kernel writes UNCONDITIONALLY into the SPLIT_KV-padded trailing region,
     so ``out`` must have at least ``padded_max_seq_len`` columns (use
     :func:`padded_seq_len`) and ``rows`` rows — otherwise the store spills
-    past each row / past the buffer (silent corruption or illegal address)."""
+    past each row / past the buffer (silent corruption or illegal address).
+    Its rows must also be distinct storage: the kernel addresses row ``r`` as
+    ``r * stride(0)`` and writes ``padded_max_seq_len`` columns from there, so
+    a row stride below that (an ``as_strided`` pitch, or 0 from ``.expand()``)
+    makes later rows overwrite earlier ones -- wrong logits, never an error."""
     if out.device != device:
         raise ValueError(
             f"{fn_name}: out.device ({out.device}) must match q.device ({device})"
@@ -512,6 +516,20 @@ def _validate_out(
             f"{fn_name}: out's innermost stride must be 1 (row-contiguous); got "
             f"strides {tuple(out.stride())}. Allocate with torch.empty((rows, "
             f"padded_seq_len(max_seq_len)), ...)."
+        )
+    # Shape and dtype say nothing about aliasing: a pitched as_strided view or
+    # an .expand()ed row pass every check above with the right shape.  Only the
+    # rows the kernel writes matter -- a single row has nothing to collide with
+    # -- and a LARGER stride (a row slice of a wider buffer) is fine.
+    if rows > 1 and out.stride(0) < padded_max_seq_len:
+        raise ValueError(
+            f"{fn_name}: out's rows overlap: row stride {out.stride(0)} is "
+            f"smaller than the {padded_max_seq_len} columns the kernel writes "
+            f"per row (padded_seq_len(max_seq_len)); got strides "
+            f"{tuple(out.stride())}. Rows must be distinct storage -- allocate "
+            f"with torch.empty((rows, padded_seq_len(max_seq_len)), ...) or "
+            f"take a row slice of a wider buffer; do not build it with "
+            f"as_strided() or expand()."
         )
 
 
@@ -1710,7 +1728,11 @@ def fp8_paged_mqa_logits(
                          out-of-bounds write -- always size it with
                          padded_seq_len() (see the Example).  Must be on q's
                          device, dtype output_dtype, rows contiguous
-                         (stride(1) == 1).  Required for CUDA graph capture.
+                         (stride(1) == 1) and non-overlapping (stride(0) >=
+                         padded_seq_len(max_seq_len): a row slice of a wider
+                         buffer is fine; an as_strided() pitch or an expand()ed
+                         row is rejected, since later rows would overwrite
+                         earlier ones).  Required for CUDA graph capture.
                          Bigger is fine -- e.g. one address-stable max-batch
                          buffer shared across captures; only the first
                          batch_size*next_n rows are written.
@@ -2279,7 +2301,11 @@ def fp4_paged_mqa_logits(
                          out-of-bounds write -- always size it with
                          padded_seq_len() (see the Example).  Must be on q's
                          device, dtype output_dtype, rows contiguous
-                         (stride(1) == 1).  Required for CUDA graph capture.
+                         (stride(1) == 1) and non-overlapping (stride(0) >=
+                         padded_seq_len(max_seq_len): a row slice of a wider
+                         buffer is fine; an as_strided() pitch or an expand()ed
+                         row is rejected, since later rows would overwrite
+                         earlier ones).  Required for CUDA graph capture.
                          Bigger is fine -- e.g. one address-stable max-batch
                          buffer shared across captures; only the first
                          batch_size*next_n rows are written.
