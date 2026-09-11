@@ -947,14 +947,15 @@ def _cached_compile_fp8_kernel(
     epi_dtype,  # cutlass dtype object
     acc_dtype,  # cutlass dtype object
     output_dtype,  # cutlass dtype object
-    # num_epi_subtiles is deliberately NOT public: measured on sm_100a at
-    # num_heads=64, subtile counts 1/2/4 tie and 8 is 5-11% slower, so the API
-    # always passes 1 (TensorRT-LLM never varies it in production either). The
-    # parameter and its _sub{n} cache tag stay so a future per-shape policy --
-    # or a reinstated argument, should some geometry ever profit -- can route a
-    # value through without a cache redesign. The kernel constructor validates
-    # the divisibility rules.
+    # Epilogue policy -- deliberately NOT public.  Both values come from
+    # _fp8_epilogue_policy, an internal per-shape table measured on these
+    # kernels, and are routed through here so the in-process cache key and the
+    # on-disk tag carry them.  Every caller passes them positionally:
+    # functools.cache keys on the literal call shape, so a defaulted argument
+    # would split one kernel into two entries.  The kernel constructor
+    # validates them.
     num_epi_subtiles: int,
+    w_cache_regs: Optional[int],
     arch: str,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -1027,6 +1028,7 @@ def _cached_compile_fp8_kernel(
         epi_dtype=epi_dtype,
         acc_dtype=acc_dtype,
         output_dtype=output_dtype,
+        w_cache_regs=w_cache_regs,
         # Construction-time arch gates (is_rubin levers, TMEM columns) must
         # follow the compile target, not the DSL's ambient device-0 probe.
         arch=arch,
@@ -1051,7 +1053,7 @@ def _cached_compile_fp8_kernel(
     tag = (
         f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
         f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
-        f"_sub{num_epi_subtiles}_{arch}"
+        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "attn_scores_fp8",
@@ -1059,6 +1061,47 @@ def _cached_compile_fp8_kernel(
         _compile_fn,
         extra_key_files=_cached_fp8_source_files(),
     )
+
+
+# (num_epi_subtiles, w_cache_regs) for the FP8 kernel's epilogue, by shape.
+# None for w_cache_regs keeps the kernel's default register budget
+# (_MAX_W_CACHE_REGS = 160).  Deliberately an internal table, not a public
+# kwarg or env var: execution-strategy choices are made here from
+# measurements on these kernels (graph-replay methodology of
+# benchmarks/bench_paged_mqa_logits.py, same node per arch), and neither knob
+# changes the head accumulation order, so every entry is bit-identical to the
+# default -- the table is purely a speed decision, pinned by
+# test_fp8_epilogue_policy_is_bit_identical_and_keyed.
+#
+# Measured 2026-09, graph_ms ratio vs the default (1, None), B200 / Rubin,
+# cells (batch, seq) = (1, 4K) (16, 4K) (64, 16K), fp32 epilogue unless noted:
+#   num_heads=64, next_n=1..4 (the tuned shape): subtiles 1/2/4 tie, 8 is
+#     5-11% slower -> default.
+#   num_heads=32, next_n=6, budget 96 (16 weights/slot instead of 24):
+#     0.92 0.85 0.89 / 0.81 0.89 0.65.  Nsight Compute on the default:
+#     ~12k local loads + ~8k local stores per launch (register spills);
+#     0 at budget 96.  Budgets 64/48 (12/8 per slot) spill nothing either
+#     but pay more SMEM weight reads and are 2-4% slower than 96.
+#   num_heads=32, next_n=8, budget 96: 1.00 0.85 0.71 / 0.79 0.78 0.63.
+#   num_heads=32, next_n=4, budget 96: 1.00 1.00 1.01 / 0.90 1.00 0.95
+#     (neutral; at next_n<=3 the formula already stays within 96).
+#   num_heads=32, next_n=6, fp16 epilogue: the budget does not bind (two
+#     weights per register); two epilogue subtiles: 1.00 1.00 0.95 /
+#     1.00 0.97 0.87 -> (2, None).
+# The rule below encodes exactly that: a 96-register budget for the fp32
+# epilogue at num_heads=32, two subtiles for its fp16 epilogue at next_n=6,
+# the default everywhere else.  Unmeasured shapes get the default.
+_FP8_EPILOGUE_DEFAULT = (1, None)
+
+
+def _fp8_epilogue_policy(num_heads: int, next_n: int, epi_dtype) -> "tuple":
+    """Return ``(num_epi_subtiles, w_cache_regs)`` for the fp8 kernel; see the
+    measured table above."""
+    if num_heads == 32:
+        if epi_dtype == cutlass.Float16:
+            return (2, None) if next_n == 6 else _FP8_EPILOGUE_DEFAULT
+        return (1, 96)
+    return _FP8_EPILOGUE_DEFAULT
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1872,6 +1915,7 @@ def fp8_paged_mqa_logits(
         else q_3d
     )
     dev_index = get_device_index(q.device)
+    num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(H, next_n, cutlass_epi)
     with _on_device(dev_index):
         compiled = _cached_compile_fp8_kernel(
             block_size,
@@ -1882,7 +1926,8 @@ def fp8_paged_mqa_logits(
             cutlass_epi,
             cutlass_acc,
             cutlass_out,
-            1,  # num_epi_subtiles -- fixed; see the compile-layer parameter note
+            num_epi_subtiles,
+            w_cache_regs,
             _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
         )
         compiled(
@@ -2626,6 +2671,11 @@ def precompile_paged_mqa_logits(
             fp8_outs = output_dtypes or (torch.float32,)
             for block_size in (32, 64, 128):
                 for nn in (1, 2, 3, 4):
+                    # Same policy routing as the launch path, so the warmed
+                    # artifact is the one the API will ask for.
+                    num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(
+                        num_heads, nn, _to_cutlass(torch.float32)
+                    )
                     for out_dtype in fp8_outs:
                         _cached_compile_fp8_kernel(
                             block_size,
@@ -2636,7 +2686,8 @@ def precompile_paged_mqa_logits(
                             _to_cutlass(torch.float32),
                             _to_cutlass(torch.float32),
                             _to_cutlass(out_dtype),
-                            1,
+                            num_epi_subtiles,
+                            w_cache_regs,
                             arch,
                         )
 

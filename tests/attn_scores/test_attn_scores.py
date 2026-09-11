@@ -1497,6 +1497,64 @@ def test_fp8_num_heads_unroll_granularity_rejected(next_n, num_heads):
     assert fp8_paged_mqa_logits.is_compute_capability_supported(100)
 
 
+@pytest.mark.parametrize("epi_dtype", [torch.float32, torch.float16])
+def test_fp8_epilogue_policy_is_bit_identical_and_keyed(epi_dtype, monkeypatch):
+    """The internal per-shape epilogue policy only changes speed.
+
+    At num_heads=32, next_n=6 the default weight-cache budget (160 registers,
+    24 weights per slot) spills -- Nsight Compute: ~12k local loads and ~8k
+    local stores per launch -- and the policy's 96-register budget (16 per
+    slot) removes every spill, 8-15% faster on B200 and 11-35% on Rubin; the
+    fp16 epilogue at this shape gains 5-13% from two epilogue subtiles.
+    Neither knob changes the head accumulation order, so the policy's kernel
+    and the default kernel must agree bit for bit, and they must be distinct
+    compile-cache entries so a policy change can never serve a stale artifact.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+    from flashinfer.attn_scores import attn_scores as A
+
+    H, next_n, ctx, block_size = 32, 6, 2048, 64
+    policy = A._fp8_epilogue_policy(H, next_n, A._to_cutlass(epi_dtype))
+    assert policy != A._FP8_EPILOGUE_DEFAULT, "test premise: shape has a policy"
+    q, kv, w, cl, bt = _make_fp8_case(4, next_n, ctx, block_size, "cuda", num_heads=H)
+    kw = dict(epi_dtype=epi_dtype, output_dtype=torch.float32)
+
+    out_policy = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, **kw).clone()
+    entries = A._cached_compile_fp8_kernel.cache_info().currsize
+    monkeypatch.setattr(A, "_fp8_epilogue_policy", lambda *a: A._FP8_EPILOGUE_DEFAULT)
+    out_default = fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx, **kw)
+    assert A._cached_compile_fp8_kernel.cache_info().currsize == entries + 1, (
+        "the default and the policy kernel must be distinct cache entries"
+    )
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(cl, next_n, ctx, "cuda")
+    assert torch.isfinite(out_policy[valid]).all()
+    assert torch.equal(out_policy, out_default), "policy changed the numerics"
+
+
+def test_fp8_kernel_w_cache_regs_knob():
+    """The kernel's weight-cache register budget defaults to the module
+    constant, takes any positive override, and rejects the rest (host-only)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer.attn_scores.kernels import FP8MQALogitsKernel
+    from flashinfer.attn_scores.kernels import fp8_paged_mqa_logits as K
+
+    def make(**kw):
+        return FP8MQALogitsKernel(
+            num_heads=32, next_n=6, phys_block_kv=64, arch="sm_100a", **kw
+        )
+
+    assert make().w_cache_regs == K._MAX_W_CACHE_REGS == 160
+    assert make(w_cache_regs=96).w_cache_regs == 96
+    with pytest.raises(ValueError, match="w_cache_regs"):
+        make(w_cache_regs=0)
+
+
 def test_fp8_out_and_schedule_meta_paths():
     """out= (pre-allocated buffer) and schedule_meta= (pre-computed) must match the
     default path bit-for-bit and the returned tensor must alias out."""
@@ -3335,7 +3393,7 @@ def test_precompile_targets_the_requested_device():
     precompile_paged_mqa_logits(device=torch.device("cuda", target), variants=("fp8",))
 
     hits = _cached_compile_fp8_kernel.cache_info().hits
-    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, arch)
+    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, arch)
     assert _cached_compile_fp8_kernel.cache_info().hits == hits + 1, (
         f"precompile(device=cuda:{target}) produced no entry for "
         f"(num_sms={sms}, arch={arch})"
@@ -3347,7 +3405,9 @@ def test_precompile_targets_the_requested_device():
     # miss is what we are asserting, not the compile result.
     with contextlib.suppress(Exception):
         other_arch = "sm_90a" if arch != "sm_90a" else "sm_80"
-        _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, other_arch)
+        _cached_compile_fp8_kernel(
+            64, 64, 128, 1, sms, f32, f32, f32, 1, None, other_arch
+        )
     assert _cached_compile_fp8_kernel.cache_info().misses > misses, (
         "a different arch reused the cache entry -- arch is not in the key"
     )

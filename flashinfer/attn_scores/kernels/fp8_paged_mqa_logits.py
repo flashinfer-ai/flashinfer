@@ -96,10 +96,16 @@ _RND_RN = "rn"
 # reads past it. Mirrors _EPI_SUBTILE_UNROLL in attn_scores.py, which applies
 # the same granularity to num_heads // num_epi_subtiles.
 _EPI_UNROLL = 4
-# Max registers per thread for the epilogue weight cache. 160 is the largest
-# footprint the per-slot policy below already requests at the shape it was
-# tuned for (num_heads=64, next_n=4), so bounding here leaves every
-# num_heads=64 configuration unchanged.
+# Default register budget per math thread for the epilogue weight cache. 160
+# is the largest footprint the per-slot policy below requests at the shape
+# the kernel was tuned for (num_heads=64, next_n=4), so it leaves every
+# num_heads=64 configuration unchanged. The constructor's w_cache_regs
+# overrides it so the API's internal per-shape policy can lower it where the
+# default spills: at num_heads=32, next_n=6 the default caches 24 weights per
+# slot (144 registers) and Nsight Compute shows ~12k local loads / ~8k local
+# stores per launch; 96 registers (16 per slot) removes every spill and runs
+# 8-15% (B200) / 11-35% (Rubin) faster, next_n=8 up to 29% / 37% faster.
+# See _fp8_epilogue_policy in attn_scores.py for the measured table.
 _MAX_W_CACHE_REGS = 160
 
 
@@ -266,6 +272,7 @@ class FP8MQALogitsKernel:
         use_flat_logits_view=None,
         use_two_level_task_loop=None,
         use_paired_pipeline_polls=None,
+        w_cache_regs=None,
         *,
         arch: str,
     ):
@@ -273,6 +280,17 @@ class FP8MQALogitsKernel:
         # explicitly and required: __init__ runs before compilation installs
         # the target, so a DSL arch query here would silently read the ambient
         # (device-0 / CUTE_DSL_ARCH) arch instead -- see _is_rubin_arch.
+        #
+        # w_cache_regs: register budget for the epilogue weight cache (see
+        # _MAX_W_CACHE_REGS); None keeps the default. Any positive value works:
+        # the math WGs floor it to the FMA unroll per slot and never go below
+        # one unroll, so it only decides how many weights per slot live in
+        # registers versus the SMEM path.
+        if w_cache_regs is not None and w_cache_regs <= 0:
+            raise ValueError(
+                f"w_cache_regs must be a positive register count; got {w_cache_regs}"
+            )
+        self.w_cache_regs = _MAX_W_CACHE_REGS if w_cache_regs is None else w_cache_regs
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
@@ -1568,10 +1586,10 @@ class FP8MQALogitsKernel:
                 if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                     # FP16 weights pack two per register.
-                    MAX_W_CACHE_ELEMS = 2 * _MAX_W_CACHE_REGS
+                    MAX_W_CACHE_ELEMS = 2 * self.w_cache_regs
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                    MAX_W_CACHE_ELEMS = _MAX_W_CACHE_REGS
+                    MAX_W_CACHE_ELEMS = self.w_cache_regs
                 # MAX_NUM_W_IN_REG caps the per-slot count, but the register
                 # footprint is the product NUM_W_IN_REG * next_n. Whenever
                 # num_heads <= MAX_NUM_W_IN_REG the per-slot cap never binds,
@@ -2002,10 +2020,10 @@ class FP8MQALogitsKernel:
                 if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                     # FP16 weights pack two per register.
-                    MAX_W_CACHE_ELEMS = 2 * _MAX_W_CACHE_REGS
+                    MAX_W_CACHE_ELEMS = 2 * self.w_cache_regs
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                    MAX_W_CACHE_ELEMS = _MAX_W_CACHE_REGS
+                    MAX_W_CACHE_ELEMS = self.w_cache_regs
                 # MAX_NUM_W_IN_REG caps the per-slot count, but the register
                 # footprint is the product NUM_W_IN_REG * next_n. Whenever
                 # num_heads <= MAX_NUM_W_IN_REG the per-slot cap never binds,
