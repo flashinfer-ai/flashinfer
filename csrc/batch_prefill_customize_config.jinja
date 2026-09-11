@@ -34,6 +34,7 @@ static_assert(std::is_same_v<DTypeKV, __nv_fp4x2_e2m1>,
 constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
 constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
 constexpr bool USE_FP16_QK_REDUCTION = {{ use_fp16_qk_reduction }};
+constexpr bool USE_INLINE_SF = {{ use_inline_sf }};
 constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
 constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};
 constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};

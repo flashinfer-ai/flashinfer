@@ -22,8 +22,8 @@ using tvm::ffi::Optional;
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                               cudaStream_t stream);
 }  // namespace flashinfer
@@ -44,11 +44,20 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
-  TVM_FFI_ICHECK_EQ(q.size(1), k.size(2));
+  // For inline FP8 KV scale, the KV tensor's last dim is slot_size (head_dim + 16);
+  // the actual head dim is taken from the Q tensor.
+  TVM_FFI_ICHECK_EQ(q.size(1), USE_INLINE_SF ? k.size(2) - 16 : k.size(2));
   TVM_FFI_ICHECK_EQ(v.dtype(), k.dtype());
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim_qk = q.size(1);
-  unsigned int head_dim_vo = v.size(2);
+  // The KV tensor's last dim: head_dim_vo plus the inline float32 scale (4B) padded to
+  // 16B (= head_dim_vo + 16) for inline scale, or just head_dim_vo otherwise. The shared
+  // K/V stride is based on this padded last dim; v is enforced contiguous by CHECK_INPUT(v),
+  // so the shape-derived stride matches v.stride().
+  unsigned int head_dim_vo_pad = v.size(2);
+  // Derive the actual head dim from the V tensor (not Q) so the QK/VO equality check
+  // below stays a real validation.
+  unsigned int head_dim_vo = USE_INLINE_SF ? head_dim_vo_pad - 16 : head_dim_vo_pad;
   unsigned int kv_len, num_kv_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   if (kv_layout == QKVLayout::kNHD) {
@@ -86,8 +95,9 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
         params.q_stride_n = num_qo_heads * head_dim_qk;
         params.q_stride_h = head_dim_qk;
         params.kv_stride_n =
-            (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo : head_dim_vo;
-        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim_vo : kv_len * head_dim_vo;
+            (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo_pad : head_dim_vo_pad;
+        params.kv_stride_h =
+            (kv_layout == QKVLayout::kNHD) ? head_dim_vo_pad : kv_len * head_dim_vo_pad;
         params.window_left = window_left;
         params.kv_chunk_size = 0;
 
@@ -95,7 +105,7 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
 
         cudaError_t status =
             flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
-                                                          AttentionVariant>(
+                                                          USE_INLINE_SF, AttentionVariant>(
                 params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "SingleDecodeWithKVCache kernel launch failed, error: "

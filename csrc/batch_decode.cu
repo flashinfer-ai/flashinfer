@@ -23,8 +23,8 @@
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                   float* tmp_s, bool enable_pdl,
                                                   cudaStream_t stream);
@@ -62,7 +62,7 @@ Array<int64_t> BatchDecodeWithPagedKVCachePlan(
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
           auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-              GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>;
+              GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, USE_INLINE_SF, AttentionVariant, Params>;
           cudaError_t status = DecodePlan<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
               static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
               static_cast<void*>(int_workspace_buffer.data_ptr()),
@@ -105,7 +105,7 @@ Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSize(
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
           auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-              GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>;
+              GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, USE_INLINE_SF, AttentionVariant, Params>;
           cudaError_t status =
               DecodePlanWorkspaceSize<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
                   float_workspace_size_in_bytes, int_workspace_size_in_bytes,
@@ -153,7 +153,10 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
     num_kv_heads = paged_k_cache.size(2);
   }
   uint32_t head_dim_qk = q.size(2);
-  uint32_t head_dim_vo = paged_v_cache.size(3);
+  // For inline FP8 KV scale, the KV cache's last dim is slot_size (head_dim + 16); the
+  // actual head dim is the slot size minus 16. Derive it from the V cache (not Q) so the
+  // QK/VO equality check below stays a real validation.
+  uint32_t head_dim_vo = USE_INLINE_SF ? paged_v_cache.size(3) - 16 : paged_v_cache.size(3);
 
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
@@ -239,9 +242,8 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
-                                                              AttentionVariant>(params, tmp_v,
-                                                                                tmp_s, enable_pdl,
-                                                                                /*stream=*/stream);
+                                                              USE_INLINE_SF, AttentionVariant>(
+                params, tmp_v, tmp_s, enable_pdl, /*stream=*/stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "BatchDecodeWithPagedKVCache failed with error " << cudaGetErrorString(status);
         return true;

@@ -60,12 +60,13 @@ namespace {
  * \param st The self-attention state to be updated
  */
 template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
-          typename AttentionVariant, typename Params, typename T>
+          bool USE_INLINE_SF, typename AttentionVariant, typename Params, typename T>
 __device__ __forceinline__ void compute_qk(
     const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* smem,
     const vec_t<float, vec_size>& q_vec, const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
     uint32_t iter_base, uint32_t iter_bound, uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
-    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz) {
+    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz,
+    const float* k_scale = nullptr) {
   float m_prev = st.m;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
@@ -86,6 +87,12 @@ __device__ __forceinline__ void compute_qk(
 #pragma unroll
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
       s[j] += math::shfl_xor_sync(s[j], offset);
+    }
+    // Inline per-(token, head) FP8 K scale: dequantize the QK dot product before the
+    // softmax. The per-row scale is staged in shared memory; k_scale points at this
+    // thread's (tz) slice of the buffer, so row j is k_scale[j].
+    if constexpr (USE_INLINE_SF) {
+      s[j] *= k_scale[j];
     }
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
     s[j] = variant.LogitsTransform(params, s[j], batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos,
@@ -130,17 +137,22 @@ __device__ __forceinline__ void compute_qk(
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
  * \param st The flashattention state to be updated
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
+template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, bool USE_INLINE_SF, typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
-                                                   state_t<vec_size>& st, uint32_t tx) {
+                                                   state_t<vec_size>& st, uint32_t tx,
+                                                   const float* v_scale = nullptr) {
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
     v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    // Inline per-(token, head) FP8 V scale: dequantize V after the softmax. The per-row
+    // scale is staged in shared memory; v_scale points at this thread's (tz) slice of the
+    // buffer, so row j is v_scale[j].
+    const float s_scaled = USE_INLINE_SF ? (s[j] * v_scale[j]) : s[j];
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      st.o[i] = st.o[i] + s[j] * v_vec[i];
+      st.o[i] = st.o[i] + s_scaled * v_vec[i];
     }
   }
 }
@@ -214,8 +226,8 @@ __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
 template <PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
-          typename Params>
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -253,7 +265,19 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   constexpr uint32_t smem_kv_region =
       std::max(2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim * sizeof(DTypeKV),
                bdz * bdy * head_dim * sizeof(float));
-  float* smem_md = (float*)(smem + smem_kv_region);
+  // FP8 inline per-(token, head) float32 scale staging (one float per KV row for K and V).
+  // Loaded with cp.async in the same cp.async group as the K/V data, so a tile's scale
+  // lands in smem with the tile. One stage per pipeline stage: iteration `iter` stages
+  // the scale for tile `iter + num_stages_smem` into stage `iter % num_stages_smem`,
+  // consumed `num_stages_smem` iterations later, so the stages must not alias.
+  constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
+  constexpr uint32_t scale_smem_bytes =
+      USE_INLINE_SF ? (2 * num_stages_smem * CTA_TILE_KV * sizeof(float)) : 0;
+  float* k_scale_smem = (float*)(smem + smem_kv_region);
+  float* v_scale_smem =
+      (float*)(smem + smem_kv_region +
+               (USE_INLINE_SF ? (num_stages_smem * CTA_TILE_KV * sizeof(float)) : 0));
+  float* smem_md = (float*)(smem + smem_kv_region + scale_smem_bytes);
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -294,6 +318,27 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
+    // FP8 inline K scale for this tile: cp.async it into stage `iter` of the scale smem in
+    // the same cp.async group as the K data above, so it lands in smem with the tile. The
+    // scale is per (kv_row, kv_head), independent of (tx, ty), so each (tz, j) is written
+    // once, by the thread with (ty*bdx + tx) == j. OOB rows are written 1.0f (not 0, to
+    // avoid 0*NaN).
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos = producer_kv_idx_base + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = iter * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_end) {
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(k_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(k + pos * kv_stride_n + kv_head_idx * kv_stride_h +
+                                                head_dim),
+              true);
+        } else {
+          k_scale_smem[sf_idx] = 1.0f;
+        }
+      }
+    }
     cp_async::commit_group();
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
@@ -302,6 +347,23 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
           v + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
+    }
+    // FP8 inline V scale for this tile: same as the K scale above, into stage `iter`.
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos = producer_kv_idx_base + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = iter * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_end) {
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(v_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(v + pos * kv_stride_n + kv_head_idx * kv_stride_h +
+                                                head_dim),
+              true);
+        } else {
+          v_scale_smem[sf_idx] = 1.0f;
+        }
+      }
     }
     cp_async::commit_group();
     producer_kv_idx_base += bdy * bdz * tile_size_per_bdx;
@@ -314,14 +376,17 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 
 #pragma unroll 2
   for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
-    // compute qk
+    // compute qk. The K scale for this tile was cp.async'd in the same cp.async group as
+    // the K data, so it is ready here.
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx, USE_INLINE_SF>(
         params, variant, /*batch_idx=*/0,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, qo_head_idx,
-        kv_head_idx, s, st_local, tx, ty, tz);
+        kv_head_idx, s, st_local, tx, ty, tz,
+        USE_INLINE_SF ? (k_scale_smem + stage_idx * CTA_TILE_KV + tz * bdy * tile_size_per_bdx)
+                      : nullptr);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -332,14 +397,33 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
+    // FP8 inline K scale for the tile loaded above: same as the prologue, into stage `stage_idx`.
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos = producer_kv_idx_base + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = stage_idx * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_end) {
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(k_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(k + pos * kv_stride_n + kv_head_idx * kv_stride_h +
+                                                head_dim),
+              true);
+        } else {
+          k_scale_smem[sf_idx] = 1.0f;
+        }
+      }
+    }
     cp_async::commit_group();
 
     // update m/d/o state
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx, USE_INLINE_SF>(
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx,
-        st_local, tx);
+        st_local, tx,
+        USE_INLINE_SF ? (v_scale_smem + stage_idx * CTA_TILE_KV + tz * bdy * tile_size_per_bdx)
+                      : nullptr);
     block.sync();
 
     // load v
@@ -350,6 +434,23 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
           v + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
               kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
+    }
+    // FP8 inline V scale for the tile loaded above: same as the K scale, into stage `stage_idx`.
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos = producer_kv_idx_base + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = stage_idx * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_end) {
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(v_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(v + pos * kv_stride_n + kv_head_idx * kv_stride_h +
+                                                head_dim),
+              true);
+        } else {
+          v_scale_smem[sf_idx] = 1.0f;
+        }
+      }
     }
     cp_async::commit_group();
 
@@ -399,8 +500,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
-          typename Params>
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
                                                              const uint32_t bx = blockIdx.x,
                                                              const uint32_t by = blockIdx.y,
@@ -446,7 +547,22 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   constexpr uint32_t smem_kv_region =
       std::max(2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * sizeof(DTypeKV),
                bdz * bdy * head_dim * sizeof(float));
+  // FP8 inline per-(token, head) float32 scale staging (one float per KV row for K and V).
+  // Loaded with cp.async in the same cp.async group as the K/V data, so a tile's scale
+  // lands in smem with the tile. One stage per pipeline stage (staged for tile
+  // `iter + num_stages_smem` into stage `iter % num_stages_smem`, consumed
+  // `num_stages_smem` iterations later, so the stages must not alias). Placed after
+  // kv_offset_smem (both live in the main loop); smem_md time-shares kv_offset_smem's
+  // start (used only at the end, in sync_state), so it does not conflict.
+  constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
+  constexpr uint32_t kv_offset_bytes = tile_size_per_bdx * bdx * bdy * bdz * sizeof(size_t);
+  constexpr uint32_t scale_smem_bytes =
+      USE_INLINE_SF ? (2 * num_stages_smem * CTA_TILE_KV * sizeof(float)) : 0;
   size_t* kv_offset_smem = (size_t*)(smem + smem_kv_region);
+  float* k_scale_smem = (float*)(smem + smem_kv_region + kv_offset_bytes);
+  float* v_scale_smem =
+      (float*)(smem + smem_kv_region + kv_offset_bytes +
+               (USE_INLINE_SF ? (num_stages_smem * CTA_TILE_KV * sizeof(float)) : 0));
   float* smem_md = (float*)(smem + smem_kv_region);
 
   vec_t<float, vec_size> q_vec;
@@ -514,6 +630,30 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           paged_kv.k_data + kv_offset[j],
           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
+    // FP8 inline K scale for this tile: cp.async it into stage `stage_idx` of the scale smem in
+    // the same cp.async group as the K data above, so it lands together with the tile. Each
+    // (tz, j) is written once, by the thread with (ty*bdx + tx) == j; the scale sits at byte
+    // offset `head_dim` within the slot. OOB rows are written 1.0f (not 0, to avoid 0*NaN).
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos = iter * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = stage_idx * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_size) {
+          // Derive the scale gmem offset from the page-resolved K offset cached in
+          // kv_offset_smem (same token) plus head_dim, instead of a fresh __ldg of the page
+          // index (which would serialize the loop on sm<80, no cp.async). The index matches
+          // the K-data load above (ty*tile + j == tid_2d).
+          const size_t scale_offset =
+              kv_offset_smem[(iter * bdz + tz) * bdy * tile_size_per_bdx + tid_2d] + head_dim;
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(k_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(paged_kv.k_data + scale_offset), true);
+        } else {
+          k_scale_smem[sf_idx] = 1.0f;
+        }
+      }
+    }
     cp_async::commit_group();
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -522,6 +662,25 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
           ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+    }
+    // FP8 inline V scale for this tile: same as the K scale above, into stage `stage_idx`.
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos = iter * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = stage_idx * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_size) {
+          // V scale offset: same page-resolved offset as the K scale (V shares the token/head
+          // layout), but from the V data base (v_data).
+          const size_t scale_offset =
+              kv_offset_smem[(iter * bdz + tz) * bdy * tile_size_per_bdx + tid_2d] + head_dim;
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(v_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(paged_kv.v_data + scale_offset), true);
+        } else {
+          v_scale_smem[sf_idx] = 1.0f;
+        }
+      }
     }
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
@@ -544,16 +703,19 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
             paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
       }
     }
-    // compute qk
+    // compute qk. The K scale for this tile was cp.async'd in the same cp.async group as
+    // the K data, so it is ready here.
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<POS_ENCODING_MODE, vec_size, bdx, bdy * tile_size_per_bdx, USE_INLINE_SF>(
         params, variant, batch_idx,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
             chunk_start + iter * tile_size_per_bdx * bdy * bdz,
         iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
-        tz);
+        tz,
+        USE_INLINE_SF ? (k_scale_smem + stage_idx * CTA_TILE_KV + tz * bdy * tile_size_per_bdx)
+                      : nullptr);
     block.sync();
 
 #pragma unroll
@@ -573,13 +735,37 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
           paged_kv.k_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
+    // FP8 inline K scale for the tile loaded above: same as the prologue, into stage `stage_idx`.
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos =
+            (iter + num_stages_smem) * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = stage_idx * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_size) {
+          // Same as the prologue: page-resolved K offset from kv_offset_smem plus head_dim.
+          const size_t scale_offset =
+              kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy *
+                              tile_size_per_bdx) +
+                             tid_2d] +
+              head_dim;
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(k_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(paged_kv.k_data + scale_offset), true);
+        } else {
+          k_scale_smem[sf_idx] = 1.0f;
+        }
+      }
+    }
     cp_async::commit_group();
 
     // update m/d/o states
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
-        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
+    update_local_state<vec_size, bdx, bdy * tile_size_per_bdx, USE_INLINE_SF>(
+        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx,
+        USE_INLINE_SF ? (v_scale_smem + stage_idx * CTA_TILE_KV + tz * bdy * tile_size_per_bdx)
+                      : nullptr);
     block.sync();
 
     // load v tiles
@@ -590,6 +776,29 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
               tx * vec_size,
           paged_kv.v_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+    }
+    // FP8 inline V scale for the tile loaded above: same as the K scale, into stage `stage_idx`.
+    if constexpr (USE_INLINE_SF) {
+      const uint32_t tid_2d = ty * bdx + tx;
+      if (tid_2d < bdy * tile_size_per_bdx) {
+        const uint32_t pos =
+            (iter + num_stages_smem) * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        const uint32_t sf_idx = stage_idx * CTA_TILE_KV + tz * (bdy * tile_size_per_bdx) + tid_2d;
+        if (pos < chunk_size) {
+          // V scale offset: same page-resolved offset as the K scale (V shares the token/head
+          // layout), but from the V data base (v_data).
+          const size_t scale_offset =
+              kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy *
+                              tile_size_per_bdx) +
+                             tid_2d] +
+              head_dim;
+          cp_async::pred_load_32b<SharedMemFillMode::kNoFill>(
+              reinterpret_cast<uint32_t*>(v_scale_smem + sf_idx),
+              reinterpret_cast<const uint32_t*>(paged_kv.v_data + scale_offset), true);
+        } else {
+          v_scale_smem[sf_idx] = 1.0f;
+        }
+      }
     }
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
@@ -619,12 +828,12 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 }
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
-          typename Params>
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
   BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
-                                    bdx, bdy, bdz, AttentionVariant>(params, smem);
+                                    bdx, bdy, bdz, USE_INLINE_SF, AttentionVariant>(params, smem);
 }
 
 /*!
@@ -666,8 +875,8 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                               cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
@@ -691,13 +900,18 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
         GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : (HEAD_DIM >= 512 ? 4U : 8U)) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
       // K+V buffer must also hold sync_state's float st.o (see kernel comment); take the max.
+      // The FP8 inline-scale buffer (2 * NUM_STAGES_SMEM * CTA_TILE_KV floats, one stage per
+      // pipeline stage) sits between the K+V region and smem_md (see kernel).
+      constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
+      constexpr uint32_t scale_smem_bytes =
+          USE_INLINE_SF ? (2U * NUM_STAGES_SMEM * CTA_TILE_KV * sizeof(float)) : 0U;
       const uint32_t smem_size = std::max(2U * NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz *
                                               HEAD_DIM * sizeof(DTypeKV),
                                           bdz * bdy * HEAD_DIM * sizeof(float)) +
-                                 2U * bdy * bdz * sizeof(float);
-      auto kernel =
-          SingleDecodeWithKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                        vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+                                 scale_smem_bytes + 2U * bdy * bdz * sizeof(float);
+      auto kernel = SingleDecodeWithKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
+                                                  tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+                                                  USE_INLINE_SF, AttentionVariant, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -751,8 +965,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   return cudaSuccess;
 }
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                   float* tmp_s, bool enable_pdl,
                                                   cudaStream_t stream) {
@@ -775,14 +989,20 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
       // K+V buffer must also hold sync_state's float st.o (see kernel comment); take the max.
+      // The FP8 inline-scale buffer (2 * NUM_STAGES_SMEM * CTA_TILE_KV floats, one stage per
+      // pipeline stage) sits after kv_offset_smem (see kernel).
+      constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
+      constexpr uint32_t scale_smem_bytes =
+          USE_INLINE_SF ? (2U * NUM_STAGES_SMEM * CTA_TILE_KV * sizeof(float)) : 0U;
       const uint32_t smem_size =
           std::max(2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV),
                    bdz * bdy * HEAD_DIM * sizeof(float)) +
           std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
-                   2 * bdy * bdz * sizeof(float));
-      auto kernel =
-          BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                            vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+                   2 * bdy * bdz * sizeof(float)) +
+          scale_smem_bytes;
+      auto kernel = BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
+                                                      tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+                                                      USE_INLINE_SF, AttentionVariant, Params>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       dim3 nblks(padded_batch_size, num_kv_heads);
