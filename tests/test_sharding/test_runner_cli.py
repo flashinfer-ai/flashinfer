@@ -1457,6 +1457,42 @@ def test_worker_port():
         assert f"master_port={port}" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("master_port", "extra", "expected_returncode"),
+    [
+        ("65534", (), 0),
+        ("65535", (), 4),
+        ("65535", ("--dist_init_method=tcp://localhost:41000",), 0),
+    ],
+)
+def test_comm_conftest_validates_sibling_master_port(
+    master_port: str, extra: tuple[str, ...], expected_returncode: int
+) -> None:
+    environment = os.environ.copy()
+    environment["MASTER_PORT"] = master_port
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "tests/comm/test_mixed_comm.py",
+            *extra,
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == expected_returncode
+    if expected_returncode:
+        assert "MASTER_PORT must be between" in result.stdout + result.stderr
+
+
 def test_long_running_dispatches_first_and_solo_runs_after_non_solo_finalized(
     tmp_path: Path,
 ) -> None:
