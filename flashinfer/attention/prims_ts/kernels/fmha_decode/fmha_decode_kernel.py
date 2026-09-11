@@ -2692,12 +2692,14 @@ def fmha_decode_launch(
             skipped_tokens = Int32(
                 _compute_static_num_skipped_kv_tiles(cfg, seq_len_kv) * cfg.tile_size_kv
             )
-            skipped_elems = skipped_tokens * d
+            skipped_elems = skipped_tokens * d * h_k
             k_tma_iter = k_iter + skipped_elems
             v_tma_iter = v_iter + skipped_elems
             kv_s_for_tma = Int32(effective_seq_len_kv)
+        # Contiguous K/V are compact BSHD, matching the public PrimTS tensor
+        # contract and the Q layout above.
         kv_layout = cute.make_layout(
-            (d, kv_s_for_tma, h_k, b), stride=(1, d, d * s_k, kv_b_stride)
+            (d, kv_s_for_tma, h_k, b), stride=(1, d * h_k, d, kv_b_stride)
         )
         k_tma = cute.make_tensor(k_tma_iter, kv_layout)
         v_tma = cute.make_tensor(v_tma_iter, kv_layout)

@@ -84,6 +84,9 @@ class _BlockSparseCompileKey:
     sparse_format: Literal["bsr", "bitmask"] = "bsr"
     use_proxy_routes: bool = False
     page_size: int | None = None
+    # A dense key keeps the Q-tile and KV-route selection but drops every
+    # routing field; the sparse fields above are then structurally inert.
+    use_block_sparse: bool = True
 
 
 @dataclass(frozen=True)
@@ -251,16 +254,61 @@ def _select_block_sparse_scheduler(
     return q_tile_size, mode == "persistent"
 
 
+def _validate_dense_contiguous_kv_extent(
+    *,
+    seq_len_kv: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Reject a contiguous K/V batch stride the launch ABI cannot express."""
+
+    if seq_len_kv * num_kv_heads * head_dim > _SIGNED_INT32_MAX:
+        raise OverflowError(
+            "dense contiguous K/V batch stride must fit in signed int32"
+        )
+
+
+def _dense_contiguous_profile_error(
+    *,
+    q_tile_size: int,
+    kv_route_size: int,
+    dtype_key: str,
+) -> ValueError:
+    """Describe an unsupported dense profile in wrapper terms.
+
+    The decode configuration rejects unqualified grouped-Keeps recipes in
+    kernel vocabulary. Dense contiguous callers choose a profile indirectly
+    through the block sizes and dtypes, so restate the supported set.
+    """
+
+    return ValueError(
+        "dense contiguous decode supports Q64/KV256 in float16 or bfloat16 "
+        "and Q128/KV128 in float16; got "
+        f"Q{q_tile_size}/KV{kv_route_size} in {dtype_key}"
+    )
+
+
+def _decode_mode_name(use_block_sparse: bool) -> str:
+    """Name the planned mode the way the wrapper's messages do."""
+
+    return "block-sparse" if use_block_sparse else "dense contiguous decode"
+
+
 def _validate_matching_dtypes(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     output_dtype: torch.dtype,
+    *,
+    use_block_sparse: bool = True,
 ) -> str:
+    """Validate the 16-bit dtype rule of a plan."""
+
+    mode = _decode_mode_name(use_block_sparse)
     if not (q_dtype == kv_dtype == output_dtype):
-        raise ValueError("block-sparse requires matching Q, K/V, and output dtypes")
+        raise ValueError(f"{mode} requires matching Q, K/V, and output dtypes")
     if q_dtype not in _SUPPORTED_DTYPES:
         raise NotImplementedError(
-            "block-sparse supports only torch.float16 and torch.bfloat16"
+            f"{mode} supports only torch.float16 and torch.bfloat16"
         )
     return _dtype_key(q_dtype)
 
@@ -303,8 +351,14 @@ def _validate_block_sparse_static_profile(
     output_dtype: torch.dtype | None,
     max_blocks_per_row: object = _CAPACITY_UNSET,
     page_size: int | None = None,
+    use_block_sparse: bool = True,
 ) -> _BlockSparseStaticProfile:
-    """Validate static policy before any device work or BSR inspection."""
+    """Validate static policy before any device work or BSR inspection.
+
+    ``use_block_sparse`` only names the mode in error messages.
+    """
+
+    mode = _decode_mode_name(use_block_sparse)
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
@@ -346,17 +400,19 @@ def _validate_block_sparse_static_profile(
             kv_block_size=kv_block_size,
         )
     if kv_block_size < 64 and q_tile_size >= 64:
-        raise ValueError("fine KV blocks require a SwapsMmaAb Q tile")
+        raise ValueError(f"{mode} fine KV blocks require a SwapsMmaAb Q tile")
     _validate_mask(mask_type)
     if head_dim != 128:
-        raise ValueError("block-sparse requires head_dim=128")
+        raise ValueError(f"{mode} requires head_dim=128")
     if mask_type == "causal" and seq_len_q > seq_len_kv:
-        raise ValueError("causal block-sparse requires seq_len_q <= seq_len_kv")
+        raise ValueError(f"causal {mode} requires seq_len_q <= seq_len_kv")
     if kv_dtype is None:
         kv_dtype = q_dtype
     if output_dtype is None:
         output_dtype = q_dtype
-    dtype_key = _validate_matching_dtypes(q_dtype, kv_dtype, output_dtype)
+    dtype_key = _validate_matching_dtypes(
+        q_dtype, kv_dtype, output_dtype, use_block_sparse=use_block_sparse
+    )
     kv_route_size = _select_block_sparse_kv_route_size(
         q_tile_size=q_tile_size,
         kv_block_size=kv_block_size,
@@ -411,16 +467,21 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "tile_size_q": q_tile_size,
         "tile_size_kv": key.kv_route_size,
         "groups_tokens_heads_q": True,
-        "use_block_sparse": True,
-        "q_block_size": key.q_block_size,
-        "kv_block_size": key.kv_block_size,
-        "use_kv_valid_bits": key.use_kv_valid_bits,
-        "use_parallel_sparse_kv_loads": key.use_parallel_sparse_kv_loads,
+        "use_block_sparse": key.use_block_sparse,
     }
+    if key.use_block_sparse:
+        config_args.update(
+            {
+                "q_block_size": key.q_block_size,
+                "kv_block_size": key.kv_block_size,
+                "use_kv_valid_bits": key.use_kv_valid_bits,
+                "use_parallel_sparse_kv_loads": key.use_parallel_sparse_kv_loads,
+            }
+        )
+        if key.use_proxy_routes:
+            config_args["use_block_sparse_proxy_routes"] = True
     if key.use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
-    if key.use_proxy_routes:
-        config_args["use_block_sparse_proxy_routes"] = True
     layout_args: dict[str, object]
     if key.page_size is None:
         layout_args = {"qkv_layout": "contiguousKv"}
@@ -466,6 +527,7 @@ def _resolve_block_sparse_launch_spec(
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     page_size: int | None = None,
+    use_block_sparse: bool = True,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -473,22 +535,36 @@ def _resolve_block_sparse_launch_spec(
     index values and physical-tail morphology never specialize this cache
     entry. Proxy and exact routes share one scheduler selection. An
     unsupported persistent profile falls back to its valid static
-    counterpart.
+    counterpart. Dense contiguous mode keeps the sparse tile selection but
+    runs the static grid, because it owns no prepared routes to amortize.
     """
 
-    q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
-        device_index=device_index,
-        batch_size=batch_size,
-        seq_len_q=seq_len_q,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        q_block_size=q_block_size,
-        kv_block_size=kv_block_size,
-        kv_route_size=kv_route_size,
-        mask_type=mask_type,
-        use_kv_valid_bits=use_kv_valid_bits,
-        max_row_route_capacity=max_row_route_capacity,
-    )
+    if use_block_sparse:
+        q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
+            device_index=device_index,
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            q_block_size=q_block_size,
+            kv_block_size=kv_block_size,
+            kv_route_size=kv_route_size,
+            mask_type=mask_type,
+            use_kv_valid_bits=use_kv_valid_bits,
+            max_row_route_capacity=max_row_route_capacity,
+        )
+    else:
+        q_tile_size = _select_block_sparse_q_tile_size(
+            q_block_size=q_block_size,
+            heads_q_per_kv=num_qo_heads // num_kv_heads,
+            kv_block_size=kv_block_size,
+        )
+        use_persistent_scheduler = False
+        _validate_dense_contiguous_kv_extent(
+            seq_len_kv=seq_len_kv,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
     compile_key = _BlockSparseCompileKey(
         device_index=device_index,
         batch_size=batch_size,
@@ -504,7 +580,8 @@ def _resolve_block_sparse_launch_spec(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         use_persistent_scheduler=use_persistent_scheduler,
-        use_parallel_sparse_kv_loads=_select_parallel_sparse_kv_loads(
+        use_parallel_sparse_kv_loads=use_block_sparse
+        and _select_parallel_sparse_kv_loads(
             kv_block_size=kv_block_size,
             use_kv_valid_bits=use_kv_valid_bits,
             max_row_route_capacity=max_row_route_capacity,
@@ -513,10 +590,17 @@ def _resolve_block_sparse_launch_spec(
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         page_size=page_size,
+        use_block_sparse=use_block_sparse,
     )
     try:
         config = _make_block_sparse_config(compile_key)
-    except ValueError:
+    except ValueError as error:
+        if not use_block_sparse:
+            raise _dense_contiguous_profile_error(
+                q_tile_size=q_tile_size,
+                kv_route_size=kv_route_size,
+                dtype_key=dtype_key,
+            ) from error
         if not compile_key.use_persistent_scheduler:
             raise
         compile_key = replace(
@@ -569,6 +653,7 @@ __all__ = [
     "_select_parallel_sparse_kv_loads",
     "_should_consider_clc",
     "_validate_block_sparse_static_profile",
+    "_validate_dense_contiguous_kv_extent",
     "_validate_matching_dtypes",
     "_validate_max_blocks_per_row",
 ]

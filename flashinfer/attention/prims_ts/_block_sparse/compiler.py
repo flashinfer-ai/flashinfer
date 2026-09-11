@@ -27,6 +27,110 @@ from .config import _BlockSparseCompileKey, _make_block_sparse_config
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 
 
+def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., object]:
+    """Compile one contiguous BSHD attention adapter without route preparation.
+
+    The dense branch consumes the same public ``[B, S, H, D]`` Q/K/V tensors as
+    the sparse branch and reaches the decode kernel directly, so no prepare
+    kernel, route workspace, or token-mask ABI takes part in the launch.
+    """
+
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda_drv
+
+    from ..kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
+    from ..kernels.fmha_decode.fmha_decode_kernel import fmha_decode_launch
+
+    config = _make_block_sparse_config(key)
+    Int32 = cutlass.Int32
+    Float32 = cutlass.Float32
+
+    @cute.jit
+    def dense_contiguous_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        null_i32 = cute.make_ptr(Int32, 0, mem_space=cutlass.AddressSpace.gmem)
+        null_f32 = cute.make_ptr(Float32, 0, mem_space=cutlass.AddressSpace.gmem)
+        fmha_decode_launch(
+            (
+                Int32(static_batch_size),
+                Int32(static_num_qo_heads),
+                Int32(static_num_kv_heads),
+                Int32(static_seq_len_kv),
+                Int32(static_head_dim),
+            ),
+            q.iterator,
+            k.iterator,
+            v.iterator,
+            out.iterator,
+            null_i32,  # seqlens_kv
+            null_i32,  # cu_seqlens_q
+            Int32(0),  # total_q_tokens
+            null_i32,  # page_idx_kv
+            out.iterator,  # partial_o
+            null_f32,  # partial_stats
+            null_i32,  # split_kv_counter
+            null_f32,  # attention_sinks
+            sm_scale,
+            Float32(1.0),  # output_scale
+            Int32(
+                static_seq_len_kv * static_num_kv_heads * static_head_dim
+            ),  # kv_b_stride
+            Int32(0),  # max_active_clusters
+            stream,
+            static_config,
+            static_seq_len_kv,
+            # Contiguous K/V has no page table; the kernel parameters behind
+            # these launcher arguments are typed, so pass typed zeros rather
+            # than relying on the launcher's literal defaults.
+            block_table_capacity=Int32(0),
+            block_table_row_stride=cutlass.Int64(0),
+            num_physical_kv_pages=cutlass.Int64(0),
+            k_page_stride=cutlass.Int64(0),
+            v_page_stride=cutlass.Int64(0),
+        )
+
+    def fake_compact(dtype: object, shape: tuple[object, ...]) -> object:
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=16,
+        )
+
+    q_shape = (key.batch_size, key.seq_len_q, key.num_qo_heads, key.head_dim)
+    kv_shape = (key.batch_size, key.seq_len_kv, key.num_kv_heads, key.head_dim)
+    with torch.cuda.device(key.device_index):
+        return cute.compile(
+            dense_contiguous_adapter,
+            fake_compact(config.q_dtype, q_shape),
+            fake_compact(config.kv_dtype, kv_shape),
+            fake_compact(config.kv_dtype, kv_shape),
+            fake_compact(config.out_dtype, q_shape),
+            Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            config,
+            key.batch_size,
+            key.seq_len_kv,
+            key.num_qo_heads,
+            key.num_kv_heads,
+            key.head_dim,
+            options=_COMPILE_OPTIONS,
+        )
+
+
 def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     """Compile one storage-specialized prepare-plus-attention adapter."""
 
@@ -583,12 +687,15 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
 def _get_compiled_block_sparse(
     key: _BlockSparseCompileKey,
 ) -> Callable[..., object]:
-    """Compile and cache one contiguous or paged prepare-plus-attention adapter."""
+    """Compile and cache one dense, contiguous, or paged attention adapter."""
 
+    if not key.use_block_sparse:
+        return _compile_dense_contiguous(key)
     return _compile_block_sparse(key)
 
 
 __all__ = [
     "_compile_block_sparse",
+    "_compile_dense_contiguous",
     "_get_compiled_block_sparse",
 ]

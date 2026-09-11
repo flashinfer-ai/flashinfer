@@ -54,6 +54,11 @@ FMHA Decode
 
     .. automethod:: __init__
 
+.. autoclass:: BatchDecodeTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
 Block-Sparse FMHA
 -----------------
 

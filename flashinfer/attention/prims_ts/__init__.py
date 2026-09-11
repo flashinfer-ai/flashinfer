@@ -15,6 +15,7 @@
 """Experimental task-scheduled attention entry points."""
 
 from .block_sparse import (
+    BatchDecodeTSWrapper,
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
     block_sparse_attention,
@@ -40,6 +41,7 @@ from .mla_decode import (
 )
 
 __all__ = [
+    "BatchDecodeTSWrapper",
     "BlockSparseTSWrapper",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",
