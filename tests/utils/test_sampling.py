@@ -543,6 +543,35 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
     )
 
 
+@pytest.mark.parametrize("top_k_arr", [True, False])
+@pytest.mark.parametrize("is_deterministic", [None, False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(4, 128, device="cuda:0"), dim=-1).to(dtype)
+    if top_k_arr:
+        top_k = torch.tensor([1, 10, 50, 128], dtype=torch.int32, device=probs.device)
+        maybe_top_k_arr, top_k_val = top_k, 0
+    else:
+        top_k = 10
+        maybe_top_k_arr, top_k_val = None, top_k
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=probs.device)
+    op = flashinfer.sampling.get_sampling_module().top_k_renorm_probs
+
+    if is_deterministic is None:
+        # Preserve the four-argument call used by ProbsTopKOp.
+        actual = op(probs, maybe_top_k_arr, top_k_val, row_states_buffer)
+    else:
+        actual = op(
+            probs, maybe_top_k_arr, top_k_val, row_states_buffer, is_deterministic
+        )
+
+    expected = flashinfer.sampling.top_k_renorm_probs(
+        probs, top_k, is_deterministic=bool(is_deterministic)
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 500])

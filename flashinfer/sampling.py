@@ -520,8 +520,8 @@ def get_sampling_module():
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
-        is_deterministic: bool,
         row_states_buffer: torch.Tensor,
+        is_deterministic: bool = False,
     ) -> torch.Tensor:
         # Support FP32, FP16, BF16
         assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
@@ -544,8 +544,8 @@ def get_sampling_module():
         probs: torch.Tensor,
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
-        is_deterministic: bool,
         row_states_buffer: torch.Tensor,
+        is_deterministic: bool = False,
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
@@ -1908,7 +1908,10 @@ def top_k_renorm_probs(
     )
 
     return get_sampling_module().top_k_renorm_probs(
-        probs, *_to_tensor_scalar_tuple(top_k), is_deterministic, row_states_buffer
+        probs,
+        *_to_tensor_scalar_tuple(top_k),
+        row_states_buffer,
+        is_deterministic=is_deterministic,
     )
 
 
