@@ -294,14 +294,16 @@ machinery off the critical path (scales staged with the route metadata and at
 tile start, one multiplier per compile-time score group) and from
 reinvesting the resources the byte-wide tiles free: a five-stage K/V ring,
 the output tile's columns split between the two lane groups of the tail, an
-INT8 accumulator seeded with an FP32 bias so scores need no conversion, and a
-smaller instruction footprint in the masked softmax paths. On B200 with the
+INT8 accumulator seeded with an FP32 bias so scores need no conversion, a
+smaller instruction footprint in the masked softmax paths, and a probability
+pass that stops at a route's last nonempty K32 fragment. On B200 with the
 `(fp8, fp8, (1, 16, 1))` recipe, kernel time relative to the BF16 kernel of
-the same plan (both scheduled by the same launch heuristic) is
-0.82 on dense S=10800 H=40, 0.94 on dense S=4096 H=8, 0.90 on block-sparse
-S=4096 H=8 (density 0.25), 0.78 on a VSA-shaped block-sparse case (S=15360,
-H=40, density 0.125), 0.79 on the SOL exact case (S=10800, H=40, density
-0.175) and 0.79 on its proxy variant; the numbers do not depend on the logit
+the same plan (both scheduled by the same launch heuristic) is 0.88 on
+dense S=10800 H=40, 1.02 on dense S=4096 H=8 (the small dense case gains
+nothing over the persistent BF16 kernel), 0.85 on block-sparse S=4096 H=8
+(density 0.25), 0.76 on a VSA-shaped block-sparse case (S=15360, H=40,
+density 0.125), 0.77 on the SOL exact case (S=10800, H=40, density 0.175)
+and 0.79 on its proxy variant; the numbers do not depend on the logit
 distribution. The INT8 recipe is within 0-4% of the FP8 recipe.
 `k_block_size=32` is neutral for FP8 and 3-4% faster than 16 for INT8.
 
