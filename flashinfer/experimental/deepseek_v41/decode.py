@@ -193,17 +193,17 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
             )
             split = min(desired, (128 + ck) // 64)
             dequant_warps, phase_chunks, narrow_offsets = 8, 8, False
-            if ck == 512 and batch >= 64:
-                # A short load phase limits live registers at moderate batch.
-                # Use int32 byte offsets only with a complete-pool size proof;
-                # the largest valid data/scale address is strictly below 2 GiB.
-                if (
-                    batch <= 128
-                    and max(swa_cache.numel(), global_cache.numel()) < 2**31
-                ):
-                    phase_chunks, narrow_offsets = 2, True
-                elif batch >= 128:
-                    dequant_warps = 16
+            if ck == 512 and batch >= 128:
+                # More dequant lanes with a shorter load phase limit the live
+                # raw data/address state while keeping large-batch parallelism.
+                dequant_warps, phase_chunks = 16, 2
+            elif (
+                ck == 512
+                and batch >= 64
+                and max(swa_cache.numel(), global_cache.numel()) < 2**31
+            ):
+                # Narrow offsets only after proving both complete pools fit.
+                phase_chunks, narrow_offsets = 2, True
             kernel = _compile(
                 q.device.index,
                 ck,

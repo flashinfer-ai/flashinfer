@@ -2038,8 +2038,12 @@ class BlackwellV41MixedCacheDecode:
         original kernel): grouped by PV K-block of kpk keys, then output slice
         j, then 64-latent block, then key row, then latent. All loads of a
         phase are issued before the first conversion."""
-        w = dq.tidx_g // self.threads_per_warp
-        l = dq.tidx_g % self.threads_per_warp
+        # This function is reached only by the dequant warp interval, so
+        # tidx_g is nonnegative. Keep lane/row arithmetic unsigned to avoid
+        # signed division/remainder fixups and their live address temporaries.
+        dequant_tid = dq.tidx_g.to(cutlass.Uint32)
+        w = dequant_tid // self.threads_per_warp
+        l = dequant_tid % self.threads_per_warp
         cta = dq.cta_in_cluster
         n_cta = self.mma_qk_tiler[1] // self.cluster_shape_mnk[0]
         kpk = self.mma_pv_tiler[2]
