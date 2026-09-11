@@ -422,6 +422,34 @@ class SmemPResource(DecodeGenResourceBase):
             sage_scale_arr=sage_scale_arr,
         )
 
+    @producer_work
+    @cute.jit
+    def compute_sage_bounded_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        route_flags: Int32,
+        fragment_limit: Int32,
+        sage_scale_arr: cutlass.Array,
+    ) -> None:
+        """Stream the route's nonempty K32 fragments and zero the rest.
+
+        ``fragment_limit`` is the warp-uniform count of fragments up to the
+        last one whose prepared score word keeps a token, derived by the
+        metadata consumer (see ``FmhaDecodeConfig.skips_empty_p_fragments``).
+        Exact-only builds never set the proxy flag, so one adapter serves both
+        route kinds.
+        """
+        assert self.cfg.use_sage_attention and self.cfg.skips_empty_p_fragments
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=_route_is_proxy(route_flags),
+            sage_scale_arr=sage_scale_arr,
+            fragment_limit=fragment_limit,
+        )
+
     @cute.jit
     def _compute_p_fragments_impl(
         self,
@@ -430,6 +458,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         route_is_proxy: Int32,
         sage_scale_arr: cutlass.Array | None = None,
+        fragment_limit: Int32 | None = None,
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
@@ -487,7 +516,16 @@ class SmemPResource(DecodeGenResourceBase):
         # a packed pair; the 16-bit schedule loads, waits, scales and
         # exponentiates each fragment in place with a scalar running sum.
         byte_wide_schedule = cfg.uses_byte_wide_p_schedule
-        last_fragment = Int32(cfg.num_softmax_score_fragments - 1)
+        num_fragments = cfg.num_softmax_score_fragments
+        if cutlass.const_expr(fragment_limit is None):
+            fragment_limit = Int32(num_fragments)
+        else:
+            assert cfg.skips_empty_p_fragments
+        # The prefetch clamp stays the compile-time last fragment even when
+        # the loop stops earlier: a bound that depends on the runtime limit
+        # costs about 2.5% on block-sparse routes, while the one masked
+        # fragment it may load past the limit is retired by the wait below.
+        last_fragment = Int32(num_fragments - 1)
         total_sum = Float32(0.0)
         total_sum_pair = (Float32(0.0), Float32(0.0))
         s_arr = cutlass.Array(Float32, fragment_regs, space=cutlass.AddressSpace.rmem)
@@ -496,7 +534,7 @@ class SmemPResource(DecodeGenResourceBase):
         )
         if cutlass.const_expr(byte_wide_schedule):
             self._load_score_fragment(tmem_base, Int32(0), pending_scores)
-        for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
+        for fragment_idx in cutlass.range(fragment_limit, unroll=1):
             fragment = Int32(fragment_idx)
             if cutlass.const_expr(not byte_wide_schedule):
                 self._load_score_fragment(tmem_base, fragment, pending_scores)
@@ -590,6 +628,31 @@ class SmemPResource(DecodeGenResourceBase):
         if cutlass.const_expr(byte_wide_schedule):
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
+        if cutlass.const_expr(cfg.skips_empty_p_fragments):
+            # Fragments past the last nonempty score word hold only masked
+            # scores; publish them as zero probabilities. The wait above has
+            # retired every score load, including the unconditional first one
+            # when the route keeps no token, before P overwrites those columns.
+            zero_regs = cutlass.Array(
+                Int32, fragment_cols, space=cutlass.AddressSpace.rmem
+            )
+            for col_idx in cutlass.range_constexpr(fragment_cols):
+                zero_regs[col_idx] = Int32(0)
+            zero_p = zero_regs.data_ptr().load(count=fragment_cols, alignment=4)
+            for fragment_idx in cutlass.range(fragment_limit, num_fragments, unroll=1):
+                fragment = Int32(fragment_idx)
+                _keeps_tcgen05_st(
+                    cfg,
+                    prims.make_tmem_ptr(
+                        tmem_base + fragment * Int32(fragment_cols), Int32
+                    ),
+                    zero_p,
+                    offset=cfg.tmem_p_cols_per_inst,
+                )
+                cute.arch.fence_view_async_tmem_store()
+                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                if publishes_fragment:
+                    prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
 
     @cute.jit

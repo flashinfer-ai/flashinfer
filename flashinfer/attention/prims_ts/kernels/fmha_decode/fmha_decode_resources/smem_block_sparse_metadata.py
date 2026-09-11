@@ -835,6 +835,12 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             None,
             "Staged sfK of the consuming half, in lane multiplier order.",
         ),
+        (
+            "softmax_p_fragment_limit",
+            Int32,
+            Int32(0),
+            "Count of leading K32 fragments up to the last nonempty token word.",
+        ),
     )
     cfg: Constexpr[FmhaDecodeConfig] = None
     inst_id: Constexpr[int] = 0
@@ -851,6 +857,9 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     _smem_words: cutlass.Array = None
     _smem_scales: cutlass.Array = None
     softmax_sage_k_scales: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    softmax_p_fragment_limit: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
     softmax_origin0_slot: Constexpr[TaskLocalVariable] = (
@@ -1301,6 +1310,34 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 + Int32(self.staging_layout.sage_scale_words_word_offset)
                 + lane_idx
             ] = k_scale
+
+    @consumer_work(returns=softmax_p_fragment_limit, work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def derive_p_fragment_limit(
+        self,
+        stage_info: StageInfo,
+        *,
+        token_word0: Uint32,
+        token_word1: Uint32,
+        token_word2: Uint32,
+        token_word3: Uint32,
+    ) -> Int32:
+        """Count this half's fragments up to the last one keeping a token.
+
+        The words are the ones ``load_route`` returned, in fragment order and
+        route-uniform, so the count is warp-uniform. It reads no stage memory
+        and may run after the release; keeping only the count live across the
+        max pass is what makes the skip in the P pass pay (see
+        ``FmhaDecodeConfig.skips_empty_p_fragments``).
+        """
+        _ = stage_info
+        limit = Int32(0)
+        for fragment_idx, token_word in enumerate(
+            (token_word0, token_word1, token_word2, token_word3)
+        ):
+            if token_word != Uint32(0):
+                limit = Int32(fragment_idx + 1)
+        return cute.arch.make_warp_uniform(limit)
 
     @consumer_work(returns=softmax_sage_k_scales)
     @cute.jit

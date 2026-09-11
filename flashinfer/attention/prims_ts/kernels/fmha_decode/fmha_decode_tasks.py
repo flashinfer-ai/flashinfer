@@ -2854,6 +2854,8 @@ def _softmax_schedule_body(
         (True, False): smem_p.compute_proxy_route_p_fragments,
         (True, True): smem_p.compute_sage_proxy_route_p_fragments,
     }[(cfg.use_block_sparse_proxy_routes, cfg.use_sage_attention)]
+    if cfg.skips_empty_p_fragments:
+        compute_p_fragments = smem_p.compute_sage_bounded_p_fragments
 
     with domain_loop(0, domain, 1, unroll=1) as d:
         if sparse_softmax_metadata is not None:
@@ -2874,6 +2876,17 @@ def _softmax_schedule_body(
             if cutlass.const_expr(cfg.use_sage_attention):
                 staged_k_scales = sparse_softmax_metadata.load_route_sage_k_scales()
             sparse_softmax_metadata.release()
+            if cutlass.const_expr(cfg.skips_empty_p_fragments):
+                # Derived here, while the words are live, so only the bound
+                # stays in registers across the max pass.
+                sparse_p_fragment_limit = (
+                    sparse_softmax_metadata.derive_p_fragment_limit(
+                        token_word0=sparse_token_word0,
+                        token_word1=sparse_token_word1,
+                        token_word2=sparse_token_word2,
+                        token_word3=sparse_token_word3,
+                    )
+                )
         if cutlass.const_expr(cfg.use_sage_attention):
             # Issue the tile's scale loads ahead of the score wait so their
             # latency hides behind the QK MMA.
@@ -2927,8 +2940,12 @@ def _softmax_schedule_body(
             p_fragments_kwargs = dict(new_max_arr=new_max_arr)
             if cutlass.const_expr(cfg.use_sage_attention):
                 p_fragments_kwargs["sage_scale_arr"] = sage_scale_arr
-            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+            if cutlass.const_expr(
+                cfg.use_block_sparse_proxy_routes or cfg.skips_empty_p_fragments
+            ):
                 p_fragments_kwargs["route_flags"] = sparse_route_flags
+            if cutlass.const_expr(cfg.skips_empty_p_fragments):
+                p_fragments_kwargs["fragment_limit"] = sparse_p_fragment_limit
             compute_p_fragments(**p_fragments_kwargs)
         else:
             # Wait for a free P stage before entering the ordered window so

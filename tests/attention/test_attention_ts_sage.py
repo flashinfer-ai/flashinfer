@@ -1842,6 +1842,147 @@ def test_block_sparse_sage_matches_dequantized_reference(case: _SparseSageCase) 
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
 
 
+# Token words a softmax half consumes, in fragment order, for one route. KV256
+# halves own alternating K64 atoms, so half 0 sees words (0, 1, 4, 5) of the
+# eight-word route; the KV128 route has one half owning all four words.
+_P_FRAGMENT_WORDS_BY_PROFILE = {
+    "kv256": ("kv256_exact_k16_q1_bf16", 768, 1, ((0, 1, 4, 5), (2, 3, 6, 7))),
+    "q128": ("q128_gqa8_exact_k16_q1_bf16", 384, 8, ((0, 1, 2, 3),)),
+}
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("qk_dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
+@pytest.mark.parametrize(
+    "profile, use_proxy_routes",
+    (("kv256", False), ("kv256", True), ("q128", False)),
+    ids=("kv256-exact", "kv256-proxy", "q128-exact"),
+)
+@torch.no_grad()
+def test_block_sparse_sage_graph_masks_empty_p_suffix(
+    profile: str, use_proxy_routes: bool, qk_dtype: torch.dtype
+) -> None:
+    """Every token-word pattern of a route yields the reference output.
+
+    The byte-wide P pass stops after the last nonempty score word of a half
+    and publishes the remaining fragments as zeros, so the pattern sweep
+    covers empty suffixes, interior holes and fully masked routes. The mask
+    is rewritten in place between CUDA-graph replays, which also checks that
+    the bound is derived per launch rather than at plan time.
+    """
+
+    base_name, seq_len_kv, group_size, word_indices = _P_FRAGMENT_WORDS_BY_PROFILE[
+        profile
+    ]
+    (base,) = _cases_named(_SPARSE_SAGE_CASES, base_name)
+    case = replace(
+        base,
+        batch_size=1,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=group_size,
+        num_kv_heads=1,
+        qk_dtype=qk_dtype,
+        use_token_mask=True,
+        use_proxy_routes=use_proxy_routes,
+        sparse_format="bitmask",
+        scheduler="persistent",
+    )
+    words_per_route = sum(len(indices) for indices in word_indices)
+    torch.manual_seed(20260910)
+    device = torch.device("cuda", 0)
+    q, k, v, params, summaries = _random_sparse_sage_inputs(case, device)
+    num_rows = -(-case.seq_len_q // case.q_block_size)
+    # Every K64 block stays selected so each route is structurally full and
+    # only the token words decide which fragments keep tokens.
+    patterns = (((tuple(range(case.num_kv_blocks)),) * num_rows,),)
+    routing = _sparse_routing(case, patterns, device)
+    if summaries is not None:
+        routing.update(k_summary=summaries[0], v_summary=summaries[1])
+    valid_bits = pack_token_mask(
+        case.seq_len_kv, (frozenset(range(case.seq_len_kv)),), device
+    )
+    wrapper = _plan_sparse_sage(
+        case, params, device, max_blocks_per_row=case.num_kv_blocks
+    )
+    output = torch.empty(q.shape, device=device, dtype=case.out_dtype)
+    sm_scale = _HEAD_DIM**-0.5
+
+    def run():
+        wrapper.run(
+            q,
+            k,
+            v,
+            kv_valid_bits=valid_bits,
+            sm_scale=sm_scale,
+            out=output,
+            **routing,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    torch.cuda.synchronize()
+
+    def replay_with_live_words(live_words, expected_patterns):
+        valid_set = frozenset(
+            token
+            for token in range(case.seq_len_kv)
+            if live_words[(token // 32) % words_per_route]
+        )
+        valid_tokens = torch.tensor(
+            [[token in valid_set for token in range(case.seq_len_kv)]], device=device
+        )
+        valid_bits.copy_(pack_token_mask(case.seq_len_kv, (valid_set,), device))
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+        if not valid_set:
+            assert torch.count_nonzero(output) == 0
+        expected = _sage_sparse_reference(
+            case,
+            q,
+            k,
+            v,
+            params,
+            summaries,
+            expected_patterns,
+            valid_tokens,
+            sm_scale=sm_scale,
+        )
+        torch.testing.assert_close(
+            output.float(),
+            expected,
+            rtol=2e-2,
+            atol=2e-2,
+            msg=lambda message: f"live words={live_words}: {message}",
+        )
+
+    # Sweep all masks of one half with the other half full, plus a few mixed
+    # patterns: prefixes, interior holes and the empty route.
+    half_masks = range(16)
+    sweeps = [(mask,) + (15,) * (len(word_indices) - 1) for mask in half_masks]
+    if len(word_indices) == 2:
+        sweeps += [(15, mask) for mask in half_masks]
+        sweeps += [(0b0101, 0b1010), (0b1010, 0b0101), (0, 0)]
+    for halves in sweeps:
+        live_words = [False] * words_per_route
+        for half, indices in enumerate(word_indices):
+            for fragment, word in enumerate(indices):
+                live_words[word] = bool(halves[half] & (1 << fragment))
+        replay_with_live_words(live_words, patterns)
+
+    if use_proxy_routes:
+        # Clearing the exact bits in place turns every summary into proxy
+        # tokens of the same graph, so the proxy route now owns the nonempty
+        # words and the exact routes vanish.
+        routing["exact_block_bits"].zero_()
+        replay_with_live_words([True] * words_per_route, ((((),) * num_rows,),))
+
+
 _INT8_FLOOR_SCALE_CASE = next(
     case
     for case in _SPARSE_SAGE_CASES

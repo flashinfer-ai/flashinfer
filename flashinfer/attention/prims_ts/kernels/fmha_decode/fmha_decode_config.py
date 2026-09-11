@@ -985,6 +985,42 @@ class FmhaDecodeConfig:
         return self.use_8bit_qkv
 
     @property
+    def skips_empty_p_fragments(self) -> bool:
+        """Whether the byte-wide P pass stops at the last nonempty K32 fragment.
+
+        A block-sparse route's prepared score words tell each softmax half
+        which of its four fragments keep any token. Fragments past the last
+        nonempty word are published as zero probabilities without reloading
+        or exponentiating them, which shortens the softmax pass of partial
+        routes (sequence tails, rows whose selected atoms do not fill the
+        final route, token-masked tails). Interior holes are still processed
+        because the fragment loop stays rolled and contiguous. The 16-bit
+        profiles keep their unconditional pass so their SASS is unchanged;
+        the bounded adapter is written for the Sage fragment pass, the only
+        byte-wide block-sparse pass the profiles admit.
+        """
+        return (
+            self.uses_byte_wide_p_schedule
+            and self.use_sage_attention
+            and self.streams_tmem_p_fragments
+            and self.use_block_sparse
+            and self.uses_prepared_score_keep_words
+        )
+
+    @property
+    def defers_correction_store_wait(self) -> bool:
+        """Whether the in-loop O rescale waits once for all its chunk stores.
+
+        The correction warps rescale O in TMEM chunk by chunk. The chunks
+        occupy disjoint columns, so their stores need no ordering among
+        themselves; one wait after the last chunk suffices before the stage
+        is released to the next PV wave. The 16-bit profiles keep the wait
+        per chunk so their SASS is unchanged. This is a performance policy
+        that follows the element width, not a dtype requirement.
+        """
+        return self.use_8bit_qkv
+
+    @property
     def use_fp8_output(self) -> bool:
         """Whether final O is stored as FP8 E4M3."""
         return self.out_dtype == Float8E4M3FN
