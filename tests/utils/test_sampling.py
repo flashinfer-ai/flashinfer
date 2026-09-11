@@ -38,6 +38,189 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
+def test_softmax_rejects_cpu_before_cuda_state(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("CUDA workspace or capability state was accessed for CPU logits")
+
+    monkeypatch.setattr(flashinfer.sampling, "_get_cache_buf", fail_if_called)
+    monkeypatch.setattr(flashinfer.sampling, "device_support_pdl", fail_if_called)
+    monkeypatch.setattr(
+        flashinfer.sampling, "_supports_blackwell_softmax", fail_if_called
+    )
+
+    with pytest.raises(ValueError, match="logits must be a CUDA tensor"):
+        flashinfer.sampling.softmax(torch.randn(2, 3))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_validate_softmax_temperature_accepts_floating_row_tensor(dtype):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+    temperature = torch.ones(3, dtype=dtype)
+
+    temperature_arr, temperature_val, temperature_is_none = (
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+    )
+
+    assert temperature_arr is temperature
+    assert temperature_val == 0.0
+    assert not temperature_is_none
+
+
+@pytest.mark.parametrize(
+    "temperature,expected_value,is_none",
+    [(None, 1.0, True), (1, 1.0, False), (0.5, 0.5, False)],
+)
+def test_validate_softmax_temperature_accepts_scalar(
+    temperature, expected_value, is_none
+):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    temperature_arr, temperature_val, temperature_is_none = (
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+    )
+
+    assert temperature_arr is None
+    assert temperature_val == expected_value
+    assert temperature_is_none is is_none
+
+
+@pytest.mark.parametrize(
+    "temperature,error_match",
+    [
+        (torch.tensor(1.0), "must be 1D"),
+        (torch.ones(3, 1), "must be 1D"),
+        (torch.ones(2), "length must equal logits.size\\(0\\)"),
+        (torch.ones(3, dtype=torch.int32), "must have dtype"),
+        (torch.ones(3, dtype=torch.bool), "must have dtype"),
+    ],
+)
+def test_validate_softmax_temperature_rejects_invalid_tensor(temperature, error_match):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=error_match):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+def test_validate_softmax_temperature_rejects_other_device():
+    logits = torch.empty((3, 5), dtype=torch.float32)
+    temperature = torch.ones(3, device="meta")
+
+    with pytest.raises(ValueError, match="same device as logits"):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+@pytest.mark.parametrize("temperature", [True, "1.0", object()])
+def test_validate_softmax_temperature_rejects_non_numeric_scalar(temperature):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="temperature must be None, a real scalar"):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+@pytest.mark.parametrize("rows", [16, 32, 64, 128, 512, 1024])
+def test_blackwell_mr515_none_route_is_exact_and_correct(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.randn((rows, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    actual = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
+    assert actual.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_blackwell_mr515_scalar_one_pdl_route_is_exact_and_correct():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.randn((64, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=1.0, enable_pdl=True
+    )
+    actual = flashinfer.sampling.softmax(logits, temperature=1.0, enable_pdl=True)
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
+    assert actual.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,temperature,enable_pdl",
+    [
+        (4, None, False),
+        (256, None, False),
+        (64, None, True),
+        (64, 1.0, False),
+        (64, 0.5, True),
+    ],
+)
+def test_blackwell_mr515_route_does_not_interpolate(rows, temperature, enable_pdl):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.empty((rows, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    [
+        (1, 111, 0.5, False, 1),
+        (256, 32000, None, False, 2),
+        (1, 32000, None, False, 3),
+        (64, 32000, None, False, 4),
+    ],
+)
+def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
+    rows, vocab_size, temperature, enable_pdl, expected_route
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    if expected_route == 4 and capability != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.full((rows, vocab_size), -torch.inf, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == expected_route
+    assert actual.data_ptr() != logits.data_ptr()
+    assert torch.isnan(expected).all()
+    assert torch.isnan(actual).all()
+
+
+def test_blackwell_route_observer_falls_back_off_blackwell():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        pytest.skip("This test exercises the non-Blackwell observer gate")
+
+    logits = torch.empty((1, 111), device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=0.5, enable_pdl=False
+    )
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
@@ -74,6 +257,67 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "batch_size,vocab_size,temperature_kind",
+    [
+        (1, 32000, "none"),  # cooperative route
+        (256, 32000, "none"),  # rowwise route
+        (512, 64000, "none"),  # bootstrap side of the wide-row boundary
+        (1024, 64000, "none"),  # rowwise side of the wide-row boundary
+        (989, 128256, "per_row"),  # full-sweep worst-row profile
+        (1, 111, "scalar"),  # scalar-temperature warp-packed route
+        (1, 111, "per_row"),  # per-row-temperature warp-packed route
+    ],
+)
+def test_softmax_blackwell_routes(batch_size, vocab_size, temperature_kind):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Loom Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if temperature_kind == "none":
+        temperature = None
+        probs_ref = torch.softmax(logits, dim=-1)
+    elif temperature_kind == "scalar":
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    else:
+        temperature = torch.full((batch_size,), 0.5, device="cuda")
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=False
+    )
+
+    assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_softmax_blackwell_random_per_row_temperature_contract(vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Loom Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    rows = 989
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    temperature = torch.rand(rows, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    assert probs.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(
+        probs,
+        probs_ref,
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
