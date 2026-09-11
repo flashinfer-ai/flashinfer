@@ -949,12 +949,14 @@ void cast_fp32_to_bf16(void* output, void const* input, int64_t num_elements, cu
 }  // namespace
 
 // Validate routing_replay_out tensor properties.
-// NOTE: dim0 is only bounded from below. The routing kernels write one replay row per
-// token unconditionally (DeepSeek launches numBlocks == num_tokens and writes row
-// blockIdx.x; the custom and llama4 kernels write row tokenIdx), so a buffer with fewer
-// rows than tokens is written past its end. Oversized buffers stay legal: with CUDA
-// graphs the buffer is pre-allocated at maximum batch size and reused across steps with
-// varying num_tokens.
+// dim0 is only bounded from below: the routing kernels write one replay row
+// per token unconditionally (DeepSeek launches numBlocks == num_tokens and
+// writes row blockIdx.x; the custom and llama4 kernels write row tokenIdx),
+// so a buffer with fewer rows than tokens is written past its end. Oversized
+// buffers stay legal: with CUDA graphs the buffer is pre-allocated at
+// maximum batch size and reused across steps with varying num_tokens.
+// dim1 is the routed top_k even when fused shared experts are enabled; those
+// extra slots are not written.
 static void validate_routing_replay_out(TensorView const& replay, TensorView const& hidden_states,
                                         int64_t top_k) {
   TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
@@ -4246,9 +4248,6 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    // Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
-    TVM_FFI_ICHECK(num_fused_shared_experts.value_or(0) == 0)
-        << "routing_replay_out is not supported with num_fused_shared_experts > 0";
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
@@ -4420,9 +4419,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    // Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
-    TVM_FFI_ICHECK(nFusedShared == 0)
-        << "routing_replay_out is not supported with num_fused_shared_experts > 0";
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
