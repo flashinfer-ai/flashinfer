@@ -46,9 +46,10 @@ Their other differences, all downstream of the quantization formats:
   dtype knobs — only fp8 exposes acc_dtype (MMA accumulator, float32 or
                 float16); fp4's accumulator is fixed float32.  Default
                 output_dtype: float32 (fp8) vs bfloat16 (fp4)
-  shapes      — fp8 is parametric (head_dim a multiple of 32,
-                next_n*num_heads a multiple of 8 in [8, 256]); fp4 is
-                specialised to exactly num_heads=64, head_dim=128
+  shapes      — fp8 is parametric (head_dim a multiple of 32, num_heads a
+                multiple of 4, next_n*num_heads a multiple of 8 in
+                [8, 256]); fp4 is specialised to exactly num_heads=64,
+                head_dim=128
   next_n=4    — single-pass everywhere on fp8; on fp4 single-pass only on
                 Rubin (SM107): SM100/SM103 run two internal KV passes
                 (identical numerics, ~2x KV reads); a caller schedule_meta
@@ -107,6 +108,15 @@ _FP4_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 # via integer division, so head_dim must be an exact multiple (see the guard in
 # fp8_paged_mqa_logits).
 _FP8_MMA_INST_K = 32
+# FP8 epilogue FMA unroll granularity.  The kernel's register and SMEM weight
+# paths both consume heads this many at a time (kernel-side _EPI_UNROLL), so
+# num_heads must be a multiple of it.  The UMMA N-mode rule below does not
+# imply it: next_n*num_heads % 8 == 0 admits e.g. next_n=4, num_heads=10.
+# Mirrored at the API boundary because the kernel constructor's own check is
+# phrased in terms of an internal compile-layer parameter (num_epi_subtiles)
+# the caller never sees, and fires only after the output has been allocated
+# and the schedule kernel compiled.
+_EPI_SUBTILE_UNROLL = 4
 # FP4 hardcodes these in FP4MQALogitsKernel.__init__ (asserts on head_dim and
 # num_heads); mirrored at the API boundary for a clearer error.
 _FP4_REQUIRED_HEAD_DIM = 128
@@ -1511,6 +1521,14 @@ def _check_fp8_paged_mqa_logits_supported(
             f"[{_MMA_N_MIN}, {_MMA_N_MAX}] (UMMA N-mode); got next_n={next_n} * "
             f"num_heads={H} = {N}."
         )
+    # Epilogue unroll granularity (see _EPI_SUBTILE_UNROLL).  Independent of
+    # the N-mode rule: with next_n a multiple of 4, num_heads=10 or 9 pass it.
+    if H % _EPI_SUBTILE_UNROLL != 0:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: num_heads must be a multiple of "
+            f"{_EPI_SUBTILE_UNROLL} (epilogue FMA unroll granularity); got "
+            f"num_heads={H} from q.shape."
+        )
     _validate_phys_block_kv(block_size, "fp8_paged_mqa_logits")
     if kv_fused.dim() != 4 or kv_fused.shape[2] != 1 or kv_fused.shape[-1] != D + 4:
         raise ValueError(
@@ -1767,6 +1785,7 @@ def fp8_paged_mqa_logits(
         future kernel may widen them without changing this signature.
 
         head_dim         must be a multiple of 32.
+        num_heads        must be a multiple of 4.
         next_n*num_heads must be a multiple of 8 in [8, 256].
         block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
         head_dim, num_heads and next_n together must fit per-CTA shared

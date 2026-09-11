@@ -1434,9 +1434,10 @@ def test_fp4_paged_mqa_logits_sf_interleaved(block_size):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _make_fp8_case(batch_size, next_n, ctx, block_size, device, seed=11, head_dim=128):
+def _make_fp8_case(
+    batch_size, next_n, ctx, block_size, device, seed=11, head_dim=128, num_heads=64
+):
     torch.manual_seed(seed)
-    num_heads = 64
     seq_lens = torch.full((batch_size,), ctx, dtype=torch.int32, device=device)
     block_tables, num_total_blocks = _make_paged_kv(
         batch_size, block_size, seq_lens, device
@@ -1453,6 +1454,45 @@ def _make_fp8_case(batch_size, next_n, ctx, block_size, device, seed=11, head_di
     )
     kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
     return q_fp8, kv_fused, weights, seq_lens, block_tables
+
+
+# Shapes the UMMA N-mode rule (next_n*num_heads a multiple of 8 in [8, 256])
+# admits although num_heads is not a multiple of the epilogue unroll (4).  Only
+# possible when next_n itself is a multiple of 4.
+@pytest.mark.parametrize("next_n,num_heads", [(4, 10), (8, 9)])
+def test_fp8_num_heads_unroll_granularity_rejected(next_n, num_heads):
+    """num_heads not a multiple of 4 is rejected at the API boundary, in the
+    caller's vocabulary, before the compile layer is entered.
+
+    Previously the public supportedness checker accepted these shapes and the
+    kernel constructor rejected them -- after the output had been allocated
+    and the schedule kernel compiled -- with a message naming the internal
+    compile-layer parameter num_epi_subtiles, which the caller cannot set.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp8_paged_mqa_logits
+    from flashinfer.attn_scores import attn_scores as A
+
+    N = next_n * num_heads
+    assert N % 8 == 0 and 8 <= N <= 256 and num_heads % 4 != 0, "test premise"
+    ctx, block_size = 256, 64
+    q, kv, w, cl, bt = _make_fp8_case(
+        2, next_n, ctx, block_size, "cuda", num_heads=num_heads
+    )
+
+    misses = A._cached_compile_fp8_kernel.cache_info().misses
+    with pytest.raises(ValueError, match=r"num_heads must be a multiple of 4") as ei:
+        fp8_paged_mqa_logits(q, kv, w, bt, cl, ctx)
+    assert "num_epi_subtiles" not in str(ei.value), "internal parameter leaked"
+    assert A._cached_compile_fp8_kernel.cache_info().misses == misses, (
+        "the compile layer was entered before the shape was rejected"
+    )
+    # The public checker is the single source of supportedness: same verdict.
+    with pytest.raises(ValueError, match=r"num_heads must be a multiple of 4"):
+        A._check_fp8_paged_mqa_logits_supported(q, kv, w, bt, cl, ctx)
+    assert fp8_paged_mqa_logits.is_compute_capability_supported(100)
 
 
 def test_fp8_out_and_schedule_meta_paths():
