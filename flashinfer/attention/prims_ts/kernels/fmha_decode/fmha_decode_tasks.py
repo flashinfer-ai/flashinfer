@@ -2991,11 +2991,7 @@ def _softmax_schedule_body(
                 p_fragments_kwargs["sage_q_scale"] = sage_q_scale
                 p_fragments_kwargs["sage_scale_arr"] = sage_scale_arr
             if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-                p_fragments_kwargs.update(
-                    route_flags=sparse_route_flags,
-                    route_origin0=sparse_origin0,
-                    route_origin1=sparse_origin1,
-                )
+                p_fragments_kwargs["route_flags"] = sparse_route_flags
             compute_p_fragments(**p_fragments_kwargs)
         else:
             # Wait for a free P stage before entering the ordered window so
@@ -3014,10 +3010,7 @@ def _softmax_schedule_body(
                 smem_p.compute_proxy_route_p(
                     new_max_arr=new_max_arr,
                     s_arr=s_arr,
-                    route_origin0=sparse_origin0,
-                    route_origin1=sparse_origin1,
-                    keeps_route_flags_or_swaps_origin2=sparse_route_flags,
-                    swaps_route_origin3_bits=sparse_token_word0,
+                    keeps_route_flags=sparse_route_flags,
                     swaps_route_flags=sparse_token_word2,
                 )
             else:

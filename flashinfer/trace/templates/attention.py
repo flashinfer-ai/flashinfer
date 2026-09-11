@@ -406,7 +406,7 @@ def _block_sparse_route_schema(
         )
         inputs["v_summary"] = Tensor(
             ["batch_size", "num_kv_blocks", "num_kv_heads", "head_dim"],
-            description="Per-block summed V vectors for proxy routes.",
+            description="Per-block mean V vectors for proxy routes.",
         )
         constraints.extend(
             [

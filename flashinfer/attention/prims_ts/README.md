@@ -248,8 +248,11 @@ and KeepsAB/SWAPAB geometry. Proxy routes currently require
 are owned by `(batch, pattern head, Q block)`. Both block-sparse APIs default
 to `share_pattern_across_kv_heads=False`; True uses a singleton pattern-head
 axis shared by all KV heads. K/V and proxy summaries retain their physical
-head axis in either mode. A proxy run supplies one K arithmetic mean and one V sum per
-semantic KV block. The final partial block uses only its structural tokens.
+head axis in either mode. A proxy run supplies one K arithmetic mean and one V
+arithmetic mean per semantic KV block; each proxy block then counts as its
+number of structural tokens in the softmax. V summaries must be per-block
+means; the kernel cannot tell a per-block sum apart and would scale the output
+by the block mass. The final partial block averages only its structural tokens.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
 proxy summaries or their represented mass.
 
