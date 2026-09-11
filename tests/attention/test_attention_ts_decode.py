@@ -2508,25 +2508,48 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert q128_sage.streams_tmem_p_fragments
 
 
-@pytest.mark.parametrize("tile_size_q", (64, 128))
+# Dense Sage grids: Q64/KV256 runs the static and the persistent grid; dense
+# Q128/KV128 runs the static grid only, its persistent coverage is block-sparse.
+_DENSE_SAGE_GRIDS = ((64, False), (64, True), (128, False))
+
+
+@pytest.mark.parametrize(("tile_size_q", "persistent"), _DENSE_SAGE_GRIDS)
 @pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
 def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
-    tile_size_q: int, o_dtype, mask_type: str
+    tile_size_q: int, o_dtype, mask_type: str, persistent: bool
 ) -> None:
-    """Sage runs the two streamed Keeps profiles with a 16-bit dequantized output."""
+    """Sage runs the two streamed Keeps profiles on their qualified grids.
+
+    The scale addressing resolves the tile through the work tile, so the
+    persistent scheduler shares the static kernel's Sage passes wherever the
+    profile admits it.
+    """
 
     cfg = make_sage_decode_config(
         tile_size_q=tile_size_q,
         tile_size_kv=256 if tile_size_q == 64 else 128,
         o_dtype=o_dtype,
         mask_type=mask_type,
+        sage_args={"use_persistent_scheduler": persistent},
     )
     assert cfg.use_sage_attention
+    assert cfg.use_persistent_scheduler is persistent
     assert cfg.streams_tmem_p_fragments
     assert cfg.use_fp8_qkv
     assert cfg.out_dtype == o_dtype
     assert not cfg.defers_softmax_anchor_updates
+
+
+def test_attention_ts_decode_dense_sage_q128_rejects_the_persistent_scheduler() -> None:
+    """Dense contiguous Q128/KV128 runs the static grid by policy, with or without Sage."""
+
+    with pytest.raises(ValueError, match="grouped KeepsMmaAb"):
+        make_sage_decode_config(
+            tile_size_q=128,
+            tile_size_kv=128,
+            sage_args={"use_persistent_scheduler": True},
+        )
 
 
 @pytest.mark.parametrize(
@@ -2538,7 +2561,6 @@ def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
             {"qkv_dtype": Float16, "o_dtype": Float16},
             "Float8E4M3FN Q, K and V",
         ),
-        (64, 256, {"sage_args": {"use_persistent_scheduler": True}}, "persistent"),
         (
             64,
             256,

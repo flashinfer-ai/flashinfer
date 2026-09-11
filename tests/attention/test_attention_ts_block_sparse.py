@@ -1474,6 +1474,17 @@ def test_block_sparse_bshd_tma_strides_use_int64_for_large_batches() -> None:
     assert all(type(stride) is cutlass.Int64 for stride in (*q_strides, *kv_strides))
     assert tuple(map(int, q_strides)) == (16, 16, 262_144, 2_147_483_648)
     assert tuple(map(int, kv_strides)) == (262_144, 16, 2_147_483_648)
+    # One 16-byte stride unit holds sixteen 8-bit elements.
+    q_strides_fp8, kv_strides_fp8 = _block_sparse_bshd_tma_strides(
+        q_seq=cutlass.Int32(8192),
+        h_q=cutlass.Int32(16384),
+        h_k=cutlass.Int32(16384),
+        s_k=cutlass.Int32(8192),
+        d=cutlass.Int32(128),
+        element_bytes=1,
+    )
+    assert tuple(map(int, q_strides_fp8)) == (8, 8, 131_072, 1_073_741_824)
+    assert tuple(map(int, kv_strides_fp8)) == (131_072, 8, 1_073_741_824)
 
 
 def test_block_sparse_selects_native_kv256_only_for_qualified_geometry() -> None:
@@ -1579,6 +1590,150 @@ def test_block_sparse_static_profile_accepts_supported_gqa_groups(
     profile = _validate_static_block_sparse_heads(num_qo_heads, num_kv_heads)
 
     assert profile.q_tile_size == expected_q_tile
+
+
+def _make_sparse_sage_params(
+    *,
+    with_summary_scale: bool = False,
+) -> prims_ts.SageAttentionParams:
+    """Sage scales for the single-head 269-token static-profile checks."""
+
+    return make_sage_params(
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=269,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        kv_block_size=64,
+        with_summary_scale=with_summary_scale,
+    )
+
+
+def _validate_static_block_sparse_dtypes(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    output_dtype: torch.dtype | None,
+    *,
+    sage: prims_ts.SageAttentionParams | None = None,
+    use_proxy_routes: bool = False,
+) -> block_sparse_module._BlockSparseStaticProfile:
+    return block_sparse_module._validate_block_sparse_static_profile(
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=269,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=_HEAD_DIM,
+        q_block_size=64,
+        kv_block_size=64,
+        use_kv_valid_bits=False,
+        mask_type="dense",
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        output_dtype=output_dtype,
+        max_blocks_per_row=2,
+        use_proxy_routes=use_proxy_routes,
+        sage=sage,
+    )
+
+
+@pytest.mark.parametrize("output_dtype", (None, torch.bfloat16, torch.float16))
+def test_block_sparse_static_profile_relaxes_dtypes_with_sage(
+    output_dtype: torch.dtype | None,
+) -> None:
+    """Sage scales qualify E4M3 Q/K/V with a 16-bit output; BF16 is the default."""
+
+    profile = _validate_static_block_sparse_dtypes(
+        _FP8, _FP8, output_dtype, sage=_make_sparse_sage_params()
+    )
+
+    assert profile.dtype_key == "float8_e4m3fn"
+    assert profile.output_dtype == (output_dtype or torch.bfloat16)
+    assert profile.sage_k_block_size == 16
+
+
+@pytest.mark.parametrize(
+    ("q_dtype", "kv_dtype", "output_dtype", "error_type", "message"),
+    (
+        pytest.param(
+            _FP8, _FP8, _FP8, NotImplementedError, "float16", id="fp8-no-sage"
+        ),
+        # An 8-bit operand without Sage is pointed at the Sage parameters
+        # before the matching rule is applied.
+        pytest.param(
+            _FP8,
+            torch.bfloat16,
+            torch.bfloat16,
+            NotImplementedError,
+            "sage=SageAttentionParams",
+            id="mixed-no-sage",
+        ),
+        pytest.param(
+            torch.float16,
+            torch.float16,
+            torch.bfloat16,
+            ValueError,
+            "matching",
+            id="16-bit-output-mismatch",
+        ),
+    ),
+)
+def test_block_sparse_static_profile_keeps_16_bit_rules_without_sage(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    with pytest.raises(error_type, match=message):
+        _validate_static_block_sparse_dtypes(q_dtype, kv_dtype, output_dtype)
+    profile = _validate_static_block_sparse_dtypes(
+        torch.float16, torch.float16, torch.float16
+    )
+    assert profile.dtype_key == "float16"
+
+
+def test_block_sparse_static_profile_rejects_mismatched_sage_dtypes() -> None:
+    with pytest.raises(ValueError, match="Q and K"):
+        _validate_static_block_sparse_dtypes(
+            _FP8, torch.bfloat16, torch.bfloat16, sage=_make_sparse_sage_params()
+        )
+
+
+def test_block_sparse_proxy_routes_require_summary_scale_with_sage() -> None:
+    """Proxy routes dequantize summaries with ``k_summary_scale`` and nothing else does."""
+
+    with pytest.raises(ValueError, match="k_summary_scale"):
+        _validate_static_block_sparse_dtypes(
+            _FP8,
+            _FP8,
+            None,
+            sage=_make_sparse_sage_params(),
+            use_proxy_routes=True,
+        )
+    with pytest.raises(ValueError, match="k_summary_scale"):
+        _validate_static_block_sparse_dtypes(
+            _FP8,
+            _FP8,
+            None,
+            sage=_make_sparse_sage_params(with_summary_scale=True),
+        )
+    wrong_shape = replace(
+        _make_sparse_sage_params(with_summary_scale=True),
+        k_summary_scale=torch.rand((1, 3)),
+    )
+    with pytest.raises(ValueError, match="k_summary_scale"):
+        _validate_static_block_sparse_dtypes(
+            _FP8, _FP8, None, sage=wrong_shape, use_proxy_routes=True
+        )
+    profile = _validate_static_block_sparse_dtypes(
+        _FP8,
+        _FP8,
+        None,
+        sage=_make_sparse_sage_params(with_summary_scale=True),
+        use_proxy_routes=True,
+    )
+    assert profile.output_dtype == torch.bfloat16
 
 
 def _validate_static_profile_geometry(
@@ -5628,7 +5783,7 @@ _DENSE_MHA_Q64_KV256 = _Case(
     expected_kv_tile=256,
 )
 # The dense contiguous Q128/KV128 grouped-Keeps profile is qualified for
-# FP16 only; BF16 at that tile is currently a block-sparse-only recipe.
+# FP16 only; BF16 at that tile is a block-sparse-only recipe.
 _DENSE_GQA_Q128_KV128 = _Case(
     "dense_contiguous_gqa_q128_kv128",
     1,
@@ -5726,7 +5881,7 @@ def _plan_dense_contiguous(
 
 
 def test_public_exports_include_the_contiguous_decode_wrapper() -> None:
-    """The contiguous wrapper is public and the old name remains an alias."""
+    """The contiguous wrapper is public and ``BlockSparseTSWrapper`` is an alias."""
 
     assert prims_ts.BatchDecodeTSWrapper is block_sparse_module.BatchDecodeTSWrapper
     assert "BatchDecodeTSWrapper" in prims_ts.__all__

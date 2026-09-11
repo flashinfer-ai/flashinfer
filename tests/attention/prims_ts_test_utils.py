@@ -122,9 +122,15 @@ def make_sage_params(
     q_block_size: int = 1,
     k_block_size: int = 16,
     with_mean: bool = False,
+    with_summary_scale: bool = False,
+    kv_block_size: int = 64,
     device: torch.device | str = "cpu",
 ) -> SageAttentionParams:
-    """Return random positive scales of one geometry in the flat layout."""
+    """Return random positive scales of one geometry in the flat layout.
+
+    ``with_summary_scale`` adds the K summary scales that proxy routes
+    require, covering ``ceil(seq_len_kv / kv_block_size)`` summaries.
+    """
 
     def flat_scales(num_heads: int, seq_len: int, block_size: int) -> torch.Tensor:
         return torch.rand(
@@ -132,10 +138,16 @@ def make_sage_params(
             device=device,
         )
 
+    num_kv_blocks = math.ceil(seq_len_kv / kv_block_size)
     return SageAttentionParams(
         q_scale=flat_scales(num_qo_heads, seq_len_q, q_block_size),
         k_scale=flat_scales(num_kv_heads, seq_len_kv, k_block_size),
         v_scale=torch.rand((num_kv_heads, head_dim), device=device),
+        k_summary_scale=(
+            flat_scales(num_kv_heads, num_kv_blocks, k_block_size)
+            if with_summary_scale
+            else None
+        ),
         v_mean=(
             torch.randn((num_kv_heads, head_dim), device=device) if with_mean else None
         ),

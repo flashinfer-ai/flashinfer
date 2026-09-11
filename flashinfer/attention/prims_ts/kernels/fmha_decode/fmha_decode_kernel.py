@@ -128,6 +128,7 @@ def _block_sparse_bshd_tma_strides(
     h_k: cutlass.Integer | int,
     s_k: cutlass.Integer | int,
     d: cutlass.Integer | int,
+    element_bytes: int = 2,
 ) -> tuple[
     tuple[cutlass.Integer | int, ...],
     tuple[cutlass.Integer | int, ...],
@@ -135,13 +136,13 @@ def _block_sparse_bshd_tma_strides(
     """Build BSHD TensorMap strides in 16-byte units using Int64 math.
 
     The raw TensorMap API omits the implicit contiguous stride and takes the
-    remaining strides in 16-byte units. Block-sparse attention supports only
-    16-bit Q/K/V with headDim=128, so one stride unit contains eight elements.
-    Keep every returned value in Int64: the outer batch stride can exceed the
+    remaining strides in 16-byte units, so one unit holds ``16 /
+    element_bytes`` elements of the 16-bit or 8-bit Q/K/V (headDim=128). Keep
+    every returned value in Int64: the outer batch stride can exceed the
     signed Int32 range even though each public tensor dimension is Int32.
     """
 
-    elements_per_stride_unit = 8
+    elements_per_stride_unit = 16 // element_bytes
     d_units = Int64(d // elements_per_stride_unit)
     h_r = h_q // h_k
     return (
@@ -350,6 +351,8 @@ def _build_decode_gen_schedule(
     q_scale_head_stride: Int32 | None = None,
     k_scale_ptr: cute.Pointer | None = None,
     k_scale_head_stride: Int32 | None = None,
+    k_summary_scale_ptr: cute.Pointer | None = None,
+    k_summary_scale_head_stride: Int32 | None = None,
     v_scale_ptr: cute.Pointer | None = None,
     v_mean_ptr: cute.Pointer | None = None,
 ) -> tuple[
@@ -909,6 +912,14 @@ def _build_decode_gen_schedule(
             tma_oob_origin=max_seq_len_kv,
             name="smemBlockSparseKvMetadata1",
         )
+        sage_scale_sources = dict(
+            h_k_idx=h_k_idx,
+            b_idx=b_idx,
+            k_scale_ptr=k_scale_ptr,
+            k_scale_head_stride=k_scale_head_stride,
+            k_summary_scale_ptr=k_summary_scale_ptr,
+            k_summary_scale_head_stride=k_summary_scale_head_stride,
+        )
         sparse_softmax_metadata0 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata0_cfg,
             cfg=cfg,
@@ -916,6 +927,7 @@ def _build_decode_gen_schedule(
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
             name="smemBlockSparseSoftmaxMetadata0",
+            **sage_scale_sources,
         )
         sparse_softmax_metadata1 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata1_cfg,
@@ -924,6 +936,7 @@ def _build_decode_gen_schedule(
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
             name="smemBlockSparseSoftmaxMetadata1",
+            **sage_scale_sources,
         )
     smem_kv = None
     smem_k0 = None
@@ -2019,6 +2032,8 @@ def _run_decode_gen_active(
     g_v_mean: cute.Pointer | None = None,
     g_q_scale_head_stride: Int32 | None = None,
     g_k_scale_head_stride: Int32 | None = None,
+    g_k_summary_scale: cute.Pointer | None = None,
+    g_k_summary_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Run the complete decode body for one runtime-valid Q tile.
 
@@ -2164,6 +2179,8 @@ def _run_decode_gen_active(
         q_scale_head_stride=g_q_scale_head_stride,
         k_scale_ptr=g_k_scale,
         k_scale_head_stride=g_k_scale_head_stride,
+        k_summary_scale_ptr=g_k_summary_scale,
+        k_summary_scale_head_stride=g_k_summary_scale_head_stride,
         v_scale_ptr=g_v_scale,
         v_mean_ptr=g_v_mean,
         page_idx_kv=g_page_idx_kv,
@@ -2359,6 +2376,8 @@ def _run_decode_gen_runtime_prefix(
     g_v_mean: cute.Pointer | None = None,
     g_q_scale_head_stride: Int32 | None = None,
     g_k_scale_head_stride: Int32 | None = None,
+    g_k_summary_scale: cute.Pointer | None = None,
+    g_k_summary_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Run the general runtime split-prefix producer or retire its suffix."""
 
@@ -2433,6 +2452,8 @@ def _run_decode_gen_runtime_prefix(
                 g_v_mean=g_v_mean,
                 g_q_scale_head_stride=g_q_scale_head_stride,
                 g_k_scale_head_stride=g_k_scale_head_stride,
+                g_k_summary_scale=g_k_summary_scale,
+                g_k_summary_scale_head_stride=g_k_summary_scale_head_stride,
             )
         else:
             _run_decode_gen_inactive_cluster_rank()
@@ -2486,6 +2507,8 @@ def _run_decode_gen_runtime_prefix(
                 g_v_mean=g_v_mean,
                 g_q_scale_head_stride=g_q_scale_head_stride,
                 g_k_scale_head_stride=g_k_scale_head_stride,
+                g_k_summary_scale=g_k_summary_scale,
+                g_k_summary_scale_head_stride=g_k_summary_scale_head_stride,
             )
         else:
             _signal_padded_pdl_producer(cfg)
@@ -2534,6 +2557,8 @@ def decode_gen_kernel(
     g_v_mean: cute.Pointer | None = None,
     g_q_scale_head_stride: Int32 | None = None,
     g_k_scale_head_stride: Int32 | None = None,
+    g_k_summary_scale: cute.Pointer | None = None,
+    g_k_summary_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
@@ -2605,6 +2630,8 @@ def decode_gen_kernel(
                 g_v_mean=g_v_mean,
                 g_q_scale_head_stride=g_q_scale_head_stride,
                 g_k_scale_head_stride=g_k_scale_head_stride,
+                g_k_summary_scale=g_k_summary_scale,
+                g_k_summary_scale_head_stride=g_k_summary_scale_head_stride,
             )
         else:
             _run_decode_gen_runtime_prefix(
@@ -2655,6 +2682,8 @@ def decode_gen_kernel(
                 g_v_mean=g_v_mean,
                 g_q_scale_head_stride=g_q_scale_head_stride,
                 g_k_scale_head_stride=g_k_scale_head_stride,
+                g_k_summary_scale=g_k_summary_scale,
+                g_k_summary_scale_head_stride=g_k_summary_scale_head_stride,
             )
     else:
         # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
@@ -2977,6 +3006,14 @@ def fmha_block_sparse_launch(
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
+    q_scale_iter: cute.Pointer | None = None,
+    k_scale_iter: cute.Pointer | None = None,
+    k_summary_scale_iter: cute.Pointer | None = None,
+    v_scale_iter: cute.Pointer | None = None,
+    v_mean_iter: cute.Pointer | None = None,
+    q_scale_head_stride: Int32 | None = None,
+    k_scale_head_stride: Int32 | None = None,
+    k_summary_scale_head_stride: Int32 | None = None,
 ) -> None:
     """Launch attention over exact and typed exact/proxy prepared KV routes.
 
@@ -2985,6 +3022,8 @@ def fmha_block_sparse_launch(
     words. Exact routes address K/V; proxy routes address summary K/V. Both
     layouts execute the same ``decode_gen_kernel`` schedule and
     physical copy policy. Exact builds constexpr-elide summary TensorMaps.
+    The Sage scale pointers and head strides are consumed only by a Sage
+    attention config; ``k_summary_scale`` only by its proxy routes.
     """
     if cutlass.const_expr(not cfg.use_block_sparse):
         raise ValueError("fmha_block_sparse_launch requires block-sparse config")
@@ -3001,10 +3040,11 @@ def fmha_block_sparse_launch(
         h_k=h_k,
         s_k=s_k,
         d=d,
+        element_bytes=cfg.kv_dtype_bytes,
     )
 
-    # FP16/BF16 H128 uses a 64-element (128-byte) inner box.  The sparse
-    # profile validator rejects other element widths and head dimensions.
+    # H128 uses a 128-byte inner box: 64 two-byte or 128 one-byte elements.
+    # The sparse profile validator rejects other head dimensions.
     tma_box0 = min(128 // cfg.kv_dtype_bytes, cfg.headdim)
     tma_swizzle = cuda.TensorMapSwizzle.s128b
     # Public tensors are contiguous BSHD. Q is factored into (Hr, Hkv) so the
@@ -3133,6 +3173,7 @@ def fmha_block_sparse_launch(
                 h_k=h_k,
                 s_k=num_kv_blocks,
                 d=d,
+                element_bytes=cfg.kv_dtype_bytes,
             )
             summary_dims = (d, num_kv_blocks, h_k, b)
             k_desc_summary_primary = create_tensor_map_tiled(
@@ -3233,6 +3274,14 @@ def fmha_block_sparse_launch(
         tma_desc_v_summary=v_desc_summary_primary,
         tma_desc_k_summary_atom=k_desc_summary_atom,
         tma_desc_v_summary_atom=v_desc_summary_atom,
+        g_q_scale=q_scale_iter,
+        g_k_scale=k_scale_iter,
+        g_v_scale=v_scale_iter,
+        g_v_mean=v_mean_iter,
+        g_q_scale_head_stride=q_scale_head_stride,
+        g_k_scale_head_stride=k_scale_head_stride,
+        g_k_summary_scale=k_summary_scale_iter,
+        g_k_summary_scale_head_stride=k_summary_scale_head_stride,
     ).launch(
         grid=grid,
         block=[cfg.threads_per_cta, 1, 1],

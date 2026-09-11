@@ -86,11 +86,14 @@ from .helpers_common import (
 from .smem_block_sparse_metadata import (
     _SOFTMAX_ROUTE_IS_PROXY_FLAG,
     _proxy_log2_block_mass,
+    _proxy_static_tail_fragment,
     _proxy_tail_summary,
     _swaps_forwards_packed_route_full,
 )
 from .sage_scales import (
+    dequant_scales_from_staged_k_scales,
     load_dequant_scales,
+    load_q_scale,
     sage_scale_arr_size,
 )
 from .helpers_kv_tile_idx import (
@@ -250,6 +253,12 @@ class TmemSResource(DecodeGenResourceBase):
             None,
             "Sage dequantization multipliers for the current tile's fragments.",
         ),
+        (
+            "sage_q_scale",
+            Float32,
+            Float32(1.0),
+            "Sage Q scale of the lane's row, loaded once per work tile.",
+        ),
     )
     inst_id: Constexpr[int] = 0
     cfg: Constexpr[FmhaDecodeConfig] = None
@@ -277,6 +286,7 @@ class TmemSResource(DecodeGenResourceBase):
     new_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     s_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sage_scale_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    sage_q_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder register and scratch state for softmax."""
@@ -1935,9 +1945,42 @@ class TmemSResource(DecodeGenResourceBase):
             use_sparse=False,
         )
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_q_scale)
+    @cute.jit
+    def load_sage_q_scale(self, stage_info: StageInfo) -> Float32:
+        """Load ``sfQ`` of the lane's Q row once per work tile.
+
+        The row is fixed for the tile, so the value serves every KV tile or
+        route of the softmax loop; only ``sfK`` changes per tile.
+        """
+        cfg = self.cfg
+        assert cfg.use_sage_attention
+        task_cache = _decode_gen_task_cache(stage_info)
+        warp_group_thread_idx = Int32(task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX])
+        kv_head_idx, batch_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        q_token_idx, local_head_idx = _q_row_token_and_local_head(
+            cfg,
+            self.h_r,
+            _logical_q_group_idx(cfg, stage_info, self.q_group_idx),
+            _keeps_row_idx(cfg, warp_group_thread_idx),
+        )
+        return load_q_scale(
+            cfg,
+            self.q_scale_ptr,
+            self.q_scale_head_stride,
+            kv_head_idx=kv_head_idx,
+            local_head_idx=local_head_idx,
+            batch_idx=batch_idx,
+            q_token_idx=q_token_idx,
+        )
+
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_scale_arr)
     @cute.jit
-    def load_sage_scales(self, stage_info: StageInfo) -> cutlass.Array:
+    def load_sage_scales(
+        self, stage_info: StageInfo, *, sage_q_scale: Float32
+    ) -> cutlass.Array:
         """Load the tile's Sage dequantization multipliers ahead of the S wait.
 
         Each lane owns one Q row and four K32 fragments whose first tokens
@@ -1962,15 +2005,6 @@ class TmemSResource(DecodeGenResourceBase):
             _tile_is_unmasked,
             _rows_are_active,
         ) = self._resolve_keeps_tile_context(stage_info)
-        kv_head_idx, batch_idx = _logical_head_batch(
-            stage_info, self.h_k_idx, self.b_idx
-        )
-        q_token_idx, local_head_idx = _q_row_token_and_local_head(
-            cfg,
-            self.h_r,
-            logical_q_group_idx,
-            _keeps_row_idx(cfg, warp_group_thread_idx),
-        )
         col_base = _keeps_col_base(cfg, lane_idx, num_fragments * fragment_regs)
         fragment_first_tokens: tuple = ()
         for fragment_idx in cutlass.range_constexpr(num_fragments):
@@ -1983,19 +2017,40 @@ class TmemSResource(DecodeGenResourceBase):
                     col_base,
                 ),
             )
+        kv_head_idx, batch_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
         return load_dequant_scales(
             cfg,
-            q_scale_ptr=self.q_scale_ptr,
-            q_scale_head_stride=self.q_scale_head_stride,
-            k_scale_ptr=self.k_scale_ptr,
+            q_scale=sage_q_scale,
+            k_scale_addr=self.k_scale_ptr.toint(),
             k_scale_head_stride=self.k_scale_head_stride,
             kv_head_idx=kv_head_idx,
             batch_idx=batch_idx,
-            local_head_idx=local_head_idx,
-            q_token_idx=q_token_idx,
             seq_len_kv=seq_len_kv,
             fragment_first_tokens=fragment_first_tokens,
         )
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_scale_arr)
+    @cute.jit
+    def load_block_sparse_sage_scales(
+        self,
+        stage_info: StageInfo,
+        *,
+        staged_k_scales: cutlass.Array,
+        sage_q_scale: Float32,
+    ) -> cutlass.Array:
+        """Combine the route's staged ``sfK`` words with the lane's ``sfQ``.
+
+        The load warp stages one ``sfK`` per scale group of the lane's
+        fragments next to the route origins (see
+        ``SmemBlockSparseSoftmaxMetadataResource``) and ``sfQ`` is loaded once
+        per work tile, so the route issues no global load of its own.
+        """
+        cfg = self.cfg
+        assert cfg.use_sage_attention and cfg.use_block_sparse
+        del stage_info
+        return dequant_scales_from_staged_k_scales(cfg, sage_q_scale, staged_k_scales)
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit
@@ -2305,29 +2360,46 @@ class TmemSResource(DecodeGenResourceBase):
                     Float32(_proxy_log2_block_mass(cfg)) * inv_scale_softmax_log2
                 )
                 tail_shift = Float32(tail_log2_delta) * inv_scale_softmax_log2
-            # The tail summary's location follows the staged atom origins; the
-            # shift itself is one add per copy of the masked pass.
+            # The Sage shift below divides by the lane's group scale, so every
+            # fragment copy of it in the masked pass carries a reciprocal and
+            # a scale-array read; a compile-time tail location keeps one copy
+            # and drops the per-fragment origin arithmetic. The 16-bit shift is
+            # one add and keeps the origin-derived location.
+            static_tail = None
+            if cutlass.const_expr(tail_log2_delta != 0.0 and cfg.use_sage_attention):
+                static_tail = _proxy_static_tail_fragment(cfg)
             if cutlass.const_expr(tail_log2_delta != 0.0):
-                for fragment_idx in cutlass.range_constexpr(num_fragments):
-                    atom_offset = Int32(
-                        (fragment_idx % fragments_per_origin) * fragment_regs
-                    )
-                    fragment_origin = origin0 + atom_offset
-                    fragment_valid = valid0
-                    if cutlass.const_expr(fragment_idx >= fragments_per_origin):
-                        fragment_origin = origin1 + atom_offset
-                        fragment_valid = valid1
-                    tail_offset = Int32(tail_summary_idx) - fragment_origin
-                    # Invalid atoms never hold the tail.
-                    if (
-                        route_is_proxy
-                        and fragment_valid != Int32(0)
-                        and tail_offset >= Int32(0)
-                        and tail_offset < Int32(fragment_regs)
-                    ):
-                        tail_fragment_mask = tail_fragment_mask | Int32(
-                            1 << fragment_idx
+                if cutlass.const_expr(static_tail is not None):
+                    tail_half, tail_static_fragment = static_tail
+                    holds_tail = route_is_proxy
+                    if cutlass.const_expr(cfg.tile_size_kv == 256):
+                        holds_tail = cutlass.Boolean(
+                            route_is_proxy
+                            and (warp_group_thread_idx >> Int32(6)) == Int32(tail_half)
                         )
+                    if holds_tail:
+                        tail_fragment_mask = Int32(1 << tail_static_fragment)
+                else:
+                    for fragment_idx in cutlass.range_constexpr(num_fragments):
+                        atom_offset = Int32(
+                            (fragment_idx % fragments_per_origin) * fragment_regs
+                        )
+                        fragment_origin = origin0 + atom_offset
+                        fragment_valid = valid0
+                        if cutlass.const_expr(fragment_idx >= fragments_per_origin):
+                            fragment_origin = origin1 + atom_offset
+                            fragment_valid = valid1
+                        tail_offset = Int32(tail_summary_idx) - fragment_origin
+                        # Invalid atoms never hold the tail.
+                        if (
+                            route_is_proxy
+                            and fragment_valid != Int32(0)
+                            and tail_offset >= Int32(0)
+                            and tail_offset < Int32(fragment_regs)
+                        ):
+                            tail_fragment_mask = tail_fragment_mask | Int32(
+                                1 << fragment_idx
+                            )
                 tail_fragment_mask = cute.arch.make_warp_uniform(tail_fragment_mask)
                 # The shifted tail score must reach TMEM for the P pass, so
                 # the route takes the store branch; the vote keeps the branch
@@ -2415,13 +2487,33 @@ class TmemSResource(DecodeGenResourceBase):
                         and cfg.use_block_sparse_proxy_routes
                         and tail_log2_delta != 0.0
                         and score_idx == tail_lane
+                        and (static_tail is None or fragment_idx == static_tail[1])
                     ):
                         # The final summary's shortfall is a score-unit shift;
-                        # a masked score stays at the sentinel in fp32.
+                        # a masked score stays at the sentinel in fp32. Sage
+                        # scores are quantized, so the shift is divided by the
+                        # lane's group scale. The approximate reciprocal is
+                        # within one ulp on a shift far below the score
+                        # resolution, and unlike the correctly rounded one it
+                        # needs no out-of-line slow-path call per fragment.
                         if (
                             (tail_fragment_mask >> Int32(fragment_idx)) & Int32(1)
                         ) != Int32(0):
-                            score = score + tail_shift
+                            lane_shift = tail_shift
+                            if cutlass.const_expr(cfg.use_sage_attention):
+                                groups = cfg.sage_k_groups_per_fragment
+                                tail_group: Constexpr[int] = tail_lane // (
+                                    fragment_regs // groups
+                                )
+                                lane_shift = tail_shift * cute.math.rcp(
+                                    Float32(
+                                        sage_scale_arr[
+                                            fragment_idx * groups + tail_group
+                                        ]
+                                    ),
+                                    approx=True,
+                                )
+                            score = score + lane_shift
                     masked_scores[score_idx] = score
                     if cutlass.const_expr(not cfg.use_sage_attention):
                         chain_idx: Constexpr[int] = score_idx % 4
@@ -2533,6 +2625,45 @@ class TmemSResource(DecodeGenResourceBase):
             max_chains[fold_chain] = cute.math.max(
                 max_chains[fold_chain], scaled_max, ftz=True
             )
+
+    @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
+    @cute.jit
+    def compute_sage_block_sparse_softmax_loop(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        sparse_origin0: Int32,
+        sparse_origin1: Int32,
+        sparse_route_flags: Int32,
+        sparse_token_word0: Uint32,
+        sparse_token_word1: Uint32,
+        sparse_token_word2: Uint32,
+        sparse_token_word3: Uint32,
+        sage_scale_arr: cutlass.Array,
+    ) -> tuple[object, object, object, object]:
+        """Consume one routed S payload with per-group Sage scales."""
+
+        assert self.cfg.use_block_sparse and self.cfg.use_sage_attention
+        return self._compute_softmax_loop_keeps_fragments(
+            stage_info,
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            use_sparse=True,
+            sparse_origin0=sparse_origin0,
+            sparse_origin1=sparse_origin1,
+            sparse_route_flags=sparse_route_flags,
+            sparse_token_word0=sparse_token_word0,
+            sparse_token_word1=sparse_token_word1,
+            sparse_token_word2=sparse_token_word2,
+            sparse_token_word3=sparse_token_word3,
+            sage_scale_arr=sage_scale_arr,
+        )
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit

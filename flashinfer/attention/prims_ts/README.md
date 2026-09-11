@@ -96,7 +96,9 @@ mean per semantic KV block; each proxy block then counts as its number of
 structural tokens in the softmax. V summaries must be per-block means: a
 per-block sum is not detectable and yields outputs scaled by the block mass.
 The final partial block averages only its structural tokens. Optional `kv_valid_bits` filters exact K/V tokens only and
-does not change proxy summaries or their represented mass.
+does not change proxy summaries or their represented mass. With Sage attention
+the summaries are E4M3 and `SageAttentionParams.k_summary_scale` carries the
+flat-layout scales of the K summaries.
 
 ## Validation
 

@@ -729,7 +729,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
             kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
-            chunk_hd = min(head_dim_stage, 64)
+            # One chunk is one swizzled 128-byte row: 64 two-byte or 128
+            # one-byte elements, matching the TensorMap inner box.
+            chunk_hd = min(head_dim_stage, 128 // cfg.kv_dtype_bytes)
             num_chunks = head_dim_stage // chunk_hd
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
             if cutlass.const_expr(cfg.use_paged_kv):

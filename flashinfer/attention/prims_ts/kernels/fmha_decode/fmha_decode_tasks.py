@@ -2816,6 +2816,9 @@ def _softmax_schedule_body(
     smem_p.init_compute_state()
     if sparse_softmax_metadata is not None:
         sparse_softmax_metadata.init_read_state()
+    if cutlass.const_expr(cfg.use_sage_attention):
+        # The lane's Q row is fixed for the work tile.
+        sage_q_scale = tmem_s.load_sage_q_scale()
     # The Sage loops take the tile's dequantization multipliers, the
     # block-sparse loops the register-resident route payload and the proxy
     # P pass its route kind; the work framework routes arguments by token
@@ -2825,11 +2828,13 @@ def _softmax_schedule_body(
         (False, False): tmem_s.compute_softmax_loop,
         (False, True): tmem_s.compute_sage_softmax_loop,
         (True, False): tmem_s.compute_block_sparse_softmax_loop,
+        (True, True): tmem_s.compute_sage_block_sparse_softmax_loop,
     }[(use_sparse, cfg.use_sage_attention)]
     compute_p_fragments = {
         (False, False): smem_p.compute_p_fragments,
         (False, True): smem_p.compute_sage_p_fragments,
         (True, False): smem_p.compute_proxy_route_p_fragments,
+        (True, True): smem_p.compute_sage_proxy_route_p_fragments,
     }[(cfg.use_block_sparse_proxy_routes, cfg.use_sage_attention)]
 
     with domain_loop(0, domain, 1, unroll=1) as d:
@@ -2848,11 +2853,19 @@ def _softmax_schedule_body(
                 sparse_token_word2,
                 sparse_token_word3,
             ) = sparse_softmax_metadata.load_route()
+            if cutlass.const_expr(cfg.use_sage_attention):
+                staged_k_scales = sparse_softmax_metadata.load_route_sage_k_scales()
             sparse_softmax_metadata.release()
         if cutlass.const_expr(cfg.use_sage_attention):
             # Issue the tile's scale loads ahead of the score wait so their
             # latency hides behind the QK MMA.
-            sage_scale_arr = tmem_s.load_sage_scales()
+            if sparse_softmax_metadata is not None:
+                sage_scale_arr = tmem_s.load_block_sparse_sage_scales(
+                    staged_k_scales=staged_k_scales,
+                    sage_q_scale=sage_q_scale,
+                )
+            else:
+                sage_scale_arr = tmem_s.load_sage_scales(sage_q_scale=sage_q_scale)
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()
         softmax_loop_kwargs = dict(
