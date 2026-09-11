@@ -1275,8 +1275,9 @@ def _prepared_descriptor_storage(
         world_size,
         rows,
     )
-    with torch.cuda.stream(main_stream):
-        descriptors.copy_(host_descriptors, non_blocking=True)
+    # Both prepared call sites pass this device's current stream. Tensor.copy_
+    # uses the destination device's current stream and tracks pinned-source lifetime.
+    descriptors.copy_(host_descriptors, non_blocking=True)
     ready_event = torch.cuda.Event(enable_timing=False)
     ready_event.record(main_stream)
     entry = _PreparedDescriptorEntry(
