@@ -103,7 +103,7 @@ def _validate_cutlass_launch_tensors(
             )
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1)
 def get_mla_module():
     return gen_mla_module().build_and_load()
 

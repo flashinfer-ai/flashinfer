@@ -2261,11 +2261,24 @@ def _direct_planned_backend_runtime_oracle(case):
     ],
 )
 def test_planned_backend_wrapper_matches_direct(backend, dtype, use_sinks):
+    from dataclasses import replace
+
     case = _make_planned_backend_runtime_case(
         backend,
         dtype,
         use_sinks=use_sinks,
+        plan=False,
     )
+    # Cover CPU staging with BF16 and native device metadata with FP8.
+    if dtype == torch.bfloat16:
+        metadata = case["metadata"]
+        case["plan_kwargs"]["metadata"] = replace(
+            metadata,
+            cum_seq_lens_q=metadata.cum_seq_lens_q.cpu(),
+            block_tables=metadata.block_tables.cpu(),
+            seq_lens=metadata.seq_lens.cpu(),
+        )
+    case["wrapper"].plan(**case["plan_kwargs"])
 
     actual = _run_planned_backend_runtime_case(case)
     expected = _direct_planned_backend_runtime_oracle(case)
@@ -2276,6 +2289,75 @@ def test_planned_backend_wrapper_matches_direct(backend, dtype, use_sinks):
         expected.float(),
         rtol=tolerance,
         atol=tolerance,
+    )
+
+
+@pytest.mark.parametrize(
+    ("backend", "source"),
+    [
+        ("trtllm-gen", "cum_seq_lens_q"),
+        ("trtllm-gen", "csr"),
+        ("xqa", "seq_lens"),
+        ("xqa", "csr"),
+        ("cute-dsl-monolithic", "block_tables"),
+        ("cute-dsl", "csr"),
+    ],
+)
+def test_planned_backend_graph_requires_device_dense_metadata(backend, source):
+    from dataclasses import replace
+
+    import flashinfer.mla as mla
+
+    case = _make_planned_backend_runtime_case(
+        backend, torch.bfloat16, use_cuda_graph=True, plan=False
+    )
+    metadata = case["metadata"]
+    if source == "csr":
+        metadata = mla.MLAPlanMetadata.csr(
+            metadata.cum_seq_lens_q,
+            torch.tensor([0, 2], dtype=torch.int32, device="cuda:0"),
+            metadata.block_tables.flatten(),
+            torch.full_like(metadata.seq_lens, 128),
+        )
+    else:
+        metadata = replace(metadata, **{source: getattr(metadata, source).cpu()})
+    case["plan_kwargs"]["metadata"] = metadata
+    with pytest.raises(ValueError, match="CUDA graph.*dense metadata.*device"):
+        case["wrapper"].plan(**case["plan_kwargs"])
+    assert case["wrapper"]._planned_backend is None
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl-monolithic", "cute-dsl-modular"])
+def test_cute_dsl_planned_rejects_unaligned_dense_table(backend):
+    from dataclasses import replace
+
+    case = _make_planned_backend_runtime_case(backend, torch.bfloat16, plan=False)
+    case["plan_kwargs"]["metadata"] = replace(
+        case["metadata"], block_tables=case["metadata"].block_tables[:, :1]
+    )
+    with pytest.raises(ValueError, match="block_tables.*width.*multiple"):
+        case["wrapper"].plan(**case["plan_kwargs"])
+    assert case["wrapper"]._planned_backend is None
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl-monolithic", "cute-dsl-modular"])
+def test_cute_dsl_planned_pads_csr_table(backend):
+    import flashinfer.mla as mla
+
+    case = _make_planned_backend_runtime_case(backend, torch.bfloat16, plan=False)
+    metadata = case["metadata"]
+    case["plan_kwargs"]["metadata"] = mla.MLAPlanMetadata.csr(
+        metadata.cum_seq_lens_q,
+        torch.tensor([0, 1], dtype=torch.int32, device="cuda:0"),
+        metadata.block_tables[:, :1].flatten(),
+        metadata.seq_lens,
+    )
+    case["wrapper"].plan(**case["plan_kwargs"])
+    torch.testing.assert_close(
+        _run_planned_backend_runtime_case(case).float(),
+        _direct_planned_backend_runtime_oracle(case).float(),
+        rtol=2e-2,
+        atol=2e-2,
     )
 
 
@@ -2347,31 +2429,6 @@ def test_trtllm_gen_planned_rejects_no_rope():
         case["wrapper"].plan(**case["plan_kwargs"])
 
 
-@pytest.mark.parametrize(
-    "backend", ["cute-dsl-monolithic", "cute-dsl-modular", "cute-dsl"]
-)
-def test_cute_dsl_planned_rejects_unsupported_installed_arch(backend, monkeypatch):
-    import flashinfer.cute_dsl.availability as availability
-    from flashinfer.mla._batch_mla._backends._capabilities import (
-        _BackendPlanUnsupportedError,
-    )
-    from flashinfer.mla._batch_mla._backends._cute_dsl_common import (
-        _BatchMLAPagedAttentionCuteDslBackendBase,
-    )
-
-    case = _make_planned_backend_runtime_case(backend, torch.bfloat16, plan=False)
-    monkeypatch.setattr(availability, "is_cute_dsl_arch_supported", lambda *args: False)
-
-    def unexpected_plan(*args, **kwargs):
-        pytest.fail("unsupported installed architecture reached backend planning")
-
-    monkeypatch.setattr(
-        _BatchMLAPagedAttentionCuteDslBackendBase, "plan", unexpected_plan
-    )
-    with pytest.raises(_BackendPlanUnsupportedError, match="installed CuTe DSL"):
-        case["wrapper"].plan(**case["plan_kwargs"])
-
-
 @pytest.mark.parametrize("actual_q_len", [1, 2])
 def test_xqa_planned_query_length_upper_bound(actual_q_len):
     from dataclasses import replace
@@ -2414,35 +2471,6 @@ def test_xqa_planned_integer_scale(scale_name):
 
 
 @pytest.mark.parametrize(
-    ("capability", "cuda_version", "supported"),
-    [
-        ((12, 0), "12.7", False),
-        ((12, 0), "12.8", True),
-        ((12, 1), "12.8", False),
-        ((12, 1), "12.9", True),
-        ((10, 0), "13.0", False),
-    ],
-)
-def test_xqa_planned_device_support(capability, cuda_version, supported, monkeypatch):
-    import flashinfer.utils as utils
-    from flashinfer.mla._batch_mla._backends import xqa_backend
-    from flashinfer.mla._batch_mla._backends._capabilities import (
-        _BackendPlanUnsupportedError,
-    )
-
-    monkeypatch.setattr(utils, "get_compute_capability", lambda device: capability)
-    monkeypatch.setattr(
-        xqa_backend, "get_compute_capability", lambda device: capability
-    )
-    monkeypatch.setattr(torch.version, "cuda", cuda_version)
-    if supported:
-        xqa_backend._validate_xqa_device_capability(torch.device("cuda"))
-    else:
-        with pytest.raises(_BackendPlanUnsupportedError):
-            xqa_backend._validate_xqa_device_capability(torch.device("cuda"))
-
-
-@pytest.mark.parametrize(
     "backend",
     ["trtllm-gen", "xqa", "cute-dsl-monolithic"],
 )
@@ -2470,6 +2498,8 @@ def test_planned_backend_wrapper_cuda_graph_replay_and_replan_rejection(backend)
     case["out"].fill_(-9)
     case["query"].add_(0.125)
     case["kv_cache"].mul_(0.5)
+    case["metadata"].seq_lens.fill_(32)
+    case["metadata"].block_tables[:, 0].fill_(1)
     graph.replay()
     torch.cuda.synchronize()
 

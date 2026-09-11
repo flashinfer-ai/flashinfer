@@ -38,7 +38,7 @@ _XQA_MIN_WORKSPACE_BYTES = 128 * 1024 * 1024
 _XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 
-@functools.cache
+@functools.lru_cache(maxsize=128)
 def get_xqa_module_mla(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -201,6 +201,7 @@ class _BatchMLAPagedAttentionXqaBackend:
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
             raise _BackendPlanUnsupportedError(reason)
         _validate_xqa_device_capability(args._float_workspace_buffer.device)
+        args.require_cuda_graph_dense_metadata("xqa")
         dense = args.native_device_dense()
         backend = cls(args._float_workspace_buffer)
         backend.plan(

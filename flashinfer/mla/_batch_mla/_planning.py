@@ -704,6 +704,31 @@ class _MLAPlanArguments:
             table_width_alignment=table_width_alignment
         )
 
+    def require_cuda_graph_dense_metadata(self, backend_name: str) -> None:
+        """Keep graph launch metadata in caller-owned device storage."""
+        if not self._use_cuda_graph:
+            return
+        device = self._float_workspace_buffer.device
+        if any(
+            not isinstance(tensor, torch.Tensor) or tensor.device != device
+            for tensor in (
+                self.metadata.cum_seq_lens_q,
+                self.metadata.block_tables,
+                self.metadata.seq_lens,
+            )
+        ):
+            raise ValueError(
+                f"{backend_name} CUDA graph plans require supplied dense metadata "
+                f"on the wrapper device {device}; CPU metadata and CSR-only "
+                "metadata would be copied rather than observe in-place updates."
+            )
+
+    def device_dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
+        return self._metadata_resolver.resolve_device_dense(
+            table_width_alignment=table_width_alignment
+        )
+
     def native_dense(self) -> _DensePlanMetadata:
         self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_native_dense()

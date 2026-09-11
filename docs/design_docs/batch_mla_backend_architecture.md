@@ -425,10 +425,12 @@ The resolver preserves a supplied native representation. If conversion is
 needed, the derived representation is cached only for that plan request. FA2
 and FA3 request CSR metadata and stage launch metadata to the wrapper device.
 CUTLASS, cuTile, TRTLLM-GEN, XQA, and CuTe DSL request dense metadata. CUTLASS,
-cuTile, XQA, and CuTe DSL require device-resident dense tensors; TRTLLM-GEN
-preserves the supplied dense tensors and stages them only as its native launch
-requires. Dense table width is aligned to `128 / page_size` for backends whose
-native kernel requires that ownership convention.
+cuTile, TRTLLM-GEN, XQA, and CuTe DSL launch with device-resident dense
+tensors. Non-graph plans may stage CPU metadata or derive dense tables from
+CSR. Such copies are snapshots taken during planning, not live views of the
+source tensors. For backends requiring table-width alignment to
+`128 / page_size`, the resolver pads CSR-derived tables and rejects supplied
+dense tables with an unaligned width.
 
 Canonical metadata receives strict shape and value validation. Deprecated flat
 CSR input is normalized through the same resolver but deliberately isolates the
@@ -612,8 +614,8 @@ TRTLLM-GEN derives compact query variability from `cum_seq_lens_q`; CuTe derives
 KV-length variability from `seq_lens`. The same inference works for canonical
 CSR input because normalization maps `qo_indptr` to `cum_seq_lens_q` and
 `kv_len_arr` to `seq_lens`. A CuTe fixed-pointer CUDA Graph plan conservatively
-uses the variable-sequence specialization so later in-place length updates stay
-within the compiled contract.
+uses the variable-sequence specialization so later in-place device length
+updates stay within the compiled contract.
 
 ## Plan state and CUDA Graph safety
 
@@ -655,6 +657,17 @@ metadata and backend-owned workspace pointers frozen for replay without a
 parallel wrapper-owned backend-name classification. CuTe DSL modular rejects
 graph mode earlier because the current modular kernel path has no validated
 capture-safe contract.
+
+TRTLLM-GEN, XQA, and CuTe DSL graph plans require caller-supplied dense
+metadata with all three tensors on the wrapper device, contiguous, and
+`torch.int32`. CPU tensors and CSR-only metadata are rejected because staging
+or conversion would hide the storage consumed by replay. Convert metadata to
+dense device tensors before planning and retain those tensors. Update
+`seq_lens` and `block_tables` in place before replay, keeping lengths within
+reserved page-table/cache capacity and page indices valid. Keep query offsets,
+query lengths, and all tensor shapes fixed; these are compiled plan facts.
+Non-graph plans continue accepting CPU and CSR metadata. CuTe DSL modular
+continues to reject graph mode entirely.
 
 The wrapper does not currently expose a CUDA Graph plan-update API. Any future
 plan-update surface must remain capability-gated per concrete backend;

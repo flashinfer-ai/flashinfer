@@ -35,7 +35,7 @@ from ._capabilities import (
 _SUPPORTED_MLA_DIMENSIONS = frozenset({(512, 64), (256, 64)})
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1)
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
@@ -236,6 +236,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         cls._validate_plan_arguments_before_metadata(args)
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
             raise _BackendPlanUnsupportedError(reason)
+        args.require_cuda_graph_dense_metadata("trtllm-gen")
         dense = args.native_dense()
         backend = cls(args._float_workspace_buffer)
         backend.plan(
@@ -634,40 +635,40 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         lse_stride_heads: int,
     ) -> None:
         self._module.trtllm_paged_attention_decode(
-            out,
-            None,
-            query,
-            kv_cache,
-            kv_cache,
-            self._float_workspace_buffer,
-            self._multi_ctas_kv_counter_buffer,
-            self._block_tables,
-            self._seq_lens,
-            self._max_q_len,
-            self._max_seq_len,
-            bmm1_scale,
-            bmm2_scale,
-            -1,
-            -1,
-            0,
-            self._batch_size,
-            -1,
-            0,
-            self._sm_count,
-            self._enable_pdl,
+            out,  # out
+            None,  # out_scale_factor
+            query,  # query
+            kv_cache,  # key_cache
+            kv_cache,  # value_cache
+            self._float_workspace_buffer,  # workspace_buffer
+            self._multi_ctas_kv_counter_buffer,  # multi_ctas_kv_counter_buffer
+            self._block_tables,  # block_tables
+            self._seq_lens,  # seq_lens
+            self._max_q_len,  # max_q_len
+            self._max_seq_len,  # max_kv_len
+            bmm1_scale,  # bmm1_scale
+            bmm2_scale,  # bmm2_scale
+            -1,  # o_sf_scale
+            -1,  # o_sf_vec_size
+            0,  # o_sf_start_index
+            self._batch_size,  # batch_size
+            -1,  # window_left
+            0,  # sparse_mla_top_k
+            self._sm_count,  # sm_count
+            self._enable_pdl,  # enable_pdl
             self._float_workspace_buffer.numel()
-            * self._float_workspace_buffer.element_size(),
-            sinks,
-            cum_seq_lens_q,
-            None,
-            None,
-            skip_softmax_threshold_scale_factor,
-            True,
-            lse,
-            lse_stride_tokens,
-            lse_stride_heads,
-            False,
-            None,
-            0,
-            None,
+            * self._float_workspace_buffer.element_size(),  # workspace_size
+            sinks,  # attention_sinks
+            cum_seq_lens_q,  # cum_seq_lens_q
+            None,  # key_block_scales
+            None,  # value_block_scales
+            skip_softmax_threshold_scale_factor,  # skip_softmax_threshold_scale_factor
+            True,  # uses_shared_paged_kv_idx
+            lse,  # lse
+            lse_stride_tokens,  # lse_stride_tokens
+            lse_stride_heads,  # lse_stride_heads
+            False,  # enable_block_sparse_attention
+            None,  # sparse_mla_top_k_lens
+            0,  # bf16q_fp8kv_transform_mode
+            None,  # use_fp16_softmax
         )

@@ -31,7 +31,7 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1)
 def get_cutile_mla_decode():
     """Load the cuda.tile kernel only after the cuTile plan is validated."""
 
