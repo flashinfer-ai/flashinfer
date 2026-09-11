@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
 import torch
 
 from flashinfer.moe_ep import BootstrapConfig, FleetParams
@@ -13,6 +14,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cutedsl impor
     Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    bootstrap_paths,
     select_graph_compile_bucket,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.weights import (
@@ -76,6 +78,58 @@ def test_decode_graph_compile_bucket_selection() -> None:
     }
     for requested, bucket in expected.items():
         assert select_graph_compile_bucket(requested, capacity) == bucket
+
+
+def test_transport_requires_matching_token_back_mode() -> None:
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.heuristic import (
+        MegaMoEHeuristicInput,
+        MegaMoEHeuristicOverrides,
+        select_megamoe_config,
+    )
+
+    shape = MegaMoEHeuristicInput(
+        tokens_per_rank=8192,
+        hidden=4096,
+        intermediate=4096,
+        num_topk=6,
+        num_total_experts=256,
+        data_parallel_size=1,
+        tensor_parallel_size=1,
+        expert_parallel_size=8,
+        ep_same_numa_peer_count=3,
+        ep_cross_numa_peer_count=4,
+        num_sms=110,
+        sm_min_partition=8,
+        sm_partition_alignment=8,
+    )
+    valid_cases = (
+        ("p2p_direct", "epi_warps"),
+        ("nvshmem_ibgda", "reuse_dispatch_warps"),
+    )
+    for backend, token_back_mode in valid_cases:
+        config = select_megamoe_config(
+            shape,
+            MegaMoEHeuristicOverrides(
+                comm_backend=backend,
+                token_back_mode=token_back_mode,
+            ),
+        )
+        assert config.token_back_mode == token_back_mode
+
+    invalid_cases = (
+        ("p2p_direct", "reuse_dispatch_warps"),
+        ("nvshmem_ibgda", "epi_warps"),
+    )
+    for backend, token_back_mode in invalid_cases:
+        with pytest.raises(ValueError, match="requires token_back_mode"):
+            select_megamoe_config(
+                shape,
+                MegaMoEHeuristicOverrides(
+                    comm_backend=backend,
+                    token_back_mode=token_back_mode,
+                ),
+            )
 
 
 def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:

@@ -403,12 +403,6 @@ class MegaMoEKernelConfig:
             "epi_warps" if backend == "p2p_direct" else "reuse_dispatch_warps"
         )
         if (
-            backend == "p2p_direct"
-            and overrides.token_back_mode == "reuse_dispatch_warps"
-        ):
-            required_token_back = "reuse_dispatch_warps"
-            config = replace(config, token_back_mode=required_token_back)
-        if (
             overrides.token_back_mode is not None
             and overrides.token_back_mode != required_token_back
         ):

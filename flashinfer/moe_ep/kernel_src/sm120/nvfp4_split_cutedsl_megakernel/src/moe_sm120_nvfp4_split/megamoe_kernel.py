@@ -257,7 +257,13 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             raise ValueError(
                 "producer_sm_count is required for split_role='k2'."
             )
-        if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
+        if (
+            token_back_mode != "epi_warps"
+            and not (
+                comm_backend == "nvshmem_ibgda"
+                and token_back_mode == "reuse_dispatch_warps"
+            )
+        ):
             raise ValueError(
                 "Split K1/K2 require token_back_mode='epi_warps', except "
                 "the nvshmem_ibgda backend which requires "
