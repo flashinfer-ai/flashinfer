@@ -74,6 +74,7 @@ from ..quantization_cute_dsl_utils import (
     bfloat2x4_to_fp8x8_packed,
     float_max_abs_8,
     floatx8_to_fp8x8_packed,
+    ld_global_v8_u32,
 )
 
 
@@ -270,17 +271,11 @@ class MXFP8QuantizeLinearKernel:
                 # fp16/bf16: 2x128-bit loads (8 elts each); fp32: 4x128-bit
                 # loads (4 elts each), so lanes v0..v15 hold 16 floats.
                 if cutlass.const_expr(self.is_float32):
-                    v0, v1, v2, v3 = ld_global_v4_u32(
+                    v0, v1, v2, v3, v4, v5, v6, v7 = ld_global_v8_u32(
                         get_ptr_as_int64(row_input, elem_idx)
                     )
-                    v4, v5, v6, v7 = ld_global_v4_u32(
-                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
-                    )
-                    v8, v9, v10, v11 = ld_global_v4_u32(
+                    v8, v9, v10, v11, v12, v13, v14, v15 = ld_global_v8_u32(
                         get_ptr_as_int64(row_input, elem_idx + Int32(8))
-                    )
-                    v12, v13, v14, v15 = ld_global_v4_u32(
-                        get_ptr_as_int64(row_input, elem_idx + Int32(12))
                     )
                     local_max = fmax_f32(
                         float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
@@ -304,11 +299,8 @@ class MXFP8QuantizeLinearKernel:
                 # 4T/SF path: 8 elements/thread, 2-shuffle reduction.
                 # fp16/bf16: 1x128-bit load; fp32: 2x128-bit loads.
                 if cutlass.const_expr(self.is_float32):
-                    v0, v1, v2, v3 = ld_global_v4_u32(
+                    v0, v1, v2, v3, v4, v5, v6, v7 = ld_global_v8_u32(
                         get_ptr_as_int64(row_input, elem_idx)
-                    )
-                    v4, v5, v6, v7 = ld_global_v4_u32(
-                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
                     )
                     local_max = float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
                 else:
@@ -547,18 +539,21 @@ class MXFP8QuantizeSwizzledKernel:
 
                         if cutlass.const_expr(self.use_2t_per_sf):
                             if cutlass.const_expr(self.is_float32):
-                                # fp32: 16 elements = 4x128-bit loads
-                                v0, v1, v2, v3 = ld_global_v4_u32(
+                                # fp32: 16 elements = 2x256-bit loads
+                                v0, v1, v2, v3, v4, v5, v6, v7 = ld_global_v8_u32(
                                     get_ptr_as_int64(row_input, elem_idx)
                                 )
-                                v4, v5, v6, v7 = ld_global_v4_u32(
-                                    get_ptr_as_int64(row_input, elem_idx + Int32(4))
-                                )
-                                v8, v9, v10, v11 = ld_global_v4_u32(
+                                (
+                                    v8,
+                                    v9,
+                                    v10,
+                                    v11,
+                                    v12,
+                                    v13,
+                                    v14,
+                                    v15,
+                                ) = ld_global_v8_u32(
                                     get_ptr_as_int64(row_input, elem_idx + Int32(8))
-                                )
-                                v12, v13, v14, v15 = ld_global_v4_u32(
-                                    get_ptr_as_int64(row_input, elem_idx + Int32(12))
                                 )
                                 local_max = fmax_f32(
                                     float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
@@ -586,12 +581,9 @@ class MXFP8QuantizeSwizzledKernel:
                             global_max = reduce_max_2threads(local_max)
                         else:
                             if cutlass.const_expr(self.is_float32):
-                                # fp32: 8 elements = 2x128-bit loads
-                                v0, v1, v2, v3 = ld_global_v4_u32(
+                                # fp32: 8 elements = 1x256-bit load
+                                v0, v1, v2, v3, v4, v5, v6, v7 = ld_global_v8_u32(
                                     get_ptr_as_int64(row_input, elem_idx)
-                                )
-                                v4, v5, v6, v7 = ld_global_v4_u32(
-                                    get_ptr_as_int64(row_input, elem_idx + Int32(4))
                                 )
                                 local_max = float_max_abs_8(
                                     v0, v1, v2, v3, v4, v5, v6, v7
@@ -724,20 +716,30 @@ class MXFP8QuantizeSwizzledKernel:
 
                             if cutlass.const_expr(self.use_2t_per_sf):
                                 if cutlass.const_expr(self.is_float32):
-                                    # fp32: 16 elements = 4x128-bit loads
-                                    v0, v1, v2, v3 = ld_global_v4_u32(
+                                    # fp32: 16 elements = 2x256-bit loads
+                                    (
+                                        v0,
+                                        v1,
+                                        v2,
+                                        v3,
+                                        v4,
+                                        v5,
+                                        v6,
+                                        v7,
+                                    ) = ld_global_v8_u32(
                                         get_ptr_as_int64(row_input, elem_idx)
                                     )
-                                    v4, v5, v6, v7 = ld_global_v4_u32(
-                                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
-                                    )
-                                    v8, v9, v10, v11 = ld_global_v4_u32(
+                                    (
+                                        v8,
+                                        v9,
+                                        v10,
+                                        v11,
+                                        v12,
+                                        v13,
+                                        v14,
+                                        v15,
+                                    ) = ld_global_v8_u32(
                                         get_ptr_as_int64(row_input, elem_idx + Int32(8))
-                                    )
-                                    v12, v13, v14, v15 = ld_global_v4_u32(
-                                        get_ptr_as_int64(
-                                            row_input, elem_idx + Int32(12)
-                                        )
                                     )
                                     local_max = fmax_f32(
                                         float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
@@ -767,12 +769,18 @@ class MXFP8QuantizeSwizzledKernel:
                                 global_max = reduce_max_2threads(local_max)
                             else:
                                 if cutlass.const_expr(self.is_float32):
-                                    # fp32: 8 elements = 2x128-bit loads
-                                    v0, v1, v2, v3 = ld_global_v4_u32(
+                                    # fp32: 8 elements = 1x256-bit load
+                                    (
+                                        v0,
+                                        v1,
+                                        v2,
+                                        v3,
+                                        v4,
+                                        v5,
+                                        v6,
+                                        v7,
+                                    ) = ld_global_v8_u32(
                                         get_ptr_as_int64(row_input, elem_idx)
-                                    )
-                                    v4, v5, v6, v7 = ld_global_v4_u32(
-                                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
                                     )
                                     local_max = float_max_abs_8(
                                         v0, v1, v2, v3, v4, v5, v6, v7

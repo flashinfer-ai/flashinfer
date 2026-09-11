@@ -21,7 +21,9 @@ and MXFP4 quantization kernels.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32, Uint64
+from typing import Tuple
+
+from cutlass import Float32, Int32, Int64, Uint32, Uint64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -734,6 +736,28 @@ def bfloat2x4_to_fp8x8_packed(
     fp8_45 = bfloat2_to_fp8x2_scaled(v2, inv_scale)
     fp8_67 = bfloat2_to_fp8x2_scaled(v3, inv_scale)
     return pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
+
+
+@dsl_user_op
+def ld_global_v8_u32(
+    base_ptr: Int64, *, loc=None, ip=None
+) -> Tuple[Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32, Uint32]:
+    """Load 256 bits (8 x uint32) from global memory (sm_100+, 32B-aligned)."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(
+            [T.i32(), T.i32(), T.i32(), T.i32(), T.i32(), T.i32(), T.i32(), T.i32()]
+        ),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.v8.u32 {$0, $1, $2, $3, $4, $5, $6, $7}, [$8];",
+        "=r,=r,=r,=r,=r,=r,=r,=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    vals = [llvm.extractvalue(T.i32(), result, [i], loc=loc, ip=ip) for i in range(8)]
+    return tuple(Uint32(v) for v in vals)
 
 
 @dsl_user_op
