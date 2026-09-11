@@ -23,16 +23,10 @@
 
 namespace {
 
+// Handles are deliberately never destroyed. A thread_local destructor on the
+// main thread may run after CUDA teardown has started, making cublasLtDestroy
+// unsafe. This follows PyTorch's handle-pool convention.
 struct ThreadLocalCublasLtHandles {
-  ~ThreadLocalCublasLtHandles() {
-    // Best-effort cleanup during thread teardown.
-    for (auto& [_, handle] : handles) {
-      if (handle != nullptr) {
-        (void)cublasLtDestroy(handle);
-      }
-    }
-  }
-
   std::unordered_map<int, cublasLtHandle_t> handles;
 };
 
