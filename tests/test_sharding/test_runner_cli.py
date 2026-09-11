@@ -128,6 +128,20 @@ def test_shard_count_precedence_is_cli_then_environment_then_one(
     )
 
 
+@pytest.mark.parametrize("gpu_count", [1, 2, 4, 8])
+def test_default_worker_count_matches_visible_gpu_count(
+    monkeypatch: pytest.MonkeyPatch, gpu_count: int
+) -> None:
+    monkeypatch.delenv("UNIT_TEST_WORKERS", raising=False)
+    monkeypatch.setenv(
+        "CUDA_VISIBLE_DEVICES", ",".join(str(index) for index in range(gpu_count))
+    )
+
+    args = unit_test_runner._parser().parse_args(["run"])
+
+    assert args.workers == gpu_count
+
+
 def test_explicit_zero_deadline_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1384,6 +1398,63 @@ def test_regular():
     assert result.returncode == 0, result.stdout + result.stderr
     assert (state / "solo-devices").read_text(encoding="utf-8") == "0,1"
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
+
+
+@pytest.mark.parametrize("worker_count", [1, 2, 4, 8])
+def test_workers_export_disjoint_master_port_blocks_for_visible_gpu_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_count: int
+) -> None:
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "port-state"
+    state.mkdir()
+    source = """\
+import os
+import time
+from pathlib import Path
+
+def test_worker_port():
+    state = Path(os.environ["PORT_STATE"])
+    record = state / (Path(__file__).stem + ".port")
+    record.write_text(
+        os.environ["CUDA_VISIBLE_DEVICES"] + ":" + os.environ["MASTER_PORT"],
+        encoding="utf-8",
+    )
+    deadline = time.monotonic() + 10
+    while len(list(state.glob("*.port"))) < int(os.environ["EXPECTED_WORKERS"]):
+        assert time.monotonic() < deadline, "parallel worker did not start"
+        time.sleep(0.05)
+"""
+    for index in range(worker_count):
+        (suite / f"test_{index}.py").write_text(source, encoding="utf-8")
+
+    visible_devices = ",".join(str(index) for index in range(worker_count))
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--workers",
+        str(worker_count),
+        env_override={
+            "CUDA_VISIBLE_DEVICES": visible_devices,
+            "EXPECTED_WORKERS": str(worker_count),
+            "PORT_STATE": str(state),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assignments = {
+        tuple(int(value) for value in path.read_text(encoding="utf-8").split(":"))
+        for path in state.glob("*.port")
+    }
+    assert assignments == {
+        (worker_index, 29500 + worker_index * 100)
+        for worker_index in range(worker_count)
+    }
+    for _, port in assignments:
+        assert f"master_port={port}" in result.stdout
 
 
 def test_long_running_dispatches_first_and_solo_runs_after_non_solo_finalized(

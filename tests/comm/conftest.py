@@ -57,9 +57,14 @@ def mnnvl_available() -> bool:
 
 
 def pytest_addoption(parser):
+    master_port = int(os.environ.get("MASTER_PORT", "29500"))
     parser.addoption("--num_nodes", type=int, default=1)
     parser.addoption("--node_id", type=int, default=0)
-    parser.addoption("--dist_init_method", type=str, default="tcp://localhost:29501")
+    parser.addoption(
+        "--dist_init_method",
+        type=str,
+        default=f"tcp://localhost:{master_port + 1}",
+    )
 
 
 @pytest.fixture
