@@ -2551,10 +2551,15 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> N
 
 @pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("extra_topk_len", [0, 128, 768])
+@pytest.mark.parametrize("extra_pbs", [64, 128, 256])
 def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
-    num_heads: int, extra_topk_len: int
+    num_heads: int, extra_topk_len: int, extra_pbs: int
 ) -> None:
-    """DSv4 dual-cache prefill honors extra_topk_length."""
+    """DSv4 dual-cache prefill honors extra_topk_length.
+
+    The length-aware shapes bypass the full-tile dispatcher, so every extra
+    cache page size needs its own coverage here.
+    """
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens = 128
@@ -2562,7 +2567,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     topk = 128
     main_pbs = 64
     extra_topk = 512
-    extra_pbs = 64
 
     main_num_blocks = 64
     main_s_kv = main_num_blocks * main_pbs
