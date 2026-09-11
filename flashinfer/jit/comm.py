@@ -352,3 +352,67 @@ def gen_dcp_alltoall_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
     )
+
+
+def gen_dcp_lse_reduce_module() -> JitSpec:
+    """Build the NCCL-symmetric-memory DCP A2A + LSE-reduce op."""
+    from torch.utils.cpp_extension import include_paths, library_paths
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10, 11, 12]
+    )
+    # This kernel uses cooperative groups and NCCL's device API, neither of
+    # which requires Hopper's architecture-specific ``90a`` ISA. Compile a
+    # generic SM90 image so it also loads on H100 installations that expose
+    # compute capability 9.0 without the ``a`` feature set.
+    nvcc_flags = [
+        flag.replace("compute_90a,code=sm_90a", "compute_90,code=sm_90")
+        for flag in nvcc_flags
+    ]
+    try:
+        cuda_include_paths = include_paths(device_type="cuda")
+        cuda_library_paths = library_paths(device_type="cuda")
+    except TypeError:
+        # PyTorch < 2.6 uses the legacy ``cuda`` boolean argument.
+        cuda_include_paths = include_paths(cuda=True)
+        cuda_library_paths = library_paths(cuda=True)
+    extra_includes: list[str | pathlib.Path] = [
+        pathlib.Path(path) for path in cuda_include_paths
+    ]
+    extra_ldflags = [f"-L{path}" for path in cuda_library_paths]
+    nccl_ldflag = "-lnccl"
+
+    nccl_home = os.environ.get("NCCL_HOME")
+    if nccl_home:
+        nccl_home_path = pathlib.Path(nccl_home)
+        nccl_lib_dir = nccl_home_path / "lib"
+        extra_includes.extend(
+            [
+                nccl_home_path / "include",
+                nccl_home_path / "include" / "nccl_device",
+            ]
+        )
+        extra_ldflags.insert(0, f"-L{nccl_lib_dir}")
+        # PyTorch's pip wheels include only the versioned NCCL shared object,
+        # whereas system installations also provide libnccl.so for -lnccl.
+        if not (nccl_lib_dir / "libnccl.so").exists():
+            versioned_libraries = sorted(nccl_lib_dir.glob("libnccl.so.*"))
+            if versioned_libraries:
+                nccl_ldflag = str(versioned_libraries[-1])
+
+    extra_ldflags += [
+        "-ltorch",
+        "-ltorch_cpu",
+        "-ltorch_cuda",
+        "-lc10",
+        "-lc10_cuda",
+        nccl_ldflag,
+    ]
+
+    return gen_jit_spec(
+        "dcp_lse_reduce",
+        [jit_env.FLASHINFER_CSRC_DIR / "dcp_lse_reduce.cu"],
+        extra_include_paths=extra_includes,
+        extra_cuda_cflags=["-std=c++20", "-DUSE_NCCL"] + nvcc_flags,
+        extra_ldflags=extra_ldflags,
+    )
