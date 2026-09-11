@@ -37,14 +37,15 @@ exercised, so no GPU or compiled kernel is required.
 
 import contextlib
 import warnings
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
-import flashinfer.fused_moe.core as core_mod
+import flashinfer.fused_moe.shared.tuning as tuning_mod
 from flashinfer.autotuner import AutoTuner
-from flashinfer.fused_moe.core import MoeRunnerInputs
+from flashinfer.fused_moe.backends.trtllm import MoERunner
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
 from flashinfer.tllm_enums import (
     DtypeTrtllmGen,
     Fp8QuantizationType,
@@ -61,36 +62,15 @@ NUM_EXPERTS = 128
 TOP_K = 8
 
 
-@pytest.fixture(autouse=True)
-def _clear_moe_module_cache():
-    """Evict the mocked module from the process-wide cache after every test.
-
-    ``_get_trtllm_moe_sm100_module_impl`` is ``functools.cache``d and the cached
-    closure captures ``module.build_and_load()``. Without this teardown the
-    MagicMock built below would be served to every later caller in the same
-    pytest session, silently breaking unrelated MoE tests.
-    """
-    yield
-    core_mod._get_trtllm_moe_sm100_module_impl.cache_clear()
-
-
 def _make_runner(fp8_quantization_type=Fp8QuantizationType.NoneFp8):
-    """Build a MoERunner with the JIT/cubin machinery mocked out (CPU-safe)."""
-    fn = core_mod._get_trtllm_moe_sm100_module_impl
-    fn.cache_clear()
-    mock_module = MagicMock()
-    mock_module.get_library_path.return_value = "/tmp/fake.so"
-    with (
-        patch.object(
-            core_mod,
-            "gen_trtllm_gen_fused_moe_sm100_module",
-            return_value=mock_module,
-        ),
-        patch.object(core_mod, "setup_cubin_loader"),
-    ):
-        MoERunner = fn(enable_rubin=False).MoERunner
+    """Build a MoERunner with the JIT/cubin machinery mocked out (CPU-safe).
 
+    ``_make_tuning_config`` never touches ``moe_op`` -- it only reads the
+    constructor-fixed shapes off ``self`` -- so a bare MagicMock stands in for
+    the loaded cubin module and keeps this file runnable without a GPU.
+    """
     return MoERunner(
+        MagicMock(),  # moe_op: unused by the tuning-config path
         top_k=TOP_K,
         num_local_experts=NUM_EXPERTS,
         dtype_act=DtypeTrtllmGen.MxE4m3,
@@ -148,10 +128,11 @@ def test_flat_act_scale_is_accepted(num_tokens):
     )
     assert [c.input_idx for c in config.constraint_specs] == [scale_idx]
 
-    # It must stay in the cold-L2 profiling arena even though it left the
-    # dynamic spec (profile_arena_input_indices is derived from the full
-    # input set, not from the dynamic spec).
-    assert scale_idx in config.profile_arena_input_indices
+    # Leaving the dynamic spec must not cost it its initializer: a
+    # ConstraintSpec also marks the dim dynamic, so the profiler still
+    # synthesizes the buffer -- at the constraint-derived size -- and needs an
+    # initializer to fill it.
+    assert scale_idx in [idx for idx, _ in config.tensor_initializers]
 
 
 def test_flat_act_scale_profiles_scale_with_sf_per_token():
@@ -280,7 +261,7 @@ def test_flat_act_sf_inferrer_is_cached():
     infer_a, infer_b = (c.constraint_specs[0].infer_shape for c in configs)
     assert infer_a is infer_b
     assert (
-        core_mod._make_flat_act_sf_numel_inferrer(hidden_idx, SF_PER_TOKEN) is infer_a
+        tuning_mod._make_flat_act_sf_numel_inferrer(hidden_idx, SF_PER_TOKEN) is infer_a
     )
     # Equal configs must therefore also hash equally.
     assert hash(configs[0].constraint_specs) == hash(configs[1].constraint_specs)

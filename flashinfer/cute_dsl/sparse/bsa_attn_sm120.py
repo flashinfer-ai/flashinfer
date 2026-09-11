@@ -589,9 +589,14 @@ def bsa_attn_sm120_blk64_sage_fwd(
         and large enough for the selected generated kernel.
     uniform_block_count : bool
         Whether every query block uses ``block_sparse_num`` selected blocks.
+        This is a caller-provided guarantee: when true, ``q2k_block_nums``
+        is ignored and its values are not checked.
     contiguous_block_indices : bool
         Whether selected block indices are contiguous. This optimization
-        requires ``uniform_block_count=True``.
+        requires ``uniform_block_count=True`` and trusts the caller's
+        guarantee without checking the indices. Non-contiguous top-k indices
+        must use ``False``, even when sorted. Incorrectly setting this flag
+        to ``True`` can produce incorrect output without raising an error.
     backend : str
         Backend name. The only supported value is ``"cake"``.
 

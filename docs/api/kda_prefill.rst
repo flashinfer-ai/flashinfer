@@ -14,12 +14,20 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 
     RecurrentKDAPrefillWorkspace
 
-.. currentmodule:: flashinfer.kda
+.. note::
 
-.. autosummary::
-    :toctree: ../generated
-
-    RecurrentKDAPrefillWrapper
+    ``flashinfer.RecurrentKDAPrefillWrapper`` is **experimental**, so it has no
+    generated reference page here until it graduates. Calling ``plan`` or
+    ``run`` is itself the opt-in and needs no environment variable; each warns
+    once per process. It is limited to compute capability 10.0 and 10.3, is
+    specific to the CuTe DSL backend, and fixes the sequence count and packed
+    token extent after the first warmup run. Its planning implementation lives
+    in ``flashinfer.experimental.kda_prefill_wrapper``; it contains no kernels
+    of its own, and the kernels it dispatches to are the stable AOT-registered
+    ones, alongside a package README. ``examples/experimental/kda_prefill_wrapper.py``
+    is a runnable plan-and-run example. See
+    `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for the
+    graduation plan.
 
 Backend selection
 -----------------
@@ -153,16 +161,17 @@ performs both launch plans before enqueueing either kernel so the dependent
 launches do not expose a Python/FFI inter-kernel gap. CUDA Graph capture still
 records the same two kernels and preserves the workspace contract below.
 
-For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
-caches a stable decreasing-length order on the host. CuTe DSL decomp retains
-the original sequence order because its CTA grid fits in one wave.
-``flashinfer.RecurrentKDAPrefillWrapper`` provides the explicit planned path
-needed for packed engine CUDA Graph capture: ``plan`` builds the order and the
-decomp ``cu_chunks`` prefix, then ``run`` consumes fixed-address buffers. The
-decomp prep kernel binary-searches this compact prefix instead of carrying a
-dense chunk-to-sequence tensor. The number of sequences, total tokens, and
-total BT=16 chunks are fixed by the first plan so the metadata and launch
-geometry remain valid across CUDA Graph replays.
+For packed CuTe DSL engine calls, omitting ``seq_order`` generates a stable
+decreasing-length order on the device. CuTe DSL decomp retains the original
+sequence order in the eager path because its CTA grid fits in one wave.
+``flashinfer.RecurrentKDAPrefillWrapper`` (experimental) provides fixed-address
+metadata for CUDA Graph capture: ``plan`` only copies packed offsets into its
+device buffer, while a captured GPU prepass generates the order and decomp
+``cu_chunks`` prefix before the recurrent kernels run. The decomp prep kernel
+binary-searches this compact prefix instead of carrying a dense
+chunk-to-sequence tensor. Its workspace and launch use a graph-static chunk
+capacity derived from tensor shapes, while the GPU prefix supplies the actual
+chunk count on each replay.
 
 State and graph semantics
 -------------------------

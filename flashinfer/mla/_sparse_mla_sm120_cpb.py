@@ -555,6 +555,10 @@ def calibrate(
     props = torch.cuda.get_device_properties(device)
     sm_count = int(props.multi_processor_count)
     l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
+    # On integrated-memory devices (GB10) the L2 is shared with the CPU fabric
+    # and the effective streaming window measures ~half the reported size.
+    if int(getattr(props, "is_integrated", 0) or 0):
+        l2_cache_bytes //= 2
     bi = _CHUNK_WIDTH[family]
     w = bi * _BYTES_PER_TOKEN[family]
     # Families whose decode is instantiated at a single topk have a fixed N,

@@ -329,7 +329,10 @@ def test_calibration_smoke(family_constants: tuple[str, CpbConstants]) -> None:
     )
     props = torch.cuda.get_device_properties(torch.device("cuda"))
     if getattr(props, "L2_cache_size", None):
-        assert c.l2_cache_bytes == props.L2_cache_size
+        expected_l2 = props.L2_cache_size
+        if getattr(props, "is_integrated", 0):
+            expected_l2 //= 2  # calibrate() halves the rail window on SoCs
+        assert c.l2_cache_bytes == expected_l2
     bw_gbps = 1.0 / c.inv_bw / 1e9
     print(f"\ncalibrated {family} constants: {c}")
     print(f"implied aggregate DRAM bandwidth: {bw_gbps:.0f} GB/s")

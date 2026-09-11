@@ -351,6 +351,21 @@ def _moe_core_impl(
             main_event = main_event or resources["main_event"]
             memset_event = memset_event or resources["memset_event"]
 
+    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+
+    # Multi-CTA Rubin tactics are filtered out in tuner.get_valid_tactics; this
+    # is the backstop for callers that pass tactic parameters directly.
+    cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
+    if is_rubin and cluster_m > 1:
+        raise NotImplementedError(
+            f"Rubin MoE with cluster_shape_m={cluster_m} is not supported. The "
+            "tile count handed to the kernel must be rounded up to a multiple "
+            "of cluster_shape_m so every cluster reaches the barrier "
+            "uniformly, and tile_idx_to_expert_idx / tile_idx_to_mn_limit must "
+            "be initialized past num_non_exiting_tiles to match, since the "
+            "kernel bounds-checks them against that same rounded count."
+        )
+
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}
     (
@@ -370,16 +385,6 @@ def _moe_core_impl(
         tile_tokens_dim=tile_size,
         **moe_sort_kwargs,
     )
-
-    # For Rubin, round num_non_exiting_tiles to the next EVEN number to
-    # prevent a cluster-synchronization deadlock. With cluster_shape_m=2,
-    # two CTAs get consecutive tile indices; if the count is odd, one CTA
-    # enters the cluster barrier while the other skips it.
-    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
-    if is_rubin:
-        kernel_num_non_exiting_tiles = ((num_non_exiting_tiles + 1) // 2) * 2
-    else:
-        kernel_num_non_exiting_tiles = num_non_exiting_tiles
 
     # Record event for async memset synchronization
     if use_async_memset and use_fused_finalize:
@@ -408,7 +413,7 @@ def _moe_core_impl(
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+            num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
             out_scale=None if use_per_token_activation else gemm1_out_scale,
             global_scale=(
@@ -482,7 +487,7 @@ def _moe_core_impl(
         b_scale=w2_weight_sf,
         alpha=w2_alpha,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+        num_non_exiting_tiles=num_non_exiting_tiles,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
