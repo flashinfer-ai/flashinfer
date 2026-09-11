@@ -5875,7 +5875,258 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
 
 
 # ---------------------------------------------------------------------------
-# SM12x b12x runners — fixed tactic, existing wrapper delegation
+# SM12x MXFP8 x MXFP4 runner - fixed tactic, internal op composition
+# ---------------------------------------------------------------------------
+
+
+def _sm12x_mxfp8_mxfp4_activation_kwargs(
+    activation: ActivationConfig,
+) -> dict[str, Any]:
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if activation.alpha != default.alpha or activation.beta != default.beta:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 supports only default SwiGLU alpha and beta."
+            )
+        return {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": None
+            if activation.limit == default.limit
+            else activation.limit,
+        }
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None or activation.clamp_limit is not None:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 requires a finite SiTU linear scale and no clamp limit."
+            )
+        return {
+            "activation": ActivationType.Situ,
+            "situ_beta": activation.gate_scale,
+            "situ_linear_beta": activation.linear_scale,
+        }
+    raise NotImplementedError(
+        f"SM12x MXFP8 x MXFP4 does not support {type(activation).__name__}."
+    )
+
+
+def _validate_sm12x_mxfp8_mxfp4_weight_view(
+    view: dict[str, torch.Tensor], x: torch.Tensor, config: MoEConfig
+) -> None:
+    experts = config.routing.num_experts
+    hidden = x.shape[1]
+    intermediate = config.experts.intermediate_size
+    expected = {
+        "w1_weight": (experts, 2 * intermediate, hidden // 2),
+        "w1_weight_sf": (experts, hidden // 128, 8 * intermediate),
+        "w2_weight": (experts, hidden, intermediate // 2),
+        "w2_weight_sf": (experts, intermediate // 128, 4 * hidden),
+    }
+    for key, shape in expected.items():
+        tensor = view[key]
+        if tensor.device != x.device:
+            raise ValueError(f"{key} must be on {x.device}, got {tensor.device}.")
+        if tensor.dtype is not torch.uint8:
+            raise TypeError(f"{key} must be uint8, got {tensor.dtype}.")
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{key} shape {tuple(tensor.shape)} != expected {shape}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{key} must be contiguous.")
+
+
+class SM12xMxfp8Mxfp4Runner(MoERunner):
+    """Unified adapter for the SM12x MXFP8 x MXFP4 internal op chain."""
+
+    backend_key = "sm12x_mxfp8_mxfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.MXFP4,)
+    supported_activation_classes = (SwiGLU, SiTU)
+    supports_expert_parallelism = False
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w2_weight",
+        "w2_weight_sf",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+
+    def _check_activation_parameters(self) -> None:
+        _sm12x_mxfp8_mxfp4_activation_kwargs(self.config.activation)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x MXFP8 x MXFP4 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x MXFP8 x MXFP4 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x MXFP8 x MXFP4 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x MXFP8 x MXFP4 requires do_finalize=True.")
+        if not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 requires use_fused_finalize=True."
+            )
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x MXFP8 x MXFP4 quantizes BF16 activations internally."
+            )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1 import (
+            cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+            out_sf_shape,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc2_finalize import (
+            cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
+            Mxfp8Q0RouteWorkspace,
+            make_mxfp8_q0_route_workspace,
+            mxfp8_q0_route_triton,
+        )
+
+        self._fc1 = cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4
+        self._fc2 = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+        self._out_sf_shape = out_sf_shape
+        self._workspace_cls = Mxfp8Q0RouteWorkspace
+        self._make_workspace = make_mxfp8_q0_route_workspace
+        self._route = mxfp8_q0_route_triton
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.hidden_states_q.dtype is not torch.bfloat16:
+            raise TypeError("SM12x MXFP8 x MXFP4 requires BF16 hidden states.")
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError(
+                "SM12x MXFP8 x MXFP4 requires activation scales to be None."
+            )
+        _validate_prerouted_inputs(
+            act,
+            act.hidden_states_q.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+        )
+        if act.topk_weights.dtype is not torch.float32:
+            raise TypeError("SM12x MXFP8 x MXFP4 requires FP32 top-k weights.")
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        _validate_sm12x_mxfp8_mxfp4_weight_view(view, act.hidden_states_q, self.config)
+        x = act.hidden_states_q
+        num_experts = self.config.routing.num_experts
+        workspace = self._make_workspace(x, act.topk_ids, num_experts)
+        total_pairs = x.shape[0] * act.topk_ids.shape[1]
+        intermediate_size = view["w1_weight"].shape[1] // 2
+        q1 = torch.empty(
+            total_pairs,
+            intermediate_size,
+            dtype=torch.float8_e4m3fn,
+            device=x.device,
+        )
+        sf1 = torch.zeros(
+            self._out_sf_shape(total_pairs, intermediate_size, num_experts),
+            dtype=torch.int32,
+            device=x.device,
+        )
+        output = torch.zeros(
+            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
+        )
+        return [
+            x,
+            act.topk_ids,
+            act.topk_weights,
+            view["w1_weight"],
+            view["w1_weight_sf"],
+            view["w2_weight"],
+            view["w2_weight_sf"],
+            q1,
+            sf1,
+            output,
+            workspace.counts,
+            workspace.offsets,
+            workspace.expert_cursor,
+            workspace.token_map,
+            workspace.token_weights,
+            workspace.dst_rows,
+            workspace.scale_dst_rows,
+            workspace.q_out,
+            workspace.scale_out,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError("SM12x MXFP8 x MXFP4 supports only tactic -1.")
+        x, ids, topk_weights, w1, w1_sf, w2, w2_sf, q1, sf1, output = inputs[:10]
+        workspace = self._workspace_cls(*inputs[10:])
+        activation = self.config.activation
+        act_kwargs = _sm12x_mxfp8_mxfp4_activation_kwargs(activation)
+        enable_pdl = self.config.execution.enable_pdl is not False
+        output.zero_()
+        offsets, token_map, route_weights, a_q, a_scale = self._route(
+            x,
+            ids,
+            topk_weights,
+            self.config.routing.num_experts,
+            workspace=workspace,
+            enable_pdl=enable_pdl,
+        )
+        self._fc1(
+            a_q,
+            a_scale,
+            w1,
+            w1_sf,
+            offsets,
+            tune=False,
+            enable_pdl=enable_pdl,
+            out_q=q1,
+            out_sf=sf1,
+            **act_kwargs,
+        )
+        self._fc2(
+            q1,
+            sf1,
+            w2,
+            w2_sf,
+            offsets,
+            token_map,
+            route_weights,
+            x.shape[0],
+            tune=False,
+            enable_pdl=enable_pdl,
+            out=output,
+        )
+        return output
+
+
+# ---------------------------------------------------------------------------
+# SM12x b12x runners - fixed tactic, existing wrapper delegation
 # ---------------------------------------------------------------------------
 
 

@@ -849,6 +849,52 @@ class TestTypedActivationConfig:
             "situ_linear_beta": None,
         }
 
+    def test_sm12x_mxfp8_mxfp4_activation_mapping(self):
+        from flashinfer.fused_moe.runners import _sm12x_mxfp8_mxfp4_activation_kwargs
+
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU()) == {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": None,
+        }
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU(limit=10.0)) == {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": 10.0,
+        }
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SiTU()) == {
+            "activation": ActivationType.Situ,
+            "situ_beta": DEFAULT_SITU_BETA,
+            "situ_linear_beta": DEFAULT_SITU_LINEAR_BETA,
+        }
+        with pytest.raises(NotImplementedError):
+            _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU(alpha=2.0))
+        with pytest.raises(NotImplementedError):
+            _sm12x_mxfp8_mxfp4_activation_kwargs(SiTU(clamp_limit=1.0))
+
+    def test_sm12x_mxfp8_mxfp4_weight_view_validation(self):
+        from flashinfer.fused_moe.runners import _validate_sm12x_mxfp8_mxfp4_weight_view
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=2, top_k=1),
+            quant=QuantConfig(variant=QuantVariant.MXFP4),
+            experts=ExpertConfig(intermediate_size=128, local_num_experts=2),
+        )
+        x = torch.empty(3, 128, dtype=torch.bfloat16)
+        view = {
+            "w1_weight": torch.empty(2, 256, 64, dtype=torch.uint8),
+            "w1_weight_sf": torch.empty(2, 1, 1024, dtype=torch.uint8),
+            "w2_weight": torch.empty(2, 128, 64, dtype=torch.uint8),
+            "w2_weight_sf": torch.empty(2, 1, 512, dtype=torch.uint8),
+        }
+        _validate_sm12x_mxfp8_mxfp4_weight_view(view, x, config)
+        with pytest.raises(ValueError, match="w1_weight shape"):
+            _validate_sm12x_mxfp8_mxfp4_weight_view(
+                {**view, "w1_weight": view["w1_weight"][:, :-1]}, x, config
+            )
+        with pytest.raises(TypeError, match="w2_weight must be uint8"):
+            _validate_sm12x_mxfp8_mxfp4_weight_view(
+                {**view, "w2_weight": view["w2_weight"].float()}, x, config
+            )
+
     def test_situ_unclamped_linear_branch_is_expressible(self):
         activation = SiTU(linear_scale=None)
         assert activation.linear_scale is None
