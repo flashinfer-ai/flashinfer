@@ -667,8 +667,13 @@ def test_prefill_state_indices_out_of_pool_fails_in_isolated_process(case_name):
         env=env,
     )
     combined = completed.stdout + completed.stderr
-    if "SKIP" in combined:
-        pytest.skip(combined.strip().splitlines()[-1])
+    # Match the marker at the start of a line. A substring search over the
+    # child's whole stdout and stderr turns any unrelated failure whose output
+    # happens to contain "SKIP" -- a path, an environment variable, a driver
+    # log line -- into a skip, which silently disables this bounds check.
+    skips = [ln for ln in combined.splitlines() if ln.startswith("SKIP:")]
+    if skips:
+        pytest.skip(skips[-1])
     assert completed.returncode != 0, combined
     assert "_assert_async_cuda_kernel" in combined, combined
     assert "GDN prefill state_indices must contain slots in" in combined, combined
