@@ -328,21 +328,30 @@ def _validate_schedule_meta_fresh(
     schedule_meta: torch.Tensor,
     seq_lens: torch.Tensor,
     fn_name: str,
+    *,
+    next_n: int,
+    variant: str,
 ) -> None:
     """Debug-mode check that a caller-supplied ``schedule_meta`` is not stale.
 
-    The schedule is a pure function of ``(seq_lens, num_sms)``, so it can be
-    recomputed and compared exactly.  Reuse is only valid while the whole
-    ``ceil(seq_lens / _SPLIT_KV)`` vector is unchanged -- a single sequence
-    crossing a ``_SPLIT_KV`` boundary (256 -> 257) changes one row's split count
-    from 1 to 2 while every tensor shape stays identical.
+    ``seq_lens`` must be the caller's NATIVE ``[batch]`` lengths.  The schedule
+    is a pure function of ``(seq_lens, num_sms, variant, next_n)``: this runs
+    the exact public-helper call the error message recommends -- with this
+    call's ``next_n``/``variant`` -- so the fp4 atom decomposition is applied
+    here, after the early returns, and following the message is guaranteed to
+    produce the schedule this check accepts.  Reuse is only valid while the
+    whole ``ceil(seq_lens / _SPLIT_KV)`` vector is unchanged -- a single
+    sequence crossing a ``_SPLIT_KV`` boundary (256 -> 257) changes one row's
+    split count from 1 to 2 while every tensor shape stays identical.
 
     A stale schedule does not merely give wrong numbers: the persistent kernel
     terminates on exact equality with the stored end boundary, so an endpoint
     that the runtime lengths can no longer produce makes the loop run forever.
     e.g. a B=1 schedule built for length 257 ends CTA 0 at (q=0, kv_idx=2);
     replayed at length 256 the iterator steps (0,0) -> (1,0), never hits (0,2),
-    and hangs.
+    and hangs.  Under the fp4 split a schedule built with the helper's DEFAULT
+    arguments describes the native B rows while the kernel iterates
+    B*num_atoms -- the same hang class, or silently unwritten output rows.
 
     Recomputing costs exactly the work ``schedule_meta`` exists to avoid, so this
     is opt-in via ``FLASHINFER_VALIDATE_INPUTS`` and skipped during CUDA-graph
@@ -354,16 +363,23 @@ def _validate_schedule_meta_fresh(
         return
     if torch.cuda.is_current_stream_capturing():
         return
-    expected = compute_paged_mqa_logits_schedule(seq_lens, device=schedule_meta.device)
+    expected = compute_paged_mqa_logits_schedule(
+        seq_lens, device=schedule_meta.device, next_n=next_n, variant=variant
+    )
     if not torch.equal(expected, schedule_meta):
+        recipe = (
+            f"compute_paged_mqa_logits_schedule(seq_lens, next_n={next_n}, "
+            f"variant={variant!r}, out=schedule_meta)"
+        )
         raise ValueError(
             f"{fn_name}: schedule_meta does not match seq_lens. It is a "
-            f"function of the whole ceil(seq_lens / {_SPLIT_KV}) vector and "
-            f"the device SM count, so a single sequence crossing a "
-            f"{_SPLIT_KV}-token boundary invalidates it even when every shape is "
-            f"unchanged. Recompute it with compute_paged_mqa_logits_schedule("
-            f"seq_lens, out=schedule_meta); reusing a stale schedule can hang "
-            f"the persistent kernel."
+            f"function of the contents of seq_lens, the device SM count, and "
+            f"this call's (variant, next_n): a changed sequence length can "
+            f"invalidate it even when every tensor shape is unchanged, and a "
+            f"schedule built with the helper's default arguments is wrong for "
+            f"variant='fp4', next_n=4 on SM100/SM103. Recompute it with "
+            f"{recipe}; reusing a stale or mismatched schedule can hang the "
+            f"persistent kernel."
         )
 
 
@@ -1727,7 +1743,13 @@ def fp8_paged_mqa_logits(
     if schedule_meta is None:
         schedule_meta = compute_paged_mqa_logits_schedule(seq_lens, device=q.device)
     else:
-        _validate_schedule_meta_fresh(schedule_meta, seq_lens, "fp8_paged_mqa_logits")
+        _validate_schedule_meta_fresh(
+            schedule_meta,
+            seq_lens,
+            "fp8_paged_mqa_logits",
+            next_n=next_n,
+            variant="fp8",
+        )
 
     # FP8 tensor passed as uint8 view (DLPack lacks float8 support)
     q_for_ffi = (
@@ -1958,7 +1980,8 @@ def fp4_paged_mqa_logits(
     next_n=4 executes as two internal passes that each read the whole KV --
     numerics identical, roughly 2x the KV-bandwidth cost (~1.3x measured
     runtime at a 16K sequence length versus next_n=3), and a caller-supplied
-    schedule_meta is rejected there (see schedule_meta below).
+    schedule_meta must then be built with this call's next_n and
+    variant="fp4" (see schedule_meta below).
 
     Example:
         Two requests, three draft positions each, 32-token KV blocks.
@@ -2320,14 +2343,27 @@ def fp4_paged_mqa_logits(
     if B == 0:
         return logits
 
-    # The scheduler enumerates batch*num_atoms q_atom tasks, so it must be
-    # built from the per-atom lengths (identity when num_atoms == 1).  Caller
-    # schedules are freshness-checked against the same expanded lengths.
-    sched_ctx = _expand_seq_lens(seq_lens, num_atoms, atom)
     if schedule_meta is None:
-        schedule_meta = compute_paged_mqa_logits_schedule(sched_ctx, device=q.device)
+        # The scheduler enumerates batch*num_atoms q_atom tasks, so it is
+        # built from the per-atom lengths (identity when num_atoms == 1).
+        # block_tables / seq_lens themselves stay native: the kernel maps
+        # q_atom_idx back onto them via _atom_seq / _atom_ctx_len.
+        schedule_meta = compute_paged_mqa_logits_schedule(
+            _expand_seq_lens(seq_lens, num_atoms, atom), device=q.device
+        )
     else:
-        _validate_schedule_meta_fresh(schedule_meta, sched_ctx, "fp4_paged_mqa_logits")
+        # Freshness check against the same per-atom lengths.  The expansion
+        # is a GPU kernel, so it runs inside the opt-in, non-capture check
+        # (via the public helper's next_n/variant) rather than here: with a
+        # caller schedule and validation off it would be dead work -- and
+        # under CUDA-graph capture a dead kernel node replayed every launch.
+        _validate_schedule_meta_fresh(
+            schedule_meta,
+            seq_lens,
+            "fp4_paged_mqa_logits",
+            next_n=next_n,
+            variant="fp4",
+        )
 
     dev_index = get_device_index(q.device)
     with _on_device(dev_index):

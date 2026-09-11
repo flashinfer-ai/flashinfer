@@ -1029,9 +1029,10 @@ def test_fp4_next_n_limits():
     The one hazard that remains is a caller-supplied schedule_meta: a split
     makes the scheduler describe batch*num_atoms rows while the schedule's
     shape is unchanged, so a schedule built from the native seq_lens would
-    pass every always-on check and still be wrong.  That combination is
-    rejected rather than silently accepted; see
-    test_fp4_next_n4_split_rejects_caller_schedule.
+    pass every always-on check and still be wrong.  Such a schedule is only
+    accepted when built with this call's next_n and variant="fp4" (the helper
+    applies the same decomposition); a default-args schedule is caught by the
+    opt-in freshness check -- see test_fp4_next_n4_caller_schedule_via_helper.
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip(
@@ -1122,12 +1123,14 @@ def test_fp4_next_n4_caller_schedule_via_helper(monkeypatch):
 
     # (c) On a split device the native (default-args) schedule is a different
     # tensor, and the opt-in freshness check refuses it before the kernel
-    # could hang on the mismatched end boundary.
+    # could hang on the mismatched end boundary.  The error's remediation
+    # recipe must itself be actionable: run it (parsed, not eval'd) into the
+    # rejected buffer and the very next call must be accepted.
     if _fp4_max_atom_for_device(torch.device(device)) < next_n:
         native = compute_paged_mqa_logits_schedule(seq_lens, device=device)
         assert not torch.equal(native, sched), "test premise: split changes it"
         monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
-        with pytest.raises(ValueError, match="Recompute it with"):
+        with pytest.raises(ValueError, match="Recompute it with") as excinfo:
             fp4_paged_mqa_logits(
                 q,
                 q_sf,
@@ -1139,6 +1142,200 @@ def test_fp4_next_n4_caller_schedule_via_helper(monkeypatch):
                 output_dtype=torch.bfloat16,
                 schedule_meta=native,
             )
+        recipe_nn, recipe_variant = _parse_schedule_recipe(str(excinfo.value))
+        assert (recipe_nn, recipe_variant) == (next_n, "fp4"), str(excinfo.value)
+        compute_paged_mqa_logits_schedule(
+            seq_lens,
+            device=device,
+            next_n=recipe_nn,
+            variant=recipe_variant,
+            out=native,
+        )
+        assert torch.equal(native, sched), (
+            "the recipe must reproduce the accepted schedule"
+        )
+        fp4_paged_mqa_logits(
+            q,
+            q_sf,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=native,
+        )
+        torch.cuda.synchronize()
+
+
+def _parse_schedule_recipe(message: str):
+    """Extract (next_n, variant) from the freshness error's recommended call.
+
+    Parsed with a regex rather than eval'd so no code from an error string is
+    ever executed by the test."""
+    import re
+
+    m = re.search(
+        r"compute_paged_mqa_logits_schedule\(seq_lens, next_n=(\d+), "
+        r"variant='(fp[48])', out=schedule_meta\)",
+        message,
+    )
+    assert m, f"no actionable recipe in the message: {message}"
+    return int(m.group(1)), m.group(2)
+
+
+@pytest.mark.parametrize("variant,next_n", [("fp8", 2), ("fp4", 4)])
+def test_stale_schedule_message_recipe_is_actionable(variant, next_n, monkeypatch):
+    """Following the freshness error's recipe verbatim must fix the mismatch.
+
+    Arch-independent stale trick (a schedule built for length 257 reused at
+    256) so the message is exercised on every SM100-class device, including
+    Rubin where the fp4 split is inactive; leg (c) of
+    test_fp4_next_n4_caller_schedule_via_helper covers the split-specific
+    default-args mismatch.  Against the pre-fix message ("...schedule(seq_lens,
+    out=schedule_meta)") the recipe parse fails: it named neither next_n nor
+    variant, and for the fp4 split it regenerated exactly the rejected schedule.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+    )
+
+    device = "cuda"
+    B, H, D, block_size = 1, 64, 128, 64
+    seq_lens = torch.full((B,), 256, dtype=torch.int32, device=device)
+    stale_lens = torch.full((B,), 257, dtype=torch.int32, device=device)
+    max_ml = 512
+    block_tables, ntb = _make_paged_kv(B, block_size, stale_lens, device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    if variant == "fp8":
+        q = torch.zeros(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
+
+        def call(sched):
+            return fp8_paged_mqa_logits(
+                q, kv, w, block_tables, seq_lens, max_ml, schedule_meta=sched
+            )
+    else:
+        q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+        q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+        kv = torch.zeros(
+            ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device
+        )
+
+        def call(sched):
+            return fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv,
+                w,
+                block_tables,
+                seq_lens,
+                max_ml,
+                output_dtype=torch.bfloat16,
+                schedule_meta=sched,
+            )
+
+    stale = compute_paged_mqa_logits_schedule(
+        stale_lens, device=device, next_n=next_n, variant=variant
+    )
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    with pytest.raises(ValueError, match="schedule_meta does not match seq_lens") as e:
+        call(stale)
+    msg = str(e.value)
+    assert f"next_n={next_n}" in msg and f"variant='{variant}'" in msg, msg
+    recipe_nn, recipe_variant = _parse_schedule_recipe(msg)
+    compute_paged_mqa_logits_schedule(
+        seq_lens, device=device, next_n=recipe_nn, variant=recipe_variant, out=stale
+    )
+    call(stale)  # the recipe made it fresh: accepted
+    torch.cuda.synchronize()
+
+
+def test_fp4_caller_schedule_does_not_expand_seq_lens(monkeypatch):
+    """With a caller schedule, the fp4 body must not materialise the per-atom
+    lengths: that is one dead elementwise kernel (and a [B*num_atoms] alloc)
+    per call -- and under CUDA-graph capture a dead node replayed on every
+    launch -- on the very path schedule_meta= exists to slim down.  The
+    expansion happens lazily inside the opt-in freshness check instead.
+    Asserted on call count, so it runs on every arch (identity or not)."""
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import (
+        compute_paged_mqa_logits_schedule,
+        fp4_paged_mqa_logits,
+        padded_seq_len,
+    )
+    from flashinfer.attn_scores import attn_scores as A
+
+    device = "cuda"
+    B, H, D, block_size, ctx, next_n = 2, 64, 128, 64, 256, 4
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    out = torch.empty(
+        (B * next_n, padded_seq_len(ctx)), dtype=torch.bfloat16, device=device
+    )
+    sched = compute_paged_mqa_logits_schedule(
+        seq_lens, device=device, next_n=next_n, variant="fp4"
+    )
+
+    def call():
+        return fp4_paged_mqa_logits(
+            q,
+            q_sf,
+            kv,
+            w,
+            block_tables,
+            seq_lens,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=sched,
+            out=out,
+        )
+
+    call()
+    torch.cuda.synchronize()  # warm JIT before counting
+    ref = call().clone()
+    torch.cuda.synchronize()
+
+    calls = []
+    orig = A._expand_seq_lens
+
+    def spy(sl, n, a):
+        calls.append((n, a))
+        return orig(sl, n, a)
+
+    monkeypatch.setattr(A, "_expand_seq_lens", spy)
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
+
+    call()
+    torch.cuda.synchronize()
+    assert calls == [], f"eager caller-schedule path expanded seq_lens: {calls}"
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+    assert calls == [], f"expansion was captured into the graph: {calls}"
+    g.replay()
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(seq_lens, next_n, ctx, device)
+    assert torch.equal(out[:, :ctx][valid], ref[:, :ctx][valid])
+
+    # With validation on, the expansion happens exactly once -- inside the
+    # freshness check -- and the helper-built schedule is accepted.
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    call()
+    torch.cuda.synchronize()
+    assert len(calls) == 1, calls
 
 
 @pytest.mark.parametrize("block_size", [64, 128])
@@ -1463,7 +1660,7 @@ def test_fp4_head_dim_num_heads_validation():
     with pytest.raises(ValueError, match="requires num_heads == 64"):
         fp4_paged_mqa_logits(q, q_sf, kv, w, block_tables, seq_lens, max_ml)
 
-    # next_n beyond what the kernel supports (1-3).
+    # next_n beyond what the kernel supports (1-4).
     q5 = torch.zeros(B, 5, num_heads, 64, dtype=torch.uint8, device=device)
     sf5 = torch.zeros(B, 5, num_heads, dtype=torch.int32, device=device)
     kv5 = torch.zeros(ntb, block_size, 1, 68, dtype=torch.uint8, device=device)
