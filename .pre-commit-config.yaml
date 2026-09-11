@@ -15,6 +15,9 @@
 # For linting consider using CI.
 files: ^(?!flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/)
 
+# cake_fmha is a manifest-authenticated export and must remain byte-exact.
+files: ^(?!csrc/cake_fmha/)
+
 # The kernel_src */src trees and blackwell_msa CUDA snapshots are generated or
 # upstream kernel drops that are re-synced periodically
 # (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel,

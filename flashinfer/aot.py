@@ -46,6 +46,7 @@ from .jit.attention import (
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
+from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
@@ -583,6 +584,13 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    # Cake FMHA packages exact tcgen05/TMEM cubins for B200 and B300.  Do not
+    # compile a family target here: the standalone manifest authenticates one
+    # architecture-specific source payload and ABI for each exact target.
+    if has_sm100a_exact:
+        jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
+    if has_sm103a_exact:
+        jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
