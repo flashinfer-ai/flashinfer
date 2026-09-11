@@ -586,6 +586,8 @@ Successful `plan()` resets the stream binding for the new plan; failed
 replanning preserves the old binding. Before switching streams through a full
 replan, finish the old updates and graph replays, then recapture `run()` for the
 new plan.
+If that replan fails, the old bound stream waits for rollback before subsequent
+updates or replay. This device-side dependency does not block the host.
 Before snapshotting or mutating graph buffers, `plan()` rejects a switch while
 the bound stream reports pending work through a nonblocking stream query.
 Slot events cover staging copies, not the subsequent commit kernel or replay.

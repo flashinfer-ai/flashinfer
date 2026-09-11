@@ -492,6 +492,7 @@ class BatchMLAPagedAttentionWrapper:
         is absent from steady :meth:`update_cuda_graph_plan` calls. A stream
         switch is rejected while the previous bound stream has pending work.
         """
+        rollback_stream: Optional[torch.cuda.Stream] = None
         if self._enable_cuda_graph_plan_update:
             if self._cuda_graph_plan_update_in_progress:
                 raise RuntimeError(
@@ -504,9 +505,10 @@ class BatchMLAPagedAttentionWrapper:
                     # Slot events cover H2D staging, not the later commit or
                     # replay. Query the whole bound stream before snapshots or
                     # live writes. Same-stream replanning is already ordered.
-                    if not torch.cuda.ExternalStream(
+                    rollback_stream = torch.cuda.ExternalStream(
                         bound_stream, device=self.device
-                    ).query():
+                    )
+                    if not rollback_stream.query():
                         raise RuntimeError(
                             "cannot replan on another stream while the bound CUDA stream "
                             "has pending work; finish old updates and replays first."
@@ -718,6 +720,10 @@ class BatchMLAPagedAttentionWrapper:
                 ].copy_(graph_workspace_snapshot)
             for tensor, snapshot in graph_metadata_snapshots:
                 tensor.copy_(snapshot)
+            if rollback_stream is not None:
+                # A failed stream switch retains the old binding. Order its
+                # next update/replay after these asynchronous restoration copies.
+                rollback_stream.wait_stream(torch.cuda.current_stream(self.device))
             raise
 
         # ---------------------------------------------------------------------------
@@ -801,7 +807,9 @@ class BatchMLAPagedAttentionWrapper:
         must execute on that same stream. Cross-stream replay is unsupported;
         the wrapper cannot observe or validate an external replay stream.
         A successful :meth:`plan` resets the binding; a failed plan preserves
-        it. Before replanning on another stream, finish the old updates and
+        it. If replanning on another stream fails, the old bound stream waits
+        for rollback before subsequent work, without blocking the host.
+        Before replanning on another stream, finish the old updates and
         replays, then recapture :meth:`run` for the new plan.
         Replanning queries the bound stream without waiting and rejects a
         stream switch while work remains. Staging events alone do not prove
