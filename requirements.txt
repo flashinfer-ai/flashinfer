@@ -1,4 +1,4 @@
-apache-tvm-ffi>=0.1.10,<0.2
+apache-tvm-ffi>=0.1.11,<0.2
 click
 # cuda-python + nccl-extensions: runtime deps for the moe_ep EP transport
 # backends (default since the EP install became opt-out; CUDA-13 wheels only
@@ -45,7 +45,7 @@ nccl-extensions>=0.1.0
 nccl4py>=0.4.1
 ninja
 numpy
-nvidia-cudnn-frontend>=1.25.0
+nvidia-cudnn-frontend>=1.28.0
 nvidia-cutlass-dsl>=4.6.2a0
 nvidia-ml-py
 packaging>=24.2
