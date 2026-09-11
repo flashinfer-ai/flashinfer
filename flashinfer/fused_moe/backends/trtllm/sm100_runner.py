@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import torch
 
@@ -31,11 +31,16 @@ from flashinfer.fused_moe.shared.tuning import (
     make_repeating_tensor_initializer,
     moe_topk_ids_init,
 )
+from flashinfer.fused_moe.shared.validation import (
+    SUPPORTED_MOE_ACT_SF_LAYOUT,
+    resolve_moe_act_sf_layout,
+)
 from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
     Fp8QuantizationType,
+    SfLayout,
     WeightLayout,
     trtllm_gen_dtype_has_scale,
 )
@@ -130,8 +135,41 @@ class MoERunner(TunableRunner):
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
         routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
+        hidden_states_scale_layout: Optional[Union[int, SfLayout]] = None,
         **kwargs,
     ) -> TuningConfig:
+        """Build a TuningConfig for this runner instance.
+
+        ``hidden_states_scale_layout`` is the layout of a block-scale
+        ``hidden_states_scale``.  Only :attr:`SfLayout.layout_linear` is
+        supported; anything else raises.  ``None`` (the default) infers the
+        linear layout and emits a :class:`DeprecationWarning` -- both the
+        inference and the optionality are deprecated.
+        """
+        # Resolve here rather than inside make_moe_tuning_config: the warning's
+        # stacklevel is counted from this frame (see resolve_moe_act_sf_layout).
+        #
+        # Two quant types carry a layout-ambiguous activation scale -- NoneFp8
+        # (the fp4 block-scale op) and MxFp8 -- because for those the buffer is
+        # a flat byte run whose linear-vs-swizzled layout is a convention
+        # rather than a shape.  The other two are pinned to an exact shape by
+        # the C++ launcher (DeepSeekFp8 is [hidden_size//128, num_tokens],
+        # PerTensorFp8 is [num_tokens, 1]), so there is nothing to declare.
+        #
+        # Only NoneFp8 resolves here for now: MxFp8 arrives via
+        # trtllm_fp8_block_scale_moe, which does not yet expose
+        # hidden_states_scale_layout, so warning on it would tell the caller to
+        # pass a parameter that does not exist.  Extending the parameter to that
+        # op is tracked as follow-up; until then MxFp8 keeps the historical
+        # implicit-linear assumption, undeclared.
+        if (
+            moe_inputs.hidden_states_scale is not None
+            and self.fp8_quantization_type == Fp8QuantizationType.NoneFp8
+        ):
+            act_sf_layout = resolve_moe_act_sf_layout(hidden_states_scale_layout)
+        else:
+            act_sf_layout = SUPPORTED_MOE_ACT_SF_LAYOUT
+
         if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0:
             if (
                 self._topk_initializer_cache is None
@@ -160,6 +198,7 @@ class MoERunner(TunableRunner):
             fp8_quantization_type=self.fp8_quantization_type,
             init_packed_topk_ids=init_packed_topk_ids,
             tune_max_num_tokens=tune_max_num_tokens,
+            act_sf_layout=act_sf_layout,
             **kwargs,
         )
 
@@ -296,19 +335,35 @@ class MoERunner(TunableRunner):
             "hidden_states's first dimension must be batch size."
         )
         if hidden_states_scale is not None:
-            assert hidden_states_scale.dim() == 2, (
-                "hidden_states_scale must be a 2D tensor"
-            )
             if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-                assert hidden_states_scale.shape[1] == num_tokens, (
+                assert (
+                    hidden_states_scale.dim() == 2
+                    and hidden_states_scale.shape[1] == num_tokens
+                ), (
                     f"DeepSeekFp8 hidden_states_scale shape "
-                    f"{tuple(hidden_states_scale.shape)} expects num_tokens={num_tokens} "
-                    f"at dim 1"
+                    f"{tuple(hidden_states_scale.shape)} expects a 2D tensor with "
+                    f"num_tokens={num_tokens} at dim 1"
                 )
+            elif hidden_states_scale.dim() == 1:
+                # Flat linear layout, i.e. mxfp8_quantize(...,
+                # is_sf_swizzled_layout=False): one contiguous run of
+                # sf_per_token scales per token.
+                if num_tokens <= 0 or hidden_states_scale.numel() % num_tokens != 0:
+                    # Not an assert: `python -O` strips those, and this
+                    # validates caller input rather than an internal invariant.
+                    raise ValueError(
+                        f"flat hidden_states_scale numel "
+                        f"{hidden_states_scale.numel()} is not a multiple of "
+                        f"num_tokens={num_tokens}"
+                    )
             else:
-                assert hidden_states_scale.shape[0] == num_tokens, (
+                assert (
+                    hidden_states_scale.dim() == 2
+                    and hidden_states_scale.shape[0] == num_tokens
+                ), (
                     f"hidden_states_scale shape {tuple(hidden_states_scale.shape)} "
-                    f"expects num_tokens={num_tokens} at dim 0"
+                    f"expects a 2D tensor with num_tokens={num_tokens} at dim 0, "
+                    f"or a flat (num_tokens * sf_per_token,) tensor"
                 )
 
         if self.dtype_weights == DtypeTrtllmGen.Bfloat16:
