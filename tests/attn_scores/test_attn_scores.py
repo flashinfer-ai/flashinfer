@@ -2267,10 +2267,109 @@ def test_api_rejects_malformed_ranks_and_dtypes():
             ctx,
         )
 
-    # Strided index tensors are rejected with the fix, not a bare FFI error.
+    # A column-strided table (inner stride != 1) is rejected with the fix, not
+    # a bare FFI error; row-strided views are accepted (see
+    # test_index_tensors_row_strided_views).
     bt_noncontig = torch.zeros((4, 2), dtype=torch.int32, device=device).t()
-    with pytest.raises(ValueError, match="block_tables must be contiguous"):
+    with pytest.raises(ValueError, match="innermost stride must be 1"):
         fp8_paged_mqa_logits(q, kv, w, bt_noncontig, cl, ctx)
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_index_tensors_row_strided_views(variant, offset):
+    """Row-strided block_tables and strided seq_lens views are accepted
+    zero-copy and give bit-identical logits to the compact tensors.
+
+    This is the serving shape SGLang produces for speculative verification: a
+    table with one row per draft token, de-expanded for this API with
+    block_tables[::next_n] (unit inner stride, row stride next_n*W) and
+    seq_lens[::next_n] (stride next_n).  The kernels read both only through
+    their layouts with scalar loads, so the API must not demand a copy the
+    kernel does not need.  offset=1 shifts the view's base by W*4 = 24 bytes
+    (not 16-byte aligned), pinning that no stronger alignment is assumed on
+    the index tensors.  Against the old code the call raised 'must be
+    contiguous' before any launch; if only the Python check were relaxed and
+    the compiled declaration stayed compact, request 1 would read request 0's
+    blocks and the bit-exact comparison would fail on its rows.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import min_block_table_width
+
+    device = "cuda"
+    torch.manual_seed(3)
+    B, next_n, H, D, block_size, ctx = 2, 2, 64, 128, 64, 300
+    seq_lens = torch.tensor([257, 300], dtype=torch.int32, device=device)
+    W = min_block_table_width(ctx, block_size)  # 6 -> W*4 = 24 B row shift
+    num_blocks = B * W
+    bt = torch.arange(num_blocks, dtype=torch.int32, device=device).view(B, W)
+    w = torch.rand(B * next_n, H, device=device)
+    if variant == "fp8":
+        kv_vals = torch.randn(num_blocks, block_size, D, device=device).to(
+            torch.float8_e4m3fn
+        )
+        kv_scales = torch.rand(num_blocks, block_size, device=device) + 0.5
+        kv = torch.cat(
+            [
+                kv_vals.view(torch.uint8).flatten(1),
+                kv_scales.view(torch.uint8).flatten(1),
+            ],
+            dim=1,
+        ).view(num_blocks, block_size, 1, D + 4)
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+
+        def call(bt_arg, sl_arg):
+            return fp8_paged_mqa_logits(q, kv, w, bt_arg, sl_arg, ctx)
+    else:
+        kv_codes = torch.randint(
+            0,
+            256,
+            (num_blocks, block_size * (D // 2)),
+            dtype=torch.uint8,
+            device=device,
+        )
+        kv_sf = torch.full(
+            (num_blocks, block_size * 4), 0x7F, dtype=torch.uint8, device=device
+        )
+        kv = torch.cat([kv_codes, kv_sf], dim=1).view(
+            num_blocks, block_size, 1, D // 2 + 4
+        )
+        q = torch.randint(
+            0, 256, (B, next_n, H, D // 2), dtype=torch.uint8, device=device
+        )
+        q_sf = torch.full((B, next_n, H), 0x7F7F7F7F, dtype=torch.int32, device=device)
+
+        def call(bt_arg, sl_arg):
+            return fp4_paged_mqa_logits(
+                q, q_sf, kv, w, bt_arg, sl_arg, ctx, output_dtype=torch.bfloat16
+            )
+
+    ref = call(bt, seq_lens).clone()
+    torch.cuda.synchronize()
+
+    bt_view = bt.repeat_interleave(next_n, dim=0)[offset::next_n]  # (B, W), (2W, 1)
+    sl_view = seq_lens.repeat_interleave(next_n)[offset::next_n]  # (B,), stride 2
+    assert bt_view.stride() == (next_n * W, 1) and not bt_view.is_contiguous()
+    assert sl_view.stride() == (next_n,) and not sl_view.is_contiguous()
+    assert torch.equal(bt_view, bt) and torch.equal(sl_view, seq_lens)
+
+    got = call(bt_view, sl_view)
+    torch.cuda.synchronize()
+    valid = _valid_causal_mask(seq_lens, next_n, ctx, device)
+    assert torch.equal(got[:, :ctx][valid], ref[:, :ctx][valid]), (
+        "row-strided index views must be bit-identical to the compact tensors"
+    )
+    assert torch.isfinite(ref[:, :ctx][valid]).all()
+
+    # A column-strided table (inner stride != 1) is still rejected: that IS a
+    # kernel requirement (entries of a row are read as adjacent scalars).
+    bt_cols = torch.zeros((B, 2 * W), dtype=torch.int32, device=device)[:, ::2]
+    assert bt_cols.shape == (B, W) and bt_cols.stride(1) == 2
+    with pytest.raises(ValueError, match="innermost stride must be 1"):
+        call(bt_cols, seq_lens)
 
 
 def test_out_layout_rejected():

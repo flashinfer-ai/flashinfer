@@ -309,18 +309,18 @@ def _validate_paged_inputs(
             f"({batch_size}) inferred from q.shape[0]; got shape "
             f"{tuple(block_tables.shape)}"
         )
-    # The kernels are compiled against compact (contiguous) index tensors; a
-    # strided view reaches the FFI binding with a bare layout error otherwise.
-    if not seq_lens.is_contiguous():
+    # Layout: the kernels read both index tensors through their layouts with
+    # scalar Int32 loads and are compiled with symbolic outer strides, so the
+    # only real requirement is that a block-table row's entries are adjacent
+    # (the compiled inner stride is 1).  seq_lens may have any stride, and a
+    # row-strided table view (block_tables[::next_n]) is accepted zero-copy --
+    # never force a copy the kernel does not need.
+    if block_tables.shape[1] > 1 and block_tables.stride(1) != 1:
         raise ValueError(
-            f"{fn_name}: seq_lens must be contiguous; got stride "
-            f"{tuple(seq_lens.stride())}. Call .contiguous() first."
-        )
-    if not block_tables.is_contiguous():
-        raise ValueError(
-            f"{fn_name}: block_tables must be contiguous (the kernel is compiled "
-            f"against a compact row-major table); got stride "
-            f"{tuple(block_tables.stride())}. Call .contiguous() first."
+            f"{fn_name}: block_tables' innermost stride must be 1 (each row's "
+            f"entries contiguous; a row-strided view such as table[::k] is "
+            f"fine); got strides {tuple(block_tables.stride())}. Call "
+            f".contiguous() first."
         )
 
 
@@ -936,11 +936,22 @@ def _cached_compile_fp8_kernel(
         (cute.sym_int(), max_ctx),
         stride=(cute.sym_int64(), 1),
     )
-    bt_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_B, max_blocks), stride_order=(1, 0)
+    # block_tables / seq_lens are read only through their layouts with scalar
+    # Int32 loads (no TMA descriptor), so the kernel needs a unit inner stride
+    # on the table and nothing else: declare the row stride (and seq_lens'
+    # stride) symbolic so views such as block_tables[::next_n] /
+    # seq_lens[::next_n] -- a per-draft-token table de-expanded without a
+    # copy -- are consumed zero-copy, like kv_fused and logits above.  A
+    # compact declaration would bake the row stride in and reject them at the
+    # FFI boundary.  4-byte alignment is all an Int32 base pointer guarantees.
+    bt_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (sym_B, max_blocks),
+        stride=(cute.sym_int64(), 1),
+        assumed_align=4,
     )
-    cl_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_B,), stride_order=(0,)
+    cl_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (sym_B,), stride=(cute.sym_int(),), assumed_align=4
     )
     sm_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_ctas_sym, 2), stride_order=(1, 0)
@@ -1068,11 +1079,15 @@ def _cached_compile_fp4_kernel(
         (cute.sym_int(), max_ctx),
         stride=(cute.sym_int64(), 1),
     )
-    bt_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_batch, max_blocks), stride_order=(1, 0)
+    # Symbolic strides for the index tensors -- see the fp8 twin above.
+    bt_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (sym_batch, max_blocks),
+        stride=(cute.sym_int64(), 1),
+        assumed_align=4,
     )
-    cl_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_batch,), stride_order=(0,)
+    cl_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (sym_batch,), stride=(cute.sym_int(),), assumed_align=4
     )
     sm_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_ctas_sym, 2), stride_order=(1, 0)
@@ -1589,8 +1604,12 @@ def fp8_paged_mqa_logits(
                          [batch_size, next_n, num_heads] tensor as
                          w.view(batch_size * next_n, num_heads).  Cast
                          internally when epi_dtype is float16.
-        block_tables:    [batch_size, max_blocks_per_seq]  int32, contiguous,
-                         on q's device.  Values are physical block indices
+        block_tables:    [batch_size, max_blocks_per_seq]  int32, on q's
+                         device, each row's entries contiguous (stride(1) ==
+                         1).  The row stride is free, so a row-strided view
+                         such as block_tables[::next_n] (a per-draft-token
+                         table de-expanded without a copy) is accepted
+                         zero-copy.  Values are physical block indices
                          into kv_fused's dim 0.  max_blocks_per_seq must be
                          at least min_block_table_width(max(seq_lens),
                          block_size) -- at least as wide as, and usually
@@ -1603,8 +1622,9 @@ def fp8_paged_mqa_logits(
                          few columns is a device-side out-of-bounds READ, i.e.
                          undefined behaviour -- it may return corrupt logits,
                          or fault and poison the CUDA context.
-        seq_lens:        [batch_size]  int32, contiguous, on q's device.
-                         Per-request KV length; no entry may exceed
+        seq_lens:        [batch_size]  int32, on q's device; any stride (a
+                         strided view such as seq_lens[::next_n] is accepted
+                         zero-copy).  Per-request KV length; no entry may exceed
                          max_seq_len.  (The DeepGEMM paged-MQA API this module
                          ports calls it ``context_lens``.)
         max_seq_len:     int  maximum KV sequence length; must be >=
@@ -2128,8 +2148,12 @@ def fp4_paged_mqa_logits(
                          [batch_size, next_n, num_heads] tensor as
                          w.view(batch_size * next_n, num_heads).  Cast
                          internally when epi_dtype is float16/bfloat16.
-        block_tables:    [batch_size, max_blocks_per_seq]  int32, contiguous,
-                         on q's device.  Values are physical block indices
+        block_tables:    [batch_size, max_blocks_per_seq]  int32, on q's
+                         device, each row's entries contiguous (stride(1) ==
+                         1).  The row stride is free, so a row-strided view
+                         such as block_tables[::next_n] (a per-draft-token
+                         table de-expanded without a copy) is accepted
+                         zero-copy.  Values are physical block indices
                          into kv_fused's dim 0.  max_blocks_per_seq must be
                          at least min_block_table_width(max(seq_lens),
                          block_size) -- at least as wide as, and usually
@@ -2142,8 +2166,9 @@ def fp4_paged_mqa_logits(
                          few columns is a device-side out-of-bounds READ, i.e.
                          undefined behaviour -- it may return corrupt logits,
                          or fault and poison the CUDA context.
-        seq_lens:        [batch_size]  int32, contiguous, on q's device.
-                         Per-request KV length; no entry may exceed
+        seq_lens:        [batch_size]  int32, on q's device; any stride (a
+                         strided view such as seq_lens[::next_n] is accepted
+                         zero-copy).  Per-request KV length; no entry may exceed
                          max_seq_len.  (The DeepGEMM paged-MQA API this module
                          ports calls it ``context_lens``.)
         max_seq_len:     int  maximum KV sequence length; must be >=
