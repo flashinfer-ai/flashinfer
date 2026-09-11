@@ -239,3 +239,120 @@ def test_cache_offsets_above_two_gib():
         args[0], args[1], large, args[3], shifted, args[5]
     )
     check(args, out, lse)
+
+
+@pytest.mark.parametrize(
+    "levels",
+    [
+        [0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.5, 0.75],
+        [0.0625, 0.5, 0.125, 0.75, 0.125, 0.375, 0.0625, 1.0],
+        [0.0625] * 7 + [0.75],
+    ],
+)
+@pytest.mark.parametrize("batch", [16, 128])
+def test_normalization_anchor_crossings(levels, batch):
+    gate()
+    q, swa, main, wi, ci, sink = make_case(batch, 512)
+    # Exact scalar products with head-dependent signs exercise differing
+    # rescale decisions in the same warp. Last tile introduces a new maximum.
+    head_scale = torch.linspace(-0.75, 1.25, 64, device=q.device).bfloat16()
+    q.copy_(head_scale[None, None, :, None].expand_as(q))
+    wd = (
+        torch.zeros((128, 512), device=q.device)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    ws = torch.full((128, 16), 127, device=q.device, dtype=torch.uint8)
+    swa = pack(wd, ws, 528)
+    cd = torch.full((512, 256), 0x22, device=q.device, dtype=torch.uint8)
+    cs = (
+        torch.tensor(levels, device=q.device)
+        .repeat_interleave(64)[:, None]
+        .expand(512, 32)
+        .contiguous()
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    main = pack(cd, cs, 288)
+    wi = (
+        torch.arange(128, device=q.device, dtype=torch.int32)[None, None]
+        .expand(batch, 1, 128)
+        .contiguous()
+    )
+    ci = (
+        torch.arange(512, device=q.device, dtype=torch.int32)[None, None]
+        .expand(batch, 1, 512)
+        .contiguous()
+    )
+    sink.fill_(-float("inf"))
+    args = (q, swa, main, wi, ci, sink)
+    out, lse, _ = deepseek_v41_decode(*args)
+    check(args, out, lse)
+
+
+def test_fp4_conversion_fallback():
+    gate()
+    from flashinfer.experimental.deepseek_v41.decode import _compile
+
+    args = make_case(128, 512)
+    _, _, plan = deepseek_v41_decode(*args)
+    fallback = dataclasses.replace(
+        plan,
+        kernel=_compile(args[0].device.index, 512, False, 16, 2, False, False),
+    )
+    out, lse, _ = deepseek_v41_decode(*args, plan=fallback)
+    check(args, out, lse)
+
+
+def test_native_fp4_all_finite_codes():
+    gate()
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.experimental import primitives as prims
+    from flashinfer.experimental.deepseek_v41 import hca_v41_primitives as hw
+
+    if (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) < (13, 2):
+        pytest.skip("native BF16 conversion requires bundled CUDA >= 13.2")
+
+    @cute.kernel
+    def convert(words: cute.Tensor, scales: cute.Tensor, out: cute.Tensor):
+        i = cute.arch.block_idx()[0] * 128 + cute.arch.thread_idx()[0]
+        if i < words.shape[0]:
+            scale = hw.fp8x2_to_bf16_word(scales[i] * 257)
+            values = hw.fp4x8_to_bf16_words(words[i])
+            for j in cutlass.range_constexpr(4):
+                out[i, j] = prims.mul_bf16x2(values[j], scale)
+
+    @cute.jit
+    def launch(words, scales, out, stream: cuda.CUstream):
+        convert(words, scales, out).launch(
+            grid=(cute.ceil_div(words.shape[0], 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    # Cross every pair of FP4 codes with every finite E4M3 scale. Permute
+    # other bytes to expose lane-order bugs; compare signed zeros bitwise.
+    ids = torch.arange(65536, device="cuda", dtype=torch.int64)
+    sc, byte = ids & 255, ids >> 8
+    keep = (sc != 127) & (sc != 255)
+    words = (
+        byte | ((byte ^ 0x53) << 8) | ((byte ^ 0x97) << 16) | ((byte ^ 0xE1) << 24)
+    )[keep].int()
+    scales = sc[keep].int()
+    out = torch.empty((words.numel(), 4), device="cuda", dtype=torch.int32)
+    tensors = [from_dlpack(x) for x in (words, scales, out)]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(launch, *tensors, stream)
+    compiled(*tensors, stream)
+    lut = torch.tensor(
+        [0.0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    codes = (words.long()[:, None] >> (4 * torch.arange(8, device="cuda"))) & 15
+    scale_values = scales.to(torch.uint8).view(torch.float8_e4m3fn).double()
+    expected = (lut[codes] * scale_values[:, None]).bfloat16()
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))

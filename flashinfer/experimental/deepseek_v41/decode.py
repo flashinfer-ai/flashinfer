@@ -16,12 +16,17 @@ def _compile(
     dequant_warps=8,
     phase_chunks=8,
     narrow_offsets=False,
+    native_fp4=None,
 ):
     import cutlass
     import cutlass.cute as cute
     from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ...cute_dsl.attention.dsa import hca_helpers
     from . import hca_v41, hca_v41_primitives
+
+    if native_fp4 is None:
+        # cute.compile uses CUTLASS's bundled compiler, not CUDA_HOME.
+        native_fp4 = (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 2)
 
     sb, sq, sh, spw, spc, sws = (cute.sym_int() for _ in range(6))
     sd = cute.sym_int(divisibility=16)
@@ -54,7 +59,7 @@ def _compile(
         mma_pv_tiler_mn=(64, 128),
         max_active_clusters=1,
         page_size_cmp=64,
-        skip_correction_threshold=0.0,
+        skip_correction_threshold=6.0,
         is_persistent=False,
         is_var_seq=True,
         is_var_split_kv=False,
@@ -67,11 +72,13 @@ def _compile(
         dequant_warps=dequant_warps,
         dequant_phase_chunks=phase_chunks,
         narrow_offsets=narrow_offsets,
+        native_fp4=native_fp4,
     )
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_decode",
         f"h64_s1_c{compressed_k}_split{int(split)}"
-        f"_dq{dequant_warps}_phase{phase_chunks}_i{32 if narrow_offsets else 64}",
+        f"_dq{dequant_warps}_phase{phase_chunks}_i{32 if narrow_offsets else 64}"
+        f"_nativefp4{int(native_fp4)}",
         lambda: cute.compile(
             kernel,
             q,

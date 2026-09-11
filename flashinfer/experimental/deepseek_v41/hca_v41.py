@@ -33,7 +33,8 @@
 # (E2M1 + per-16 E4M3) compressed KV, both dequantized to BF16 for kind::f16
 # MMA, plus the V4.1 per-head sink. The single-CTA head64 structure of DeepSeek
 # FlashMLA (csrc/kernels/sm100/decode/sparse/head64, MIT) was used as a design
-# reference for the SMEM/TMEM budget; no FlashMLA code is copied.
+# reference for the SMEM/TMEM budget and deferred softmax rescaling;
+# no FlashMLA code is copied.
 # Work in progress: see the module docstring for the current state.
 
 import math
@@ -103,6 +104,7 @@ class BlackwellV41MixedCacheDecode:
         dequant_warps: int = 8,
         dequant_phase_chunks: int = 8,
         narrow_offsets: bool = False,
+        native_fp4: bool = False,
     ):
         """Initializes the configuration for a Blackwell Heavily Compressed Attention (HCA) kernel.
 
@@ -162,6 +164,7 @@ class BlackwellV41MixedCacheDecode:
         self.max_topk = max_topk
         self.use_2cta_instrs = mma_qk_tiler_mn[0] == 128
         self.use_primitives = not self.use_2cta_instrs
+        self.native_fp4 = native_fp4
         self.cluster_shape_mnk = (2 if self.use_2cta_instrs else 1, 1, 1)
         if not self.use_2cta_instrs:
             assert mma_qk_tiler_mn == (64, 64)
@@ -1945,16 +1948,37 @@ class BlackwellV41MixedCacheDecode:
         """32 E2M1 elements (two 16-groups; E4M3 scale bytes in sc_word[7:0],
         [15:8]) -> four 8-element BF16 fragments, each written to this CTA's K
         tile and to the V tile of CTA `owner`."""
-        s0 = self._e4m3_to_f32(sc_word & 255)
-        s1 = self._e4m3_to_f32((sc_word >> 8) & 255)
-        for q in cutlass.range_constexpr(4):
-            if cutlass.const_expr(q < 2):
-                sc = s0
-            else:
-                sc = s1
-            frag = self._to_bf16_frag(self._fp4x8_to_f32x8(chunk[q]) * sc)
-            self._store_frag(frag, k_base, e0k + q * 8)
-            self._store_frag_dsmem(frag, v_base, e0v + q * 8, owner)
+        if cutlass.const_expr(self.native_fp4):
+            # E2M1 times finite E4M3 needs at most six significant bits;
+            # packed BF16 multiplication is exact and avoids FP32 expansion.
+            packed_scale = hw.fp8x2_to_bf16_word(sc_word).to(cutlass.Uint32)
+            s0 = ((packed_scale & 65535) * 65537).to(cutlass.Int32)
+            s1 = ((packed_scale >> 16) * 65537).to(cutlass.Int32)
+            for q in cutlass.range_constexpr(4):
+                sc = s0 if q < 2 else s1
+                words = hw.fp4x8_to_bf16_words(chunk[q])
+                frag = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32)
+                for i in cutlass.range_constexpr(4):
+                    frag[i] = prims.mul_bf16x2(words[i], sc)
+                bf16_frag = cute.make_tensor(
+                    cute.recast_ptr(frag.iterator, dtype=cutlass.BFloat16),
+                    cute.make_layout(8),
+                )
+                self._store_frag(bf16_frag, k_base, e0k + q * 8)
+                self._store_frag_dsmem(bf16_frag, v_base, e0v + q * 8, owner)
+        else:
+            # Preserve the same kernel on older bundled CUDA toolchains that
+            # do not support PTX 9.2's native BF16 conversion instructions.
+            s0 = self._e4m3_to_f32(sc_word & 255)
+            s1 = self._e4m3_to_f32((sc_word >> 8) & 255)
+            for q in cutlass.range_constexpr(4):
+                if cutlass.const_expr(q < 2):
+                    sc = s0
+                else:
+                    sc = s1
+                frag = self._to_bf16_frag(self._fp4x8_to_f32x8(chunk[q]) * sc)
+                self._store_frag(frag, k_base, e0k + q * 8)
+                self._store_frag_dsmem(frag, v_base, e0v + q * 8, owner)
 
     @cute.jit
     def _store_fp8_chunk(
@@ -3126,6 +3150,14 @@ class BlackwellV41MixedCacheDecode:
         # A split can begin with a completely masked window tile and no
         # sink. Preserve its -inf maximum for a later nonempty tile, while
         # avoiding -inf - -inf in the rescale and exponentiation.
+        # Like FlashMLA's head64 schedule, delay shifting the normalization
+        # anchor until its log2 increase exceeds the threshold. Select it
+        # before forming P, the old-sum factor, and final-tile metadata so
+        # every quantity uses the same anchor; P remains bounded by 2**6.
+        if (
+            row_max_new - row_max
+        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+            row_max_new = row_max
         empty_row = row_max_new == -self.acc_dtype.inf
         correction_factor = cute.math.exp2(
             cutlass.select_(

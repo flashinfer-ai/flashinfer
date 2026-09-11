@@ -15,6 +15,30 @@ from cutlass.experimental import primitives as prims
 
 
 @cute.jit
+def fp4x8_to_bf16_words(word: cutlass.Int32):
+    """Native PTX 9.2 conversion; CUTLASS 4.7 lacks this typed wrapper."""
+    return prims.inline_ptx(
+        "{ .reg .b8 b0, b1, b2, b3; "
+        "mov.b32 {b0, b1, b2, b3}, {$r0}; "
+        "cvt.rn.bf16x2.e2m1x2 {$w0}, b0; "
+        "cvt.rn.bf16x2.e2m1x2 {$w1}, b1; "
+        "cvt.rn.bf16x2.e2m1x2 {$w2}, b2; "
+        "cvt.rn.bf16x2.e2m1x2 {$w3}, b3; }",
+        write_only_types=[cutlass.Int32] * 4,
+        read_only_args=[word],
+    )
+
+
+@cute.jit
+def fp8x2_to_bf16_word(word: cutlass.Int32):
+    return prims.inline_ptx(
+        "cvt.rn.bf16x2.e4m3x2 {$w0}, {$r0};",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[word.to(cutlass.Uint16)],
+    )
+
+
+@cute.jit
 def qk_mma(sq, sk, dst, kv_stage: cutlass.Int32):
     """M64 N64 K512, Q/K both SW128 K-major; overwrite the score tile."""
     # The primitive consumes a native addrspace-6 pointer. Rebuild it from
