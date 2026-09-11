@@ -544,6 +544,40 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 32, 256])
+@pytest.mark.parametrize("vocab_size", [32000, 128256, 163840])
+@pytest.mark.parametrize("k", [40, 5000])
+def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
+    """Repeated calls on identical input must return bit-identical output.
+
+    Serving engines run this kernel independently on every tensor-parallel rank
+    and commit the result (sampled tokens, speculative accept lengths) to
+    per-rank state; a last-bit difference between ranks eventually deadlocks a
+    collective. The multi-CTA path used to pool the per-CTA partial sums with a
+    float atomicAdd, so the normalizer depended on CTA arrival order.
+    """
+    torch.manual_seed(0)
+    # heavy-tailed, high-entropy rows: many kept elements, so the cross-CTA sum
+    # has many terms and the old atomicAdd path differed on ~all calls
+    ranks = torch.arange(1, vocab_size + 1, device="cuda:0", dtype=torch.float32)
+    logits = torch.empty(batch_size, vocab_size, device="cuda:0")
+    for r in range(batch_size):
+        perm = torch.randperm(vocab_size, device="cuda:0")
+        logits[r] = (-1.1 * torch.log(ranks))[perm] + 0.6 * torch.randn(
+            vocab_size, device="cuda:0"
+        )
+    probs = torch.softmax(logits, dim=-1)
+    ref = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    for _ in range(30):
+        out = flashinfer.sampling.top_k_renorm_probs(probs, k)
+        assert torch.equal(out, ref), "top_k_renorm_probs output changed between calls"
+    # per-request k tensor path
+    top_k = torch.full((batch_size,), k, device="cuda:0", dtype=torch.int32)
+    ref_t = flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+    for _ in range(10):
+        assert torch.equal(flashinfer.sampling.top_k_renorm_probs(probs, top_k), ref_t)
+
+
 def test_top_k_renorm_probs_mixed_k_persistent_loop(dtype):
     """Test top_k_renorm_probs with mixed k values in persistent loop (multi-CTA mode).
 
