@@ -111,6 +111,10 @@ struct MoeA2ADispatchParams {
   // Expert routing information
   int32_t const* token_selected_experts;  // [local_num_tokens, top_k]
 
+  // Invalid-expert id: any (token, k) whose expert id equals this value is treated as
+  // padding and skipped during dispatch
+  int32_t invalid_expert_id;
+
   // Generic payloads
   int num_payloads;                          // Number of different payload types
   PayloadDescriptor payloads[kMaxPayloads];  // Array of payload descriptors
