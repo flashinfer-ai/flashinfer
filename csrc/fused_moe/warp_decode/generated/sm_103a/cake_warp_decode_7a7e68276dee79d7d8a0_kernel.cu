@@ -430,7 +430,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_05eeb4fae0e0bb547df0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_warp_decode_7a7e68276dee79d7d8a0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -505,12 +505,12 @@ kernel_cake_warp_decode_05eeb4fae0e0bb547df0(const __grid_constant__ CUtensorMap
             mbarrier_init(smem + 176, 1);
             mbarrier_init(smem + 184, 1);
             mbarrier_init(smem + 192, 1);
-            // sfb_free: 5 barriers, init_count=1
-            mbarrier_init(smem + 200, 1);
-            mbarrier_init(smem + 208, 1);
-            mbarrier_init(smem + 216, 1);
-            mbarrier_init(smem + 224, 1);
-            mbarrier_init(smem + 232, 1);
+            // sfb_free: 5 barriers, init_count=4
+            mbarrier_init(smem + 200, 4);
+            mbarrier_init(smem + 208, 4);
+            mbarrier_init(smem + 216, 4);
+            mbarrier_init(smem + 224, 4);
+            mbarrier_init(smem + 232, 4);
             // tmem_sfa_full: 5 barriers, init_count=1
             mbarrier_init(smem + 240, 1);
             mbarrier_init(smem + 248, 1);
@@ -856,8 +856,10 @@ kernel_cake_warp_decode_05eeb4fae0e0bb547df0(const __grid_constant__ CUtensorMap
                 if (warp == 4) {
                     if (elect_sync()) {
                         mbarrier_arrive(tmem_sfb_full_addr + (stage) * 8);
-                        mbarrier_arrive(sfb_free_addr + (stage) * 8);
                     }
+                }
+                if (elect_sync()) {
+                    mbarrier_arrive(sfb_free_addr + (stage) * 8);
                 }
                 stage += 1;
                 if (stage == 5) { stage = 0; _phase_sfb_full ^= 1; _phase_k_done ^= 1; }

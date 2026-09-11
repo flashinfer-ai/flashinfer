@@ -781,6 +781,7 @@ class CakeWarpDecodeConfig:
         supported = (
             (SwiGLU(), (2048, 512, 512)),
             (SwiGLU(), (2048, 1536, 60)),
+            (SwiGLU(), (2560, 768, 384)),
             (SiLU(), (6144, 1536, 192)),
         )
         if not any(
@@ -790,7 +791,8 @@ class CakeWarpDecodeConfig:
             raise ValueError(
                 "Cake warp decode weight preparation supports only default "
                 "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
-                "= (2048, 512, 512) or (2048, 1536, 60), and SiLU() with "
+                "= (2048, 512, 512), (2048, 1536, 60), or (2560, 768, 384), "
+                "and SiLU() with "
                 "(6144, 1536, 192); got "
                 f"activation={activation!r}, geometry={geometry}."
             )

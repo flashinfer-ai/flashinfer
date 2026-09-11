@@ -48,6 +48,7 @@ enum class Geometry : uint8_t {
   kH2048I512E512K10,
   kH2048I1536E60K4,
   kH6144I1536E192K4,
+  kH2560I768E384K4,
 };
 
 enum class Activation : uint8_t {
@@ -139,6 +140,18 @@ constexpr Schedule SelectSm103aSchedule(const Shape& shape) {
     return UnsupportedSchedule();
   }
 
+  if (IsGeometry(shape, 2560, 768, 384, 4)) {
+    return {true,
+            Geometry::kH2560I768E384K4,
+            RouteLayout::kDirect,
+            RoutePacker::kNone,
+            shape.num_tokens == 1 ? Fc1Schedule::kStatic : Fc1Schedule::kPersistent,
+            Fc2Schedule::kRouteParallelK256,
+            128,
+            4,
+            0};
+  }
+
   if (IsGeometry(shape, 2048, 512, 512, 10)) {
     if (shape.num_tokens < 23) {
       return {true,
@@ -227,6 +240,18 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
     return UnsupportedSchedule();
   }
 
+  if (IsGeometry(shape, 2560, 768, 384, 4)) {
+    return {true,
+            Geometry::kH2560I768E384K4,
+            RouteLayout::kDirect,
+            RoutePacker::kNone,
+            shape.num_tokens == 1 ? Fc1Schedule::kStatic : Fc1Schedule::kPersistent,
+            Fc2Schedule::kRouteParallelK256,
+            128,
+            4,
+            0};
+  }
+
   if (IsGeometry(shape, 2048, 512, 512, 10)) {
     return {true,
             Geometry::kH2048I512E512K10,
@@ -284,6 +309,7 @@ constexpr Schedule SelectSchedule(const Shape& shape) {
 constexpr Shape E512Shape(int32_t tokens) { return {tokens, 2048, 512, 512, 512, 10}; }
 constexpr Shape E60Shape(int32_t tokens) { return {tokens, 2048, 1536, 60, 60, 4}; }
 constexpr Shape E192SiluShape(int32_t tokens) { return {tokens, 6144, 1536, 192, 192, 4}; }
+constexpr Shape E384Shape(int32_t tokens) { return {tokens, 2560, 768, 384, 384, 4}; }
 
 // Compile-time boundary tests keep the public policy stable even before the
 // generated kernel inventory is present.
@@ -327,6 +353,19 @@ static_assert(SelectSm100aSchedule(E192SiluShape(2)).fc1 == Fc1Schedule::kPersis
 static_assert(SelectSm100aSchedule(E192SiluShape(32)).fc1 == Fc1Schedule::kPersistent);
 static_assert(!SelectSm103aSchedule({1, 2048, 512, 511, 511, 10}).supported);
 static_assert(!SelectSm100aSchedule({1, 2048, 1536, 60, 60, 5}).supported);
+static_assert(SelectSm100aSchedule(E384Shape(1)).fc1 == Fc1Schedule::kStatic);
+static_assert(SelectSm100aSchedule(E384Shape(2)).fc1 == Fc1Schedule::kPersistent);
+static_assert(SelectSm100aSchedule(E384Shape(32)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm100aSchedule(E384Shape(32)).fc2 == Fc2Schedule::kRouteParallelK256);
+static_assert(SelectSm103aSchedule(E384Shape(1)).fc1 == Fc1Schedule::kStatic);
+static_assert(SelectSm103aSchedule(E384Shape(2)).fc1 == Fc1Schedule::kPersistent);
+static_assert(SelectSm103aSchedule(E384Shape(32)).route_layout == RouteLayout::kDirect);
+static_assert(SelectSm103aSchedule(E384Shape(32)).fc2 == Fc2Schedule::kRouteParallelK256);
+static_assert(ActivationForGeometry(SelectSm103aSchedule(E384Shape(1)).geometry) ==
+              Activation::kSwiGLU);
+static_assert(Gemm1WeightRows(E384Shape(1), SelectSm103aSchedule(E384Shape(1))) == 1536);
+static_assert(!SelectSm100aSchedule(E384Shape(0)).supported);
+static_assert(!SelectSm103aSchedule(E384Shape(33)).supported);
 
 struct Invocation {
   Shape shape;

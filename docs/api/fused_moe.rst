@@ -136,7 +136,8 @@ portfolio fails closed outside these contracts:
 
 * ``(activation, hidden_size, intermediate_size, num_experts, top_k)`` is
   exactly ``(SwiGLU(), 2048, 512, 512, 10)``,
-  ``(SwiGLU(), 2048, 1536, 60, 4)``, or
+  ``(SwiGLU(), 2048, 1536, 60, 4)``,
+  ``(SwiGLU(), 2560, 768, 384, 4)``, or
   ``(SiLU(), 6144, 1536, 192, 4)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
   int32 expert IDs and BF16 routing weights;

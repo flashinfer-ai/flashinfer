@@ -38,6 +38,7 @@ The mandatory dense matrix is:
 |---|---:|---:|---:|---:|---:|
 | SwiGLU | 2048 | 512 | 512 | 10 | every value from 1 through 32 |
 | SwiGLU | 2048 | 1536 | 60 | 4 | every value from 1 through 32 |
+| SwiGLU | 2560 | 768 | 384 | 4 | every value from 1 through 32 |
 | standalone SiLU | 6144 | 1536 | 192 | 4 | every value from 1 through 32 |
 
 GEMM1 fixture construction is activation-aware. Its logical BF16 weight shape
@@ -124,6 +125,7 @@ selector transitions:
 - E512: T=1, 2, 22, 23, 32.
 - E60: T=1, 7, 8, 10, 11, 12, 16, 17, 32.
 - standalone-SiLU E192: T=1, 2, 32.
+- SwiGLU E384: T=1, 2, 32.
 
 Workspace preparation occurs on stream A before capture on distinct stream B.
 The harness first replays the graph without mutation and checks the applicable
@@ -151,12 +153,12 @@ subsequent layer call, and replays it from another stream. This is the
 framework-level regression gate for runner workspace selection and reusable
 routing-validation receipts.
 
-The selector boundary labels in the JSON receipt distinguish E60 `_e64_scan1`
-at T=11, `_e64_scan2` at T=12..16, and the general route packer at T=17..32.
+On SM103, the selector boundary labels in the JSON receipt distinguish E60
+`_e64_scan1` at T=11, `_e64_scan2` at T=12..16, and the general route packer at T=17..32.
 They distinguish E512 direct routing through T=22 from the general route packer
 at T=23..32.
-Standalone-SiLU E192 uses the static direct route at T=1 and the persistent
-direct route at T=2..32.
+Standalone-SiLU E192 and SwiGLU E384 use the static direct route at T=1 and the
+persistent direct route at T=2..32 on both targets.
 
 ## CUPTI benchmark gate
 
@@ -211,8 +213,8 @@ python benchmarks/cake_warp_decode.py \
 ```
 
 Use `--benchmark-tokens 1 11 17 24 32` to request a smaller explicit
-performance slice; correctness mode always retains the full three-configuration,
-T=1..32 matrix.
+performance slice; correctness mode always tests T=1..32 for every selected
+geometry. `--geometry all` includes all four configurations listed above.
 
 ## Compute Sanitizer entry point
 

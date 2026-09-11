@@ -696,6 +696,7 @@ class CakeWarpDecodeRunner(MoERunner):
         # activation, hidden_size, intermediate_size, num_experts, top_k
         (SwiGLU(), 2048, 512, 512, 10),
         (SwiGLU(), 2048, 1536, 60, 4),
+        (SwiGLU(), 2560, 768, 384, 4),
         (SiLU(), 6144, 1536, 192, 4),
     }
     _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
@@ -795,8 +796,9 @@ class CakeWarpDecodeRunner(MoERunner):
         if configuration_without_hidden not in supported_without_hidden:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner supports only default SwiGLU() with "
-                "(intermediate_size, num_experts, top_k) = (512, 512, 10) or "
-                "(1536, 60, 4), and SiLU() with (1536, 192, 4); got "
+                "(intermediate_size, num_experts, top_k) = (512, 512, 10), "
+                "(1536, 60, 4), or (768, 384, 4), and SiLU() with "
+                "(1536, 192, 4); got "
                 f"{configuration_without_hidden}."
             )
 
@@ -1174,7 +1176,8 @@ class CakeWarpDecodeRunner(MoERunner):
             raise ValueError(
                 "CakeWarpDecodeRunner supports only default SwiGLU() with "
                 "(hidden_size, intermediate_size, num_experts, top_k) = "
-                "(2048, 512, 512, 10) or (2048, 1536, 60, 4), and SiLU() "
+                "(2048, 512, 512, 10), (2048, 1536, 60, 4), or "
+                "(2560, 768, 384, 4), and SiLU() "
                 "with (6144, 1536, 192, 4); got "
                 f"{configuration}."
             )

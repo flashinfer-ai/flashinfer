@@ -203,8 +203,9 @@ Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate
               static_cast<int32_t>(num_experts),       static_cast<int32_t>(top_k)};
   const Schedule schedule = SelectSchedule(shape);
   TVM_FFI_ICHECK(schedule.supported)
-      << "cake warp decode supports only (H=2048, I=512, E=512, top_k=10) or "
-         "(H=2048, I=1536, E=60, top_k=4) with SwiGLU, or "
+      << "cake warp decode supports only (H=2048, I=512, E=512, top_k=10), "
+         "(H=2048, I=1536, E=60, top_k=4), or (H=2560, I=768, E=384, top_k=4) "
+         "with SwiGLU, or "
          "(H=6144, I=1536, E=192, top_k=4) with SiLU, with 1 <= num_tokens <= 32";
   TVM_FFI_ICHECK(ActivationForGeometry(schedule.geometry) != Activation::kSiLU ||
                  FLASHINFER_CAKE_WARP_DECODE_HAS_SILU)

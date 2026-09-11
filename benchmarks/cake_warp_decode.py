@@ -133,6 +133,7 @@ GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
 )
 
 
@@ -146,7 +147,7 @@ def _has_official_baseline(geometry: Geometry) -> bool:
 
 def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     """Name the fixed schedule/route-packer bucket exercised by a row."""
-    if geometry.activation == SiLU():
+    if geometry.activation == SiLU() or geometry.num_experts == 384:
         return "static_direct" if num_tokens == 1 else "persistent_direct"
 
     if geometry.num_experts == 512:
@@ -311,7 +312,7 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
     hidden_q, hidden_scale = TrtllmFp4Config.prepare_activations(
         hidden, variant=QuantVariant.NVFP4
     )
-    weight_view = TrtllmFp4Config.prepare_weights(
+    weight_view = CakeWarpDecodeConfig.prepare_weights(
         w1,
         w2,
         variant=QuantVariant.NVFP4,

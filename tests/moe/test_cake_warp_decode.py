@@ -279,6 +279,8 @@ def test_runner_build_passes_its_explicit_target_and_device(
     [
         (None, SwiGLU(), 2048, 512, 512),
         (SwiGLU(), SwiGLU(), 2048, 1536, 60),
+        (None, SwiGLU(), 2560, 768, 384),
+        (SwiGLU(), SwiGLU(), 2560, 768, 384),
         (SiLU(), SiLU(), 6144, 1536, 192),
     ],
 )
@@ -327,6 +329,8 @@ def test_config_preparation_delegates_to_trtllm_physical_view(
         (SiLU(), 2048, 1536, 60),
         (SwiGLU(), 6144, 1536, 192),
         (SwiGLU(alpha=2.0), 2048, 1536, 60),
+        (SiLU(), 2560, 768, 384),
+        (SwiGLU(alpha=2.0), 2560, 768, 384),
     ],
 )
 def test_config_preparation_rejects_activation_geometry_cross_product(
@@ -407,20 +411,40 @@ def test_support_rejects_nonexact_architectures(device_arch):
 
 
 @pytest.mark.parametrize("device_arch", [100, 103])
-def test_support_accepts_exact_architectures(device_arch):
-    runner, _ = _runner(device_arch=device_arch)
+@pytest.mark.parametrize("intermediate_size,num_experts", [(1536, 60), (768, 384)])
+def test_support_accepts_exact_architectures(
+    device_arch, intermediate_size, num_experts
+):
+    runner, _ = _runner(
+        _config(intermediate_size=intermediate_size, num_experts=num_experts),
+        device_arch=device_arch,
+    )
     runner._check_support()
 
 
-def test_pack_reuses_prepared_workspace_and_preserves_ffi_order():
-    runner, module = _runner()
-    act = _activation_pack()
-    weights, view = _weight_pack()
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,num_experts",
+    [(2048, 1536, 60), (2560, 768, 384)],
+)
+def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
+    device_arch, hidden_size, intermediate_size, num_experts
+):
+    runner, module = _runner(
+        _config(intermediate_size=intermediate_size, num_experts=num_experts),
+        device_arch=device_arch,
+    )
+    act = _activation_pack(hidden_size=hidden_size)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
 
     first = runner.pack_inputs(act, weights)
     second = runner.pack_inputs(act, weights)
 
-    assert module.size_calls == [(7, 2048, 1536, 60, 4)]
+    assert module.size_calls == [(7, hidden_size, intermediate_size, num_experts, 4)]
     assert len(module.prepare_calls) == 1
     assert first[1] is second[1]
     assert first[0] is not second[0]
@@ -528,6 +552,11 @@ def test_silu_pack_rejects_gated_rows_and_alpha():
             2048,
         ),
         (_config(), 6144),
+        (_config(intermediate_size=768, num_experts=384), 2048),
+        (
+            _config(intermediate_size=768, num_experts=384, activation=SiLU()),
+            2560,
+        ),
     ],
 )
 def test_pack_rejects_activation_geometry_cross_product(config, hidden_size):
