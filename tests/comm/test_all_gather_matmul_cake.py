@@ -55,7 +55,7 @@ def _manifest(backend, source: bytes, arch: str):
         "arch": arch,
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
-        "kernel_count": 12,
+        "kernel_count": 13,
         "launch": backend._launch_contract(source, arch),
         "constraints": backend._constraints_for_arch(arch),
         "kernel_symbols": list(backend._KERNEL_SYMBOLS),

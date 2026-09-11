@@ -2495,3 +2495,52 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
 #undef smem_a_addr
 #undef smem_b_addr
 #undef tma_full_addr
+
+#define CAKE_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 128
+
+extern "C" {
+
+__global__ __launch_bounds__(128) void
+kernel_cake_blackwell_all_gather_matmul_fused_peer_copy(unsigned int* __restrict__ inp, long long* __restrict__ payload_peers, long long* __restrict__ signal_peers, unsigned int* __restrict__ counters, unsigned int ready_target)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // === Task calls (dependency order) ===
+    int peer_slot = blockIdx.y;
+    unsigned int* destination = reinterpret_cast<unsigned int*>(payload_peers[peer_slot]);
+    unsigned int* signal = reinterpret_cast<unsigned int*>(signal_peers[peer_slot]);
+    #pragma unroll 1
+    for (int vector = blockIdx.x * 128 + tid; vector < 524288; vector += gridDim.x * 128) {
+        uint32_t _sysv_ld_0[4];
+        asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_0[0]), "=r"(_sysv_ld_0[1]), "=r"(_sysv_ld_0[2]), "=r"(_sysv_ld_0[3]) : "l"(inp + (vector * 4)) : "memory");
+        asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(destination + (vector * 4)), "r"(_sysv_ld_0[0]), "r"(_sysv_ld_0[1]), "r"(_sysv_ld_0[2]), "r"(_sysv_ld_0[3]) : "memory");
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (elect_sync()) {
+            unsigned int last_ticket = (unsigned int)(gridDim.x - 1);
+            uint32_t _atomic_inc_old_0;
+            asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
+                : "=r"(_atomic_inc_old_0) : "l"(&counters[peer_slot]), "r"(static_cast<uint32_t>(last_ticket)) : "memory");
+            if (_atomic_inc_old_0 == last_ticket) {
+                __threadfence_system();
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(signal) + (0))), "r"(static_cast<unsigned int>(ready_target)) : "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef CAKE_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
