@@ -710,7 +710,9 @@ def _reference(inputs):
 
 
 def _aligned_workspace(*, device):
-    storage = torch.empty(_WORKSPACE_BYTES + 127, dtype=torch.uint8, device=device)
+    storage = torch.full(
+        (_WORKSPACE_BYTES + 127,), 0xA5, dtype=torch.uint8, device=device
+    )
     offset = (-int(storage.data_ptr())) % 128
     workspace = storage[offset : offset + _WORKSPACE_BYTES]
     assert workspace.numel() == _WORKSPACE_BYTES
@@ -763,7 +765,8 @@ def test_cake_sage_block_sparse_attention(case):
         backend="cake",
     )
 
-    assert workspace_storage.data_ptr() != 0
+    # The compatibility workspace is unused by every exported specialization.
+    assert torch.all(workspace_storage == 0xA5).item()
     assert returned.data_ptr() == inputs["O"].data_ptr()
     if bool(params["empty_first_row"]):
         first_q_block = returned[0, 0, : min(_BLOCK, int(params["seqlen_q"]))]

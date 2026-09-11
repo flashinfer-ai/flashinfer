@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real SM120 regressions for mutable caller-owned tensor-map storage.
+"""Real SM120 regressions for launch-owned tensor-map descriptors.
 
 Each case runs in a child process: stale invalid descriptors in an unfixed
 binding can fault the CUDA context, which must not poison subsequent tests.
@@ -59,7 +59,7 @@ def _inputs(value):
 
 
 def _workspace():
-    workspace = torch.empty(512, dtype=torch.uint8, device="cuda")
+    workspace = torch.full((512,), 0xA5, dtype=torch.uint8, device="cuda")
     assert workspace.data_ptr() % 128 == 0
     return workspace
 
@@ -90,16 +90,24 @@ def _check(inputs, value):
     )
 
 
+def _check_workspace(workspace, value):
+    torch.testing.assert_close(
+        workspace, torch.full_like(workspace, value), rtol=0, atol=0
+    )
+
+
 def _zeroed_workspace():
     inputs, workspace = _inputs(1.0), _workspace()
     _launch(inputs, workspace)
     _check(inputs, 1.0)
+    _check_workspace(workspace, 0xA5)
     # No host synchronization between the overwrite and the consuming launch:
-    # descriptor refresh must be ordered on the same stream as both operations.
+    # the descriptor parameters must be independent of workspace contents.
     workspace.zero_()
     inputs["out"].fill_(17.0)
     _launch(inputs, workspace)
     _check(inputs, 1.0)
+    _check_workspace(workspace, 0)
 
 
 def _stale_valid_descriptor():
@@ -110,15 +118,18 @@ def _stale_valid_descriptor():
     _check(first, 1.0)
     _check(second, -1.0)
 
-    # Both tensor sets stay live. Copy valid maps into a slot whose cached host
-    # key still describes the other binding: the old implementation returns
-    # successfully but leaves second.out untouched and overwrites first.out.
+    # Both tensor sets stay live. With the old pointer ABI, this copies valid
+    # maps into a slot whose host key still describes the other binding: it
+    # returns successfully but overwrites first.out instead of second.out.
+    # With launch-owned descriptors, both workspaces remain untouched.
     second_workspace.copy_(first_workspace)
     first["out"].fill_(19.0)
     second["out"].fill_(17.0)
     _launch(second, second_workspace)
     _check(second, -1.0)
     _check(first, 19.0)
+    _check_workspace(first_workspace, 0xA5)
+    _check_workspace(second_workspace, 0xA5)
 
 
 def _recycled_workspace_view():
@@ -126,6 +137,7 @@ def _recycled_workspace_view():
     workspace = storage[:]
     _launch(inputs, workspace)
     _check(inputs, 1.0)
+    _check_workspace(workspace, 0xA5)
     address = workspace.data_ptr()
     del workspace
 
@@ -138,10 +150,11 @@ def _recycled_workspace_view():
     inputs["out"].fill_(17.0)
     _launch(inputs, workspace)
     _check(inputs, 1.0)
+    _check_workspace(workspace, 0)
 
 
 def _graph_replay():
-    first, second = _inputs(1.0), _inputs(-1.0)
+    first, second, eager = _inputs(1.0), _inputs(-1.0), _inputs(0.5)
     workspace = _workspace()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -149,19 +162,31 @@ def _graph_replay():
         _launch(first, workspace)
     stream.synchronize()
 
-    # Initialize the JIT module with first, then capture a genuinely new tensor
-    # binding. Descriptors are capture parameters; their stack storage can end
-    # before replay, and graph replay must restore them after an eager rebind.
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
+    # Capture both a warmed binding and a new binding. Every graph must retain
+    # its own by-value maps after the host's temporary descriptor storage ends,
+    # even when other graphs and eager launches bind different tensors.
+    first_graph, second_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(first_graph, stream=stream):
+        _launch(first, workspace)
+    with torch.cuda.graph(second_graph, stream=stream):
         _launch(second, workspace)
     for _ in range(3):
-        _launch(first, workspace)
+        _launch(eager, workspace)
+        _check(eager, 0.5)
+        eager["out"].fill_(23.0)
         first["out"].fill_(19.0)
         second["out"].fill_(17.0)
-        graph.replay()
+        workspace.zero_()
+        second_graph.replay()
         _check(second, -1.0)
         _check(first, 19.0)
+        _check(eager, 23.0)
+        workspace.fill_(0xA5)
+        first_graph.replay()
+        _check(first, 1.0)
+        _check(second, -1.0)
+        _check(eager, 23.0)
+        _check_workspace(workspace, 0xA5)
 
 
 def _ordered_stream_reuse():
@@ -178,6 +203,14 @@ def _ordered_stream_reuse():
     torch.cuda.current_stream().wait_stream(consumer)
     _check(first, 1.0)
     _check(second, -1.0)
+    _check_workspace(workspace, 0)
+
+
+def _empty_workspace():
+    inputs = _inputs(1.0)
+    workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+    _launch(inputs, workspace)
+    _check(inputs, 1.0)
 
 
 _SCENARIOS = {
@@ -186,6 +219,7 @@ _SCENARIOS = {
     "recycled_view": _recycled_workspace_view,
     "graph_replay": _graph_replay,
     "ordered_streams": _ordered_stream_reuse,
+    "empty": _empty_workspace,
 }
 
 
