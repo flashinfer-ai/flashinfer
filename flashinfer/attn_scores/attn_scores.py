@@ -1135,6 +1135,29 @@ def _cached_compile_fp4_kernel(
 _SPLIT_KV = _COMPUTE_BLOCK_KV * _NUM_MATH_WG  # 256 — output alignment granularity
 
 
+def _schedule_bucket(num_rows: int) -> int:
+    """The 32-row bucket the schedule kernel is specialised on.
+
+    ``num_rows`` is the scheduler row count -- the caller's batch size for fp8
+    and unsplit fp4, ``batch_size * num_atoms`` under the fp4 atom split.  The
+    single definition shared by the launch path and precompile, so the two
+    cannot drift apart again.
+    """
+    return max(((num_rows + 31) // 32) * 32, 32)
+
+
+def _precompile_schedule_buckets(batch_sizes, variants, device: torch.device) -> set:
+    """Every schedule-kernel bucket the given variants can request for the
+    given caller batch sizes: bucket(B) for fp8 and unsplit fp4, plus
+    bucket(B * num_atoms) for each fp4 next_n that splits on ``device``."""
+    multipliers = {1}
+    if "fp4" in variants:
+        for nn in range(1, _FP4_MAX_NEXT_N + 1):
+            _, num_atoms = _fp4_atom_decomposition(nn, device)
+            multipliers.add(num_atoms)
+    return {_schedule_bucket(int(b) * m) for b in batch_sizes for m in multipliers}
+
+
 def _gpu_schedule(
     seq_lens: torch.Tensor,
     schedule_meta: torch.Tensor,
@@ -1148,7 +1171,7 @@ def _gpu_schedule(
     from .kernels.schedule_kernel import _compile_schedule_kernel
 
     batch_size = int(seq_lens.shape[0])
-    aligned_b = max(((batch_size + 31) // 32) * 32, 32)
+    aligned_b = _schedule_bucket(batch_size)
     dev_index = get_device_index(schedule_meta.device)
     with _on_device(dev_index):
         compiled = _compile_schedule_kernel(
@@ -2439,15 +2462,18 @@ def precompile_paged_mqa_logits(
                        bfloat16 and float32 for FP4 -- the API default plus
                        the dtype consumers with a float logits ABI require.
                        Pass an explicit tuple to build only what you run.
-        batch_sizes:   Batch sizes whose GPU schedule kernel should be warmed.
-                       The schedule kernel specialises on
-                       ``ceil(batch_size / 32) * 32``, so it is compiled per
-                       32-row bucket and is NOT covered by the shape sweep
-                       above.  Sizes in the same bucket collapse to one build.
-                       Defaults to None, which warms no schedule buckets --
-                       a deployment that captures CUDA graphs for a known set
-                       of batch sizes should pass them, or the first capture
-                       of each bucket pays compilation.
+        batch_sizes:   Batch sizes whose GPU schedule kernel should be warmed,
+                       in caller units.  The schedule kernel specialises on
+                       the scheduler row count in 32-row buckets: the batch
+                       size for fp8 and unsplit fp4, but batch_size*num_atoms
+                       under the fp4 atom split (next_n=4 on SM100/SM103
+                       schedules twice the rows).  Every bucket the requested
+                       variants can reach from each size is warmed, then
+                       deduplicated; none of this is covered by the shape
+                       sweep above.  Defaults to None, which warms no schedule
+                       buckets -- a deployment that captures CUDA graphs for a
+                       known set of batch sizes should pass them, or the first
+                       capture of each bucket pays compilation.
     """
     if not _CUTE_DSL_AVAILABLE:
         warnings.warn(
@@ -2542,12 +2568,16 @@ def precompile_paged_mqa_logits(
                             num_atoms,
                         )
 
-        # The schedule kernel is keyed on the aligned batch size, not on the
-        # shape tuple above, so it needs its own warm-up. Dedup first: every
-        # batch size inside a 32-row bucket compiles the same kernel.
+        # The schedule kernel is keyed on the aligned *scheduler row count*,
+        # not on the shape tuple above, so it needs its own warm-up.  That row
+        # count is the caller's batch size for fp8 and unsplit fp4, but
+        # batch * num_atoms under the fp4 atom split (next_n=4 on SM100/SM103
+        # schedules 2 * batch rows) -- warm every bucket the requested variants
+        # can reach from each batch size, then dedup: every size inside a
+        # 32-row bucket compiles the same kernel.
         from .kernels.schedule_kernel import _compile_schedule_kernel
 
         for aligned_b in sorted(
-            {max(((int(b) + 31) // 32) * 32, 32) for b in (batch_sizes or ())}
+            _precompile_schedule_buckets(batch_sizes or (), variants, device)
         ):
             _compile_schedule_kernel(aligned_b, _SPLIT_KV, num_sms, arch)

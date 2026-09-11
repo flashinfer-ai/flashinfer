@@ -2982,6 +2982,93 @@ def test_precompile_warms_fp4_float32_output():
     )
 
 
+def test_precompile_warms_fp4_split_schedule_bucket():
+    """precompile(batch_sizes=[B]) must warm the schedule bucket fp4 next_n=4
+    actually requests: 2B rows on SM100/SM103 (two atoms), B rows on SM107.
+
+    batch_sizes is in caller units but the schedule kernel is keyed on the
+    scheduler row count, and only the launch path applied the atom
+    decomposition -- so before the fix every B > 16 missed on a split device
+    (bucket(B) warmed, bucket(2B) requested) and the first fp4 next_n=4 call,
+    or the first CUDA-graph capture, compiled inside the hot path.  Pins:
+    (a) the runtime bucket is an in-process hit, (b) the unsplit bucket stays
+    warm (fp8 and fp4 next_n<=3 request it), (c) an end-to-end fp4 next_n=4
+    call adds no miss, (d) an unwarmed bucket still misses so (a)-(c) are not
+    vacuous.  Fails against the unfixed code at (a) on SM100/SM103 and at the
+    import of the (then missing) shared derivation everywhere.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, precompile_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import (
+        _SPLIT_KV,
+        _cached_gpu_arch,
+        _cached_num_sms,
+        _fp4_atom_decomposition,
+        _precompile_schedule_buckets,
+        _schedule_bucket,
+    )
+    from flashinfer.attn_scores.kernels.schedule_kernel import _compile_schedule_kernel
+
+    dev = torch.cuda.current_device()
+    device = torch.device("cuda", dev)
+    arch, sms = _cached_gpu_arch(dev), _cached_num_sms(dev)
+    B = 32
+    _, num_atoms = _fp4_atom_decomposition(4, device)
+    expected_bucket = _schedule_bucket(B * num_atoms)  # 64 on SM100/SM103, 32 on SM107
+
+    # The derivation itself, GPU-free: bucket(B) is always present; the split
+    # adds bucket(B*num_atoms); fp8 alone never expands.
+    assert _precompile_schedule_buckets([B], ("fp4",), device) == {32, expected_bucket}
+    assert _precompile_schedule_buckets([B], ("fp8",), device) == {32}
+    assert _precompile_schedule_buckets([1, 40], ("fp8", "fp4"), device) == (
+        {32, 64} if num_atoms == 1 else {32, 64, 96}
+    )
+
+    # In-process cache is session-wide; clear it so hits below are decided by
+    # what precompile warmed, not by test order (disk cache still serves).
+    _compile_schedule_kernel.cache_clear()
+    precompile_paged_mqa_logits(
+        device=device,
+        variants=("fp4",),
+        output_dtypes=(torch.bfloat16,),
+        batch_sizes=[B],
+    )
+    # (a) the bucket the runtime will request is warm
+    hits = _compile_schedule_kernel.cache_info().hits
+    _compile_schedule_kernel(expected_bucket, _SPLIT_KV, sms, arch)
+    assert _compile_schedule_kernel.cache_info().hits == hits + 1, (
+        f"precompile(batch_sizes=[{B}]) did not warm schedule bucket "
+        f"{expected_bucket} (fp4 next_n=4 schedules {B}*{num_atoms} rows here)"
+    )
+    # (b) the unsplit bucket is warm too
+    hits = _compile_schedule_kernel.cache_info().hits
+    _compile_schedule_kernel(32, _SPLIT_KV, sms, arch)
+    assert _compile_schedule_kernel.cache_info().hits == hits + 1
+
+    # (c) a real fp4 next_n=4 call at B=32 must not enter the compile path
+    ctx, block_size, H, D, next_n = 512, 64, 64, 128, 4
+    seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    q_sf = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+    misses = _compile_schedule_kernel.cache_info().misses
+    fp4_paged_mqa_logits(
+        q, q_sf, kv, w, block_tables, seq_lens, ctx, output_dtype=torch.bfloat16
+    )
+    torch.cuda.synchronize()
+    assert _compile_schedule_kernel.cache_info().misses == misses, (
+        "fp4 next_n=4 at B=32 compiled a schedule bucket after precompile"
+    )
+    # (d) negative control: an unwarmed bucket misses
+    misses = _compile_schedule_kernel.cache_info().misses
+    _compile_schedule_kernel(expected_bucket + 128, _SPLIT_KV, sms, arch)
+    assert _compile_schedule_kernel.cache_info().misses == misses + 1
+
+
 def test_precompile_output_dtypes_is_honoured_and_validated():
     """An explicit output_dtypes tuple builds only those, and is checked up front."""
     if not is_sm100a_supported(torch.device("cuda")):
