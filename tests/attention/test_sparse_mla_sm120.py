@@ -1701,9 +1701,9 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-# num_heads=8 exercises the runtime-H instantiation (GLM53_NOPE has dedicated
-# 32/64 only), e.g. a 64-head layer at TP8.
-@pytest.mark.parametrize("num_heads", [8, 32, 64])
+# GLM53_NOPE has dedicated instantiations at 8/16/32/64 (the TP8/TP4/TP2/TP1
+# shards of the 64-head layer); num_heads=24 exercises the runtime-H fallback.
+@pytest.mark.parametrize("num_heads", [8, 16, 24, 32, 64])
 def test_sparse_mla_sm120_decode_glm53_nope(num_heads: int) -> None:
     torch.manual_seed(3)
     device = torch.device("cuda")
