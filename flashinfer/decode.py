@@ -2052,6 +2052,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Call this method before CUDA graph capture when a planned standard FA2
         tensor-core decode wrapper will receive K and V tensors with different
         data strides.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
         """
         if (
             getattr(self, "_plan_info", None) is None
