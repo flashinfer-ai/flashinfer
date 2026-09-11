@@ -514,6 +514,10 @@ def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activati
 @pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.MXFP4))
 def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
     _xfail_w4a16_sm103(variant)
+    if get_compute_capability(torch.device("cuda")) == (10, 7) and isinstance(
+        activation, SiTU
+    ):
+        pytest.skip("TRTLLM FP4 SiTU is not implemented on SM107")
     act, weights, config, view, (routing_logits, routing_bias) = _make_fp4_shared_case(
         variant,
         0,
