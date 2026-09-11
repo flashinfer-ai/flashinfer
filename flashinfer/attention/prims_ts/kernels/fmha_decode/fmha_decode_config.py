@@ -22,6 +22,7 @@ that should be set before kernel compilation.
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, fields, replace
+import math
 
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN, Int8
@@ -29,6 +30,7 @@ from cutlass import BFloat16, Float16, Float32, Float8E4M3FN, Int8
 from ...sage import SAGE_K_BLOCK_SIZES, is_power_of_two
 from ..._block_sparse.common import (
     _block_sparse_kv_atom_size,
+    _block_sparse_proxy_summary_geometry,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
@@ -1335,6 +1337,41 @@ class FmhaDecodeConfig:
         Keeps profile issues the plain CTA-local instruction.
         """
         return self.tile_size_kv == 256
+
+    @property
+    def proxy_summary_geometry(self) -> tuple[int, int]:
+        """Return ``(summary count, final summary's token mass)`` of proxy routes.
+
+        A proxy summary stands for one KV block of the static sequence, so
+        the count is one per block and the final block may be ragged.
+        """
+        return _block_sparse_proxy_summary_geometry(
+            self.static_seq_len_kv, self.kv_block_size
+        )
+
+    @property
+    def proxy_log2_block_mass(self) -> float:
+        """Return ``log2`` of the tokens one full proxy summary stands for.
+
+        A proxy summary is the mean K/V of its KV block, so the block behaves
+        like that many identical tokens: the mass enters the softmax as an
+        additive ``log2(mass)`` on the summary's log2-domain logit, in the max
+        pass and in the exponent, and the summary's probability then carries
+        the mass into both the numerator and the denominator with weight one.
+        """
+        return math.log2(self.kv_block_size)
+
+    @property
+    def proxy_tail_summary(self) -> tuple[int, float]:
+        """Return the final summary index and its ``log2(mass)`` shortfall.
+
+        The final KV block may be ragged; its summary stands for fewer tokens,
+        so its logit offset is ``log2(kv_block_size)`` plus the returned
+        non-positive delta. The delta is zero when the sequence ends on a
+        block boundary.
+        """
+        num_summaries, tail_mass = self.proxy_summary_geometry
+        return num_summaries - 1, math.log2(tail_mass) - math.log2(self.kv_block_size)
 
     @property
     def num_packed_p_regs(self) -> int:

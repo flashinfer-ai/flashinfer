@@ -927,6 +927,29 @@ class TmemSResource(DecodeGenResourceBase):
             s_arr[reg_idx] = s_vals[reg_idx]
 
     @cute.jit
+    def _proxy_score_shifts(
+        self, route_is_proxy: cutlass.Boolean
+    ) -> tuple[Float32, Float32]:
+        """Return a route's ``(proxy_max_shift, tail_shift)`` in score units.
+
+        A proxy route carries its token mass in the logit: the tile maximum
+        moves by the full block's ``log2`` mass and the ragged final summary's
+        score by its ``log2`` shortfall, both divided by ``c`` so they apply
+        to scores before the anchor. Exact routes get zero shifts. Callers
+        pass a warp-uniform route kind so the branch stays uniform.
+        """
+        proxy_max_shift = Float32(0.0)
+        tail_shift = Float32(0.0)
+        if route_is_proxy:
+            inv_scale_softmax_log2 = cute.math.rcp(self.scale_softmax_log2)
+            _, tail_log2_delta = self.cfg.proxy_tail_summary
+            proxy_max_shift = (
+                Float32(self.cfg.proxy_log2_block_mass) * inv_scale_softmax_log2
+            )
+            tail_shift = Float32(tail_log2_delta) * inv_scale_softmax_log2
+        return proxy_max_shift, tail_shift
+
+    @cute.jit
     def _softmax_anchor(self, old_max: Float32, tile_max: Float32) -> Float32:
         """Return the exponent reference max for the tile's P pass.
 
@@ -1950,6 +1973,47 @@ class TmemSResource(DecodeGenResourceBase):
                     s_vals[s_base_hi + 2] = _neg_max_f32()
 
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        # A proxy route carries its token mass in the logit: every summary's
+        # maximum moves by the full block's log2 mass in score units, and the
+        # ragged final summary's score registers are shifted by its shortfall
+        # before the reduction so the P pass exponentiates the right mass.
+        proxy_max_shift = Float32(0.0)
+        if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+            tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
+            route_is_proxy_uniform = cute.arch.make_warp_uniform(route_is_proxy)
+            proxy_max_shift, tail_shift = self._proxy_score_shifts(
+                route_is_proxy_uniform
+            )
+            if cutlass.const_expr(tail_log2_delta != 0.0):
+                if route_is_proxy_uniform:
+                    for token_group_idx in cutlass.range_constexpr(4):
+                        atom_origin, logical_summary = _swaps_routed_coordinate(
+                            cfg,
+                            Int32(lane_idx) >> Int32(2),
+                            sparse_origin0,
+                            sparse_origin1,
+                            sparse_origin2,
+                            sparse_origin3,
+                            token_group_idx=token_group_idx,
+                        )
+                        # Invalid atoms never hold the tail.
+                        if atom_origin >= Int32(0) and logical_summary == Int32(
+                            tail_summary_idx
+                        ):
+                            for tail_repeat_idx in cutlass.range_constexpr(q_repeats):
+                                tail_s_base = tail_repeat_idx * 4 + token_group_idx * 2
+                                if cutlass.const_expr(token_group_idx >= 2):
+                                    tail_s_base = (
+                                        q_repeats * 4
+                                        + tail_repeat_idx * 4
+                                        + (token_group_idx - 2) * 2
+                                    )
+                                s_vals[tail_s_base + 0] = (
+                                    s_vals[tail_s_base + 0] + tail_shift
+                                )
+                                s_vals[tail_s_base + 1] = (
+                                    s_vals[tail_s_base + 1] + tail_shift
+                                )
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Reduce this lane's S registers to one candidate per scale group.
             repeat_idx = scale_idx // 2
@@ -1961,6 +2025,9 @@ class TmemSResource(DecodeGenResourceBase):
                 cute.math.max(s_vals[s_base_hi + 0], s_vals[s_base_hi + 2], ftz=True),
                 ftz=True,
             )
+            if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+                # The mass enters before the anchor, so the P range is unchanged.
+                local_max = local_max + proxy_max_shift
             local_max = cute.math.max(local_max, old_max_vals[scale_idx], ftz=True)
             local_max_vals[scale_idx] = local_max
 
@@ -2475,6 +2542,57 @@ class TmemSResource(DecodeGenResourceBase):
             # The load/store branch must be uniform for each participating warp.
             warp_scores_are_unmasked = cute.arch.vote_all_sync(warp_scores_are_unmasked)
 
+        # A proxy route carries its token mass in the logit: the tile maximum
+        # moves by the full block's log2 mass in score units, and the ragged
+        # final summary's score is shifted by its mass shortfall before the
+        # fold and the TMEM write-back, so the P pass reloads a score whose
+        # exponent already carries the right mass. The route kind is uniform
+        # across the CTA, so the branch below is uniform as well.
+        proxy_max_shift = Float32(0.0)
+        if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+            # The route kind and the tail location are the same for every
+            # lane; stating that keeps the fold and the load/store branch
+            # below on the uniform datapath.
+            route_is_proxy = cute.arch.make_warp_uniform(
+                _route_is_proxy(sparse_route_flags)
+            )
+            tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
+            tail_lane: Constexpr[int] = tail_summary_idx % fragment_regs
+            tail_fragment_mask = Int32(0)
+            proxy_max_shift, tail_shift = self._proxy_score_shifts(route_is_proxy)
+            # The tail summary's location follows the staged atom origins; the
+            # shift itself is one add per copy of the masked pass.
+            if cutlass.const_expr(tail_log2_delta != 0.0):
+                for fragment_idx in cutlass.range_constexpr(num_fragments):
+                    atom_offset = Int32(
+                        (fragment_idx % fragments_per_origin) * fragment_regs
+                    )
+                    fragment_origin = origin0 + atom_offset
+                    fragment_valid = valid0
+                    if cutlass.const_expr(fragment_idx >= fragments_per_origin):
+                        fragment_origin = origin1 + atom_offset
+                        fragment_valid = valid1
+                    tail_offset = Int32(tail_summary_idx) - fragment_origin
+                    # Invalid atoms never hold the tail.
+                    if (
+                        route_is_proxy
+                        and fragment_valid != Int32(0)
+                        and tail_offset >= Int32(0)
+                        and tail_offset < Int32(fragment_regs)
+                    ):
+                        tail_fragment_mask = tail_fragment_mask | Int32(
+                            1 << fragment_idx
+                        )
+                tail_fragment_mask = cute.arch.make_warp_uniform(tail_fragment_mask)
+                # The shifted tail score must reach TMEM for the P pass, so
+                # the route takes the store branch; the vote keeps the branch
+                # condition warp-uniform.
+                warp_scores_are_unmasked = cute.arch.vote_all_sync(
+                    cutlass.Boolean(
+                        warp_scores_are_unmasked and tail_fragment_mask == Int32(0)
+                    )
+                )
+
         score_tmem_addr = (
             task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
             + Int32(self._alloc.offset)
@@ -2562,6 +2680,18 @@ class TmemSResource(DecodeGenResourceBase):
                     ) != Uint32(0)
                     if not score_is_kept:
                         score = _neg_max_f32()
+                    if cutlass.const_expr(
+                        use_sparse
+                        and cfg.use_block_sparse_proxy_routes
+                        and tail_log2_delta != 0.0
+                        and score_idx == tail_lane
+                    ):
+                        # The final summary's shortfall is a score-unit shift;
+                        # a masked score stays at the sentinel in fp32.
+                        if (
+                            (tail_fragment_mask >> Int32(fragment_idx)) & Int32(1)
+                        ) != Int32(0):
+                            score = score + tail_shift
                     masked_scores[score_idx] = score
                     if cutlass.const_expr(not cfg.use_sage_attention):
                         chain_idx: Constexpr[int] = score_idx % 4
@@ -2596,6 +2726,11 @@ class TmemSResource(DecodeGenResourceBase):
             # so it applies once here. A fully masked tile keeps the sentinel.
             if tile_max != _neg_max_f32():
                 tile_max = tile_max * sage_q_scale
+        if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
+            # The mass enters before the anchor, so the P range is unchanged; a
+            # fully masked route keeps the sentinel, the shift is far below its
+            # FP32 resolution.
+            tile_max = tile_max + proxy_max_shift
         old_max = new_max_arr[0]
         new_max = self._softmax_anchor(old_max, tile_max)
         old_max_arr[0] = old_max
