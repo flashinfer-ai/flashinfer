@@ -40,9 +40,7 @@ def _integration_manifest(target: str) -> dict:
         arg_plan_kind, prepared_abi, stage = (
             blackwell_jit._INTEGRATION_COMPONENT_METADATA[component]
         )
-        threads, smem_bytes = blackwell_jit._INTEGRATION_LAUNCH_RESOURCES[
-            component
-        ]
+        threads, smem_bytes = blackwell_jit._INTEGRATION_LAUNCH_RESOURCES[component]
         grid_mode = integration_grid_modes[variant["grid_kind"]]
         logical_grid_mode = grid_mode
         if component == "cute_warp_mma_m16_bf16":
@@ -108,9 +106,7 @@ def _integration_manifest(target: str) -> dict:
         {
             "arg_plan": blackwell_jit._raw_pointer_integration_arg_plan(),
             "arg_plan_kind": "raw_pointer",
-            "exact_shape": copy.deepcopy(
-                blackwell_jit._INTEGRATION_ROW7_EXACT_SHAPE
-            ),
+            "exact_shape": copy.deepcopy(blackwell_jit._INTEGRATION_ROW7_EXACT_SHAPE),
             "grid_mode": "persistent_m16_2sm",
             "ir_symbol": "synthetic_ir_cute_warp_m16_2sm",
             "kernel_symbol": "kernel_flashinfer_bf16_fp4_synthetic_74",
@@ -127,40 +123,56 @@ def _integration_manifest(target: str) -> dict:
     kernels.append(exact_row7)
     ir_symbols.append(exact_row7["ir_symbol"])
 
-    generic_row3 = next(kernel for kernel in kernels
+    generic_row3 = next(
+        kernel
+        for kernel in kernels
         if kernel["component"] == "cute_warp_mma_m64_bf16"
-        and kernel["has_alpha"] is True and kernel["enable_pdl"] is True)
+        and kernel["has_alpha"] is True
+        and kernel["enable_pdl"] is True
+    )
     exact_row3 = copy.deepcopy(generic_row3)
-    exact_row3.update({
-        "exact_shape": copy.deepcopy(blackwell_jit._INTEGRATION_ROW3_EXACT_SHAPE),
-        "grid_mode": "flat_overflow",
-        "launch_grid": blackwell_jit._row3_launch_grid(),
-        "ir_symbol": blackwell_jit._INTEGRATION_ROW3_IR_SYMBOL,
-        "kernel_symbol": "kernel_flashinfer_bf16_fp4_synthetic_75",
-        "module_ident": "flashinfer_bf16_fp4_synthetic_000000004b",
-        "schedule_symbol": "flashinfer_bf16_fp4_synthetic_75",
-        "smem_bytes": 73728, "smem_data_offset_bytes": 1024,
-        "smem_pool_bytes": 72704, "threads": 160, "tile_m": 64,
-    })
+    exact_row3.update(
+        {
+            "exact_shape": copy.deepcopy(blackwell_jit._INTEGRATION_ROW3_EXACT_SHAPE),
+            "grid_mode": "flat_overflow",
+            "launch_grid": blackwell_jit._row3_launch_grid(),
+            "ir_symbol": blackwell_jit._INTEGRATION_ROW3_IR_SYMBOL,
+            "kernel_symbol": "kernel_flashinfer_bf16_fp4_synthetic_75",
+            "module_ident": "flashinfer_bf16_fp4_synthetic_000000004b",
+            "schedule_symbol": "flashinfer_bf16_fp4_synthetic_75",
+            "smem_bytes": 73728,
+            "smem_data_offset_bytes": 1024,
+            "smem_pool_bytes": 72704,
+            "threads": 160,
+            "tile_m": 64,
+        }
+    )
     kernels.append(exact_row3)
     ir_symbols.append(exact_row3["ir_symbol"])
 
     route_names = list(
         dict.fromkeys(
-            selection["route"]
-            for selection in blackwell_jit._DISPATCH_SELECTION
+            selection["route"] for selection in blackwell_jit._DISPATCH_SELECTION
         )
     )
     routes = [{"route": route, "specializations": []} for route in route_names]
     for component in ("cute_warp_mma_m32_bf16", "cute_warp_mma_m64_bf16"):
-        route = next(item for item in routes
-                     if item["route"] == blackwell_jit._COMPONENT_SPECS[component][0])
+        route = next(
+            item
+            for item in routes
+            if item["route"] == blackwell_jit._COMPONENT_SPECS[component][0]
+        )
         selected = [kernel for kernel in kernels if kernel["component"] == component]
         selected.sort(key=lambda kernel: "exact_shape" not in kernel)
         route["specializations"] = [
-            {"match": {"out_dtype": kernel["output_dtype"],
-                       "has_alpha": kernel["has_alpha"], "enable_pdl": kernel["enable_pdl"],
-                       **copy.deepcopy(kernel.get("exact_shape", {}))}}
+            {
+                "match": {
+                    "out_dtype": kernel["output_dtype"],
+                    "has_alpha": kernel["has_alpha"],
+                    "enable_pdl": kernel["enable_pdl"],
+                    **copy.deepcopy(kernel.get("exact_shape", {})),
+                }
+            }
             for kernel in selected
         ]
 
@@ -239,9 +251,7 @@ def _legacy_variant_manifest(target: str) -> dict:
                         variant["reuses_alpha_specializations"] = [False, True]
                     symbol_stem = blackwell_jit._variant_symbol_stem(variant)
                     variant["kernel_symbol"] = f"kernel_{symbol_stem}"
-                    variant["module_ident"] = (
-                        f"{symbol_stem}_{len(variants):010x}"
-                    )
+                    variant["module_ident"] = f"{symbol_stem}_{len(variants):010x}"
                     variant["schedule_symbol"] = symbol_stem
                     variants.append(variant)
 
@@ -306,9 +316,7 @@ def test_checked_in_schema_3_artifact_pair_is_accepted(target: str) -> None:
     assert parsed["arch"] == blackwell_jit._NVCC_ARCH[target]
     assert len(blackwell_jit._manifest_kernel_symbols(parsed)) == 76
     assert len(parsed["ir_symbols"]) == 16
-    blackwell_jit._validate_source_header(
-        source_raw, parsed, manifest_raw, target
-    )
+    blackwell_jit._validate_source_header(source_raw, parsed, manifest_raw, target)
 
 
 @pytest.mark.parametrize("target", ["sm100", "sm103"])
@@ -408,8 +416,7 @@ def test_integration_manifest_preserves_exact_m16_then_row7_and_generic_m32() ->
     m32_route = next(
         route
         for route in manifest["dispatch"]["routes"]
-        if route["route"]
-        == blackwell_jit._COMPONENT_SPECS["cute_warp_mma_m32_bf16"][0]
+        if route["route"] == blackwell_jit._COMPONENT_SPECS["cute_warp_mma_m32_bf16"][0]
     )
     assert len(m32_route["specializations"]) == 5
     assert m32_route["specializations"][0]["match"] == {
@@ -466,9 +473,7 @@ def test_integration_manifest_rejects_row7_exact_shape_drift(
     value: dict[str, object],
 ) -> None:
     manifest = _integration_manifest("sm100")
-    exact = next(
-        kernel for kernel in manifest["kernels"] if "exact_shape" in kernel
-    )
+    exact = next(kernel for kernel in manifest["kernels"] if "exact_shape" in kernel)
     exact["exact_shape"] = value
 
     with pytest.raises(ValueError, match="row7 exact shape"):
@@ -476,11 +481,14 @@ def test_integration_manifest_rejects_row7_exact_shape_drift(
 
 
 @pytest.mark.parametrize("target", ["sm100", "sm103"])
-def test_exported_manifest_preserves_selected_m16_kernel_and_split_grid(target: str) -> None:
+def test_exported_manifest_preserves_selected_m16_kernel_and_split_grid(
+    target: str,
+) -> None:
     _, path = _artifact_paths(target)
     manifest, _ = blackwell_jit._load_abi_manifest(path, target)
     selected = [
-        kernel for kernel in manifest["kernels"]
+        kernel
+        for kernel in manifest["kernels"]
         if kernel["component"] == "cute_warp_mma_m16_bf16"
     ]
     assert len(selected) == 4
@@ -493,11 +501,14 @@ def test_exported_manifest_preserves_selected_m16_kernel_and_split_grid(target: 
         if expression["op"] == "parameter":
             return parameters[expression["name"]]
         operations = {
-            "add": operator.add, "subtract": operator.sub,
-            "multiply": operator.mul, "floor_divide": operator.floordiv,
+            "add": operator.add,
+            "subtract": operator.sub,
+            "multiply": operator.mul,
+            "floor_divide": operator.floordiv,
         }
         return operations[expression["op"]](
-            evaluate(expression["lhs"], parameters), evaluate(expression["rhs"], parameters),
+            evaluate(expression["lhs"], parameters),
+            evaluate(expression["rhs"], parameters),
         )
 
     for kernel in selected:
@@ -513,7 +524,8 @@ def test_exported_manifest_preserves_selected_m16_kernel_and_split_grid(target: 
 def test_integration_manifest_rejects_m16_unsplit_launch_grid() -> None:
     manifest = _integration_manifest("sm100")
     selected = next(
-        kernel for kernel in manifest["kernels"]
+        kernel
+        for kernel in manifest["kernels"]
         if kernel["component"] == "cute_warp_mma_m16_bf16"
     )
     grid_x = selected["launch_grid"]["x"]["expression"]
@@ -523,15 +535,21 @@ def test_integration_manifest_rejects_m16_unsplit_launch_grid() -> None:
 
 
 @pytest.mark.parametrize("target", ["sm100", "sm103"])
-def test_exported_manifest_preserves_selected_large_m_kernel_and_full_tile_grid(target: str) -> None:
+def test_exported_manifest_preserves_selected_large_m_kernel_and_full_tile_grid(
+    target: str,
+) -> None:
     _, path = _artifact_paths(target)
     manifest, _ = blackwell_jit._load_abi_manifest(path, target)
-    exact = next(kernel for kernel in manifest["kernels"]
-                 if kernel.get("exact_shape") == {"M": 768, "N": 2112, "K": 2048})
+    exact = next(
+        kernel
+        for kernel in manifest["kernels"]
+        if kernel.get("exact_shape") == {"M": 768, "N": 2112, "K": 2048}
+    )
     assert exact["ir_symbol"] == blackwell_jit._INTEGRATION_ROW3_IR_SYMBOL
     assert exact["arg_plan_kind"] == "cute_warp"
     assert exact["grid_mode"] == "flat_overflow"
     assert (exact["threads"], exact["smem_bytes"]) == (160, 73728)
+
     def evaluate(expression: dict) -> int:
         import operator
 
@@ -539,27 +557,51 @@ def test_exported_manifest_preserves_selected_large_m_kernel_and_full_tile_grid(
             return expression["value"]
         if expression["op"] == "parameter":
             return {"M": 768, "N": 2112}[expression["name"]]
-        operations = {"add": operator.add, "subtract": operator.sub,
-                      "multiply": operator.mul, "floor_divide": operator.floordiv}
-        return operations[expression["op"]](evaluate(expression["lhs"]), evaluate(expression["rhs"]))
+        operations = {
+            "add": operator.add,
+            "subtract": operator.sub,
+            "multiply": operator.mul,
+            "floor_divide": operator.floordiv,
+        }
+        return operations[expression["op"]](
+            evaluate(expression["lhs"]), evaluate(expression["rhs"])
+        )
 
-    assert [evaluate(exact["launch_grid"][axis]["expression"]) for axis in ("x", "y", "z")] == [396, 1, 1]
+    assert [
+        evaluate(exact["launch_grid"][axis]["expression"]) for axis in ("x", "y", "z")
+    ] == [396, 1, 1]
     records = blackwell_jit._manifest_kernel_specs(manifest)
-    selected = next(record for record in records if record["kernel_symbol"] == exact["kernel_symbol"])
-    assert (selected["exact_m"], selected["exact_n"], selected["exact_k"]) == (768, 2112, 2048)
+    selected = next(
+        record
+        for record in records
+        if record["kernel_symbol"] == exact["kernel_symbol"]
+    )
+    assert (selected["exact_m"], selected["exact_n"], selected["exact_k"]) == (
+        768,
+        2112,
+        2048,
+    )
     assert not selected["raw_pointer_abi"] and not selected["persistent_m16_2sm"]
 
 
-@pytest.mark.parametrize("field,value", [
-    ("exact_shape", {"M": 768, "N": 2112, "K": 4096}),
-    ("ir_symbol", "synthetic_ir_cute_warp_mma_m64_bf16"),
-    ("grid_mode", "persistent"),
-    ("launch_grid", 16),
-])
-def test_integration_manifest_rejects_large_m_export_fidelity_drift(field: str, value: object) -> None:
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("exact_shape", {"M": 768, "N": 2112, "K": 4096}),
+        ("ir_symbol", "synthetic_ir_cute_warp_mma_m64_bf16"),
+        ("grid_mode", "persistent"),
+        ("launch_grid", 16),
+    ],
+)
+def test_integration_manifest_rejects_large_m_export_fidelity_drift(
+    field: str, value: object
+) -> None:
     manifest = _integration_manifest("sm100")
-    exact = next(kernel for kernel in manifest["kernels"]
-                 if kernel.get("exact_shape") == {"M": 768, "N": 2112, "K": 2048})
+    exact = next(
+        kernel
+        for kernel in manifest["kernels"]
+        if kernel.get("exact_shape") == {"M": 768, "N": 2112, "K": 2048}
+    )
     if field == "launch_grid":
         tiles_m = exact["launch_grid"]["x"]["expression"]["lhs"]
         tiles_m["rhs"]["value"] = value
@@ -614,9 +656,7 @@ def test_checked_in_sm100_and_sm103_manifests_are_an_exact_arch_pair() -> None:
     raw_source_hashes = {}
     for target in ("sm100", "sm103"):
         source_path, manifest_path = _artifact_paths(target)
-        manifest, manifest_raw = blackwell_jit._load_abi_manifest(
-            manifest_path, target
-        )
+        manifest, manifest_raw = blackwell_jit._load_abi_manifest(manifest_path, target)
         blackwell_jit._validate_source_header(
             source_path.read_bytes(), manifest, manifest_raw, target
         )
@@ -734,9 +774,7 @@ def test_manifest_rejects_deep_variant_abi_mutations(
 
 def test_source_header_rejects_abi_version_2() -> None:
     source_path, manifest_path = _artifact_paths("sm100")
-    manifest, manifest_raw = blackwell_jit._load_abi_manifest(
-        manifest_path, "sm100"
-    )
+    manifest, manifest_raw = blackwell_jit._load_abi_manifest(manifest_path, "sm100")
     source_raw = source_path.read_bytes().replace(
         b"FLASHINFER_BLACKWELL_BF16_FP4_ABI_VERSION 3",
         b"FLASHINFER_BLACKWELL_BF16_FP4_ABI_VERSION 2",
@@ -751,9 +789,7 @@ def test_source_header_rejects_abi_version_2() -> None:
 
 def test_source_header_rejects_kernel_symbol_drift() -> None:
     source_path, manifest_path = _artifact_paths("sm100")
-    manifest, manifest_raw = blackwell_jit._load_abi_manifest(
-        manifest_path, "sm100"
-    )
+    manifest, manifest_raw = blackwell_jit._load_abi_manifest(manifest_path, "sm100")
     kernel_symbol = sorted(blackwell_jit._manifest_kernel_symbols(manifest))[0]
     kernel_symbol = kernel_symbol.encode()
     source_raw = source_path.read_bytes().replace(

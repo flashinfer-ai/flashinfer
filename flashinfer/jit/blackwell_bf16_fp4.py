@@ -118,34 +118,22 @@ _DISPATCH_SELECTION = [
     },
     {
         "components": ["cute_warp_mma_m16_k16_bf16"],
-        "route": (
-            "prepared_native_warp_mma_m16n64k16_cute_dsl_"
-            "s0e5m3_f16mma_v2"
-        ),
+        "route": ("prepared_native_warp_mma_m16n64k16_cute_dsl_s0e5m3_f16mma_v2"),
         "when": {"K": 16, "backend": "cute-dsl"},
     },
     {
         "components": ["cute_warp_mma_m16_k32_bf16"],
-        "route": (
-            "prepared_native_warp_mma_m16n64k32_cute_dsl_"
-            "s0e5m3_f16mma_v2"
-        ),
+        "route": ("prepared_native_warp_mma_m16n64k32_cute_dsl_s0e5m3_f16mma_v2"),
         "when": {"K": 32, "backend": "cute-dsl"},
     },
     {
         "components": ["cute_warp_mma_m16_k48_bf16"],
-        "route": (
-            "prepared_native_warp_mma_m16n64k48_cute_dsl_"
-            "s0e5m3_f16mma_v2"
-        ),
+        "route": ("prepared_native_warp_mma_m16n64k48_cute_dsl_s0e5m3_f16mma_v2"),
         "when": {"K": 48, "backend": "cute-dsl"},
     },
     {
         "components": ["cute_warp_mma_m16_bf16"],
-        "route": (
-            "prepared_native_warp_mma_m16n64k128_cute_dsl_"
-            "s0e5m3_f16mma_v2"
-        ),
+        "route": ("prepared_native_warp_mma_m16n64k128_cute_dsl_s0e5m3_f16mma_v2"),
         "when": {
             "K": 1024,
             "M_at_most": 16,
@@ -154,10 +142,7 @@ _DISPATCH_SELECTION = [
     },
     {
         "components": ["cute_warp_mma_m32_bf16"],
-        "route": (
-            "prepared_native_warp_mma_m32n64k128_cute_dsl_"
-            "s0e5m3_f16mma_v2"
-        ),
+        "route": ("prepared_native_warp_mma_m32n64k128_cute_dsl_s0e5m3_f16mma_v2"),
         "when": {
             "K_at_least": 128,
             "K_multiple": 64,
@@ -167,10 +152,7 @@ _DISPATCH_SELECTION = [
     },
     {
         "components": ["cute_warp_mma_m64_bf16"],
-        "route": (
-            "prepared_native_warp_mma_m64n64k128_cute_dsl_"
-            "s0e5m3_f16mma_v2"
-        ),
+        "route": ("prepared_native_warp_mma_m64n64k128_cute_dsl_s0e5m3_f16mma_v2"),
         "when": {
             "K_multiple": 128,
             "M_at_least": 33,
@@ -413,6 +395,7 @@ _INTEGRATION_M16_WINNER_IR_SYMBOL = (
 
 def _m16_launch_grid() -> dict[str, Any]:
     """Two N32 output blocks per packed N64 tile for the selected M16 kernel."""
+
     def constant(value: int) -> dict[str, Any]:
         return {"op": "constant", "value": value}
 
@@ -421,23 +404,28 @@ def _m16_launch_grid() -> dict[str, Any]:
 
     def tiles(name: str, index: int, divisor: int) -> dict[str, Any]:
         parameter = {
-            "op": "parameter", "name": name,
-            "host_argument_index": index, "kernel_argument_index": index,
+            "op": "parameter",
+            "name": name,
+            "host_argument_index": index,
+            "kernel_argument_index": index,
         }
         return binary(
             "floor_divide",
-            binary("subtract", binary("add", parameter, constant(divisor)), constant(1)),
+            binary(
+                "subtract", binary("add", parameter, constant(divisor)), constant(1)
+            ),
             constant(divisor),
         )
 
     grid_x = binary(
-        "multiply", tiles("M", 5, 16),
+        "multiply",
+        tiles("M", 5, 16),
         binary("multiply", tiles("N", 6, 64), constant(2)),
     )
     return {
         axis: {"host_argument_index": 8 + index, "expression": expression}
         for index, (axis, expression) in enumerate(
-            zip(("x", "y", "z"), (grid_x, constant(1), constant(1)))
+            zip(("x", "y", "z"), (grid_x, constant(1), constant(1)), strict=True)
         )
     }
 
@@ -450,18 +438,31 @@ def _row3_launch_grid() -> dict[str, Any]:
         return {"op": op, "lhs": lhs, "rhs": rhs}
 
     def tiles(name: str, index: int) -> dict[str, Any]:
-        parameter = {"op": "parameter", "name": name,
-                     "host_argument_index": index, "kernel_argument_index": index}
-        return binary("floor_divide",
-                      binary("subtract", binary("add", parameter, constant(64)), constant(1)),
-                      constant(64))
+        parameter = {
+            "op": "parameter",
+            "name": name,
+            "host_argument_index": index,
+            "kernel_argument_index": index,
+        }
+        return binary(
+            "floor_divide",
+            binary("subtract", binary("add", parameter, constant(64)), constant(1)),
+            constant(64),
+        )
 
     return {
         axis: {"host_argument_index": 8 + index, "expression": expression}
-        for index, (axis, expression) in enumerate(zip(
-            ("x", "y", "z"),
-            (binary("multiply", tiles("M", 5), tiles("N", 6)), constant(1), constant(1)),
-        ))
+        for index, (axis, expression) in enumerate(
+            zip(
+                ("x", "y", "z"),
+                (
+                    binary("multiply", tiles("M", 5), tiles("N", 6)),
+                    constant(1),
+                    constant(1),
+                ),
+                strict=True,
+            )
+        )
     }
 
 
@@ -509,16 +510,12 @@ _INTEGRATION_LAUNCH_RESOURCES = {
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _MODULE_IDENT_SUFFIX_PATTERN = re.compile(r"^[0-9a-f]{10}$")
 _CPP_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_KERNEL_SYMBOL_PATTERN = re.compile(
-    r"^kernel_flashinfer_bf16_fp4_[A-Za-z0-9_]+$"
-)
+_KERNEL_SYMBOL_PATTERN = re.compile(r"^kernel_flashinfer_bf16_fp4_[A-Za-z0-9_]+$")
 _KERNEL_DEFINITION_PATTERN = re.compile(
     r"\b__global__\s+(?:__launch_bounds__\([^)]*\)\s+)?void\s+"
     r"(kernel_flashinfer_bf16_fp4_[A-Za-z0-9_]+)\s*\("
 )
-_VARIANT_ABI_SHA256 = (
-    "46fc96e77732fb4ad0c8a8b171e8339954ddb1342835bc0de01afe074a73b889"
-)
+_VARIANT_ABI_SHA256 = "46fc96e77732fb4ad0c8a8b171e8339954ddb1342835bc0de01afe074a73b889"
 _KERNEL_SPECS_MARKER = "FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_SPECS"
 _KERNEL_COUNT_MARKER = "FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_COUNT"
 
@@ -605,10 +602,7 @@ def _variant_symbol_stem(variant: dict[str, Any]) -> str:
         stem += "_flat"
     if variant["component"] == "cudnn_split_k2_reduce_bf16":
         return f"{stem}_pdl{int(variant['enable_pdl'])}"
-    return (
-        f"{stem}_a{int(variant['has_alpha'])}"
-        f"_pdl{int(variant['enable_pdl'])}"
-    )
+    return f"{stem}_a{int(variant['has_alpha'])}_pdl{int(variant['enable_pdl'])}"
 
 
 def _variant_abi_sha256(variants: list[dict[str, Any]]) -> str:
@@ -617,13 +611,9 @@ def _variant_abi_sha256(variants: list[dict[str, Any]]) -> str:
         for variant in variants
     ]
     records.sort(
-        key=lambda record: json.dumps(
-            record, sort_keys=True, separators=(",", ":")
-        )
+        key=lambda record: json.dumps(record, sort_keys=True, separators=(",", ":"))
     )
-    payload = json.dumps(
-        records, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    payload = json.dumps(records, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -852,8 +842,7 @@ def _integration_component(kernel: dict[str, Any]) -> str:
     logical_tile_m = (
         32
         if (
-            kernel.get("route")
-            == _COMPONENT_SPECS["cute_warp_mma_m32_bf16"][0]
+            kernel.get("route") == _COMPONENT_SPECS["cute_warp_mma_m32_bf16"][0]
             and kernel.get("logical_grid_mode") == "persistent"
         )
         else physical_tile_m
@@ -866,9 +855,7 @@ def _integration_component(kernel: dict[str, Any]) -> str:
         and (grid_kind, kernel.get("flat_grid")) in grids
         and logical_tile_m == tile_m
     ]
-    if len(candidates) != 1 or (
-        component is not None and component != candidates[0]
-    ):
+    if len(candidates) != 1 or (component is not None and component != candidates[0]):
         raise ValueError(
             "Blackwell BF16 x FP4 integration manifest kernel does not resolve "
             "to one logical component"
@@ -907,9 +894,7 @@ def _integration_arg_plan(arg_plan_kind: str) -> list[list[str]]:
         else "tma_buffer"
     )
     output_kind = (
-        "tma_buffer"
-        if arg_plan_kind in {"cute_warp", "cute_warp_short"}
-        else "buffer"
+        "tma_buffer" if arg_plan_kind in {"cute_warp", "cute_warp_short"} else "buffer"
     )
     return [
         ["tma_buffer", "A"],
@@ -934,9 +919,7 @@ def _raw_pointer_integration_arg_plan() -> list[list[str]]:
     return _integration_arg_plan("raw_pointer")
 
 
-def _is_m32_raw_pointer_kernel(
-    component: str, kernel: dict[str, Any]
-) -> bool:
+def _is_m32_raw_pointer_kernel(component: str, kernel: dict[str, Any]) -> bool:
     return (
         component == "cute_warp_mma_m32_bf16"
         and kernel.get("arg_plan_kind") == "raw_pointer"
@@ -1128,8 +1111,14 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
             )
 
         exact_shape = kernel.get("exact_shape")
-        exact_tma_m64 = component == "cute_warp_mma_m64_bf16" and exact_shape is not None
-        expected_exact_shape = _INTEGRATION_ROW3_EXACT_SHAPE if exact_tma_m64 else _INTEGRATION_ROW7_EXACT_SHAPE
+        exact_tma_m64 = (
+            component == "cute_warp_mma_m64_bf16" and exact_shape is not None
+        )
+        expected_exact_shape = (
+            _INTEGRATION_ROW3_EXACT_SHAPE
+            if exact_tma_m64
+            else _INTEGRATION_ROW7_EXACT_SHAPE
+        )
         if exact_shape is not None:
             if (
                 not isinstance(exact_shape, dict)
@@ -1217,9 +1206,10 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
             "Blackwell BF16 x FP4 integration manifest requires one exact row7 "
             "specialization and one generic M32 fallback"
         )
-    if sum(
-        kernel["ir_symbol"] == exact_row7[0]["ir_symbol"] for kernel in kernels
-    ) != 1:
+    if (
+        sum(kernel["ir_symbol"] == exact_row7[0]["ir_symbol"] for kernel in kernels)
+        != 1
+    ):
         raise ValueError(
             "Blackwell BF16 x FP4 integration manifest physical IR inventory "
             "does not isolate the exact row7 specialization"
@@ -1230,7 +1220,10 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
             "Blackwell BF16 x FP4 integration manifest requires one exact row3 "
             "specialization and one generic M64 fallback"
         )
-    if sum(kernel["ir_symbol"] == exact_row3[0]["ir_symbol"] for kernel in kernels) != 1:
+    if (
+        sum(kernel["ir_symbol"] == exact_row3[0]["ir_symbol"] for kernel in kernels)
+        != 1
+    ):
         raise ValueError(
             "Blackwell BF16 x FP4 integration manifest physical IR inventory "
             "does not isolate the exact row3 specialization"
@@ -1257,9 +1250,13 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
         ("cute_warp_mma_m64_bf16", _INTEGRATION_ROW3_EXACT_SHAPE, "row3/M64"),
     ):
         route_name = _COMPONENT_SPECS[component][0]
-        selected_routes = [route for route in routes if route.get("route") == route_name]
+        selected_routes = [
+            route for route in routes if route.get("route") == route_name
+        ]
         if len(selected_routes) != 1:
-            raise ValueError(f"Blackwell BF16 x FP4 integration manifest is missing the {label} route")
+            raise ValueError(
+                f"Blackwell BF16 x FP4 integration manifest is missing the {label} route"
+            )
         specializations = selected_routes[0].get("specializations")
         generic_match = {"out_dtype": "bfloat16", "has_alpha": True, "enable_pdl": True}
         exact_match = {**generic_match, **shape}
@@ -1267,7 +1264,9 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
             not isinstance(specializations, list)
             or len(specializations) != 5
             or specializations[0].get("match") != exact_match
-            or not any(item.get("match") == generic_match for item in specializations[1:])
+            or not any(
+                item.get("match") == generic_match for item in specializations[1:]
+            )
         ):
             raise ValueError(
                 f"Blackwell BF16 x FP4 integration manifest {label} exact route must "
@@ -1282,7 +1281,9 @@ def _manifest_kernel_specs(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     integration = "kernels" in manifest
     specs = []
     for record in records:
-        component = _integration_component(record) if integration else record["component"]
+        component = (
+            _integration_component(record) if integration else record["component"]
+        )
         specs.append(
             {
                 "component": component,
@@ -1332,7 +1333,7 @@ def _render_binding_source(
         "KernelSpec{{{component}, {has_alpha}, {enable_pdl}, {flat_grid}, "
         "{raw_pointer_abi}, {persistent_m16_2sm}, "
         "{exact_m}, {exact_n}, {exact_k}, "
-        '\"{kernel_symbol}\", {threads}u, {smem_bytes}u}}'.format(
+        '"{kernel_symbol}", {threads}u, {smem_bytes}u}}'.format(
             component=_COMPONENT_ENUMS[record["component"]],
             has_alpha=str(record["has_alpha"]).lower(),
             enable_pdl=str(record["enable_pdl"]).lower(),
@@ -1435,6 +1436,8 @@ def _load_abi_manifest(path: Path, target: str) -> tuple[dict[str, Any], bytes]:
 
 
 def _source_define(source: str, name: str) -> str:
+    # Apply C line splicing before reading formatted macro values.
+    source = source.replace("\\\n", "")
     match = re.search(rf"^#define {re.escape(name)}\s+(.+?)\s*$", source, re.MULTILINE)
     if match is None:
         raise ValueError(f"generated Blackwell BF16 x FP4 source is missing {name}")

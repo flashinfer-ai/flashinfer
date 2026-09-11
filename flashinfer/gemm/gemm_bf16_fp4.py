@@ -215,7 +215,9 @@ def _blackwell_tiled_bf16_fp4_requirement(
     if int(a.shape[1]) != k:
         raise ValueError(f"a.shape[1]={int(a.shape[1])} but prepared b encodes K={k}")
     if n % 64 != 0:
-        raise ValueError(f"blackwell-tiled requires N to be a multiple of 64; got N={n}")
+        raise ValueError(
+            f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
+        )
     if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != (k_tiles, n):
         raise ValueError(
             "blackwell-tiled expects S0E5M3 uint8 scales with shape "

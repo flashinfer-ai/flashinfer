@@ -16,7 +16,6 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
-
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
@@ -74,8 +73,8 @@ inline void CheckCudaTensor(const TensorView& tensor, const char* name) {
 inline void CheckSameDevice(const TensorView& tensor, const TensorView& reference,
                             const char* name) {
   TVM_FFI_CHECK(tensor.device().device_id == reference.device().device_id, ValueError)
-      << name << " must be on cuda:" << reference.device().device_id << ", got cuda:"
-      << tensor.device().device_id;
+      << name << " must be on cuda:" << reference.device().device_id
+      << ", got cuda:" << tensor.device().device_id;
 }
 
 inline void CheckDtype(const TensorView& tensor, const char* name, int code, int bits) {
@@ -84,8 +83,8 @@ inline void CheckDtype(const TensorView& tensor, const char* name, int code, int
                     static_cast<int>(dtype.lanes) == 1,
                 TypeError)
       << name << " has the wrong dtype: got DLDataType(code=" << static_cast<int>(dtype.code)
-      << ", bits=" << static_cast<int>(dtype.bits)
-      << ", lanes=" << static_cast<int>(dtype.lanes) << ")";
+      << ", bits=" << static_cast<int>(dtype.bits) << ", lanes=" << static_cast<int>(dtype.lanes)
+      << ")";
 }
 
 inline void CheckMatrix(const TensorView& tensor, const char* name) {
@@ -101,17 +100,15 @@ inline void CheckTarget(int32_t device_id) {
 #endif
   int major = 0;
   int minor = 0;
-  cudaError_t status =
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
+  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaDeviceGetAttribute(minor) failed: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(major == 10 && minor == FLASHINFER_BLACKWELL_BF16_FP4_TARGET_MINOR,
-                RuntimeError)
-      << "this module requires compute capability 10."
-      << FLASHINFER_BLACKWELL_BF16_FP4_TARGET_MINOR << ", got " << major << "." << minor;
+  TVM_FFI_CHECK(major == 10 && minor == FLASHINFER_BLACKWELL_BF16_FP4_TARGET_MINOR, RuntimeError)
+      << "this module requires compute capability 10." << FLASHINFER_BLACKWELL_BF16_FP4_TARGET_MINOR
+      << ", got " << major << "." << minor;
 }
 
 inline void CheckCurrentDevice(const TensorView& reference) {
@@ -124,9 +121,8 @@ inline void CheckCurrentDevice(const TensorView& reference) {
       << ", a=cuda:" << reference.device().device_id;
 }
 
-inline Problem CheckInputs(const TensorView& a, const TensorView& b,
-                           const TensorView& b_descale, const TensorView& alpha,
-                           const TensorView& out, int64_t layout_code) {
+inline Problem CheckInputs(const TensorView& a, const TensorView& b, const TensorView& b_descale,
+                           const TensorView& alpha, const TensorView& out, int64_t layout_code) {
   CheckMatrix(a, "a");
   CheckMatrix(b, "b");
   CheckMatrix(b_descale, "b_descale");
@@ -151,8 +147,8 @@ inline Problem CheckInputs(const TensorView& a, const TensorView& b,
   const int64_t m64 = a.size(0);
   const int64_t k64 = a.size(1);
   TVM_FFI_CHECK(m64 > 0 && k64 > 0 && k64 % 16 == 0, ValueError)
-      << "a must have positive shape (M, K) with K divisible by 16, got (" << m64 << ", "
-      << k64 << ")";
+      << "a must have positive shape (M, K) with K divisible by 16, got (" << m64 << ", " << k64
+      << ")";
 
   const bool tiled = layout_code == 1;
   int64_t n64 = 0;
@@ -175,12 +171,11 @@ inline Problem CheckInputs(const TensorView& a, const TensorView& b,
     TVM_FFI_CHECK(b_descale.size(0) == n64 && b_descale.size(1) == k64 / 16, ValueError)
         << "native b_descale must have shape (N, K / 16)";
     const DLDataType output_dtype = out.dtype();
-    const bool output_bf16 = output_dtype.code == kDLBfloat && output_dtype.bits == 16 &&
-                             output_dtype.lanes == 1;
-    const bool output_f16 = output_dtype.code == kDLFloat && output_dtype.bits == 16 &&
-                            output_dtype.lanes == 1;
-    TVM_FFI_CHECK(output_bf16 || output_f16, TypeError)
-        << "native out must be bfloat16 or float16";
+    const bool output_bf16 =
+        output_dtype.code == kDLBfloat && output_dtype.bits == 16 && output_dtype.lanes == 1;
+    const bool output_f16 =
+        output_dtype.code == kDLFloat && output_dtype.bits == 16 && output_dtype.lanes == 1;
+    TVM_FFI_CHECK(output_bf16 || output_f16, TypeError) << "native out must be bfloat16 or float16";
   }
   TVM_FFI_CHECK(out.size(0) == m64 && out.size(1) == n64, ValueError)
       << "out must have shape (M, N)";
@@ -192,8 +187,12 @@ inline Problem CheckInputs(const TensorView& a, const TensorView& b,
   // Python represents alpha=None with a float32 one-element view beginning at
   // a.data_ptr(); every explicit alpha is an independent contiguous tensor.
   const bool has_alpha = alpha.data_ptr() != a.data_ptr();
-  return Problem{static_cast<int32_t>(m64), static_cast<int32_t>(n64),
-                 static_cast<int32_t>(k64), tiled, output_bf16, has_alpha};
+  return Problem{static_cast<int32_t>(m64),
+                 static_cast<int32_t>(n64),
+                 static_cast<int32_t>(k64),
+                 tiled,
+                 output_bf16,
+                 has_alpha};
 }
 
 struct TmaDeviceArena {
@@ -206,8 +205,7 @@ struct TmaDeviceArena {
 // The generated bundle uses the pointer TMA ABI. Descriptor slots are
 // immutable for process lifetime, so concurrent streams never observe a
 // descriptor being rewritten while a prior launch is still in flight.
-inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id,
-                           cudaStream_t stream) {
+inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id, cudaStream_t stream) {
   static std::mutex mutex;
   static auto* slots = new std::unordered_map<std::string, void*>();
   static auto* arenas = new std::unordered_map<CUcontext, TmaDeviceArena>();
@@ -218,8 +216,7 @@ inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id,
       << "pointer TMA ABI requires an active CUDA context";
   CUdevice current_device = -1;
   CheckCudaResult(cuCtxGetDevice(&current_device), "cuCtxGetDevice");
-  TVM_FFI_CHECK(current_device == device_id, RuntimeError)
-      << "TMA descriptor device mismatch";
+  TVM_FFI_CHECK(current_device == device_id, RuntimeError) << "TMA descriptor device mismatch";
 
   std::string key = std::to_string(reinterpret_cast<uintptr_t>(context));
   key.push_back(':');
@@ -248,8 +245,7 @@ inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id,
   }
   const size_t chunk_index = arena.used / TmaDeviceArena::kSlotsPerChunk;
   const size_t slot_index = arena.used % TmaDeviceArena::kSlotsPerChunk;
-  const CUdeviceptr slot =
-      arena.chunks[chunk_index] + slot_index * sizeof(CUtensorMap);
+  const CUdeviceptr slot = arena.chunks[chunk_index] + slot_index * sizeof(CUtensorMap);
   CheckCudaResult(cuMemcpyHtoD(slot, &tensor_map, sizeof(CUtensorMap)),
                   "cuMemcpyHtoD(TMA descriptor)");
   ++arena.used;
@@ -260,16 +256,14 @@ inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id,
 
 inline CUtensorMap EncodeTma2D(const TensorView& tensor, CUtensorMapDataType data_type,
                                uint32_t element_bytes, uint32_t box_x, uint32_t box_y,
-                               CUtensorMapSwizzle swizzle, bool allow_oob_x,
-                               bool allow_oob_y, const char* name) {
+                               CUtensorMapSwizzle swizzle, bool allow_oob_x, bool allow_oob_y,
+                               const char* name) {
   TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.stride(1) == 1, ValueError)
       << name << " must be a contiguous rank-2 TMA source";
   const uint64_t global_dim[2] = {static_cast<uint64_t>(tensor.size(1)),
                                   static_cast<uint64_t>(tensor.size(0))};
-  const uint64_t global_strides[1] = {
-      static_cast<uint64_t>(tensor.stride(0)) * element_bytes};
-  TVM_FFI_CHECK((allow_oob_x || box_x <= global_dim[0]) &&
-                    (allow_oob_y || box_y <= global_dim[1]),
+  const uint64_t global_strides[1] = {static_cast<uint64_t>(tensor.stride(0)) * element_bytes};
+  TVM_FFI_CHECK((allow_oob_x || box_x <= global_dim[0]) && (allow_oob_y || box_y <= global_dim[1]),
                 ValueError)
       << "TMA box exceeds " << name << " without an out-of-bounds-enabled axis";
   const uint32_t box_dim[2] = {box_x, box_y};
@@ -277,32 +271,27 @@ inline CUtensorMap EncodeTma2D(const TensorView& tensor, CUtensorMapDataType dat
   CUtensorMap tensor_map{};
   const CUresult result = cuTensorMapEncodeTiled(
       &tensor_map, data_type, 2, tensor.data_ptr(), global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled failed for " << name
-      << ": CUresult=" << static_cast<int>(result);
+      << "cuTensorMapEncodeTiled failed for " << name << ": CUresult=" << static_cast<int>(result);
   return tensor_map;
 }
 
 inline CUtensorMap EncodeWarpA3D(const TensorView& a, uint32_t tile_m) {
-  TVM_FFI_CHECK(a.size(1) % 64 == 0, ValueError)
-      << "warp A descriptor requires K divisible by 64";
+  TVM_FFI_CHECK(a.size(1) % 64 == 0, ValueError) << "warp A descriptor requires K divisible by 64";
   const uint64_t global_dim[3] = {64u, static_cast<uint64_t>(a.size(0)),
                                   static_cast<uint64_t>(a.size(1) / 64)};
-  const uint64_t global_strides[2] = {
-      static_cast<uint64_t>(a.stride(0)) * 2u, 64u * 2u};
+  const uint64_t global_strides[2] = {static_cast<uint64_t>(a.stride(0)) * 2u, 64u * 2u};
   const uint32_t box_dim[3] = {64u, tile_m, 2u};
   const uint32_t element_strides[3] = {1u, 1u, 1u};
   CUtensorMap tensor_map{};
   const CUresult result = cuTensorMapEncodeTiled(
-      &tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, a.data_ptr(), global_dim,
-      global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      &tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, a.data_ptr(), global_dim, global_strides,
+      box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled failed for warp A: CUresult="
-      << static_cast<int>(result);
+      << "cuTensorMapEncodeTiled failed for warp A: CUresult=" << static_cast<int>(result);
   return tensor_map;
 }
 
@@ -340,17 +329,15 @@ struct KernelSpec {
 
 constexpr size_t kKernelSpecCount = FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_COUNT;
 
-constexpr std::array<KernelSpec, kKernelSpecCount> kKernelSpecs = {{
-    FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_SPECS
-}};
+constexpr std::array<KernelSpec, kKernelSpecCount> kKernelSpecs = {
+    {FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_SPECS}};
 
 inline const KernelSpec& FindKernelSpec(Component component, bool has_alpha, bool enable_pdl,
-                                        int32_t m, int32_t n, int32_t k,
-                                        bool flat_grid = false) {
+                                        int32_t m, int32_t n, int32_t k, bool flat_grid = false) {
   const KernelSpec* generic_match = nullptr;
   for (const KernelSpec& spec : kKernelSpecs) {
-    const bool alpha_match = component == Component::kNativeSplitK2ReduceBf16 ||
-                             spec.has_alpha == has_alpha;
+    const bool alpha_match =
+        component == Component::kNativeSplitK2ReduceBf16 || spec.has_alpha == has_alpha;
     if (spec.component == component && alpha_match && spec.enable_pdl == enable_pdl &&
         spec.flat_grid == flat_grid) {
       const bool exact = spec.exact_m != 0 || spec.exact_n != 0 || spec.exact_k != 0;
@@ -385,8 +372,8 @@ inline tvm::ffi::CubinKernel& GetKernel(const KernelSpec& spec) {
   return reference;
 }
 
-inline void LaunchKernel(const KernelSpec& spec, void** args, uint32_t grid_x,
-                         uint32_t grid_y, uint32_t grid_z, cudaStream_t stream) {
+inline void LaunchKernel(const KernelSpec& spec, void** args, uint32_t grid_x, uint32_t grid_y,
+                         uint32_t grid_z, cudaStream_t stream) {
   tvm::ffi::CubinKernel& kernel = GetKernel(spec);
   tvm::ffi::cuda_api::LaunchConfig config{};
 #if TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API
@@ -426,38 +413,33 @@ inline void LaunchKernel(const KernelSpec& spec, void** args, uint32_t grid_x,
 }
 
 inline uint32_t CheckedGrid(int64_t value, const char* name) {
-  TVM_FFI_CHECK(value > 0 &&
-                    static_cast<uint64_t>(value) <= std::numeric_limits<uint32_t>::max(),
+  TVM_FFI_CHECK(value > 0 && static_cast<uint64_t>(value) <= std::numeric_limits<uint32_t>::max(),
                 ValueError)
       << name << " does not fit a CUDA grid dimension: " << value;
   return static_cast<uint32_t>(value);
 }
 
-inline int64_t CeilDiv(int64_t value, int64_t divisor) {
-  return (value + divisor - 1) / divisor;
-}
+inline int64_t CeilDiv(int64_t value, int64_t divisor) { return (value + divisor - 1) / divisor; }
 
 inline int32_t MultiProcessorCount(int32_t device_id) {
   int count = 0;
   const cudaError_t status =
       cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device_id);
   TVM_FFI_CHECK(status == cudaSuccess && count > 0, RuntimeError)
-      << "cudaDeviceGetAttribute(multiProcessorCount) failed: "
-      << cudaGetErrorString(status);
+      << "cudaDeviceGetAttribute(multiProcessorCount) failed: " << cudaGetErrorString(status);
   return count;
 }
 
 inline void LaunchBase(const Problem& problem, const TensorView& a, const TensorView& b,
-                       const TensorView& b_descale, const TensorView& alpha,
-                       const TensorView& out, bool enable_pdl, cudaStream_t stream) {
+                       const TensorView& b_descale, const TensorView& alpha, const TensorView& out,
+                       bool enable_pdl, cudaStream_t stream) {
   const bool cp_async = !problem.tiled && problem.k % kNativeTmaK != 0;
   const int64_t grid_m = CeilDiv(problem.m, kTileM);
   const int64_t grid_n = CeilDiv(problem.n, kTileN);
   const bool flat_grid = grid_m > 65535;
 
-  CUtensorMap a_map =
-      EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
-                  CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
+  CUtensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
+                                  CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
   void* p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
   void* p_b = b.data_ptr();
   void* p_b_descale = b_descale.data_ptr();
@@ -466,20 +448,17 @@ inline void LaunchBase(const Problem& problem, const TensorView& a, const Tensor
   if (!cp_async) {
     if (problem.tiled) {
       b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_INT32, 4u, 128u, 4u,
-                         CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b");
-      b_descale_map =
-          EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 64u, 4u,
-                      CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b_descale");
+                          CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b");
+      b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 64u, 4u,
+                                  CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b_descale");
     } else {
       b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
-                         CU_TENSOR_MAP_SWIZZLE_NONE, true, true, "b");
-      b_descale_map =
-          EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
-                      CU_TENSOR_MAP_SWIZZLE_NONE, true, true, "b_descale");
+                          CU_TENSOR_MAP_SWIZZLE_NONE, true, true, "b");
+      b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
+                                  CU_TENSOR_MAP_SWIZZLE_NONE, true, true, "b_descale");
     }
     p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
-    p_b_descale =
-        TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
+    p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
   }
 
   void* p_alpha = alpha.data_ptr();
@@ -493,86 +472,70 @@ inline void LaunchBase(const Problem& problem, const TensorView& a, const Tensor
   if (problem.tiled) {
     component = Component::kTiledBaseBf16;
   } else if (cp_async) {
-    component = problem.output_bf16 ? Component::kNativeCpAsyncBf16
-                                    : Component::kNativeCpAsyncF16;
+    component = problem.output_bf16 ? Component::kNativeCpAsyncBf16 : Component::kNativeCpAsyncF16;
   } else {
-    component = problem.output_bf16 ? Component::kNativeTmaBf16
-                                    : Component::kNativeTmaF16;
+    component = problem.output_bf16 ? Component::kNativeTmaBf16 : Component::kNativeTmaF16;
   }
-  const KernelSpec& spec =
-      FindKernelSpec(component, problem.has_alpha, enable_pdl, problem.m, problem.n,
-                     problem.k, flat_grid);
+  const KernelSpec& spec = FindKernelSpec(component, problem.has_alpha, enable_pdl, problem.m,
+                                          problem.n, problem.k, flat_grid);
   if (flat_grid) {
-    LaunchKernel(spec, args, CheckedGrid(grid_m * grid_n, "flat grid.x"), 1u, 1u,
-                 stream);
+    LaunchKernel(spec, args, CheckedGrid(grid_m * grid_n, "flat grid.x"), 1u, 1u, stream);
   } else {
-    LaunchKernel(spec, args, CheckedGrid(grid_n, "grid.x"), CheckedGrid(grid_m, "grid.y"),
-                 1u, stream);
+    LaunchKernel(spec, args, CheckedGrid(grid_n, "grid.x"), CheckedGrid(grid_m, "grid.y"), 1u,
+                 stream);
   }
 }
 
-inline void LaunchGroupM128(const Problem& problem, const TensorView& a,
-                            const TensorView& b, const TensorView& b_descale,
-                            const TensorView& alpha, const TensorView& out,
-                            bool enable_pdl, cudaStream_t stream) {
-  CUtensorMap a_map =
-      EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 128u,
-                  CU_TENSOR_MAP_SWIZZLE_128B, false, false, "a");
-  CUtensorMap b_map =
-      EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
-                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
-  CUtensorMap b_descale_map =
-      EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
-                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
+inline void LaunchGroupM128(const Problem& problem, const TensorView& a, const TensorView& b,
+                            const TensorView& b_descale, const TensorView& alpha,
+                            const TensorView& out, bool enable_pdl, cudaStream_t stream) {
+  CUtensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 128u,
+                                  CU_TENSOR_MAP_SWIZZLE_128B, false, false, "a");
+  CUtensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
+                                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
+  CUtensorMap b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
+                                          CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
   void* p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
   void* p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
-  void* p_b_descale =
-      TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
+  void* p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
   void* p_alpha = alpha.data_ptr();
   void* p_out = out.data_ptr();
   int32_t m = problem.m;
   int32_t n = problem.n;
   int32_t k = problem.k;
   void* args[] = {&p_a, &p_b, &p_b_descale, &p_alpha, &p_out, &m, &n, &k};
-  const KernelSpec& spec = FindKernelSpec(Component::kNativeGroupM128Bf16,
-                                          problem.has_alpha, enable_pdl, problem.m,
-                                          problem.n, problem.k);
+  const KernelSpec& spec = FindKernelSpec(Component::kNativeGroupM128Bf16, problem.has_alpha,
+                                          enable_pdl, problem.m, problem.n, problem.k);
   LaunchKernel(spec, args, CheckedGrid(CeilDiv(problem.n, 64), "group grid.x"),
                CheckedGrid(problem.m / 128, "group grid.y"), 1u, stream);
 }
 
 inline void LaunchWarp(const Problem& problem, const TensorView& a, const TensorView& b,
-                       const TensorView& b_descale, const TensorView& alpha,
-                       const TensorView& out, Component component, uint32_t tile_m,
-                       uint32_t tile_k, bool enable_pdl, cudaStream_t stream) {
+                       const TensorView& b_descale, const TensorView& alpha, const TensorView& out,
+                       Component component, uint32_t tile_m, uint32_t tile_k, bool enable_pdl,
+                       cudaStream_t stream) {
   const KernelSpec& spec =
-      FindKernelSpec(component, problem.has_alpha, enable_pdl, problem.m, problem.n,
-                     problem.k);
+      FindKernelSpec(component, problem.has_alpha, enable_pdl, problem.m, problem.n, problem.k);
   const bool short_k = tile_k != 128u;
   void* p_a = a.data_ptr();
   void* p_b = b.data_ptr();
   void* p_b_descale = b_descale.data_ptr();
   void* p_out = out.data_ptr();
   if (!spec.raw_pointer_abi) {
-    CUtensorMap a_map =
-        short_k ? EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, tile_k, 16u,
-                              CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "a")
-                : EncodeWarpA3D(a, tile_m);
-    CUtensorMap b_map =
-        EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_INT32, 4u, 128u, tile_k / 16u,
-                    CU_TENSOR_MAP_SWIZZLE_NONE, false, !short_k, "b");
-    CUtensorMap out_map =
-        EncodeTma2D(out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, tile_m,
-                    CU_TENSOR_MAP_SWIZZLE_128B, true, true, "out");
+    CUtensorMap a_map = short_k ? EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, tile_k, 16u,
+                                              CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "a")
+                                : EncodeWarpA3D(a, tile_m);
+    CUtensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_INT32, 4u, 128u, tile_k / 16u,
+                                    CU_TENSOR_MAP_SWIZZLE_NONE, false, !short_k, "b");
+    CUtensorMap out_map = EncodeTma2D(out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, tile_m,
+                                      CU_TENSOR_MAP_SWIZZLE_128B, true, true, "out");
     p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
     p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
     p_out = TmaDeviceSlot(out_map, out.device().device_id, stream);
     if (!short_k) {
-      CUtensorMap b_descale_map =
-          EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 64u, 8u,
-                      CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b_descale");
-      p_b_descale =
-          TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
+      CUtensorMap b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 64u, 8u,
+                                              CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b_descale");
+      p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
     }
   }
   void* p_alpha = alpha.data_ptr();
@@ -583,19 +546,15 @@ inline void LaunchWarp(const Problem& problem, const TensorView& a, const Tensor
 
   const int64_t grid_tile_m = spec.persistent_m16_2sm ? 16 : tile_m;
   const int64_t sm_multiplier = spec.persistent_m16_2sm ? 2 : 1;
-  const bool exact_k1024_m16 =
-      spec.raw_pointer_abi && component == Component::kTiledWarpM16Bf16;
+  const bool exact_k1024_m16 = spec.raw_pointer_abi && component == Component::kTiledWarpM16Bf16;
   const int64_t n_splits = exact_k1024_m16 ? 2 : 1;
-  const int64_t total_tiles =
-      CeilDiv(problem.m, grid_tile_m) * CeilDiv(problem.n, 64) * n_splits;
-  const bool exact_large_m =
-      component == Component::kTiledWarpM64Bf16 && spec.exact_m != 0;
+  const int64_t total_tiles = CeilDiv(problem.m, grid_tile_m) * CeilDiv(problem.n, 64) * n_splits;
+  const bool exact_large_m = component == Component::kTiledWarpM64Bf16 && spec.exact_m != 0;
   const int64_t launch_grid =
       (exact_k1024_m16 || exact_large_m)
           ? total_tiles
-          : std::min<int64_t>(
-                total_tiles,
-                sm_multiplier * MultiProcessorCount(a.device().device_id));
+          : std::min<int64_t>(total_tiles,
+                              sm_multiplier * MultiProcessorCount(a.device().device_id));
   LaunchKernel(spec, args, CheckedGrid(launch_grid, "warp grid.x"), 1u, 1u, stream);
 }
 
@@ -622,8 +581,7 @@ struct WorkspaceKeyHash {
 
 inline void* SplitWorkspace(const Problem& problem, cudaStream_t stream) {
   static std::mutex mutex;
-  static auto* workspaces =
-      new std::unordered_map<WorkspaceKey, CUdeviceptr, WorkspaceKeyHash>();
+  static auto* workspaces = new std::unordered_map<WorkspaceKey, CUdeviceptr, WorkspaceKeyHash>();
   CUcontext context = nullptr;
   CheckCudaResult(cuCtxGetCurrent(&context), "cuCtxGetCurrent(split workspace)");
   TVM_FFI_CHECK(context != nullptr, RuntimeError)
@@ -641,8 +599,7 @@ inline void* SplitWorkspace(const Problem& problem, cudaStream_t stream) {
   TVM_FFI_CHECK(capture_status == CU_STREAM_CAPTURE_STATUS_NONE, RuntimeError)
       << "the split-K workspace must be warmed before CUDA Graph capture";
   const uint64_t elements = static_cast<uint64_t>(problem.m) * problem.n;
-  TVM_FFI_CHECK(elements <= std::numeric_limits<size_t>::max() / (2u * sizeof(float)),
-                ValueError)
+  TVM_FFI_CHECK(elements <= std::numeric_limits<size_t>::max() / (2u * sizeof(float)), ValueError)
       << "split-K workspace size overflows size_t";
   CUdeviceptr allocation = 0;
   CheckCudaResult(cuMemAlloc(&allocation, elements * 2u * sizeof(float)),
@@ -651,93 +608,85 @@ inline void* SplitWorkspace(const Problem& problem, cudaStream_t stream) {
   return reinterpret_cast<void*>(static_cast<uintptr_t>(allocation));
 }
 
-inline void LaunchSplitK2(const Problem& problem, const TensorView& a,
-                          const TensorView& b, const TensorView& b_descale,
-                          const TensorView& alpha, const TensorView& out,
-                          bool enable_pdl, cudaStream_t stream) {
-  CUtensorMap a_map =
-      EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
-                  CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
-  CUtensorMap b_map =
-      EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
-                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
-  CUtensorMap b_descale_map =
-      EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
-                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
+inline void LaunchSplitK2(const Problem& problem, const TensorView& a, const TensorView& b,
+                          const TensorView& b_descale, const TensorView& alpha,
+                          const TensorView& out, bool enable_pdl, cudaStream_t stream) {
+  CUtensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
+                                  CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
+  CUtensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
+                                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
+  CUtensorMap b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
+                                          CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
   void* p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
   void* p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
-  void* p_b_descale =
-      TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
+  void* p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
   void* p_alpha = alpha.data_ptr();
   void* p_partials = SplitWorkspace(problem, stream);
   int32_t m = problem.m;
   int32_t n = problem.n;
   int32_t k = problem.k;
-  void* partial_args[] = {
-      &p_a, &p_b, &p_b_descale, &p_alpha, &p_partials, &m, &n, &k};
-  const KernelSpec& partial_spec = FindKernelSpec(
-      Component::kNativeSplitK2PartialF32, problem.has_alpha, enable_pdl,
-      problem.m, problem.n, problem.k);
+  void* partial_args[] = {&p_a, &p_b, &p_b_descale, &p_alpha, &p_partials, &m, &n, &k};
+  const KernelSpec& partial_spec =
+      FindKernelSpec(Component::kNativeSplitK2PartialF32, problem.has_alpha, enable_pdl, problem.m,
+                     problem.n, problem.k);
   LaunchKernel(partial_spec, partial_args,
-               CheckedGrid(CeilDiv(problem.n, 64), "split partial grid.x"), 1u, 2u,
-               stream);
+               CheckedGrid(CeilDiv(problem.n, 64), "split partial grid.x"), 1u, 2u, stream);
 
   void* p_out = out.data_ptr();
   int32_t elements = problem.m * problem.n;
   void* reduce_args[] = {&p_partials, &p_out, &elements};
-  const KernelSpec& reduce_spec =
-      FindKernelSpec(Component::kNativeSplitK2ReduceBf16, false, enable_pdl,
-                     problem.m, problem.n, problem.k);
+  const KernelSpec& reduce_spec = FindKernelSpec(Component::kNativeSplitK2ReduceBf16, false,
+                                                 enable_pdl, problem.m, problem.n, problem.k);
   LaunchKernel(reduce_spec, reduce_args,
-               CheckedGrid(CeilDiv(elements, kSplitReduceThreads), "split reducer grid.x"),
-               1u, 1u, stream);
+               CheckedGrid(CeilDiv(elements, kSplitReduceThreads), "split reducer grid.x"), 1u, 1u,
+               stream);
 }
 
-void Run(TensorView a, TensorView b, TensorView b_descale, TensorView alpha,
-         TensorView out, int64_t layout_code, bool enable_pdl) {
+void Run(TensorView a, TensorView b, TensorView b_descale, TensorView alpha, TensorView out,
+         int64_t layout_code, bool enable_pdl) {
   const Problem problem = CheckInputs(a, b, b_descale, alpha, out, layout_code);
   const DLDevice device = a.device();
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(device.device_type, device.device_id));
+  cudaStream_t stream =
+      reinterpret_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
 
-  if (!problem.tiled && problem.output_bf16 && problem.k % kNativeTmaK == 0 &&
-      problem.m == 768 && problem.n == 2112 && problem.k == 2048) {
+  if (!problem.tiled && problem.output_bf16 && problem.k % kNativeTmaK == 0 && problem.m == 768 &&
+      problem.n == 2112 && problem.k == 2048) {
     LaunchGroupM128(problem, a, b, b_descale, alpha, out, enable_pdl, stream);
     return;
   }
-  if (!problem.tiled && problem.output_bf16 && problem.k % kNativeTmaK == 0 &&
-      problem.m == 1 && problem.n == 4096 && problem.k == 4096) {
+  if (!problem.tiled && problem.output_bf16 && problem.k % kNativeTmaK == 0 && problem.m == 1 &&
+      problem.n == 4096 && problem.k == 4096) {
     LaunchSplitK2(problem, a, b, b_descale, alpha, out, enable_pdl, stream);
     return;
   }
   if (problem.tiled && problem.k == 16) {
-    LaunchWarp(problem, a, b, b_descale, alpha, out,
-               Component::kTiledWarpM16K16Bf16, 16u, 16u, enable_pdl, stream);
+    LaunchWarp(problem, a, b, b_descale, alpha, out, Component::kTiledWarpM16K16Bf16, 16u, 16u,
+               enable_pdl, stream);
     return;
   }
   if (problem.tiled && problem.k == 32) {
-    LaunchWarp(problem, a, b, b_descale, alpha, out,
-               Component::kTiledWarpM16K32Bf16, 16u, 32u, enable_pdl, stream);
+    LaunchWarp(problem, a, b, b_descale, alpha, out, Component::kTiledWarpM16K32Bf16, 16u, 32u,
+               enable_pdl, stream);
     return;
   }
   if (problem.tiled && problem.k == 48) {
-    LaunchWarp(problem, a, b, b_descale, alpha, out,
-               Component::kTiledWarpM16K48Bf16, 16u, 48u, enable_pdl, stream);
+    LaunchWarp(problem, a, b, b_descale, alpha, out, Component::kTiledWarpM16K48Bf16, 16u, 48u,
+               enable_pdl, stream);
     return;
   }
   if (problem.tiled && problem.m <= 16 && problem.k == 1024) {
-    LaunchWarp(problem, a, b, b_descale, alpha, out,
-               Component::kTiledWarpM16Bf16, 16u, 128u, enable_pdl, stream);
+    LaunchWarp(problem, a, b, b_descale, alpha, out, Component::kTiledWarpM16Bf16, 16u, 128u,
+               enable_pdl, stream);
     return;
   }
   if (problem.tiled && problem.m <= 32 && problem.k >= 128 && problem.k % 64 == 0) {
-    LaunchWarp(problem, a, b, b_descale, alpha, out,
-               Component::kTiledWarpM32Bf16, 32u, 128u, enable_pdl, stream);
+    LaunchWarp(problem, a, b, b_descale, alpha, out, Component::kTiledWarpM32Bf16, 32u, 128u,
+               enable_pdl, stream);
     return;
   }
   if (problem.tiled && problem.m >= 33 && problem.k % 128 == 0) {
-    LaunchWarp(problem, a, b, b_descale, alpha, out,
-               Component::kTiledWarpM64Bf16, 64u, 128u, enable_pdl, stream);
+    LaunchWarp(problem, a, b, b_descale, alpha, out, Component::kTiledWarpM64Bf16, 64u, 128u,
+               enable_pdl, stream);
     return;
   }
   LaunchBase(problem, a, b, b_descale, alpha, out, enable_pdl, stream);
