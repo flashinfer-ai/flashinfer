@@ -35,7 +35,6 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
 )
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     compute_expert_token_count_from_sizes,
-    compute_expert_token_range,
     mbarrier_arrive_expect_tx_on_peer,
     store_i32_to_peer_cluster_smem_async,
 )
@@ -141,17 +140,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         cluster_shape_mn: Tuple[int, int],
         group_hint: int,
         token_padding_block: int,
+        expert_token_sizes: cute.Tensor,
         load_balance_mode: Literal["static", "atomic_counter"] = "static",
         load_balance_counter_ptr=None,
         override_num_stages: Optional[int] = None,
-        # Exactly one of the next two must be non-None (sizes preferred when
-        # the host can expose a direct view onto ``expert_recv_count_sum``;
-        # prefix_sum required when only a host-precomputed cumsum is
-        # available).  The scheduler picks the data source at codegen time
-        # via ``cutlass.const_expr(self.expert_token_sizes is not None)``;
-        # serialization is type-discriminated below.
-        expert_token_sizes: Optional[cute.Tensor] = None,
-        expert_token_prefix_sum: Optional[cute.Tensor] = None,
     ):
         """Create fused fc12 scheduler params."""
         if scenario != "2Dx3D":
@@ -172,14 +164,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             raise ValueError(
                 f"token_padding_block must be positive, got {token_padding_block}"
             )
-        if (expert_token_sizes is None) == (expert_token_prefix_sum is None):
-            raise ValueError(
-                "Exactly one of expert_token_sizes / expert_token_prefix_sum "
-                "must be provided (got "
-                f"sizes={'set' if expert_token_sizes is not None else 'None'}, "
-                f"prefix_sum={'set' if expert_token_prefix_sum is not None else 'None'})."
-            )
-
         super().__init__(
             scenario=scenario,
             expert_shape=expert_shape,
@@ -193,7 +177,6 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
         self.expert_token_sizes = expert_token_sizes
-        self.expert_token_prefix_sum = expert_token_prefix_sum
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -213,11 +196,7 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         ]
         if self.load_balance_mode == "atomic_counter":
             fields.append("load_balance_counter_ptr")
-        fields.append(
-            "expert_token_sizes"
-            if self.expert_token_sizes is not None
-            else "expert_token_prefix_sum"
-        )
+        fields.append("expert_token_sizes")
         return fields
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
@@ -276,12 +255,6 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_pipeline,
         producer_state,
     ):
-        # Per-expert token range data source lives on ``params``: either
-        # ``params.expert_token_sizes`` (sizes-mode, e.g. zero-copy view of
-        # ``expert_recv_count_sum``) or ``params.expert_token_prefix_sum``
-        # (cumulative-end, host-precomputed).  See
-        # ``compute_expert_token_range`` / ``compute_expert_token_count_from_sizes``
-        # in ``moe_utils.py`` for the per-mode helpers.
         self.params = params
         self.num_persistent_clusters = num_persistent_clusters
         self.cta_id_in_cluster = cta_id_in_cluster
@@ -707,22 +680,13 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             state.current_token_block_cumul + state.current_token_block_count
         )
 
-        # Only the count is consumed; either supported source yields it.
         state.current_expert_idx = state.current_expert_idx + Int32(1)
-        if cutlass.const_expr(self.params.expert_token_sizes is not None):
-            this_expert_token_cnt = compute_expert_token_count_from_sizes(
-                self.params.expert_token_sizes,
-                state.current_expert_idx,
-                loc=loc,
-                ip=ip,
-            )
-        else:
-            _, this_expert_token_cnt = compute_expert_token_range(
-                self.params.expert_token_prefix_sum,
-                state.current_expert_idx,
-                loc=loc,
-                ip=ip,
-            )
+        this_expert_token_cnt = compute_expert_token_count_from_sizes(
+            self.params.expert_token_sizes,
+            state.current_expert_idx,
+            loc=loc,
+            ip=ip,
+        )
         state.current_this_expert_token_cnt = this_expert_token_cnt
         state.current_token_block_count = (
             this_expert_token_cnt + Int32(cluster_tile_m) - 1
@@ -818,23 +782,12 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         expert_cursor = state.current_group_first_expert
 
         while expert_cursor < self.expert_cnt and cumulative_fc1 < threshold:
-            # Only the per-expert token count drives the group greedy walk
-            # (the offset is not consumed here), so the sizes-mode branch
-            # is the simpler one.
-            if cutlass.const_expr(self.params.expert_token_sizes is not None):
-                token_count_e = compute_expert_token_count_from_sizes(
-                    self.params.expert_token_sizes,
-                    expert_cursor,
-                    loc=loc,
-                    ip=ip,
-                )
-            else:
-                _, token_count_e = compute_expert_token_range(
-                    self.params.expert_token_prefix_sum,
-                    expert_cursor,
-                    loc=loc,
-                    ip=ip,
-                )
+            token_count_e = compute_expert_token_count_from_sizes(
+                self.params.expert_token_sizes,
+                expert_cursor,
+                loc=loc,
+                ip=ip,
+            )
             token_block_count_e = (token_count_e + Int32(cluster_tile_m) - 1) // Int32(
                 cluster_tile_m
             )

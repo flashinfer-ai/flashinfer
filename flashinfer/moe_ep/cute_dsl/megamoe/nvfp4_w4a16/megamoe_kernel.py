@@ -704,7 +704,6 @@ class Sm100W4A16MegaMoEKernel:
             load_balance_mode=self.load_balance_mode,
             load_balance_counter_ptr=counter_ptr,
             override_num_stages=self.num_sched_stages,
-            expert_token_prefix_sum=None,
             expert_token_sizes=expert_token_sizes,
         )
         (
