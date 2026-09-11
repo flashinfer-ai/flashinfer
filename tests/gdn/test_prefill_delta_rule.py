@@ -63,8 +63,10 @@ def _skip_if_cp_unsupported():
                 f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
         return
+    if get_compute_capability(device)[0] == 8:
+        return
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
+        pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, or SM12x")
 
 
 def _skip_if_fp8_state_unsupported(state_dtype: torch.dtype):
