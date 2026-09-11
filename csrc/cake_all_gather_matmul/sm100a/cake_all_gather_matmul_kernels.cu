@@ -20,11 +20,13 @@
 #include <stdint.h>
 
 // Pointer-ABI TMA descriptors are encoded by the CUDA driver and stored in
-// device memory. Keep the generated kernel pointee self-contained and
+// device memory.  Keep the generated kernel pointee self-contained and
 // layout-identical to the compiler's opaque 128-byte descriptor type.
 struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
+#include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <math_constants.h>
 
@@ -44,6 +46,11 @@ __device__ __forceinline__ uint32_t elect_sync() {
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
         :: "r"(mbar_addr), "r"(count) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
+    asm volatile("mbarrier.init.b64 [%0], %1;"
+        :: "l"(mbar_addr), "r"(count));
 }
 
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
@@ -74,37 +81,105 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
+// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
+// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
 
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
+        " P1, [%0], %1, %2;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
+        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+}
+
+// Exact source ports may request the PTX suspendTimeHint operand explicitly.
+// The hint is expressed in nanoseconds and is kept separate from the canonical
+// no-hint CTA helper so unrelated schedules retain their existing retry path.
+
+__device__ __forceinline__ void mbarrier_wait_suspend(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_SUSPEND:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_SUSPEND;\n\t"
+        "bra.uni LAB_WAIT_SUSPEND;\n\t"
+        "DONE_SUSPEND:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT_CLUSTER:\n\t"
         "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE_CLUSTER;\n\t"
         "bra.uni LAB_WAIT_CLUSTER;\n\t"
         "DONE_CLUSTER:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        ".reg .u32 WAIT_ADDR;\n\t"
+        "mov.u32 WAIT_ADDR, %0;\n\t"
+        "LAB_WAIT_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+        " P1, [WAIT_ADDR], %1, %2;\n\t"
+        "@P1 bra.uni DONE_HINT;\n\t"
+        "bra.uni LAB_WAIT_HINT;\n\t"
+        "DONE_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
+}
+
+// Exact unqualified CTA wait used by source schedules whose PTX intentionally
+// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
+
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED_HINT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra DONE_RELAXED_HINT;\n\t"
+        "bra LAB_WAIT_RELAXED_HINT;\n\t"
+        "DONE_RELAXED_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(
+        int mbar_addr, int phase, uint32_t suspend_time_hint) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_CLUSTER_HINT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " P1, [%0], %1, %2;\n\t"
+        "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+        "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+        "DONE_CLUSTER_HINT:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
@@ -113,9 +188,30 @@ __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, ui
     }
 }
 
+__device__ __forceinline__ void mbarrier_wait_token_suspend(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
 __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
     if (token == 0) {
         mbarrier_wait_cluster(mbar_addr, phase);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
+    }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
+        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
+    if (token == 0) {
+        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
     }
 }
 
@@ -228,7 +324,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -238,8 +334,9 @@ __global__ __launch_bounds__(32) void
 kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -276,11 +373,11 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0(int32_t pg_world, int32_t
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -290,8 +387,9 @@ __global__ __launch_bounds__(32) void
 kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -328,11 +426,11 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1(int32_t pg_world, int32_t
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -342,8 +440,9 @@ __global__ __launch_bounds__(32) void
 kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -380,11 +479,11 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0(int32_t pg_world, int32_t
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -394,8 +493,9 @@ __global__ __launch_bounds__(32) void
 kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -432,11 +532,11 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1(int32_t pg_world, int32_t
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -446,8 +546,9 @@ __global__ __launch_bounds__(32) void
 kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -484,11 +585,11 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0(int32_t pg_world, int32_t
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -498,8 +599,9 @@ __global__ __launch_bounds__(32) void
 kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1(int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
 
     const int bid = blockIdx.x;
@@ -536,11 +638,11 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1(int32_t pg_world, int32_t
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -560,12 +662,14 @@ __global__ __launch_bounds__(192) void
 kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
@@ -574,6 +678,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -588,7 +693,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
     __half* smem_b = reinterpret_cast<__half*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 groups, 12 barriers)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
@@ -619,7 +724,6 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -771,7 +875,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            const int epi_tid = epi_warp * 32 + lane;
+            const int epi_tid = (unsigned int)(epi_warp * 32) + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (int peer_pass_1 = 0; peer_pass_1 < 2; peer_pass_1++) {
@@ -827,7 +931,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -846,7 +950,8 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 #undef smem_a_addr
 #undef smem_b_addr
 #undef tma_full_addr
-#define LOOM_INF CUDART_INF_F
+
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -866,12 +971,14 @@ __global__ __launch_bounds__(192) void
 kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
@@ -880,6 +987,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -894,7 +1002,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 groups, 12 barriers)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
@@ -925,7 +1033,6 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1077,7 +1184,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            const int epi_tid = epi_warp * 32 + lane;
+            const int epi_tid = (unsigned int)(epi_warp * 32) + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (int peer_pass_1 = 0; peer_pass_1 < 2; peer_pass_1++) {
@@ -1133,7 +1240,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -1152,7 +1259,8 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 #undef smem_a_addr
 #undef smem_b_addr
 #undef tma_full_addr
-#define LOOM_INF CUDART_INF_F
+
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -1172,12 +1280,14 @@ __global__ __launch_bounds__(192) void
 kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
@@ -1186,6 +1296,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1200,7 +1311,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
     __half* smem_b = reinterpret_cast<__half*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 groups, 12 barriers)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
@@ -1231,7 +1342,6 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1383,7 +1493,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            const int epi_tid = epi_warp * 32 + lane;
+            const int epi_tid = (unsigned int)(epi_warp * 32) + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (int peer_pass_1 = 0; peer_pass_1 < 4; peer_pass_1++) {
@@ -1439,7 +1549,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -1459,7 +1569,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -1479,12 +1589,14 @@ __global__ __launch_bounds__(192) void
 kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
@@ -1493,6 +1605,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1507,7 +1620,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 groups, 12 barriers)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
@@ -1538,7 +1651,6 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1690,7 +1802,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            const int epi_tid = epi_warp * 32 + lane;
+            const int epi_tid = (unsigned int)(epi_warp * 32) + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (int peer_pass_1 = 0; peer_pass_1 < 4; peer_pass_1++) {
@@ -1746,7 +1858,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -1766,7 +1878,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -1786,12 +1898,14 @@ __global__ __launch_bounds__(192) void
 kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
@@ -1800,6 +1914,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1814,7 +1929,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
     __half* smem_b = reinterpret_cast<__half*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 groups, 12 barriers)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
@@ -1845,7 +1960,6 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1997,7 +2111,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            const int epi_tid = epi_warp * 32 + lane;
+            const int epi_tid = (unsigned int)(epi_warp * 32) + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (int peer_pass_1 = 0; peer_pass_1 < 8; peer_pass_1++) {
@@ -2053,7 +2167,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -2073,7 +2187,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -2093,12 +2207,14 @@ __global__ __launch_bounds__(192) void
 kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
@@ -2107,6 +2223,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -2121,7 +2238,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
     __nv_bfloat16* smem_b = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int smem_b_addr = smem + 17408;
 
-    // Mbarrier init (4 groups, 12 barriers)
+    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
@@ -2152,7 +2269,6 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -2176,7 +2292,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
             unsigned int load_stage = 0;
             unsigned int load_phase = 1;
             #pragma unroll
-            for (int peer_pass = 0; peer_pass < 8; peer_pass++) {
+            for (int peer_pass = blockIdx.y; peer_pass < 8; peer_pass += gridDim.y) {
                 int peer = (rank - peer_pass + 8) % 8;
                 #pragma unroll 1
                 for (int chunk_idx = 0; chunk_idx < (M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432); chunk_idx++) {
@@ -2237,7 +2353,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
             #pragma unroll
-            for (int _peer_pass = 0; _peer_pass < 8; _peer_pass++) {
+            for (int _peer_pass = blockIdx.y; _peer_pass < 8; _peer_pass += gridDim.y) {
                 #pragma unroll 1
                 for (int chunk_idx_1 = 0; chunk_idx_1 < (M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432); chunk_idx_1++) {
                     int rows_left_1 = M - chunk_idx_1 * ((M < 2432) ? M : 2432);
@@ -2304,10 +2420,10 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
         { // epilogue_main
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
-            const int epi_tid = epi_warp * 32 + lane;
+            const int epi_tid = (unsigned int)(epi_warp * 32) + lane;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
-            for (int peer_pass_1 = 0; peer_pass_1 < 8; peer_pass_1++) {
+            for (int peer_pass_1 = blockIdx.y; peer_pass_1 < 8; peer_pass_1 += gridDim.y) {
                 int peer_1 = (rank - peer_pass_1 + 8) % 8;
                 #pragma unroll 1
                 for (int chunk_idx_2 = 0; chunk_idx_2 < (M + ((M < 2432) ? M : 2432) - 1) / ((M < 2432) ? M : 2432); chunk_idx_2++) {
@@ -2360,7 +2476,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
 
 } // extern "C"
 
-#undef LOOM_INF
+#undef CAKE_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF

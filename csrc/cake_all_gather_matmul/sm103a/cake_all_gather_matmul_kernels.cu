@@ -81,40 +81,22 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
+// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
+// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
 
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
+        " P1, [%0], %1, %2;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
+        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
 }
 
 // Exact source ports may request the PTX suspendTimeHint operand explicitly.
@@ -696,6 +678,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -741,7 +724,6 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1005,6 +987,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1050,7 +1033,6 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1314,6 +1296,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1359,7 +1342,6 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1623,6 +1605,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1668,7 +1651,6 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -1932,6 +1914,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1977,7 +1960,6 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
@@ -2241,6 +2223,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -2286,7 +2269,6 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
