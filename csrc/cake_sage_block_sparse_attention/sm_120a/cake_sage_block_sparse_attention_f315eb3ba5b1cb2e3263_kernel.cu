@@ -29,6 +29,11 @@ typedef short int int16_t;
 struct __align__(128) CakeTensorMap {
   uint64_t opaque[16];
 };
+struct __align__(64) CakeTensorMap64 {
+  uint64_t opaque[16];
+};
+static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 template <int N>
 struct __align__(128) CakeTensorMapPack {
   CakeTensorMap maps[N];
@@ -75,7 +80,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 128
 #define HAS_BLOCK_NUMS 0
 #define BLOCK_SIZES_MODE 0
-#define FULL_K64_TILES 0
+#define FULL_K64_TILES 1
 #define UNIFORM_NONEMPTY 1
 #define CONTIGUOUS_BLOCK_INDICES 1
 
@@ -129,37 +134,106 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
   return token;
 }
 
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
+// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
+// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+  uint32_t ticks = 0x989680;
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
       "LAB_WAIT:\n\t"
       "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
+      " P1, [%0], %1, %2;\n\t"
       "@P1 bra.uni DONE;\n\t"
       "bra.uni LAB_WAIT;\n\t"
       "DONE:\n\t"
       "}\n" ::"r"(mbar_addr),
-      "r"(phase)
+      "r"(phase), "r"(ticks)
+      : "memory");
+}
+
+// Exact source ports may request the PTX suspendTimeHint operand explicitly.
+// The hint is expressed in nanoseconds and is kept separate from the canonical
+// no-hint CTA helper so unrelated schedules retain their existing retry path.
+__device__ __forceinline__ void mbarrier_wait_suspend(int mbar_addr, int phase,
+                                                      uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_SUSPEND:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra.uni DONE_SUSPEND;\n\t"
+      "bra.uni LAB_WAIT_SUSPEND;\n\t"
+      "DONE_SUSPEND:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
       : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-  uint32_t ticks = 0x989680;
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
       "LAB_WAIT_CLUSTER:\n\t"
       "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-      " P1, [%0], %1, %2;\n\t"
+      " P1, [%0], %1;\n\t"
       "@P1 bra.uni DONE_CLUSTER;\n\t"
       "bra.uni LAB_WAIT_CLUSTER;\n\t"
       "DONE_CLUSTER:\n\t"
       "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(ticks)
+      "r"(phase)
+      : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_hint(int mbar_addr, int phase,
+                                                   uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      ".reg .u32 WAIT_ADDR;\n\t"
+      "mov.u32 WAIT_ADDR, %0;\n\t"
+      "LAB_WAIT_HINT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+      " P1, [WAIT_ADDR], %1, %2;\n\t"
+      "@P1 bra.uni DONE_HINT;\n\t"
+      "bra.uni LAB_WAIT_HINT;\n\t"
+      "DONE_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
+      : "memory");
+}
+
+// Exact unqualified CTA wait used by source schedules whose PTX intentionally
+// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(int mbar_addr, int phase,
+                                                           uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_RELAXED_HINT:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra DONE_RELAXED_HINT;\n\t"
+      "bra LAB_WAIT_RELAXED_HINT;\n\t"
+      "DONE_RELAXED_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint));
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(int mbar_addr, int phase,
+                                                           uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_CLUSTER_HINT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+      "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+      "DONE_CLUSTER_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
       : "memory");
 }
 
@@ -169,10 +243,33 @@ __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, ui
   }
 }
 
+__device__ __forceinline__ void mbarrier_wait_token_suspend(int mbar_addr, int phase,
+                                                            uint32_t token,
+                                                            uint32_t suspend_time_hint) {
+  if (token == 0) {
+    mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
+  }
+}
+
 __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase,
                                                             uint32_t token) {
   if (token == 0) {
     mbarrier_wait_cluster(mbar_addr, phase);
+  }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_hint(int mbar_addr, int phase, uint32_t token,
+                                                         uint32_t suspend_time_hint) {
+  if (token == 0) {
+    mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
+  }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(int mbar_addr, int phase,
+                                                                 uint32_t token,
+                                                                 uint32_t suspend_time_hint) {
+  if (token == 0) {
+    mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
   }
 }
 
@@ -248,15 +345,16 @@ __device__ __forceinline__ void tma_store_5d(const void* tmap, int x, int y, int
 extern "C" {
 
 __global__
-__launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e52ef5d5e924(
+__launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_f315eb3ba5b1cb2e3263(
     CakeTensorMap const* Q_map, CakeTensorMap const* K_map, CakeTensorMap const* V_map,
     CakeTensorMap const* O_map, float* __restrict__ q_scale, float* __restrict__ k_scale,
     float* __restrict__ v_scale, int* __restrict__ q2k_block_index,
     int* __restrict__ q2k_block_nums, int* __restrict__ block_sizes, int seqlen_q, int seqlen_k,
     int num_heads, int q2k_capacity, int num_k_blocks, int block_sparse_num, float softmax_scale) {
   const int tid = threadIdx.x;
-  const int warp = make_warp_uniform(tid / 32);
-  const int lane = tid % 32;
+  const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+  uint32_t lane;
+  asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
   extern __shared__ __align__(1024) char smem_raw[];
   int smem;
@@ -293,7 +391,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   __nv_bfloat16* o_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
   const int o_smem_addr = smem + 1024;
 
-  // Mbarrier init (3 groups, 3 barriers)
+  // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 3 barriers)
   // Mbarriers at smem_raw[0..24)
 
   if (tid == 0) {
@@ -389,7 +487,8 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       output[feature * 8 + elem] = 0.0f;
     }
   }
-  int q_scale_index = q_base / 128 * 4 + (q_base % 128 + warp * 16) / 32;
+  int q_scale_index =
+      (unsigned int)(q_base / 128 * 4) + ((unsigned int)(q_base % 128) + warp * 16) / 32;
   int q_scale_base = (batch * num_heads + head) * ((seqlen_q + 127) / 128 * 4);
   float q_scale_lane = 0.0f;
   if (lane == 0) {
@@ -806,22 +905,6 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
     float k_scale_value = _shfl_2;
     float score_scale_log2 = q_softmax_log2 * k_scale_value;
     int valid_tokens = 64;
-    {
-      valid_tokens = seqlen_k - current_physical * 64;
-      if (valid_tokens > 64) {
-        valid_tokens = 64;
-      }
-      if (valid_tokens < 0) {
-        valid_tokens = 0;
-      }
-      {
-        {
-        }
-      }
-      if (valid_tokens < 0) {
-        valid_tokens = 0;
-      }
-    }
     int preload_count = load_count + 1;
     int next_physical = 0;
     if (preload_count < selected_count) {
@@ -2032,7 +2115,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   float total_0 = row_sum[1];
   float _rcp_1 = approx_rcp(((total_0 != 0.0f && total_0 == total_0) ? total_0 : 1.0f));
   reciprocal[1] = _rcp_1;
-  unsigned int scale_base = v_scale_base + lane % 4 * 2;
+  unsigned int scale_base = (unsigned int)v_scale_base + lane % 4 * 2;
   float _vec_load_0[2];
   {
     float2 _v2_8 = *reinterpret_cast<const float2*>(v_scale + scale_base);
@@ -2065,9 +2148,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
     packed[_lp] = *(uint32_t*)&_bf2;
   }
   uint32_t _stmatrix_addr_10 = static_cast<uint32_t>(
-      o_smem_addr + (unsigned int)((lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                                    (lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                                   16));
+      o_smem_addr + (lane / 16 / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+                     (unsigned int)((lane / 16 % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+                        16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_10),
       "r"(*reinterpret_cast<const uint32_t*>(&packed[0])),
@@ -2075,7 +2158,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed[3]))
       : "memory");
-  unsigned int scale_base_1 = v_scale_base + 16 + lane % 4 * 2;
+  unsigned int scale_base_1 = (unsigned int)(v_scale_base + 16) + lane % 4 * 2;
   float _vec_load_2[2];
   {
     float2 _v2_11 = *reinterpret_cast<const float2*>(v_scale + scale_base_1);
@@ -2109,9 +2192,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_13 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((2 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((2 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_13),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_6[0])),
@@ -2119,7 +2202,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed_6[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_6[3]))
       : "memory");
-  unsigned int scale_base_7 = v_scale_base + 32 + lane % 4 * 2;
+  unsigned int scale_base_7 = (unsigned int)(v_scale_base + 32) + lane % 4 * 2;
   float _vec_load_4[2];
   {
     float2 _v2_14 = *reinterpret_cast<const float2*>(v_scale + scale_base_7);
@@ -2153,9 +2236,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_16 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((4 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((4 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_16),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_12[0])),
@@ -2163,7 +2246,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed_12[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_12[3]))
       : "memory");
-  unsigned int scale_base_13 = v_scale_base + 48 + lane % 4 * 2;
+  unsigned int scale_base_13 = (unsigned int)(v_scale_base + 48) + lane % 4 * 2;
   float _vec_load_6[2];
   {
     float2 _v2_17 = *reinterpret_cast<const float2*>(v_scale + scale_base_13);
@@ -2197,9 +2280,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_19 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((6 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((6 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_19),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_18[0])),
@@ -2207,7 +2290,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed_18[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_18[3]))
       : "memory");
-  unsigned int scale_base_19 = v_scale_base + 64 + lane % 4 * 2;
+  unsigned int scale_base_19 = (unsigned int)(v_scale_base + 64) + lane % 4 * 2;
   float _vec_load_8[2];
   {
     float2 _v2_20 = *reinterpret_cast<const float2*>(v_scale + scale_base_19);
@@ -2241,9 +2324,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_22 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((8 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((8 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_22),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_24[0])),
@@ -2251,7 +2334,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed_24[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_24[3]))
       : "memory");
-  unsigned int scale_base_25 = v_scale_base + 80 + lane % 4 * 2;
+  unsigned int scale_base_25 = (unsigned int)(v_scale_base + 80) + lane % 4 * 2;
   float _vec_load_10[2];
   {
     float2 _v2_23 = *reinterpret_cast<const float2*>(v_scale + scale_base_25);
@@ -2285,9 +2368,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_25 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((10 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((10 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_25),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_30[0])),
@@ -2295,7 +2378,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed_30[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_30[3]))
       : "memory");
-  unsigned int scale_base_31 = v_scale_base + 96 + lane % 4 * 2;
+  unsigned int scale_base_31 = (unsigned int)(v_scale_base + 96) + lane % 4 * 2;
   float _vec_load_12[2];
   {
     float2 _v2_26 = *reinterpret_cast<const float2*>(v_scale + scale_base_31);
@@ -2329,9 +2412,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_28 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((12 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((12 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_28),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_36[0])),
@@ -2339,7 +2422,7 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
       "r"(*reinterpret_cast<const uint32_t*>(&packed_36[2])),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_36[3]))
       : "memory");
-  unsigned int scale_base_37 = v_scale_base + 112 + lane % 4 * 2;
+  unsigned int scale_base_37 = (unsigned int)(v_scale_base + 112) + lane % 4 * 2;
   float _vec_load_14[2];
   {
     float2 _v2_29 = *reinterpret_cast<const float2*>(v_scale + scale_base_37);
@@ -2373,9 +2456,9 @@ __launch_bounds__(128, 3) void kernel_cake_sage_block_sparse_attention_2c6e4042e
   }
   uint32_t _stmatrix_addr_31 = static_cast<uint32_t>(
       o_smem_addr +
-      (unsigned int)(((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
-                      ((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16) *
-                     16));
+      ((14 + lane / 16) / 8 * 512 + (warp * 16 + lane % 16) * 8 +
+       (unsigned int)(((14 + lane / 16) % 8 * 16 ^ (warp * 16 + lane % 16 & 7) << 4) / 16)) *
+          16);
   asm volatile(
       "stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"r"(_stmatrix_addr_31),
       "r"(*reinterpret_cast<const uint32_t*>(&packed_42[0])),

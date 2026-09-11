@@ -586,7 +586,11 @@ def bsa_attn_sm120_blk64_sage_fwd(
         Caller-owned contiguous BF16 output with shape ``[B, H, Sq, 128]``.
     tma_descriptor_workspace : torch.Tensor
         Caller-owned contiguous CUDA uint8 workspace, aligned to 128 bytes
-        and large enough for the selected generated kernel.
+        and large enough for the selected generated kernel. This is mutable
+        scratch: descriptors are refreshed on the current stream on every
+        call and CUDA Graph replay. Keep the workspace and captured tensors
+        alive while in use, and order reuse of the same workspace across
+        streams. Initialize the JIT module before CUDA Graph capture.
     uniform_block_count : bool
         Whether every query block uses ``block_sparse_num`` selected blocks.
         This is a caller-provided guarantee: when true, ``q2k_block_nums``
@@ -604,6 +608,16 @@ def bsa_attn_sm120_blk64_sage_fwd(
     -------
     torch.Tensor
         The caller-owned ``out`` tensor after attention output is written.
+
+    Notes
+    -----
+    Non-contiguous indices support both per-row ``q2k_block_nums`` and the
+    scalar ``block_sparse_num`` count, with every supported ``block_sizes``
+    layout and with aligned or partial final KV blocks. Omitting
+    ``q2k_block_nums`` uses the scalar count even when
+    ``uniform_block_count=False``. Setting ``uniform_block_count=True``
+    uses the scalar count and ignores any supplied per-row counts. A row
+    selecting zero blocks produces an exactly zero output.
     """
     if backend != "cake":
         raise ValueError(f"unsupported SM120 Sage backend: {backend!r}")
