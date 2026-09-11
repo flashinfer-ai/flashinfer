@@ -17,7 +17,12 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 
-typedef CUtensorMap FlashInferTensorMap;
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
+
+// Keep the exported descriptor ABI independent of the CUDA header alignment.
+struct alignas(128) FlashInferTensorMap {
+  CUtensorMap value;
+};
 static_assert(sizeof(FlashInferTensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
 static_assert(alignof(FlashInferTensorMap) == 128,
               "CUtensorMap ABI alignment must remain 128 bytes");

@@ -49,7 +49,15 @@ constexpr int32_t kNativeTmaK = 256;
 constexpr int32_t kSplitReduceThreads = 128;
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
-static_assert(alignof(CUtensorMap) == 128, "CUtensorMap ABI alignment must remain 128 bytes");
+
+// Keep the exported descriptor ABI independent of the CUDA header alignment.
+struct alignas(128) FlashInferTensorMap {
+  CUtensorMap value;
+};
+
+static_assert(sizeof(FlashInferTensorMap) == 128, "Tensor map ABI size must remain 128 bytes");
+static_assert(alignof(FlashInferTensorMap) == 128,
+              "Tensor map ABI alignment must remain 128 bytes");
 
 struct Problem {
   int32_t m;
@@ -205,7 +213,8 @@ struct TmaDeviceArena {
 // The generated bundle uses the pointer TMA ABI. Descriptor slots are
 // immutable for process lifetime, so concurrent streams never observe a
 // descriptor being rewritten while a prior launch is still in flight.
-inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id, cudaStream_t stream) {
+inline void* TmaDeviceSlot(const FlashInferTensorMap& tensor_map, int32_t device_id,
+                           cudaStream_t stream) {
   static std::mutex mutex;
   static auto* slots = new std::unordered_map<std::string, void*>();
   static auto* arenas = new std::unordered_map<CUcontext, TmaDeviceArena>();
@@ -220,7 +229,7 @@ inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id, cud
 
   std::string key = std::to_string(reinterpret_cast<uintptr_t>(context));
   key.push_back(':');
-  key.append(reinterpret_cast<const char*>(&tensor_map), sizeof(CUtensorMap));
+  key.append(reinterpret_cast<const char*>(&tensor_map), sizeof(FlashInferTensorMap));
   std::lock_guard<std::mutex> lock(mutex);
   const auto found = slots->find(key);
   if (found != slots->end()) {
@@ -239,14 +248,15 @@ inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id, cud
       << "the immutable TMA descriptor arena is exhausted";
   if (arena.used % TmaDeviceArena::kSlotsPerChunk == 0) {
     CUdeviceptr chunk = 0;
-    CheckCudaResult(cuMemAlloc(&chunk, TmaDeviceArena::kSlotsPerChunk * sizeof(CUtensorMap)),
-                    "cuMemAlloc(TMA descriptor arena)");
+    CheckCudaResult(
+        cuMemAlloc(&chunk, TmaDeviceArena::kSlotsPerChunk * sizeof(FlashInferTensorMap)),
+        "cuMemAlloc(TMA descriptor arena)");
     arena.chunks.push_back(chunk);
   }
   const size_t chunk_index = arena.used / TmaDeviceArena::kSlotsPerChunk;
   const size_t slot_index = arena.used % TmaDeviceArena::kSlotsPerChunk;
-  const CUdeviceptr slot = arena.chunks[chunk_index] + slot_index * sizeof(CUtensorMap);
-  CheckCudaResult(cuMemcpyHtoD(slot, &tensor_map, sizeof(CUtensorMap)),
+  const CUdeviceptr slot = arena.chunks[chunk_index] + slot_index * sizeof(FlashInferTensorMap);
+  CheckCudaResult(cuMemcpyHtoD(slot, &tensor_map, sizeof(FlashInferTensorMap)),
                   "cuMemcpyHtoD(TMA descriptor)");
   ++arena.used;
   void* pointer = reinterpret_cast<void*>(static_cast<uintptr_t>(slot));
@@ -254,10 +264,10 @@ inline void* TmaDeviceSlot(const CUtensorMap& tensor_map, int32_t device_id, cud
   return pointer;
 }
 
-inline CUtensorMap EncodeTma2D(const TensorView& tensor, CUtensorMapDataType data_type,
-                               uint32_t element_bytes, uint32_t box_x, uint32_t box_y,
-                               CUtensorMapSwizzle swizzle, bool allow_oob_x, bool allow_oob_y,
-                               const char* name) {
+inline FlashInferTensorMap EncodeTma2D(const TensorView& tensor, CUtensorMapDataType data_type,
+                                       uint32_t element_bytes, uint32_t box_x, uint32_t box_y,
+                                       CUtensorMapSwizzle swizzle, bool allow_oob_x,
+                                       bool allow_oob_y, const char* name) {
   TVM_FFI_CHECK(tensor.ndim() == 2 && tensor.stride(1) == 1, ValueError)
       << name << " must be a contiguous rank-2 TMA source";
   const uint64_t global_dim[2] = {static_cast<uint64_t>(tensor.size(1)),
@@ -268,9 +278,9 @@ inline CUtensorMap EncodeTma2D(const TensorView& tensor, CUtensorMapDataType dat
       << "TMA box exceeds " << name << " without an out-of-bounds-enabled axis";
   const uint32_t box_dim[2] = {box_x, box_y};
   const uint32_t element_strides[2] = {1u, 1u};
-  CUtensorMap tensor_map{};
+  FlashInferTensorMap tensor_map{};
   const CUresult result = cuTensorMapEncodeTiled(
-      &tensor_map, data_type, 2, tensor.data_ptr(), global_dim, global_strides, box_dim,
+      &tensor_map.value, data_type, 2, tensor.data_ptr(), global_dim, global_strides, box_dim,
       element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
@@ -278,18 +288,19 @@ inline CUtensorMap EncodeTma2D(const TensorView& tensor, CUtensorMapDataType dat
   return tensor_map;
 }
 
-inline CUtensorMap EncodeWarpA3D(const TensorView& a, uint32_t tile_m) {
+inline FlashInferTensorMap EncodeWarpA3D(const TensorView& a, uint32_t tile_m) {
   TVM_FFI_CHECK(a.size(1) % 64 == 0, ValueError) << "warp A descriptor requires K divisible by 64";
   const uint64_t global_dim[3] = {64u, static_cast<uint64_t>(a.size(0)),
                                   static_cast<uint64_t>(a.size(1) / 64)};
   const uint64_t global_strides[2] = {static_cast<uint64_t>(a.stride(0)) * 2u, 64u * 2u};
   const uint32_t box_dim[3] = {64u, tile_m, 2u};
   const uint32_t element_strides[3] = {1u, 1u, 1u};
-  CUtensorMap tensor_map{};
-  const CUresult result = cuTensorMapEncodeTiled(
-      &tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, a.data_ptr(), global_dim, global_strides,
-      box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  FlashInferTensorMap tensor_map{};
+  const CUresult result =
+      cuTensorMapEncodeTiled(&tensor_map.value, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, a.data_ptr(),
+                             global_dim, global_strides, box_dim, element_strides,
+                             CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                             CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled failed for warp A: CUresult=" << static_cast<int>(result);
   return tensor_map;
@@ -438,13 +449,13 @@ inline void LaunchBase(const Problem& problem, const TensorView& a, const Tensor
   const int64_t grid_n = CeilDiv(problem.n, kTileN);
   const bool flat_grid = grid_m > 65535;
 
-  CUtensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
-                                  CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
+  FlashInferTensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
+                                          CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
   void* p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
   void* p_b = b.data_ptr();
   void* p_b_descale = b_descale.data_ptr();
-  CUtensorMap b_map{};
-  CUtensorMap b_descale_map{};
+  FlashInferTensorMap b_map{};
+  FlashInferTensorMap b_descale_map{};
   if (!cp_async) {
     if (problem.tiled) {
       b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_INT32, 4u, 128u, 4u,
@@ -489,12 +500,13 @@ inline void LaunchBase(const Problem& problem, const TensorView& a, const Tensor
 inline void LaunchGroupM128(const Problem& problem, const TensorView& a, const TensorView& b,
                             const TensorView& b_descale, const TensorView& alpha,
                             const TensorView& out, bool enable_pdl, cudaStream_t stream) {
-  CUtensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 128u,
-                                  CU_TENSOR_MAP_SWIZZLE_128B, false, false, "a");
-  CUtensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
-                                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
-  CUtensorMap b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
-                                          CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
+  FlashInferTensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 128u,
+                                          CU_TENSOR_MAP_SWIZZLE_128B, false, false, "a");
+  FlashInferTensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
+                                          CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
+  FlashInferTensorMap b_descale_map =
+      EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
+                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
   void* p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
   void* p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
   void* p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
@@ -522,19 +534,23 @@ inline void LaunchWarp(const Problem& problem, const TensorView& a, const Tensor
   void* p_b_descale = b_descale.data_ptr();
   void* p_out = out.data_ptr();
   if (!spec.raw_pointer_abi) {
-    CUtensorMap a_map = short_k ? EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, tile_k, 16u,
-                                              CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "a")
-                                : EncodeWarpA3D(a, tile_m);
-    CUtensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_INT32, 4u, 128u, tile_k / 16u,
-                                    CU_TENSOR_MAP_SWIZZLE_NONE, false, !short_k, "b");
-    CUtensorMap out_map = EncodeTma2D(out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, tile_m,
-                                      CU_TENSOR_MAP_SWIZZLE_128B, true, true, "out");
+    FlashInferTensorMap a_map = short_k
+                                    ? EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, tile_k,
+                                                  16u, CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "a")
+                                    : EncodeWarpA3D(a, tile_m);
+    FlashInferTensorMap b_map =
+        EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_INT32, 4u, 128u, tile_k / 16u,
+                    CU_TENSOR_MAP_SWIZZLE_NONE, false, !short_k, "b");
+    FlashInferTensorMap out_map =
+        EncodeTma2D(out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, tile_m,
+                    CU_TENSOR_MAP_SWIZZLE_128B, true, true, "out");
     p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
     p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
     p_out = TmaDeviceSlot(out_map, out.device().device_id, stream);
     if (!short_k) {
-      CUtensorMap b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 64u, 8u,
-                                              CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b_descale");
+      FlashInferTensorMap b_descale_map =
+          EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 64u, 8u,
+                      CU_TENSOR_MAP_SWIZZLE_NONE, false, true, "b_descale");
       p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
     }
   }
@@ -611,12 +627,13 @@ inline void* SplitWorkspace(const Problem& problem, cudaStream_t stream) {
 inline void LaunchSplitK2(const Problem& problem, const TensorView& a, const TensorView& b,
                           const TensorView& b_descale, const TensorView& alpha,
                           const TensorView& out, bool enable_pdl, cudaStream_t stream) {
-  CUtensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
-                                  CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
-  CUtensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
-                                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
-  CUtensorMap b_descale_map = EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
-                                          CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
+  FlashInferTensorMap a_map = EncodeTma2D(a, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2u, 64u, 16u,
+                                          CU_TENSOR_MAP_SWIZZLE_128B, true, true, "a");
+  FlashInferTensorMap b_map = EncodeTma2D(b, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 32u, 64u,
+                                          CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b");
+  FlashInferTensorMap b_descale_map =
+      EncodeTma2D(b_descale, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1u, 16u, 64u,
+                  CU_TENSOR_MAP_SWIZZLE_NONE, false, false, "b_descale");
   void* p_a = TmaDeviceSlot(a_map, a.device().device_id, stream);
   void* p_b = TmaDeviceSlot(b_map, b.device().device_id, stream);
   void* p_b_descale = TmaDeviceSlot(b_descale_map, b_descale.device().device_id, stream);
