@@ -326,6 +326,8 @@ validate the stream used by an external replay.
 Successful ``plan()`` starts a new stream-binding lifecycle; a failed plan
 preserves the previous binding.  Before replanning on another stream, finish
 the old updates and replays, then recapture ``run()`` for the new plan.
+If that replan fails, the old bound stream waits for rollback before subsequent
+updates or replay; this device-side dependency does not block the host.
 ``plan()`` rejects a stream switch while the bound stream reports pending work,
 using a nonblocking stream query before snapshotting or changing graph buffers.
 Staging-slot events alone do not establish completion of publication or replay.

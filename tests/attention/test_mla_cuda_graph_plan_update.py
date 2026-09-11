@@ -4,6 +4,7 @@ import ctypes
 import importlib
 import inspect
 import re
+import time
 from contextlib import nullcontext
 from types import ModuleType
 from threading import Event
@@ -969,34 +970,77 @@ def test_real_generated_capture_update_replay_uses_lean_state(
     replacement_indices = torch.tensor([0, 1], dtype=torch.int32)
     replacement_lengths = torch.tensor([1, 1], dtype=torch.int32)
 
+    from cuda.bindings import runtime
+
+    rollback_release = Event()
+    rollback_expired = Event()
+
+    @ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+    def hold_rollback(_):
+        if not rollback_release.wait(timeout=10):
+            rollback_expired.set()
+
     def fail_update_state_init(**kwargs):
         # Prove this is the late failure path, after backend.plan staged CSR.
         assert torch.equal(qo_indptr_buf.cpu(), initial_qo)
         assert torch.equal(kv_indptr_buf.cpu(), replacement_kv)
         assert torch.equal(kv_indices_buf[:2].cpu(), replacement_indices)
+        if failed_plan_stream != stream:
+            # Hold restoration after live CSR changed, without making the
+            # original stream busy when plan() checks it at entry.
+            (error,) = runtime.cudaLaunchHostFunc(
+                failed_plan_stream.cuda_stream,
+                ctypes.cast(hold_rollback, ctypes.c_void_p).value,
+                0,
+            )
+            assert error == runtime.cudaError_t.cudaSuccess
         raise RuntimeError("synthetic update state initialization failure")
 
-    stream.wait_stream(torch.cuda.current_stream(device))
-    with monkeypatch.context() as patch, torch.cuda.stream(stream):
-        patch.setattr(
-            fa_common,
-            "_make_mla_cuda_graph_plan_update_state",
-            fail_update_state_init,
-        )
-        with pytest.raises(RuntimeError, match="update state initialization failure"):
-            wrapper.plan(
-                metadata=MLAPlanMetadata.csr(
-                    initial_qo, replacement_kv, replacement_indices, replacement_lengths
-                ),
-                **plan_kwargs,
-            )
-        graph.replay()
-    stream.synchronize()
-    assert wrapper._planned_backend is backend_before
-    assert wrapper._cuda_graph_plan_update_stream == stream.cuda_stream
-    for tensor, snapshot in zip(live_tensors, live_snapshots, strict=True):
-        assert torch.equal(tensor, snapshot)
-    torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
+    for failed_plan_stream in (stream, torch.cuda.Stream()):
+        failed_plan_stream.wait_stream(torch.cuda.current_stream(device))
+        replay_done = torch.cuda.Event()
+        try:
+            with monkeypatch.context() as patch, torch.cuda.stream(failed_plan_stream):
+                patch.setattr(
+                    fa_common,
+                    "_make_mla_cuda_graph_plan_update_state",
+                    fail_update_state_init,
+                )
+                with pytest.raises(
+                    RuntimeError, match="update state initialization failure"
+                ):
+                    wrapper.plan(
+                        metadata=MLAPlanMetadata.csr(
+                            initial_qo,
+                            replacement_kv,
+                            replacement_indices,
+                            replacement_lengths,
+                        ),
+                        **plan_kwargs,
+                    )
+            with torch.cuda.stream(stream):
+                graph.replay()
+                replay_done.record()
+            if failed_plan_stream != stream:
+                # Observe a real replay completion event, not a host callback
+                # that CUDA may serialize with the gate on the other stream.
+                deadline = time.monotonic() + 1.0
+                while not replay_done.query() and time.monotonic() < deadline:
+                    rollback_release.wait(timeout=0.001)
+                assert not replay_done.query(), (
+                    "old-stream replay completed before cross-stream rollback"
+                )
+        finally:
+            rollback_release.set()
+            failed_plan_stream.synchronize()
+            stream.synchronize()
+        assert not rollback_expired.is_set(), "rollback gate timed out"
+        rollback_release.clear()
+        assert wrapper._planned_backend is backend_before
+        assert wrapper._cuda_graph_plan_update_stream == stream.cuda_stream
+        for tensor, snapshot in zip(live_tensors, live_snapshots, strict=True):
+            assert torch.equal(tensor, snapshot)
+        torch.testing.assert_close(out, committed_output, rtol=1e-3, atol=1e-3)
 
     for slot in backend_before._cuda_graph_plan_update_state.slots:
         slot.completion_event = _RecordFailureEvent()
@@ -1046,8 +1090,6 @@ def test_real_generated_capture_update_replay_uses_lean_state(
     # A completed staging event does not cover later publication or replay.
     # Block a real replay after all slot events completed and require a replan
     # on another stream to reject before even snapshotting the shared buffers.
-    from cuda.bindings import runtime
-
     current_backend = wrapper._planned_backend
     current_state = current_backend._cuda_graph_plan_update_state
     assert all(slot.completion_event.query() for slot in current_state.slots)
