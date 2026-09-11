@@ -388,6 +388,11 @@ inline bool dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size, 
 #undef DISPATCH_DOTS3_SWA_SG
 }
 
+// Dispatch a DSV4 single-cache sparse-MLA prefill to a pre-built kernel
+// instantiation. The cache must use 64-token pages; num_heads (8-128) folds
+// into 1-2 head groups and the compute mode follows the candidate count.
+// Returns false when the configuration has no instantiation so the caller
+// can fall back.
 inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, const bf16* Q,
                                  const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
