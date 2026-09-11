@@ -157,26 +157,24 @@ class _Bf16TokenComm(TokenInPullTokenBackPush):
                     v_for_min = remaining_lane
                 length = Int32(cute.arch.warp_redux_sync(v_for_min, "min"))
 
-                if num_active_ranks > Int32(0):
-                    num_round_tokens = length * num_active_ranks
-                    if slot_idx < num_round_tokens:
-                        slot_idx_in_round = slot_idx % num_active_ranks
-                        current_rank_in_expert_idx = fns_b32(
-                            Int32(mask),
-                            Int32(0),
-                            slot_idx_in_round + Int32(1),
-                        )
-                        token_idx_in_rank = offset + (slot_idx // num_active_ranks)
-                        decided = Int32(1)
-                    else:
-                        slot_idx = slot_idx - num_round_tokens
-                        offset = offset + length
-                        if remaining_lane > length:
-                            remaining_lane = remaining_lane - length
-                        else:
-                            remaining_lane = Int32(0)
-                else:
+                # A valid remaining slot always has an active source rank.
+                num_round_tokens = length * num_active_ranks
+                if slot_idx < num_round_tokens:
+                    slot_idx_in_round = slot_idx % num_active_ranks
+                    current_rank_in_expert_idx = fns_b32(
+                        Int32(mask),
+                        Int32(0),
+                        slot_idx_in_round + Int32(1),
+                    )
+                    token_idx_in_rank = offset + (slot_idx // num_active_ranks)
                     decided = Int32(1)
+                else:
+                    slot_idx = slot_idx - num_round_tokens
+                    offset = offset + length
+                    if remaining_lane > length:
+                        remaining_lane = remaining_lane - length
+                    else:
+                        remaining_lane = Int32(0)
 
             if _iket_pull_emit:
                 _iket.range_pop()  # Pull.ChooseToken
@@ -197,6 +195,11 @@ class _Bf16TokenComm(TokenInPullTokenBackPush):
             )
             inp_tok_local_base = input_token_buffer.iterator.toint()
             inp_w_local_base = input_topk_weights_buffer.iterator.toint()
+
+            # Mapping and tracker bookkeeping can overlap the preceding store's
+            # SMEM read. Complete that read only before overwriting its buffer.
+            if cutlass.const_expr(self._flag_batch > 1):
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
             with cute.arch.elect_one():
                 pull_buffer_warp_ptr = pull_buffer_ptr + (
@@ -276,9 +279,8 @@ class _Bf16TokenComm(TokenInPullTokenBackPush):
                 cute.arch.cp_async_bulk_commit_group()
                 fc1_input_topk_weights_buffer[pool_token_idx] = weight
 
-            # All lanes wait so the issuing thread is always included.
-            # Publication requires completed writes; other iterations only
-            # release the SMEM buffer for the next token's pull.
+            # Full batches require completed writes before publication. The
+            # next pull waits for partial-batch source reads before buffer reuse.
             if cutlass.const_expr(self._flag_batch == 1):
                 cute.arch.cp_async_bulk_wait_group(0)
                 cute.arch.sync_warp()
@@ -286,8 +288,6 @@ class _Bf16TokenComm(TokenInPullTokenBackPush):
                 if flag_tracker.cumulated_flags + Int32(1) == Int32(self._flag_batch):
                     cute.arch.cp_async_bulk_wait_group(0)
                     cute.arch.sync_warp()
-                else:
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
 
             if _iket_pull_emit:
                 _iket.range_pop()  # Pull.TMA_Store
