@@ -55,7 +55,7 @@ _KERNEL_ARGUMENT_NAMES = (
 )
 
 
-def test_source_bundle_has_exact_twelve_symbol_inventory() -> None:
+def test_source_bundle_has_exact_28_symbol_inventory() -> None:
     source_path, source = backend._load_source_bundle()
     manifest = json.loads((source_path.parent / "manifest.json").read_text())
     symbols = tuple(
@@ -66,9 +66,17 @@ def test_source_bundle_has_exact_twelve_symbol_inventory() -> None:
         )
     )
 
-    assert len(symbols) == 12
-    assert symbols == backend._KERNEL_SYMBOLS
+    assert len(symbols) == 28
+    assert symbols == (
+        backend._KERNEL_SYMBOLS
+        + backend._SM103_T1_KERNEL_SYMBOLS
+        + backend._SM100_WS8_MID_KERNEL_SYMBOLS
+    )
     assert manifest["kernel_symbols"] == list(backend._KERNEL_SYMBOLS)
+    assert manifest["sm103_t1_kernel_symbols"] == list(backend._SM103_T1_KERNEL_SYMBOLS)
+    assert manifest["sm100_ws8_mid_kernel_symbols"] == list(
+        backend._SM100_WS8_MID_KERNEL_SYMBOLS
+    )
     assert manifest["architectures"] == ["sm_100a", "sm_103a"]
     assert manifest["constraints"]["world_sizes"] == [2, 4, 8]
     assert manifest["constraints"]["max_lamport_comm_size_bytes"] == 2145386496
@@ -92,7 +100,8 @@ def test_host_exposes_only_reduction_and_has_exact_18_parameter_ffi() -> None:
     assert parameter_names == _FFI_PARAMETER_NAMES
     assert len(parameter_names) == 18
     assert exported_functions == ["run_reduction"]
-    assert source.count("CAKE_MOE_AR_LAUNCH_CASE(") == 13
+    # One macro definition plus the 28 physical kernel launch cases.
+    assert source.count("CAKE_MOE_AR_LAUNCH_CASE(") == 29
     assert "dtype_index * 6 + world_index * 2 + output_index" in source
 
 
