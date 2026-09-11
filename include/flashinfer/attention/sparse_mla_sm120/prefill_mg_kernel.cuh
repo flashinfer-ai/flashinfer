@@ -126,7 +126,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     static_assert(Cfg::BI < 64, "a BI=64 split tile should re-examine staging");
     int idx_rope_cur = 0, mask0_cur = 0, mask1_cur = 0;
     if (actual_ni > 0) {
-      idx_rope_cur = idx_base[qk_nb + gid];
+      idx_rope_cur = mask_idx_past_len(idx_base[qk_nb + gid], qk_nb + gid, topk_len);
       mask0_cur = idx_base[qk_nb + tid * 2];
       mask1_cur = idx_base[qk_nb + tid * 2 + 1];
     }
@@ -150,7 +150,8 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
       int idx_rope_nxt = 0, mask0_nxt = 0, mask1_nxt = 0;
       if (ti + 1 < actual_ni) {
         const int32_t* ibn = idx_base + (ti + 1) * Cfg::BI;
-        idx_rope_nxt = ibn[qk_nb + gid];
+        idx_rope_nxt =
+            mask_idx_past_len(ibn[qk_nb + gid], (ti + 1) * Cfg::BI + qk_nb + gid, topk_len);
         mask0_nxt = ibn[qk_nb + tid * 2];
         mask1_nxt = ibn[qk_nb + tid * 2 + 1];
       }
@@ -574,8 +575,13 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
 
     // This thread's candidate index for tile t, staged a tile ahead of use so
     // the index LDG latency is hidden behind the previous tile's gather.
+    // Bound by topk_len, not just actual_ni * BI: the last tile is partial and
+    // caller padding past topk_len may be stale, and a garbage index would
+    // gather a wild gmem address.
     auto load_idx = [&](int t) -> int {
-      return (t < actual_ni && io_tid < Cfg::BI) ? __ldg(idx_base + t * Cfg::BI + io_tid) : -1;
+      return (t < actual_ni && io_tid < Cfg::BI && t * Cfg::BI + io_tid < topk_len)
+                 ? __ldg(idx_base + t * Cfg::BI + io_tid)
+                 : -1;
     };
     // Scales first (plain stores, no mbar signal), then bulk gather
     // (cp.async.bulk signals mbar_kv on completion). Math warps wake on
@@ -679,7 +685,8 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       if (qk_warp) {
         uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
-        const int idx_rope = ib[qk_nb + gid];
+        const int idx_rope =
+            mask_idx_past_len(ib[qk_nb + gid], ti * Cfg::BI + qk_nb + gid, topk_len);
         const int mask0 = ib[qk_nb + tid * 2];
         const int mask1 = ib[qk_nb + tid * 2 + 1];
 
@@ -1019,8 +1026,9 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
         static_assert(Cfg::BI == BI && Cfg::MATH_WARPS == N_MATH_WARPS,
                       "xv_rope_mma is hardcoded to the 64/8 tile; parameterize it before running a "
                       "V_HAS_ROPE model at a different BI");
-        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib, KV_cache, mwarp, lane,
-                                         stride_kv_block, reinterpret_cast<bf16*>(sm.w_fp8));
+        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib,
+                                         min(Cfg::BI, topk_len - ti * Cfg::BI), KV_cache, mwarp,
+                                         lane, stride_kv_block, reinterpret_cast<bf16*>(sm.w_fp8));
       }
 
       bar_arrive_alt<1, 5, Cfg::BLOCK_THREADS>(ti & 1);
@@ -1257,15 +1265,21 @@ __device__ __forceinline__ void prefill_mg_impl(
     // This thread's candidate index for logical tile t, staged a tile ahead of
     // use so the index LDG latency is hidden behind the previous tile's
     // gather. main_ni equals NI under ASSUME_FULL_TILES, so the main/extra
-    // split needs no branch on the tile-length mode.
+    // split needs no branch on the tile-length mode. Lanes past the runtime
+    // topk length are masked out: the last tile is partial and caller padding
+    // may be stale, and a garbage index would gather a wild gmem address.
     auto load_idx = [&](int t) -> int {
       if (t >= loop_bound || io_tid >= BI) return -1;
       if constexpr (DUAL_CACHE) {
         const bool is_main = t < main_ni;
+        if (is_main ? (t * BI + io_tid >= topk_len)
+                    : ((t - main_ni) * BI + io_tid >= topk_len_extra)) {
+          return -1;
+        }
         const int32_t* p = is_main ? (idx_base + t * BI) : (idx_base_extra + (t - main_ni) * BI);
         return __ldg(p + io_tid);
       } else {
-        return __ldg(idx_base + t * BI + io_tid);
+        return (t * BI + io_tid < topk_len) ? __ldg(idx_base + t * BI + io_tid) : -1;
       }
     };
     // Scales first (plain stores, no mbar signal), then bulk gather
@@ -1400,7 +1414,10 @@ __device__ __forceinline__ void prefill_mg_impl(
       // Entry base: only gid's entry needed (rope prefetch + QK rope)
       const uint8_t* entry_base_gid;
       {
-        const int idx = ib[qk_nb + gid];
+        // Position and runtime length are phase-relative under dual cache.
+        const int phase_ti = (DUAL_CACHE && !is_main) ? (ti - main_ni) : ti;
+        const int len_now = (DUAL_CACHE && !is_main) ? topk_len_extra : topk_len;
+        const int idx = mask_idx_past_len(ib[qk_nb + gid], phase_ti * BI + qk_nb + gid, len_now);
         if constexpr (DUAL_CACHE) {
           if (is_main) {
             entry_base_gid =
@@ -1985,19 +2002,24 @@ __device__ __forceinline__ void prefill_mg_impl(
       // ── XV rope BF16 MMA (DSV4, both groups) ──────────────
       if constexpr (KV::V_HAS_ROPE) {
         bar_sync_t<2, MATH_THREADS>();
+        // Entries past the phase's runtime length carry stale caller padding;
+        // the rope reads re-derive gmem addresses from `ib`, so pass the bound.
+        const int valid_len = (DUAL_CACHE && !is_main)
+                                  ? min(BI, topk_len_extra - (ti - main_ni) * BI)
+                                  : min(BI, topk_len - ti * BI);
         if constexpr (DUAL_CACHE) {
           if (is_main) {
-            xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, w_grp, ib, kv_global, mwarp,
-                                                         lane, stride_kv_block_now,
+            xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, w_grp, ib, valid_len, kv_global,
+                                                         mwarp, lane, stride_kv_block_now,
                                                          reinterpret_cast<bf16*>(sm.w_fp8()));
           } else {
-            xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE_EXTRA, MG_N_HG>(acc_rope, w_grp, ib, kv_global,
-                                                               mwarp, lane, stride_kv_block_now,
-                                                               reinterpret_cast<bf16*>(sm.w_fp8()));
+            xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE_EXTRA, MG_N_HG>(
+                acc_rope, w_grp, ib, valid_len, kv_global, mwarp, lane, stride_kv_block_now,
+                reinterpret_cast<bf16*>(sm.w_fp8()));
           }
         } else {
-          xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, w_grp, ib, kv_global, mwarp, lane,
-                                                       stride_kv_block_now,
+          xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, w_grp, ib, valid_len, kv_global,
+                                                       mwarp, lane, stride_kv_block_now,
                                                        reinterpret_cast<bf16*>(sm.w_fp8()));
         }
       }
