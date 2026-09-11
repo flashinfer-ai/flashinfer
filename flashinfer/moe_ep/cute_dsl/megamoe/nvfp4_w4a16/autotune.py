@@ -100,7 +100,7 @@ def _autotune_knobs_impl(
 
 
 def w4a16_candidates() -> List[Dict[str, Any]]:
-    """Eight M256 W4A16 tactics with explicit scheduler depth 2.
+    """Four M256 W4A16 tactics with flag batch 4 and scheduler depth 2.
 
     Both geometries use two-CTA instructions and two dequantization warp
     groups. Explicit M128 configurations remain supported by the kernel.
@@ -113,13 +113,12 @@ def w4a16_candidates() -> List[Dict[str, Any]]:
             load_balance_mode="atomic_counter",
             mma_tiler_mnk=tile,
             use_2cta_instrs=True,
-            flag_batch=flag_batch,
+            flag_batch=4,
             token_back_mode=token_back,
             in_kernel_fc2_reduce=False,
             num_sched_stages=2,
         )
         for tile in ((256, 128, 256), (256, 64, 256))
-        for flag_batch in (4, 8)
         for token_back in ("epi_warps", "reuse_dispatch_warps")
     ]
 

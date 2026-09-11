@@ -88,8 +88,8 @@ With `knobs=None`, W4A16 loads a recorded winner or uses the built-in profile:
 `load_balance_mode="atomic_counter"`, and `token_back_mode="epi_warps"`.
 An explicit knob dictionary, including `{}`, preserves the existing manual
 configuration behavior instead of merging these defaults. `knobs="auto"`
-collectively tunes eight tactics on the first forward before graph capture:
-N64/N128, flag batches 4/8, and epilogue/reused-dispatch token return, all with
+collectively tunes four tactics on the first forward before graph capture:
+N64/N128 and epilogue/reused-dispatch token return, with flag batch 4 and
 two scheduler stages. Explicit configurations also support M128 outside the
 default autotune catalog.
 
