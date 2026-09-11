@@ -255,7 +255,7 @@ def testMxfp8Quantize(args):
         )
     if input_dtype == torch.float32 and "cuda" in backends:
         print("[INFO] cuda backend does not support float32 input for mxfp8_quantize")
-        backends.remove("cuda")
+        backends = [b for b in backends if b != "cuda"]
         if len(backends) == 0:
             print("[ERROR] No backends to test. Exiting.")
             return res

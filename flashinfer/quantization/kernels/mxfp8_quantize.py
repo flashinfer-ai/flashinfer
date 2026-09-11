@@ -1084,6 +1084,15 @@ def mxfp8_quantize_cute_dsl(
     else:
         input_padded = input.contiguous()
 
+    # The kernels use vectorized global loads: 128-bit (16B) for fp16/bf16 and
+    # 256-bit (32B) for fp32. `.contiguous()` preserves contiguous *views* with
+    # a storage offset (e.g. `pool[4:4 + m * k].view(m, k)`), whose data_ptr can
+    # be under-aligned and would fault the vector load. Materialize an aligned
+    # copy in that rare case (fresh torch allocations are 256B-aligned).
+    required_align = 32 if input.dtype == torch.float32 else 16
+    if input_padded.data_ptr() % required_align != 0:
+        input_padded = input_padded.clone(memory_format=torch.contiguous_format)
+
     dtype_key = _TORCH_DTYPE_KEY[input.dtype]
 
     # Cached device-specific target grid for grid size computation
