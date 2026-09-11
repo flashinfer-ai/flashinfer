@@ -7,7 +7,17 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
+from typing import (
+    Callable,
+    ClassVar,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import torch
 
@@ -125,9 +135,11 @@ class _BatchMLAGeneratedFaMechanics:
         kv_len_arr_buf: Optional[torch.Tensor],
         int_workspace_buffer: Optional[torch.Tensor] = None,
         pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
+        graph_plan_info: Optional[Sequence[int]] = None,
     ) -> None:
         self._backend = backend
         self._float_workspace_buffer = float_workspace_buffer
+        self._graph_plan_info = graph_plan_info
         self.device = float_workspace_buffer.device
         if int_workspace_buffer is None:
             int_workspace_buffer = torch.empty(
@@ -303,6 +315,13 @@ class _BatchMLAGeneratedFaMechanics:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
         kv_len_arr_host = kv_len_arr.to("cpu")
+        # A CUDA graph replays the kernel and grid of the plan it was captured
+        # with (MLAPlanInfo: num_blks_x first, cta_tile_q last), so a replan
+        # keeps them; 0 lets the planner choose.
+        graph_num_blks_x = graph_cta_tile_q = 0
+        if self._use_cuda_graph and self._graph_plan_info is not None:
+            graph_num_blks_x = int(self._graph_plan_info[0])
+            graph_cta_tile_q = int(self._graph_plan_info[-1])
         plan_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -313,6 +332,8 @@ class _BatchMLAGeneratedFaMechanics:
             num_heads,
             head_dim_ckv,
             causal,
+            graph_num_blks_x,
+            graph_cta_tile_q,
         )
         if hasattr(cached_module, "plan_with_staged_workspace_bytes"):
             plan_info, staged_int_workspace_bytes = (
@@ -513,6 +534,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         kv_split_widths: tuple[int, int],
         int_workspace_buffer: Optional[torch.Tensor] = None,
         pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
+        graph_plan_info: Optional[Sequence[int]] = None,
     ) -> None:
         if backend is None:
             if self._plan_capabilities is None:
@@ -528,6 +550,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             kv_len_arr_buf=kv_len_arr_buf,
             int_workspace_buffer=int_workspace_buffer,
             pin_memory_int_workspace_buffer=pin_memory_int_workspace_buffer,
+            graph_plan_info=graph_plan_info,
         )
         self._query_split_widths = query_split_widths
         self._kv_split_widths = kv_split_widths
@@ -571,6 +594,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
             kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
             int_workspace_buffer=args._graph_plan_int_workspace_buffer,
+            graph_plan_info=args._graph_plan_info,
         )
         if args._use_cuda_graph:
             backend._preflight_graph_metadata_buffers(

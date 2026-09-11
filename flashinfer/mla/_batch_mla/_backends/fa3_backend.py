@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 """
 
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Sequence
 
 import torch
 
@@ -39,6 +39,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAPagedAttentionFaBackendBase):
         kv_split_widths: tuple[int, int],
         int_workspace_buffer: Optional[torch.Tensor] = None,
         pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
+        graph_plan_info: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__(
             backend="fa3",
@@ -52,6 +53,7 @@ class _BatchMLAPagedAttentionFa3Backend(_BatchMLAPagedAttentionFaBackendBase):
             kv_split_widths=kv_split_widths,
             int_workspace_buffer=int_workspace_buffer,
             pin_memory_int_workspace_buffer=pin_memory_int_workspace_buffer,
+            graph_plan_info=graph_plan_info,
         )
 
     def plan(

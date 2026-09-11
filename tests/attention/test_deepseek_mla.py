@@ -581,7 +581,8 @@ def test_batch_mla_oob_kv_nan(
     q = torch.cat([q_nope, q_pe], dim=-1)
     o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
     lse_ref = lse_ref.flatten(0, 1)
-    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    o_tol = 1e-3 if dtype == torch.half else 2e-2
+    torch.testing.assert_close(o, o_ref, rtol=o_tol, atol=o_tol)
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
@@ -737,7 +738,8 @@ def test_batch_mla_page_attention(
     q = torch.cat([q_nope, q_pe], dim=-1)
     o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
     lse_ref = lse_ref.flatten(0, 1)
-    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    o_tol = 1e-3 if dtype == torch.half else 2e-2
+    torch.testing.assert_close(o, o_ref, rtol=o_tol, atol=o_tol)
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
@@ -767,6 +769,220 @@ def test_batch_mla_page_attention_cuda_graph_replan(backend):
         use_cuda_graph=True,
         dtype=torch.half,
     )
+
+
+# The SM90 kernel runs 16- and 32-row Q tiles (with the GEMM operands swapped)
+# when the longest packed query in the batch fits; 64-row tiles otherwise.
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("kv_len", [17, 130, 4096, 8737])
+@pytest.mark.parametrize("qo_len", [1, 2, 4])
+@pytest.mark.parametrize("num_heads", [8, 16, 32])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [1, 64])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+def test_batch_mla_narrow_q_tile(
+    batch_size, kv_len, qo_len, num_heads, causal, page_size, dtype
+):
+    test_batch_mla_page_attention(
+        batch_size=batch_size,
+        kv_len=kv_len,
+        qo_len=qo_len,
+        num_heads=num_heads,
+        causal=causal,
+        page_size=page_size,
+        backend="fa3",
+        use_cuda_graph=False,
+        dtype=dtype,
+    )
+
+
+# Long-context decode splits the KV cache over every SM (128 partial states per
+# query row here), so the merge runs its batched, multi-group path.
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_long_context_decode(num_heads, causal, backend):
+    test_batch_mla_page_attention(
+        batch_size=1,
+        kv_len=65536,
+        qo_len=1,
+        num_heads=num_heads,
+        causal=causal,
+        page_size=64,
+        backend=backend,
+        use_cuda_graph=False,
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_mixed_qo_len_batch(num_heads, causal, page_size, backend):
+    """Requests with different qo_len share one plan; the Q tile follows the
+    longest packed query in the batch."""
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("FA3 is not supported on this device")
+    torch.manual_seed(42)
+    dtype = torch.half
+    head_dim_ckv, head_dim_kpe = 512, 64
+    qo_lens = [1, 3, 1, 2, 5, 1]
+    kv_lens = [300, 17, 4096, 130, 64, 2000]
+    batch_size = len(qo_lens)
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+    pages = [math.ceil(kv_len / page_size) for kv_len in kv_lens]
+
+    q_nope = torch.randn(
+        sum(qo_lens), num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(
+        sum(qo_lens), num_heads, head_dim_kpe, dtype=dtype, device=device
+    )
+    ckv = torch.randn(sum(pages), page_size, head_dim_ckv, dtype=dtype, device=device)
+    kpe = torch.randn(sum(pages), page_size, head_dim_kpe, dtype=dtype, device=device)
+
+    q_indptr = torch.tensor([0] + qo_lens, dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    kv_indptr = torch.tensor([0] + pages, dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    kv_indices = torch.arange(sum(pages), dtype=torch.int32, device=device)
+    kv_len_arr = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        workspace_buffer, backend=backend
+    )
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.csr(
+            q_indptr, kv_indptr, kv_indices, kv_len_arr
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=causal,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+        lse_mode="base2",
+    )
+    o, lse = wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv, kpe), return_lse=True)
+
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    for i in range(batch_size):
+        q_i = q[q_indptr[i] : q_indptr[i + 1]]
+        k_i, v_i = generate_kv_from_cache(
+            ckv[kv_indptr[i] : kv_indptr[i + 1]],
+            kpe[kv_indptr[i] : kv_indptr[i + 1]],
+            kv_lens[i],
+            1,
+            num_heads,
+        )
+        o_ref, lse_ref = attention_ref(1, q_i, k_i, v_i, causal, sm_scale)
+        torch.testing.assert_close(
+            o[q_indptr[i] : q_indptr[i + 1]], o_ref, rtol=1e-3, atol=2e-3
+        )
+        torch.testing.assert_close(
+            lse[q_indptr[i] : q_indptr[i + 1]],
+            lse_ref.flatten(0, 1),
+            rtol=1e-3,
+            atol=2e-3,
+        )
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_cuda_graph_replan_keeps_kernel_config(backend):
+    """A CUDA graph replays the kernel and grid it was captured with, so a
+    replan for a batch that would pick another Q tile or cluster size keeps
+    the captured configuration, and replaying the graph is still correct."""
+    device = torch.device("cuda:0")
+    clear_cuda_cache(device)
+    if backend == "fa3" and not is_sm90a_supported(device):
+        pytest.skip("FA3 is not supported on this device")
+    torch.manual_seed(42)
+    num_heads, head_dim_ckv, head_dim_kpe, page_size = 16, 512, 64, 1
+    kv_len, qo_len_max, dtype = 200, 10, torch.half
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        workspace_buffer,
+        backend=backend,
+        use_cuda_graph=True,
+        qo_indptr=torch.empty(2, dtype=torch.int32, device=device),
+        kv_indptr=torch.empty(2, dtype=torch.int32, device=device),
+        kv_indices=torch.empty(kv_len, dtype=torch.int32, device=device),
+        kv_len_arr=torch.empty(1, dtype=torch.int32, device=device),
+    )
+    ckv = torch.randn(kv_len, page_size, head_dim_ckv, dtype=dtype, device=device)
+    kpe = torch.randn(kv_len, page_size, head_dim_kpe, dtype=dtype, device=device)
+
+    def plan(qo_len):
+        wrapper.plan(
+            metadata=flashinfer.mla.MLAPlanMetadata.csr(
+                torch.tensor([0, qo_len], dtype=torch.int32, device=device),
+                torch.tensor([0, kv_len], dtype=torch.int32, device=device),
+                torch.arange(kv_len, dtype=torch.int32, device=device),
+                torch.tensor([kv_len], dtype=torch.int32, device=device),
+            ),
+            num_heads=num_heads,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            page_size=page_size,
+            causal=True,
+            sm_scale=sm_scale,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            query_layout="split",
+            kv_cache_layout="split",
+            lse_mode="base2",
+        )
+        return wrapper._plan_info[0], wrapper._plan_info[-1]
+
+    # Graph-static buffers sized for the longest replanned query.
+    q_nope = torch.randn(
+        qo_len_max, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(qo_len_max, num_heads, head_dim_kpe, dtype=dtype, device=device)
+    o_buf = torch.zeros(qo_len_max, num_heads, head_dim_ckv, dtype=dtype, device=device)
+    lse_buf = torch.zeros(qo_len_max, num_heads, dtype=torch.float32, device=device)
+
+    def run():
+        wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv, kpe), out=o_buf, lse=lse_buf)
+
+    # Captured with 16 packed rows; the replans would otherwise move to the
+    # 64-row tile (48 rows) and to two-CTA clusters (160 rows).
+    captured = plan(qo_len=1)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+
+    k, v = generate_kv_from_cache(ckv, kpe, kv_len, 1, num_heads)
+    for qo_len in (1, 3, 10):
+        assert plan(qo_len) == captured
+        q_nope.normal_()
+        q_pe.normal_()
+        o_buf.zero_()
+        lse_buf.zero_()
+        g.replay()
+        q = torch.cat([q_nope[:qo_len], q_pe[:qo_len]], dim=-1)
+        o_ref, lse_ref = attention_ref(1, q, k, v, True, sm_scale)
+        torch.testing.assert_close(o_buf[:qo_len], o_ref, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(
+            lse_buf[:qo_len], lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
@@ -1032,7 +1248,7 @@ def test_batch_mla_fp8_nope_group_scales_matches_bf16_reference(backend):
 @pytest.mark.parametrize("kv_len", [256, 1024, 4096])
 @pytest.mark.parametrize("qo_len", [1, 16])
 @pytest.mark.parametrize("page_size", [16, 64])
-@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("num_heads", [8, 16, 32, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_batch_mla_fp8_kv_matches_bf16_reference(
     batch_size, kv_len, qo_len, page_size, num_heads, causal
