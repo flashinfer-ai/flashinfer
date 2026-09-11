@@ -637,6 +637,30 @@ def _cutlass_nvfp4_svdquant_requirement(*args, **kwargs):
     return True
 
 
+@supported_compute_capability([100, 103])
+def _cake_nvfp4_svdquant_requirement(
+    a, b, a_sf, b_sf, alpha, d, l1, bias=None, **kwargs
+):
+    cuda_version = get_cuda_version()
+    if cuda_version < Version("13.0"):
+        raise ValueError(
+            "Cake NVFP4 SVDQuant requires CUDA 13.0 or later. "
+            f"Current CUDA version: {cuda_version}."
+        )
+    from ..jit.cake_nvfp4_svdquant import (
+        is_cake_nvfp4_svdquant_problem_supported,
+    )
+
+    return is_cake_nvfp4_svdquant_problem_supported(
+        m=int(a.shape[0]),
+        n=int(b.shape[0]),
+        k=int(a.shape[1]) * 2,
+        rank=int(d.shape[1]),
+        has_bias=bias is not None,
+        device=a.device,
+    )
+
+
 @supported_compute_capability([120, 121])
 def _cute_dsl_nvfp4_svdquant_requirement(*args, **kwargs):
     cuda_version = get_cuda_version()
@@ -661,7 +685,9 @@ def _heuristic_func_nvfp4_svdquant(
     # Preserve backend_checks order: on SM120/SM121, cute-dsl precedes
     # cute-dsl-unfused when both are supported, which selects the fused-first
     # implementation tuning configuration.
-    return suitable_backends
+    # The generated Cake implementation is explicit-only; preserve the
+    # existing automatic backend selection and autotuning denominator.
+    return [backend for backend in suitable_backends if backend != "cake"]
 
 
 def _check_mm_nvfp4_svdquant_problem(
@@ -674,7 +700,9 @@ def _check_mm_nvfp4_svdquant_problem(
     l1: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"] = "auto",
+    backend: Literal[
+        "cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"
+    ] = "auto",
     enable_pdl: Optional[bool] = None,
 ):
     if a.ndim != 2 or b.ndim != 2:
@@ -741,6 +769,7 @@ def _check_mm_nvfp4_svdquant_problem(
 @backend_requirement(
     {
         "cutlass": _cutlass_nvfp4_svdquant_requirement,
+        "cake": _cake_nvfp4_svdquant_requirement,
         "cute-dsl": _cute_dsl_nvfp4_svdquant_requirement,
         "cute-dsl-unfused": _cute_dsl_nvfp4_svdquant_requirement,
     },
@@ -758,12 +787,15 @@ def mm_nvfp4_svdquant(
     l1: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"] = "auto",
+    backend: Literal[
+        "cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"
+    ] = "auto",
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""SVDQuant NVFP4 GEMM: ``out = alpha * (a @ bᵀ + d @ l1ᵀ) [+ bias]``.
 
-    On SM100/SM103, CUTLASS fuses the block-scaled NVFP4 residual GEMM with the rank-r
+    On SM100/SM103, CUTLASS and the explicit ``"cake"`` backend fuse the block-scaled
+    NVFP4 residual GEMM with the rank-r
     BF16 LoRA-up correction and optional bias. On SM120/SM121, ``"cute-dsl"`` fuses the
     correction and bias into the b12x CuTe DSL kernel's FP32 accumulator epilogue, while
     ``"cute-dsl-unfused"`` retains the compositional implementation as a
@@ -801,28 +833,68 @@ def mm_nvfp4_svdquant(
         SM120/SM121 CuTe DSL kernel.
     out: Optional[torch.Tensor]
         Output tensor, shape ``(m, n)`` bf16; allocated when ``None``.
-    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"]
-        ``"cutlass"`` selects the fused SM100/SM103 implementation;
+    backend: Literal["cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"]
+        ``"cutlass"`` selects the existing fused SM100/SM103 implementation;
+        ``"cake"`` selects the generated fused SM100/SM103 implementation
+        and requires CUDA 13.0 or later;
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
         ``"auto"`` (default) selects by compute capability. On SM120/SM121,
         fused and unfused are compared only while autotuning is enabled;
         otherwise the fused-first runner is selected.
     enable_pdl: Optional[bool]
-        Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
+        Whether to launch with Programmatic Dependent Launch. For ``"cake"``, ``None``
+        preserves the selected generated route; other backends use the device default.
 
     Returns
     -------
     out: torch.Tensor
         Output tensor, shape ``(m, n)`` bf16.
     """
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(a.device)
     if out is None:
         out = torch.empty(a.shape[0], b.shape[0], dtype=torch.bfloat16, device=a.device)
     # Preserve the historical public numel>=1 contract while specializing all
     # backend kernels and autotune keys on one scalar device element.
     alpha_scalar = alpha.reshape(-1)[:1]
+
+    if backend == "cake":
+        from ..jit.cake_nvfp4_svdquant import (
+            cake_nvfp4_svdquant_workspace_size,
+            run_cake_nvfp4_svdquant,
+        )
+
+        workspace_bytes = cake_nvfp4_svdquant_workspace_size(
+            m=int(a.shape[0]),
+            n=int(b.shape[0]),
+            k=int(a.shape[1]) * 2,
+            rank=int(d.shape[1]),
+            has_bias=bias is not None,
+            device=a.device,
+        )
+        workspace = None
+        if workspace_bytes:
+            workspace = _get_cache_buf(
+                "cake_nvfp4_svdquant_tma_workspace", workspace_bytes, a.device
+            )[:workspace_bytes]
+            if workspace.data_ptr() % 128:
+                raise RuntimeError("Cake descriptor workspace is not 128-byte aligned")
+        return run_cake_nvfp4_svdquant(
+            backend="cake",
+            a=a,
+            b=b,
+            a_sf=a_sf,
+            b_sf=b_sf,
+            alpha=alpha_scalar,
+            d=d,
+            l1=l1,
+            bias=bias,
+            out=out,
+            workspace=workspace,
+            enable_pdl=enable_pdl,
+        )
+
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(a.device)
 
     tune_sm120_implementations = False
     if backend == "auto":

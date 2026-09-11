@@ -8,7 +8,7 @@ cross-handle recv-buffer reuse, cache invalidation on dtype change and
 
 Everything runs on CPU tensors against the fake ``nccl.ep`` from
 ``conftest.py`` — the fake handle records calls instead of communicating, so
-no GPU or nccl4py wheel is needed.
+no GPU or nccl-extensions wheel is needed.
 """
 
 from __future__ import annotations

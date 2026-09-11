@@ -18,6 +18,7 @@
 #include <cstdint>
 
 #include "flashinfer/comm/pcie_ipc_all_reduce.cuh"
+#include "flashinfer/comm/pcie_ipc_ce_ring.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace fi = flashinfer::comm::pcie_ipc;
@@ -36,12 +37,65 @@ namespace {
 struct PcieIpcHandle {
   fi::PeerViews views;
   fi::WorkspaceLayout layout;
+  fi::CeResources ce;
+  bool ce_ready;
   int rank;
   int world_size;
   int max_blocks;
   int64_t max_numel;
   int elem_size;
 };
+
+// One dtype arm for both data planes, so the switch below does not have to be
+// written twice as the second one grows.
+template <typename T>
+cudaError_t dispatch_one(const PcieIpcHandle* h, const T* in, T* out, int64_t numel, int blocks,
+                         int threads, fi::Variant algo, bool use_pdl, cudaStream_t stream) {
+  if (algo == fi::Variant::kCopyEngineRing) {
+    return fi::ce_ring_all_reduce_flat<T>(in, out, numel, h->views, h->rank, h->world_size,
+                                          h->layout, h->ce, blocks, threads, stream);
+  }
+  if (algo == fi::Variant::kCopyEngineIsland) {
+    return fi::ce_ring_all_reduce_island<T>(in, out, numel, h->views, h->rank, h->world_size,
+                                            h->layout, h->ce, blocks, threads, stream);
+  }
+  return fi::all_reduce<T>(in, out, numel, h->views, h->rank, h->world_size, h->max_blocks,
+                           h->max_numel, blocks, threads, algo, use_pdl, stream);
+}
+
+// Streams and events for the copy-engine ring. Non-blocking so the side streams
+// never implicitly serialise against the legacy default stream, and events with
+// timing disabled because the ring records tens of them per collective and the
+// device-side timestamp write on a timing event is not free.
+cudaError_t ce_resources_create(fi::CeResources* ce) {
+  auto stream = [](cudaStream_t* s) { return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking); };
+  auto event = [](cudaEvent_t* e) { return cudaEventCreateWithFlags(e, cudaEventDisableTiming); };
+  cudaError_t err = stream(&ce->copy_stream);
+  if (err == cudaSuccess) err = stream(&ce->flag_stream);
+  if (err == cudaSuccess) err = event(&ce->input_ready);
+  if (err == cudaSuccess) err = event(&ce->copy_done);
+  if (err == cudaSuccess) err = event(&ce->flag_done);
+  for (int i = 0; err == cudaSuccess && i < fi::kCeMaxPieces; ++i) err = event(&ce->add_done[i]);
+  const int n = 2 * (fi::kMaxWorldSize - 1) * fi::kCeMaxPieces;
+  for (int i = 0; err == cudaSuccess && i < n; ++i) err = event(&ce->copied[i]);
+  return err;
+}
+
+// Events before streams: destroying a stream with queued work is legal and
+// deferred, destroying an event a queued node still references is not.
+void ce_resources_destroy(fi::CeResources* ce) {
+  // Null on the init failure path, where nullptr means the legacy default stream.
+  if (ce->copy_stream != nullptr) cudaStreamSynchronize(ce->copy_stream);
+  if (ce->flag_stream != nullptr) cudaStreamSynchronize(ce->flag_stream);
+  const int n = 2 * (fi::kMaxWorldSize - 1) * fi::kCeMaxPieces;
+  for (int i = 0; i < n; ++i) cudaEventDestroy(ce->copied[i]);
+  for (int i = 0; i < fi::kCeMaxPieces; ++i) cudaEventDestroy(ce->add_done[i]);
+  cudaEventDestroy(ce->flag_done);
+  cudaEventDestroy(ce->copy_done);
+  cudaEventDestroy(ce->input_ready);
+  cudaStreamDestroy(ce->flag_stream);
+  cudaStreamDestroy(ce->copy_stream);
+}
 
 }  // namespace
 
@@ -89,6 +143,10 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
     ptrs[i] = ipc_ptrs[i];
   }
 
+  // The parentheses are load-bearing: value-initialisation zeroes the POD
+  // members, which is the only reason the ce_resources_destroy on a failed
+  // ce_resources_create below is safe (cudaEventDestroy of a null handle is an
+  // ignored error, not UB). Dropping them turns a failing path into a crash.
   auto* handle = new PcieIpcHandle();
   handle->layout = fi::compute_workspace_layout(world_size, max_numel, static_cast<int>(elem_size),
                                                 static_cast<int>(max_blocks));
@@ -105,10 +163,24 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
     TVM_FFI_LOG_AND_THROW(RuntimeError)
         << "failed to zero the pcie ipc workspace: " << cudaGetErrorString(err);
   }
+  handle->ce_ready = false;
+  err = ce_resources_create(&handle->ce);
+  if (err != cudaSuccess) {
+    ce_resources_destroy(&handle->ce);
+    delete handle;
+    TVM_FFI_LOG_AND_THROW(RuntimeError)
+        << "failed to create the copy-engine ring's streams and events: "
+        << cudaGetErrorString(err);
+  }
+  handle->ce_ready = true;
   return reinterpret_cast<fptr_t>(handle);
 }
 
-void pcie_ipc_dispose(fptr_t handle) { delete reinterpret_cast<PcieIpcHandle*>(handle); }
+void pcie_ipc_dispose(fptr_t handle) {
+  auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
+  if (h->ce_ready) ce_resources_destroy(&h->ce);
+  delete h;
+}
 
 /*!
  * \brief Out-of-place all-reduce over the shared workspace.
@@ -172,21 +244,48 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
     TVM_FFI_ICHECK_EQ(blocks % 4, 0)
         << "the TP8 topology kernel requires blocks divisible by 4, got " << blocks;
   }
+  if (algo == fi::Variant::kCopyEngineRing || algo == fi::Variant::kCopyEngineIsland) {
+    // `blocks` carries the sub-chunk depth here, not a grid size; see
+    // IpcVariant.COPY_ENGINE_RING in pcie_ipc_policy.py, and kCeAddThreads for
+    // why the thread count is fixed rather than searched. The candidate grid
+    // never emits either, so these checks only reject a configuration that
+    // arrived by an explicit config=.
+    TVM_FFI_ICHECK_EQ(threads, fi::kCeAddThreads)
+        << "the copy-engine ring fixes its add kernel at " << fi::kCeAddThreads << " threads, got "
+        << threads;
+    TVM_FFI_ICHECK(blocks >= 1 && blocks <= fi::kCeMaxPieces)
+        << "the copy-engine ring reads `blocks` as its sub-chunk depth, which "
+        << "must be in [1, " << fi::kCeMaxPieces << "], got " << blocks;
+    const int64_t pack_elems = 16 / h->elem_size;
+    const int64_t shards =
+        algo == fi::Variant::kCopyEngineIsland ? 4 : static_cast<int64_t>(h->world_size);
+    const int64_t shard_div = shards * pack_elems;
+    TVM_FFI_ICHECK_EQ(numel % shard_div, 0)
+        << "the copy-engine ring splits the payload into " << shards
+        << " shards of whole 16-byte packs, so numel must be divisible by " << shard_div << ", got "
+        << numel;
+    // The ring reads inp[recv_chunk] at every reduce step while writing
+    // out[recv_chunk], and re-reads out[send_chunk] at the next step. In-place
+    // may happen to work, which is the worst state to leave it in.
+    TVM_FFI_ICHECK_NE(inp.data_ptr(), out.data_ptr())
+        << "the copy-engine ring does not support an in-place all-reduce";
+    TVM_FFI_ICHECK(!(algo == fi::Variant::kCopyEngineIsland && h->world_size != 8))
+        << "the island schedule is a 4+4 decomposition and is world_size 8 only, got "
+        << h->world_size;
+  }
 
   cudaError_t err = cudaSuccess;
   switch (encode_dlpack_dtype(out.dtype())) {
     case bfloat16_code:
-      err = fi::all_reduce<nv_bfloat16>(static_cast<const nv_bfloat16*>(inp.data_ptr()),
-                                        static_cast<nv_bfloat16*>(out.data_ptr()), numel, h->views,
-                                        h->rank, h->world_size, h->max_blocks, h->max_numel,
-                                        static_cast<int>(blocks), static_cast<int>(threads), algo,
-                                        enable_pdl, stream);
+      err = dispatch_one<nv_bfloat16>(h, static_cast<const nv_bfloat16*>(inp.data_ptr()),
+                                      static_cast<nv_bfloat16*>(out.data_ptr()), numel,
+                                      static_cast<int>(blocks), static_cast<int>(threads), algo,
+                                      enable_pdl, stream);
       break;
     case float16_code:
-      err = fi::all_reduce<half>(
-          static_cast<const half*>(inp.data_ptr()), static_cast<half*>(out.data_ptr()), numel,
-          h->views, h->rank, h->world_size, h->max_blocks, h->max_numel, static_cast<int>(blocks),
-          static_cast<int>(threads), algo, enable_pdl, stream);
+      err = dispatch_one<half>(h, static_cast<const half*>(inp.data_ptr()),
+                               static_cast<half*>(out.data_ptr()), numel, static_cast<int>(blocks),
+                               static_cast<int>(threads), algo, enable_pdl, stream);
       break;
     default:
       // The kernel templates carry a generic path, but only the two 2-byte

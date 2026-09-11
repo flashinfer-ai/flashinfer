@@ -550,6 +550,60 @@ def bsa_attn_sm120_blk64_sage_fwd(
     storage. Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS,
     and the operation supports MHA, head dimension 128, non-causal forward
     without LSE.
+
+    Parameters
+    ----------
+    q_int8 : torch.Tensor
+        Contiguous INT8 queries with shape ``[B, H, Sq, 128]``.
+    k_int8 : torch.Tensor
+        Contiguous INT8 keys with shape ``[B, H, Sk, 128]``.
+    v_fp8 : torch.Tensor
+        Contiguous FP8 E4M3 values in HDS layout with shape
+        ``[B, H, 128, ceil(Sk / 64) * 64]``.
+    q_scale : torch.Tensor
+        Contiguous FP32 query scales with shape
+        ``[B, H, ceil(Sq / 128) * 4]``.
+    k_scale : torch.Tensor
+        Contiguous FP32 key scales with shape ``[B, H, ceil(Sk / 64)]``.
+    v_scale : torch.Tensor
+        Contiguous FP32 value scales with shape ``[B, H, 128]``.
+    q2k_block_index : torch.Tensor
+        Contiguous INT32 selected KV block indices with shape
+        ``[B, H, ceil(Sq / 64), capacity]``.
+    block_sparse_num : int
+        Uniform number of selected KV blocks per query block when
+        ``q2k_block_nums`` is omitted. Must be between zero and ``capacity``.
+    block_sizes : torch.Tensor, optional
+        Contiguous INT32 valid-token counts for the KV blocks. Supported
+        shapes are ``[num_kv_blocks]``, ``[B, num_kv_blocks]``, and
+        ``[B, H, num_kv_blocks]``.
+    q2k_block_nums : torch.Tensor, optional
+        Contiguous INT32 selected-block counts with shape
+        ``[B, H, ceil(Sq / 64)]``.
+    softmax_scale : float, optional
+        Positive finite softmax scale. ``None`` selects ``1 / sqrt(128)``.
+    out : torch.Tensor
+        Caller-owned contiguous BF16 output with shape ``[B, H, Sq, 128]``.
+    tma_descriptor_workspace : torch.Tensor
+        Caller-owned contiguous CUDA uint8 workspace, aligned to 128 bytes
+        and large enough for the selected generated kernel.
+    uniform_block_count : bool
+        Whether every query block uses ``block_sparse_num`` selected blocks.
+        This is a caller-provided guarantee: when true, ``q2k_block_nums``
+        is ignored and its values are not checked.
+    contiguous_block_indices : bool
+        Whether selected block indices are contiguous. This optimization
+        requires ``uniform_block_count=True`` and trusts the caller's
+        guarantee without checking the indices. Non-contiguous top-k indices
+        must use ``False``, even when sorted. Incorrectly setting this flag
+        to ``True`` can produce incorrect output without raising an error.
+    backend : str
+        Backend name. The only supported value is ``"cake"``.
+
+    Returns
+    -------
+    torch.Tensor
+        The caller-owned ``out`` tensor after attention output is written.
     """
     if backend != "cake":
         raise ValueError(f"unsupported SM120 Sage backend: {backend!r}")
