@@ -2340,8 +2340,8 @@ def test_cute_dsl_planned_rejects_unaligned_dense_table(backend):
     assert case["wrapper"]._planned_backend is None
 
 
-@pytest.mark.parametrize("backend", ["cute-dsl-monolithic", "cute-dsl-modular"])
-def test_cute_dsl_planned_pads_csr_table(backend):
+@pytest.mark.parametrize("backend", ["xqa", "cute-dsl-monolithic", "cute-dsl-modular"])
+def test_planned_backend_pads_csr_table(backend):
     import flashinfer.mla as mla
 
     case = _make_planned_backend_runtime_case(backend, torch.bfloat16, plan=False)

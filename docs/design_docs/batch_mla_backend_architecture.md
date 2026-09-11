@@ -590,11 +590,14 @@ contract.
 ### XQA
 
 The planned XQA backend is selected only by `backend="xqa"`. It requires SM120
-or SM121, dense device metadata, one query token per request, packed query and
-KV-cache tensors, BF16 output, BF16 or FP8 E4M3 inputs with matching query/KV
-dtypes, scalar BMM scales, and no LSE, sinks, profiler, skip-softmax, output
-scale, or sparse mode. The historical generic XQA speculative paths and
-`(256, 64)` MLA shape are not part of this backend.
+with CUDA 12.8 or later, or SM12x minor versions 1 or greater with CUDA 12.9 or
+later. Non-graph plans may stage CPU metadata or derive aligned dense tables
+from CSR; CUDA Graph plans require caller-owned dense metadata on the wrapper
+device. It requires one query token per request, packed query and KV-cache
+tensors, BF16 output, BF16 or FP8 E4M3 inputs with matching query/KV dtypes,
+scalar BMM scales, and no LSE, sinks, profiler, skip-softmax, output scale, or
+sparse mode. The historical generic XQA speculative paths and `(256, 64)` MLA
+shape are not part of this backend.
 
 ### CuTe DSL
 
