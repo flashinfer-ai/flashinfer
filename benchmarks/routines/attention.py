@@ -1106,10 +1106,6 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         prims_ts_mask_type = (
             "causal" if not speculative_decode or effective_causal else "dense"
         )
-        # The common fixture intentionally exposes nonstandard outer strides;
-        # PrimTS accepts compact HND pages, so preserve the logical values in a
-        # backend-specific compact cache.
-        prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_q_shape = (
             (batch_size, num_qo_heads, head_dim_qk)
             if s_qo == 1
@@ -1117,17 +1113,18 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         )
         # The common fixture intentionally exposes nonstandard outer strides;
         # PrimTS accepts compact HND pages, so preserve the logical values in a
-        # backend-specific compact cache.
-        prims_ts_k_cache = kv_cache[:, 0].contiguous()
+        # backend-specific compact cache. Matching K/V dtypes keep the combined
+        # cache so both operands stay in one allocation.
         if prims_ts_v_dtype != kv_dtype:
+            prims_ts_k_cache = kv_cache[:, 0].contiguous()
             prims_ts_v_cache, prims_ts_v_scale_t = to_float8(
                 kv_cache[:, 1].contiguous(), prims_ts_v_dtype
             )
             prims_ts_v_scale = prims_ts_v_scale_t.item()
+            prims_ts_kv_cache = (prims_ts_k_cache, prims_ts_v_cache)
         else:
-            prims_ts_v_cache = kv_cache[:, 1].contiguous()
             prims_ts_v_scale = v_scale
-        prims_ts_kv_cache = (prims_ts_k_cache, prims_ts_v_cache)
+            prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
