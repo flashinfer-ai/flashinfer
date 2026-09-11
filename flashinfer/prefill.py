@@ -3532,7 +3532,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             or ``cute-dsl``/``cute-dsl-prims``/``cutile``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
-            device architecture and kernel availability.
+            device architecture and kernel availability: ``fa3`` on Hopper where it applies,
+            ``fmha_v2`` for large-sequence MHA on SM120, and ``cutlass`` on SM100a/SM110a for
+            the head dims its tcgen05 kernel serves (square ``d=128``, or ``d_qk=192``) when no
+            sliding window, logits soft cap, custom mask or multi-item-scoring pointer is in
+            play -- the CUTLASS path does not accept those, so ``auto`` stays on ``fa2`` for
+            them. Otherwise ``fa2``.
+            ``auto`` never selects ``cudnn``: that backend takes ``qo_indptr`` in *element*
+            offsets rather than token offsets (see :meth:`run`), so it cannot be substituted
+            for another backend without changing what the caller must pass.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
@@ -4193,6 +4201,53 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     )
                 ):
                     self._backend = "fmha_v2"
+
+                # SM100a/SM110a: prefer the CUTLASS tcgen05 FMHA kernel over FA2.
+                #
+                # determine_attention_backend only ever answers "fa3" or "fa2",
+                # and FA3 is gated on is_sm90a_supported(), which is False on
+                # Blackwell -- so `auto` lands on FA2 there unconditionally. FA2
+                # has no tcgen05 path, and the gap is large rather than marginal:
+                # measured on B200 (bf16, causal, ragged prefill), CUTLASS ran
+                # 2.4x faster at 64x8 heads d128 s4096 (11.66 -> 4.79 ms), 2.5x
+                # at b4 s16384 (44.61 -> 18.14), 1.7x at b64 s1024 (1.79 ->
+                # 1.06) and 2.0x at 128 heads d192/128 (28.17 -> 14.23), with
+                # outputs matching FA2 under the benchmark's refcheck.
+                #
+                # The conditions below are deliberately narrower than the
+                # kernel's true domain, because the CUTLASS run path
+                # (fmha_varlen, see run()) takes only causal + scales: it never
+                # receives window_left, logits_soft_cap, a custom mask or the
+                # multi-item-scoring pointers, so selecting it while any of
+                # those are requested would silently drop them. An explicit
+                # backend="cutlass" still reaches the same kernel and is
+                # unaffected by this gate; this only redirects `auto`, which
+                # would otherwise have returned FA2.
+                elif (
+                    self._backend == "fa2"
+                    and self._kv_layout == "NHD"
+                    and (
+                        is_sm100a_supported(self.device)
+                        or is_sm110a_supported(self.device)
+                    )
+                    # get_fmha_module's domain: square d128, or d192 (MLA-style
+                    # rectangular, where head_dim_vo may differ).
+                    and (
+                        (head_dim_qk == 128 and head_dim_qk == head_dim_vo)
+                        or head_dim_qk == 192
+                    )
+                    and q_data_type == kv_data_type
+                    and q_data_type in (torch.float16, torch.bfloat16)
+                    and PosEncodingMode[pos_encoding_mode].value
+                    == PosEncodingMode.NONE.value
+                    and self._custom_mask_buf is None
+                    and window_left < 0
+                    and logits_soft_cap == 0.0
+                    and prefix_len_ptr is None
+                    and token_pos_in_items_ptr is None
+                    and max_item_len_ptr is None
+                ):
+                    self._backend = "cutlass"
 
             get_module_args = (
                 q_data_type,
