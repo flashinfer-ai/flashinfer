@@ -682,6 +682,100 @@ void RunPreparedPackedQkv(
       << "waiting for prepared peer copies on the main stream failed";
 }
 
+tvm::ffi::Function BindPreparedPackedQkv(
+    tvm::ffi::Tensor scratch,
+    tvm::ffi::Tensor weight,
+    tvm::ffi::Tensor ready,
+    tvm::ffi::Tensor flag_peers,
+    tvm::ffi::Tensor peer_scratch_0,
+    tvm::ffi::Tensor peer_signal_0,
+    tvm::ffi::Tensor peer_scratch_1,
+    tvm::ffi::Tensor peer_signal_1,
+    tvm::ffi::Tensor peer_scratch_2,
+    tvm::ffi::Tensor peer_signal_2,
+    tvm::ffi::Tensor peer_scratch_3,
+    tvm::ffi::Tensor peer_signal_3,
+    tvm::ffi::Tensor peer_scratch_4,
+    tvm::ffi::Tensor peer_signal_4,
+    tvm::ffi::Tensor peer_scratch_5,
+    tvm::ffi::Tensor peer_signal_5,
+    tvm::ffi::Tensor peer_scratch_6,
+    tvm::ffi::Tensor peer_signal_6,
+    int64_t world_size,
+    int64_t rank,
+    int64_t rows,
+    int64_t comm_cuda_stream,
+    int64_t bridge_cuda_event,
+    int64_t expected_scratch_ptr,
+    int64_t expected_ready_ptr,
+    int64_t expected_peer_scratch_0,
+    int64_t expected_peer_signal_0,
+    int64_t expected_peer_scratch_1,
+    int64_t expected_peer_signal_1,
+    int64_t expected_peer_scratch_2,
+    int64_t expected_peer_signal_2,
+    int64_t expected_peer_scratch_3,
+    int64_t expected_peer_signal_3,
+    int64_t expected_peer_scratch_4,
+    int64_t expected_peer_signal_4,
+    int64_t expected_peer_scratch_5,
+    int64_t expected_peer_signal_5,
+    int64_t expected_peer_scratch_6,
+    int64_t expected_peer_signal_6) {
+  // Retain owning tensor handles once; each invocation still executes the
+  // original validated launcher and its unchanged stream/event protocol.
+  return tvm::ffi::Function::FromTyped(
+      [=](TensorView inp, TensorView out, TensorView descriptor_storage,
+          int64_t phase, int64_t ready_target, int64_t main_cuda_stream) {
+        RunPreparedPackedQkv(
+            inp,
+            scratch,
+            weight,
+            out,
+            descriptor_storage,
+            ready,
+            flag_peers,
+            peer_scratch_0,
+            peer_signal_0,
+            peer_scratch_1,
+            peer_signal_1,
+            peer_scratch_2,
+            peer_signal_2,
+            peer_scratch_3,
+            peer_signal_3,
+            peer_scratch_4,
+            peer_signal_4,
+            peer_scratch_5,
+            peer_signal_5,
+            peer_scratch_6,
+            peer_signal_6,
+            world_size,
+            rank,
+            rows,
+            phase,
+            ready_target,
+            main_cuda_stream,
+            comm_cuda_stream,
+            bridge_cuda_event,
+            expected_scratch_ptr,
+            expected_ready_ptr,
+            expected_peer_scratch_0,
+            expected_peer_signal_0,
+            expected_peer_scratch_1,
+            expected_peer_signal_1,
+            expected_peer_scratch_2,
+            expected_peer_signal_2,
+            expected_peer_scratch_3,
+            expected_peer_signal_3,
+            expected_peer_scratch_4,
+            expected_peer_signal_4,
+            expected_peer_scratch_5,
+            expected_peer_signal_5,
+            expected_peer_scratch_6,
+            expected_peer_signal_6);
+      });
+}
+
 }  // namespace flashinfer_cake_all_gather_matmul
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
@@ -691,6 +785,10 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     run_barrier, flashinfer_cake_all_gather_matmul::RunBarrier);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     run_main, flashinfer_cake_all_gather_matmul::RunMain);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    bind_prepared_packed_qkv,
+    flashinfer_cake_all_gather_matmul::BindPreparedPackedQkv);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     run_prepared_packed_qkv,
     flashinfer_cake_all_gather_matmul::RunPreparedPackedQkv);
@@ -1244,6 +1342,7 @@ class _PreparedPackedQkvSm103Launcher:
     peer_signal_ptrs: tuple[int, ...]
     native_peer_args: tuple[Any, ...] = field(repr=False)
     native_expected_peer_args: tuple[int, ...]
+    native_bound: Any = field(default=None, repr=False)
     verbose: bool = False
 
     def _validate_hot_input(self, inp: torch.Tensor) -> None:
@@ -1316,27 +1415,32 @@ class _PreparedPackedQkvSm103Launcher:
                     )
                 state.ready_epoch += 1
                 ready_target = state.ready_epoch
-                self.module.run_prepared_packed_qkv(
-                    inp,
-                    workspace.scratch,
-                    w,
-                    output,
-                    descriptors,
-                    self.signal_pad,
-                    state.flag_peers,
-                    *self.native_peer_args,
-                    self.world_size,
-                    self.rank,
-                    self.rows,
-                    phase,
-                    ready_target,
-                    main_stream_id,
-                    int(workspace.comm_stream.cuda_stream),
-                    int(workspace.bridge_event.cuda_event),
-                    int(self.scratch_fingerprint[0]),
-                    self.signal_pad_ptr,
-                    *self.native_expected_peer_args,
-                )
+                if self.native_bound is not None:
+                    self.native_bound(
+                        inp, output, descriptors, phase, ready_target, main_stream_id
+                    )
+                else:
+                    self.module.run_prepared_packed_qkv(
+                        inp,
+                        workspace.scratch,
+                        w,
+                        output,
+                        descriptors,
+                        self.signal_pad,
+                        state.flag_peers,
+                        *self.native_peer_args,
+                        self.world_size,
+                        self.rank,
+                        self.rows,
+                        phase,
+                        ready_target,
+                        main_stream_id,
+                        int(workspace.comm_stream.cuda_stream),
+                        int(workspace.bridge_event.cuda_event),
+                        int(self.scratch_fingerprint[0]),
+                        self.signal_pad_ptr,
+                        *self.native_expected_peer_args,
+                    )
                 if state.tail_event is None:
                     state.tail_event = torch.cuda.Event(enable_timing=False)
                 state.tail_event.record(main_stream)
@@ -1518,6 +1622,23 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
                 scratch_fingerprint=scratch_fingerprint,
                 weight_fingerprint=weight_fingerprint,
             )
+            native_bound = None
+            if world_size == 8 and rows == 512 and int(w.shape[1]) == 1280:
+                native_bound = module.bind_prepared_packed_qkv(
+                    workspace.scratch,
+                    w,
+                    signal_pad,
+                    state.flag_peers,
+                    *native_peer_args,
+                    world_size,
+                    rank,
+                    rows,
+                    int(workspace.comm_stream.cuda_stream),
+                    int(workspace.bridge_event.cuda_event),
+                    int(scratch_fingerprint[0]),
+                    int(signal_pad.data_ptr()),
+                    *native_expected_peer_args,
+                )
             launcher = _PreparedPackedQkvSm103Launcher(
                 group=group,
                 group_id=id(group),
@@ -1546,6 +1667,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
                 peer_signal_ptrs=peer_signal_ptrs,
                 native_peer_args=native_peer_args,
                 native_expected_peer_args=native_expected_peer_args,
+                native_bound=native_bound,
                 verbose=verbose,
             )
             return launcher
