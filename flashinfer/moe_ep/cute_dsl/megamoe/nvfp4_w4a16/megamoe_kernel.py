@@ -34,7 +34,7 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import CombineFormat, TokenSrc
 from .custom_ext import W4A16Fc12SchedExtension
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import spin_wait
-from .token_comm import _Bf16TokenComm
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import TokenInPullTokenBackPush
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     TokenCommArgs as ExtractedTokenCommArgs,
 )
@@ -293,7 +293,7 @@ class Sm100W4A16MegaMoEKernel:
         fc2_publishes_per_token_cluster_tile = (
             (hidden + cluster_fc2_tile_hidden - 1) // cluster_fc2_tile_hidden
         ) * cluster_shape_mnk[0]
-        self.token_comm = _Bf16TokenComm(
+        self.token_comm = TokenInPullTokenBackPush(
             world_size=world_size,
             num_topk=num_topk,
             num_experts_per_rank=self.num_experts_per_rank,
