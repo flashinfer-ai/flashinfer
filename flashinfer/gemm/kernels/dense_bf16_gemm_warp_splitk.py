@@ -20,6 +20,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
@@ -791,20 +793,32 @@ def _compile(
     use_pdl: bool,
     has_bias: bool,
 ):
-    device = _torch.device("cuda", device_index)
-    with _torch.cuda.device(device):
-        kernel = CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias)
-        tensors = tuple(
-            _from_dlpack(tensor)
-            for tensor in (
-                _torch.empty((n, k), device=device, dtype=dtype),
-                _torch.empty((m, k), device=device, dtype=dtype),
-                _torch.empty((n,), device=device, dtype=dtype),
-                _torch.empty((m, n), device=device, dtype=dtype),
-            )
+    def compile_kernel():
+        return cute_ext.compile(
+            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
+            *(
+                _from_dlpack(tensor)
+                for tensor in (
+                    _torch.empty((n, k), device="cuda", dtype=dtype),
+                    _torch.empty((m, k), device="cuda", dtype=dtype),
+                    _torch.empty((n,), device="cuda", dtype=dtype),
+                    _torch.empty((m, n), device="cuda", dtype=dtype),
+                )
+            ),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(device).cuda_stream)
-        return cute_ext.compile(kernel, *tensors, stream)
+
+    with _torch.cuda.device(device_index):
+        return build_and_load_cute_dsl_kernel(
+            "dense_bf16_gemm_warp_splitk",
+            f"{str(dtype).removeprefix('torch.')}_m{m}_n{n}_k{k}"
+            f"_out{tactic.output_tile}_token{tactic.token_tile}_kt{tactic.k_tile}"
+            f"_stages{tactic.stages}_bl{tactic.b_loader_warps}"
+            f"_pdl{int(use_pdl)}_bias{int(has_bias)}",
+            compile_kernel,
+            extra_key_files=(__file__,),
+        )
 
 
 def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=None):
@@ -816,15 +830,13 @@ def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=N
         compiled = _compile(
             device_index, a.dtype, m, n, k, tactic, pdl, bias is not None
         )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
         # Without bias the kernel never reads its bias argument; pass a row of
         # ``out`` so the launch signature stays fixed.
         compiled(
-            _from_dlpack(b.T),
-            _from_dlpack(a),
-            _from_dlpack(bias if bias is not None else out[0]),
-            _from_dlpack(out),
-            stream,
+            b.T,
+            a,
+            bias if bias is not None else out[0],
+            out,
         )
     return out
 

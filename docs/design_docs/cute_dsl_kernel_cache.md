@@ -49,7 +49,7 @@ Callers depend on the interface, not the implementation: `gen_jit_spec()` and th
 
 The on-disk conventions also match the nvcc cache: the same two-level scheme (in-process `functools.cache` + on-disk artifact), the same `cached_ops/` root with one directory per op family, invalidation at the same module granularity as ninja rebuilds. It diverges only where the DSL toolchain forces it — artifacts are single-arch object files rather than multi-arch fatbin `.so`s.
 
-One contract nuance: `try_load()` returns the cached artifact only when it is present *and known-valid*, and may conservatively return `None` even when artifacts exist. `JitSpecCuteDsl` decides validity itself (`.o` present + `meta.json` match); `JitSpecNvcc` returns only the AOT artifact, routing the JIT path through `build()` where ninja's dependency scan owns freshness. On a miss, `JitSpecCuteDsl.build()` keeps the freshly compiled kernel in memory and `load()` returns it directly — a build is never followed by a redundant JITLink reload from disk.
+One contract nuance: `try_load()` returns the cached artifact only when it is present *and known-valid*, and may conservatively return `None` even when artifacts exist. `JitSpecCuteDsl` decides validity itself (`.o` present + `meta.json` match); `JitSpecNvcc` returns only the AOT artifact, routing the JIT path through `build()` where ninja's dependency scan owns freshness. On a miss, `JitSpecCuteDsl.build()` compiles and exports the kernel. `load()` prefers the exported artifact so fresh builds and cache hits use the same loaded form and unsupported targets fail before invocation. If no artifact was produced, it falls back to the in-process compiled kernel.
 
 ### 2.1 Internal interface for kernel authors
 
@@ -70,8 +70,9 @@ def _get_compiled_kernel(...):
 ```
 
 On a **hit**, the kernel is JITLinked from the cached `.o` (milliseconds).
-On a **miss**, `compile_fn` runs, the result is exported to the module
-directory, and the in-process compiled function is returned directly.
+On a **miss**, `compile_fn` runs and the result is exported to the module
+directory. The exported artifact is then loaded; if export produced no
+artifact, the in-process compiled function is used instead.
 
 ### 2.2 Cache on disk layout
 
@@ -224,6 +225,25 @@ The initial implementation was a free function that duplicated the lock/double-c
 The benchmark command
 `flashinfer_benchmark.py --routine nvfp4_quantize ... --backends cuda cute-dsl`
 compiles on the first run and is compile-free on every subsequent run.
+
+### BF16 dense GEMM
+
+The `mm_bf16(backend="cute-dsl")` Direct, cluster Split-K, and warp Split-K
+kernels use the same disk-cache helper. Their names encode all static shape,
+layout, dtype, tactic, bias, and PDL fields that affect code generation.
+Cluster Split-K retains dynamic matrix extents, so its artifacts can be reused
+across shapes with the same layout and tactic. Device indices distinguish
+in-process loaded functions; disk artifacts are shared by matching architecture.
+
+The kernels use TVM-FFI's environment stream, preserving the caller's current
+PyTorch CUDA stream. Only compiled kernels are persisted here; autotune winners
+are a separate cache and need not be saved.
+
+Keeping `~/.cache/flashinfer` across server restarts is sufficient for reuse.
+For replaceable containers, preserve that directory or set
+`FLASHINFER_WORKSPACE_BASE` to a persistent mount before importing FlashInfer.
+The first use of a missing specialization still compiles it; this integration
+does not precompile or package kernels in a wheel.
 
 ## 5. Limitations and future work
 

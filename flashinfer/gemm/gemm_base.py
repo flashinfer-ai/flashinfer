@@ -739,6 +739,8 @@ def mm_bf16(
         kernels on the M <= 32 buckets and the cuBLASLt fallback on the larger
         ones, so a single large-M warm-up tunes both ranges; with bias the
         direct kernel is excluded.
+        Compiled CuTe DSL kernels are cached on disk and reused across processes
+        when the source, compiler stack, architecture, and configuration match.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -2035,7 +2037,6 @@ def get_mm_bf16_cublaslt_module():
     )
 
 
-_CUTE_DSL_BF16_AUTOTUNE_VERSION = 12
 # M bound of the CuTe-DSL low-M kernels; larger M runs the cuBLASLt fallback.
 _CUTE_DSL_BF16_MAX_M = 32
 
@@ -2193,7 +2194,6 @@ class _CuteDSLBf16Runner(TunableRunner):
             bias is not None,
             bool(pdl),
             self.compute_capability,
-            _CUTE_DSL_BF16_AUTOTUNE_VERSION,
         )
 
 
