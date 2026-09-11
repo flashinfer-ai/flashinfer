@@ -1401,6 +1401,7 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
         pytest.param("w4a16", 288, 448, 64, id="w4a16-tail"),
         pytest.param("w4a16", 7200, 2112, 64, id="w4a16-n64-wrap"),
         pytest.param("w4a16", 7200, 2112, 128, id="w4a16-n128-wrap"),
+        pytest.param("w4a16", 7200, 2112, 256, id="w4a16-n256-wrap"),
         pytest.param("w4a16", 18272, 64, 64, id="w4a16-activation-tail"),
     ],
 )

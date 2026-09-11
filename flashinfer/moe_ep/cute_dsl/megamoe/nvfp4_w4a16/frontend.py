@@ -77,9 +77,10 @@ class MegaMoEW4A16Config:
             (128, 128, 256),
             (256, 64, 256),
             (256, 128, 256),
+            (256, 256, 256),
         ):
             raise ValueError(
-                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
+                f"Unsupported W4A16 MegaMoE mma_tiler_mnk={self.mma_tiler_mnk}."
             )
         if self.cluster_shape_mnk != (2, 1, 1) and not (
             self.cluster_shape_mnk == (1, 1, 1) and self.mma_tiler_mnk == (128, 64, 256)

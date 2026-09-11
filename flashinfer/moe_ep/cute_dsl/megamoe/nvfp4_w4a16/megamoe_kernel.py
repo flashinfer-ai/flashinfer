@@ -5,7 +5,7 @@
 
 The local W4A16 helpers load packed weights and block scales, then decode
 BF16 tiles directly into the TMEM operand pipeline. Both GEMMs use
-dynamic routed-token widths with M128/M256, N64/N128 and K256 allocation.
+dynamic routed-token widths through N256 with M128/M256 and K256 allocation.
 Static and atomic schedulers fuse BF16 dispatch, both GEMMs, and combine.
 """
 
@@ -69,6 +69,7 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
             (128, 128, 256),
             (256, 64, 256),
             (256, 128, 256),
+            (256, 256, 256),
         )
         assert transform_a_source == tcgen05.OperandSource.TMEM
         acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
@@ -76,19 +77,20 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         cols_per_acc = utils.get_num_tmem_alloc_cols(acc_one, True)
         cols_per_a = cute.round_up(cta_tile_shape_mnk[2] // 2, 4)
         assert cols_per_acc == mma_tiler_mnk[1] and cols_per_a == 128
-        # Reuse the local W4A16 TMEM-capacity rule: after two accumulator
-        # stages, N64 fits three decoded K256 tiles; N128 still fits two.
+        # Match split W4A16's capacity rule: N256 uses one accumulator,
+        # leaving two decoded tiles; N64/N128 retain two accumulators.
+        acc_stages = 1 if mma_tiler_mnk[1] == 256 else 2
         max_tmem_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        transform_stages = (max_tmem_cols - 2 * cols_per_acc) // cols_per_a
+        transform_stages = (max_tmem_cols - acc_stages * cols_per_acc) // cols_per_a
         assert transform_stages in (2, 3)
         # load, transform, acc, unused-C, unused-tile-info, ACC-cols, A-cols.
         return (
             self._raw_stage_count,
             transform_stages,
-            2,
+            acc_stages,
             1,
             1,
-            2 * cols_per_acc,
+            acc_stages * cols_per_acc,
             transform_stages * cols_per_a,
         )
 
@@ -159,9 +161,10 @@ class Sm100W4A16MegaMoEKernel:
             (128, 128, 256),
             (256, 64, 256),
             (256, 128, 256),
+            (256, 256, 256),
         ):
             raise ValueError(
-                "W4A16 MegaMoE requires mma_tiler_mnk=M128/M256, N64/N128, K256."
+                f"Unsupported W4A16 MegaMoE mma_tiler_mnk={mma_tiler_mnk}."
             )
         if cluster_shape_mnk != (2, 1, 1) and not (
             cluster_shape_mnk == (1, 1, 1) and mma_tiler_mnk == (128, 64, 256)
@@ -360,7 +363,7 @@ class Sm100W4A16MegaMoEKernel:
 
     @staticmethod
     def _make_shared_storage(
-        sched_storage_cls, raw_stages, transform_stages, activation_stages
+        sched_storage_cls, raw_stages, transform_stages, activation_stages, acc_stages
     ):
         @cute.struct
         class SharedStorage:
@@ -371,7 +374,7 @@ class Sm100W4A16MegaMoEKernel:
             activation_barriers: cute.struct.MemRange[
                 cutlass.Int64, 2 * activation_stages
             ]
-            acc_barriers: cute.struct.MemRange[cutlass.Int64, 4]
+            acc_barriers: cute.struct.MemRange[cutlass.Int64, 2 * acc_stages]
             sched_storage: sched_storage_cls  # type: ignore[valid-type]
             tmem_dealloc: cutlass.Int64
             tmem_holding: cutlass.Int32
@@ -413,6 +416,7 @@ class Sm100W4A16MegaMoEKernel:
                     raw_stages,
                     mixed.num_trans2mma_stage,
                     activation_stages,
+                    mixed.num_acc_stage,
                 )
                 if self._smem_size(storage_cls, comm_storage_cls, mixed) <= capacity:
                     return mixed, storage_cls, activation_stages
@@ -717,7 +721,7 @@ class Sm100W4A16MegaMoEKernel:
             32, c_layout_view, mix.num_load2trans_stage, self.num_activation_stages
         )
         self.cluster_layout_vmnk = mix.cluster_layout_vmnk
-        self.num_acc_stage = self.num_acc_pipeline_stages = 2
+        self.num_acc_stage = self.num_acc_pipeline_stages = mix.num_acc_stage
         self.num_tmem_alloc_cols = 512
         self.epilogue = W4A16Epilogue(
             mma_tiler_mnk=self.mma_tiler,
@@ -734,6 +738,7 @@ class Sm100W4A16MegaMoEKernel:
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
         )
+        assert self.epilogue.num_acc_stage == self.num_acc_stage
         assert self.epilogue.acc_tmem_cols * self.num_acc_stage == mix.num_acc_tmem_cols
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             cutlass.BFloat16,
@@ -793,6 +798,43 @@ class Sm100W4A16MegaMoEKernel:
         ba2, bt2 = cute.nvgpu.make_tiled_tma_atom_B(
             b_op, b2, b_stage, self.mma_tiler, tiled_mma, mix.cluster_layout_vmnk.shape
         )
+        activation_half_mma = None
+        if cutlass.const_expr(self.mma_tiler[1] == 256):
+            activation_half_mma = sm100_utils.make_trivial_tiled_mma(
+                cutlass.BFloat16,
+                mix.a_major_mode,
+                mix.b_major_mode,
+                cutlass.Float32,
+                mix.cta_group,
+                (256, 128),
+                mix.transform_a_source,
+            )
+            # Restrict local N to 64 without compacting the N256 K-plane strides.
+            half_b_stage = cute.composition(
+                b_stage, ((cute.make_layout(64), None), None, None)
+            )
+            # TMA may refactor the MMA K modes; compare logical size, not nesting.
+            assert cute.size(half_b_stage) == cute.size(b_stage) // 2 == 64 * 256, (
+                f"N256 activation layout: full={b_stage}, half={half_b_stage}"
+            )
+            half_ba1, half_bt1 = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
+                b1,
+                half_b_stage,
+                (256, 128, 256),
+                activation_half_mma,
+                mix.cluster_layout_vmnk.shape,
+            )
+            half_ba2, half_bt2 = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
+                b2,
+                half_b_stage,
+                (256, 128, 256),
+                activation_half_mma,
+                mix.cluster_layout_vmnk.shape,
+            )
+            ba1, bt1 = (ba1, half_ba1), (bt1, half_bt1)
+            ba2, bt2 = (ba2, half_ba2), (bt2, half_bt2)
         self.a_tx_bytes = cute.size_in_bytes(
             cutlass.Float4E2M1FN, raw_stage
         ) + cute.size_in_bytes(cutlass.Float8E4M3FN, mix.smem_layout_scale_per_stage)
@@ -802,6 +844,7 @@ class Sm100W4A16MegaMoEKernel:
         grid = sched.get_grid_shape(max_active_clusters)
         self.kernel(
             tiled_mma,
+            activation_half_mma,
             wa1,
             wt1,
             sa1,
@@ -913,6 +956,7 @@ class Sm100W4A16MegaMoEKernel:
     def _activation_task(
         self,
         mma,
+        activation_half_mma,
         ext,
         work,
         atom,
@@ -924,7 +968,61 @@ class Sm100W4A16MegaMoEKernel:
         state,
         k_count,
     ):
+        args = (
+            mma,
+            activation_half_mma,
+            ext,
+            work,
+            atom,
+            tensor,
+            s_b,
+            cluster_layout,
+            cluster_coord,
+            pipe,
+            state,
+            k_count,
+        )
+        if cutlass.const_expr(self.mma_tiler[1] == 256):
+            # One uniform choice per work; each K loop has a static copy width.
+            if work.valid_tokens_in_cta_tile <= 128:
+                state = self._activation_load(*args, half_width=True)
+            else:
+                state = self._activation_load(*args)
+        else:
+            state = self._activation_load(*args)
+        return state
+
+    @cute.jit
+    def _activation_load(
+        self,
+        mma,
+        activation_half_mma,
+        ext,
+        work,
+        atom,
+        tensor,
+        s_b,
+        cluster_layout,
+        cluster_coord,
+        pipe,
+        state,
+        k_count,
+        half_width: cutlass.Constexpr[bool] = False,
+    ):
+        load_n = self.mma_tiler[1]
+        if cutlass.const_expr(self.mma_tiler[1] == 256):
+            atom, tensor = atom[int(half_width)], tensor[int(half_width)]
+        if cutlass.const_expr(half_width):
+            load_n = 128
+            mma = activation_half_mma
+            # Keep the old swizzle, K-plane offsets and full B-stage stride.
+            s_b = cute.composition(
+                s_b, ((cute.make_layout(64), None), None, None, None)
+            )
         real_b, _ = ext.get_gmem_tensor("b", tensor, work)
+        if cutlass.const_expr(half_width):
+            # Scheduler tile IDs still advance by N256, not by the copy width.
+            real_b = cute.domain_offset((work.tile_n_idx * 256, 0, 0), real_b)
         # Match the existing swapped Mega dynamic-N split in both FC phases.
         # Only two-CTA MMA splits B at align16(valid)/2. One-CTA
         # MMA consumes the full routed-N tile, multicast across the cluster.
@@ -932,13 +1030,11 @@ class Sm100W4A16MegaMoEKernel:
             if cute.arch.block_idx()[0] % 2 != 0:
                 shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                     valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
-                    mma_tiler_n=self.mma_tiler[1],
+                    mma_tiler_n=load_n,
                 )
                 real_b = cute.domain_offset((shift, 0, 0), real_b)
         thr = mma.get_slice(cute.arch.block_idx()[0] % cute.size(mma.thr_id.shape))
-        gb = cute.local_tile(
-            real_b, (self.mma_tiler[1], self.mma_tiler[2]), (None, None, None)
-        )
+        gb = cute.local_tile(real_b, (load_n, self.mma_tiler[2]), (None, None, None))
         cta_layout = cute.make_layout(
             cute.slice_(cluster_layout, (0, None, 0, 0)).shape
         )
@@ -949,13 +1045,19 @@ class Sm100W4A16MegaMoEKernel:
             cute.group_modes(s_b, 0, 3),
             cute.group_modes(thr.partition_B(gb), 0, 3),
         )
-        src = src[(None, work.tile_n_idx, None, 0)]
+        if cutlass.const_expr(half_width):
+            src = src[(None, 0, None, 0)]
+        else:
+            src = src[(None, work.tile_n_idx, None, 0)]
         mask = cpasync.create_tma_multicast_mask(
             cluster_layout, cluster_coord, mcast_mode=1
         )
         state.reset_count()
         for _ in cutlass.range(k_count, unroll=1):
-            pipe.producer_acquire(state)
+            if cutlass.const_expr(half_width):
+                pipe.producer_acquire(state, expected_tx=self.b_tx_bytes // 2)
+            else:
+                pipe.producer_acquire(state)
             cute.copy(
                 atom,
                 src[(None, state.count)],
@@ -972,6 +1074,7 @@ class Sm100W4A16MegaMoEKernel:
     def kernel(
         self,
         mma,
+        activation_half_mma,
         wa1,
         wt1,
         sa1,
@@ -1059,7 +1162,7 @@ class Sm100W4A16MegaMoEKernel:
         )
         acc_pipe = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_barriers.data_ptr(),
-            num_stages=2,
+            num_stages=self.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, 128 * cta_v_size
@@ -1111,7 +1214,7 @@ class Sm100W4A16MegaMoEKernel:
             swizzle=activation_layout.inner,
         )
         acc_fake = mma.make_fragment_C(
-            cute.append(mma.partition_shape_C(self.mma_tiler[:2]), 2)
+            cute.append(mma.partition_shape_C(self.mma_tiler[:2]), self.num_acc_stage)
         )
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         tmem.allocate(512)
@@ -1186,6 +1289,7 @@ class Sm100W4A16MegaMoEKernel:
                     self.token_comm.fc1_tma_b_predispatch_spin(token_comm_args, work)
                     state = self._activation_task(
                         mma,
+                        activation_half_mma,
                         ext,
                         work,
                         ba1,
@@ -1208,6 +1312,7 @@ class Sm100W4A16MegaMoEKernel:
                         )
                     state = self._activation_task(
                         mma,
+                        activation_half_mma,
                         ext,
                         work,
                         ba2,
@@ -1315,7 +1420,7 @@ class Sm100W4A16MegaMoEKernel:
                 pipeline.PipelineUserType.Consumer, self.num_activation_stages
             )
             acc_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, 2
+                pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
             work = consumer.consume_work()
             while work.is_valid_tile:

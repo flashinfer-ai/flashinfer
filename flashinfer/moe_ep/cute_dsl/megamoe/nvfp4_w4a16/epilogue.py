@@ -38,7 +38,7 @@ from .tmem_epilogue import (
 
 
 class W4A16Epilogue:
-    """Current scheduler/return contract with BF16 FC1 and two acc stages."""
+    """BF16 handoffs with one N256 accumulator or two N64/N128 stages."""
 
     _EpilogueSyncWaitBarId = 1
     _EpilogueTokenTileSize = 64
@@ -65,7 +65,13 @@ class W4A16Epilogue:
     ):
         if (
             mma_tiler_mnk
-            not in ((128, 64, 256), (128, 128, 256), (256, 64, 256), (256, 128, 256))
+            not in (
+                (128, 64, 256),
+                (128, 128, 256),
+                (256, 64, 256),
+                (256, 128, 256),
+                (256, 256, 256),
+            )
             or (
                 cluster_shape_mn != (2, 1)
                 and not (cluster_shape_mn == (1, 1) and mma_tiler_mnk == (128, 64, 256))
@@ -101,7 +107,9 @@ class W4A16Epilogue:
             static_expert_shape[1] // 2 if static_expert_shape is not None else None
         )
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
-        self.num_acc_stage = 2
+        # N256 leaves columns256..511 for two decoded K256 operand tiles.
+        # Its four subtiles reuse scratch only inside the one acc stage.
+        self.num_acc_stage = 1 if self.cta_tile_n == 256 else 2
         self.tmem_acc_layout_py_obj = (
             (self.cta_tile_m, self.cta_tile_n, self.num_acc_stage),
             (1 << 16, 1, self.cta_tile_n),
@@ -357,8 +365,8 @@ class W4A16Fc2Epilogue(EpilogueContext):
                     release_after_reorder=i == self.subtile_cnt - 1,
                 )
             elif cutlass.const_expr(i == self.subtile_cnt - 1):
-                # Includes zero tokens and N128 tiles with only the first
-                # subtile valid. This is the existing valid guard's else arm.
+                # Includes zero tokens and tiles whose last subtile is empty.
+                # This is the existing valid guard's else arm.
                 cute.arch.fence_view_async_tmem_load()
                 acc_pipeline.consumer_release(acc_consumer_state)
 
@@ -448,7 +456,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
         acc_pipeline.consumer_wait(acc_consumer_state)
         iket.range_push("fc1_epi")
         # Keep prior subtiles in the established loop and specialize only the
-        # final one. N64 has no prior subtile; N128 has one.
+        # final one. N64/N128/N256 have zero/one/three prior subtiles.
         if cutlass.const_expr(self.subtile_cnt > 1):
             for subtile_idx in cutlass.range(self.subtile_cnt - 1, unroll=1):
                 if subtile_idx * 64 < work_tile_info.valid_tokens_in_cta_tile:
@@ -479,8 +487,8 @@ class W4A16Fc1Epilogue(EpilogueContext):
                 release_after_scratch=True,
             )
         else:
-            # Includes zero tokens and N128 tiles with only the first
-            # subtile valid. All earlier stores retain their original order.
+            # Includes zero tokens and tiles whose last subtile is empty.
+            # All earlier stores retain their original order.
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(acc_consumer_state)
 
