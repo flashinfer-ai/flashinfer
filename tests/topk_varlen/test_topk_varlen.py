@@ -1317,6 +1317,31 @@ def test_backend_heuristic_priority():
         "radix",
         "radix_cutlass",
     ]
+    # hint-free fp32 (gvr_2 runs on its synthetic anchor): gvr_2 still first
+    # everywhere except the one measured loss — K >= 2048, N <= 4096, single
+    # row — where radix_filter leads and gvr_2 follows; a real hint restores
+    # gvr_2 to the front there.
+    all5 = all4 + ["radix_filter"]
+
+    def order_k(suitable, batch, n_cols, top_k, hinted):
+        logits = torch.empty(batch, n_cols, dtype=torch.float32, device="meta")
+        seq_lens = torch.empty(batch, dtype=torch.int32, device="meta")
+        pre_idx = (
+            torch.empty(batch, top_k, dtype=torch.int32, device="meta")
+            if hinted
+            else None
+        )
+        return _top_k_varlen_heuristic(suitable, logits, seq_lens, top_k, pre_idx)
+
+    assert order_k(all5, 16, 32768, 512, False)[0] == "gvr_2"
+    assert order_k(all5, 1, 4096, 1024, False)[0] == "gvr_2"
+    assert order_k(all5, 2, 4096, 2048, False)[0] == "gvr_2"
+    assert order_k(all5, 1, 4096, 2048, False)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all4, 1, 4096, 2048, False)[0] == "gvr_2"  # no radix_filter
+    # (a meta pre_idx fails the CUDA-device check and counts as absent; a hint
+    # on the logits device is exercised by the GPU tests)
+    assert order_k(all5, 1, 4096, 2048, True)[:2] == ["radix_filter", "gvr_2"]
+
     # None tensors (skip_check / doc examples): static fallback order.
     assert _top_k_varlen_heuristic(all4, None, None, None) == [
         "gvr_2",
@@ -1423,9 +1448,10 @@ def _malformed_hints(batch, top_k):
 def test_malformed_hint_is_discarded_with_warning(kind):
     """A malformed ``pre_idx`` (wrong shape, dtype, device, layout or
     alignment) is dropped with a RuntimeWarning and the call runs hint-free
-    and exact, under ``auto`` and under an explicit hint-free backend. The
-    hint-consuming backends refuse the call up front instead of failing
-    inside the kernel (they cannot run without a hint)."""
+    and exact, under ``auto``, under an explicit hint-free backend, and under
+    ``gvr_2`` (which runs on its synthetic anchor). ``gvr`` cannot run
+    without a hint and refuses the call up front instead of failing inside
+    the kernel."""
     from flashinfer.utils import BackendSupportedError
 
     batch, n, top_k = 4, 8192, 1024
@@ -1453,31 +1479,37 @@ def test_malformed_hint_is_discarded_with_warning(kind):
         )
     assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
     assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
-    # explicit hint-consuming backends: refused by their checker up front
-    # (the @backend_requirement decorator reports a failed explicit-backend
-    # check as ValueError("Problem size is not supported ..."))
-    for backend in ("gvr", "gvr_2"):
-        if flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor):
-            with pytest.raises(
-                (BackendSupportedError, ValueError), match="not supported"
-            ):
-                flashinfer.top_k_varlen(
-                    logits, seq_lens, top_k, pre_idx=bad, backend=backend
-                )
-            # skip_check=True bypasses the checkers: the body must still refuse
-            # instead of handing the discarded hint (None) to the kernel host
-            with (
-                pytest.warns(RuntimeWarning, match="pre_idx"),
-                pytest.raises(BackendSupportedError, match="well-formed"),
-            ):
-                flashinfer.top_k_varlen(
+    # gvr_2: the hint is dropped with the warning and the call runs exact on
+    # the host's synthetic anchor (checked and skip_check paths alike)
+    if flashinfer.top_k_varlen.is_backend_supported("gvr_2", cc):
+        for skip in (False, True):
+            with pytest.warns(RuntimeWarning, match="synthetic sampling anchor"):
+                indices, _ = flashinfer.top_k_varlen(
                     logits,
                     seq_lens,
                     top_k,
                     pre_idx=bad,
-                    backend=backend,
-                    skip_check=True,
+                    backend="gvr_2",
+                    skip_check=skip,
                 )
+            assert torch.equal(
+                torch.sort(logits.gather(1, indices.long()), dim=1).values, ref
+            )
+    # gvr (V1) consumes the hint: refused by its checker up front (the
+    # @backend_requirement decorator reports a failed explicit-backend check
+    # as ValueError("Problem size is not supported ..."))
+    if flashinfer.top_k_varlen.is_backend_supported("gvr", cc):
+        with pytest.raises((BackendSupportedError, ValueError), match="not supported"):
+            flashinfer.top_k_varlen(logits, seq_lens, top_k, pre_idx=bad, backend="gvr")
+        # skip_check=True bypasses the checkers: the body must still refuse
+        # instead of handing the discarded hint (None) to the kernel host
+        with (
+            pytest.warns(RuntimeWarning, match="pre_idx"),
+            pytest.raises(BackendSupportedError, match="well-formed"),
+        ):
+            flashinfer.top_k_varlen(
+                logits, seq_lens, top_k, pre_idx=bad, backend="gvr", skip_check=True
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
