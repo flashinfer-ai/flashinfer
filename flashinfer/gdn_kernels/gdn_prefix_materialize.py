@@ -143,6 +143,7 @@ from .gdn_decode_bf16_wy_ucache_flush import (
     _sw128_xor,
     f32,
     io,
+    ring_ty,
     state_ty,
 )
 
@@ -660,6 +661,21 @@ def gdn_prefix_materialize(
         raise ValueError("HV must be a multiple of H")
     if k_cache.shape[3] != K_dim or u_cache.shape[3] != V_dim:
         raise ValueError("ring feature dims must match the state")
+    if u_cache.shape[1] != HV or g_cache.shape[1] != HV:
+        raise ValueError(
+            f"u_cache/g_cache head dims must equal state HV ({HV}); got "
+            f"{u_cache.shape[1]}/{g_cache.shape[1]} -- the kernel indexes every "
+            f"value head, so an undersized ring reads past its allocation"
+        )
+    if k_cache.dtype != ring_ty_torch() or u_cache.dtype != ring_ty_torch():
+        # The fold MMA and the 16 B ring cp.async are typed for the module's
+        # RING element type (== IO by default; fp16 in ring-fp16 mode). NOT
+        # necessarily the STATE dtype: the mixed mode pairs an fp16 state with
+        # bf16 rings. A wrong ring dtype would be re-interpreted bytewise.
+        raise ValueError(
+            f"k_cache/u_cache dtype must be {ring_ty_torch()} "
+            f"(the module RING dtype); got {k_cache.dtype}/{u_cache.dtype}"
+        )
     # Ring depth is DERIVED from the buffer, never taken as an argument: a
     # caller-supplied depth that disagreed with the allocation would make the
     # kernel's (base + j) & (depth - 1) index run off the end of one request's
@@ -786,6 +802,14 @@ def gdn_prefix_materialize(
             raise ValueError(f"{_n} must be contiguous (got a strided view)")
 
     def mk_dyn(t):
+        # assumed_align=16 below is a PROMISE to the compiler (TMA base, 16 B
+        # ring cp.async). torch base allocations are 512 B aligned, but a
+        # sliced view can carry any storage offset -- verify rather than trust.
+        if t.data_ptr() % 16:
+            raise ValueError(
+                "all materialization tensors must be 16-byte aligned "
+                f"(got data_ptr % 16 == {t.data_ptr() % 16})"
+            )
         cute_tensor = from_dlpack(t, assumed_align=16)
         if t.is_contiguous():
             return cute_tensor.mark_compact_shape_dynamic(
@@ -855,3 +879,13 @@ def gdn_prefix_materialize(
 def state_ty_torch() -> torch.dtype:
     """The torch dtype matching the module's compile-time STATE element type."""
     return torch.float16 if state_ty is cutlass.Float16 else torch.bfloat16
+
+
+def ring_ty_torch() -> torch.dtype:
+    """The torch dtype matching the module's compile-time RING element type.
+
+    Equals the IO dtype by default; fp16 under GDN_UCACHE_RING_DTYPE=fp16.
+    Distinct from the STATE dtype in the mixed modes, which is why the ring
+    validation must not reuse state_ty_torch().
+    """
+    return torch.float16 if ring_ty is cutlass.Float16 else torch.bfloat16

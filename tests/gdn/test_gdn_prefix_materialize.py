@@ -627,3 +627,63 @@ def test_noncontiguous_metadata_rejected():
         gdn_prefix_materialize(
             state, _i32([0, 1]), _i32([2, 3]), kc, uc, gc, _i32([0, 0]), strided_count
         )
+
+
+def test_undersized_ring_heads_rejected():
+    """u_cache/g_cache with fewer heads than the state's HV must be refused.
+
+    The kernel indexes every value head < HV into both rings; an undersized
+    allocation would be read past its end (CodeRabbit PR finding)."""
+    _skip_if_not_sm90_or_later()
+    state, kc, uc, gc = _make_pool(4, [8], [0], seed=51)
+    short_uc = uc[:, : HV - 1].contiguous()
+    with pytest.raises(ValueError, match="head dims must equal state HV"):
+        gdn_prefix_materialize(
+            state, _i32([0]), _i32([1]), kc, short_uc, gc, _i32([0]), _i32([2])
+        )
+    short_gc = gc[:, :1].contiguous()
+    with pytest.raises(ValueError, match="head dims must equal state HV"):
+        gdn_prefix_materialize(
+            state, _i32([0]), _i32([1]), kc, uc, short_gc, _i32([0]), _i32([2])
+        )
+
+
+def test_wrong_ring_dtype_rejected():
+    """Ring dtype must equal the module RING dtype, not merely be 16-bit.
+
+    The 16 B cp.async copies raw bytes and the fold MMA is typed for the ring
+    element type, so an fp32 (or otherwise mismatched) ring would be silently
+    reinterpreted bytewise. Note the check targets the RING dtype: in the
+    mixed modes it legitimately differs from the STATE dtype."""
+    _skip_if_not_sm90_or_later()
+    from flashinfer.gdn_kernels.gdn_prefix_materialize import ring_ty_torch
+
+    state, kc, uc, gc = _make_pool(4, [8], [0], seed=52)
+    bad = torch.float32 if ring_ty_torch() != torch.float32 else torch.float16
+    with pytest.raises(ValueError, match="module RING dtype"):
+        gdn_prefix_materialize(
+            state, _i32([0]), _i32([1]), kc.to(bad), uc, gc, _i32([0]), _i32([2])
+        )
+    with pytest.raises(ValueError, match="module RING dtype"):
+        gdn_prefix_materialize(
+            state, _i32([0]), _i32([1]), kc, uc.to(bad), gc, _i32([0]), _i32([2])
+        )
+
+
+def test_misaligned_base_pointer_rejected():
+    """A sliced view whose data_ptr is not 16-byte aligned must be refused.
+
+    The descriptors promise assumed_align=16 to the compiler (TMA base, 16 B
+    ring cp.async); an 8-byte-aligned slice would make that promise false."""
+    _skip_if_not_sm90_or_later()
+    state, kc, uc, gc = _make_pool(4, [8], [0], seed=53)
+    n = state.numel()
+    # Offset by 4 bf16 elements = 8 bytes: contiguous, correct shape, misaligned.
+    buf = torch.zeros(n + 4, dtype=state.dtype, device=DEV)
+    shifted = buf[4 : 4 + n].view(state.shape)
+    shifted.copy_(state)
+    assert shifted.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        gdn_prefix_materialize(
+            shifted, _i32([0]), _i32([1]), kc, uc, gc, _i32([0]), _i32([2])
+        )
