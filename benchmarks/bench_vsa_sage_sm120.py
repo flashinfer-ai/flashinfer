@@ -1,7 +1,7 @@
 """
 Benchmark: SM120 Sage (QK-INT8/PV-FP8) block-sparse VSA attention.
 
-Matches the PR #4951 portfolio configurations:
+Benchmark configurations:
   b=8, h=32, head_dim=128
   seqlen: 1024, 2048, 4096, 8192, 16384, 32768, 65536
   density: 10%, 50%, 90%
@@ -20,7 +20,7 @@ from flashinfer.cute_dsl.sparse.bsa_utils.sage_quant_sm120 import (
     quantize_sage_qkv_sm120,
 )
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm12x_supported
+
 
 BLOCK = 64
 HEAD_DIM = 128
@@ -45,8 +45,8 @@ def _build_q2k(batch, heads, num_q_blocks, num_kv_blocks, density, device):
 
 def run_benchmark():
     device = torch.device("cuda")
-    if not is_sm12x_supported(device):
-        print("ERROR: SM120/SM121 GPU required.")
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        print("ERROR: SM120 GPU (compute capability 12.0) required.")
         sys.exit(1)
 
     torch.manual_seed(42)
@@ -100,6 +100,7 @@ def run_benchmark():
                 q2k_index,
                 block_sparse_num=int(q2k_nums.max().item()),
                 q2k_block_nums=q2k_nums,
+                backend="cute_dsl",
             )
             torch.cuda.synchronize()
 
@@ -114,13 +115,15 @@ def run_benchmark():
                     q2k_index,
                     block_sparse_num=int(q2k_nums.max().item()),
                     q2k_block_nums=q2k_nums,
+                    backend="cute_dsl",
                 ),
                 repeat_time_ms=500,
             )
             ms = statistics.median(times)
 
-            # FLOPs: active_blocks 已含 batch×heads，每对 (q_tile,k_tile) 做 QK+PV 两次 GEMM
-            # QK: 2×BLOCK×HEAD_DIM×BLOCK，PV: 2×BLOCK×BLOCK×HEAD_DIM → 共 4×BLOCK²×HEAD_DIM
+            # FLOPs: active_blocks includes batch*heads; each (q_tile, k_tile) pair
+            # does two GEMMs: QK (2*BLOCK*HEAD_DIM*BLOCK) + PV (2*BLOCK*BLOCK*HEAD_DIM)
+            # = 4*BLOCK^2*HEAD_DIM per active block.
             flops = 4 * active_blocks * BLOCK * BLOCK * HEAD_DIM
             tflops = flops / (ms * 1e-3) / 1e12
             actual_density = active_blocks / (

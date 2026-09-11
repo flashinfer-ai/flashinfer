@@ -172,6 +172,7 @@ def test_vsa_sm120_sage_accuracy(batch, num_heads, num_blocks, density):
         q2k_index,
         block_sparse_num=num_blocks,
         q2k_block_nums=q2k_nums,
+        backend="cute_dsl",
     )
 
     torch.testing.assert_close(o.float(), o_ref.float(), atol=ATOL, rtol=RTOL)
@@ -206,6 +207,7 @@ def test_vsa_sm120_sage_sm_scale(sm_scale):
         block_sparse_num=num_blocks,
         q2k_block_nums=q2k_nums,
         softmax_scale=sm_scale,
+        backend="cute_dsl",
     )
 
     torch.testing.assert_close(o.float(), o_ref.float(), atol=ATOL, rtol=RTOL)
@@ -254,6 +256,7 @@ def test_vsa_sm120_sage_ragged_seqlen(seqlen_q, seqlen_k):
         vs,
         index,
         block_sparse_num=num_kv_blocks,
+        backend="cute_dsl",
     )
 
     torch.testing.assert_close(o.float(), o_ref.float(), atol=ATOL, rtol=RTOL)
@@ -291,6 +294,7 @@ def test_vsa_sm120_sage_empty_row():
         index,
         block_sparse_num=num_blocks,
         q2k_block_nums=nums,
+        backend="cute_dsl",
     )
 
     assert torch.all(o[:, :, :BLOCK, :] == 0), "empty Q-block output should be zero"
@@ -331,6 +335,7 @@ def test_vsa_sm120_sage_out_param():
         index,
         block_sparse_num=num_blocks,
         out=preallocated,
+        backend="cute_dsl",
     )
     assert out.data_ptr() == preallocated.data_ptr()
     assert torch.isfinite(out).all()
@@ -394,6 +399,7 @@ def test_vsa_sm120_sage_block_sizes(block_sizes_mode):
         index,
         block_sparse_num=num_blocks,
         block_sizes=block_sizes,
+        backend="cute_dsl",
     )
 
     torch.testing.assert_close(o.float(), o_ref.float(), atol=ATOL, rtol=RTOL)
@@ -428,6 +434,7 @@ def test_vsa_sm120_sage_gqa_guard():
             vs,
             index,
             block_sparse_num=num_blocks,
+            backend="cute_dsl",
         )
 
 
@@ -462,6 +469,7 @@ def test_vsa_sm120_sage_wrong_arch_dtype_guards():
             vs,
             index,
             block_sparse_num=num_blocks,
+            backend="cute_dsl",
         )
 
 
@@ -521,7 +529,16 @@ def test_vsa_sm120_sage_v_permutation_consistency():
     # Large softmax_scale sharpens the (already diagonal-dominant) score
     # matrix into a near-one-hot distribution.
     out = bsa_attn_sm120_blk64_sage_fwd(
-        q8, k8, v8, qs, ks, vs, index, block_sparse_num=1, softmax_scale=30.0
+        q8,
+        k8,
+        v8,
+        qs,
+        ks,
+        vs,
+        index,
+        block_sparse_num=1,
+        softmax_scale=30.0,
+        backend="cute_dsl",
     )
     out_mean = out.float().mean(dim=-1)  # [batch, num_heads, S]
 
@@ -596,9 +613,8 @@ def test_quantize_sage_kv_shapes_and_v_scale_cap():
 )
 def test_vsa_sm120_sage_rejects_mismatched_shapes(bad_tensor_name, mutate):
     """Wrong-shaped Q/K scale tensors or a non-MHA K must raise, not silently
-    compute a wrong result (regression test for a bug found in review: an
-    under-sized q_scale used to run to completion and return a finite but
-    numerically wrong output)."""
+    compute a wrong result; an under-sized q_scale previously ran to completion
+    and returned a finite but numerically wrong output."""
     device = torch.device("cuda")
     torch.manual_seed(0)
     batch, num_heads, num_blocks = 1, 2, 2
@@ -635,4 +651,98 @@ def test_vsa_sm120_sage_rejects_mismatched_shapes(bad_tensor_name, mutate):
             tensors["v_scale"],
             index,
             block_sparse_num=num_blocks,
+            backend="cute_dsl",
+        )
+
+
+def test_cake_backend_requires_out():
+    """backend='cake' must raise ValueError when out= is omitted."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    with pytest.raises(ValueError, match="requires a caller-owned out tensor"):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            tma_descriptor_workspace=workspace,
+            backend="cake",
+        )
+
+
+def test_cake_backend_requires_tma_workspace():
+    """backend='cake' must raise ValueError when tma_descriptor_workspace= is omitted."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+    out = torch.empty(
+        batch, num_heads, seqlen, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    with pytest.raises(ValueError, match="requires tma_descriptor_workspace"):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            out=out,
+            backend="cake",
+        )
+
+
+def test_unsupported_backend():
+    """An unknown backend name must raise ValueError."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+    with pytest.raises(ValueError, match="unsupported SM120 Sage backend"):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            backend="unknown",
         )

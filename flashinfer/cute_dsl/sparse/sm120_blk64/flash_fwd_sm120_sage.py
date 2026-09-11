@@ -18,11 +18,9 @@
 # infrastructure, but QK runs through a custom INT8 warp MMA (MmaInt8Op, the
 # SM80-era m16n8k32 s8s8s32 atom -- SM120 has no newer native INT8 tensor-core
 # instruction) with an INT32 accumulator folded straight into a log2-domain
-# online softmax, and PV runs through the native FP8 warp MMA. Does not
-# compute LSE (matches the upstream kernel; flashinfer's own vsa_sm120_blk64
-# bf16/fp16 kernel does compute LSE, but this Sage kernel is exposed as a
-# standalone function, not through the BlockSparseAttentionWrapper/
-# _vsa_run_core dispatch path that requires it).
+# online softmax, and PV runs through the native FP8 warp MMA.
+# Does not compute LSE; exposed as a standalone function rather than through
+# BlockSparseAttentionWrapper/_vsa_run_core.
 
 import math
 import operator
@@ -40,9 +38,13 @@ import cuda.bindings.driver as cuda
 from . import layout_utils
 from . import kernel_utils
 from .batched_static_scheduler import BatchedStaticSchedulerMixin
+from .flash_fwd_sm120 import mask as _mask_fp8
 
 
 SM120_SAGE_FWD_BLOCK_SIZE = 64
+# Coupled to SAGE_V_SCALE_MAX (sage_quant_sm120.py): the FP16 PV accumulator
+# overflows if FP8_MAX(448) * SAGE_V_SCALE_MAX * K_tile(64) >= 65504.
+# Raising this scale or the K-tile size requires re-checking that bound.
 SAGE_P_QUANT_SCALE = 256.0
 SAGE_P_QUANT_LOG2_SCALE = math.log2(SAGE_P_QUANT_SCALE)
 SAGE_P_RESCALE_THRESHOLD = math.log2(448.0 / SAGE_P_QUANT_SCALE)
@@ -115,6 +117,12 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
             "Only block_size_n=64 is supported in this kernel."
         )
         self.num_threads = 128
+        # kv_stage is fixed at 1: the Sage kernel's smem and register footprint
+        # (INT8 Q/K + FP8 V tiles + FP8 P fragment + FP32/FP16 accumulators)
+        # leaves insufficient resources on SM120 to open a second pipeline stage.
+        # V's smem index is therefore always 0 (== K_consumer_state.index when
+        # kv_stage == 1), which is why it is hardcoded rather than tracked via
+        # V_consumer_state.index.
         self.kv_stage = 1
         self.q_stage = 1
 
@@ -962,21 +970,6 @@ def _load_sage_k_scale_int8(
     """Load the single Sage K64 descale for one physical KV tile."""
     scale_idx = k_tile_idx if k_tile_idx < gKScale.shape[0] else gKScale.shape[0] - 1
     return gKScale[scale_idx]
-
-
-@cute.jit
-def _mask_fp8(
-    tSrS: cute.ThrMma,
-    tScS: cute.Tensor,
-    varblk: cutlass.Int32,
-):
-    tSrS_mn = layout_utils.reshape_acc_to_mn(tSrS)
-    tScS_mn = layout_utils.reshape_acc_to_mn(tScS)
-
-    for n in cutlass.range(cute.size(tSrS_mn, mode=[1]), unroll_full=True):
-        should_mask = tScS_mn[0, n][1] >= varblk
-        for m in cutlass.range(cute.size(tSrS_mn, mode=[0]), unroll_full=True):
-            tSrS_mn[m, n] = -cutlass.Float32.inf if should_mask else tSrS_mn[m, n]
 
 
 @cute.jit

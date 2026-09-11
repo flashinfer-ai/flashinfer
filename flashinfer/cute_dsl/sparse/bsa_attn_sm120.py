@@ -52,37 +52,75 @@ def _prepare_sm120_sparse_metadata(
     device: torch.device,
 ):
     """Validate and transpose SM120 sparse metadata into kernel ABI layout."""
-    assert q2k_block_index.dtype == torch.int32
-    assert q2k_block_index.device == device
-    assert q2k_block_index.shape[:3] == (batch_size, num_heads, num_q_blocks)
+    if q2k_block_index.dtype != torch.int32:
+        raise TypeError(f"q2k_block_index must be int32, got {q2k_block_index.dtype}")
+    if q2k_block_index.device != device:
+        raise ValueError(
+            f"q2k_block_index must be on {device}, got {q2k_block_index.device}"
+        )
+    if q2k_block_index.shape[:3] != (batch_size, num_heads, num_q_blocks):
+        raise ValueError(
+            f"q2k_block_index.shape {tuple(q2k_block_index.shape)} must start with "
+            f"(batch={batch_size}, num_heads={num_heads}, num_q_blocks={num_q_blocks})"
+        )
 
     has_block_nums = q2k_block_nums is not None and q2k_block_nums.numel() > 0
     if has_block_nums:
-        assert q2k_block_nums.dtype == torch.int32
-        assert q2k_block_nums.device == device
-        assert q2k_block_nums.shape == (batch_size, num_heads, num_q_blocks)
+        if q2k_block_nums.dtype != torch.int32:
+            raise TypeError(f"q2k_block_nums must be int32, got {q2k_block_nums.dtype}")
+        if q2k_block_nums.device != device:
+            raise ValueError(
+                f"q2k_block_nums must be on {device}, got {q2k_block_nums.device}"
+            )
+        if q2k_block_nums.shape != (batch_size, num_heads, num_q_blocks):
+            raise ValueError(
+                f"q2k_block_nums.shape {tuple(q2k_block_nums.shape)} must be "
+                f"(batch={batch_size}, num_heads={num_heads}, num_q_blocks={num_q_blocks})"
+            )
         q2k_block_nums = q2k_block_nums.contiguous()
     else:
-        assert 1 <= block_sparse_num <= q2k_block_index.shape[-1]
+        capacity = q2k_block_index.shape[-1]
+        if not (0 <= block_sparse_num <= capacity):
+            raise ValueError(
+                f"block_sparse_num ({block_sparse_num}) must be in [0, capacity={capacity}]"
+            )
 
     has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
     block_sizes_mode = 0
     if has_block_sizes:
-        assert block_sizes.dtype == torch.int32
-        assert block_sizes.device == device
+        if block_sizes.dtype != torch.int32:
+            raise TypeError(f"block_sizes must be int32, got {block_sizes.dtype}")
+        if block_sizes.device != device:
+            raise ValueError(
+                f"block_sizes must be on {device}, got {block_sizes.device}"
+            )
         if block_sizes.ndim == 1:
-            assert block_sizes.shape == (num_kv_blocks,)
+            if block_sizes.shape != (num_kv_blocks,):
+                raise ValueError(
+                    f"block_sizes.shape {tuple(block_sizes.shape)} must be ({num_kv_blocks},)"
+                )
             block_sizes_t = block_sizes.contiguous()
             block_sizes_mode = 1
         elif block_sizes.ndim == 2:
-            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            if block_sizes.shape != (batch_size, num_kv_blocks):
+                raise ValueError(
+                    f"block_sizes.shape {tuple(block_sizes.shape)} must be "
+                    f"({batch_size}, {num_kv_blocks})"
+                )
             block_sizes_t = block_sizes.contiguous().permute(1, 0)
             block_sizes_mode = 2
-        else:
-            assert block_sizes.ndim == 3
-            assert block_sizes.shape == (batch_size, num_heads, num_kv_blocks)
+        elif block_sizes.ndim == 3:
+            if block_sizes.shape != (batch_size, num_heads, num_kv_blocks):
+                raise ValueError(
+                    f"block_sizes.shape {tuple(block_sizes.shape)} must be "
+                    f"({batch_size}, {num_heads}, {num_kv_blocks})"
+                )
             block_sizes_t = block_sizes.contiguous().permute(2, 1, 0)
             block_sizes_mode = 3
+        else:
+            raise ValueError(
+                f"block_sizes must be 1D, 2D, or 3D, got {block_sizes.ndim}D"
+            )
 
     # (B, H, Q, K) -> (K, Q, H, B)
     q2k_t = q2k_block_index.contiguous().permute(3, 2, 1, 0)
@@ -544,24 +582,24 @@ def bsa_attn_sm120_blk64_sage_fwd(
     tma_descriptor_workspace: Optional[torch.Tensor] = None,
     uniform_block_count: bool = False,
     contiguous_block_indices: bool = False,
-    backend: str = "cute_dsl",
+    backend: str = "cake",
 ) -> torch.Tensor:
     """Run prequantized SM120 Sage block-sparse attention.
 
     Supports two backends selected via ``backend``:
 
-    ``"cute_dsl"`` (default)
+    ``"cake"`` (default)
+        tvm-ffi generated kernel. All CUDA storage is caller-owned: ``out``
+        and ``tma_descriptor_workspace`` are required keyword arguments.
+        ``uniform_block_count`` and ``contiguous_block_indices`` tuning flags
+        are only honoured by this backend.
+
+    ``"cute_dsl"``
         CuTe-DSL port of upstream Block-Sparse-Attention. Uses BHSD tensor
         layout throughout, allocates ``out`` internally when not provided,
         and does not require ``tma_descriptor_workspace``. Supports SM120
         only (exact compute capability 12.0), MHA only, head dimension 128,
         non-causal forward without LSE.
-
-    ``"cake"``
-        tvm-ffi generated kernel. All CUDA storage is caller-owned: ``out``
-        and ``tma_descriptor_workspace`` are required keyword arguments.
-        ``uniform_block_count`` and ``contiguous_block_indices`` tuning flags
-        are only honoured by this backend.
 
     Parameters
     ----------
@@ -608,7 +646,7 @@ def bsa_attn_sm120_blk64_sage_fwd(
         Whether selected block indices are contiguous. Requires
         ``uniform_block_count=True``. Only used by ``backend="cake"``.
     backend : str
-        Backend name. ``"cute_dsl"`` (default) or ``"cake"``.
+        Backend name. ``"cake"`` (default) or ``"cute_dsl"``.
 
     Returns
     -------
@@ -723,6 +761,16 @@ def bsa_attn_sm120_blk64_sage_fwd(
 
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
+    if isinstance(softmax_scale, bool) or not isinstance(softmax_scale, (int, float)):
+        raise TypeError("softmax_scale must be a number")
+    if not math.isfinite(float(softmax_scale)) or float(softmax_scale) <= 0.0:
+        raise ValueError("softmax_scale must be finite and positive")
+
+    if q_int8.device.index != torch.cuda.current_device():
+        raise ValueError(
+            f"q_int8 is on cuda:{q_int8.device.index} but the current CUDA device is "
+            f"cuda:{torch.cuda.current_device()}; inputs must reside on the current device"
+        )
 
     if out is not None:
         if out.dtype != torch.bfloat16:
@@ -732,6 +780,10 @@ def bsa_attn_sm120_blk64_sage_fwd(
                 f"out.shape {tuple(out.shape)} must be "
                 f"(batch={batch}, num_heads={num_heads}, seqlen_q={seqlen_q}, head_dim={head_dim})"
             )
+        if out.device != q_int8.device:
+            raise ValueError(f"out must be on {q_int8.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
     else:
         out = torch.empty(
             (batch, num_heads, seqlen_q, head_dim),

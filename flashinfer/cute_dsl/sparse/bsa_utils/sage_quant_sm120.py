@@ -17,10 +17,8 @@
 # QK-INT8 / PV-FP8 operand layout consumed by
 # flash_fwd_sm120_sage.BlockSparseAttnForwardSageSm120Blk64.
 #
-# Phase-1 scope note: unlike upstream, this module has no AOT-compiled quant
-# runtime fallback and no external-workspace reuse parameter -- both are
-# optional performance paths, not required for correctness. Only the plain
-# Triton JIT path is ported here.
+# No AOT-compiled quant runtime fallback and no external-workspace reuse
+# parameter -- both are optional performance paths, not required for correctness.
 
 from typing import Optional, Sequence
 
@@ -34,6 +32,10 @@ SAGE_Q_BLOCK_SIZE = 128
 SAGE_K_BLOCK_SIZE = 64
 SAGE_KV_STATS_CHUNK = 256
 SAGE_HEAD_DIM = 128
+# FP16 PV accumulator overflow constraint: the worst-case PV tile sum must
+# stay below FP16_MAX (65504).  With FP8-E4M3 max 448 and a K-tile of 64
+# tokens: 448 * SAGE_V_SCALE_MAX * 64 = 64512 < 65504.  If SAGE_P_QUANT_SCALE
+# (flash_fwd_sm120_sage.py) or the K-tile size changes, re-verify this bound.
 SAGE_V_SCALE_MAX = 2.25
 
 
