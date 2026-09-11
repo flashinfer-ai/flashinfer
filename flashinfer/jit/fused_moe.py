@@ -455,3 +455,56 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
     )
+
+
+def gen_trtllm_gen_moe_finalize_module() -> JitSpec:
+    """JitSpec for the standalone trtllm-gen MoE finalize stage.
+
+    Compiles only the finalize/dev kernels (trtllm_fused_moe_dev_kernel.cu)
+    plus its binding, so the token-combine stage can be built and tested
+    without the batched-GEMM stack of fused_moe_trtllm_sm100. Only the BMM
+    export headers are needed (for btg::Dtype et al.), not the GEMM cubins.
+    """
+    checksum = get_artifact(
+        f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
+    )
+    assert checksum, "Failed to get checksums.txt"
+    bmm_export_path = f"{ArtifactPath.TRTLLM_GEN_BMM}/include/trtllmGen_bmm_export"
+    for header in BMM_EXPORT_HEADERS:
+        h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
+        assert h, f"{header} not found"
+    symlink_path = (
+        jit_env.FLASHINFER_CUBIN_DIR
+        / "flashinfer"
+        / "trtllm"
+        / "batched_gemm"
+        / "trtllmGen_bmm_export"
+    )
+    ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
+    verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+
+    nvcc_flags = [
+        "-DTLLM_GEN_EXPORT_INTERFACE",
+        "-DTLLM_ENABLE_CUDA",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+    ] + current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 12]
+    )
+
+    return gen_jit_spec(
+        "trtllm_gen_moe_finalize",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_finalize_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR,
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
+            jit_env.FLASHINFER_CUBIN_DIR,
+        ],
+    )

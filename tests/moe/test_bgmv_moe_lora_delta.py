@@ -349,3 +349,69 @@ def _ref_fc2_delta_with_zeroed_inactive(
             b = lora_b[0][lid, e].float()
             out[t] += scale * w * (b @ (a @ a_vec))
     return out
+
+
+@pytest.mark.parametrize("T", [4, 16])
+@pytest.mark.parametrize("rank", [16, 32])
+def test_gemm2_delta_fused_finalize_equivalence(T, rank):
+    """The FC2 delta folded into trtllm_gen_moe_finalize must match the current
+    flow (finalize without delta, then a separate addition of the bgmv delta)."""
+    _skip_if_unsupported_sm()
+    major, _ = torch.cuda.get_device_capability()
+    if major != 10:
+        pytest.skip("trtllm_gen_moe_finalize requires SM100/SM103")
+    from flashinfer.fused_moe import trtllm_gen_moe_finalize
+
+    device = torch.device("cuda")
+    torch.manual_seed(4)
+    num_experts, k, max_loras = 8, 2, 4
+    hidden, inter = 768, 768
+    scale = 0.5
+    P = T * k
+
+    lora_a = [
+        torch.randn(
+            max_loras, num_experts, rank, inter, dtype=torch.bfloat16, device=device
+        )
+        * 0.02
+    ]
+    lora_b = [
+        torch.randn(
+            max_loras, num_experts, hidden, rank, dtype=torch.bfloat16, device=device
+        )
+        * 0.02
+    ]
+    topk_ids, topk_weights, lora_ids = _make_routing(
+        T, k, num_experts, max_loras, device
+    )
+    act_perm = torch.randn(P, inter, dtype=torch.bfloat16, device=device) * 0.1
+    perm = torch.randperm(P, dtype=torch.int64, device=device)
+
+    w_ptr_a, stride_a = _build_w_ptr(lora_a, num_experts)
+    w_ptr_b, stride_b = _build_w_ptr(lora_b, num_experts)
+    delta = bgmv_moe_gemm2_lora_delta(
+        act_perm,
+        perm,
+        w_ptr_a,
+        stride_a,
+        w_ptr_b,
+        stride_b,
+        topk_ids,
+        topk_weights,
+        lora_ids,
+        rank,
+        hidden,
+        scale=scale,
+    )
+
+    # Synthetic unfinalized FC2 output for the same routing.
+    gemm2_output = torch.randn(P, hidden, dtype=torch.bfloat16, device=device) * 0.1
+    expert_weights = topk_weights.to(torch.bfloat16)
+    e2p = perm.to(torch.int32)
+
+    base = trtllm_gen_moe_finalize(gemm2_output, expert_weights, e2p)
+    fused = trtllm_gen_moe_finalize(gemm2_output, expert_weights, e2p, lora_delta=delta)
+
+    torch.testing.assert_close(
+        fused.float(), base.float() + delta.float(), atol=2e-2, rtol=2e-2
+    )

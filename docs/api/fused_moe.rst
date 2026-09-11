@@ -242,6 +242,19 @@ can be used (and tested) independently of quantization and GEMM configuration.
     trtllm_gen_routing
     TrtllmGenRoutingResult
 
+Standalone TRT-LLM Gen Finalize
+-------------------------------
+
+The token-combine (finalize) stage the TRT-LLM Gen fused MoE launchers run
+when ``do_finalize=True``, exposed on its own so callers holding the
+``do_finalize=False`` outputs can complete the combine separately — optionally
+fusing in a per-token delta such as a LoRA down-projection delta.
+
+.. autosummary::
+    :toctree: ../generated
+
+    trtllm_gen_moe_finalize
+
 CuteDSL Fused MoE
 -----------------
 

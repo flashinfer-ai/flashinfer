@@ -395,6 +395,22 @@ struct Data {
   // Hidden dimension output stride of FC2.
   int32_t hiddenDimPadded;
   int32_t const* totalNumPaddedTokens;
+
+  // Optional auxiliary delta fused into the token combine (e.g. a LoRA
+  // down-projection delta). Disabled when loraDeltaPtr is nullptr. The delta
+  // dtype matches the output dtype; rows are contiguous over the unpadded
+  // hiddenDim. loraTopK selects the layout:
+  //   1    -> [numTokens, hiddenDim], one pre-combined row per token
+  //   topK -> [numTokens, topK, hiddenDim], one row per (token, slot)
+  // Rows are addressed by expandedIdx = tokenIdx * loraTopK + k, NOT through
+  // the permutation: inactive slots (expandedIdxToPermutedIdx == -1) are still
+  // accumulated, so the producer must zero-fill their delta rows.
+  void const* loraDeltaPtr = nullptr;
+  int32_t loraTopK = 0;
+  float loraDeltaScale = 1.0f;
+  // Multiply each per-slot delta row by expertWeightsPtr[expandedIdx].
+  // Requires loraTopK == topK and expertWeightsPtr != nullptr.
+  bool loraApplyExpertWeights = false;
 };
 
 template <typename Type_, typename TypeExpW_, int TopKUnrollFactor_, bool UsePdl_>
@@ -420,6 +436,11 @@ struct KernelParams {
   int32_t topK;
   int32_t const* totalNumPaddedTokens;
 
+  Type const* loraDeltaPtr;
+  int32_t loraTopK;
+  float loraDeltaScale;
+  bool loraApplyExpertWeights;
+
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
 
@@ -437,6 +458,11 @@ struct KernelParams {
     params.numExperts = data.numExperts;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+
+    params.loraDeltaPtr = (Type const*)data.loraDeltaPtr;
+    params.loraTopK = data.loraTopK;
+    params.loraDeltaScale = data.loraDeltaScale;
+    params.loraApplyExpertWeights = data.loraApplyExpertWeights;
 
     return params;
   }

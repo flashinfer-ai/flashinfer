@@ -148,6 +148,10 @@ from .trtllm_gen_routing import (  # noqa: F401
     trtllm_gen_routing as trtllm_gen_routing,
 )
 
+from .trtllm_gen_finalize import (  # noqa: F401
+    trtllm_gen_moe_finalize as trtllm_gen_moe_finalize,
+)
+
 from .bgmv_moe import (  # noqa: F401
     BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     bgmv_moe as bgmv_moe,
@@ -307,6 +311,7 @@ __all__ = [
     "hash_topk",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
+    "trtllm_gen_moe_finalize",
     "bgmv_moe",
     "BGMVMoEBlackwellPlan",
     "bgmv_moe_shrink",
