@@ -173,6 +173,42 @@ _CASES = json.loads(r"""[
         }
     },
     {
+        "name": "ut_noncontiguous_topk_ragged_k",
+        "params": {
+            "batch_size": 1,
+            "benchmark": false,
+            "block_sizes_mode": 0,
+            "check_correctness": true,
+            "empty_first_row": false,
+            "noncontiguous_topk": true,
+            "num_heads": 4,
+            "position_sensitive": false,
+            "seed": 4951,
+            "selected_blocks": 16,
+            "seqlen_k": 4000,
+            "seqlen_q": 4000,
+            "softmax_scale": "default"
+        }
+    },
+    {
+        "name": "ut_noncontiguous_topk_ragged_k_unaligned_tail",
+        "params": {
+            "batch_size": 1,
+            "benchmark": false,
+            "block_sizes_mode": 0,
+            "check_correctness": true,
+            "empty_first_row": false,
+            "noncontiguous_topk": true,
+            "num_heads": 4,
+            "position_sensitive": false,
+            "seed": 4951,
+            "selected_blocks": 16,
+            "seqlen_k": 4033,
+            "seqlen_q": 128,
+            "softmax_scale": "default"
+        }
+    },
+    {
         "name": "ut_empty_first_row",
         "params": {
             "batch_size": 1,
@@ -397,6 +433,10 @@ def _make_inputs(params, *, device):
             + 0.25
         )
 
+    if bool(params.get("noncontiguous_topk", False)):
+        # Make attention to padded tokens fail the numerical comparison.
+        logical_v[..., seqlen_k:] = 64.0
+
     inverse_perm = torch.tensor(_V_INVERSE_PERM, dtype=torch.long, device=device)
     v_fp8 = logical_v.view(batch, heads, _HEAD_DIM, k_blocks * 4, 16)
     v_fp8 = v_fp8.index_select(-1, inverse_perm).reshape(
@@ -419,6 +459,22 @@ def _make_inputs(params, *, device):
     q2k = ((batch_coord * 3 + head_coord * 5 + query_coord * 7 + slot) % k_blocks).to(
         torch.int32
     )
+    if bool(params.get("noncontiguous_topk", False)):
+        # Always select the partial tail and exclude its predecessor so every
+        # row has a gap, even if its random top-k happens to be consecutive.
+        scores = torch.rand(
+            (batch, heads, q_blocks, k_blocks - 2),
+            device=device,
+            generator=generator,
+        )
+        selected = scores.topk(selected_blocks - 1, dim=-1).indices
+        tail = torch.full(
+            (batch, heads, q_blocks, 1),
+            k_blocks - 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        q2k = torch.cat((selected, tail), dim=-1).sort(dim=-1).values.to(torch.int32)
     q2k = q2k.contiguous()
     q2k_nums = torch.full(
         (batch, heads, q_blocks),
@@ -564,6 +620,13 @@ def test_cake_sage_block_sparse_attention(case):
     softmax_scale = (
         None if params["softmax_scale"] == "default" else float(params["softmax_scale"])
     )
+    noncontiguous_topk = bool(params.get("noncontiguous_topk", False))
+    if noncontiguous_topk:
+        q2k = inputs["q2k_block_index"]
+        tail_block = _ceil_div(int(params["seqlen_k"]), _BLOCK) - 1
+        assert torch.all(q2k[..., -1] == tail_block).item()
+        assert torch.all(torch.any(q2k[..., 1:] - q2k[..., :-1] > 1, dim=-1)).item()
+    uniform_contiguous = not bool(params["empty_first_row"]) and not noncontiguous_topk
 
     returned = bsa_attn_sm120_blk64_sage_fwd(
         inputs["Q"],
@@ -579,8 +642,8 @@ def test_cake_sage_block_sparse_attention(case):
         softmax_scale=softmax_scale,
         out=inputs["O"],
         tma_descriptor_workspace=workspace,
-        uniform_block_count=not bool(params["empty_first_row"]),
-        contiguous_block_indices=not bool(params["empty_first_row"]),
+        uniform_block_count=uniform_contiguous,
+        contiguous_block_indices=uniform_contiguous,
         backend="cake",
     )
 
