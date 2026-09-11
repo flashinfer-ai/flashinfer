@@ -332,6 +332,18 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     SUPPORTED_HEAD_TILES = [32, 64, 128, 256]
     SUPPORTED_PAGE_SIZES = SUPPORTED_PAGE_SIZES
     MMA_TILER = (16, 8, 32)  # mma.sync.aligned.m16n8k32
+    # FP8 P pre-scale: exponent offset added to P so that P*2^offset fills more
+    # of E4M3's [0, 448] normal range before the PV MMA. P in (0, 1] would put
+    # every weight below 2^-6 into the subnormal staircase (2^-9 absolute
+    # steps, up to +/-25% relative error) and every weight below 2^-10 rounds
+    # to ZERO, while row_sum keeps the unquantized fp32 P - so diffuse-softmax
+    # mass silently vanishes from the numerator only. offset =
+    # floor(log2(448)) = 8 (same derivation as the SM100 cute-dsl backend's
+    # p_fp8_prescale_log2) moves the flush boundary to 2^-18 and keeps
+    # P*2^8 <= 256 < 448, so no satfinite clamping occurs. The offset scales
+    # the numerator (O accumulator) and denominator (row_sum) identically and
+    # cancels in O = acc/row_sum; only the LSE needs the explicit -offset.
+    P_FP8_PRESCALE_LOG2 = 8.0
     # Barrier 0 is the CTA-wide initialization barrier; barrier 1 synchronizes
     # compute warps before the K/V storage is aliased for the output epilogue.
     COMPUTE_BARRIER_ID = 1
@@ -1187,7 +1199,11 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # anchor to avoid -inf - -inf = NaN while preserving zero P.
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
+            # The pre-scale offset rides along in the exp2 exponent: masked
+            # entries stay -inf (exp2 -> 0) and the row max still gives 256.
+            neg_exp_max_scaled = (
+                -(exp_max * softmax_scale_log2) + self.P_FP8_PRESCALE_LOG2
+            )
             tile_sum0 = cutlass.Float32(0.0)
             tile_sum1 = cutlass.Float32(0.0)
             p_even0 = cutlass.Float32(0.0)
@@ -1354,7 +1370,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             if cutlass.const_expr(is_masked_frontier_tile):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
+            neg_exp_max_scaled = (
+                -(exp_max * softmax_scale_log2) + self.P_FP8_PRESCALE_LOG2
+            )
             tile_sum0 = cutlass.Float32(0.0)
             tile_sum1 = cutlass.Float32(0.0)
             p_even0 = cutlass.Float32(0.0)
@@ -2492,6 +2510,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             #
             #   log2(sum(exp(score * scale)))
             #     = row_max * scale * log2(e) + log2(row_sum).
+            #
+            # row_sum carries the P pre-scale factor 2^P_FP8_PRESCALE_LOG2,
+            # so undo it here to keep the LSE exact.
             if cutlass.const_expr(lse is not None):
                 if lane_mod4 == 0:
                     for row_half in cutlass.range_constexpr(2):
@@ -2508,8 +2529,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             lse[
                                 q_token_base + lse_q_seq_idx,
                                 q_head_idx,
-                            ] = lse_row_max * softmax_scale_log2 + cute.math.log2(
-                                lse_row_sum, fastmath=True
+                            ] = (
+                                lse_row_max * softmax_scale_log2
+                                + cute.math.log2(lse_row_sum, fastmath=True)
+                                - self.P_FP8_PRESCALE_LOG2
                             )
 
             # No compute warp may alias sKV as sO while a peer still reads the
