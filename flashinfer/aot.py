@@ -823,12 +823,15 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
-            jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
             # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        if has_sm100a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm100a"))
+        if has_sm103a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm103a"))
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is
