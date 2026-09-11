@@ -6175,7 +6175,6 @@ class MegaMoeFc12Runner(MoERunner):
         self._sort_buffers: Optional[dict[str, torch.Tensor]] = None
         self._permuted_input: Optional[torch.Tensor] = None
         self._permuted_output: Optional[torch.Tensor] = None
-        self._expert_end_offsets: Optional[torch.Tensor] = None
         self._launcher: Any = None
         self.tuning_config = TuningConfig()
 
@@ -6225,9 +6224,6 @@ class MegaMoeFc12Runner(MoERunner):
             (max_rows, hidden), dtype=torch.bfloat16, device=self.device
         )
         self._permuted_output = torch.empty_like(self._permuted_input)
-        self._expert_end_offsets = torch.empty(
-            (num_local_experts,), dtype=torch.int32, device=self.device
-        )
         launcher_cls = (
             Bf16Mxfp8Fc12Launcher
             if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.BF16)
@@ -6316,7 +6312,6 @@ class MegaMoeFc12Runner(MoERunner):
         assert self._sort_buffers is not None
         assert self._permuted_input is not None
         assert self._permuted_output is not None
-        assert self._expert_end_offsets is not None
         assert self._launcher is not None
         from .cute_dsl.moe_utils import moe_permute, moe_sort, moe_unpermute
         from .megamoe_fc12 import Bf16Fc12Inputs
@@ -6345,7 +6340,6 @@ class MegaMoeFc12Runner(MoERunner):
             **self._sort_buffers,
         )
         assert local_expert_counts is not None
-        torch.cumsum(local_expert_counts, dim=0, out=self._expert_end_offsets)
         moe_permute(
             hidden_states,
             self._permuted_input,
@@ -6363,7 +6357,7 @@ class MegaMoeFc12Runner(MoERunner):
                 fc1_weight,
                 fc2_weight,
                 self._permuted_output,
-                self._expert_end_offsets,
+                local_expert_counts,
                 (inputs[6] if len(inputs) > 6 else None),
                 (inputs[7] if len(inputs) > 7 else None),
             )

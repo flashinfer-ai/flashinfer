@@ -592,12 +592,12 @@ def moe_sort(
         out_total_num_padded_tokens: Pre-allocated buffer for total_num_padded_tokens.
         out_num_non_exiting_tiles: Pre-allocated buffer for num_non_exiting_tiles.
         out_expert_counts: Optional pre-allocated ``2 * num_experts`` int32
-            buffer. When supplied, its local-expert slice is filled by a
-            dedicated post-routing histogram and exposed as
-            ``result.expert_counts``.
+            buffer. Routing uses the first half as the histogram and the
+            second half as per-expert tile cursors. Its local-expert slice is
+            returned as the final value.
 
     Returns:
-        tuple: A tuple of 6 elements:
+        tuple: A tuple of 7 elements:
             - tile_idx_to_expert_idx: [max_num_tiles], int32
                 Mapping from tile index to local expert index (0 to num_local_experts-1).
             - tile_idx_to_mn_limit: [max_num_tiles], int32
@@ -611,9 +611,8 @@ def moe_sort(
                 Total number of padded tokens. Returned as tensor for CUDA graph compatibility.
             - num_non_exiting_tiles: [1], int32 (device tensor)
                 Number of non-exiting (active) tiles.
-            - expert_counts: [num_local_experts], int32 local routing histogram
-              available as an attribute when ``out_expert_counts`` is supplied,
-              without changing six-value unpacking.
+            - expert_counts: [num_local_experts], int32 local routing histogram,
+              or None when ``out_expert_counts`` is not supplied.
 
     Example:
         >>> import torch
@@ -720,9 +719,6 @@ def moe_sort(
             "out_expert_counts must be an int32 tensor with at least "
             f"2 * num_experts ({2 * num_experts}) entries."
         )
-    # Small/cluster routing paths use mPtrExpertCounts as internal scratch and
-    # do not promise its final contents.  When requested, the binding fills
-    # out_expert_counts with a dedicated post-routing histogram instead.
     routing_expert_counts = out_expert_counts
     if routing_expert_counts is None and num_tokens > 1024:
         routing_expert_counts = torch.empty(

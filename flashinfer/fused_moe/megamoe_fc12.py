@@ -116,7 +116,7 @@ class Bf16Fc12Inputs:
     fc1_weight: torch.Tensor
     fc2_weight: torch.Tensor
     output: torch.Tensor
-    expert_end_offsets: torch.Tensor
+    expert_token_sizes: torch.Tensor
     fc1_weight_sf: Optional[torch.Tensor] = None
     fc2_weight_sf: Optional[torch.Tensor] = None
 
@@ -167,7 +167,9 @@ class Bf16Fc12Launcher:
             "fc2_output": self._to_cute(inputs.output),
             "topk_scores": self._to_cute(unit_scores),
             "fc1_done_counter": self._to_cute(fc1_done_counter, assumed_align=4),
-            "offs": self._to_cute(inputs.expert_end_offsets, assumed_align=4),
+            "expert_token_sizes": self._to_cute(
+                inputs.expert_token_sizes, assumed_align=4
+            ),
             "stream": cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         }
 
@@ -277,7 +279,9 @@ class Bf16Mxfp8Fc12Launcher(Bf16Fc12Launcher):
             "fc2_output": self._to_cute(inputs.output.reshape(-1, 1, self.hidden)),
             "topk_scores": self._to_cute(unit_scores),
             "fc1_done_counter": self._to_cute(fc1_done_counter, assumed_align=4),
-            "offs": self._to_cute(inputs.expert_end_offsets, assumed_align=4),
+            "expert_token_sizes": self._to_cute(
+                inputs.expert_token_sizes, assumed_align=4
+            ),
             "stream": cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         }
 
