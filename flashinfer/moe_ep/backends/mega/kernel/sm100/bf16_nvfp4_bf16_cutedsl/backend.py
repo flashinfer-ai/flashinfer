@@ -40,6 +40,7 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
         self._autotune_pending = config.knobs == "auto"
+        self._autotune_winner: dict | None = None
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return bf16_cutedsl_runtime_requirements(bootstrap)
@@ -191,13 +192,15 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             from ......cute_dsl.megamoe.nvfp4_w4a16 import autotune_w4a16_mega_moe
 
-            autotune_w4a16_mega_moe(
-                output,
-                transformed_weights[0],
-                transformed_weights[1],
-                workspace,
-                num_tokens=output.shape[0],
-                gate_up_clamp=self._kernel_config.gate_up_clamp,
+            self._autotune_winner = dict(
+                autotune_w4a16_mega_moe(
+                    output,
+                    transformed_weights[0],
+                    transformed_weights[1],
+                    workspace,
+                    num_tokens=output.shape[0],
+                    gate_up_clamp=self._kernel_config.gate_up_clamp,
+                )
             )
             self._autotune_pending = False
         w4a16_mega_moe(
