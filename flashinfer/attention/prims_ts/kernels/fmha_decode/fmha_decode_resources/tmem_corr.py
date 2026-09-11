@@ -39,6 +39,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import FP8_P_QUANT_SCALE
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     Constexpr,
@@ -1048,8 +1049,17 @@ class TmemCorrResource(DecodeGenResourceBase):
         reduce_row_idx: Int32,
         sum_val: Float32,
         max_val: Float32,
+        *,
+        restores_fp8_partial_scale: Constexpr[bool] = True,
     ) -> tuple[Int64, Float32]:
-        """Resolve one logical row's output address and normalization once."""
+        """Resolve one logical row's output address and normalization once.
+
+        FP8 O accumulators and row sums both carry the 448 P scale. Tails that
+        normalize the FP32 accumulator directly pass
+        ``restores_fp8_partial_scale=False`` so the two cancel; the fused split
+        reducers keep the default because their partials were divided by 448
+        before narrowing to 16 bits.
+        """
         cfg = self.cfg
         attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
         attention_sink_head_idx = _local_head_from_q_output_row(
@@ -1069,11 +1079,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_qkv and restores_fp8_partial_scale):
             # Since P is scaled to [0, 448] for Fused GMEM/cluster FP8-Q,
             # divide the partial O by 448 before narrowing it to 16 bits,
             # and restore after the partials have been reduced in FP32.
-            norm_scale *= Float32(448.0)
+            norm_scale *= Float32(FP8_P_QUANT_SCALE)
         physical_dst_row_idx = _q_physical_output_row_from_logical(
             cfg,
             self.h_r,
@@ -2541,6 +2551,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
                 if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                     partial_scale = self._separate_partial_norm_scale(denominator)
+                elif cutlass.const_expr(cfg.use_fp8_qkv):
+                    # Fused partials are narrowed to 16 bits unnormalized, so
+                    # remove the 448 P scale here; the reducer restores it.
+                    partial_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
                 partial_row_base = self._gmem_partial_row_offset(
                     logical_kv_idx,
                     cta_idx_kv,
@@ -2560,12 +2574,15 @@ class TmemCorrResource(DecodeGenResourceBase):
                     exchange_row_idx,
                     self.seq_len_q,
                 )
+                # The direct tail normalizes the FP32 accumulators, so the
+                # FP8 P scale in O and in the denominator cancel.
                 dst_row_base, norm_scale = self._softmax_output_row_state(
                     logical_h_k_idx,
                     logical_b_idx,
                     logical_output_row_idx,
                     denominator,
                     global_max,
+                    restores_fp8_partial_scale=False,
                 )
 
         for fragment in cutlass.range_constexpr(cfg.headdim // 32):
@@ -2938,7 +2955,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                 partial_norm_scale = self._separate_partial_norm_scale(reduced_sum_0)
             elif cutlass.const_expr(cfg.use_fp8_qkv):
-                partial_norm_scale = Float32(1.0 / 448.0)
+                partial_norm_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             partial_o_row_base = self._gmem_partial_row_offset(
                 logical_kv_idx,
@@ -3525,7 +3542,7 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    norm_scale = Float32(1.0 / 448.0)
+                    norm_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
                     if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                         norm_scale = self._separate_partial_norm_scale(
                             reduced_sum[scale_idx]
@@ -3990,7 +4007,7 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    norm_scale = Float32(1.0 / 448.0)
+                    norm_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
                     if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                         norm_scale = self._separate_partial_norm_scale(
                             reduced_sum[scale_idx]

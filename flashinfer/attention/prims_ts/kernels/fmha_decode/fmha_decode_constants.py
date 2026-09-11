@@ -18,6 +18,8 @@ Keep non-obvious integer constants here with their rationale so config,
 resource, and reduction code can use named values without duplicating comments.
 """
 
+import math
+
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
 # so auto split-KV selection remains deterministic in offline/test flows.
 FALLBACK_SM_COUNT_B200 = 148
@@ -120,6 +122,23 @@ TMEM_ROW_STRIDE = 16 << 16
 PACKED_REGISTER_BYTES = 4
 FP8_VALUES_PER_REG = 4
 FP16_VALUES_PER_REG = 2
+
+# K elements consumed by one tcgen05 MMA instruction: 32 bytes of the K-major
+# operand row, so 32 one-byte or 16 two-byte elements. A streamed K32 score
+# fragment therefore feeds one FP8 PV instruction or two 16-bit ones.
+FP8_MMA_K_STEP = 32
+FP16_MMA_K_STEP = 16
+
+# FP8 probabilities are quantized as 448 * p (the E4M3 maximum). Row sums and
+# attention-sink terms follow the same scale; the output normalization divides
+# it back out. The log2 form is the addend of the exp2-domain softmax.
+FP8_P_QUANT_SCALE = 448.0
+FP8_P_QUANT_LOG2_SCALE = math.log2(FP8_P_QUANT_SCALE)
+
+# tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
+# 128-byte swizzle atom spans one 128-byte row per K or MN index.
+SMEM_DESC_UNIT_BYTES = 16
+SWIZZLE_128B_ROW_BYTES = 128
 
 # Per-lane register ownership denominators for packed output fragments.
 FP8_OUTPUT_ELEMENTS_PER_REG_GROUP = 512

@@ -405,15 +405,20 @@ class SmemPResource(DecodeGenResourceBase):
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
         assert self._tmem_alloc.offset == self.tmem_s_ref._alloc.offset
-        # One FP32 score per column, two packed 16-bit probabilities per column.
+        # One FP32 score per column; two 16-bit or four FP8 probabilities per
+        # packed column.
         fragment_regs = cfg.softmax_score_fragment_regs
-        fragment_cols = fragment_regs // 2
+        fragment_cols = cfg.fragment_p_packed_cols
 
         new_max = new_max_arr[0]
         safe_new_max = new_max
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
         minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
+        if cutlass.const_expr(cfg.use_fp8_qkv):
+            # FP8 P carries the static 448 quantization scale; the row sums
+            # follow it and the epilogue divides it back out.
+            minus_max_scale += _fp8_log2_quant_scale()
         tmem_base = self._tmem_base_addr + Int32(self._tmem_alloc.offset)
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
@@ -447,12 +452,26 @@ class SmemPResource(DecodeGenResourceBase):
                         ),
                     )
 
-            packed_p = (
-                s_arr.data_ptr()
-                .load(count=fragment_regs, alignment=4)
-                .to(cfg.q_dtype)
-                .bitcast(Int32)
-            )
+            if cutlass.const_expr(cfg.use_fp8_qkv):
+                packed_regs = cutlass.Array(
+                    Int32, fragment_cols, space=cutlass.AddressSpace.rmem
+                )
+                for col_idx in cutlass.range_constexpr(fragment_cols):
+                    value_base = col_idx * 4
+                    packed_regs[col_idx] = _pack_float4_to_fp8_e4m3_inline(
+                        Float32(s_arr[value_base]),
+                        Float32(s_arr[value_base + 1]),
+                        Float32(s_arr[value_base + 2]),
+                        Float32(s_arr[value_base + 3]),
+                    )
+                packed_p = packed_regs.data_ptr().load(count=fragment_cols, alignment=4)
+            else:
+                packed_p = (
+                    s_arr.data_ptr()
+                    .load(count=fragment_regs, alignment=4)
+                    .to(cfg.q_dtype)
+                    .bitcast(Int32)
+                )
             _keeps_tcgen05_st(
                 cfg,
                 prims.make_tmem_ptr(tmem_base + fragment * Int32(fragment_cols), Int32),
@@ -1447,7 +1466,7 @@ class SmemPResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 # A streamed profile's four pipeline stages are K32 fragments of one P
                 # operand, not four independent full S/P stages.
-                p_stage_cols = cfg.softmax_score_fragment_regs // 2
+                p_stage_cols = cfg.fragment_p_packed_cols
             p_tmem_addr = self._tmem_base_addr + Int32(
                 self._tmem_alloc.offset + stage_info.stage_idx * p_stage_cols
             )
@@ -1489,8 +1508,7 @@ class SmemPResource(DecodeGenResourceBase):
         )
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
 
-        fragment_cols = cfg.softmax_score_fragment_regs // 2
         p_tmem_addr = self._tmem_base_addr + Int32(
-            self._tmem_alloc.offset + fragment_idx * fragment_cols
+            self._tmem_alloc.offset + fragment_idx * cfg.fragment_p_packed_cols
         )
         return p_tmem_addr

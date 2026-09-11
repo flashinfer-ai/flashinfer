@@ -36,6 +36,11 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import (
+    FP8_MMA_K_STEP,
+    FP8_P_QUANT_LOG2_SCALE,
+    FP16_MMA_K_STEP,
+)
 
 Constexpr = cutlass.Constexpr
 NEG_FLT_MAX = -3.4028235e38
@@ -161,7 +166,7 @@ def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
 
 def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one tcgen05 MMA instruction."""
-    return 32 if cfg.use_fp8_qkv else 16
+    return FP8_MMA_K_STEP if cfg.use_fp8_qkv else FP16_MMA_K_STEP
 
 
 @cute.jit
@@ -379,7 +384,7 @@ def _major_k_stride_bytes(dtype_bytes: int, headdim: int) -> int:
 @cute.jit
 def _fp8_log2_quant_scale() -> Float32:
     """Return log2 scaling used by FP8 probability quantization."""
-    return Float32(8.8073549)
+    return Float32(FP8_P_QUANT_LOG2_SCALE)
 
 
 def _neg_max_f32() -> Float32:

@@ -26,6 +26,7 @@ import pytest
 import torch
 
 HEAD_DIM = 128
+FP8 = torch.float8_e4m3fn
 Patterns = tuple[tuple[tuple[tuple[int, ...], ...], ...], ...]
 
 REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
@@ -33,6 +34,22 @@ REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="PrimTS block-sparse attention requires SM100 or SM103",
 )
+
+
+def dense_stream_columns(kv_tile_size: int, device: torch.device) -> list[torch.Tensor]:
+    """Return the tile columns of each online-softmax stream of a dense KV tile.
+
+    KV256 splits a tile into two spatial halves of two K64 atoms each; KV128
+    runs one stream over the whole tile.
+    """
+
+    tile_columns = torch.arange(kv_tile_size, device=device)
+    if kv_tile_size == 256:
+        return [
+            torch.cat((tile_columns[0:64], tile_columns[128:192])),
+            torch.cat((tile_columns[64:128], tile_columns[192:256])),
+        ]
+    return [tile_columns]
 
 
 def widest_bsr_row(patterns: Patterns) -> int:
