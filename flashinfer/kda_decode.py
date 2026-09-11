@@ -382,6 +382,11 @@ def fused_kda_decode(
     lower_bound: Optional[float] = -5.0,
     norm_eps: float = 1e-5,
     output: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
+    state_indices_mode: Optional[
+        Literal["positive_unique", "unique_or_null", "repeated_positive"]
+    ] = None,
 ) -> torch.Tensor:
     r"""Run the fused Kimi KDA decode pipeline.
 
@@ -440,6 +445,22 @@ def fused_kda_decode(
         output:
             Optional preallocated contiguous bfloat16 output with shape
             ``[1, num_rows, H, 128]``.
+        backend:
+            Implementation backend. ``"cute-dsl"`` preserves the existing
+            FlashInfer implementation. ``"cake"`` strictly selects an
+            exported Cake kernel and raises when no registered route matches.
+            ``"auto"`` selects Cake only when ``state_indices_mode`` is
+            supplied and a route matches on SM100a or SM103a, otherwise
+            preserving CuTe DSL. Each architecture uses its own compiled module.
+            Default: ``"cute-dsl"``.
+        state_indices_mode:
+            Host-known assertion about ``state_indices`` used only by the Cake
+            dispatcher. ``"positive_unique"`` means every index is positive
+            and unique; ``"unique_or_null"`` means positive indices are unique
+            and non-positive null rows may be present; ``"repeated_positive"``
+            means at least one positive slot repeats (null rows may also be
+            present). Required for ``backend="cake"``. The dispatcher never
+            reads the CUDA tensor to infer this property.
 
     Returns:
         The bfloat16 output tensor with shape ``[1, num_rows, H, 128]``.
@@ -461,6 +482,8 @@ def fused_kda_decode(
         lower_bound=lower_bound,
         norm_eps=norm_eps,
         output=output,
+        backend=backend,
+        state_indices_mode=state_indices_mode,
     )
 
 

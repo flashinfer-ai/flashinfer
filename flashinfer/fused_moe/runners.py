@@ -30,7 +30,7 @@ from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Mapping, Optional
+from typing import Any, ClassVar, List, Literal, Mapping, Optional
 
 import torch
 
@@ -669,41 +669,45 @@ class MoERunner(TunableRunner):
 
 
 # ---------------------------------------------------------------------------
-# Cake exact-SM103 NVFP4 warp-decode runner
+# Cake exact-SM100/SM103 NVFP4 warp-decode runner
 # ---------------------------------------------------------------------------
 
 
 class CakeWarpDecodeRunner(MoERunner):
-    """Exact-SM103 Cake runner for two calibrated NVFP4 decode geometries.
+    """Exact-SM100/SM103 Cake runner for calibrated NVFP4 decode geometries.
 
     The runner consumes the physical tensor view produced by
     :class:`TrtllmFp4Config`: packed E2M1 weights and activations, E4M3 block
-    scales, and per-expert FP32 epilogue scales. The generated kernel fixes
-    SwiGLU ``alpha=1`` and ``beta=0``; the compatible ``gemm1_alpha`` field in
-    the TRTLLM view is therefore not a launch argument.
+    scales, and per-expert FP32 epilogue scales. Supported SwiGLU geometries fix
+    ``alpha=1`` and ``beta=0``; the compatible ``gemm1_alpha`` field in the
+    TRTLLM view is therefore not a launch argument. Activation is identified by
+    the exact geometry and does not extend the tensor launch ABI.
     """
 
     backend_key = "cake"
     supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = (SwiGLU, SiLU)
     supports_expert_parallelism = False
 
-    _SUPPORTED_GEOMETRIES: ClassVar[set[tuple[int, int, int, int]]] = {
-        # hidden_size, intermediate_size, num_experts, top_k
-        (2048, 512, 512, 10),
-        (2048, 1536, 60, 4),
+    _SUPPORTED_CONFIGURATIONS: ClassVar[
+        set[tuple[ActivationConfig, int, int, int, int]]
+    ] = {
+        # activation, hidden_size, intermediate_size, num_experts, top_k
+        (SwiGLU(), 2048, 512, 512, 10),
+        (SwiGLU(), 2048, 1536, 60, 4),
+        (SiLU(), 6144, 1536, 192, 4),
     }
     _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
         "gemm1_weights",
         "gemm1_weights_scale",
-        "gemm1_alpha",
         "gemm2_weights",
         "gemm2_weights_scale",
         "output1_scale_scalar",
         "output1_scale_gate_scalar",
         "output2_scale_scalar",
     )
+    _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
     _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
@@ -744,14 +748,10 @@ class CakeWarpDecodeRunner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self._device_arch != 103:
+        if self._device_arch not in (100, 103):
             raise NotImplementedError(
-                f"CakeWarpDecodeRunner requires exact SM103, got SM{self._device_arch}."
-            )
-        if self.config.activation != SwiGLU():
-            raise NotImplementedError(
-                "CakeWarpDecodeRunner supports only default SwiGLU() "
-                "(alpha=1, beta=0, default clamp)."
+                "CakeWarpDecodeRunner requires exact SM100 or SM103, "
+                f"got SM{self._device_arch}."
             )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
@@ -780,21 +780,24 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner requires local_expert_offset=0 and "
                 "local_num_experts=num_experts."
             )
-        geometry_without_hidden = (
+        configuration_without_hidden = (
+            self.config.activation,
             experts.intermediate_size,
             local_num_experts,
             routing.top_k,
         )
         supported_without_hidden = {
-            (intermediate_size, num_experts, top_k)
-            for _, intermediate_size, num_experts, top_k in self._SUPPORTED_GEOMETRIES
+            (activation, intermediate_size, num_experts, top_k)
+            for activation, _, intermediate_size, num_experts, top_k in (
+                self._SUPPORTED_CONFIGURATIONS
+            )
         }
-        if geometry_without_hidden not in supported_without_hidden:
+        if configuration_without_hidden not in supported_without_hidden:
             raise NotImplementedError(
-                "CakeWarpDecodeRunner supports only "
-                "(intermediate_size, num_experts, top_k) = (512, 512, 10) "
-                "or (1536, 60, 4); got "
-                f"{geometry_without_hidden}."
+                "CakeWarpDecodeRunner supports only default SwiGLU() with "
+                "(intermediate_size, num_experts, top_k) = (512, 512, 10) or "
+                "(1536, 60, 4), and SiLU() with (1536, 192, 4); got "
+                f"{configuration_without_hidden}."
             )
 
     def _build(self) -> None:
@@ -802,7 +805,17 @@ class CakeWarpDecodeRunner(MoERunner):
             get_cake_fused_moe_warp_decode_module,
         )
 
-        self._module = get_cake_fused_moe_warp_decode_module(device=self.device)
+        target: Literal["sm100a", "sm103a"]
+        if self._device_arch == 100:
+            target = "sm100a"
+        elif self._device_arch == 103:
+            target = "sm103a"
+        else:
+            raise RuntimeError(
+                "CakeWarpDecodeRunner build requires exact SM100 or SM103, "
+                f"got SM{self._device_arch}."
+            )
+        self._module = get_cake_fused_moe_warp_decode_module(target, device=self.device)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
@@ -1150,18 +1163,20 @@ class CakeWarpDecodeRunner(MoERunner):
         hidden_size = int(act.hidden_states_q.shape[1]) * 2
         routing = self.config.routing
         intermediate_size = self.config.experts.intermediate_size
-        geometry = (
+        configuration = (
+            self.config.activation,
             hidden_size,
             intermediate_size,
             routing.num_experts,
             routing.top_k,
         )
-        if geometry not in self._SUPPORTED_GEOMETRIES:
+        if configuration not in self._SUPPORTED_CONFIGURATIONS:
             raise ValueError(
-                "CakeWarpDecodeRunner supports only "
+                "CakeWarpDecodeRunner supports only default SwiGLU() with "
                 "(hidden_size, intermediate_size, num_experts, top_k) = "
-                "(2048, 512, 512, 10) or (2048, 1536, 60, 4); "
-                f"got {geometry}."
+                "(2048, 512, 512, 10) or (2048, 1536, 60, 4), and SiLU() "
+                "with (6144, 1536, 192, 4); got "
+                f"{configuration}."
             )
 
         _validate_prerouted_inputs(
@@ -1197,10 +1212,17 @@ class CakeWarpDecodeRunner(MoERunner):
             raise ValueError("CakeWarpDecodeRunner does not consume per_token_scale.")
 
         view = weights.get_view(self.backend_key)
-        missing = [key for key in self._REQUIRED_WEIGHT_KEYS if key not in view]
+        activation = self.config.activation
+        gated_weight_keys = self._GATED_WEIGHT_KEYS if activation.is_gated else ()
+        required_weight_keys = self._REQUIRED_WEIGHT_KEYS + gated_weight_keys
+        missing = [key for key in required_weight_keys if key not in view]
         if missing:
             raise KeyError(f"Cake warp decode weight view is missing {missing}.")
-        allowed = set(self._REQUIRED_WEIGHT_KEYS)
+        if not activation.is_gated and "gemm1_alpha" in view:
+            raise ValueError(
+                "Cake warp decode standalone SiLU weights must not provide gemm1_alpha."
+            )
+        allowed = set(required_weight_keys)
         unexpected = sorted(
             key
             for key, value in view.items()
@@ -1213,7 +1235,7 @@ class CakeWarpDecodeRunner(MoERunner):
             )
 
         num_experts = routing.num_experts
-        gemm1_rows = 2 * intermediate_size
+        gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
         self._require_tensor(
             view["gemm1_weights"],
             name="gemm1_weights",
@@ -1227,13 +1249,14 @@ class CakeWarpDecodeRunner(MoERunner):
             shape=(num_experts, gemm1_rows, hidden_size // 16),
             device=device,
         )
-        self._require_tensor(
-            view["gemm1_alpha"],
-            name="gemm1_alpha",
-            dtype=torch.float32,
-            shape=(num_experts,),
-            device=device,
-        )
+        if activation.is_gated:
+            self._require_tensor(
+                view["gemm1_alpha"],
+                name="gemm1_alpha",
+                dtype=torch.float32,
+                shape=(num_experts,),
+                device=device,
+            )
         self._require_tensor(
             view["gemm2_weights"],
             name="gemm2_weights",
@@ -4315,6 +4338,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -4785,6 +4809,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -5140,6 +5165,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         from ..tllm_enums import RoutingMethodType, WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -5419,6 +5445,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
@@ -5648,6 +5675,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         from ..tllm_enums import WeightLayout
 
         self._inner = self._module.MoERunner(
+            self._module.moe_op,
             top_k=self.config.routing.top_k,
             num_local_experts=self._num_local_experts,
             dtype_act=self._dtype_act,
