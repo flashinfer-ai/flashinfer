@@ -22,7 +22,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from ..decode import _dtype_key, _validate_mask, _validate_positive_int
+from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
@@ -397,15 +397,9 @@ def _validate_block_sparse_static_profile(
 def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig":
     """Build one decode configuration from its exact compile cache key."""
 
-    import cutlass
-
     from ..kernels.fmha_decode.fmha_decode_config import make_decode_config
 
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-    }
-    dtype = dtype_map[key.dtype_key]
+    dtype = _cutlass_dtype(key.dtype_key)
     q_tile_size = _select_block_sparse_q_tile_size(
         q_block_size=key.q_block_size,
         heads_q_per_kv=key.num_qo_heads // key.num_kv_heads,
