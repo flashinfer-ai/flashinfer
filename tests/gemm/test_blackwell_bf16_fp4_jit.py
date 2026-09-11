@@ -92,6 +92,8 @@ def _integration_manifest(target: str) -> dict:
         }
         if "tile_m" in variant:
             kernel["tile_m"] = variant["tile_m"]
+        if component == "cute_warp_mma_m16_bf16":
+            kernel["launch_grid"] = blackwell_jit._m16_launch_grid()
         kernels.append(kernel)
 
     generic_row7 = next(
@@ -382,7 +384,7 @@ def test_integration_manifest_preserves_exact_m16_then_row7_and_generic_m32() ->
     assert all(kernel["grid_mode"] == "flat_overflow" for kernel in m16_kernels)
     assert all(kernel["logical_grid_mode"] == "persistent" for kernel in m16_kernels)
     assert all(
-        (kernel["threads"], kernel["smem_bytes"]) == (128, 27648)
+        (kernel["threads"], kernel["smem_bytes"]) == (128, 21504)
         for kernel in m16_kernels
     )
     assert len(raw_pointer) == 1
@@ -470,6 +472,53 @@ def test_integration_manifest_rejects_row7_exact_shape_drift(
     exact["exact_shape"] = value
 
     with pytest.raises(ValueError, match="row7 exact shape"):
+        blackwell_jit._validate_integration_manifest(manifest)
+
+
+@pytest.mark.parametrize("target", ["sm100", "sm103"])
+def test_exported_manifest_preserves_selected_m16_kernel_and_split_grid(target: str) -> None:
+    _, path = _artifact_paths(target)
+    manifest, _ = blackwell_jit._load_abi_manifest(path, target)
+    selected = [
+        kernel for kernel in manifest["kernels"]
+        if kernel["component"] == "cute_warp_mma_m16_bf16"
+    ]
+    assert len(selected) == 4
+
+    def evaluate(expression: dict, parameters: dict[str, int]) -> int:
+        import operator
+
+        if expression["op"] == "constant":
+            return expression["value"]
+        if expression["op"] == "parameter":
+            return parameters[expression["name"]]
+        operations = {
+            "add": operator.add, "subtract": operator.sub,
+            "multiply": operator.mul, "floor_divide": operator.floordiv,
+        }
+        return operations[expression["op"]](
+            evaluate(expression["lhs"], parameters), evaluate(expression["rhs"], parameters),
+        )
+
+    for kernel in selected:
+        assert (kernel["threads"], kernel["smem_bytes"]) == (128, 21504)
+        assert kernel["arg_plan_kind"] == "raw_pointer"
+        for m, n, expected_x in ((1, 64, 2), (16, 1024, 32), (7, 4160, 130)):
+            assert [
+                evaluate(kernel["launch_grid"][axis]["expression"], {"M": m, "N": n})
+                for axis in ("x", "y", "z")
+            ] == [expected_x, 1, 1]
+
+
+def test_integration_manifest_rejects_m16_unsplit_launch_grid() -> None:
+    manifest = _integration_manifest("sm100")
+    selected = next(
+        kernel for kernel in manifest["kernels"]
+        if kernel["component"] == "cute_warp_mma_m16_bf16"
+    )
+    grid_x = selected["launch_grid"]["x"]["expression"]
+    grid_x["rhs"] = grid_x["rhs"]["lhs"]
+    with pytest.raises(ValueError, match="M16 launch grid"):
         blackwell_jit._validate_integration_manifest(manifest)
 
 

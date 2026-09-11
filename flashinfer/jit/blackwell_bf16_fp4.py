@@ -411,6 +411,37 @@ _INTEGRATION_M16_WINNER_IR_SYMBOL = (
 )
 
 
+def _m16_launch_grid() -> dict[str, Any]:
+    """Two N32 output blocks per packed N64 tile for the selected M16 kernel."""
+    def constant(value: int) -> dict[str, Any]:
+        return {"op": "constant", "value": value}
+
+    def binary(op: str, lhs: dict, rhs: dict) -> dict[str, Any]:
+        return {"op": op, "lhs": lhs, "rhs": rhs}
+
+    def tiles(name: str, index: int, divisor: int) -> dict[str, Any]:
+        parameter = {
+            "op": "parameter", "name": name,
+            "host_argument_index": index, "kernel_argument_index": index,
+        }
+        return binary(
+            "floor_divide",
+            binary("subtract", binary("add", parameter, constant(divisor)), constant(1)),
+            constant(divisor),
+        )
+
+    grid_x = binary(
+        "multiply", tiles("M", 5, 16),
+        binary("multiply", tiles("N", 6, 64), constant(2)),
+    )
+    return {
+        axis: {"host_argument_index": 8 + index, "expression": expression}
+        for index, (axis, expression) in enumerate(
+            zip(("x", "y", "z"), (grid_x, constant(1), constant(1)))
+        )
+    }
+
+
 def _row3_launch_grid() -> dict[str, Any]:
     def constant(value: int) -> dict[str, Any]:
         return {"op": "constant", "value": value}
@@ -471,7 +502,7 @@ _INTEGRATION_LAUNCH_RESOURCES = {
     "cute_warp_mma_m16_k16_bf16": (96, 150528),
     "cute_warp_mma_m16_k32_bf16": (96, 150528),
     "cute_warp_mma_m16_k48_bf16": (96, 150528),
-    "cute_warp_mma_m16_bf16": (128, 27648),
+    "cute_warp_mma_m16_bf16": (128, 21504),
     "cute_warp_mma_m32_bf16": (160, 218112),
     "cute_warp_mma_m64_bf16": (160, 73728),
 }
@@ -1057,6 +1088,16 @@ def _validate_integration_manifest(manifest: dict[str, Any]) -> None:
                 raise ValueError(
                     "Blackwell BF16 x FP4 integration manifest M16 route is not "
                     "bound to the promoted exact-K winner IR"
+                )
+            if (
+                kernel["grid_mode"] != "flat_overflow"
+                or kernel["logical_grid_mode"] != "persistent"
+                or kernel.get("tile_m") != 16
+                or kernel["launch_grid"] != _m16_launch_grid()
+            ):
+                raise ValueError(
+                    "Blackwell BF16 x FP4 integration manifest M16 launch grid "
+                    "does not match its selected physical implementation"
                 )
             winner_m16.append(kernel)
         expected_arg_plan_kind, expected_prepared_abi, expected_stage = (

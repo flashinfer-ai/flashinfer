@@ -583,10 +583,11 @@ inline void LaunchWarp(const Problem& problem, const TensorView& a, const Tensor
 
   const int64_t grid_tile_m = spec.persistent_m16_2sm ? 16 : tile_m;
   const int64_t sm_multiplier = spec.persistent_m16_2sm ? 2 : 1;
-  const int64_t total_tiles =
-      CeilDiv(problem.m, grid_tile_m) * CeilDiv(problem.n, 64);
   const bool exact_k1024_m16 =
       spec.raw_pointer_abi && component == Component::kTiledWarpM16Bf16;
+  const int64_t n_splits = exact_k1024_m16 ? 2 : 1;
+  const int64_t total_tiles =
+      CeilDiv(problem.m, grid_tile_m) * CeilDiv(problem.n, 64) * n_splits;
   const bool exact_large_m =
       component == Component::kTiledWarpM64Bf16 && spec.exact_m != 0;
   const int64_t launch_grid =
