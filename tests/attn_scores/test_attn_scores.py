@@ -2422,26 +2422,72 @@ def test_inputs_foreign_device_rejected_paged():
         fp8_paged_mqa_logits(q, kv, w, bt, cl_far, ctx)
 
 
-def test_schedule_helper_validates_inputs():
-    """compute_paged_mqa_logits_schedule validates dtype and out= up front.
+# The schedule helper's three internal paths: the GPU schedule kernel, the fp4
+# atom-split expansion in front of it, and the CPU numpy fallback.
+_SCHEDULE_HELPER_PATHS = [
+    pytest.param({}, id="fp8-gpu"),
+    pytest.param({"next_n": 4, "variant": "fp4"}, id="fp4-split"),
+    pytest.param({"use_gpu_kernel": False}, id="cpu-fallback"),
+]
 
-    Previously an int64 seq_lens died inside the DSL (CUDA path) or was
-    silently truncated by numpy (CPU path), and a malformed out= reached the
-    compiled kernel or out.copy_ bare.
+
+@pytest.mark.parametrize("kwargs", _SCHEDULE_HELPER_PATHS)
+def test_schedule_helper_validates_inputs(kwargs):
+    """compute_paged_mqa_logits_schedule validates seq_lens and out= up front,
+    on every internal path.
+
+    The paths failed differently on a malformed seq_lens, two of them
+    silently: the GPU kernel path errored bare in the FFI binding on a [1, B]
+    tensor; the fp4 split path reshaped [1, B] through the atom expansion into
+    a wrong flat vector; and the CPU fallback read shape[0] == 1 and emitted a
+    one-row schedule (a hang or unwritten rows in the persistent kernel, not
+    a wrong number).  An int64 seq_lens died inside the DSL or was truncated
+    by numpy, and a malformed out= reached the compiled kernel or out.copy_
+    bare.
     """
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
     from flashinfer import compute_paged_mqa_logits_schedule
 
-    cl64 = torch.full((2,), 256, dtype=torch.int64, device="cuda")
+    dev = torch.device("cuda", torch.cuda.current_device())
+    cl64 = torch.full((2,), 256, dtype=torch.int64, device=dev)
     with pytest.raises(ValueError, match="seq_lens must be int32"):
-        compute_paged_mqa_logits_schedule(cl64)
+        compute_paged_mqa_logits_schedule(cl64, **kwargs)
 
-    cl = torch.full((2,), 256, dtype=torch.int32, device="cuda")
-    bad_out = torch.zeros((3, 2), dtype=torch.int32, device="cuda")
+    # [1, B] has the same numel as [B]; every path used to accept it.
+    cl_2d = torch.full((1, 2), 256, dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match=r"seq_lens must be 1-D"):
+        compute_paged_mqa_logits_schedule(cl_2d, **kwargs)
+
+    cl = torch.full((2,), 256, dtype=torch.int32, device=dev)
+    bad_out = torch.zeros((3, 2), dtype=torch.int32, device=dev)
     with pytest.raises(ValueError, match="schedule_meta must have shape"):
-        compute_paged_mqa_logits_schedule(cl, out=bad_out)
+        compute_paged_mqa_logits_schedule(cl, out=bad_out, **kwargs)
+
+    # Guard the new checks against over-strictness on the same path: the
+    # well-formed call succeeds, and a strided view of the same lengths gives
+    # the identical schedule (layout is not a constraint).
+    if is_sm100a_supported(dev) or kwargs.get("use_gpu_kernel", True) is False:
+        ref = compute_paged_mqa_logits_schedule(cl, **kwargs)
+        strided = cl.repeat_interleave(2)[::2]
+        assert strided.stride(0) == 2, "test premise: a genuinely strided view"
+        assert torch.equal(compute_paged_mqa_logits_schedule(strided, **kwargs), ref)
+
+
+def test_schedule_helper_rejects_foreign_device_seq_lens():
+    """seq_lens on another GPU than the target device is rejected by name on
+    every path instead of reaching the FFI binding (or being silently copied
+    across devices by the CPU fallback).  Needs two GPUs."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device")
+
+    from flashinfer import compute_paged_mqa_logits_schedule
+
+    cl_far = torch.full((2,), 256, dtype=torch.int32, device="cuda:1")
+    for kwargs in ({}, {"next_n": 4, "variant": "fp4"}, {"use_gpu_kernel": False}):
+        with pytest.raises(ValueError, match=r"seq_lens is on cuda:1"):
+            compute_paged_mqa_logits_schedule(cl_far, device="cuda:0", **kwargs)
 
 
 def test_precompile_dsl_guards(monkeypatch):

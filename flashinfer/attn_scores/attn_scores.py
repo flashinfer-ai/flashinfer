@@ -414,6 +414,41 @@ def _validate_schedule_meta(
         )
 
 
+def _validate_schedule_seq_lens(
+    seq_lens: torch.Tensor, device: torch.device, fn_name: str
+) -> None:
+    """``seq_lens`` given to the schedule helper must be a 1-D int32 ``[B]``
+    tensor and, when it lives on CUDA, on the target ``device``.
+
+    The helper's three internal paths fail differently on a malformed tensor,
+    and two of them fail silently: the GPU kernel path reaches the FFI binding
+    and errors bare on a ``[1, B]`` or foreign-device tensor; the fp4 split
+    path reshapes ``[1, B]`` through ``_expand_seq_lens`` into a wrong flat
+    vector; and the CPU fallback's numpy loop reads ``shape[0] == 1`` and
+    emits a one-row schedule.  A wrong schedule is not a wrong number but a
+    hang or unwritten rows in the persistent kernel, so reject up front --
+    before the fp4 expansion, which would otherwise mask the rank error.
+
+    Layout is deliberately not checked: every path reads ``seq_lens`` through
+    its layout, so a strided view is accepted (see ``_validate_paged_inputs``).
+    """
+    if seq_lens.dtype != torch.int32:
+        raise ValueError(
+            f"{fn_name}: seq_lens must be int32 (matching fp8/fp4_paged_mqa_logits); "
+            f"got {seq_lens.dtype}"
+        )
+    if seq_lens.dim() != 1:
+        raise ValueError(
+            f"{fn_name}: seq_lens must be 1-D with shape [batch_size]; got shape "
+            f"{tuple(seq_lens.shape)}"
+        )
+    if seq_lens.is_cuda and seq_lens.device != device:
+        raise ValueError(
+            f"{fn_name}: seq_lens is on {seq_lens.device} but the schedule is "
+            f"being built for {device}; pass device= to match, or move seq_lens."
+        )
+
+
 def _validate_output_addressable(
     rows: int, padded_max_seq_len: int, out: Optional[torch.Tensor], fn_name: str
 ) -> None:
@@ -1260,7 +1295,7 @@ def compute_paged_mqa_logits_schedule(
     across flashinfer versions, devices, or different (variant, next_n).
 
     Args:
-        seq_lens:       [B] int32, on CPU or CUDA.
+        seq_lens:       [B] int32 (1-D), on CPU or on ``device``; any stride.
         device:         target CUDA device.  Defaults to seq_lens.device,
                         or the current CUDA device when seq_lens is on CPU.
         next_n:         the next_n (q.shape[1]) of the upcoming main call.
@@ -1285,18 +1320,16 @@ def compute_paged_mqa_logits_schedule(
     Returns:
         schedule_meta: [num_sms+1, 2] int32 on CUDA (``out`` if provided).
     """
-    if seq_lens.dtype != torch.int32:
-        raise ValueError(
-            f"compute_paged_mqa_logits_schedule: seq_lens must be int32 "
-            f"(matching fp8/fp4_paged_mqa_logits); got {seq_lens.dtype}"
-        )
     if device is None:
         device = seq_lens.device if seq_lens.is_cuda else torch.device("cuda")
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
-        # Normalize an index-less "cuda" to the current device so the out=
-        # device-equality check below compares like with like.
+        # Normalize an index-less "cuda" to the current device so the
+        # device-equality checks below compare like with like.
         device = torch.device("cuda", torch.cuda.current_device())
+    # Before the fp4 expansion: it would reshape a malformed [1, B] into a
+    # plausible flat vector and hide the rank error from every later check.
+    _validate_schedule_seq_lens(seq_lens, device, "compute_paged_mqa_logits_schedule")
     if variant not in ("fp8", "fp4"):
         raise ValueError(
             f"compute_paged_mqa_logits_schedule: variant must be 'fp8' or "
