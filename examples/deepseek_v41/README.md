@@ -5,7 +5,10 @@ adapted from Mengyu Guo's CuTe DSL HCA ([#3943](https://github.com/flashinfer-ai
 [#4368](https://github.com/flashinfer-ai/flashinfer/pull/4368)). Original attribution
 and licenses are retained. MMA, TMEM and cache memory operations use
 `cutlass.experimental.primitives`. FlashMLA informed the single-CTA resource
-budget and deferred softmax rescaling; no FlashMLA code was copied.
+budget, deferred softmax rescaling, WS QK/PV layouts with partial-score
+exchange, fused softmax/correction and shared-memory/TMA output. The original
+HCA foundation and these FlashMLA design contributions are acknowledged in
+the source.
 
 Run `python examples/deepseek_v41/decode.py` on SM100. The validated environment
 uses CUTLASS DSL 4.7, PyTorch 2.13+cu130 and CUDA toolkit 13.2. Decode is JIT-only
@@ -16,7 +19,13 @@ bundled CUDA >= 13.2, compressed-cache decoding uses native FP4-to-BF16 and
 packed BF16 multiplication. Older bundled compilers retain the existing
 conversion sequence inside the same kernel. Packed conversion uses two small
 `prims.inline_ptx` helpers (CUTLASS 4.7 lacks a typed FP4-to-BF16 wrapper);
-the MMA/TMEM pipeline remains expressed through primitives.
+WS MMA also uses public `prims.inline_ptx` to work around CUTLASS 4.7's typed
+WS wrapper; other MMA/TMEM operations use the typed primitives.
+
+The backend keeps the measured split schedule for small batches and selects
+WS QK/PV with fused softmax/correction for K512/B128+. When that batch exceeds
+the device's SM count, CTAs process multiple requests through the same pipeline.
+This is internal scheduling in one implementation and requires no API selector.
 
 Decode currently accepts contiguous BF16 queries `[B,1,64,512]`, 64-token pages,
 128 MXFP8 window slots and up to 512 FP4 compressed slots, padded to multiples

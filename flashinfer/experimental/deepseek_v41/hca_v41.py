@@ -32,10 +32,11 @@
 # contract: BF16 query, MXFP8 (E4M3 + per-32 E8M0) sliding-window KV and FP4
 # (E2M1 + per-16 E4M3) compressed KV, both dequantized to BF16 for kind::f16
 # MMA, plus the V4.1 per-head sink. The single-CTA head64 structure of DeepSeek
-# FlashMLA (csrc/kernels/sm100/decode/sparse/head64, MIT) was used as a design
-# reference for the SMEM/TMEM budget and deferred softmax rescaling;
-# no FlashMLA code is copied.
-# Work in progress: see the module docstring for the current state.
+# FlashMLA (DeepSeek-AI/FlashMLA, csrc/kernels/sm100/decode/sparse/head64,
+# MIT) also informed the resource budget, deferred softmax rescaling, WS QK/PV
+# layouts with partial-score exchange, fused softmax/correction, and the
+# shared-memory/TMA output path. These ideas are adapted to this CuTe DSL
+# implementation and the DS4.1 mixed-cache contract.
 
 import math
 from typing import Type, Tuple, Optional
@@ -46,6 +47,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
+from cutlass.experimental.cuda.tensor_map import (
+    TensorMap,
+    TensorMapSwizzle,
+    create_tensor_map_tiled_from_view,
+)
 from . import hca_v41_primitives as hw
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
@@ -70,6 +76,8 @@ from ...cute_dsl.attention.dsa.hca_helpers import (
 """SM100 H64/S1 DS4.1 mixed-cache decode, adapted from Mengyu Guo's HCA.
 
 The public wrapper selects the M64 single-CTA primitives specialization.
+Large mixed-cache batches use WS QK/PV and fused softmax/correction; small
+batches retain the split schedule. Both share cache conversion and reduction.
 Queries, dequantized KV and probabilities use BF16; accumulation and softmax
 use FP32. Physical slot -1 is masked without reading cache storage. The sink
 is applied once at final normalization, preserving natural-log, sink-exclusive
@@ -105,6 +113,7 @@ class BlackwellV41MixedCacheDecode:
         dequant_phase_chunks: int = 8,
         narrow_offsets: bool = False,
         native_fp4: bool = False,
+        use_ws: bool = False,
     ):
         """Initializes the configuration for a Blackwell Heavily Compressed Attention (HCA) kernel.
 
@@ -140,6 +149,7 @@ class BlackwellV41MixedCacheDecode:
         # The last `qk_rope_head_dim` of these are assumed to be already
         # RoPE-rotated by the caller; the kernel does not see rope as a
         # separate path.
+        self.use_ws = use_ws
         self.latent_dim = 512
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
@@ -190,30 +200,29 @@ class BlackwellV41MixedCacheDecode:
         self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
         self.iterations_pv_n = self.latent_dim // self.mma_pv_tiler[1]
 
-        # Set specialized warp ids.
-        # Compute (softmax) warp groups: g0 = warps 0-3 (even k-tiles), g1 =
-        # warps 8-11 (odd k-tiles). Correction warps 4-7. Each 128-thread
-        # compute group must start at a multiple of 4 warps because the
-        # compute code derives its lane from tidx % 128. MMA split: W12 issues
-        # QK only, W14 issues PV only; W13 loads Q by TMA (K/V come from the
-        # dequant warps). The original TMA-V warp is gone; its registers go to
-        # the dequant group.
+        # Split decode retains the dual-softmax low-latency schedule. The WS
+        # schedule uses one softmax/correction group (warps 0-3), QK/TMA/PV
+        # warps 4/5/6, sixteen dequant warps, and one idle warp. Every compute
+        # group starts on a 128-thread boundary for its logical lane mapping.
         self.compute_warp_ids = (0, 1, 2, 3)
-        self.correction_warp_ids = (4, 5, 6, 7)
-        self.second_compute_warp_ids = (8, 9, 10, 11)
-        self.mma_qk_warp_id = 12
-        self.load_tma_k_warp_id = 13
-        self.mma_pv_warp_id = 14
+        self.correction_warp_ids: Tuple[int, ...] = () if use_ws else (4, 5, 6, 7)
+        self.second_compute_warp_ids: Tuple[int, ...] = () if use_ws else (8, 9, 10, 11)
+        self.mma_qk_warp_id = 4 if use_ws else 12
+        self.load_tma_k_warp_id = 5 if use_ws else 13
+        self.mma_pv_warp_id = 6 if use_ws else 14
         # Dequant group: gathers raw FP8/FP4 rows with plain loads and writes
         # the BF16 K and V tiles that the UMMA warps consume.
         assert dequant_warps in (8, 16)
         assert dequant_warps == 8 or not self.use_2cta_instrs
-        self.dequant_warp_ids = tuple(range(15, 15 + dequant_warps))
+        assert not use_ws or (dequant_warps == 16 and not self.use_2cta_instrs)
+        self.dequant_warp_ids = tuple(
+            range(7 if use_ws else 15, (7 if use_ws else 15) + dequant_warps)
+        )
         # Register allocation rounds the CTA up to a multiple of 4 warps, so a
         # 23-warp launch gets the 24-warp budget (80/lane) but only 23 shares of
         # it. Launch the 24th warp as an idle one at the minimum allocation to
         # keep its 80 - 24 registers in the pool.
-        self.idle_warp_id = 15 + dequant_warps
+        self.idle_warp_id = (7 if use_ws else 15) + dequant_warps
         self.num_total_compute_warps = self.num_compute_warps + len(
             self.second_compute_warp_ids
         )
@@ -230,25 +239,20 @@ class BlackwellV41MixedCacheDecode:
             )
         )
 
-        # 24 warps launch with 80 registers per lane (65536 / 768 rounded down
-        # to the 8-register granule; ptxas reports REG accordingly), so the
-        # setmaxnreg targets must sum to at most 24 * 80 = 1920:
-        # 8*96 + 4*136 + 3*40 + 1*24 + 8*56 = 1904. A larger sum blocks the
-        # increases forever; a "decrease" above the launch value is an illegal
-        # instruction. With 64-key tiles each softmax thread holds 32 scores,
-        # which is what lets softmax live in 96.
-        # M64/PV128 halves the correction fragment. Its MMA/Q-load warps
-        # fit in 32 registers, allowing dequant to use 80 without exceeding
-        # the pool: 8*96 + 4*96 + 3*32 + 24 + 8*80 = 1912 <= 1920.
-        # The 32-warp M64 schedule gives more threads to dequant and reduces
-        # its per-thread row count. Its register pool is 32*64 = 2048:
-        # 8*96 + 4*96 + 3*32 + 24 + 16*48 = 2040.
-        self.softmax_reg_num = 96
+        # Register budgets must fit each of the four SM subpartitions. WS
+        # launches 24 warps at 80 registers/lane: per subpartition, one
+        # 192-register compute warp + four 64-register dequant warps + one
+        # 32-register producer = 480 (the idle warp uses 24 instead of 32).
+        # The standard 24-warp schedule retains 96 for each softmax/correction
+        # warp and 80 for dequant; its total is 1912 <= 24 * 80.
+        self.softmax_reg_num = 192 if use_ws else 96
         self.correction_reg_num = 136 if self.use_2cta_instrs else 96
         self.other_reg_num = 40 if self.use_2cta_instrs else 32
         self.idle_reg_num = 24
         self.dequant_reg_num = (
-            56 if self.use_2cta_instrs else 48 if dequant_warps == 16 else 80
+            (64 if dequant_warps == 16 else 96)
+            if use_ws
+            else (56 if self.use_2cta_instrs else 48 if dequant_warps == 16 else 80)
         )
         # Raw 16-byte chunks each dequant thread keeps in flight per phase.
         self.dequant_phase_chunks = dequant_phase_chunks
@@ -272,7 +276,7 @@ class BlackwellV41MixedCacheDecode:
             num_threads=(
                 self.threads_per_warp * 2
                 + self.threads_per_warp * self.num_total_compute_warps
-                + self.threads_per_warp * self.num_compute_warps
+                + self.threads_per_warp * len(self.correction_warp_ids)
             ),
         )
         self.softmax_exchange_sync_bar_0 = pipeline.NamedBarrier(
@@ -707,7 +711,17 @@ class BlackwellV41MixedCacheDecode:
 
         softmax_scale_log2 = softmax_scale * LOG2_E
 
+        output_flat = cute.make_tensor(
+            o.iterator,
+            cute.make_layout(
+                (o.shape[0] * o.shape[2] * o.shape[3], 512), stride=(512, 1)
+            ),
+        )
+        output_map = create_tensor_map_tiled_from_view(
+            output_flat, box_dims=(64, 64), swizzle=TensorMapSwizzle.s128b
+        )
         self.split_kv_kernel(
+            output_map,
             qk_tiled_mma,
             pv_tiled_mma,
             tma_atom_q_latent,
@@ -788,6 +802,7 @@ class BlackwellV41MixedCacheDecode:
     @cute.kernel
     def split_kv_kernel(
         self,
+        output_map: cutlass.GridConstant[TensorMap],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tma_atom_q_latent: Optional[cute.CopyAtom],
@@ -1035,6 +1050,11 @@ class BlackwellV41MixedCacheDecode:
                     load_q_producer_state = self.load_tma_q(
                         tma_common_params, tma_qk_params, load_q_producer_state
                     )
+                if cutlass.const_expr(self.is_persistent):
+                    # Q scratch is reused for score exchange and TMA output;
+                    # all active roles finish the current request before the
+                    # producer may load the next Q or overwrite slot indices.
+                    prims.barrier_cta_sync(13, thread_count=self.threads_per_cta - 32)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             load_q_pipeline.producer_tail(load_q_producer_state)
@@ -1129,6 +1149,11 @@ class BlackwellV41MixedCacheDecode:
                         )
                         k_index += 1
                         k_tile_count -= 1
+                if cutlass.const_expr(self.is_persistent):
+                    # Q scratch is reused for score exchange and TMA output;
+                    # all active roles finish the current request before the
+                    # producer may load the next Q or overwrite slot indices.
+                    prims.barrier_cta_sync(13, thread_count=self.threads_per_cta - 32)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             load_k_pipeline.producer_tail(load_k_producer_state)
@@ -1195,6 +1220,11 @@ class BlackwellV41MixedCacheDecode:
                         load_k_consumer_state,
                         mma_s_producer_state,
                     )
+                if cutlass.const_expr(self.is_persistent):
+                    # Q scratch is reused for score exchange and TMA output;
+                    # all active roles finish the current request before the
+                    # producer may load the next Q or overwrite slot indices.
+                    prims.barrier_cta_sync(13, thread_count=self.threads_per_cta - 32)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -1262,6 +1292,11 @@ class BlackwellV41MixedCacheDecode:
                         p_mma_consumer_state,
                         mma_o_producer_state,
                     )
+                if cutlass.const_expr(self.is_persistent):
+                    # Q scratch is reused for score exchange and TMA output;
+                    # all active roles finish the current request before the
+                    # producer may load the next Q or overwrite slot indices.
+                    prims.barrier_cta_sync(13, thread_count=self.threads_per_cta - 32)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
@@ -1269,77 +1304,207 @@ class BlackwellV41MixedCacheDecode:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Compute warp
-        # ///////////////////////////////////////////////////////////////////////////////
-        if (
-            warp_idx >= self.compute_warp_ids[0]
-            and warp_idx <= self.compute_warp_ids[-1]
-        ):
-            prims.setmaxregister(
-                self.softmax_reg_num, prims.SetMaxRegisterAction.INCREASE
-            )
-            mma_s_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_s_stage
-            )
-            p_mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_mma_stage
-            )
-            p_cor_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_cor_stage
-            )
-            mma_o_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_o_stage
-            )
-            prims.barrier_cta_sync(
-                self.tmem_ptr_sync_bar.barrier_id,
-                thread_count=self.tmem_ptr_sync_bar.num_threads,
-            )
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-
-            tile_sched = create_hca_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-            while work_tile.is_valid_tile:
-                blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
+        if cutlass.const_expr(self.use_ws):
+            # ///////////////////////////////////////////////////////////////////////////////
+            #  Compute warp
+            # ///////////////////////////////////////////////////////////////////////////////
+            if (
+                warp_idx >= self.compute_warp_ids[0]
+                and warp_idx <= self.compute_warp_ids[-1]
+            ):
+                prims.setmaxregister(
+                    self.softmax_reg_num, prims.SetMaxRegisterAction.INCREASE
                 )
-                if k_tile_count > 0:
-                    compute_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        split_kv=split_kv,
-                        local_split_kv=local_split_kv,
-                        smem_exchange=softmax_smem_exchange,
-                        sSlots=sSlots,
-                        mAccO=mAccO,
-                        mO=mO,
-                        k_tile_total=cute.ceil_div(
-                            cache_seqs[blk_coord[2]], self.mma_qk_tiler[1]
-                        ),
-                        K_valid=self.get_effective_hca_k(
-                            sparse_mla_topk_lens, blk_coord
-                        ),
-                        window_valid_len=self.get_window_valid_len(
-                            window_valid_lens, blk_coord
-                        ),
-                        L=self.latent_dim,
-                        tmem_ptr=tmem_ptr,
-                        sMeta=sMeta,
-                        tidx=tidx,
-                        p_cor_pipeline=p_cor_pipeline,
-                        attn_sink_unscaled=attn_sink_unscaled,
+                mma_s_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_s_stage
+                )
+                p_mma_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.p_mma_stage
+                )
+                p_cor_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.p_cor_stage
+                )
+                mma_o_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_o_stage
+                )
+                prims.barrier_cta_sync(
+                    self.tmem_ptr_sync_bar.barrier_id,
+                    thread_count=self.tmem_ptr_sync_bar.num_threads,
+                )
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+                q_copy_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.load_q_stage
+                )
+                tile_sched = create_hca_static_tile_scheduler(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                while work_tile.is_valid_tile:
+                    blk_coord = work_tile.tile_idx
+                    k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                        split_kv, cache_seqs, block_split_kvs, blk_coord
                     )
-                    compute_softmax_params = SimpleNamespace(
-                        tiled_mma_qk=tiled_mma_qk,
-                        sP=sP,
-                        mma_s_pipeline=mma_s_pipeline,
-                        p_mma_pipeline=p_mma_pipeline,
-                        softmax_scale_log2=softmax_scale_log2,
+                    if k_tile_count > 0:
+                        load_q_pipeline.consumer_wait(q_copy_state)
+                        hw.stage_q_tmem(sQ, tmem_ptr)
+                        prims.barrier_cta_sync(10, thread_count=160)
+                        q_copy_state.advance()
+                        compute_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            split_kv=split_kv,
+                            local_split_kv=local_split_kv,
+                            smem_exchange=softmax_smem_exchange,
+                            epilogue_exchange=epilogue_smem_exchange,
+                            sSlots=sSlots,
+                            mAccO=mAccO,
+                            mO=mO,
+                            k_tile_total=cute.ceil_div(
+                                cache_seqs[blk_coord[2]], self.mma_qk_tiler[1]
+                            ),
+                            K_valid=self.get_effective_hca_k(
+                                sparse_mla_topk_lens, blk_coord
+                            ),
+                            window_valid_len=self.get_window_valid_len(
+                                window_valid_lens, blk_coord
+                            ),
+                            L=self.latent_dim,
+                            tmem_ptr=tmem_ptr,
+                            sMeta=sMeta,
+                            tidx=((tidx % 64) // 16) * 32
+                            + tidx % 16
+                            + ((tidx % 128) // 64) * 16,
+                            score_exchange=storage.smem_q_latent.data_ptr(),
+                            p_cor_pipeline=p_cor_pipeline,
+                            attn_sink_unscaled=attn_sink_unscaled,
+                            attn_sink=attn_sink_unscaled,
+                            H=mQL.shape[0],
+                            output_exchange=storage.smem_q_latent.data_ptr(),
+                            output_map=output_map,
+                            tiled_mma_pv=tiled_mma_pv,
+                            mma_o_pipeline=mma_o_pipeline,
+                            epilogue_params=SimpleNamespace(
+                                output_scale=output_scale,
+                                softmax_scale_log2=softmax_scale_log2,
+                                mAccLSE=mAccLSE,
+                                mLSE=mLSE,
+                            ),
+                        )
+                        compute_softmax_params = SimpleNamespace(
+                            tiled_mma_qk=tiled_mma_qk,
+                            sP=sP,
+                            mma_s_pipeline=mma_s_pipeline,
+                            p_mma_pipeline=p_mma_pipeline,
+                            softmax_scale_log2=softmax_scale_log2,
+                        )
+                        (
+                            mma_s_consumer_state,
+                            p_mma_producer_state,
+                            p_cor_producer_state,
+                            mma_o_consumer_state,
+                        ) = self.compute_ws(
+                            compute_common_params,
+                            compute_softmax_params,
+                            k_index=k_index,
+                            k_tile_count=k_tile_count,
+                            mma_s_consumer_state=mma_s_consumer_state,
+                            p_mma_producer_state=p_mma_producer_state,
+                            p_cor_producer_state=p_cor_producer_state,
+                            is_second_compute_warp=False,
+                            mma_o_consumer_state=mma_o_consumer_state,
+                        )
+                    if cutlass.const_expr(self.is_persistent):
+                        # Q scratch is reused for score exchange and TMA output;
+                        # all active roles finish the current request before the
+                        # producer may load the next Q or overwrite slot indices.
+                        prims.barrier_cta_sync(
+                            13, thread_count=self.threads_per_cta - 32
+                        )
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+
+            if cutlass.const_expr(self.use_2cta_instrs):
+                # A CTA must stay alive until its peer has finished all DSMEM
+                # V stores, including tiles whose query heads are padding.
+                prims.barrier_cluster_arrive()
+                prims.barrier_cluster_wait()
+            return
+
+        else:
+            # ///////////////////////////////////////////////////////////////////////////////
+            #  Compute warp
+            # ///////////////////////////////////////////////////////////////////////////////
+            if (
+                warp_idx >= self.compute_warp_ids[0]
+                and warp_idx <= self.compute_warp_ids[-1]
+            ):
+                prims.setmaxregister(
+                    self.softmax_reg_num, prims.SetMaxRegisterAction.INCREASE
+                )
+                mma_s_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_s_stage
+                )
+                p_mma_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.p_mma_stage
+                )
+                p_cor_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.p_cor_stage
+                )
+                mma_o_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_o_stage
+                )
+                prims.barrier_cta_sync(
+                    self.tmem_ptr_sync_bar.barrier_id,
+                    thread_count=self.tmem_ptr_sync_bar.num_threads,
+                )
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+                tile_sched = create_hca_static_tile_scheduler(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                while work_tile.is_valid_tile:
+                    blk_coord = work_tile.tile_idx
+                    k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                        split_kv, cache_seqs, block_split_kvs, blk_coord
                     )
-                    mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state = (
-                        self.compute(
+                    if k_tile_count > 0:
+                        compute_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            split_kv=split_kv,
+                            local_split_kv=local_split_kv,
+                            smem_exchange=softmax_smem_exchange,
+                            sSlots=sSlots,
+                            mAccO=mAccO,
+                            mO=mO,
+                            k_tile_total=cute.ceil_div(
+                                cache_seqs[blk_coord[2]], self.mma_qk_tiler[1]
+                            ),
+                            K_valid=self.get_effective_hca_k(
+                                sparse_mla_topk_lens, blk_coord
+                            ),
+                            window_valid_len=self.get_window_valid_len(
+                                window_valid_lens, blk_coord
+                            ),
+                            L=self.latent_dim,
+                            tmem_ptr=tmem_ptr,
+                            sMeta=sMeta,
+                            tidx=tidx,
+                            p_cor_pipeline=p_cor_pipeline,
+                            attn_sink_unscaled=attn_sink_unscaled,
+                        )
+                        compute_softmax_params = SimpleNamespace(
+                            tiled_mma_qk=tiled_mma_qk,
+                            sP=sP,
+                            mma_s_pipeline=mma_s_pipeline,
+                            p_mma_pipeline=p_mma_pipeline,
+                            softmax_scale_log2=softmax_scale_log2,
+                        )
+                        (
+                            mma_s_consumer_state,
+                            p_mma_producer_state,
+                            p_cor_producer_state,
+                        ) = self.compute(
                             compute_common_params,
                             compute_softmax_params,
                             k_index=k_index,
@@ -1349,84 +1514,86 @@ class BlackwellV41MixedCacheDecode:
                             p_cor_producer_state=p_cor_producer_state,
                             is_second_compute_warp=False,
                         )
-                    )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Compute warp - second group (g1, warps 8-11, odd k-tiles).
-        # ///////////////////////////////////////////////////////////////////////////////
-        if (
-            warp_idx >= self.second_compute_warp_ids[0]
-            and warp_idx <= self.second_compute_warp_ids[-1]
-        ):
-            prims.setmaxregister(
-                self.softmax_reg_num, prims.SetMaxRegisterAction.INCREASE
-            )
-            mma_s_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_s_stage
-            )
-            p_mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_mma_stage
-            )
-            p_cor_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.p_cor_stage
-            )
-            mma_o_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_o_stage
-            )
-            prims.barrier_cta_sync(
-                self.tmem_ptr_sync_bar.barrier_id,
-                thread_count=self.tmem_ptr_sync_bar.num_threads,
-            )
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-
-            tile_sched = create_hca_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-            mma_s_consumer_state.advance()
-            p_mma_producer_state.advance()
-            p_cor_producer_state.advance()
-            while work_tile.is_valid_tile:
-                blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
+            # ///////////////////////////////////////////////////////////////////////////////
+            #  Compute warp - second group (g1, warps 8-11, odd k-tiles).
+            # ///////////////////////////////////////////////////////////////////////////////
+            if (
+                warp_idx >= self.second_compute_warp_ids[0]
+                and warp_idx <= self.second_compute_warp_ids[-1]
+            ):
+                prims.setmaxregister(
+                    self.softmax_reg_num, prims.SetMaxRegisterAction.INCREASE
                 )
-                if k_tile_count > 0:
-                    compute_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        split_kv=split_kv,
-                        local_split_kv=local_split_kv,
-                        smem_exchange=softmax_smem_exchange,
-                        sSlots=sSlots,
-                        mAccO=mAccO,
-                        mO=mO,
-                        k_tile_total=cute.ceil_div(
-                            cache_seqs[blk_coord[2]], self.mma_qk_tiler[1]
-                        ),
-                        K_valid=self.get_effective_hca_k(
-                            sparse_mla_topk_lens, blk_coord
-                        ),
-                        window_valid_len=self.get_window_valid_len(
-                            window_valid_lens, blk_coord
-                        ),
-                        L=self.latent_dim,
-                        tmem_ptr=tmem_ptr,
-                        sMeta=sMeta,
-                        tidx=tidx,
-                        p_cor_pipeline=p_cor_pipeline,
-                        attn_sink_unscaled=attn_sink_unscaled,
+                mma_s_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_s_stage
+                )
+                p_mma_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.p_mma_stage
+                )
+                p_cor_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.p_cor_stage
+                )
+                mma_o_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_o_stage
+                )
+                prims.barrier_cta_sync(
+                    self.tmem_ptr_sync_bar.barrier_id,
+                    thread_count=self.tmem_ptr_sync_bar.num_threads,
+                )
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+                tile_sched = create_hca_static_tile_scheduler(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                mma_s_consumer_state.advance()
+                p_mma_producer_state.advance()
+                p_cor_producer_state.advance()
+                while work_tile.is_valid_tile:
+                    blk_coord = work_tile.tile_idx
+                    k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                        split_kv, cache_seqs, block_split_kvs, blk_coord
                     )
-                    compute_softmax_params = SimpleNamespace(
-                        tiled_mma_qk=tiled_mma_qk,
-                        sP=sP,
-                        mma_s_pipeline=mma_s_pipeline,
-                        p_mma_pipeline=p_mma_pipeline,
-                        softmax_scale_log2=softmax_scale_log2,
-                    )
-                    mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state = (
-                        self.compute(
+                    if k_tile_count > 0:
+                        compute_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            split_kv=split_kv,
+                            local_split_kv=local_split_kv,
+                            smem_exchange=softmax_smem_exchange,
+                            sSlots=sSlots,
+                            mAccO=mAccO,
+                            mO=mO,
+                            k_tile_total=cute.ceil_div(
+                                cache_seqs[blk_coord[2]], self.mma_qk_tiler[1]
+                            ),
+                            K_valid=self.get_effective_hca_k(
+                                sparse_mla_topk_lens, blk_coord
+                            ),
+                            window_valid_len=self.get_window_valid_len(
+                                window_valid_lens, blk_coord
+                            ),
+                            L=self.latent_dim,
+                            tmem_ptr=tmem_ptr,
+                            sMeta=sMeta,
+                            tidx=tidx,
+                            p_cor_pipeline=p_cor_pipeline,
+                            attn_sink_unscaled=attn_sink_unscaled,
+                        )
+                        compute_softmax_params = SimpleNamespace(
+                            tiled_mma_qk=tiled_mma_qk,
+                            sP=sP,
+                            mma_s_pipeline=mma_s_pipeline,
+                            p_mma_pipeline=p_mma_pipeline,
+                            softmax_scale_log2=softmax_scale_log2,
+                        )
+                        (
+                            mma_s_consumer_state,
+                            p_mma_producer_state,
+                            p_cor_producer_state,
+                        ) = self.compute(
                             compute_common_params,
                             compute_softmax_params,
                             k_index=k_index,
@@ -1436,83 +1603,82 @@ class BlackwellV41MixedCacheDecode:
                             p_cor_producer_state=p_cor_producer_state,
                             is_second_compute_warp=True,
                         )
-                    )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Correction warp
-        # ///////////////////////////////////////////////////////////////////////////////
-        if (
-            warp_idx >= self.correction_warp_ids[0]
-            and warp_idx <= self.correction_warp_ids[-1]
-        ):
-            prims.setmaxregister(
-                self.correction_reg_num, prims.SetMaxRegisterAction.INCREASE
-            )
-            p_cor_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.p_cor_stage
-            )
-            mma_o_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.mma_o_stage
-            )
-            # sync with mma warp before retrieving tmem ptr
-            prims.barrier_cta_sync(
-                self.tmem_ptr_sync_bar.barrier_id,
-                thread_count=self.tmem_ptr_sync_bar.num_threads,
-            )
-
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-
-            tile_sched = create_hca_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
-            )
-            work_tile = tile_sched.initial_work_tile_info()
-            while work_tile.is_valid_tile:
-                blk_coord = work_tile.tile_idx
-                k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
-                    split_kv, cache_seqs, block_split_kvs, blk_coord
+            # ///////////////////////////////////////////////////////////////////////////////
+            #  Correction warp
+            # ///////////////////////////////////////////////////////////////////////////////
+            if (
+                warp_idx >= self.correction_warp_ids[0]
+                and warp_idx <= self.correction_warp_ids[-1]
+            ):
+                prims.setmaxregister(
+                    self.correction_reg_num, prims.SetMaxRegisterAction.INCREASE
                 )
-                if k_tile_count > 0:
-                    compute_common_params = SimpleNamespace(
-                        blk_coord=blk_coord,
-                        split_kv=split_kv,
-                        local_split_kv=local_split_kv,
-                        smem_exchange=epilogue_smem_exchange,
-                        attn_sink=attn_sink_unscaled,
-                        mAccO=mAccO,
-                        mO=mO,
-                        L=self.latent_dim,
-                        H=mQL.shape[0],
-                        tmem_ptr=tmem_ptr,
-                        sMeta=sMeta,
-                        tidx=tidx,
-                        tiled_mma_pv=tiled_mma_pv,
-                        p_cor_pipeline=p_cor_pipeline,
-                        mma_o_pipeline=mma_o_pipeline,
-                    )
-                    compute_epilogue_params = SimpleNamespace(
-                        output_scale=output_scale,
-                        softmax_scale_log2=softmax_scale_log2,
-                        mAccLSE=mAccLSE,
-                        mLSE=mLSE,
-                    )
-                    p_cor_consumer_state, mma_o_consumer_state = self.correction(
-                        compute_common_params,
-                        compute_epilogue_params,
-                        k_tile_count=k_tile_count,
-                        p_cor_consumer_state=p_cor_consumer_state,
-                        mma_o_consumer_state=mma_o_consumer_state,
-                    )
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
+                p_cor_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.p_cor_stage
+                )
+                mma_o_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.mma_o_stage
+                )
+                # sync with mma warp before retrieving tmem ptr
+                prims.barrier_cta_sync(
+                    self.tmem_ptr_sync_bar.barrier_id,
+                    thread_count=self.tmem_ptr_sync_bar.num_threads,
+                )
 
-        if cutlass.const_expr(self.use_2cta_instrs):
-            # A CTA must stay alive until its peer has finished all DSMEM
-            # V stores, including tiles whose query heads are padding.
-            prims.barrier_cluster_arrive()
-            prims.barrier_cluster_wait()
-        return
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+
+                tile_sched = create_hca_static_tile_scheduler(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work_tile = tile_sched.initial_work_tile_info()
+                while work_tile.is_valid_tile:
+                    blk_coord = work_tile.tile_idx
+                    k_index, k_tile_count, local_split_kv = self.get_k_tile_count(
+                        split_kv, cache_seqs, block_split_kvs, blk_coord
+                    )
+                    if k_tile_count > 0:
+                        compute_common_params = SimpleNamespace(
+                            blk_coord=blk_coord,
+                            split_kv=split_kv,
+                            local_split_kv=local_split_kv,
+                            smem_exchange=epilogue_smem_exchange,
+                            attn_sink=attn_sink_unscaled,
+                            mAccO=mAccO,
+                            mO=mO,
+                            L=self.latent_dim,
+                            H=mQL.shape[0],
+                            tmem_ptr=tmem_ptr,
+                            sMeta=sMeta,
+                            tidx=tidx,
+                            tiled_mma_pv=tiled_mma_pv,
+                            p_cor_pipeline=p_cor_pipeline,
+                            mma_o_pipeline=mma_o_pipeline,
+                        )
+                        compute_epilogue_params = SimpleNamespace(
+                            output_scale=output_scale,
+                            softmax_scale_log2=softmax_scale_log2,
+                            mAccLSE=mAccLSE,
+                            mLSE=mLSE,
+                        )
+                        p_cor_consumer_state, mma_o_consumer_state = self.correction(
+                            compute_common_params,
+                            compute_epilogue_params,
+                            k_tile_count=k_tile_count,
+                            p_cor_consumer_state=p_cor_consumer_state,
+                            mma_o_consumer_state=mma_o_consumer_state,
+                        )
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+
+            if cutlass.const_expr(self.use_2cta_instrs):
+                # A CTA must stay alive until its peer has finished all DSMEM
+                # V stores, including tiles whose query heads are padding.
+                prims.barrier_cluster_arrive()
+                prims.barrier_cluster_wait()
+            return
 
     @cute.kernel
     def reduction_kernel(
@@ -2320,6 +2486,9 @@ class BlackwellV41MixedCacheDecode:
             load_q_release_state = load_q_consumer_state.clone()
             load_q_pipeline.consumer_wait(load_q_consumer_state)
             load_q_consumer_state.advance()
+            if cutlass.const_expr(self.use_ws):
+                prims.barrier_cta_sync(10, thread_count=160)
+                prims.tcgen05_fence("after_thread_sync")
             while k_tile_count > 0:
                 (
                     tiled_mma_qk,
@@ -2453,9 +2622,15 @@ class BlackwellV41MixedCacheDecode:
             load_q_pipeline.consumer_wait(load_q_consumer_state)
         load_k_pipeline.consumer_wait(load_k_consumer_state)
         if cutlass.const_expr(self.use_primitives):
-            hw.qk_mma(
-                qk_params.sQ, qk_params.sKC, tStS.iterator, load_k_consumer_state.index
-            )
+            if cutlass.const_expr(self.use_ws):
+                hw.qk_mma_ws(qk_params.sKC, load_k_consumer_state.index)
+            else:
+                hw.qk_mma(
+                    qk_params.sQ,
+                    qk_params.sKC,
+                    tStS.iterator,
+                    load_k_consumer_state.index,
+                )
             tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
         else:
             for q_stage in range(self.iterations_qk_latent):
@@ -2526,12 +2701,16 @@ class BlackwellV41MixedCacheDecode:
 
         load_v_pipeline.consumer_wait(load_v_consumer_state)
         vc_stage = load_v_consumer_state.index
-        for acc_stage in range(self.iterations_pv_n):
-            mma_o_pipeline.producer_acquire(mma_o_producer_state)
-            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
-            if cutlass.const_expr(self.use_primitives):
+        if cutlass.const_expr(self.use_ws):
+            for acc_stage in range(0, self.iterations_pv_n, 2):
+                # Each WS N256 slice writes two 64-column TMEM views.
+                # Acquire both prior consumers before touching either half.
+                first_state = mma_o_producer_state.clone()
+                mma_o_pipeline.producer_acquire(mma_o_producer_state)
+                mma_o_producer_state.advance()
+                mma_o_pipeline.producer_acquire(mma_o_producer_state)
                 tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-                hw.pv_mma(
+                hw.pv_mma_ws(
                     pv_params.sP,
                     pv_params.sVC,
                     tOtO.iterator,
@@ -2541,27 +2720,49 @@ class BlackwellV41MixedCacheDecode:
                     accumulate_flag,
                 )
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
-            else:
-                for p_stage in range(self.iterations_pv_k):
+                mma_o_pipeline.producer_commit(first_state)
+                mma_o_pipeline.producer_commit(mma_o_producer_state)
+                mma_o_producer_state.advance()
+        else:
+            for acc_stage in range(self.iterations_pv_n):
+                mma_o_pipeline.producer_acquire(mma_o_producer_state)
+                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
+                if cutlass.const_expr(self.use_primitives):
                     tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-                    for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
-                        cute.gemm(
-                            tiled_mma_pv,
-                            tOtO,
-                            pv_params.tOrP[
-                                None,
-                                None,
-                                k_block,
-                                (p_stage, p_mma_consumer_state.index),
-                            ],
-                            pv_params.tOrVC[
-                                None, None, k_block, ((acc_stage, p_stage), vc_stage)
-                            ],
-                            tOtO,
-                        )
-                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
-            mma_o_pipeline.producer_commit(mma_o_producer_state)
-            mma_o_producer_state.advance()
+                    hw.pv_mma(
+                        pv_params.sP,
+                        pv_params.sVC,
+                        tOtO.iterator,
+                        p_mma_consumer_state.index,
+                        vc_stage,
+                        acc_stage,
+                        accumulate_flag,
+                    )
+                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                else:
+                    for p_stage in range(self.iterations_pv_k):
+                        tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
+                        for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
+                            cute.gemm(
+                                tiled_mma_pv,
+                                tOtO,
+                                pv_params.tOrP[
+                                    None,
+                                    None,
+                                    k_block,
+                                    (p_stage, p_mma_consumer_state.index),
+                                ],
+                                pv_params.tOrVC[
+                                    None,
+                                    None,
+                                    k_block,
+                                    ((acc_stage, p_stage), vc_stage),
+                                ],
+                                tOtO,
+                            )
+                            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                mma_o_pipeline.producer_commit(mma_o_producer_state)
+                mma_o_producer_state.advance()
         load_v_pipeline.consumer_release(load_v_consumer_state)
         load_v_consumer_state.advance()
         pv_params.p_mma_pipeline.consumer_release(p_mma_consumer_state)
@@ -2854,6 +3055,72 @@ class BlackwellV41MixedCacheDecode:
         return mma_s_consumer_state, p_mma_producer_state, p_cor_producer_state
 
     @cute.jit
+    def compute_ws(
+        self,
+        common_params,
+        softmax_params,
+        k_index,
+        k_tile_count,
+        mma_s_consumer_state,
+        p_mma_producer_state,
+        p_cor_producer_state,
+        is_second_compute_warp: bool,
+        mma_o_consumer_state,
+    ):
+        row_max = self.acc_dtype(self.init_row_max)
+        row_sum = self.acc_dtype(0.0)
+        correction_factor = self.acc_dtype(1.0)
+        initial_count = k_tile_count
+        while k_tile_count > 0:
+            tile_valid_len = common_params.K_valid
+            if k_index < self.window_tiles:
+                tile_valid_len = common_params.window_valid_len
+            (
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+            ) = self.softmax(
+                common_params,
+                softmax_params,
+                k_index,
+                tile_valid_len,
+                mma_s_consumer_state,
+                p_mma_producer_state,
+                p_cor_producer_state,
+                row_max,
+                row_sum,
+                correction_factor,
+                False,
+                True,
+                k_tile_count == 1,
+            )
+            if k_tile_count != initial_count:
+                mma_o_consumer_state = self.rescale(
+                    common_params,
+                    mma_o_consumer_state,
+                    correction_factor,
+                    cutlass.Int32(correction_factor == self.acc_dtype(1.0)),
+                )
+            k_index += 1
+            k_tile_count -= 1
+        mma_o_consumer_state = self.epilogue(
+            common_params,
+            common_params.epilogue_params,
+            mma_o_consumer_state,
+            row_sum,
+            row_max,
+        )
+        return (
+            mma_s_consumer_state,
+            p_mma_producer_state,
+            p_cor_producer_state,
+            mma_o_consumer_state,
+        )
+
+    @cute.jit
     def init_p_cor_metadata(
         self,
         common_params: SimpleNamespace,
@@ -3070,7 +3337,17 @@ class BlackwellV41MixedCacheDecode:
             not self.use_2cta_instrs or (arch >= Arch.sm_100 and arch <= Arch.sm_100f)
         ):
             if cutlass.const_expr(self.use_primitives):
-                hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
+                if cutlass.const_expr(self.use_ws):
+                    hw.load_ws_scores(
+                        tTR_rAcc,
+                        common_params.score_exchange,
+                        mma_s_consumer_state.index,
+                        self.softmax_exchange_sync_bar_1.barrier_id
+                        if is_second_compute_warp
+                        else self.softmax_exchange_sync_bar_0.barrier_id,
+                    )
+                else:
+                    hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
             else:
                 cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
@@ -3132,23 +3409,26 @@ class BlackwellV41MixedCacheDecode:
                 ],
             )
 
-        if cutlass.const_expr(is_second_compute_warp):
-            prims.barrier_cta_sync(
-                self.softmax_order_bar_1.barrier_id,
-                thread_count=self.softmax_order_bar_1.num_threads,
-            )
+        if cutlass.const_expr(self.use_ws):
+            row_max_new = cute.arch.fmax(row_max_new, row_max)
         else:
-            prims.barrier_cta_sync(
-                self.softmax_order_bar_0.barrier_id,
-                thread_count=self.softmax_order_bar_0.num_threads,
-            )
+            if cutlass.const_expr(is_second_compute_warp):
+                prims.barrier_cta_sync(
+                    self.softmax_order_bar_1.barrier_id,
+                    thread_count=self.softmax_order_bar_1.num_threads,
+                )
+            else:
+                prims.barrier_cta_sync(
+                    self.softmax_order_bar_0.barrier_id,
+                    thread_count=self.softmax_order_bar_0.num_threads,
+                )
 
-        other_row_max, other_row_sum = self.load_other_group_metadata(
-            common_params, softmax_params, p_cor_producer_state
-        )
-        row_max_new = cute.arch.fmax(row_max_new, other_row_max)
-        row_max = other_row_max
-        row_sum = other_row_sum
+            other_row_max, other_row_sum = self.load_other_group_metadata(
+                common_params, softmax_params, p_cor_producer_state
+            )
+            row_max_new = cute.arch.fmax(row_max_new, other_row_max)
+            row_max = other_row_max
+            row_sum = other_row_sum
 
         # A split can begin with a completely masked window tile and no
         # sink. Preserve its -inf maximum for a later nonempty tile, while
@@ -3171,18 +3451,19 @@ class BlackwellV41MixedCacheDecode:
             fastmath=True,
         )
         saved_p_cor_idx = p_cor_producer_state.index
-        if not is_local_last_tile:
-            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
-                common_params,
-                softmax_params,
-                correction_factor,
-                row_sum,
-                row_max,
-                row_max_new,
-                tAcc,
-                tidx,
-                p_cor_producer_state,
-            )
+        if cutlass.const_expr(not self.use_ws):
+            if not is_local_last_tile:
+                p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+                    common_params,
+                    softmax_params,
+                    correction_factor,
+                    row_sum,
+                    row_max,
+                    row_max_new,
+                    tAcc,
+                    tidx,
+                    p_cor_producer_state,
+                )
 
         fma_b = softmax_params.softmax_scale_log2
         fma_c = cutlass.select_(
@@ -3190,9 +3471,23 @@ class BlackwellV41MixedCacheDecode:
             self.acc_dtype(0.0),
             (0.0 - row_max_new) * softmax_params.softmax_scale_log2,
         )
-        for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
-            tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
-            tTR_rAcc[i] = cute.math.exp2(tTR_rAcc[i], fastmath=True)
+        if cutlass.const_expr(self.use_ws):
+            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+                scaled = prims.fma_packed_f32x2(
+                    (tTR_rAcc[i], tTR_rAcc[i + 1]),
+                    (fma_b, fma_b),
+                    (fma_c, fma_c),
+                    rnd="rn",
+                )
+                tTR_rAcc[i] = cute.math.exp2(scaled[0], fastmath=True)
+                tTR_rAcc[i + 1] = cute.math.exp2(scaled[1], fastmath=True)
+
+        else:
+            for i in cutlass.range(
+                cute.size(tTR_rAcc), vectorize=True, unroll_full=True
+            ):
+                tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
+                tTR_rAcc[i] = cute.math.exp2(tTR_rAcc[i], fastmath=True)
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
         tTR_rS.store(tTR_rAcc.load().to(self.q_dtype))
@@ -3233,7 +3528,12 @@ class BlackwellV41MixedCacheDecode:
         sP_copy_view = smem_thr_copy.partition_D(sP_mk_view)
 
         softmax_params.p_mma_pipeline.producer_acquire(p_mma_producer_state)
-        cute.copy(smem_tiled_copy, rP_copy_view, sP_copy_view)
+        if cutlass.const_expr(self.use_ws):
+            hw.store_p_inter(
+                tTR_rS, softmax_params.sP.iterator, p_mma_producer_state.index
+            )
+        else:
+            cute.copy(smem_tiled_copy, rP_copy_view, sP_copy_view)
         prims.fence_proxy("async_shared", space=prims.SharedSpace.shared_cta)
         softmax_params.p_mma_pipeline.producer_commit(p_mma_producer_state)
         p_mma_producer_state.advance()
@@ -3246,37 +3546,40 @@ class BlackwellV41MixedCacheDecode:
             )
         row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
-        if not is_local_last_tile:
-            self.store_p_cor_row_sum(
-                common_params,
-                row_sum,
-                saved_p_cor_idx,
-                tAcc,
-                tidx,
-            )
-
-        if is_local_last_tile:
-            p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
-                common_params,
-                softmax_params,
-                correction_factor,
-                row_sum,
-                row_max,
-                row_max_new,
-                tAcc,
-                tidx,
-                p_cor_producer_state,
-            )
-        if cutlass.const_expr(is_second_compute_warp):
-            prims.barrier_cta_arrive(
-                self.softmax_order_bar_0.barrier_id,
-                self.softmax_order_bar_0.num_threads,
-            )
+        if cutlass.const_expr(self.use_ws):
+            p_cor_producer_state.advance()
         else:
-            prims.barrier_cta_arrive(
-                self.softmax_order_bar_1.barrier_id,
-                self.softmax_order_bar_1.num_threads,
-            )
+            if not is_local_last_tile:
+                self.store_p_cor_row_sum(
+                    common_params,
+                    row_sum,
+                    saved_p_cor_idx,
+                    tAcc,
+                    tidx,
+                )
+
+            if is_local_last_tile:
+                p_cor_producer_state, row_max_new = self.exchange_p_cor_metadata(
+                    common_params,
+                    softmax_params,
+                    correction_factor,
+                    row_sum,
+                    row_max,
+                    row_max_new,
+                    tAcc,
+                    tidx,
+                    p_cor_producer_state,
+                )
+            if cutlass.const_expr(is_second_compute_warp):
+                prims.barrier_cta_arrive(
+                    self.softmax_order_bar_0.barrier_id,
+                    self.softmax_order_bar_0.num_threads,
+                )
+            else:
+                prims.barrier_cta_arrive(
+                    self.softmax_order_bar_1.barrier_id,
+                    self.softmax_order_bar_1.num_threads,
+                )
 
         mma_s_consumer_state.advance()
         return (
@@ -3328,6 +3631,11 @@ class BlackwellV41MixedCacheDecode:
             common_params.tmem_ptr + self.tmem_o_offset, tOtO_layout
         )
         tOtO = tOtO[None, None, None, iter_n]
+        if cutlass.const_expr(self.use_ws):
+            packed_offset = iter_n * 64
+            tOtO = cute.make_tensor(
+                tOtO.iterator - iter_n * 128 + packed_offset, tOtO.layout
+            )
 
         tAcc = tOtO[(None, None), 0, 0]
 
@@ -3406,6 +3714,29 @@ class BlackwellV41MixedCacheDecode:
         tTR_gO = tmem_load_thr_copy.partition_D(gO)
         tTR_cO = tmem_load_thr_copy.partition_D(cO)
         tTR_rAcc = cute.make_fragment_like(tTR_gO, self.acc_dtype)
+        if cutlass.const_expr(self.use_ws):
+            physical_tid, _, _ = cute.arch.thread_idx()
+            head = physical_tid % 64
+            col = (
+                ((physical_tid % 128) // 64) * 128
+                + (iter_n // 2) * 256
+                + (iter_n % 2) * 64
+            )
+            if cutlass.const_expr(common_params.mAccO is None):
+                row_view = common_params.mO[
+                    head, None, common_params.blk_coord[1], common_params.blk_coord[2]
+                ]
+            else:
+                row_view = common_params.mAccO[
+                    head,
+                    common_params.blk_coord[3],
+                    None,
+                    common_params.blk_coord[1],
+                    common_params.blk_coord[2],
+                ]
+            tTR_gO = cute.make_tensor(
+                row_view.iterator + col, cute.make_layout(tTR_rAcc.shape)
+            )
         return tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc
 
     @cute.jit
@@ -3549,7 +3880,10 @@ class BlackwellV41MixedCacheDecode:
 
                 # load o
                 if cutlass.const_expr(self.use_primitives):
-                    hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
+                    if cutlass.const_expr(self.use_ws):
+                        hw.load_tmem_ws(tAcc.iterator, tTR_rAcc)
+                    else:
+                        hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
                 else:
                     cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
                 # rescale, using `mul_packed_f32x2` to reduce the number of instructions
@@ -3560,7 +3894,10 @@ class BlackwellV41MixedCacheDecode:
 
                 # store o to tensor memory for next k tile
                 if cutlass.const_expr(self.use_primitives):
-                    hw.store_tmem_m64(tTR_rAcc, tAcc.iterator)
+                    if cutlass.const_expr(self.use_ws):
+                        hw.store_tmem_ws(tTR_rAcc, tAcc.iterator)
+                    else:
+                        hw.store_tmem_m64(tTR_rAcc, tAcc.iterator)
                 else:
                     cute.copy(tmem_store_tiled_copy, tTR_rAcc, tTR_tAcc)
 
@@ -3598,20 +3935,22 @@ class BlackwellV41MixedCacheDecode:
 
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
 
+        # The fused WS group must not overwrite the final tile's shared
+        # row-max exchange while another warp still reads it. Use the already
+        # allocated epilogue buffer, as the separate correction group does.
+        exchange = common_params.smem_exchange
+        if cutlass.const_expr(self.use_ws):
+            exchange = common_params.epilogue_exchange
+
         # exchange row_sum between warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
-            common_params.smem_exchange[tidx] = row_sum
+            exchange[tidx] = row_sum
             prims.barrier_cta_sync(
                 self.epilogue_exchange_sync_bar.barrier_id,
                 thread_count=self.epilogue_exchange_sync_bar.num_threads,
             )
             # (64, 2)
-            row_sum = (
-                row_sum
-                + common_params.smem_exchange[
-                    (tidx ^ (64 if self.use_2cta_instrs else 16))
-                ]
-            )
+            row_sum = row_sum + exchange[(tidx ^ (64 if self.use_2cta_instrs else 16))]
 
             # LSE is shared by every PV-N output tile. Store it once before
             # materializing the large O fragment so its global pointer and
@@ -3712,7 +4051,10 @@ class BlackwellV41MixedCacheDecode:
 
             # load o
             if cutlass.const_expr(self.use_primitives):
-                hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
+                if cutlass.const_expr(self.use_ws):
+                    hw.load_tmem_ws(tAcc.iterator, tTR_rAcc)
+                else:
+                    hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
             else:
                 cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
 
@@ -3724,15 +4066,11 @@ class BlackwellV41MixedCacheDecode:
                 self.acc_dtype(0.0),
                 cute.arch.rcp_approx(row_sum),
             )
+            normalizer = epilogue_params.output_scale * inv_row_sum * sink_scale
             for i in cutlass.range(
                 cute.size(tTR_rAcc), vectorize=True, unroll_full=True
             ):
-                tTR_rAcc[i] = (
-                    tTR_rAcc[i]
-                    * epilogue_params.output_scale
-                    * inv_row_sum
-                    * sink_scale
-                )
+                tTR_rAcc[i] = tTR_rAcc[i] * normalizer
 
             # store o to global memory
             tR2G_rO_src = None
@@ -3745,12 +4083,39 @@ class BlackwellV41MixedCacheDecode:
                 # using accumulate dtype for o
                 tR2G_rO_src = tTR_rAcc
 
-            if cute.elem_less(tTR_cO[0][0], common_params.H):
-                cute.autovec_copy(
-                    tR2G_rO_src,
-                    tR2G_rO_dst,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
+            if cutlass.const_expr(self.use_ws):
+                if cutlass.const_expr(common_params.mAccO is None):
+                    hw.stage_ws_output_sw128(
+                        tR2G_rO_src, common_params.output_exchange, iter_n
+                    )
+                    hw.issue_ws_output(
+                        common_params.output_map,
+                        common_params.output_exchange,
+                        (
+                            common_params.blk_coord[2] * common_params.mO.shape[2]
+                            + common_params.blk_coord[1]
+                        )
+                        * common_params.H,
+                        iter_n,
+                    )
+                else:
+                    hw.store_ws_output(
+                        tR2G_rO_src,
+                        common_params.output_exchange,
+                        common_params.mO,
+                        common_params.mAccO,
+                        common_params.blk_coord,
+                        common_params.H,
+                        iter_n,
+                    )
+
+            else:
+                if cute.elem_less(tTR_cO[0][0], common_params.H):
+                    cute.autovec_copy(
+                        tR2G_rO_src,
+                        tR2G_rO_dst,
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
 
             # The primitives helper already completed this TMEM load.
             if cutlass.const_expr(not self.use_primitives):
@@ -3758,6 +4123,16 @@ class BlackwellV41MixedCacheDecode:
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
             mma_o_consumer_state.advance()
 
+        if cutlass.const_expr(self.use_ws and common_params.mAccO is None):
+            hw.flush_ws_output(
+                common_params.output_map,
+                common_params.output_exchange,
+                (
+                    common_params.blk_coord[2] * common_params.mO.shape[2]
+                    + common_params.blk_coord[1]
+                )
+                * common_params.H,
+            )
         return mma_o_consumer_state
 
     def make_and_init_load_qkv_pipeline(

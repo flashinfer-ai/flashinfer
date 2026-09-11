@@ -17,6 +17,7 @@ def _compile(
     phase_chunks=8,
     narrow_offsets=False,
     native_fp4=None,
+    persistent_ctas=0,
 ):
     import cutlass
     import cutlass.cute as cute
@@ -52,15 +53,19 @@ def _compile(
     valid = f(cutlass.Int32, (sb,), assumed_align=16)
     sink = f(cutlass.Float32, (64,), assumed_align=16)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
+    # WS is selected only for the measured K512 large-batch configuration.
+    use_ws = dequant_warps == 16 and not split
+    assert not persistent_ctas or use_ws
     kernel = hca_v41.BlackwellV41MixedCacheDecode(
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
         mma_qk_tiler_mn=(64, 64),
         mma_pv_tiler_mn=(64, 128),
-        max_active_clusters=1,
+        max_active_clusters=persistent_ctas or sm_count,
         page_size_cmp=64,
         skip_correction_threshold=6.0,
-        is_persistent=False,
+        is_persistent=bool(persistent_ctas),
         is_var_seq=True,
         is_var_split_kv=False,
         is_causal=True,
@@ -73,12 +78,13 @@ def _compile(
         dequant_phase_chunks=phase_chunks,
         narrow_offsets=narrow_offsets,
         native_fp4=native_fp4,
+        use_ws=use_ws,
     )
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_decode",
         f"h64_s1_c{compressed_k}_split{int(split)}"
         f"_dq{dequant_warps}_phase{phase_chunks}_i{32 if narrow_offsets else 64}"
-        f"_nativefp4{int(native_fp4)}",
+        f"_nativefp4{int(native_fp4)}_ws{int(use_ws)}_ctas{persistent_ctas}_sm{sm_count}",
         lambda: cute.compile(
             kernel,
             q,
@@ -186,7 +192,7 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
             if torch.cuda.is_current_stream_capturing():
                 raise ValueError("prepare a decode plan before CUDA Graph capture")
             ck = 0 if global_indices is None else global_indices.shape[2]
-            # Frozen small-batch schedule; tuning stays inside this kernel family.
+            # Keep the measured split schedule for low-latency small batches.
             desired = (
                 10
                 if batch <= 4
@@ -201,8 +207,8 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
             split = min(desired, (128 + ck) // 64)
             dequant_warps, phase_chunks, narrow_offsets = 8, 8, False
             if ck == 512 and batch >= 128:
-                # More dequant lanes with a shorter load phase limit the live
-                # raw data/address state while keeping large-batch parallelism.
+                # WS QK/PV with fused softmax/correction uses sixteen dequant
+                # warps and a short load phase. Reuse CTAs only above one wave.
                 dequant_warps, phase_chunks = 16, 2
             elif (
                 ck == 512
@@ -211,6 +217,16 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
             ):
                 # Narrow offsets only after proving both complete pools fit.
                 phase_chunks, narrow_offsets = 2, True
+            persistent_ctas = 0
+            if dequant_warps == 16:
+                sm_count = torch.cuda.get_device_properties(
+                    q.device
+                ).multi_processor_count
+                if batch > sm_count:
+                    # Balance requests per CTA across the minimum number of
+                    # waves, avoiding a short final wave on the full-SM grid.
+                    waves = (batch + sm_count - 1) // sm_count
+                    persistent_ctas = (batch + waves - 1) // waves
             kernel = _compile(
                 q.device.index,
                 ck,
@@ -218,6 +234,7 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
                 dequant_warps,
                 phase_chunks,
                 narrow_offsets,
+                persistent_ctas=persistent_ctas,
             )
             workspace = (
                 torch.empty(

@@ -133,6 +133,7 @@ def check(args, out, lse):
         (128, 512),
         (129, 512),
         (256, 512),
+        (512, 512),
         (4, 0),
         (128, 0),
         (2, 64),
@@ -249,7 +250,7 @@ def test_cache_offsets_above_two_gib():
         [0.0625] * 7 + [0.75],
     ],
 )
-@pytest.mark.parametrize("batch", [16, 128])
+@pytest.mark.parametrize("batch", [16, 128, 256])
 def test_normalization_anchor_crossings(levels, batch):
     gate()
     q, swa, main, wi, ci, sink = make_case(batch, 512)
@@ -257,6 +258,10 @@ def test_normalization_anchor_crossings(levels, batch):
     # rescale decisions in the same warp. Last tile introduces a new maximum.
     head_scale = torch.linspace(-0.75, 1.25, 64, device=q.device).bfloat16()
     q.copy_(head_scale[None, None, :, None].expand_as(q))
+    if batch > 128:
+        # Persistent CTAs must reset row statistics and O when their next
+        # request reverses which heads need normalization-anchor changes.
+        q[batch // 2 :].mul_(-0.5)
     wd = (
         torch.zeros((128, 512), device=q.device)
         .to(torch.float8_e4m3fn)
