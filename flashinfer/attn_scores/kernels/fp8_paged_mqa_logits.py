@@ -691,6 +691,7 @@ class FP8MQALogitsKernel:
         # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
         NUM_MATH_WG = 2  # kNumMathWarpGroups
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
+        PHYS_BLOCK_KV = self.phys_block_kv
         sm_idx = bidz
         start_q = mScheduleMeta[(sm_idx, 0)]
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
@@ -1149,16 +1150,31 @@ class FP8MQALogitsKernel:
                 # Block table prefetch for group 0 (like DeepGEMM L233-241).
                 # Each lane loads num_blocks_per_mma physical block indices
                 # for one compute tile (kv_idx counts compute tiles).
+                #
+                # Tail-predicated per COLUMN, not per tile: the table is only
+                # guaranteed ceil(ctx / phys_block_kv) columns wide (the
+                # natural serving-stack width), while a compute tile spans
+                # NUM_BLOCKS_PER_MMA columns, so the last tile of a row whose
+                # length is not a multiple of block_kv would otherwise read
+                # past the row -- the next row's entries, or past the
+                # allocation on the last row (memcheck: 4-byte over-read).
+                # Columns beyond the row's blocks only feed positions >= ctx,
+                # which the epilogue masks, so block 0 (always in the pool)
+                # stands in, as it already does for lanes past the last tile.
+                # Cost: one warp-uniform, L2-hot Int32 load per re-prefetch
+                # (every 32 tiles or at a row change) and a compare per column.
                 if kv_blk_ptr == 32:
                     kv_blk_ptr = cutlass.Int32(0)
                     prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
-                    if prefetch_kv < num_kv:
-                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
-                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
-                    else:
-                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = cutlass.Int32(0)
+                    num_phys_row = (
+                        mContextLens[q_idx] + PHYS_BLOCK_KV - 1
+                    ) // PHYS_BLOCK_KV
+                    for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                        col = prefetch_kv * NUM_BLOCKS_PER_MMA + i
+                        blk = cutlass.Int32(0)
+                        if col < num_phys_row:
+                            blk = mBlockTable[(q_idx, col)]
+                        cached_blks[i] = blk
 
                 # Get block indices via shuffle before barrier (like DeepGEMM L244)
                 phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
@@ -1244,17 +1260,20 @@ class FP8MQALogitsKernel:
                 if q_idx != q_idx_old:
                     kv_blk_ptr = cutlass.Int32(32)
 
-                # Block table prefetch for group 1 (like DeepGEMM L233-241).
+                # Block table prefetch for group 1 (like DeepGEMM L233-241);
+                # tail-predicated per column exactly like group 0 above.
                 if kv_blk_ptr == 32:
                     kv_blk_ptr = cutlass.Int32(0)
                     prefetch_kv = kv_idx + 1 + lane_idx * NUM_MATH_WG
-                    if prefetch_kv < num_kv:
-                        base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
-                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
-                    else:
-                        for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = cutlass.Int32(0)
+                    num_phys_row = (
+                        mContextLens[q_idx] + PHYS_BLOCK_KV - 1
+                    ) // PHYS_BLOCK_KV
+                    for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
+                        col = prefetch_kv * NUM_BLOCKS_PER_MMA + i
+                        blk = cutlass.Int32(0)
+                        if col < num_phys_row:
+                            blk = mBlockTable[(q_idx, col)]
+                        cached_blks[i] = blk
 
                 # Get block indices via shuffle before barrier (like DeepGEMM L244)
                 phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA

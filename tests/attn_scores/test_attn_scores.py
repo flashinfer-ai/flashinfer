@@ -18,6 +18,10 @@ Reference implementations are adapted from TRT-LLM test scripts.
 
 import pytest
 import contextlib
+import os
+import shutil
+import subprocess
+import sys
 
 import torch
 
@@ -256,15 +260,13 @@ def _ref_fp4_paged_mqa_logits(
 
 def _make_paged_kv(batch_size, block_size, seq_lens, device):
     n_blk_per_seq = (seq_lens + block_size - 1) // block_size
-    # The kernel reads ceil(ctx/128) compute tiles * (128 // block_size) physical
-    # blocks per row, which can exceed ceil(ctx/block_size) when ctx is not a
-    # multiple of 128. Size block_tables for that access pattern; the extra columns
-    # default to physical index 0 (a valid pool block) since those positions are
-    # beyond ctx (masked) — this avoids an out-of-bounds block_tables/KV read.
-    kern_blk = ((seq_lens + 127) // 128) * (128 // block_size)
+    # Natural width -- ceil(max ctx / block_size), the table a serving stack
+    # keeps.  The kernels predicate every block-table read on the row's own
+    # block count, so no compute-tile padding is needed; a shorter row's
+    # trailing columns (zeros here) are never read.
     total = int(n_blk_per_seq.sum().item())
     num_total_blocks = total + batch_size * 2
-    max_blk = int(kern_blk.max().item())
+    max_blk = int(n_blk_per_seq.max().item())
     block_tables = torch.zeros((batch_size, max_blk), dtype=torch.int32, device=device)
     pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
     off = 0
@@ -1716,70 +1718,274 @@ def test_fp4_head_dim_num_heads_validation():
 
 
 def test_block_table_width_contract(monkeypatch):
-    """block_tables must be wide enough for the kernel's compute-tile indexing.
+    """block_tables must be at least the natural width ceil(ctx / block_size).
 
-    The kernel reads ceil(ctx/128) tiles x (128 // block_size) blocks per tile,
-    which exceeds ceil(ctx/block_size) when ctx is not a multiple of 128, so a
-    naturally-sized table is indexed out of bounds. The bound needs the per-row
-    seq_lens from device memory, so the check is opt-in behind
-    FLASHINFER_VALIDATE_INPUTS. Regression for PR #4365 review r3824399380.
+    ctx=257 at block_size=64 occupies 5 blocks while the kernel walks 3
+    128-token compute tiles spanning 6 table columns.  The kernel predicates
+    each column on the row's own block count, so the natural 5-column table
+    (what a serving stack emits) is accepted and runs, and only a table
+    narrower than 5 is rejected.  The bound needs the per-row seq_lens from
+    device memory, so the check is opt-in behind FLASHINFER_VALIDATE_INPUTS.
+    Regression for PR #4365 review r3824399380 and the block-table width
+    thread on PR #4737.
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
 
-    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+    from flashinfer import (
+        fp4_paged_mqa_logits,
+        fp8_paged_mqa_logits,
+        min_block_table_width,
+    )
     from flashinfer.attn_scores.attn_scores import _validate_paged_bounds
 
     device = "cuda"
     B, H, D, block_size = 2, 64, 128, 64
-    ctx = 257  # deliberately not a multiple of 128
-    blocks = -(-ctx // block_size)  # 5 -- what a caller would naturally allocate
-    need = -(-ctx // 128) * (128 // block_size)  # 6 -- what the kernel indexes
-    assert (blocks, need) == (5, 6), "test premise: ctx exposes the tile/block gap"
+    ctx = 257  # deliberately not a multiple of the 128-token compute tile
+    natural = -(-ctx // block_size)  # 5 -- what a serving stack allocates
+    tile_cols = -(-ctx // 128) * (128 // block_size)  # 6 -- what the tiles span
+    assert (natural, tile_cols) == (5, 6), "test premise: ctx exposes the gap"
+    assert min_block_table_width(ctx, block_size) == natural
 
     seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
-    narrow = torch.zeros((B, blocks), dtype=torch.int32, device=device)
-    wide = torch.zeros((B, need), dtype=torch.int32, device=device)
+    narrow = torch.zeros((B, natural - 1), dtype=torch.int32, device=device)
+    table = torch.zeros((B, natural), dtype=torch.int32, device=device)
 
     # Default (unset): no sync, no check. Exercise the validator directly rather
     # than launching -- a narrow table would genuinely read out of bounds.
     monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS", raising=False)
     assert (
-        _validate_paged_bounds(narrow, seq_lens, ctx, block_size, B * need, "x") is None
+        _validate_paged_bounds(narrow, seq_lens, ctx, block_size, B * natural, "x")
+        is None
     )
 
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
-    ntb = B * need
+    ntb = B * natural
     w = torch.zeros(B * 1, H, device=device, dtype=torch.float32)
 
     q8 = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
     kv8 = torch.zeros(ntb, block_size, 1, D + 4, dtype=torch.uint8, device=device)
     with pytest.raises(
-        ValueError, match=r"block_tables has 5 columns.*indexes up to 6"
+        ValueError, match=r"block_tables has 4 columns.*occupies 5 blocks"
     ):
         fp8_paged_mqa_logits(q8, kv8, w, narrow, seq_lens, ctx)
-    fp8_paged_mqa_logits(q8, kv8, w, wide, seq_lens, ctx)
+    fp8_paged_mqa_logits(q8, kv8, w, table, seq_lens, ctx)  # natural width runs
 
     q4 = torch.zeros(B, 1, H, D // 2, dtype=torch.uint8, device=device)
     sf4 = torch.zeros(B, 1, H, dtype=torch.int32, device=device)
     kv4 = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
     with pytest.raises(
-        ValueError, match=r"block_tables has 5 columns.*indexes up to 6"
+        ValueError, match=r"block_tables has 4 columns.*occupies 5 blocks"
     ):
         fp4_paged_mqa_logits(
             q4, sf4, kv4, w, narrow, seq_lens, ctx, output_dtype=torch.bfloat16
         )
     fp4_paged_mqa_logits(
-        q4, sf4, kv4, w, wide, seq_lens, ctx, output_dtype=torch.bfloat16
+        q4, sf4, kv4, w, table, seq_lens, ctx, output_dtype=torch.bfloat16
     )
 
     # Lives in the API body, so skip_check=True must not bypass it.
-    with pytest.raises(ValueError, match=r"block_tables has 5 columns"):
+    with pytest.raises(ValueError, match=r"block_tables has 4 columns"):
         fp8_paged_mqa_logits(q8, kv8, w, narrow, seq_lens, ctx, skip_check=True)
 
-    # A padded table is accepted even though ctx is not a multiple of 128, and
     # max_seq_len being much larger than ctx must NOT tighten the bound.
-    fp8_paged_mqa_logits(q8, kv8, w, wide, seq_lens, ctx * 8)
+    fp8_paged_mqa_logits(q8, kv8, w, table, seq_lens, ctx * 8)
+
+
+def _natural_width_serving_case(variant, device):
+    """SGLang-shaped inputs for the block-table width contract.
+
+    seq_lens = [129, 257, 385] at block_size=64 occupy [3, 5, 7] blocks, so the
+    conventional table -- ceil(max(seq_lens) / block_size) = 7 columns, what a
+    serving stack's metadata emits -- is [3, 7].  The kernel walks [2, 3, 4]
+    128-token compute tiles spanning [4, 6, 8] columns: every row's last tile
+    spans a column past the row's blocks, and the longest row is LAST so a
+    tile-granular reader would run one entry past the 84-byte allocation
+    (memcheck on the unpredicated kernel: "Invalid __global__ read of size 4
+    ... 1 bytes after the nearest allocation ... of size 84 bytes").  Shorter
+    rows' trailing entries are an out-of-pool sentinel, so any read of them
+    is caught by the debug validator (which checks exactly the entries the
+    kernel reads) or by memcheck.
+
+    Returns ``(call, ref, seq_lens, next_n, max_seq_len)``; ``call(**kw)``
+    runs the public API (float32 output) and ``ref`` is the torch reference.
+    """
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits
+
+    torch.manual_seed(7)
+    H, D, block_size, next_n = 64, 128, 64, 2
+    seq_lens = torch.tensor([129, 257, 385], dtype=torch.int32, device=device)
+    B, max_seq_len = seq_lens.numel(), 385
+    lens = seq_lens.tolist()
+    n_blk = [-(-c // block_size) for c in lens]  # [3, 5, 7]
+    tile_cols = [-(-c // 128) * (128 // block_size) for c in lens]  # [4, 6, 8]
+    assert (n_blk, tile_cols) == ([3, 5, 7], [4, 6, 8]), "test premise"
+    width = max(n_blk)
+    num_blocks = sum(n_blk)
+    pool = torch.randperm(num_blocks, dtype=torch.int32, device=device)
+    SENTINEL = 2**30  # far outside the pool; never read by the kernel
+    block_tables = torch.full((B, width), SENTINEL, dtype=torch.int32, device=device)
+    off = 0
+    for r, nb in enumerate(n_blk):
+        block_tables[r, :nb] = pool[off : off + nb]
+        off += nb
+    weights = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    if variant == "fp8":
+        q = torch.randn(B, next_n, H, D, device=device).to(torch.float8_e4m3fn)
+        kv_f32 = torch.randn(num_blocks, block_size, D, device=device)
+        scale = _ceil_to_ue8m0_fp(
+            kv_f32.abs().amax(-1, keepdim=True).clamp(1e-4) / 448.0
+        ).squeeze(-1)
+        kv_fp8 = (kv_f32 / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
+        ref = _ref_fp8_paged_mqa_logits(
+            q, kv_fp8, scale, weights, seq_lens, block_tables, max_seq_len, block_size
+        )
+
+        def call(**kw):
+            return fp8_paged_mqa_logits(
+                q, kv_fused, weights, block_tables, seq_lens, max_seq_len, **kw
+            )
+
+    else:
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        q_sf = sfp.view(torch.int32).view(B, next_n, H)
+        q_sim = _cast_back_from_fp4(qp, sfp, gran_k=32).view(B, next_n, H, D)
+        kv_cache = torch.randn(
+            num_blocks, block_size, 1, D, device=device, dtype=torch.bfloat16
+        )
+        kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+        ref = _ref_fp4_paged_mqa_logits(
+            q_sim.float(), kv_sim.float(), weights, seq_lens, block_tables, max_seq_len
+        )
+
+        def call(**kw):
+            return fp4_paged_mqa_logits(
+                q,
+                q_sf,
+                kv_fused,
+                weights,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                output_dtype=torch.float32,
+                **kw,
+            )
+
+    return call, ref, seq_lens, next_n, max_seq_len
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_natural_width_block_table_serving_layout(variant, monkeypatch):
+    """A block table of the conventional serving width ceil(seq_len / block_size)
+    with lengths that are not multiples of the compute tile is accepted and
+    computes correctly, eagerly with FLASHINFER_VALIDATE_INPUTS=1 and under
+    CUDA-graph replay.
+
+    SGLang's DSV4 metadata emits exactly this width (raw length 1028 ->
+    seq_len 257 at block size 64 -> 5 entries); the unpredicated kernel read a
+    sixth.  See _natural_width_serving_case for the shape.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import padded_seq_len
+
+    device = "cuda"
+    call, ref, seq_lens, next_n, max_seq_len = _natural_width_serving_case(
+        variant, device
+    )
+    valid = _valid_causal_mask(seq_lens, next_n, max_seq_len, device)
+
+    # Debug validation accepts the natural width and ignores the sentinel
+    # entries, because it checks exactly the entries the kernel reads.
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    eager = call().clone()
+    torch.cuda.synchronize()
+    assert torch.isfinite(eager[valid]).all(), "non-finite logits in the valid region"
+    torch.testing.assert_close(eager[valid], ref[valid].float(), atol=5e-5, rtol=1e-5)
+    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS")
+
+    # The same natural-width table captured in a CUDA graph (no validation is
+    # possible there, so the kernel's own predication is all that protects it).
+    out = torch.empty(
+        (seq_lens.numel() * next_n, padded_seq_len(max_seq_len)),
+        dtype=torch.float32,
+        device=device,
+    )
+    call(out=out)  # warm-up outside capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        res = call(out=out)
+    out.fill_(float("nan"))
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(res[valid], eager[valid])
+
+
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+def test_natural_width_block_table_memcheck(variant):
+    """compute-sanitizer memcheck: the kernel reads nothing past a natural-width
+    block table.  Before the per-column predication it over-read 4 bytes past
+    the 84-byte allocation of the longest-last row in
+    _natural_width_serving_case (and the read landed on the next row's entry
+    for interior rows).
+
+    Opt-in -- FLASHINFER_MEMCHECK_TESTS=1 with compute-sanitizer available --
+    because it spawns the sanitizer, which not every CI image has, and a
+    regression does not fail cleanly: memcheck turns the over-read into a
+    launch failure whose teardown wedges until the timeout.  With the kernels
+    cached a passing run takes about ten seconds.  Every tensor is its own
+    cudaMalloc (PYTORCH_NO_CUDA_MEMORY_CACHING) so the over-read is visible at
+    the allocation boundary.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+    if os.environ.get("FLASHINFER_MEMCHECK_TESTS", "0") in ("0", ""):
+        pytest.skip(
+            "opt-in: set FLASHINFER_MEMCHECK_TESTS=1 (spawns compute-sanitizer)"
+        )
+    sanitizer = (
+        shutil.which("compute-sanitizer") or "/usr/local/cuda/bin/compute-sanitizer"
+    )
+    if not os.path.exists(sanitizer):
+        pytest.skip("compute-sanitizer not found")
+
+    import flashinfer
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(flashinfer.__file__)))
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    code = (
+        f"import sys, torch; sys.path.insert(0, {tests_dir!r}); "
+        "from test_attn_scores import _natural_width_serving_case; "
+        f"call, *_ = _natural_width_serving_case({variant!r}, 'cuda'); "
+        "call(); torch.cuda.synchronize(); print('MEMCHECK_CASE_RAN')"
+    )
+    env = dict(os.environ)
+    env["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+    env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [
+            sanitizer,
+            "--tool",
+            "memcheck",
+            "--print-limit",
+            "3",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    report = proc.stdout + proc.stderr
+    assert "MEMCHECK_CASE_RAN" in report, report[-3000:]
+    assert "ERROR SUMMARY: 0 errors" in report, report[-3000:]
 
 
 def test_max_seq_len_bound(monkeypatch):

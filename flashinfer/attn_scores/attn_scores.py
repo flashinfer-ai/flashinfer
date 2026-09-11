@@ -289,14 +289,14 @@ def _validate_paged_inputs(
     Int32 fakes; a CPU or int64 tensor would make the kernel dereference a bad
     pointer or misread storage) and have exactly ``batch_size`` rows.
 
-    NOTE (caller invariant, not checked here): the kernel reads
-    ceil(seq_lens[b]/128) compute tiles * (128 // block_size) physical
-    blocks per row, so ``block_tables`` must have at least
-    ``max_b ceil(seq_lens[b]/128) * (128 // block_size)`` columns. A
-    narrower block_tables causes an out-of-bounds read. The bound needs the
-    per-row lengths from device memory, so it cannot be checked here without a
-    D2H copy; :func:`_validate_paged_bounds` performs it when
-    ``FLASHINFER_VALIDATE_INPUTS`` is set."""
+    NOTE (caller invariant, not checked here): ``block_tables`` must have at
+    least ``max_b ceil(seq_lens[b] / block_size)`` columns -- the natural
+    width, one entry per KV block a request occupies.  The kernels predicate
+    every block-table read on the row's own block count, so nothing past a
+    row's blocks is ever read; a narrower table is an out-of-bounds read.
+    The bound needs the per-row lengths from device memory, so it cannot be
+    checked here without a D2H copy; :func:`_validate_paged_bounds` performs
+    it when ``FLASHINFER_VALIDATE_INPUTS`` is set."""
     if not (seq_lens.is_cuda and seq_lens.dtype == torch.int32):
         raise ValueError(
             f"{fn_name}: seq_lens must be an int32 CUDA tensor, got "
@@ -569,18 +569,17 @@ def _validate_paged_bounds(
        seq_lens=[257] with max_seq_len=256 allocates 256 columns while
        the schedule reaches 512.
 
-    2. ``block_tables`` wide enough for the kernel
+    2. ``block_tables`` at least the natural width
 
-    The kernel walks KV in ``_COMPUTE_BLOCK_KV``-token compute tiles and reads
-    ``_COMPUTE_BLOCK_KV // block_size`` blocks per tile, so it indexes columns up
-    to ``ceil(ctx / _COMPUTE_BLOCK_KV) * (_COMPUTE_BLOCK_KV // block_size)``.
-    That exceeds the natural ``ceil(ctx / block_size)`` whenever ctx is not a
-    multiple of ``_COMPUTE_BLOCK_KV`` -- ctx=257 with block_size=64 needs 6
-    columns, not 5.  The kernel only guards that the *tile* exists, not that
-    every block in it does, so a naturally-sized table is read out of bounds:
-    interior rows silently pick up the next row's entry (a valid pool index
-    belonging to another sequence), and the last row reads past the allocation,
-    feeding a wild index to the KV TMA load.
+    Row ``b`` must have ``ceil(seq_lens[b] / block_size)`` entries -- one per
+    KV block the request occupies, the width a paged-KV serving stack keeps
+    anyway.  The kernels walk KV in ``_COMPUTE_BLOCK_KV``-token compute tiles
+    that span ``_COMPUTE_BLOCK_KV // block_size`` table columns, but predicate
+    each column on the row's own block count, so the last tile of a length
+    that is not a multiple of the tile (ctx=257 with block_size=64: 5 blocks,
+    3 tiles spanning 6 columns) never reads column 5.  A table narrower than
+    the natural width IS read out of bounds: interior rows pick up the next
+    row's entries, the last row reads past the allocation.
 
     The bound depends on the per-row ``seq_lens``, which live on device, so
     this costs a D2H copy.  It is therefore opt-in via
@@ -604,26 +603,22 @@ def _validate_paged_bounds(
             f"max_seq_len but the schedule follows seq_lens, so a longer "
             f"sequence is written past the end of the row."
         )
-    blocks_per_tile = _COMPUTE_BLOCK_KV // block_size
-    need = max(-(-c // _COMPUTE_BLOCK_KV) for c in lens) * blocks_per_tile
+    need = min_block_table_width(longest, block_size)
     if block_tables.shape[1] < need:
         raise ValueError(
             f"{fn_name}: block_tables has {block_tables.shape[1]} columns but the "
-            f"kernel indexes up to {need} (= min_block_table_width("
-            f"max(seq_lens), block_size)) for these seq_lens with "
-            f"block_size={block_size}. Columns past a "
-            f"sequence's real blocks are read but masked, so they may hold any "
-            f"valid pool index (0 works)."
+            f"longest sequence ({longest} tokens) occupies {need} blocks of "
+            f"{block_size} (= min_block_table_width(max(seq_lens), block_size)). "
+            f"A narrower table is a device-side out-of-bounds READ."
         )
     # 3. Every block-table entry the kernel can READ must be a valid pool
     #    index -- the classic stale-block bug. Per row r the kernel reads
-    #    columns [0, ceil(ctx_r/128)*blocks_per_tile); entries beyond a row's
-    #    own read region are unconstrained. This path already paid the D2H
-    #    sync, so the value check rides along.
+    #    exactly columns [0, ceil(ctx_r / block_size)); entries beyond a row's
+    #    own blocks are never read and are unconstrained. This path already
+    #    paid the D2H sync, so the value check rides along.
     bt = block_tables.cpu()
     per_row_need = torch.tensor(
-        [-(-c // _COMPUTE_BLOCK_KV) * blocks_per_tile for c in lens],
-        dtype=torch.int64,
+        [min_block_table_width(c, block_size) for c in lens], dtype=torch.int64
     )
     read_mask = (
         torch.arange(bt.shape[1], dtype=torch.int64)[None, :] < per_row_need[:, None]
@@ -1284,13 +1279,15 @@ def padded_seq_len(max_seq_len: int) -> int:
 def min_block_table_width(seq_len: int, block_size: int) -> int:
     """Return the minimum ``block_tables`` column count for a sequence length.
 
-    At least as wide as, and usually wider than, the naive
-    ``ceil(seq_len / block_size)``: the kernels read the block table at a
-    coarser internal granularity and touch every column a whole step covers,
-    so a naturally-sized table can be a device-side out-of-bounds READ.  The granularity is an implementation detail that may
-    change -- always size the table with this helper rather than hard-coding
-    the rule.  Columns past a sequence's real blocks may hold any valid pool
-    index (0 works).
+    This is the natural width ``ceil(seq_len / block_size)`` -- one entry per
+    KV block the sequence occupies, exactly the table a paged-KV serving stack
+    already keeps per request.  The kernels predicate every block-table read
+    on the row's own block count, so no padding columns are needed and
+    entries past a sequence's blocks are never read (they may hold anything).
+
+    Kept as a helper so callers name the contract in one place rather than
+    hard-coding the rule; a future kernel that needs a wider table can change
+    it here without touching call sites.
 
     Allocate ``block_tables`` as::
 
@@ -1299,7 +1296,7 @@ def min_block_table_width(seq_len: int, block_size: int) -> int:
     (using ``max_seq_len`` as the bound also works; see the Example in
     :func:`fp8_paged_mqa_logits`).
     """
-    return -(-seq_len // _COMPUTE_BLOCK_KV) * (_COMPUTE_BLOCK_KV // block_size)
+    return -(-seq_len // block_size)
 
 
 def compute_paged_mqa_logits_schedule(
@@ -1586,12 +1583,11 @@ def fp8_paged_mqa_logits(
 
             # Per-request KV lengths and a block table into the shared KV pool.
             seq_lens = torch.tensor([3000, 8000], dtype=torch.int32, device=device)
-            # Table width: wider than the naive ceil(8000/32) = 250 -- the
-            # kernel reads the table at a coarser internal granularity (see
-            # the block_tables docs).
+            # Table width: ceil(8000/32) = 250 blocks per request -- the
+            # natural width (the helper keeps the rule in one place).
             blocks_per_seq = flashinfer.min_block_table_width(
                 max_seq_len, block_size
-            )  # 252
+            )  # 250
             num_blocks = B * blocks_per_seq
             block_tables = torch.arange(
                 num_blocks, dtype=torch.int32, device=device
@@ -1681,16 +1677,17 @@ def fp8_paged_mqa_logits(
                          zero-copy.  Values are physical block indices
                          into kv_fused's dim 0.  max_blocks_per_seq must be
                          at least min_block_table_width(max(seq_lens),
-                         block_size) -- at least as wide as, and usually
-                         wider than, the naive ceil(max(seq_lens) /
-                         block_size), because the kernel reads the table at
-                         a coarser internal granularity (seq_len=257 with
-                         block_size=64 needs 6 columns, not 5).  Extra
-                         entries may be any valid index (0).  This
-                         is a hard precondition, not a checked argument: too
-                         few columns is a device-side out-of-bounds READ, i.e.
-                         undefined behaviour -- it may return corrupt logits,
-                         or fault and poison the CUDA context.
+                         block_size) = ceil(max(seq_lens) / block_size) --
+                         the natural width, one entry per KV block a request
+                         occupies, i.e. the table a paged-KV serving stack
+                         already keeps.  The kernel never reads row b past
+                         its own ceil(seq_lens[b] / block_size) entries, so
+                         a shorter request's trailing entries may hold
+                         anything.  The width is a hard precondition, not a
+                         checked argument: too few columns is a device-side
+                         out-of-bounds READ, i.e. undefined behaviour -- it
+                         may return corrupt logits, or fault and poison the
+                         CUDA context.
         seq_lens:        [batch_size]  int32, on q's device; any stride (a
                          strided view such as seq_lens[::next_n] is accepted
                          zero-copy).  Per-request KV length; no entry may exceed
@@ -2113,12 +2110,11 @@ def fp4_paged_mqa_logits(
 
             # Per-request KV lengths and a block table into the shared KV pool.
             seq_lens = torch.tensor([3000, 8000], dtype=torch.int32, device=device)
-            # Table width: wider than the naive ceil(8000/32) = 250 -- the
-            # kernel reads the table at a coarser internal granularity (see
-            # the block_tables docs).
+            # Table width: ceil(8000/32) = 250 blocks per request -- the
+            # natural width (the helper keeps the rule in one place).
             blocks_per_seq = flashinfer.min_block_table_width(
                 max_seq_len, block_size
-            )  # 252
+            )  # 250
             num_blocks = B * blocks_per_seq
             block_tables = torch.arange(
                 num_blocks, dtype=torch.int32, device=device
@@ -2230,16 +2226,17 @@ def fp4_paged_mqa_logits(
                          zero-copy.  Values are physical block indices
                          into kv_fused's dim 0.  max_blocks_per_seq must be
                          at least min_block_table_width(max(seq_lens),
-                         block_size) -- at least as wide as, and usually
-                         wider than, the naive ceil(max(seq_lens) /
-                         block_size), because the kernel reads the table at
-                         a coarser internal granularity (seq_len=257 with
-                         block_size=64 needs 6 columns, not 5).  Extra
-                         entries may be any valid index (0).  This
-                         is a hard precondition, not a checked argument: too
-                         few columns is a device-side out-of-bounds READ, i.e.
-                         undefined behaviour -- it may return corrupt logits,
-                         or fault and poison the CUDA context.
+                         block_size) = ceil(max(seq_lens) / block_size) --
+                         the natural width, one entry per KV block a request
+                         occupies, i.e. the table a paged-KV serving stack
+                         already keeps.  The kernel never reads row b past
+                         its own ceil(seq_lens[b] / block_size) entries, so
+                         a shorter request's trailing entries may hold
+                         anything.  The width is a hard precondition, not a
+                         checked argument: too few columns is a device-side
+                         out-of-bounds READ, i.e. undefined behaviour -- it
+                         may return corrupt logits, or fault and poison the
+                         CUDA context.
         seq_lens:        [batch_size]  int32, on q's device; any stride (a
                          strided view such as seq_lens[::next_n] is accepted
                          zero-copy).  Per-request KV length; no entry may exceed

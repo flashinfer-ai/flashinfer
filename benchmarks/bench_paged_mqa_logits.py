@@ -48,6 +48,7 @@ import torch
 from flashinfer import (
     fp4_paged_mqa_logits,
     fp8_paged_mqa_logits,
+    min_block_table_width,
     padded_seq_len,
 )
 
@@ -66,7 +67,7 @@ def _make_inputs(kind, batch, seq_len, next_n, block_size, device):
     the API docstring example does.  Timing is data-independent, but finite
     inputs let bench_one assert finite logits, which catches a wrong layout.
     """
-    ntb_cols = ((seq_len + 127) // 128 * 128) // block_size
+    ntb_cols = min_block_table_width(seq_len, block_size)  # natural width
     num_blocks = max(batch * ntb_cols, 1)
     seq_lens = torch.full((batch,), seq_len, dtype=torch.int32, device=device)
     block_tables = (

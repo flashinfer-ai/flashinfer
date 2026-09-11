@@ -46,15 +46,14 @@ def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
 def _make_paged_block_table(seq_lens, block_size, device):
     """Random paged block table + total block count for a batch of seq_lens.
 
-    Sized for the kernel's access pattern: it reads ceil(seq_len/128) compute tiles *
-    (128 // block_size) physical blocks per row, which exceeds ceil(seq_len/block_size)
-    when seq_len is not a multiple of 128. The extra columns default to physical index
-    0 (a valid pool block); those positions are beyond seq_len (masked), so this avoids
-    an out-of-bounds block_tables / KV read."""
+    Natural width -- ceil(max(seq_lens) / block_size), one entry per KV block a
+    request occupies, i.e. the table a paged-KV serving stack already keeps.  The
+    kernels predicate every block-table read on the row's own block count, so no
+    padding columns are needed; a shorter row's trailing entries (zeros here) are
+    never read."""
     n_blk = (seq_lens + block_size - 1) // block_size
-    kern_blk = ((seq_lens + 127) // 128) * (128 // block_size)
     total = int(n_blk.sum().item()) + seq_lens.shape[0] * 2
-    max_blk = int(kern_blk.max().item())
+    max_blk = int(n_blk.max().item())
     block_tables = torch.zeros(
         (seq_lens.shape[0], max_blk), dtype=torch.int32, device=device
     )

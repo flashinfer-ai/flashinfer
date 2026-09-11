@@ -561,7 +561,7 @@ def test_adv_zero_length_row_not_executed(variant):
     SENTINEL = -98765.0
 
     cl = torch.tensor([128, 0], dtype=torch.int32, device=DEVICE)
-    width = max(-(-int(c) // 128) for c in cl.tolist()) * (128 // block_size)
+    width = max(-(-int(c) // block_size) for c in cl.tolist())  # natural width
     block_tables = torch.zeros((B, max(width, 1)), dtype=torch.int32, device=DEVICE)
     ntb = 4
     w = torch.ones(B * next_n, H, device=DEVICE, dtype=torch.float32)
