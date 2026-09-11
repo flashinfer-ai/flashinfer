@@ -220,6 +220,10 @@ def _autotune_configs(device=None):
         ]:
             for BK in [64]:
                 for occupancy in [1, 2, 4, 8]:
+                    # WAR: Skip the two-CTA cluster kernel at occupancy=2.
+                    # See https://github.com/flashinfer-ai/flashinfer/issues/4465
+                    if nc == 2 and occupancy == 2:
+                        continue
                     for subtile in subtile_options:
                         yield SimpleNamespace(
                             BLOCK_M=BM,
