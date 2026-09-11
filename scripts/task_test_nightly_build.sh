@@ -53,10 +53,13 @@ echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
 (cd /tmp && python -m flashinfer show-config)
 
-# Copy only test sources into an isolated directory so package tests exercise the
-# installed flashinfer distribution instead of shadowing it with /workspace.
+# Copy test sources and repository-owned test data into an isolated directory so
+# package tests exercise the installed flashinfer distribution instead of
+# shadowing it with /workspace.
 cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
+mkdir -p "${TEST_RUN_DIR}/ci"
+cp -a "${SOURCE_WORKSPACE}/ci/cuda-versions.json" "${TEST_RUN_DIR}/ci/"
 
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
