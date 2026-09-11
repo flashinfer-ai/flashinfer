@@ -46,6 +46,7 @@ from .jit.attention import (
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
+from .jit.cake_fmha import gen_cake_fmha_compat_module
 from .jit.cpp_ext import get_cuda_version
 from .jit.fp4_quantization import (
     gen_fp4_quantization_sm90_module,
@@ -81,8 +82,6 @@ from .jit.flash_kda import (
     gen_flash_kda_m128_n16_checkpoint_module,
     get_flash_kda_generated_variant_ids,
 )
-from .jit.flash_kda_backward import gen_flash_kda_backward_module
-from .jit.flash_kda_training import gen_flash_kda_training_module
 from .jit.flash_kda_decode import (
     FLASH_KDA_DECODE_DIRECT_VARIANTS,
     FLASH_KDA_DECODE_VARIANTS,
@@ -533,6 +532,7 @@ def gen_all_modules(
     has_sm100 = sm_capabilities.get("sm100", False)
     has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
     has_blackwell_msa_sm103a = sm_capabilities.get("blackwell_msa_sm103a", False)
+    has_sm100a_exact = sm_capabilities.get("sm100a_exact", False)
     has_flash_kda_prefill_sm100a = sm_capabilities.get(
         "flash_kda_prefill_sm100a", False
     )
@@ -547,12 +547,6 @@ def gen_all_modules(
     has_flash_kda_decode_sm100f = sm_capabilities.get("flash_kda_decode_sm100f", False)
     has_flash_kda_decode_sm103a_direct = sm_capabilities.get(
         "flash_kda_decode_sm103a_direct", False
-    )
-    has_flash_kda_backward_sm100a = sm_capabilities.get(
-        "flash_kda_backward_sm100a", False
-    )
-    has_flash_kda_backward_sm103a = sm_capabilities.get(
-        "flash_kda_backward_sm103a", False
     )
     has_cake_kda_decode_sm100a_legacy = sm_capabilities.get(
         "cake_kda_decode_sm100a_legacy", False
@@ -569,6 +563,7 @@ def gen_all_modules(
     )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
+    has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
     has_sm107 = sm_capabilities.get("sm107", False)
     has_sm110 = sm_capabilities.get("sm110", False)
     has_sm120 = sm_capabilities.get("sm120", False)
@@ -589,6 +584,13 @@ def gen_all_modules(
             add_oai_oss,
         )
     )
+    # Cake FMHA packages exact tcgen05/TMEM cubins for B200 and B300.  Do not
+    # compile a family target here: the standalone manifest authenticates one
+    # architecture-specific source payload and ABI for each exact target.
+    if has_sm100a_exact:
+        jit_specs.append(gen_cake_fmha_compat_module("sm100a"))
+    if has_sm103a_exact:
+        jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
@@ -663,13 +665,6 @@ def gen_all_modules(
             gen_flash_kda_decode_module(variant, "sm103a")
             for variant in FLASH_KDA_DECODE_DIRECT_VARIANTS
         )
-    if has_flash_kda_backward_sm100a:
-        jit_specs.append(gen_flash_kda_backward_module("sm100a"))
-        jit_specs.append(gen_flash_kda_training_module("sm100a"))
-    if has_flash_kda_backward_sm103a:
-        jit_specs.append(gen_flash_kda_backward_module("sm103a"))
-        jit_specs.append(gen_flash_kda_training_module("sm103a"))
-
     # The Cake-owned direct T1 kernels follow the same legacy/family/exact
     # target policy as the provenanced FlashKDA decode portfolio.
     if has_cake_kda_decode_sm100a_legacy:
@@ -828,12 +823,15 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
-            jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
             # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        if has_sm100a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm100a"))
+        if has_sm103a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm103a"))
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is
@@ -1232,14 +1230,6 @@ def detect_sm_capabilities():
             flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
         )
         and cuda_version >= Version("12.9"),
-        "flash_kda_backward_sm103a": bool(
-            flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
-        )
-        and cuda_version >= Version("12.9"),
-        "flash_kda_backward_sm100a": (
-            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
-            and cuda_version >= Version("12.8")
-        ),
         "cake_kda_decode_sm100a_legacy": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
             and Version("12.8") <= cuda_version < Version("12.9")

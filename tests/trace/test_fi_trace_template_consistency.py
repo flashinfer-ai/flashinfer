@@ -68,6 +68,26 @@ def test_svdquant_trace_activation_scale_tracks_variable_m():
     )
 
 
+def test_trtllm_ragged_attention_deepseek_trace_row_check_is_optional_bool():
+    from flashinfer.prefill import trtllm_ragged_attention_deepseek
+    from flashinfer.trace.templates.gemm import (
+        trtllm_ragged_attention_deepseek_trace,
+    )
+
+    row_check = trtllm_ragged_attention_deepseek_trace.inputs[
+        "skip_all_rows_active_check"
+    ]
+    assert isinstance(row_check, Scalar)
+    assert row_check.dtype == "bool"
+    assert row_check.optional is True
+    assert (
+        inspect.signature(trtllm_ragged_attention_deepseek)
+        .parameters["skip_all_rows_active_check"]
+        .default
+        is True
+    )
+
+
 def _resolved_param(json_key: str, descriptor) -> str:
     """Return the function-parameter name that descriptor maps to."""
     p = getattr(descriptor, "param", None)
