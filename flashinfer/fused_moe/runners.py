@@ -6183,7 +6183,7 @@ class MegaMoeFc12Runner(MoERunner):
         super()._check_support()
         from ..utils import get_compute_capability
 
-        if get_compute_capability(self.device) != (10, 0):
+        if get_compute_capability(self.device) not in ((10, 0), (10, 3)):
             raise NotImplementedError(
                 "The BF16 MegaMOE FC12 launcher is validated on SM100 only."
             )
@@ -6253,35 +6253,15 @@ class MegaMoeFc12Runner(MoERunner):
                 f"MegaMOE FC12 does not support {act.routing_input_mode!r}."
             )
         routing = self.config.routing
-        if act.routing_input_mode is RoutingInputMode.FromLogits:
-            _validate_logits_inputs(
-                act, act.num_tokens, routing.num_experts, type(self).__name__
-            )
-            from .trtllm_gen_routing import trtllm_gen_routing
-
-            routed = trtllm_gen_routing(
-                act.routing_logits,
-                act.routing_bias,
-                routing.method,
-                routing.top_k,
-                n_group=routing.n_group or 0,
-                topk_group=routing.topk_group or 0,
-                local_expert_offset=self.config.experts.local_expert_offset,
-                local_num_experts=self.config.experts.local_num_experts,
-                routed_scaling_factor=routing.routed_scaling_factor or 1.0,
-                tile_tokens_dim=64,
-            )
-            topk_ids, topk_weights = routed.topk_ids, routed.topk_weights
-        else:
-            _validate_prerouted_inputs(
-                act,
-                act.num_tokens,
-                routing.top_k,
-                type(self).__name__,
-                allowed_weights_dtypes=(torch.float32, torch.bfloat16),
-                require_contiguous=True,
-            )
-            topk_ids, topk_weights = act.topk_ids, act.topk_weights
+        _validate_prerouted_inputs(
+            act,
+            act.num_tokens,
+            routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32, torch.bfloat16),
+            require_contiguous=True,
+        )
+        topk_ids, topk_weights = act.topk_ids, act.topk_weights
         if act.hidden_states_q.dtype is not torch.bfloat16:
             raise TypeError("BF16 MegaMOE FC12 requires bfloat16 activations.")
         view = weights.get_view(self.backend_key)
@@ -6345,7 +6325,15 @@ class MegaMoeFc12Runner(MoERunner):
             :6
         ]
         routing = self.config.routing
-        result = moe_sort(
+        (
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            total_num_padded_tokens,
+            num_non_exiting_tiles,
+            local_expert_counts,
+        ) = moe_sort(
             topk_ids,
             topk_weights,
             num_experts=routing.num_experts,
@@ -6356,14 +6344,14 @@ class MegaMoeFc12Runner(MoERunner):
             enable_pdl=self._enable_pdl,
             **self._sort_buffers,
         )
-        assert result.expert_counts is not None
-        torch.cumsum(result.expert_counts, dim=0, out=self._expert_end_offsets)
+        assert local_expert_counts is not None
+        torch.cumsum(local_expert_counts, dim=0, out=self._expert_end_offsets)
         moe_permute(
             hidden_states,
             self._permuted_input,
-            result.tile_idx_to_mn_limit,
-            result.permuted_idx_to_expanded_idx,
-            result.num_non_exiting_tiles,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
             self._permuted_input.shape[0],
             routing.top_k,
             64,
@@ -6383,7 +6371,7 @@ class MegaMoeFc12Runner(MoERunner):
         moe_unpermute(
             self._permuted_output,
             output,
-            result.expanded_idx_to_permuted_idx,
+            expanded_idx_to_permuted_idx,
             topk_weights,
             hidden_states.shape[0],
             routing.top_k,

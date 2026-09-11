@@ -75,16 +75,15 @@ def prepare_megamoe_fc12_weights(
 
     # FC12's WGMMA layout alternates gate/up groups of 32 along N.
     fc1 = torch.empty_like(w1_bf16)
-    fc1.view(num_local_experts, intermediate_size // 32, 2, 32, hidden_size)[
-        :, :, 0
-    ].copy_(
+    fc1_interleaved = fc1.view(
+        num_local_experts, intermediate_size // 32, 2, 32, hidden_size
+    )
+    fc1_interleaved[:, :, 0].copy_(
         w1_bf16[:, :intermediate_size].view(
             num_local_experts, intermediate_size // 32, 32, hidden_size
         )
     )
-    fc1.view(num_local_experts, intermediate_size // 32, 2, 32, hidden_size)[
-        :, :, 1
-    ].copy_(
+    fc1_interleaved[:, :, 1].copy_(
         w1_bf16[:, intermediate_size:].view(
             num_local_experts, intermediate_size // 32, 32, hidden_size
         )
@@ -95,6 +94,7 @@ def prepare_megamoe_fc12_weights(
     }
 
 
+# TODO: Should this implementation live under moe_ep directly?
 def _enable_fc12_sources() -> None:
     """Make the verbatim CuTe-DSL FC12 source package importable lazily."""
     source_root = (

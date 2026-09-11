@@ -412,6 +412,7 @@ def launch_w4a16_moe(
         permuted_idx_to_expanded_idx,
         _,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         token_selected_experts=token_selected_experts,
         token_final_scales=token_final_scales,

@@ -79,6 +79,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm(n2, k, tile_shape_mn, num_tokens, dty
         permuted_idx_to_expanded_idx,
         _total_padded,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
     )

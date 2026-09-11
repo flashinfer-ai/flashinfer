@@ -439,53 +439,6 @@ def moe_output_memset_inplace(output: torch.Tensor) -> None:
 # ============================ moe_sort ============================
 
 
-class MoESortResult(tuple):
-    """Routing maps returned by :func:`moe_sort`.
-
-    The six positional fields intentionally preserve the original unpacking
-    contract.  ``expert_counts`` is the persistent local-expert histogram used
-    by compact FC12 launches.
-    """
-
-    tile_idx_to_expert_idx: torch.Tensor
-    tile_idx_to_mn_limit: torch.Tensor
-    expanded_idx_to_permuted_idx: torch.Tensor
-    permuted_idx_to_expanded_idx: torch.Tensor
-    total_num_padded_tokens: torch.Tensor
-    num_non_exiting_tiles: torch.Tensor
-    expert_counts: Optional[torch.Tensor]
-
-    def __new__(
-        cls,
-        tile_idx_to_expert_idx: torch.Tensor,
-        tile_idx_to_mn_limit: torch.Tensor,
-        expanded_idx_to_permuted_idx: torch.Tensor,
-        permuted_idx_to_expanded_idx: torch.Tensor,
-        total_num_padded_tokens: torch.Tensor,
-        num_non_exiting_tiles: torch.Tensor,
-        expert_counts: torch.Tensor,
-    ):
-        result = super().__new__(
-            cls,
-            (
-                tile_idx_to_expert_idx,
-                tile_idx_to_mn_limit,
-                expanded_idx_to_permuted_idx,
-                permuted_idx_to_expanded_idx,
-                total_num_padded_tokens,
-                num_non_exiting_tiles,
-            ),
-        )
-        result.tile_idx_to_expert_idx = tile_idx_to_expert_idx
-        result.tile_idx_to_mn_limit = tile_idx_to_mn_limit
-        result.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
-        result.permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx
-        result.total_num_padded_tokens = total_num_padded_tokens
-        result.num_non_exiting_tiles = num_non_exiting_tiles
-        result.expert_counts = expert_counts
-        return result
-
-
 def allocate_moe_sort_buffers(
     num_tokens: int,
     num_experts: int,
@@ -562,11 +515,12 @@ def allocate_moe_sort_buffers(
         "out_num_non_exiting_tiles": torch.empty(
             (1,), dtype=torch.int32, device=device
         ),
-    }
-    if include_expert_counts:
-        buffers["out_expert_counts"] = torch.empty(
+        "out_expert_counts": torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
+        if include_expert_counts
+        else None,
+    }
     return buffers
 
 
@@ -587,7 +541,15 @@ def moe_sort(
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
     out_expert_counts: Optional[torch.Tensor] = None,
-) -> MoESortResult:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+]:
     """
     Sort tokens by expert assignment and generate mapping tensors.
 
@@ -805,22 +767,23 @@ def moe_sort(
         cuda_stream_ptr,
     )
 
+    if out_expert_counts is not None:
+        local_expert_counts = out_expert_counts[
+            local_expert_offset : local_expert_offset + num_local_experts
+        ]
+    else:
+        local_expert_counts = None
+
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility
     # (avoiding .item() which causes CPU-GPU sync)
-    return MoESortResult(
+    return (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
         expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx,
         total_num_padded_tokens_tensor,
         num_non_exiting_tiles,
-        (
-            out_expert_counts[
-                local_expert_offset : local_expert_offset + num_local_experts
-            ]
-            if out_expert_counts is not None
-            else None
-        ),
+        local_expert_counts,
     )
 
 
