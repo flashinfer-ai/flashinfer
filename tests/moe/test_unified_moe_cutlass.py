@@ -66,6 +66,7 @@ from flashinfer.utils import (
     is_sm121a_supported,
     is_sm12x_supported,
     is_sm90a_supported,
+    round_up,
 )
 
 
@@ -2202,11 +2203,13 @@ cutlass_nvfp4_required = pytest.mark.skipif(
 )
 
 
-def _make_nvfp4_case(num_tokens: int = 16, activation=None):
+def _make_nvfp4_case(
+    num_tokens: int = 16, activation=None, intermediate_size: int = 256
+):
     torch.manual_seed(44)
     device = torch.device("cuda", torch.cuda.current_device())
     num_experts, top_k = 4, 2
-    hidden_size, intermediate_size = 128, 256
+    hidden_size = 128
     activation = activation or SwiGLU()
     gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
@@ -2346,6 +2349,31 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     # needs to catch a wrong magnitude.
     ref_rtol = ref_atol = 3e-1 if isinstance(activation, Identity) else 2e-1
     _assert_numerically_close(actual, expected, rtol=ref_rtol, atol=ref_atol)
+
+
+@cutlass_nvfp4_required
+@pytest.mark.parametrize("activation", (ReLU2(), SwiGLU()))
+@pytest.mark.parametrize("intermediate_size", (96, 192))
+def test_cutlass_nvfp4_accepts_intermediate_size_not_multiple_of_128(
+    activation, intermediate_size
+):
+    # The fc1 block scale is padded to the 128-row swizzle tile and fc2's
+    # K-dimension scale groups to 64, so these shapes hand the binding scale
+    # tensors with more rows than inter_size (2 * inter_size when gated).
+    config, act, weights, view = _make_nvfp4_case(
+        activation=activation, intermediate_size=intermediate_size
+    )
+    expected_rows = intermediate_size * (2 if activation.is_gated else 1)
+    assert view["fc1_weight_block_scale"].shape[1] == round_up(expected_rows, 128)
+    layer = MoELayer(config)
+    _pin_fallback_winner(layer, act)
+
+    actual = layer(act, weights)
+    expected = _nvfp4_quantized_reference(act, view, activation)
+
+    assert layer.winner_backend == "cutlass_nvfp4"
+    assert torch.isfinite(actual).all(), "CUTLASS NVFP4 produced non-finite output"
+    _assert_numerically_close(actual, expected, rtol=2e-1, atol=2e-1)
 
 
 @cutlass_nvfp4_required
