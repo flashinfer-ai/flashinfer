@@ -1189,3 +1189,72 @@ if __name__ == "__main__":
         max_in_kv_len=110,
         kv_layout="NHD",
     )
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_xqa_batch_decode_long_context_multi_block(kv_dtype, kv_layout):
+    """Large batch, one KV head, mixed lengths up to 8K: each sequence is split
+    across several CTAs and merged."""
+    torch.manual_seed(0)
+    batch_size, page_size, num_kv_heads, head_grp_size, head_dim = 64, 64, 1, 8, 128
+    num_qo_heads = num_kv_heads * head_grp_size
+    q_dtype = "bf16"
+
+    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(batch_size, 1, 8191)
+    q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
+    kv_cache, k_scale, v_scale, _, _, ref_kv_cache = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_dtype,
+        q_dtype,
+        kv_layout,
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
+    out, o_scale = create_output(q, q_dtype)
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    wrapper_ref = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer_ref, kv_layout, use_tensor_cores=True
+    )
+    wrapper_ref.plan(
+        kv_indptr,
+        all_page_ids,
+        kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        kv_data_type=ref_kv_cache.dtype,
+        q_data_type=ref_q.dtype,
+    )
+    output_ref = wrapper_ref.run(ref_q, ref_kv_cache)
+
+    output = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+        q.contiguous(),
+        kv_cache,
+        workspace_buffer,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        torch.max(seq_lens).item(),
+        q_scale * k_scale * sm_scale,
+        v_scale / o_scale,
+        out=out,
+        kv_layout=kv_layout,
+    )
+
+    tol = 1e-1 if kv_dtype == "fp8" else 1e-2
+    torch.testing.assert_close(output.float(), output_ref.float(), rtol=tol, atol=tol)
