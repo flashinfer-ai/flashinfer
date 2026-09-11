@@ -13,7 +13,7 @@ TRACE_TMA_WAIT_SAMPLE_STRIDE = 8
 # suitable for repeated profiling.  MEGA_SPLIT_K2_TILE_TRACE=1 appends this
 # per-tile region for one diagnostic launch.
 K2_TILE_TRACE_CTA_CAPACITY = TRACE_CTA_CAPACITY
-K2_TILE_TRACE_TILES_PER_CTA = 2048
+K2_TILE_TRACE_TILES_PER_CTA = 128
 K2_TILE_TRACE_FIELDS = 11
 
 ROLE_K1 = 0

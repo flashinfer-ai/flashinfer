@@ -32,11 +32,10 @@ from .moe_utils import spin_wait, spin_wait_i32_ge_inline
 from .sm120_mma import (
     MMA_N,
     get_layout_sfa_tv,
-    get_layout_sfb_tv,
-    issue_m64n8k64_nvfp4,
+    issue_m64n8k64_nvfp4_packed_sfb,
     make_sm120_ldmatrix_atom,
+    make_swapab_m64n8k128_tiled_mma,
     partition_fragment_sfa_for_sm120_mma,
-    partition_fragment_sfb_for_sm120_mma,
 )
 from .split_timestamp import (
     FIELD_FIRST_TILE_ID,
@@ -75,6 +74,7 @@ from .split_timestamp import (
     read_globaltimer,
     trace_word,
 )
+from .sm120_ptx_helpers import lds_b32_raw
 from src.ptx_helpers import ldg_f32_raw
 from src.token_comm import TokenSrcMetadata
 
@@ -82,8 +82,8 @@ from src.token_comm import TokenSrcMetadata
 UseScaleTma = True
 
 
-class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
-    """SM120 K2 with a physically separate FC2-only device kernel body."""
+class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
+    """N16 K2 with two N8 compute groups sharing each A-weight stage."""
 
     def __init__(
         self,
@@ -92,11 +92,16 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
         compact_k2: bool = True,
         **kwargs,
     ):
+        # The dual-group path needs a complete producer warpgroup for legal
+        # register redistribution and is intended to validate two CTA/SM.
+        kwargs["k2_natural_regs"] = True
+        kwargs["k2_min_blocks_per_sm"] = 2
         super().__init__(
             *args,
             split_role="k2",
             producer_sm_count=producer_sm_count,
             compact_k2=compact_k2,
+            k2_n16_dual_group=True,
             **kwargs,
         )
         self.k2_tile_trace_enabled = self.jit_config.enable_k2_tile_trace
@@ -160,7 +165,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             (fc2_weight_gemm.shape[1] + self.mma_tiler[2] - 1)
             // self.mma_tiler[2]
             * fc1_tiles_per_fc2_k_tile
-            * len(self.compute_warp_id)
+            * (self.mma_tiler[0] // 16)
         )
         ext = Sm120SwapABNvfp4Fc12SchedExtension(sf_vec_size=self.sf_vec_size, fc1_done_counter_ptr=fc1_done_counter.iterator, fc2_spin_threshold=ext_fc2_spin_threshold, fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(token_comm_args))
         warp_idx = cute.arch.warp_idx()
@@ -184,11 +189,22 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
         tidx, _, _ = cute.arch.thread_idx()
         SchedCls = sched_params.get_scheduler_type()
         SchedStorage = SchedCls.make_storage_struct(sched_params, ext, num_drain_warps=0)
+        work_tile_scratch_layout = cute.make_layout(
+            (ext.WorkTileInfo.TotalFields, len(self.compute_warp_id)),
+            stride=(1, ext.WorkTileInfo.TotalFields),
+        )
 
         @cute.struct
         class SharedStorage:
             ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 4]
             sched_storage: SchedStorage
+            work_tile_scratch: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32,
+                    ext.WorkTileInfo.TotalFields * len(self.compute_warp_id),
+                ],
+                16,
+            ]
             sA: cute.struct.Align[cute.struct.MemRange[self.smem_alloc_a_dtype, cute.cosize(a_smem_layout_staged)], 128]
             sB: cute.struct.Align[cute.struct.MemRange[self.b_dtype, cute.cosize(b_smem_layout_staged)], 128]
             sSFA: cute.struct.Align[cute.struct.MemRange[self.sf_dtype, cute.cosize(sfa_smem_layout_staged)], 128]
@@ -207,6 +223,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
+        sWorkTile = storage.work_tile_scratch.get_tensor(work_tile_scratch_layout)
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         mma_tiler_k = self.mma_tiler[2]
         k_tile_cnt_fc2 = (fc2_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
@@ -243,7 +260,11 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         fail_sleep_cycles=500,
                     )
                 cute.arch.sync_warp()
-                cute.arch.fence_acq_rel_gpu()
+                # The descriptor release also orders FC1 data/scale stores.
+                # TMA observes a separate async proxy, so both the system
+                # acquire and the generic-to-async proxy fence are required.
+                cute.arch.fence_acq_rel_sys()
+                cute.arch.fence_proxy('async.global')
                 iket.range_pop()
                 dequeue_end = cutlass.Int64(0)
                 if cutlass.const_expr(
@@ -573,27 +594,39 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             if cutlass.const_expr(self.enable_token_comm and self.use_warpgroup_reg_realloc):
                 cute.arch.warpgroup_reg_alloc(self.epi_reg_cnt)
             compute_warp = warp_idx
-            compute_m_warp = compute_warp
             lane_idx = cute.arch.lane_idx()
             lane_g = lane_idx >> cutlass.Int32(2)
             lane_t = lane_idx & cutlass.Int32(3)
-            n_groups = self.mma_tiler[1] // MMA_N
-            rFc2Store = cute.make_rmem_tensor((8,), self.fc2_output_dtype)
+            compute_m_warp = compute_warp % cutlass.Int32(4)
+            compute_n_warp = compute_warp // cutlass.Int32(4)
+            n_groups = 1
+            mma_tidx = tidx % cutlass.Int32(128)
+            compute_tiled_mma = make_swapab_m64n8k128_tiled_mma(
+                a_dtype=self.a_dtype,
+                b_dtype=self.b_dtype,
+                acc_dtype=self.acc_dtype,
+                sf_dtype=self.sf_dtype,
+            )
+            sB_compute = cute.local_tile(
+                sB,
+                (8, None, None),
+                (compute_n_warp, 0, None),
+            )
+            sB_compute = cute.group_modes(sB_compute, 2, 4)
+            compute_tile_n = 8
+            rFc2Store = cute.make_rmem_tensor((4,), self.fc2_output_dtype)
             rFc2StoreI32 = cute.recast_tensor(rFc2Store, cutlass.Int32)
-            mma_tidx = tidx
-            compute_tiled_mma = tiled_mma
+            rSFBCompact = cute.make_rmem_tensor((8,), self.sf_dtype)
+            rSFBCompactI32 = cute.recast_tensor(
+                rSFBCompact, cutlass.Int32
+            )
             thr_mma = compute_tiled_mma.get_slice(mma_tidx)
             tCsA = thr_mma.partition_A(sA)
-            sB_compute = sB
-            sSFB_compute = sSFB
             tCsB = thr_mma.partition_B(sB_compute)
             tCrA = compute_tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
             tCrB = compute_tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
             tCrSFA = partition_fragment_sfa_for_sm120_mma(
                 compute_tiled_mma, sSFA[None, None, 0], mma_tidx
-            )
-            tCrSFB = partition_fragment_sfb_for_sm120_mma(
-                compute_tiled_mma, sSFB_compute[None, None, 0], mma_tidx
             )
             atom_copy_ldmatrix_A = make_sm120_ldmatrix_atom(
                 self.a_dtype,
@@ -616,14 +649,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     cute.size(compute_tiled_mma.permutation_mnk[2]),
                 ),
             )
-            smem_tiled_copy_SFB = cute.make_tiled_copy(
-                atom_copy_scale,
-                get_layout_sfb_tv(compute_tiled_mma),
-                (
-                    cute.size(compute_tiled_mma.permutation_mnk[1]),
-                    cute.size(compute_tiled_mma.permutation_mnk[2]),
-                ),
-            )
             thr_copy_ldmatrix_A = smem_tiled_copy_A.get_slice(mma_tidx)
             thr_copy_ldmatrix_B = smem_tiled_copy_B.get_slice(mma_tidx)
             tCsA_copy_view = thr_copy_ldmatrix_A.partition_S(sA)
@@ -631,17 +656,13 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             tCrA_copy_view = thr_copy_ldmatrix_A.retile(tCrA)
             tCrB_copy_view = thr_copy_ldmatrix_B.retile(tCrB)
             thr_copy_SFA = smem_tiled_copy_SFA.get_slice(mma_tidx)
-            thr_copy_SFB = smem_tiled_copy_SFB.get_slice(mma_tidx)
             tCsSFA_copy_view = thr_copy_SFA.partition_S(sSFA)
-            tCsSFB_copy_view = thr_copy_SFB.partition_S(sSFB_compute)
             tCrSFA_copy_view = thr_copy_SFA.retile(tCrSFA)
-            tCrSFB_copy_view = thr_copy_SFB.retile(tCrSFB)
             acc_shape = compute_tiled_mma.partition_shape_C(
-                (self.mma_tiler[0], self.mma_tiler[1])
+                (self.mma_tiler[0], compute_tile_n)
             )
             accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
             work_tile_info = sched_consumer.consume_work()
-            fc2_detail_tiles_seen = cutlass.Int32(0)
             green_trace_seen_work = cutlass.Int32(0)
             k2_trace_tile_count = cutlass.Int64(0)
             k2_trace_first_tile_id = cutlass.Int64(0)
@@ -656,6 +677,17 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             k2_trace_store_ns = cutlass.Int64(0)
             compute_tile_seq = cutlass.Int32(0)
             while work_tile_info.is_valid_tile:
+                # The scheduler warp acquired the K1-published descriptor.
+                # Transfer that release chain to every compute lane before it
+                # later consumes row metadata for direct peer stores.
+                cute.arch.fence_acq_rel_sys()
+                if lane_idx == cutlass.Int32(0):
+                    work_tile_rmem = work_tile_info.to_rmem()
+                    for field in cutlass.range_constexpr(
+                        0, ext.WorkTileInfo.TotalFields
+                    ):
+                        sWorkTile[field, compute_warp] = work_tile_rmem[field]
+                cute.arch.sync_warp()
                 tile_begin = cutlass.Int64(0)
                 tile_tma_a_wait_ns = cutlass.Int64(0)
                 tile_tma_b_wait_ns = cutlass.Int64(0)
@@ -712,19 +744,41 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                                 k2_trace_first_tile_id = packed_tile_id
                             k2_trace_last_tile_id = packed_tile_id
                             k2_trace_tile_count += cutlass.Int64(1)
-                trace_compute_detail = cutlass.Int32(0)
-                trace_all_k_detail = cutlass.Int32(0)
-                if bidx == cutlass.Int32(0):
-                    if fc2_detail_tiles_seen == cutlass.Int32(0):
-                        trace_compute_detail = cutlass.Int32(1)
-                    if bidz == cutlass.Int32(0) and fc2_detail_tiles_seen < cutlass.Int32(4):
-                        trace_compute_detail = cutlass.Int32(1)
-                        trace_all_k_detail = cutlass.Int32(1)
                 k2_trace_mainloop_start = cutlass.Int64(0)
                 if cutlass.const_expr(green_trace is not None):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
                             k2_trace_mainloop_start = read_globaltimer()
+                mainloop_tile_m_idx = sWorkTile[1, compute_warp]
+                mainloop_tile_n_idx = sWorkTile[2, compute_warp]
+                # One N128 SFB stage contains eight N16 tiles. Encode both
+                # the routed tile slot and this warp's N8 half in the shared
+                # address, then keep only the eight K16 scale bytes in a fixed
+                # register fragment for the two K64 QMMA issues.
+                sfb_tile_slot = mainloop_tile_n_idx % cutlass.Int32(8)
+                lane_scale_row = (
+                    sfb_tile_slot * cutlass.Int32(16)
+                    + compute_n_warp * cutlass.Int32(8)
+                    + lane_idx // cutlass.Int32(4)
+                )
+                sfb_lane_byte_base = (
+                    (lane_scale_row % cutlass.Int32(32))
+                    * cutlass.Int32(16)
+                    + (lane_scale_row // cutlass.Int32(32))
+                    * cutlass.Int32(4)
+                )
+                work_tile_info = ext.WorkTileInfo(
+                    expert_idx=cutlass.Int32(WorkTileState.DONE),
+                    tile_m_idx=cutlass.Int32(0),
+                    tile_n_idx=cutlass.Int32(0),
+                    cumulative_data_physical_row=cutlass.Int32(0),
+                    cumulative_sf_physical_row=cutlass.Int32(0),
+                    cumulative_token_block_count=cutlass.Int32(0),
+                    valid_tokens_in_tile=cutlass.Int32(0),
+                    phase_and_peek=cutlass.Int32(BlockPhase.None_),
+                    fc1_counter_index=cutlass.Int32(0),
+                    valid_tokens_in_cluster=cutlass.Int32(0),
+                )
                 accumulators.fill(0.0)
                 a_consumer.reset()
                 b_consumer.reset()
@@ -734,24 +788,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     peek_a_full_status = a_consumer.try_wait()
                     peek_b_full_status = b_consumer.try_wait()
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    trace_k_detail = cutlass.Int32(0)
-                    if trace_compute_detail != cutlass.Int32(0):
-                        if trace_all_k_detail != cutlass.Int32(0):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile < cutlass.Int32(2):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(11):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(12):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(23):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(24):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile + cutlass.Int32(2) >= k_tile_cnt:
-                            trace_k_detail = cutlass.Int32(1)
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_push('sm120_fc2_wait_a')
                     k2_trace_a_wait_start = cutlass.Int64(0)
                     k2_trace_a_wait_active = cutlass.Boolean(0)
                     tile_a_wait_start = cutlass.Int64(0)
@@ -766,7 +802,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             if lane_idx == cutlass.Int32(0):
                                 if peek_a_full_status == cutlass.Boolean(0):
                                     k2_trace_tma_a_wait_calls += cutlass.Int64(1)
-                                    if (k_tile + fc2_detail_tiles_seen + cta_linear_id) % cutlass.Int32(TRACE_TMA_WAIT_SAMPLE_STRIDE) == cutlass.Int32(0):
+                                    if (k_tile + cta_linear_id) % cutlass.Int32(TRACE_TMA_WAIT_SAMPLE_STRIDE) == cutlass.Int32(0):
                                         k2_trace_a_wait_start = read_globaltimer()
                                         k2_trace_a_wait_active = cutlass.Boolean(1)
                                         k2_trace_tma_a_timed_calls += cutlass.Int64(1)
@@ -784,9 +820,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             if lane_idx == cutlass.Int32(0):
                                 if k2_trace_a_wait_active:
                                     k2_trace_tma_a_wait_ns += read_globaltimer() - k2_trace_a_wait_start
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                        iket.range_push('sm120_fc2_wait_b')
                     k2_trace_b_wait_start = cutlass.Int64(0)
                     k2_trace_b_wait_active = cutlass.Boolean(0)
                     tile_b_wait_start = cutlass.Int64(0)
@@ -801,7 +834,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             if lane_idx == cutlass.Int32(0):
                                 if peek_b_full_status == cutlass.Boolean(0):
                                     k2_trace_tma_b_wait_calls += cutlass.Int64(1)
-                                    if (k_tile + fc2_detail_tiles_seen + cta_linear_id) % cutlass.Int32(TRACE_TMA_WAIT_SAMPLE_STRIDE) == cutlass.Int32(0):
+                                    if (k_tile + cta_linear_id) % cutlass.Int32(TRACE_TMA_WAIT_SAMPLE_STRIDE) == cutlass.Int32(0):
                                         k2_trace_b_wait_start = read_globaltimer()
                                         k2_trace_b_wait_active = cutlass.Boolean(1)
                                         k2_trace_tma_b_timed_calls += cutlass.Int64(1)
@@ -819,8 +852,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             if lane_idx == cutlass.Int32(0):
                                 if k2_trace_b_wait_active:
                                     k2_trace_tma_b_wait_ns += read_globaltimer() - k2_trace_b_wait_start
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
                     peek_a_full_status = cutlass.Boolean(1)
                     peek_b_full_status = cutlass.Boolean(1)
                     if handle_a.count + 1 < k_tile_cnt:
@@ -830,13 +861,23 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
                     tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
                     tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
-                    tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
-                    sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(self.mma_tiler_sfa[0] // self.mma_tiler[0])
+                    sfa_m_group = mainloop_tile_m_idx % cutlass.Int32(self.mma_tiler_sfa[0] // self.mma_tiler[0])
                     tCsSFA_selected = cute.make_tensor(tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8), tCsSFA_p.layout)
                     tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
-                    tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
                     tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
-                    tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
+                    sfb_stage_byte_offset = (
+                        sfb_lane_byte_base
+                        + handle_b.index
+                        * cutlass.Int32(cute.cosize(sfb_smem_layout))
+                    )
+                    rSFBCompactI32[0] = lds_b32_raw(
+                        sSFB.iterator + sfb_stage_byte_offset
+                    )
+                    rSFBCompactI32[1] = lds_b32_raw(
+                        sSFB.iterator
+                        + sfb_stage_byte_offset
+                        + cutlass.Int32(512)
+                    )
                     tile_compute_start = cutlass.Int64(0)
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
@@ -847,25 +888,28 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     cute.copy(smem_tiled_copy_A, tCsA_p[None, None, 0], tCrA_copy_view[None, None, 0])
                     cute.copy(smem_tiled_copy_B, tCsB_p[None, None, 0], tCrB_copy_view[None, None, 0])
                     cute.copy(smem_tiled_copy_SFA, tCsSFA_p_filtered[None, None, 0], tCrSFA_copy_view_filtered[None, None, 0])
-                    cute.copy(smem_tiled_copy_SFB, tCsSFB_p_filtered[None, None, 0], tCrSFB_copy_view_filtered[None, 0, None, 0])
-                    sfb_tiles_per_tma = 1
-                    sfb_tile_slot = cutlass.Int32(0)
-                    if cutlass.const_expr(self.mma_tiler[1] < 128):
-                        sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_slot = work_tile_info.tile_n_idx % cutlass.Int32(sfb_tiles_per_tma)
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_push('sm120_fc2_k128_compute')
                     for k_inner_mma in cutlass.range_constexpr(0, 2):
                         if cutlass.const_expr(k_inner_mma + 1 < 2):
                             k_inner_next = k_inner_mma + 1
                             cute.copy(smem_tiled_copy_A, tCsA_p[None, None, k_inner_next], tCrA_copy_view[None, None, k_inner_next])
                             cute.copy(smem_tiled_copy_B, tCsB_p[None, None, k_inner_next], tCrB_copy_view[None, None, k_inner_next])
                             cute.copy(smem_tiled_copy_SFA, tCsSFA_p_filtered[None, None, k_inner_next], tCrSFA_copy_view_filtered[None, None, k_inner_next])
-                            cute.copy(smem_tiled_copy_SFB, tCsSFB_p_filtered[None, None, k_inner_next], tCrSFB_copy_view_filtered[None, 0, None, k_inner_next])
                         for ng in cutlass.range_constexpr(0, n_groups):
-                            for sfb_slot in cutlass.range_constexpr(0, sfb_tiles_per_tma):
-                                if sfb_tile_slot == cutlass.Int32(sfb_slot):
-                                    issue_m64n8k64_nvfp4(compute_tiled_mma, accumulators[None, None, ng], tCrA, tCrB, tCrSFA, tCrSFB, n_group=ng, active_n_groups=n_groups, sfa_m_group=0, sfb_n_group=sfb_slot * n_groups + ng, k_inner=k_inner_mma, a_dtype=self.a_dtype, b_dtype=self.b_dtype, sf_dtype=self.sf_dtype)
+                            issue_m64n8k64_nvfp4_packed_sfb(
+                                compute_tiled_mma,
+                                accumulators[None, None, ng],
+                                tCrA,
+                                tCrB,
+                                tCrSFA,
+                                rSFBCompactI32,
+                                n_group=ng,
+                                active_n_groups=n_groups,
+                                sfa_m_group=0,
+                                k_inner=k_inner_mma,
+                                a_dtype=self.a_dtype,
+                                b_dtype=self.b_dtype,
+                                sf_dtype=self.sf_dtype,
+                            )
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
                     ):
@@ -874,8 +918,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                                 tile_ldsm_qmma_ns += (
                                     read_globaltimer() - tile_compute_start
                                 )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
                     handle_a.release()
                     handle_b.release()
                 if cutlass.const_expr(green_trace is not None):
@@ -889,13 +931,18 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
                             k2_trace_store_start = read_globaltimer()
-                hidden_base = work_tile_info.tile_m_idx * cutlass.Int32(self.mma_tiler[0])
-                tile_token_base = work_tile_info.tile_n_idx * cutlass.Int32(self.mma_tiler[1])
+                store_expert_idx = sWorkTile[0, compute_warp]
+                store_tile_m_idx = sWorkTile[1, compute_warp]
+                store_tile_n_idx = sWorkTile[2, compute_warp]
+                store_data_row = sWorkTile[3, compute_warp]
+                store_valid_tokens = sWorkTile[6, compute_warp]
+                hidden_base = store_tile_m_idx * cutlass.Int32(self.mma_tiler[0])
+                tile_token_base = store_tile_n_idx * cutlass.Int32(self.mma_tiler[1])
                 fc2_alpha_value = cutlass.Float32(1.0)
                 if cutlass.const_expr(fc2_alpha is not None):
                     fc2_alpha_value = ldg_f32_raw(
                         fc2_alpha.iterator.toint()
-                        + cutlass.Int64(work_tile_info.expert_idx)
+                        + cutlass.Int64(store_expert_idx)
                         * cutlass.Int64(4)
                     )
                 for ng in cutlass.range_constexpr(0, n_groups):
@@ -904,7 +951,11 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     scaled_acc1 = acc[1] * fc2_alpha_value
                     scaled_acc2 = acc[2] * fc2_alpha_value
                     scaled_acc3 = acc[3] * fc2_alpha_value
-                    token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
+                    token0 = (
+                        compute_n_warp * cutlass.Int32(8)
+                        + cutlass.Int32(ng * MMA_N)
+                        + lane_t * cutlass.Int32(2)
+                    )
                     token1 = token0 + cutlass.Int32(1)
                     valid_token0 = token0
                     valid_token1 = token1
@@ -914,8 +965,8 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         + lane_g
                     )
                     hidden1 = hidden0 + cutlass.Int32(8)
-                    pool_token0 = work_tile_info.cumulative_data_physical_row + tile_token_base + token0
-                    pool_token1 = work_tile_info.cumulative_data_physical_row + tile_token_base + token1
+                    pool_token0 = store_data_row + tile_token_base + token0
+                    pool_token1 = store_data_row + tile_token_base + token1
                     tile_pack_start = cutlass.Int64(0)
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
@@ -930,10 +981,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         rFc2Store[1] = cute.arch.shuffle_sync(scaled_acc0, partner_lane).to(self.fc2_output_dtype)
                         rFc2Store[2] = scaled_acc2.to(self.fc2_output_dtype)
                         rFc2Store[3] = cute.arch.shuffle_sync(scaled_acc2, partner_lane).to(self.fc2_output_dtype)
-                        rFc2Store[4] = scaled_acc1.to(self.fc2_output_dtype)
-                        rFc2Store[5] = cute.arch.shuffle_sync(scaled_acc1, partner_lane).to(self.fc2_output_dtype)
-                        rFc2Store[6] = scaled_acc3.to(self.fc2_output_dtype)
-                        rFc2Store[7] = cute.arch.shuffle_sync(scaled_acc3, partner_lane).to(self.fc2_output_dtype)
                     iket.range_pop()
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
@@ -950,7 +997,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         if compute_warp == cutlass.Int32(0):
                             if lane_idx == cutlass.Int32(0):
                                 tile_peer_store_start = read_globaltimer()
-                    if valid_token0 < work_tile_info.valid_tokens_in_tile:
+                    if valid_token0 < store_valid_tokens:
                         fc2_store_token0 = pool_token0
                         if cutlass.const_expr(self.ibgda_k2_direct_staging):
                             fc2_store_token0 = cutlass.Int32(
@@ -999,7 +1046,19 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             fc2_output[fc2_store_token0, 0, hidden0] = scaled_acc0.to(self.fc2_output_dtype)
                             fc2_output[fc2_store_token0, 0, hidden1] = scaled_acc2.to(self.fc2_output_dtype)
                             iket.range_pop()
-                    if valid_token1 < work_tile_info.valid_tokens_in_tile:
+                    if cutlass.const_expr(self.fc2_packed_store):
+                        # Keep shuffle_sync warp-uniform.  Reuse the row0 pack
+                        # only after its predicated stores have completed.
+                        partner_lane = lane_idx ^ cutlass.Int32(4)
+                        rFc2Store[0] = scaled_acc1.to(self.fc2_output_dtype)
+                        rFc2Store[1] = cute.arch.shuffle_sync(
+                            scaled_acc1, partner_lane
+                        ).to(self.fc2_output_dtype)
+                        rFc2Store[2] = scaled_acc3.to(self.fc2_output_dtype)
+                        rFc2Store[3] = cute.arch.shuffle_sync(
+                            scaled_acc3, partner_lane
+                        ).to(self.fc2_output_dtype)
+                    if valid_token1 < store_valid_tokens:
                         fc2_store_token1 = pool_token1
                         if cutlass.const_expr(self.ibgda_k2_direct_staging):
                             fc2_store_token1 = cutlass.Int32(
@@ -1028,8 +1087,8 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                                 row1_i32_1 = cute.make_tensor(cute.recast_ptr(row1_hidden1, dtype=cutlass.Int32), cute.make_layout(1))
                                 iket.range_pop()
                                 iket.range_push('sm120_fc2_store_stg_issue')
-                                row1_i32_0[0] = rFc2StoreI32[2]
-                                row1_i32_1[0] = rFc2StoreI32[3]
+                                row1_i32_0[0] = rFc2StoreI32[0]
+                                row1_i32_1[0] = rFc2StoreI32[1]
                                 iket.range_pop()
                         elif cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
                             iket.range_push('sm120_fc2_store_metadata_address')
@@ -1064,6 +1123,14 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         if lane_idx == cutlass.Int32(0):
                             tile_peer_finalize_start = read_globaltimer()
                 iket.range_push('sm120_fc2_store_fence_signal')
+                restored_work_rmem = cute.make_rmem_tensor(
+                    (ext.WorkTileInfo.TotalFields,), cutlass.Int32
+                )
+                for field in cutlass.range_constexpr(
+                    0, ext.WorkTileInfo.TotalFields
+                ):
+                    restored_work_rmem[field] = sWorkTile[field, compute_warp]
+                work_tile_info = ext.WorkTileInfo.from_rmem(restored_work_rmem)
                 if cutlass.const_expr(combine_ready_flags is not None and fc2_block_done_counter is not None):
                     cute.arch.fence_acq_rel_sys()
                     cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=32 * len(self.compute_warp_id))
@@ -1090,7 +1157,6 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
                             k2_trace_store_ns += read_globaltimer() - k2_trace_store_start
-                fc2_detail_tiles_seen += cutlass.Int32(1)
                 if cutlass.const_expr(green_trace is not None):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
@@ -1185,14 +1251,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         cute.arch.store(green_trace.iterator + trace_word(trace_role, cta_linear_id, FIELD_TMA_B_TIMED_CALLS), k2_trace_tma_b_timed_calls, scope='gpu')
                         cute.arch.store(green_trace.iterator + trace_word(trace_role, cta_linear_id, FIELD_MAINLOOP_NS), k2_trace_mainloop_ns, scope='gpu')
                         cute.arch.store(green_trace.iterator + trace_word(trace_role, cta_linear_id, FIELD_STORE_NS), k2_trace_store_ns, scope='gpu')
-        lane_idx = cute.arch.lane_idx()
-        self.token_comm_hook_kernel_tail(
-            token_comm_args,
-            k2_ready_queue_state,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
-        )
+        # The workers never wait on rank progress or another CTA's admission.
         if cutlass.const_expr(green_trace is not None):
             if warp_idx == cutlass.Int32(0):
                 if lane_idx == cutlass.Int32(0):
@@ -1203,4 +1262,4 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
     fc1fc2_kernel_impl = fc2_combine_kernel_impl
 
 
-__all__ = ["Sm120Fc2CombineKernel"]
+__all__ = ["Sm120Fc2CombineN16DualGroupKernel"]

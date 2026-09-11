@@ -331,6 +331,73 @@ def _arch_mma_m16n8k64_nvfp4(
     acc[3] = acc_dtype(res[3])
 
 
+@dsl_user_op
+def _arch_mma_m16n8k64_nvfp4_packed_sfb(
+    acc: cute.Tensor,
+    a_reg: cute.Tensor,
+    b_reg: cute.Tensor,
+    sfa_reg: cute.Tensor,
+    sfb_packed,
+    *,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+    byte_id_a: int = 0,
+    byte_id_b: int = 0,
+    thread_id_a: int = 0,
+    thread_id_b: int = 0,
+    loc=None,
+    ip=None,
+) -> None:
+    """Issue native-NVFP4 QMMA from a preloaded packed SFB word."""
+
+    a_i32 = a_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
+    b_i32 = b_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
+    sfa_i32 = sfa_reg.load(loc=loc, ip=ip).bitcast(
+        cutlass.Int32, loc=loc, ip=ip
+    )
+
+    shape_attr = _pack_shape((MMA_M, MMA_N, MMA_K), loc=loc, ip=ip).type.attribute
+    res = _cute_nvgpu_ir.arch_mma_SM120_block_scaled(
+        [acc_dtype.mlir_type] * 4,
+        shape_attr,
+        NVFP4_BLOCK,
+        ir.TypeAttr.get(a_dtype.mlir_type),
+        ir.TypeAttr.get(b_dtype.mlir_type),
+        ir.TypeAttr.get(sf_dtype.mlir_type),
+        [
+            a_i32[0].ir_value(loc=loc, ip=ip),
+            a_i32[1].ir_value(loc=loc, ip=ip),
+            a_i32[2].ir_value(loc=loc, ip=ip),
+            a_i32[3].ir_value(loc=loc, ip=ip),
+        ],
+        [
+            b_i32[0].ir_value(loc=loc, ip=ip),
+            b_i32[1].ir_value(loc=loc, ip=ip),
+        ],
+        [
+            acc[0].ir_value(loc=loc, ip=ip),
+            acc[1].ir_value(loc=loc, ip=ip),
+            acc[2].ir_value(loc=loc, ip=ip),
+            acc[3].ir_value(loc=loc, ip=ip),
+        ],
+        sfa_i32[0].ir_value(loc=loc, ip=ip),
+        sfb_packed.ir_value(loc=loc, ip=ip),
+        thread_id_a=thread_id_a,
+        thread_id_b=thread_id_b,
+        byte_id_a=cutlass.Int16(byte_id_a).ir_value(loc=loc, ip=ip),
+        byte_id_b=cutlass.Int16(byte_id_b).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+
+    acc[0] = acc_dtype(res[0])
+    acc[1] = acc_dtype(res[1])
+    acc[2] = acc_dtype(res[2])
+    acc[3] = acc_dtype(res[3])
+
+
 def _thrfrg_sfa(scale_layout: cute.Layout, tiled_mma: cute.TiledMma):
     """Build the public SM120 NVFP4 SFA thread-fragment layout."""
     t_tensor = cute.logical_divide(
@@ -466,6 +533,7 @@ def issue_m64n8k64_nvfp4(
     n_group: int,
     active_n_groups: int,
     sfa_m_group,
+    sfb_n_group: int = -1,
     k_inner: int,
     a_dtype: Type[cutlass.Numeric],
     b_dtype: Type[cutlass.Numeric],
@@ -482,11 +550,13 @@ def issue_m64n8k64_nvfp4(
         sfa_frag[None, sfa_m_group, k_inner].iterator,
         cute.make_layout(4),
     )
+    if cutlass.const_expr(sfb_n_group < 0):
+        sfb_n_group = n_group
     sfb_reg = cute.make_tensor(
         sfb_frag[
             None,
-            (n_group % 2, (n_group // 2) % 2),
-            n_group // 4,
+            (sfb_n_group % 2, (sfb_n_group // 2) % 2),
+            sfb_n_group // 4,
             k_inner,
         ].iterator,
         cute.make_layout(4),
@@ -497,6 +567,48 @@ def issue_m64n8k64_nvfp4(
         b_reg,
         sfa_reg,
         sfb_reg,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        acc_dtype=cutlass.Float32,
+        sf_dtype=sf_dtype,
+    )
+
+
+@cute.jit
+def issue_m64n8k64_nvfp4_packed_sfb(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    a_frag,
+    b_frag,
+    sfa_frag,
+    sfb_packed,
+    *,
+    n_group: int,
+    active_n_groups: int,
+    sfa_m_group,
+    k_inner: int,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+) -> None:
+    """Issue one K64 QMMA from a fixed four-byte SFB fragment.
+
+    The caller folds the dynamic N128 slot into the shared-memory address and
+    loads two packed words for K128. Each K64 issue consumes one word, so the
+    register-fragment layout is independent of the routed tile index.
+    """
+
+    if cutlass.const_expr(n_group >= active_n_groups):
+        return
+    _arch_mma_m16n8k64_nvfp4_packed_sfb(
+        acc,
+        a_frag[None, 0, k_inner],
+        b_frag[None, n_group, k_inner],
+        cute.make_tensor(
+            sfa_frag[None, sfa_m_group, k_inner].iterator,
+            cute.make_layout(4),
+        ),
+        sfb_packed[k_inner],
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         acc_dtype=cutlass.Float32,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,7 +21,8 @@ from .comm import (
 from .staging import ACTIVATION_DTYPE
 from .weights import SCALE_DTYPE, TransformedWeights, ceil_div, round_up
 
-DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256, 320, 384)
+_WARNED_DECODE_CAPACITY_FALLBACKS: set[int] = set()
 
 
 def select_graph_compile_bucket(
@@ -42,7 +44,7 @@ def select_graph_compile_bucket(
             f"compile token count {requested_tokens_per_rank} is outside "
             f"workspace capacity {workspace_capacity}"
         )
-    return next(
+    selected = next(
         (
             bucket
             for bucket in DECODE_GRAPH_COMPILE_BUCKETS
@@ -50,6 +52,26 @@ def select_graph_compile_bucket(
         ),
         workspace_capacity,
     )
+    if (
+        selected == workspace_capacity
+        and workspace_capacity > DECODE_GRAPH_COMPILE_BUCKETS[-1]
+        and requested_tokens_per_rank > DECODE_GRAPH_COMPILE_BUCKETS[-1]
+        and requested_tokens_per_rank < workspace_capacity
+        and requested_tokens_per_rank <= 2 * DECODE_GRAPH_COMPILE_BUCKETS[-1]
+        and workspace_capacity not in _WARNED_DECODE_CAPACITY_FALLBACKS
+    ):
+        _WARNED_DECODE_CAPACITY_FALLBACKS.add(workspace_capacity)
+        warnings.warn(
+            "SM120 NVFP4 MegaMoE decode compile request "
+            f"({requested_tokens_per_rank} rows) exceeds the largest dedicated "
+            f"decode graph bucket ({DECODE_GRAPH_COMPILE_BUCKETS[-1]}); "
+            f"falling back to workspace capacity ({workspace_capacity}). "
+            "Decode performance may regress because this selects the prefill "
+            "kernel heuristic.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return selected
 
 
 @dataclass(frozen=True)
@@ -490,7 +512,7 @@ class MegaMoESm120Nvfp4Frontend:
         runtime_k1 = dict(base_runtime, stream=k1_cuda)
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
         compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
-        k2_ctas_per_sm = spec.kernel.k2_min_blocks_per_sm
+        k2_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
         k2_launch_clusters = spec.kernel.k2_sms * k2_ctas_per_sm
         compile_k2 = dict(
             runtime_k2,
@@ -563,6 +585,7 @@ class MegaMoESm120Nvfp4Frontend:
             k1_executor=k1_executor,
             k2_executor=k2_executor,
             k2_drain_executor=drain_executor,
+            k2_finalizer_executor=finalizer_executor,
             k3_executor=k3_executor,
             launch_k1=lambda: k1_executor(**runtime_k1),
             launch_k2=lambda: k2_executor(**runtime_k2),
@@ -579,7 +602,13 @@ class MegaMoESm120Nvfp4Frontend:
             launch_k3=lambda: k3_executor(**runtime_k3),
             launch_reset=lambda: self._reset_execution(execution),
             k1_sm_count=spec.kernel.k1_sms,
-            k2_grid_blocks=k2_launch_clusters,
+            k1_grid_clusters=spec.kernel.k1_sms,
+            k2_grid_clusters=k2_launch_clusters,
+            k2_drain_grid_clusters=(
+                k2_drain_launch_clusters
+                if k2_drain_launch_clusters > 0
+                else None
+            ),
         )
         graph_captured = time.monotonic()
         if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
@@ -621,10 +650,9 @@ class MegaMoESm120Nvfp4Frontend:
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
             execution.local_workspace[offset : offset + size].zero_()
-        if "expert_recv_count_sum" in kernel._shared_offsets:
-            offset = int(kernel._shared_offsets["expert_recv_count_sum"])
-            size = int(kernel._shared_region_by_name["expert_recv_count_sum"].nbytes)
-            execution.shared_workspace[offset : offset + size].zero_()
+        # The graph finalizer owns peer-written expert_recv_count and its
+        # published sum. It clears both between two rank barriers; clearing
+        # either here can erase an early peer's next-epoch dispatch write.
         if execution.green_trace is not None:
             execution.green_trace.zero_()
 

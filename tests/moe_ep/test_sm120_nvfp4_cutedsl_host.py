@@ -68,7 +68,11 @@ def test_decode_graph_compile_bucket_selection() -> None:
         168: 168,
         169: 256,
         256: 256,
-        257: capacity,
+        257: 320,
+        320: 320,
+        321: 384,
+        384: 384,
+        385: capacity,
     }
     for requested, bucket in expected.items():
         assert select_graph_compile_bucket(requested, capacity) == bucket

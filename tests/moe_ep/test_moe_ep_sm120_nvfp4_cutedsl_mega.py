@@ -60,7 +60,7 @@ def _problem(
     rows = torch.arange(tokens, device="cuda")
     topk_ids = torch.stack(
         ((rows * 3 + rank) % experts, (rows * 5 + rank + 1) % experts), 1
-    ).long()
+    ).to(torch.int32)
     inputs = MoEEpTensors(
         hidden_states=hidden_states,
         topk_ids=topk_ids,

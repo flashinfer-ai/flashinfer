@@ -71,10 +71,11 @@ _DispatchWarpCount = 4
 # token-back; one i64 = {src_rank, src_token, src_topk} (see TokenSrcMetadata).
 _TokenMetadataBytes = TokenSrcMetadata.nbytes
 
-# NVLink signal slots used by the DeepGEMM-style phase/sign barrier.
-# A separate local counter selects phase/sign; the signal slots are not reset
-# by tail cleanup.
-_NvlinkSlotCount = 2
+# Keep the graph finalizer's phase pair on a separate coherence line from the
+# persistent K1/K2 barrier pair.
+_FinalizerSignalSlotBase = 32
+_NvlinkSlotCount = _FinalizerSignalSlotBase + 2
+_NvlinkCounterCount = 2
 
 # Grid-sync counter slots. ``software_grid_sync`` phase-flips bit 31 within
 # each slot; split K1 and K2 use separate slots so concurrent grids cannot
@@ -203,14 +204,18 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         fc1_ready_tile_tokens: Optional[int] = None,
         fc1_producer_tile_tokens: Optional[int] = None,
         k2_token_tile_tokens: Optional[int] = None,
+        k2_ready_tile_tokens: Optional[int] = None,
         split_role: Literal["k1", "k2"],
         producer_sm_count: Optional[int] = None,
         compact_k2: bool = True,
+        k2_tail_reclaim: bool = False,
+        skip_global_tail: bool = False,
         k1_ready_queue_workspace: bool = True,
         k2_ready_queue: bool = True,
         k2_ready_queue_bundle: int = 16,
         k2_natural_regs: bool = False,
         k2_min_blocks_per_sm: int = 1,
+        k2_n16_dual_group: bool = False,
         green_trace_role: Optional[int] = None,
         k1_ready_queue_m_rotation: int = 0,
         jit_config: Optional[Sm120JitConfig] = None,
@@ -252,13 +257,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             raise ValueError(
                 "producer_sm_count is required for split_role='k2'."
             )
-        if (
-            token_back_mode != "epi_warps"
-            and not (
-                comm_backend == "nvshmem_ibgda"
-                and token_back_mode == "reuse_dispatch_warps"
-            )
-        ):
+        if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
             raise ValueError(
                 "Split K1/K2 require token_back_mode='epi_warps', except "
                 "the nvshmem_ibgda backend which requires "
@@ -268,9 +267,17 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             raise ValueError(
                 "nvshmem_ibgda requires token_back_mode='reuse_dispatch_warps'."
             )
-        if load_balance_mode != "static":
+        if (
+            load_balance_mode != "static"
+            and not (
+                split_role == "k2"
+                and k2_tail_reclaim
+                and load_balance_mode == "atomic_counter"
+            )
+        ):
             raise NotImplementedError(
-                "Split K1/K2 require the static scheduler."
+                "Split K1 requires the static scheduler. K2 may use the "
+                "atomic scheduler only for shared-queue tail reclaim."
             )
 
         # token_back_mode selects where the cross-rank fc2 push-back runs:
@@ -319,6 +326,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         self.split_role = split_role
         self.comm_backend = comm_backend
         self.producer_sm_count = producer_sm_count
+        self.k2_tail_reclaim = k2_tail_reclaim
+        self.skip_global_tail = skip_global_tail
         self.k2_ready_queue = (
             split_role in ("k1", "k2")
             and k2_ready_queue
@@ -348,9 +357,10 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             if k2_token_tile_tokens is None
             else k2_token_tile_tokens
         )
-        self.k2_ready_tile_tokens = max(
-            self.fc1_ready_tile_tokens,
-            self.k2_token_tile_tokens,
+        self.k2_ready_tile_tokens = (
+            max(self.fc1_ready_tile_tokens, self.k2_token_tile_tokens)
+            if k2_ready_tile_tokens is None
+            else k2_ready_tile_tokens
         )
         if self.fc1_ready_tile_tokens % token_padding_block != 0:
             raise ValueError(
@@ -385,13 +395,28 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             // self.fc1_producer_tile_tokens
         )
         self.compact_k2 = compact_k2
+        self.k2_n16_dual_group = bool(
+            split_role == "k2" and k2_n16_dual_group
+        )
+        if self.k2_n16_dual_group:
+            if mma_tiler_mnk != (64, 16, 128):
+                raise ValueError(
+                    "K2 dual-group mapping requires tile (64,16,128)"
+                )
+            self.compute_warp_id = tuple(range(8))
+            self.tma_a_warp_id = 8
+            self.tma_b_warp_id = 9
+            self.sched_warp_id = 10
+            self.sm120_aux_warp_id = 11
         default_natural_regs = (
             split_role == "k2"
             and compact_k2
             and mma_tiler_mnk[1] == 32
         )
         use_natural_regs = (
-            k2_natural_regs if split_role == "k2" else default_natural_regs
+            (k2_natural_regs or self.k2_n16_dual_group)
+            if split_role == "k2"
+            else default_natural_regs
         )
         self.use_warpgroup_reg_realloc = not (
             split_role == "k2" and compact_k2 and use_natural_regs
@@ -431,6 +456,9 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             base_warps
             + (len(self.dispatch_warp_id) if self.dispatch_warp_id else 0)
         )
+        if self.k2_n16_dual_group:
+            # The compact dual path has no work for the legacy aux warp.
+            self.threads_per_cta = 32 * 11
 
         # Independent MegaMoE-specific constants.
         self.world_size = world_size
@@ -533,8 +561,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             # the kernel-tail rank release/reset after their FC2 work; the
             # remaining producer/scheduler/aux warps are the four cohabitants.
             token_comm_dispatch_warp_start = 0
-            num_other_warps = (
-                len(self.compute_warp_id) - 4 + 4
+            num_other_warps = len(self.compute_warp_id) - 4 + (
+                3 if self.k2_n16_dual_group else 4
             )
             token_comm_num_dispatch_warps = 4
         else:
@@ -832,7 +860,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             _RegionSpec(
                 "nvlink_barrier_counter",
                 cutlass.Int32,
-                (1,),
+                (_NvlinkCounterCount,),
                 16,
             ),
             _RegionSpec(
@@ -893,7 +921,10 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                     16,
                 )
             )
-            if self.token_back_schedule_mode == "atomic_counter":
+            if (
+                self.token_back_schedule_mode == "atomic_counter"
+                or self.k2_tail_reclaim
+            ):
                 specs.append(
                     _RegionSpec(
                         "token_back_schedule_counter",
@@ -902,7 +933,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                         16,
                     )
                 )
-        if self.load_balance_mode == "atomic_counter":
+        if self.load_balance_mode == "atomic_counter" or self.k2_tail_reclaim:
             specs.append(
                 _RegionSpec(
                     "load_balance_counter",
@@ -1278,21 +1309,23 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc2_output_workspace_native = self._view_local(
                 local_workspace, "fc2_output_workspace",
             )
-            fc2_output_workspace_u8 = self._make_typed_view(
-                local_workspace,
-                self._local_offsets["fc2_output_workspace"],
-                cutlass.Uint8,
-                (pool_token_capacity * self.hidden * (
-                    int(self.fc2_output_dtype.width) // 8
-                ),),
-                None,
-                self._local_region_by_name["fc2_output_workspace"].align,
+            # Token communication needs only byte-addressable base pointers.
+            # A full Uint8 view can exceed CuTe's signed 32-bit layout-size
+            # limit at large token counts, so keep a one-element pointer view
+            # and perform every byte offset explicitly in Int64.
+            fc2_output_workspace_u8 = cute.make_tensor(
+                cute.recast_ptr(
+                    fc2_output_workspace_native.iterator,
+                    dtype=cutlass.Uint8,
+                ),
+                cute.make_layout(1),
             )
             fc2_done_counter = self._view_local(
                 local_workspace, "fc2_done_counter",
             )
-            combine_output_u8 = cute.recast_tensor(
-                combine_output, cutlass.Uint8,
+            combine_output_u8 = cute.make_tensor(
+                cute.recast_ptr(combine_output.iterator, dtype=cutlass.Uint8),
+                cute.make_layout(1),
             )
         else:
             fc2_output_workspace_native = None
@@ -1523,6 +1556,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             )
         elif cutlass.const_expr(
             self.split_role == "k1"
+            or (self.split_role == "k2" and self.skip_global_tail)
             or (
                 self.comm_backend == "nvshmem_ibgda"
                 and self.split_role == "k2"

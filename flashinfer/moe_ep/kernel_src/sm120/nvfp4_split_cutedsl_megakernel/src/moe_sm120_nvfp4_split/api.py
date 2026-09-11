@@ -23,9 +23,11 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump when a generated-kernel ABI or opaque workspace layout changes. Version
-# 4 applies gate_up_clamp in the SM120 inline K1 epilogue; older cached inline
-# kernels accepted the parameter but performed unclamped SwiGLU.
-KERNEL_CACHE_ABI = 4
+# 5 adds exact N16/N32 SFB fragment selection. Version 6 makes dual-N8 ready
+# ownership cover the complete N128 SFB TMA slab. Version 7 adds the shared
+# K2 main/drain queue and graph-ordered tail finalizer contract. Version 8
+# publishes K2 work only after every FC1 K bundle in the ready block completes.
+KERNEL_CACHE_ABI = 15
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,8 @@ class SplitKernelBundle:
 
     k1: Any
     k2: Any
+    k2_drain: Optional[Any]
+    k2_finalizer: Optional[Any]
     local_workspace_bytes: int
     shared_workspace_bytes: int
     cache_key: str
@@ -203,6 +207,10 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     from common.megamoe_constants import SfPaddingBlock
     from .kernel_dispatch_fc1 import build_sm120_dispatch_fc1_kernel
     from .kernel_fc2_combine import Sm120Fc2CombineKernel
+    from .kernel_fc2_combine_n16_dual import (
+        Sm120Fc2CombineN16DualGroupKernel,
+    )
+    from .kernel_k2_finalizer import Sm120K2TailFinalizerKernel
     from .sm120_mma import CTA_TOKEN_TILE
 
     problem = spec.problem
@@ -211,12 +219,19 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     cluster_size = 1
     k1_clusters = options.k1_active_clusters or config.k1_sms // cluster_size
     k2_clusters = options.k2_active_clusters or config.k2_sms // cluster_size
+    k2_ctas_per_sm = 2 if config.k2_warps == 12 else 1
+    k2_launch_clusters = k2_clusters * k2_ctas_per_sm
     k1_group_hint = options.group_hint or k1_clusters
-    k2_group_hint = options.group_hint or k2_clusters
+    k2_group_hint = options.group_hint or k2_launch_clusters
 
     k1_token_n = config.k1_tile[1]
     k2_token_n = config.k2_tile[1]
     ready_token_n = max(k1_token_n, k2_token_n)
+    if config.k2_warps == 12 and k2_token_n == 16:
+        # K2 stages one N128 SFB slab even though each consumer owns N16.
+        # Do not publish any child tile while K1 can still update sibling
+        # scale rows covered by the same TMA transaction.
+        ready_token_n = max(ready_token_n, 128)
     token_padding_block = min(CTA_TOKEN_TILE, k1_token_n)
     if (
         ready_token_n % k1_token_n
@@ -233,6 +248,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         fc1_ready_tile_tokens=k1_token_n,
         fc1_producer_tile_tokens=k1_token_n,
         k2_token_tile_tokens=k2_token_n,
+        k2_ready_tile_tokens=ready_token_n,
         static_expert_shape=(
             problem.num_experts_per_rank,
             problem.intermediate,
@@ -271,34 +287,79 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         group_hint=k1_group_hint,
         mma_tiler_mnk=config.k1_tile,
         load_balance_mode="static",
+        k2_tail_reclaim=config.k2_tail_reclaim,
         green_trace_role=0,
         **common_kwargs,
+    )
+    k2_load_balance = (
+        "atomic_counter" if config.k2_tail_reclaim else "static"
     )
     k2_common = dict(
         group_hint=k2_group_hint,
         mma_tiler_mnk=config.k2_tile,
         num_ab_stages_override=config.k2_stages,
-        compact_k2=(config.k2_warps == 8 or config.k2_tile[1] == 256),
-        load_balance_mode="static",
+        compact_k2=(config.k2_warps in (8, 12) or config.k2_tile[1] == 256),
+        load_balance_mode=k2_load_balance,
+        k2_tail_reclaim=config.k2_tail_reclaim,
+        skip_global_tail=(config.k2_tail_reclaim or config.k2_warps == 12),
         producer_sm_count=(
             k1_clusters * cluster_size if options.concurrent_k1_k2 else 0
         ),
         green_trace_role=1,
     )
-    k2 = Sm120Fc2CombineKernel(**k2_common, **common_kwargs)
+    k2_kernel_cls = (
+        Sm120Fc2CombineN16DualGroupKernel
+        if config.k2_warps == 12
+        else Sm120Fc2CombineKernel
+    )
+    k2 = k2_kernel_cls(**k2_common, **common_kwargs)
 
-    expected_threads = 32 * config.k2_warps
+    k2_drain = None
+    k2_finalizer = None
+    if config.k2_tail_reclaim:
+        drain_common = dict(k2_common)
+        drain_common.update(
+            group_hint=k2_group_hint,
+            load_balance_mode="atomic_counter",
+            k2_tail_reclaim=True,
+            producer_sm_count=0,
+            green_trace_role=2,
+        )
+        k2_drain = k2_kernel_cls(**drain_common, **common_kwargs)
+
+    if config.k2_tail_reclaim or config.k2_warps == 12:
+        finalizer_common = dict(k2_common)
+        finalizer_common.update(
+            group_hint=1,
+            load_balance_mode="static",
+            k2_tail_reclaim=config.k2_tail_reclaim,
+            producer_sm_count=0,
+            skip_global_tail=False,
+            green_trace_role=3,
+        )
+        k2_finalizer = Sm120K2TailFinalizerKernel(
+            **finalizer_common, **common_kwargs
+        )
+
+    expected_threads = 32 * (11 if config.k2_warps == 12 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(
             f"K2 requested {expected_threads} threads, got {k2.threads_per_cta}"
         )
     workspace_sizes = k1.get_workspace_sizes()
-    if k2.get_workspace_sizes() != workspace_sizes:
+    peers = [k2]
+    if k2_drain is not None:
+        peers.append(k2_drain)
+    if k2_finalizer is not None:
+        peers.append(k2_finalizer)
+    if any(peer.get_workspace_sizes() != workspace_sizes for peer in peers):
         raise RuntimeError("K1/K2 workspace layouts are not byte-identical")
 
     return SplitKernelBundle(
         k1=k1,
         k2=k2,
+        k2_drain=k2_drain,
+        k2_finalizer=k2_finalizer,
         local_workspace_bytes=workspace_sizes[0],
         shared_workspace_bytes=workspace_sizes[1],
         cache_key=spec.cache_key,

@@ -44,12 +44,27 @@ _LOCAL_DECODE_SM_PARTITION = (80, 30)
 _LOCAL_DEFAULT_SM_PARTITION = (72, 38)
 _HYBRID_SM_PARTITION = (48, 16, 16, 30)
 
-# Keep the decode rule below the first neutral bucket.  On RTX Pro 5000 EP4,
-# DSV4-flash has 1.5/3/6 routed rows per expert at 16/32/64 tokens and all
-# three benefit from the N16 K2 worker, bundle-2 publication, and 80/30 K1/K2
-# split.  The 12-row (128-token) bucket is neutral, so it stays on the existing
-# N32 preset together with all larger prefill bands.
-_LOCAL_DECODE_MAX_ROWS_PER_EXPERT = 6.0
+# RTX Pro 5000 EP4 NVFP4 sweep: DSV4-flash decode buckets through 128 tokens
+# (12 expected rows/expert) benefit from the N16 K2 worker and the 80/30 split.
+# The dual-N8 mapping is intentionally enabled only for the exact measured
+# model/parallel envelope below; other local shapes may still use single-N16.
+_LOCAL_DECODE_MAX_ROWS_PER_EXPERT = 12.0
+_DUAL_N8_DECODE_MAX_TOKENS_PER_RANK = 128
+_TAIL_RECLAIM_MIN_TOKENS_PER_RANK = 32
+
+
+def _is_validated_dual_n8_decode(shape: "MegaMoEHeuristicInput") -> bool:
+    return (
+        shape.ep_cross_numa_peer_count == 0
+        and shape.data_parallel_size == 1
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+        and shape.hidden == 4096
+        and shape.intermediate == 4096
+        and shape.num_topk == 6
+        and shape.num_total_experts == 256
+        and shape.tokens_per_rank <= _DUAL_N8_DECODE_MAX_TOKENS_PER_RANK
+    )
 
 
 def _scale_sm_partition(
@@ -196,6 +211,7 @@ class MegaMoEHeuristicOverrides:
     k2_tile: Optional[Tile] = None
     k2_stages: Optional[int] = None
     k2_warps: Optional[int] = None
+    k2_tail_reclaim: Optional[bool] = None
     k1_sms: Optional[int] = None
     k2_sms: Optional[int] = None
     tx_sms: Optional[int] = None
@@ -260,6 +276,7 @@ class MegaMoEKernelConfig:
     ready_queue_bundle: int
     k2_natural_regs: bool
     k2_min_blocks_per_sm: int
+    k2_tail_reclaim: bool
 
     expected_rows_per_expert: float
 
@@ -324,6 +341,16 @@ class MegaMoEKernelConfig:
                 k2_natural_regs=(token_n == 32),
                 k2_min_blocks_per_sm=2 if token_n == 32 else 1,
             )
+            if overrides.k2_warps is None:
+                config = replace(config, k2_warps=8)
+            if overrides.k2_tail_reclaim is None:
+                config = replace(config, k2_tail_reclaim=False)
+        if (
+            overrides.k2_warps is not None
+            and overrides.k2_warps != 12
+            and overrides.k2_tail_reclaim is None
+        ):
+            config = replace(config, k2_tail_reclaim=False)
 
         backend = overrides.comm_backend or config.comm_backend
         if backend == "p2p_direct":
@@ -376,6 +403,12 @@ class MegaMoEKernelConfig:
             "epi_warps" if backend == "p2p_direct" else "reuse_dispatch_warps"
         )
         if (
+            backend == "p2p_direct"
+            and overrides.token_back_mode == "reuse_dispatch_warps"
+        ):
+            required_token_back = "reuse_dispatch_warps"
+            config = replace(config, token_back_mode=required_token_back)
+        if (
             overrides.token_back_mode is not None
             and overrides.token_back_mode != required_token_back
         ):
@@ -413,6 +446,10 @@ def select_megamoe_config(
         not cross_numa
         and rows <= _LOCAL_DECODE_MAX_ROWS_PER_EXPERT
     )
+    # The dual-N8 path is enabled only for the exact four-rank DSV4-flash
+    # envelope covered by balanced, power-law, concentrated and empty-rank
+    # graph/eager replay tests. Other shapes retain the single-N16 path.
+    dual_n8_decode = _is_validated_dual_n8_decode(shape)
     k2_token_n = 16 if local_decode else k1_token_n
     k1_tile = (64, k1_token_n, 128)
     k2_tile = (64, k2_token_n, 128)
@@ -552,7 +589,7 @@ def select_megamoe_config(
             or (k2_token_n == 128 and rows <= 512.0)
             else 2
         ),
-        k2_warps=8,
+        k2_warps=12 if dual_n8_decode else 8,
         k1_sms=k1_sms,
         k2_sms=k2_sms,
         tx_sms=tx_sms,
@@ -594,8 +631,16 @@ def select_megamoe_config(
             if local_decode
             else 4 if rows <= 128.0 else 8 if rows <= 512.0 else 16
         ),
-        k2_natural_regs=(k2_token_n == 32),
-        k2_min_blocks_per_sm=2 if k2_token_n == 32 else 1,
+        k2_natural_regs=(k2_token_n == 32 or dual_n8_decode),
+        k2_min_blocks_per_sm=(
+            2 if k2_token_n == 32 or dual_n8_decode else 1
+        ),
+        # Reclaim is neutral for balanced/power-law routing but shortens the
+        # concentrated slow-rank tail. Bucket 7/16 avoid the extra launch.
+        k2_tail_reclaim=(
+            dual_n8_decode
+            and shape.tokens_per_rank >= _TAIL_RECLAIM_MIN_TOKENS_PER_RANK
+        ),
         expected_rows_per_expert=rows,
     )
     if overrides is not None:

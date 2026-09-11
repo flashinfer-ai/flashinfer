@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -300,15 +301,18 @@ class NativeGreenContextGraph:
         k1_executor: Any,
         k2_executor: Any,
         k2_drain_executor: Optional[Any],
+        k2_finalizer_executor: Optional[Any],
         k3_executor: Optional[Any],
         launch_k1: Callable[[], None],
         launch_k2: Callable[[], None],
         launch_k2_drain: Optional[Callable[[], None]],
         launch_k2_finalizer: Optional[Callable[[], None]],
         launch_k3: Optional[Callable[[], None]],
-        launch_reset: Optional[Callable[[], None]],
+        launch_reset: Optional[Callable[[], None]] = None,
         k1_sm_count: int,
-        k2_grid_blocks: Optional[int] = None,
+        k1_grid_clusters: Optional[int] = None,
+        k2_grid_clusters: Optional[int] = None,
+        k2_drain_grid_clusters: Optional[int] = None,
         green_resources: Optional[NativeGreenContextResources] = None,
         device: Optional[int] = None,
     ) -> "NativeGreenContextGraph":
@@ -335,25 +339,40 @@ class NativeGreenContextGraph:
         )
         try:
             if launch_reset is not None:
+                # Queue reset and publication belong to one replay DAG. This
+                # prevents replay N+1 from clearing state while replay N's
+                # Green-Context consumers are still retiring.
                 with torch.cuda.stream(root_stream):
                     launch_reset()
             capture_ready.record(root_stream)
             k1_stream.wait_event(capture_ready)
             k2_stream.wait_event(capture_ready)
             launch_k1()
+            serialize_k2 = (
+                os.environ.get("MEGA_DIAG_SERIALIZE_K2", "0") == "1"
+            )
+            if serialize_k2 and launch_k2_drain is not None:
+                raise RuntimeError(
+                    "MEGA_DIAG_SERIALIZE_K2 is incompatible with K2 tail "
+                    "reclaim because the drain shares the K2 work queue."
+                )
+            if serialize_k2:
+                k1_done.record(k1_stream)
+                k2_stream.wait_event(k1_done)
             launch_k2()
             if launch_k2_drain is not None:
-                # Same G1 stream: the drain worker begins only after K1 has
-                # released its SM partition.
+                # The drain runs on the K1 stream, so it starts only after K1
+                # releases that Green partition and then joins the main K2
+                # worker grid through the shared atomic queue.
                 launch_k2_drain()
-            k1_done.record(k1_stream)
+            if not serialize_k2:
+                k1_done.record(k1_stream)
             k2_done.record(k2_stream)
             root_stream.wait_event(k1_done)
             root_stream.wait_event(k2_done)
             if launch_k2_finalizer is not None:
-                # The worker kernels deliberately skip the global tail.
-                # This one-CTA node reuses the original rank barrier/reset
-                # after both shared-queue consumers have drained.
+                # Join every peer K2 store and reclaim the shared count state
+                # before K3 consumes this epoch's combine buffer.
                 launch_k2_finalizer()
             if launch_k3 is not None:
                 launch_k3()
@@ -418,10 +437,6 @@ class NativeGreenContextGraph:
                 green_resources.execution_contexts[0],
                 green_resources.execution_contexts[3],
             ]
-        if k2_grid_blocks is None:
-            k2_grid_blocks = k2_sm_count
-        if k2_grid_blocks <= 0:
-            raise ValueError("k2_grid_blocks must be positive")
         try:
             if green_resources is None:
                 for index, resource in enumerate(resources):
@@ -482,12 +497,21 @@ class NativeGreenContextGraph:
                 else:
                     # Public CuTeDSL 4.6 uses a CUDA-dialect host shim whose
                     # executor does not expose CUfunction handles. K1/K2 are
-                    # persistent cluster=1 kernels, so their captured grid
-                    # volumes are exactly their disjoint SM allocations.
+                    # persistent cluster=1 kernels.  A kernel normally has
+                    # one CTA per partition SM, but K2 may deliberately
+                    # launch two resident CTAs per SM.  Use the explicitly
+                    # supplied captured-grid volumes to identify nodes; the
+                    # Green Context still owns only k1_sm_count/k2_sm_count
+                    # physical SMs.
                     context_index = (
-                        0 if grid_blocks == k1_sm_count
+                        0
+                        if grid_blocks in {
+                            k1_grid_clusters or k1_sm_count,
+                            k2_drain_grid_clusters,
+                        }
                         else 1
-                        if grid_blocks == k2_grid_blocks
+                        if grid_blocks
+                        == (k2_grid_clusters or k2_sm_count)
                         else None
                     )
                 if context_index is None:

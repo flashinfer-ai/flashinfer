@@ -3387,7 +3387,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             fail_sleep_cycles=500,
                         )
                     cute.arch.sync_warp()
-                    cute.arch.fence_acq_rel_gpu()
+                    cute.arch.fence_acq_rel_sys()
 
                     expert_idx = cutlass.Int32(0)
                     tile_m_idx = cutlass.Int32(0)
@@ -3973,6 +3973,15 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                     self.token_comm_hook_fc1_tma_b_predispatch_spin(
                         token_comm_args, work_tile_info,
                     )
+                    if cutlass.const_expr(
+                        token_comm_args is not None and self.k1_ready_queue
+                    ):
+                        # The scheduler acquired a dispatch-published queue
+                        # descriptor and handed it to this TMA warp. Complete
+                        # the generic-to-async proxy transfer before TMA reads
+                        # the freshly staged activation and scale rows.
+                        cute.arch.fence_acq_rel_sys()
+                        cute.arch.fence_proxy("async.global")
 
                     k_tile_cnt = k_tile_cnt_fc1
                     real_b, desc_ptr_b = ext.get_gmem_tensor(
@@ -4631,22 +4640,14 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         tCsSFB_p_filtered[None, None, 0],
                         tCrSFB_copy_view_filtered[None, 0, None, 0],
                     )
-                    tCrSFB_mma_lo = tCrSFB
-                    tCrSFB_mma_hi = tCrSFB
-                    sfb_tile_is_hi = cutlass.Boolean(0)
+                    sfb_tiles_per_tma = 1
+                    sfb_tile_slot = cutlass.Int32(0)
                     if cutlass.const_expr(self.mma_tiler[1] < 128):
-                        # Keep the N64 half selection static in RMEM. A dynamic
-                        # iterator offset forces ptxas to materialize the full
-                        # N128 SFB fragment in local memory.
-                        tCrSFB_mma_hi = cute.make_tensor(
-                            tCrSFB.iterator + n_groups // 4,
-                            tCrSFB.layout,
-                        )
                         sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_is_hi = (
+                        sfb_tile_slot = (
                             work_tile_info.tile_n_idx
                             % cutlass.Int32(sfb_tiles_per_tma)
-                        ) != cutlass.Int32(0)
+                        )
 
                     if trace_k_detail != cutlass.Int32(0):
                         if is_phase_linear1:
@@ -4681,38 +4682,26 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                 ],
                             )
                         for ng in cutlass.range_constexpr(0, n_groups):
-                            if sfb_tile_is_hi:
-                                issue_m64n8k64_nvfp4(
-                                    tiled_mma,
-                                    accumulators[None, None, ng],
-                                    tCrA,
-                                    tCrB,
-                                    tCrSFA,
-                                    tCrSFB_mma_hi,
-                                    n_group=ng,
-                                    active_n_groups=n_groups,
-                                    sfa_m_group=0,
-                                    k_inner=k_inner_mma,
-                                    a_dtype=self.a_dtype,
-                                    b_dtype=self.b_dtype,
-                                    sf_dtype=self.sf_dtype,
-                                )
-                            else:
-                                issue_m64n8k64_nvfp4(
-                                    tiled_mma,
-                                    accumulators[None, None, ng],
-                                    tCrA,
-                                    tCrB,
-                                    tCrSFA,
-                                    tCrSFB_mma_lo,
-                                    n_group=ng,
-                                    active_n_groups=n_groups,
-                                    sfa_m_group=0,
-                                    k_inner=k_inner_mma,
-                                    a_dtype=self.a_dtype,
-                                    b_dtype=self.b_dtype,
-                                    sf_dtype=self.sf_dtype,
-                                )
+                            for sfb_slot in cutlass.range_constexpr(
+                                0, sfb_tiles_per_tma
+                            ):
+                                if sfb_tile_slot == cutlass.Int32(sfb_slot):
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        sfb_n_group=sfb_slot * n_groups + ng,
+                                        k_inner=k_inner_mma,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
                     if trace_k_detail != cutlass.Int32(0):
                         iket.range_pop()
                     handle_a.release()
@@ -5082,10 +5071,11 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                 cute.make_layout(1),
                             )
                             output_i32[0] = scratch_i32[0]
-                    # FC1 output is consumed only by the local K2 kernel. A
-                    # GPU-scope release suffices before the local ready flag;
-                    # system scope needlessly drains stores toward peers.
-                    cute.arch.fence_acq_rel_gpu()
+                    # K2 runs in a distinct Green Context and consumes these
+                    # stores through the TMA async proxy.  Start a system-scope
+                    # release chain here; the last producer completes it when
+                    # publishing the ready descriptor.
+                    cute.arch.fence_acq_rel_sys()
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=32 * len(self.compute_warp_id),
@@ -5134,8 +5124,13 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                     + counter_slot * fc2_ready_bundle_cnt
                                     + ready_bundle_idx,
                                     cutlass.Int32(1),
-                                    sem="release",
-                                    scope="gpu",
+                                    # The last completer publishes the K2
+                                    # descriptor.  Acquire the preceding
+                                    # release sequence so that publication
+                                    # transitively exposes every producer
+                                    # CTA's FC1 data and scale stores.
+                                    sem="acq_rel",
+                                    scope="sys",
                                 )
                             if cutlass.const_expr(
                                 k2_ready_queue_state is not None
@@ -5193,17 +5188,55 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                     ) // cutlass.Int32(
                                         self.fc1_ready_tile_tokens
                                     )
-                                final_bundle_complete = (
-                                    ready_bundle_idx
-                                    == cutlass.Int32(fc2_ready_bundle_cnt - 1)
-                                    and ready_old + cutlass.Int32(1)
-                                    == bundle_k_tiles
+                                bundle_expected = (
+                                    bundle_k_tiles
                                     * cutlass.Int32(
                                         fc1_tiles_per_fc2_k_tile
                                     )
                                     * producer_tiles_in_ready_block
                                 )
-                                if final_bundle_complete:
+                                bundle_complete = (
+                                    (ready_old & cutlass.Int32(0xFFFF))
+                                    + cutlass.Int32(1)
+                                    == bundle_expected
+                                )
+                                all_bundles_complete = cutlass.Int32(0)
+                                if bundle_complete:
+                                    completed_bundle_old = cutlass.Int32(0)
+                                    if lane_idx == cutlass.Int32(0):
+                                        # Pack the ready-block bundle count in
+                                        # the high 16 bits of its first
+                                        # contribution counter.  Queue
+                                        # publication must not depend on the
+                                        # final K bundle happening to finish
+                                        # after every earlier bundle.
+                                        completed_bundle_old = cute.arch.atomic_add(
+                                            fc1_done_counter.iterator
+                                            + counter_slot * fc2_ready_bundle_cnt,
+                                            cutlass.Int32(1 << 16),
+                                            sem="acq_rel",
+                                            scope="sys",
+                                        )
+                                    completed_bundle_old = cute.arch.shuffle_sync(
+                                        completed_bundle_old,
+                                        offset=0,
+                                        mask=0xFFFFFFFF,
+                                        mask_and_clamp=31,
+                                    )
+                                    completed_bundle_count = (
+                                        completed_bundle_old
+                                        >> cutlass.Int32(16)
+                                    ) + cutlass.Int32(1)
+                                    if (
+                                        completed_bundle_count
+                                        == cutlass.Int32(fc2_ready_bundle_cnt)
+                                    ):
+                                        all_bundles_complete = cutlass.Int32(1)
+                                if all_bundles_complete != cutlass.Int32(0):
+                                    # Acquire every FC1 producer's release
+                                    # before this last producer publishes the
+                                    # descriptor and its ready flag.
+                                    cute.arch.fence_acq_rel_sys()
                                     hidden_tiles = (
                                         self.hidden
                                         + self.mma_tiler[0]
@@ -5319,7 +5352,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                                 )
                                             )
                                     cute.arch.sync_warp()
-                                    cute.arch.fence_acq_rel_gpu()
+                                    cute.arch.fence_acq_rel_sys()
                                     for queue_store_iter in cutlass.range_constexpr(
                                         0, queue_store_iters
                                     ):
@@ -5338,7 +5371,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                                 + queue_pos,
                                                 cutlass.Int32(1),
                                                 sem="release",
-                                                scope="gpu",
+                                                scope="sys",
                                             )
                     else:
                         if lane_idx == cutlass.Int32(0):

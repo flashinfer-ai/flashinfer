@@ -228,6 +228,12 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
 
+        # dispatch_prep writes route-list entries directly into peer memory
+        # from every dispatch CTA/lane. The following grid sync is GPU-scoped,
+        # so SM0 cannot publish peer counts on behalf of stores that remain in
+        # another lane's P2P write path. Flush every producer before the local
+        # grid elects SM0 to publish rank readiness.
+        cute.arch.fence_acq_rel_sys()
         software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
                            num_threads=self.num_dispatch_threads)
 
@@ -328,12 +334,12 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         queue_desc[desc_base + Int32(4)] = cumulative_sf
         queue_desc[desc_base + Int32(5)] = cumulative_token_block
         queue_desc[desc_base + Int32(6)] = valid_tokens
-        cute.arch.fence_acq_rel_gpu()
+        cute.arch.fence_acq_rel_sys()
         cute.arch.store(
             queue_ready.iterator + queue_pos,
             Int32(1),
             sem="release",
-            scope="gpu",
+            scope="sys",
         )
 
     @cute.jit
@@ -395,7 +401,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 queue_desc[desc_base + Int32(5)] = cumulative_token_block
                 queue_desc[desc_base + Int32(6)] = valid_tokens
         cute.arch.sync_warp()
-        cute.arch.fence_acq_rel_gpu()
+        cute.arch.fence_acq_rel_sys()
         for work_batch in cutlass.range_constexpr(
             0, (self.k1_ready_queue_m_tiles + 31) // 32
         ):
@@ -408,7 +414,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     + tile_m_idx,
                     Int32(1),
                     sem="release",
-                    scope="gpu",
+                    scope="sys",
                 )
 
     @cute.jit
@@ -950,6 +956,11 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 # Rendezvous before publishing fc1_ready_counter so every
                 # lane observes token, scale, weight, and metadata completion.
                 cute.arch.sync_warp()
+                # The pull has already completed through the local mbarrier,
+                # and every object guarded by fc1_ready_counter lives in this
+                # GPU's HBM.  K1 is the only consumer, so a GPU-scope release
+                # is sufficient; system scope needlessly drains each token's
+                # local stores toward peers before publishing the ready tile.
                 cute.arch.fence_acq_rel_sys()
 
                 # Accumulate this token's release target into the rotating-lane
@@ -978,8 +989,11 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                         old_count = cute.arch.atomic_add(
                             fc1_ready_counter.iterator + task_tile_idx,
                             Int32(1),
-                            sem="release",
-                            scope="gpu",
+                            # The last token producer publishes all K1 work
+                            # for this tile.  Acquire the preceding producers'
+                            # release sequence before exposing the descriptor.
+                            sem="acq_rel",
+                            scope="sys",
                         )
                         if old_count + Int32(1) == valid_tokens_in_tile:
                             publish_tile = Int32(1)
@@ -1696,6 +1710,8 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         num_sms,
         prologue_grid_sync: cutlass.Constexpr[bool],
         epilogue_grid_sync: cutlass.Constexpr[bool],
+        signal_slot_base: cutlass.Constexpr[int] = 0,
+        counter_index: cutlass.Constexpr[int] = 0,
     ):
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
@@ -1709,16 +1725,19 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 signal_phase = Int32(slot)
                 target = Int32(1)
                 if cutlass.const_expr(nvlink_barrier_counter is not None):
-                    status = nvlink_barrier_counter[0] & Int32(3)
+                    status = nvlink_barrier_counter[counter_index]
                     signal_phase = status & Int32(1)
-                    signal_sign = status >> Int32(1)
-                    if signal_sign != Int32(0):
-                        target = Int32(0)
+                    # Publish the full generation rather than a two-bit
+                    # phase/sign value. Under strongly imbalanced routing a
+                    # fast empty rank can otherwise observe a stale signal
+                    # after four barriers and leave the epoch early (ABA).
+                    target = status + Int32(1)
 
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
                 if lane_idx < Int32(self.world_size):
                     signal_slot = (
-                        signal_phase * Int32(self.world_size)
+                        Int32(signal_slot_base * self.world_size)
+                        + signal_phase * Int32(self.world_size)
                         + Int32(self.local_rank)
                     )
                     lane_peer_addr = peer_rank_ptr_mapper.map(
@@ -1732,7 +1751,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 if lane_idx == 0:
                     if cutlass.const_expr(nvlink_barrier_counter is not None):
                         cute.arch.atomic_add(
-                            nvlink_barrier_counter.iterator,
+                            nvlink_barrier_counter.iterator + counter_index,
                             Int32(1),
                             sem="relaxed",
                             scope="gpu",
@@ -1743,15 +1762,17 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                         for rank in cutlass.range_constexpr(0, self.world_size, 1):
                             local_signal_ptr = (
                                 nvlink_barrier_signal.iterator
+                                + Int32(signal_slot_base * self.world_size)
                                 + signal_phase * Int32(self.world_size)
                                 + Int32(rank)
                             )
-                            if cute.arch.load(
+                            signal_value = cute.arch.load(
                                 local_signal_ptr,
                                 Int32,
                                 sem="acquire",
                                 scope="sys",
-                            ) != target:
+                            )
+                            if signal_value < target:
                                 all_ready = Int32(0)
                         if all_ready != Int32(0):
                             ready = Int32(1)
@@ -1773,11 +1794,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         before the caller elects its last completer, so this helper needs no
         software grid sync and no four-warp dispatch group.
         """
-        status = nvlink_barrier_counter[0] & Int32(3)
+        status = nvlink_barrier_counter[0]
         signal_phase = status & Int32(1)
-        target = Int32(1)
-        if status >> Int32(1) != Int32(0):
-            target = Int32(0)
+        target = status + Int32(1)
 
         signal_base = nvlink_barrier_signal.iterator.toint()
         signal_slot = (
@@ -1812,7 +1831,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     Int32,
                     sem="acquire",
                     scope="sys",
-                ) != target:
+                ) < target:
                     all_ready = Int32(0)
             if all_ready != Int32(0):
                 ready = Int32(1)
@@ -2072,6 +2091,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 epilogue_grid_sync=True,
             )
             _iket.range_pop()
+
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
                 token_comm_args.nvlink_barrier_counter,
@@ -2108,6 +2128,81 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 epilogue_grid_sync=True,
             )
             _iket.range_pop()
+
+    @cute.jit
+    def kernel_tail_after_grid_drain_epoch(
+        self,
+        token_comm_args,
+        *,
+        warp_idx,
+        lane_idx,
+    ):
+        """Join peer stores once after graph-ordered worker completion.
+
+        The worker streams have already drained before this one-CTA node is
+        launched. The first cross-rank barrier transfers ownership of all
+        peer-written count records to their local rank. This CTA clears those
+        records, then a second barrier publishes reset completion before any
+        rank can begin the next replay.
+        """
+        if (warp_idx >= self.dispatch_warp_start) and (
+            warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
+        ):
+            local_warp_idx = Int32(warp_idx) - Int32(
+                self.dispatch_warp_start
+            )
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                Int32(0),
+                local_warp_idx,
+                lane_idx,
+                slot=1,
+                num_sms=1,
+                prologue_grid_sync=False,
+                epilogue_grid_sync=False,
+                signal_slot_base=32,
+                counter_index=1,
+            )
+            thread_linear = (
+                local_warp_idx * Int32(self.warp_threads) + lane_idx
+            )
+            stride = Int32(self.kernel_tail_threads)
+            recv_total: cutlass.Constexpr[int] = (
+                self.world_size * self.num_experts_per_rank
+            )
+            i = thread_linear
+            while i < Int32(recv_total):
+                rank_idx = i // Int32(self.num_experts_per_rank)
+                expert_idx = i % Int32(self.num_experts_per_rank)
+                token_comm_args.expert_recv_count[
+                    rank_idx, expert_idx
+                ] = Int64(0)
+                i = i + stride
+
+            i = thread_linear
+            while i < Int32(self.num_experts_per_rank):
+                token_comm_args.expert_recv_count_sum[i] = Int64(0)
+                i = i + stride
+            cute.arch.fence_acq_rel_sys()
+
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                Int32(0),
+                local_warp_idx,
+                lane_idx,
+                slot=1,
+                num_sms=1,
+                prologue_grid_sync=False,
+                epilogue_grid_sync=False,
+                signal_slot_base=32,
+                counter_index=1,
+            )
 
     @cute.jit
     def kernel_tail_ibgda(
