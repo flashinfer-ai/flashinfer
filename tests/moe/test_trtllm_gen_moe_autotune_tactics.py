@@ -406,6 +406,7 @@ def test_nvfp4_per_token_all_tactics_are_correct(
                     use_4over6=True,
                     weights_use_4over6=True,
                     activation_type=activation_type,
+                    zero_rows=False,
                 )
         except Exception as err:
             raise AssertionError(
