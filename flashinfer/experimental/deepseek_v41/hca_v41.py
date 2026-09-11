@@ -329,7 +329,10 @@ class BlackwellV41MixedCacheDecode:
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
-        self.mma_o_stage = 2
+        # One completion slot per physical O slice lets PV issue a full tile
+        # before waiting for correction. N128/D512 needs four slots; only the
+        # mbarrier ring grows, since all output slices already occupy TMEM.
+        self.mma_o_stage = self.iterations_pv_n
 
         self.tmem_o_offset = (
             (self.mma_s_stage * self.mma_qk_tiler[1] // self.warps_in_n)
