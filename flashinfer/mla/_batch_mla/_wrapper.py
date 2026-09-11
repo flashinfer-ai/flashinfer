@@ -501,7 +501,11 @@ class BatchMLAPagedAttentionWrapper:
         normalized to the device required by the selected backend; tensors on
         another accelerator device are rejected. Passing flat CSR or dense
         metadata fields remains supported for compatibility, but is deprecated
-        in favor of the ``metadata=`` object form.
+        in favor of the ``metadata=`` object form. TRTLLM-GEN, XQA, and CuTe
+        DSL CUDA graph plans require supplied contiguous ``int32`` dense
+        metadata on the wrapper device. Retain and update those device tensors
+        in place for replay; CPU and CSR-only graph metadata are rejected.
+        Query offsets and lengths must remain fixed after graph planning.
 
         The plan also declares the later :meth:`run` contract. In particular,
         ``query_layout``, ``kv_cache_layout``, ``lse_mode``, ``output_dtype``,

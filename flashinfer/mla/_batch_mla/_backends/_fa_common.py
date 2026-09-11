@@ -25,7 +25,7 @@ class _GeneratedBatchMLAModule(Protocol):
     def run(self, *args: object) -> object: ...
 
 
-@functools.cache
+@functools.lru_cache(maxsize=128)
 def get_batch_mla_module(
     backend: str,
     dtype_q: torch.dtype,

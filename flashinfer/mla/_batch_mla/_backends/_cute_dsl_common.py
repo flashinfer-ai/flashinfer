@@ -403,7 +403,8 @@ class _BatchMLAPagedAttentionCuteDslBackendBase:
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionCuteDslBackendBase":
         cls.preflight_plan_from_wrapper(args)
-        dense = args.native_device_dense()
+        args.require_cuda_graph_dense_metadata(cls._backend_name)
+        dense = args.device_dense(table_width_alignment=128 // args.page_size)
         backend = cls(args._float_workspace_buffer)
         backend.plan(
             cum_seq_lens_q=dense.cum_seq_lens_q,
