@@ -436,6 +436,12 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, c
   return false;  // unreachable
 }
 
+// Dispatch a DSV4 dual-cache (hierarchical candidate pool) sparse-MLA prefill
+// to a pre-built kernel instantiation. The main cache must use 64-token pages.
+// Uniform candidate counts take the full-tile path; per-token topk lengths take
+// the length-aware path. Both select by num_heads (8-128, folded into 1-2 head
+// groups) and extra-cache page size (2, 64, 128 or 256 tokens). Returns false
+// when the configuration has no instantiation so the caller can fall back.
 inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page_block_size,
                                int extra_page_block_size, const bf16* Q, const uint8_t* KV,
                                const int32_t* indices, const uint8_t* KV_extra,
