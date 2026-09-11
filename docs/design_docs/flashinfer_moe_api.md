@@ -40,7 +40,7 @@ config = MoEConfig(
         top_k=8,
         method=RoutingMethodType.DeepSeekV3,
     ),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
+    quant=QuantConfig(variant=QuantVariant.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
     backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)],
 )
@@ -75,7 +75,7 @@ output = layer(tensors)
 layer.benchmark(Gemm1Tensors)   # isolate gemm1
 layer.benchmark_all()           # full breakdown
 # --- Variant via immutable replace ---
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
+fp8_config = dataclasses.replace(config, quant=QuantConfig(variant=QuantVariant.FP8PerTensor))
 fp8_layer  = MoELayer(**fp8_config)
 # --- Repro from issue log ---
 repro = MoERepro.from_file("user_issue.log")
@@ -90,13 +90,15 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | Config | Owns |
 | --- | --- |
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
-| QuantConfig | dtype (fp4/fp8/bf16), granularity (per-tensor/per-token/block) |
+| QuantConfig | variant (one QuantVariant knob: dtype + granularity + scale convention), swizzled_scale_factors, per_token_scale, nvfp4_4over6 (NVFP4 4over6 recipe, §3.4) |
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
 | BackendOptions | ordered candidate set via \| operator |
 | ExecutionConfig | enable_pdl, tune_max_num_tokens |
 | MoEFinalizeConfig | do_finalize, use_fused_finalize |
 | MoEConfig | assembles all above; supports \*\*unpacking protocol |
+
+The `QuantConfig` row is corrected here. It previously read *"dtype (fp4/fp8/bf16), granularity (per-tensor/per-token/block)"*, which never matched what shipped: the May 31, 2026 Decision Log records that "the implementation deliberately collapsed the older `QuantDtype` + `QuantGranularity` + `Fp8Variant` triple into one `QuantVariant` enum". The row now also carries the NVFP4 4over6 recipe, described in §3.4.
 
 ### 3.1 RoutingConfig
 
@@ -145,7 +147,7 @@ MoEConfig implements keys() and __getitem__ so it can be unpacked directly with 
 ```
 config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
+    quant=QuantConfig(variant=QuantVariant.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
     backends=[TrtllmFp4Config(), CutlassConfig()],
 )
@@ -153,8 +155,28 @@ config = MoEConfig(
 output = moe_layer(tensors, **config)
 layer  = MoELayer(**config)
 # Immutable variant
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
+fp8_config = dataclasses.replace(config, quant=QuantConfig(variant=QuantVariant.FP8PerTensor))
 ```
+
+### 3.4 QuantConfig.nvfp4_4over6 — three-state recipe
+
+NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: alongside the standard `amax / 6` E4M3 block scale it also forms the 1.5x tighter `amax / 4`, quantizes the block both ways, dequantizes both, and keeps whichever reconstructs the block with less error. Until now it was configured only by four process-wide environment variables — `FLASHINFER_NVFP4_4OVER6`, `..._ERR_MODE`, `..._ERR_USE_FAST_MATH`, `..._E4M3_USE_256` — which a serving process cannot vary per layer or per model. `QuantConfig.nvfp4_4over6` is the config-object spelling, appended last so existing positional construction keeps working.
+
+| `nvfp4_4over6=` | Meaning |
+| --- | --- |
+| `NVFP4Recipe.FROM_ENV` (default; `None` is an alias) | Read `FLASHINFER_NVFP4_4OVER6`; when it is `"1"`, the other three variables supply the recipe. Read on every call. Byte-for-byte the behaviour that predates this field. |
+| `NVFP4Recipe.STANDARD` | 4over6 off. `FLASHINFER_NVFP4_4OVER6=1` cannot turn it back on. |
+| `NVFP44Over6Config(...)` | On with exactly this recipe. The environment is ignored, with **no** per-field merge: a field left at its dataclass default keeps that default rather than picking up the environment's value. |
+
+**Why three states, when every other optional field in this tree is `Optional[...]` with `None` meaning "backend default".** `None` is already spoken for. Internally the 4over6 recipe has always been a two-state `Optional[NVFP44Over6Config]` in which `None` means *disabled*, and every kernel driver is written against that convention. A public field whose default must mean "derive from the environment" therefore cannot borrow `None` for it without either rewriting all of those drivers or silently changing what an explicit `None` does to callers that already pass one. Three states is the honest count: off, on-with-this-recipe, and defer. `None` is kept as an alias for `FROM_ENV` at the public boundary only, so a caller that passes `None` today keeps the behaviour it has today.
+
+**Why an `Enum` and not a module-level sentinel.** A bare `_FROM_ENV = object()` would distinguish the third state and nothing else. `NVFP4Recipe` gives, for free, the properties this config tree already leans on: singleton identity (`is` comparisons survive), `pickle` and `copy.deepcopy` (so a `MoEConfig` survives `dataclasses.replace` and a process boundary), hashing (the field participates in autotuner cache keys), static narrowing for type checkers, an eval-safe `__repr__` (`NVFP4Recipe.FROM_ENV`, not `<object object at 0x...>`), and a `.value` that is a plain JSON token, so a framework-level quantization config serializes without a custom encoder. The `__repr__` property is the deciding one, and it is worth contrasting with C42: finer `SfLayout` selection was deliberately *not* exposed on `QuantConfig` precisely because `SfLayout` has no eval-safe `__repr__` and would have broken the `eval(repr(cfg))` round-trip — a plain `bool` (`swizzled_scale_factors`) was used instead. `NVFP4Recipe` and `NVFP44Over6Config` both carry hand-rolled eval-safe `__repr__`s (`NVFP44Over6Config` emitting non-default fields only, matching `MoEFinalizeConfig` / `ExecutionConfig`), so the 4over6 recipe can be exposed as the real object where `SfLayout` could not.
+
+**Exactly one resolution boundary.** `resolve_nvfp4_4over6()` is the only place the `FLASHINFER_NVFP4_4OVER6*` variables are read on the Python side, so precedence is decided once rather than re-derived per backend. Above it the type is the three-state `NVFP44Over6Setting`; below it every kernel driver keeps the pre-existing two-state `Optional[NVFP44Over6Config]` where `None` means off, and keeps the pre-existing parameter name `nvfp4_4over6_config`. The naming split is load-bearing: because the public parameter is spelled `nvfp4_4over6` and the resolved one `nvfp4_4over6_config`, a three-state value leaking into a `@functools.cache`-d kernel getter is a *name* mismatch at the call site instead of a silent cache collision between `FROM_ENV` and whatever it happened to resolve to on that call. The same asymmetry is enforced at the FFI boundary: `nvfp4_4over6_code()` is typed on the resolved two-state value, so FlashInfer's own Python cannot emit the `FROM_ENV` wire code (`-1`); that code exists so a direct C++ / TVM-FFI caller which passes nothing still lands on the legacy env-reading path.
+
+**An explicit recipe is never silently ignored.** The failure this field must not have is a user pinning `NVFP44Over6Config(e4m3_max=256)`, getting standard NVFP4 numerics from a backend that ignores it, and finding out only from an accuracy regression. Support is therefore opt-in per backend, mirroring how `num_fused_shared_experts` is already handled: `MoERunner.supports_nvfp4_4over6` is a `ClassVar[bool]` defaulting to `False`, and `MoERunner._check_support()` raises `NotImplementedError` for *any* explicit setting on a runner that has not set it. The gate deliberately inspects the **unresolved** three-state value rather than the resolved one, so `NVFP4Recipe.STANDARD` is rejected as well: a backend that has not threaded the field still reads the environment, so a pinned `STANDARD` there could be flipped back on by `FLASHINFER_NVFP4_4OVER6=1` — the same silent override the field exists to prevent. Only `FROM_ENV` (and its `None` alias) passes quietly, because that *is* a request for the legacy behaviour. A runner that opts in may narrow further in its own `_check_support()`: `CuteDslNvfp4Runner` honours a pinned `NVFP44Over6Config` only with `per_token_scale=True`, the single path where it quantizes the GEMM2 input itself, while still accepting `STANDARD` on the other path because GEMM1's NVFP4 epilogue never consults the environment there. Because `MoELayer` swallows `_check_support` failures in order to filter candidates, a setting no backend accepts would otherwise surface only as the "none of the configured backends are usable" `RuntimeError` — so `MoELayer` appends a 4over6-specific hint to that message naming the runners that do implement it, exactly the shape of the existing fused-shared-experts hint.
+
+**Scope: activations, not weights.** The field governs the activation quantization the MoE kernels perform at runtime. Weight quantization happens ahead of the call, in the caller's own quantize step, and is configured there — `tests/moe/test_trtllm_gen_per_token_moe.py` parametrizes `use_4over6` and `weights_use_4over6` independently for exactly that reason. One cross-field rule is enforced by `QuantConfig.__post_init__` rather than by a runner: an explicit recipe on a non-`NVFP4` variant raises `ValueError` at the point the config is written. Putting that check in `_check_support()` would have let the candidate filter swallow it and report "no backend available" instead of naming the mistake — the same reasoning that already keeps `_validate_fused_shared_experts` out of `check_support()`.
 
 ## 4. Public API
 

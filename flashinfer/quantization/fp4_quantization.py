@@ -58,6 +58,19 @@ from ..utils import (
     _unpack_paged_kv_cache,
 )
 from ..tllm_enums import SfLayout
+from .nvfp4_quantization_utils import (
+    FLOAT4_E2M1_MAX,
+    NVFP4_4OVER6_CODE_FROM_ENV,
+    NVFP44Over6Config,
+    NVFP44Over6Setting,
+    NVFP4Recipe,
+    nvfp4_4over6_code,
+    nvfp4_4over6_fp8_input_error,
+    nvfp4_4over6_from_code,
+    nvfp4_4over6_is_from_env,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
+)
 
 
 NVFP4_QUANT_ENV_VARS = (
@@ -67,6 +80,67 @@ NVFP4_QUANT_ENV_VARS = (
     "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
     "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
 )
+
+
+#: Input dtypes routed to an FP8->FP4 kernel, which has no 4over6 candidate
+#: search.  Only e4m3 today: csrc/nv_internal/tensorrt_llm/thop/fp4Quantize.cpp
+#: maps ``dl_float8_e4m3fn`` alone onto ``__nv_fp8_e4m3``, and the FP8 branch of
+#: ``invokeFP4Quantization`` keys off exactly that type.  Every other dtype the
+#: kernels reject outright.
+_FP8_TO_FP4_INPUT_DTYPES = (torch.float8_e4m3fn,)
+
+
+def _forward_nvfp4_4over6(nvfp4_4over6: NVFP44Over6Setting) -> NVFP44Over6Setting:
+    """Value to hand a callee that resolves the setting for itself.
+
+    ``FROM_ENV`` is forwarded as ``FROM_ENV``, never as the recipe it resolves
+    to.  Two reasons, one rule: ``None`` means "4over6 off" below the resolve
+    boundary but "read the environment" above it, so a resolved recipe cannot
+    be spelled in a public ``nvfp4_4over6=`` parameter without changing
+    meaning; and re-widening an environment-derived recipe into an explicit
+    one erases where it came from, which is what the guards here and the
+    callees' error messages key off.  (``MoERunner._forward_kwargs`` in
+    flashinfer/fused_moe/runners.py forwards explicit values only, for the
+    same reason.)
+
+    Forwarding ``FROM_ENV`` means the callee reads the environment.  The
+    recipe that reaches a kernel still comes from exactly one read: on a path
+    that forwards, this frame's own resolution feeds at most an
+    explicit-recipe guard, and those never consult the environment.
+    """
+    if nvfp4_4over6_is_from_env(nvfp4_4over6):
+        return NVFP4Recipe.FROM_ENV
+    # Explicit: resolving cannot touch the environment, and canonicalizes a
+    # subclass once here rather than once per callee.
+    config = resolve_nvfp4_4over6(nvfp4_4over6)
+    return NVFP4Recipe.STANDARD if config is None else config
+
+
+#: Relative tolerance for pairing the per-token global scale with the recipe.
+#: Loose enough that a float32 round-trip of ``1 / (448 * 6)`` passes, far
+#: tighter than the 448/256 ratio (1.75) the check exists to catch.
+_GLOBAL_SF_RTOL = 1e-3
+
+
+def _check_per_token_global_scale(
+    scale_inv: float, nvfp4_4over6_config: Optional[NVFP44Over6Config]
+) -> None:
+    """Verify a per-token inverse global scale matches the 4over6 recipe.
+
+    The E4M3 clamp appears both in the global scale and in the kernel's
+    candidate search; mixing a ``448``-derived scale with a ``256`` recipe
+    silently rescales the whole tensor instead of failing.  Takes an already
+    materialized ``float`` so it can never add a device synchronization.
+    """
+    expected = 1.0 / (nvfp4_e4m3_max(nvfp4_4over6_config) * FLOAT4_E2M1_MAX)
+    if abs(scale_inv - expected) > _GLOBAL_SF_RTOL * expected:
+        raise ValueError(
+            f"a_global_sf={scale_inv!r} does not match the requested NVFP4 "
+            f"4over6 recipe {nvfp4_4over6_config!r}, which implies "
+            f"a_global_sf={expected!r}.  Build the scale from the same recipe: "
+            "flashinfer.make_nvfp4_global_scale(a, per_token_activation=True, "
+            "nvfp4_4over6=<the same value>)."
+        )
 
 
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
@@ -273,6 +347,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         is_sf_8x4_layout: bool = False,
         is_global_scale_inversed: bool = False,
         enable_pdl: Optional[bool] = None,
+        # Appended last so existing positional construction keeps working.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
 
@@ -285,6 +361,10 @@ def get_fp4_quantization_module(backend: str = "100"):
             is_sf_8x4_layout (bool, optional): Whether to use 8x4 layout or 128x4 layout for scale factors. Defaults to False.
             enable_pdl (Optional[bool], optional): Whether to enable PDL (Programmatic Dependent Launch).
                 If None, automatically detects based on device capability. Defaults to None.
+            nvfp4_4over6_code (int, optional): Packed NVFP4 4over6 recipe (see
+                flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
+                kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
+                variables. Defaults to ``-1``.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -322,6 +402,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             is_sf_8x4_layout,
             is_global_scale_inversed,
             enable_pdl,
+            nvfp4_4over6_code,
         )
         return out_val, out_sf[:out_sf_size]
 
@@ -332,6 +413,14 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
+        # Parity with fp4_quantize_sm100 above, positional included: a fake
+        # binds the real op's arguments by position, so a missing one here
+        # would make the next argument land in the wrong parameter.
+        is_sf_8x4_layout: bool = False,
+        is_global_scale_inversed: bool = False,
+        enable_pdl: Optional[bool] = None,
+        # Output shapes do not depend on the recipe; accepted and ignored.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape
         return (
@@ -415,6 +504,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
+        # Appended last so existing positional construction keeps working.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize a batched tensor to FP4 (E2M1x2) with per-block scale factors.
 
@@ -435,6 +526,10 @@ def get_fp4_quantization_module(backend: str = "100"):
                 Defaults to 16.
             sf_use_ue8m0 (bool, optional): Scale-factor encoding type.
                 False → UE4M3 (default), True → UE8M0.
+            nvfp4_4over6_code (int, optional): Packed NVFP4 4over6 recipe (see
+                flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
+                kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
+                variables. Defaults to ``-1``.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -469,6 +564,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf,
             sf_vec_size,
             sf_use_ue8m0,
+            nvfp4_4over6_code,
         )
         return out_val, out_sf
 
@@ -478,6 +574,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         global_scale: Optional[torch.Tensor] = None,
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
+        # Output shapes do not depend on the recipe; accepted and ignored.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         b, m, k = input.shape
         return (
@@ -497,6 +595,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         scale_inv: float,
         expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
         sf_layout: int = SfLayout.layout_linear.value,
+        # Appended last so existing positional construction keeps working.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         m, k = input.shape
         output = input.new_empty((m, k // 2), dtype=torch.uint8)
@@ -525,6 +625,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             output_per_token_scale,
             expanded_idx_to_permuted_idx,
             sf_layout,
+            nvfp4_4over6_code,
         )
         return output, output_scale, output_per_token_scale
 
@@ -534,6 +635,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         scale_inv: float,
         expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
         sf_layout: int = SfLayout.layout_linear.value,
+        # Output shapes do not depend on the recipe; accepted and ignored.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         m, k = input.shape
         out_scale_cols = (
@@ -563,6 +666,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         input: torch.Tensor,
         mask: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
+        # Appended last so existing positional construction keeps working.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize a silu and matmul with masked batched tensor to FP4 (E2M1x2) with per-block scale factors.
 
@@ -577,6 +682,10 @@ def get_fp4_quantization_module(backend: str = "100"):
             mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.
             global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
                 dtype float32.
+            nvfp4_4over6_code (int, optional): Packed NVFP4 4over6 recipe (see
+                flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
+                kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
+                variables. Defaults to ``-1``.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -615,6 +724,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             global_scale,
             mask,
             True,
+            nvfp4_4over6_code,
         )
         output = output.permute(1, 2, 0)
         output_scales = output_scales.view(torch.float8_e4m3fn).view(
@@ -628,6 +738,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         input: torch.Tensor,
         mask: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
+        # Output shapes do not depend on the recipe; accepted and ignored.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = input.device
         l, m, k_by_2 = input.shape
@@ -658,6 +770,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         input_tensor: torch.Tensor,
         input_global_scale: torch.Tensor,
         mask: torch.Tensor,
+        # Appended last so existing positional construction keeps working.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Quantize input tensor to FP4 and return quantized tensor and scale, for
@@ -667,6 +781,10 @@ def get_fp4_quantization_module(backend: str = "100"):
                 l is number of groups, m is number of tokens per group, k is number of features.
             input_global_scale: A scalar scaling factor for the entire tensor, with
                 shape (l,).
+            nvfp4_4over6_code: Packed NVFP4 4over6 recipe (see
+                flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
+                kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
+                variables.
         Outputs:
             output: The quantized tensor in FP4, with shape (m, k // 2, l) but the physical
                 layout is (l, m, k // 2). `// 2` is because two fp4 values are packed into
@@ -699,6 +817,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             input_global_scale,
             mask,
             False,
+            nvfp4_4over6_code,
         )
         # The physical layout of the output is (l, m, k // 2), but we want to return a
         # logical layout (m, k // 2, l) required by the flashinfer masked group gemm.
@@ -717,6 +836,8 @@ def get_fp4_quantization_module(backend: str = "100"):
         input_tensor: torch.Tensor,
         input_global_scale: torch.Tensor,
         mask: torch.Tensor,
+        # Output shapes do not depend on the recipe; accepted and ignored.
+        nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = input_tensor.device
         l, m, k = input_tensor.shape
@@ -821,6 +942,8 @@ def silu_and_mul_nvfp4_quantize(
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
     enable_pdl: Optional[bool] = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply SwiGLU and NVFP4 quantization in one CuTe-DSL kernel.
 
@@ -843,12 +966,23 @@ def silu_and_mul_nvfp4_quantize(
         Use the 8x4 rather than 128x4 swizzled layout.
     enable_pdl : bool, optional
         Enable Programmatic Dependent Launch. Auto-detected when None.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
         Packed FP4 values of shape ``[M, K/2]`` and their scale factors.
     """
+    # Not resolved here: the kernel below resolves, and forwarding the
+    # three-state value keeps this frame from reading the environment at all
+    # (see _forward_nvfp4_4over6).  An explicit value is still validated, by
+    # the resolve inside that helper.
     if sf_vec_size != 16:
         raise NotImplementedError(
             "sf_vec_size can only be 16 for silu_and_mul_nvfp4_quantize"
@@ -892,6 +1026,7 @@ def silu_and_mul_nvfp4_quantize(
         global_scale,
         sf_layout=sf_layout,
         enable_pdl=enable_pdl,
+        nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
     )
 
 
@@ -906,6 +1041,8 @@ def fp4_quantize(
     is_global_scale_inversed: bool = False,
     enable_pdl: Optional[bool] = None,
     backend: str = "cuda",
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to FP4 format.
 
@@ -948,6 +1085,13 @@ def fp4_quantize(
             fp16/bf16/fp8 (NVFP4).
           * ``sf_vec_size=32, sf_use_ue8m0=True``: all layouts, fp16/bf16
             (MXFP4).
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -964,16 +1108,59 @@ def fp4_quantize(
         or ``sf_vec_size`` other than 16 or 32).
     ValueError
         If the ``"cute-dsl"`` backend is requested for an unsupported
-        parameter combination.
+        parameter combination, or if an explicit ``nvfp4_4over6`` recipe is
+        combined with MXFP4 parameters (``sf_vec_size=32`` /
+        ``sf_use_ue8m0=True``) or with fp8 input, none of which has a
+        4over6 candidate search.
 
     Warnings
     --------
     The ``"cute-dsl"`` backend is **experimental** and not part of the
     stable API.  It may change or be removed in future versions without
     notice.
+
+    Notes
+    -----
+    Precedence of ``nvfp4_4over6``:
+
+    - ``NVFP4Recipe.FROM_ENV`` (the default, and what ``None`` means): read
+      ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``, the other three vars supply
+      the recipe.  Read on every call.  Byte-for-byte the old behaviour.
+    - ``NVFP4Recipe.STANDARD``: 4over6 off.  ``FLASHINFER_NVFP4_4OVER6=1``
+      cannot turn it back on.
+    - ``NVFP44Over6Config(...)``: on with exactly this recipe; env ignored,
+      NO per-field merge.
+
+    An explicit value wins wholesale: a config supplies all three knobs or
+    none.  There is no per-field merge with the environment, because a
+    half-environment recipe is not reproducible from a log line.
+
+    Build the global scale from the SAME recipe -- use
+    ``flashinfer.make_nvfp4_global_scale(..., nvfp4_4over6=<same value>)``.
     """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
+
+    # Two kernel paths below have no 4over6 candidate search and would drop an
+    # explicitly requested recipe without a trace -- leaving a global scale
+    # built for e4m3_max=256 paired with a kernel that clamps at 448.  MXFP4
+    # has no candidate search at all; the FP8->FP4 kernels hardcode the
+    # off-recipe (see nvfp4_4over6_fp8_input_error).  Only an explicit per-call
+    # recipe raises: a process-wide environment variable is not a per-call
+    # request, it has always been ignored on both paths, and the FROM_ENV path
+    # must stay byte-for-byte compatible.  The CuTe-DSL backend keeps raising
+    # for FP8 under FROM_ENV too, as it always has -- that check stays with the
+    # kernel that cannot honor the recipe.
+    if nvfp4_4over6_config is not None and not nvfp4_4over6_is_from_env(nvfp4_4over6):
+        if sf_vec_size != 16 or sf_use_ue8m0:
+            raise ValueError(
+                "nvfp4_4over6 applies to NVFP4 only (sf_vec_size=16, "
+                f"sf_use_ue8m0=False); got sf_vec_size={sf_vec_size}, "
+                f"sf_use_ue8m0={sf_use_ue8m0}."
+            )
+        if input.dtype in _FP8_TO_FP4_INPUT_DTYPES:
+            raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, input.dtype)
 
     # The quantize kernel reads global_scale as float32 on input's device. Normalize
     # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
@@ -990,6 +1177,7 @@ def fp4_quantize(
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
             enable_pdl,
+            _forward_nvfp4_4over6(nvfp4_4over6),
         )
     elif backend != "cuda":
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
@@ -1013,6 +1201,7 @@ def fp4_quantize(
         is_sf_8x4_layout,
         is_global_scale_inversed,
         enable_pdl,
+        nvfp4_4over6_code(nvfp4_4over6_config),
     )
     # Swizzled sf includes row/column padding from block_scale_interleave
     # (rows to multiple of 128, cols to multiple of 4), so we use the padded
@@ -1039,15 +1228,22 @@ def _fp4_quantize_custom_op(
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
     enable_pdl: Optional[bool] = None,
+    # Appended last so existing positional construction keeps working.  A flat
+    # int, not a dataclass: only primitives cross the torch.library boundary.
+    nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Keyword-only forwarding from here on.  Passing these positionally used to
+    # land ``enable_pdl`` in ``is_global_scale_inversed``, fp4_quantize's seventh
+    # positional parameter, which silently inverted the global scale.
     return fp4_quantize(
         input,
         global_scale,
         sf_vec_size,
         sf_use_ue8m0,
-        is_sf_swizzled_layout,
-        is_sf_8x4_layout,
-        enable_pdl,
+        is_sf_swizzled_layout=is_sf_swizzled_layout,
+        is_sf_8x4_layout=is_sf_8x4_layout,
+        enable_pdl=enable_pdl,
+        nvfp4_4over6=nvfp4_4over6_from_code(nvfp4_4over6_code),
     )
 
 
@@ -1060,6 +1256,8 @@ def _fp4_quantize_fake(
     is_sf_swizzled_layout: bool = True,
     is_sf_8x4_layout: bool = False,
     enable_pdl: Optional[bool] = None,
+    # Output shapes do not depend on the recipe; accepted and ignored.
+    nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     is_column_major = input.stride(-2) == 1
     if is_column_major:
@@ -1096,8 +1294,16 @@ def _fp4_quantize_cute_dsl(
     is_sf_swizzled_layout: bool,
     is_sf_8x4_layout: bool,
     enable_pdl: Optional[bool],
+    nvfp4_4over6: NVFP44Over6Setting,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """CuTe-DSL dispatch for fp4_quantize. Maps parameters to the appropriate kernel."""
+    """CuTe-DSL dispatch for fp4_quantize. Maps parameters to the appropriate kernel.
+
+    ``nvfp4_4over6`` is the caller's **unresolved** three-state setting: the
+    NVFP4 kernel resolves it, and keeping ``FROM_ENV`` unresolved down to there
+    is what lets it name the source when it has to refuse (see
+    :func:`_forward_nvfp4_4over6`).  The MXFP4 kernel below takes no recipe;
+    :func:`fp4_quantize` has already rejected an explicit one for it.
+    """
     from ..cute_dsl import is_cute_dsl_available
 
     if not is_cute_dsl_available():
@@ -1120,7 +1326,11 @@ def _fp4_quantize_cute_dsl(
             sf_layout = _nvfp4_kernels.SF_LAYOUT_128x4
 
         return _nvfp4_kernels.nvfp4_quantize_cute_dsl(
-            input, global_scale, sf_layout=sf_layout, enable_pdl=enable_pdl
+            input,
+            global_scale,
+            sf_layout=sf_layout,
+            enable_pdl=enable_pdl,
+            nvfp4_4over6=nvfp4_4over6,
         )
 
     elif sf_vec_size == 32 and sf_use_ue8m0:
@@ -1340,6 +1550,8 @@ def nvfp4_quantize(
     backend: str = "cuda",
     per_token_activation: bool = False,
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ):
     r"""Quantize input tensor to NVFP4 format.
 
@@ -1378,6 +1590,13 @@ def nvfp4_quantize(
     expanded_idx_to_permuted_idx : torch.Tensor, optional
         Optional row-remapping buffer for per-token activation
         quantization.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -1393,7 +1612,31 @@ def nvfp4_quantize(
     The ``"cute-dsl"`` backend is **experimental** and not part of the
     stable API.  It may change or be removed in future versions without
     notice.
+
+    Notes
+    -----
+    Precedence of ``nvfp4_4over6``:
+
+    - ``NVFP4Recipe.FROM_ENV`` (the default, and what ``None`` means): read
+      ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``, the other three vars supply
+      the recipe.  Read on every call.  Byte-for-byte the old behaviour.
+    - ``NVFP4Recipe.STANDARD``: 4over6 off.  ``FLASHINFER_NVFP4_4OVER6=1``
+      cannot turn it back on.
+    - ``NVFP44Over6Config(...)``: on with exactly this recipe; env ignored,
+      NO per-field merge.
+
+    An explicit value wins wholesale: a config supplies all three knobs or
+    none.  There is no per-field merge with the environment, because a
+    half-environment recipe is not reproducible from a log line.
+
+    Build the global scale from the SAME recipe -- use
+    ``flashinfer.make_nvfp4_global_scale(..., nvfp4_4over6=<same value>)``.
+    With ``per_token_activation=True`` the pairing is checked whenever
+    ``nvfp4_4over6`` is explicit and ``a_global_sf`` can be read without a
+    device synchronization.
     """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    nvfp4_4over6_is_explicit = not nvfp4_4over6_is_from_env(nvfp4_4over6)
     if per_token_activation:
         if sf_vec_size != 16:
             raise ValueError(
@@ -1410,6 +1653,9 @@ def nvfp4_quantize(
                 if isinstance(a_global_sf, torch.Tensor)
                 else float(a_global_sf)
             )
+            # Free: this path already materialized the scale on the host above.
+            if nvfp4_4over6_is_explicit:
+                _check_per_token_global_scale(scale_inv, nvfp4_4over6_config)
             a_cuda = a.cuda()
             expanded_idx_to_permuted_idx_cuda = (
                 expanded_idx_to_permuted_idx.cuda()
@@ -1425,6 +1671,7 @@ def nvfp4_quantize(
                 scale_inv,
                 expanded_idx_to_permuted_idx_cuda,
                 sf_layout.value,
+                nvfp4_4over6_code(nvfp4_4over6_config),
             )
         elif backend == "cute-dsl":
             from ..cute_dsl import is_cute_dsl_available
@@ -1451,6 +1698,11 @@ def nvfp4_quantize(
                 SfLayout.layout_8x4: SF_LAYOUT_8x4,
                 SfLayout.layout_linear: SF_LAYOUT_LINEAR,
             }
+            # A device tensor is deliberately left unchecked: reading it costs a
+            # stream synchronization this path has never had (and which would be
+            # illegal under CUDA graph capture).
+            if nvfp4_4over6_is_explicit and not isinstance(a_global_sf, torch.Tensor):
+                _check_per_token_global_scale(float(a_global_sf), nvfp4_4over6_config)
             a_fp4, a_sf, per_token_scale = nvfp4_quantize_per_token_cute_dsl(
                 a.cuda(),
                 (
@@ -1460,6 +1712,7 @@ def nvfp4_quantize(
                 ),
                 sf_layout=_sf_layout_map[sf_layout],
                 enable_pdl=enable_pdl,
+                nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
             )
         else:
             raise ValueError(
@@ -1478,6 +1731,9 @@ def nvfp4_quantize(
             is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
             is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
 
+        # fp4_quantize resolves for itself; it must also still be able to tell
+        # an explicit recipe from an environment-derived one, since only the
+        # former makes fp8 input an error there.
         a_fp4, a_sf = fp4_quantize(
             a.cuda(),
             a_global_sf.cuda(),
@@ -1486,6 +1742,7 @@ def nvfp4_quantize(
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             is_sf_8x4_layout=is_sf_8x4_layout,
             enable_pdl=enable_pdl,
+            nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
         )
     elif backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -1518,7 +1775,11 @@ def nvfp4_quantize(
             sf_layout_int = _sf_layout_map[sfLayout]
 
         a_fp4, a_sf = nvfp4_quantize_cute_dsl(
-            a.cuda(), a_global_sf, sf_layout=sf_layout_int, enable_pdl=enable_pdl
+            a.cuda(),
+            a_global_sf,
+            sf_layout=sf_layout_int,
+            enable_pdl=enable_pdl,
+            nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
         )
     else:
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
@@ -1702,6 +1963,8 @@ def nvfp4_batched_quantize(
     a,
     a_global_sf,
     sf_vec_size=16,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ):
     r"""Quantize batched input tensor to NVFP4 format.
 
@@ -1713,6 +1976,13 @@ def nvfp4_batched_quantize(
         Global scale factor of shape ``[1]`` with dtype ``float32``.
     sf_vec_size : int
         Scale-factor vector size.  Defaults to ``16``.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -1724,6 +1994,16 @@ def nvfp4_batched_quantize(
         (M is padded to a multiple of 128 and ``K / sf_vec_size`` is
         rounded up to a multiple of 4).
     """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    # Same silent-drop hole as fp4_quantize: the docstring says fp16/bf16, but
+    # fp4_batched_quantize also dispatches e4m3 onto invokeFP4Quantization's
+    # recipe-less FP8 branch.  Explicit recipes only, for the reasons there.
+    if (
+        nvfp4_4over6_config is not None
+        and not nvfp4_4over6_is_from_env(nvfp4_4over6)
+        and a.dtype in _FP8_TO_FP4_INPUT_DTYPES
+    ):
+        raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, a.dtype)
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(device_arch).fp4_batched_quantize_sm100(
@@ -1731,6 +2011,7 @@ def nvfp4_batched_quantize(
         a_global_sf,
         sf_vec_size,
         False,
+        nvfp4_4over6_code(nvfp4_4over6_config),
     )
     return a_fp4, a_sf
 
@@ -1895,6 +2176,8 @@ def scaled_fp4_grouped_quantize(
     a,
     mask,
     a_global_sf,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ):
     r"""Quantize a batched input tensor to NVFP4 with a per-row mask.
 
@@ -1906,6 +2189,13 @@ def scaled_fp4_grouped_quantize(
         Mask tensor applied before quantization.
     a_global_sf : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -1920,6 +2210,7 @@ def scaled_fp4_grouped_quantize(
         of 128 and ``padded_K`` rounds ``K // sf_vec_size`` (with
         ``sf_vec_size = 16``) up to a multiple of 4.
     """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
@@ -1928,6 +2219,7 @@ def scaled_fp4_grouped_quantize(
         a,
         a_global_sf,
         mask,
+        nvfp4_4over6_code(nvfp4_4over6_config),
     )
     return a_fp4, a_sf
 

@@ -223,15 +223,15 @@ def _quantize_and_pack(
         # the kernel index the scale tensor out of bounds → illegal memory access.
         if per_token_activation:
             from flashinfer.quantization.nvfp4_quantization_utils import (
-                current_nvfp4_4over6_config,
                 make_nvfp4_global_scale,
+                resolve_nvfp4_4over6,
             )
             from flashinfer.tllm_enums import SfLayout
 
             global_scale = make_nvfp4_global_scale(
                 flat,
                 per_token_activation=True,
-                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+                nvfp4_4over6_config=resolve_nvfp4_4over6(),
             )
             hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
                 flat,

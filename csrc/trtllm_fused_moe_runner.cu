@@ -24,6 +24,7 @@
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
 namespace tensorrt_llm {
@@ -900,18 +901,25 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
                                                  : QuantizationSFLayout::SWIZZLED_8x4;
 
-    float globalScaleInv = 1.f / (448.f * 6.f);
-    if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
-        tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
-      globalScaleInv = 1.f / (256.f * 6.f);
-    }
+    // One resolution per launch. Previously this site derived the runtime
+    // globalScaleInv from its own pair of env reads while the callee independently
+    // re-read the same env vars to pick the compile-time e4m3Max, so the two could
+    // desync (e.g. if the env changed between the reads) for one knob. Now a single
+    // NVFP4RecipeSpec feeds both, and recipe.globalScaleInv() is by construction the
+    // scale matching recipe.e4m3Max.
+    //
+    // This runner still resolves FROM_ENV: threading a caller-supplied code through
+    // the trtllm_fp4_block_scale_moe FFI is deferred (issue #5141), and
+    // kNVFP44Over6FromEnv is the single literal marking that remaining deferred read.
+    auto const recipe =
+        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * totalExpertsPerToken, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),
         workspace.expanded_idx_to_permuted_idx,
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

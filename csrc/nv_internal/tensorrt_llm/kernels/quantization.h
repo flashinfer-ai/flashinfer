@@ -20,6 +20,7 @@
 
 #include "flashinfer/fp4_layout.cuh"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 
 namespace tensorrt_llm {
 using flashinfer::QuantizationSFLayout;
@@ -60,23 +61,29 @@ template <typename T>
 void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, float scale = 1.0f,
                        int32_t* expanded_idx_to_permuted_idx = nullptr, cudaStream_t stream = 0);
 
+// `recipe` is deliberately mandatory (no default) on the three entry points below:
+// a defaulted trailing parameter would let a future call site compile while silently
+// ignoring an explicitly requested NVFP4 recipe. Callers with nothing to say pass
+// resolveNVFP4Recipe(kNVFP44Over6FromEnv). See issue #5141.
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
                            int64_t* output, int32_t* SFOutput, bool useUE8M0,
-                           QuantizationSFLayout layout, int multiProcessorCount,
-                           bool enable_pdl = false, bool use_row_wise_scale = false,
-                           bool inverse_scale = false, cudaStream_t stream = 0);
+                           QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
+                           bool use_row_wise_scale, bool inverse_scale,
+                           NVFP4RecipeSpec const& recipe, cudaStream_t stream = 0);
 
 template <typename T>
 void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* input,
                                        void* input_global_scale, void* mask, bool use_silu_and_mul,
-                                       int m_topk, int k, int n_experts, cudaStream_t stream);
+                                       int m_topk, int k, int n_experts,
+                                       NVFP4RecipeSpec const& recipe, cudaStream_t stream);
 
 template <typename T>
 void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, float globalScaleInv,
                                       int32_t* expanded_idx_to_permuted_idx, uint8_t* weightOutput,
                                       uint8_t* scaleOutput, float* perTokenScaleOutput,
-                                      QuantizationSFLayout sfLayout, cudaStream_t stream = 0);
+                                      QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
+                                      cudaStream_t stream = 0);
 
 template <typename T>
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, T const* SFIn,

@@ -21,6 +21,7 @@
 
 #include "flashinfer/fp4_layout.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/utils.h"
 
@@ -36,7 +37,8 @@
 void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, TensorView valueE2M1,
                   TensorView scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0,
                   bool isSfSwizzledLayout, bool isSf8x4Layout, bool isGlobalScaleInversed,
-                  bool enable_pdl) {
+                  bool enable_pdl, int64_t nvfp44Over6Code) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp44Over6Code);
   CHECK_CUDA(self);
   CHECK_CONTIGUOUS(self);
   if (sfUseUE8M0) {
@@ -79,7 +81,8 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
       1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      enable_pdl, useRowWiseGlobalScale, isGlobalScaleInversed, get_stream(self.device()));
+      enable_pdl, useRowWiseGlobalScale, isGlobalScaleInversed, recipe,                            \
+      get_stream(self.device()));
 
   if (sfUseUE8M0) {
     if (self.dtype() == dl_float16) {
@@ -138,7 +141,8 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
 // self_block_scale_factors:
 //   [B, ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4], SF_DTYPE (UE4M3 or UE8M0)
 void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Tensor scaleFP8SF,
-                          int64_t sfVecSize, bool sfUseUE8M0) {
+                          int64_t sfVecSize, bool sfUseUE8M0, int64_t nvfp44Over6Code) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp44Over6Code);
   CHECK_CUDA(self);
   CHECK_CONTIGUOUS(self);
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
@@ -171,7 +175,7 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
       b, m, k, reinterpret_cast<T*>(self.data_ptr()), static_cast<float*>(globalScale.data_ptr()), \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      /*enable_pdl=*/false, use_row_wise_global_scale, /* inverse_scale */ false,                  \
+      /*enable_pdl=*/false, use_row_wise_global_scale, /* inverse_scale */ false, recipe,          \
       get_stream(self.device()));
 
   if (self.dtype() == dl_float16) {
@@ -200,7 +204,9 @@ void fp4_batched_quantize(Tensor self, Tensor globalScale, Tensor valueE2M1, Ten
 
 void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_scale,
                                                 Tensor const input, Tensor const input_global_scale,
-                                                Tensor const mask, bool use_silu_and_mul) {
+                                                Tensor const mask, bool use_silu_and_mul,
+                                                int64_t nvfp44Over6Code) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp44Over6Code);
   auto fp32_dtype = DLDataType{kDLFloat, 32, 1};
   auto int32_dtype = DLDataType{kDLInt, 32, 1};
   auto uint8_dtype = DLDataType{kDLUInt, 8, 1};
@@ -252,11 +258,11 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
   if (in_dtype == dl_float16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<half>(
         output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
-        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream);
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, recipe, stream);
   } else if (in_dtype == dl_bfloat16) {
     tensorrt_llm::kernels::invokeSiluAndMulNVFP4Quantization<__nv_bfloat16>(
         output.data_ptr(), output_scale.data_ptr(), input.data_ptr(), input_global_scale.data_ptr(),
-        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, stream);
+        mask.data_ptr(), use_silu_and_mul, m_topk, k, n_experts, recipe, stream);
   } else {
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "silu_and_mul_scaled_nvfp4_experts_quantize only "
                                                   "supports input tensor with dtypes fp16/bf16.";
@@ -266,7 +272,8 @@ void silu_and_mul_scaled_nvfp4_experts_quantize(Tensor output, Tensor output_sca
 void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, TensorView output,
                                      TensorView output_scale, TensorView output_per_token_scale,
                                      Optional<TensorView> expanded_idx_to_permuted_idx,
-                                     int64_t sfLayout_) {
+                                     int64_t sfLayout_, int64_t nvfp44Over6Code) {
+  auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(nvfp44Over6Code);
   CHECK_CUDA(input);
   CHECK_CONTIGUOUS(input);
   CHECK_CUDA(output);
@@ -329,14 +336,14 @@ void nvfp4_quant_and_per_token_scale(TensorView const input, double scale_inv_, 
         m, n, reinterpret_cast<half const*>(input.data_ptr()), scale_inv,
         expanded_idx_to_permuted_idx_ptr, reinterpret_cast<uint8_t*>(output.data_ptr()),
         reinterpret_cast<uint8_t*>(output_scale.data_ptr()),
-        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, stream);
+        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, recipe, stream);
   } else if (in_dtype == dl_bfloat16) {
 #ifdef ENABLE_BF16
     tensorrt_llm::kernels::invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         m, n, reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()), scale_inv,
         expanded_idx_to_permuted_idx_ptr, reinterpret_cast<uint8_t*>(output.data_ptr()),
         reinterpret_cast<uint8_t*>(output_scale.data_ptr()),
-        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, stream);
+        reinterpret_cast<float*>(output_per_token_scale.data_ptr()), sfLayout, recipe, stream);
 #else
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "nvfp4_quant_and_per_token_scale: BFloat16 support is not enabled.";

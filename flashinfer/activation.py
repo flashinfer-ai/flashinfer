@@ -35,6 +35,12 @@ from .utils import (
     get_compute_capability,
 )
 from .quantization.fp4_quantization import get_fp4_quantization_module
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Setting,
+    NVFP4Recipe,
+    nvfp4_4over6_code,
+    resolve_nvfp4_4over6,
+)
 
 
 @functools.cache
@@ -205,6 +211,8 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
     a,
     mask,
     a_global_sf,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ):
     r"""Fused SiLU + mul + per-expert NVFP4 quantization with a per-row mask.
 
@@ -221,6 +229,13 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         expert-assignment mask).
     a_global_sf : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
+        (the default; ``None`` is an alias) derives the recipe from the
+        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
+        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
+        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
+        that recipe, environment ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -236,6 +251,7 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         multiple of 4.  Here ``sf_vec_size`` is fixed at ``16`` (NVFP4),
         matching :func:`flashinfer.quantization.nvfp4_quantize`.
     """
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(
@@ -244,5 +260,6 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
         a,
         mask,
         a_global_sf,
+        nvfp4_4over6_code(nvfp4_4over6_config),
     )
     return a_fp4, a_sf

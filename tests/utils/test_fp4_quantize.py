@@ -29,6 +29,11 @@ from flashinfer import (
 )
 from flashinfer.quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
+    NVFP4Recipe,
+    current_nvfp4_4over6_config,
+    make_nvfp4_global_scale,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
 )
 from flashinfer.quantization.fp4_quantization import NVFP4_QUANT_ENV_VARS
 from flashinfer.utils import (
@@ -1040,6 +1045,400 @@ def test_nvfp4_quantize_roundtrip(
         atol=0.5,
         msg=f"{backend} {sf_layout.name} NVFP4 quantize -> dequantize roundtrip failed",
     )
+
+
+# =============================================================================
+# Explicit 4over6 recipes via the public ``nvfp4_4over6=`` parameter
+# =============================================================================
+# Everything above drives 4over6 through ``set_nvfp4_quant_env``, which is the
+# FROM_ENV path and stays the default forever.  The tests below drive it
+# through the parameter instead.  The headline acceptance criterion of issue
+# #5141 is that several recipes can be exercised in ONE process without
+# mutating ``os.environ``, so those tests must not call the fixture at all.
+
+# Kept small on purpose: each distinct recipe is a separate CuTe-DSL kernel
+# compilation, and the TE-reference test above already sweeps all eight.
+EXPLICIT_4OVER6_SETTINGS = [
+    NVFP4Recipe.STANDARD,
+    NVFP44Over6Config(),
+    NVFP44Over6Config(err_mode="MSE", e4m3_max=256),
+]
+
+# One small, forgiving shape: these tests are about which recipe reached the
+# kernel, not about shape coverage.
+FOUR_OVER_SIX_SHAPE = (256, 128)
+
+
+def _assert_env_does_not_enable_4over6() -> None:
+    """Fail loudly if ambient environment could be supplying the recipe.
+
+    Note the autouse ``set_nvfp4_quant_env`` fixture leaves
+    ``FLASHINFER_NVFP4_4OVER6`` *present* with the value ``"0"`` rather than
+    deleted, so this asserts the stronger and more meaningful property — the
+    environment resolves to "4over6 off" — instead of literal absence.
+    """
+    assert current_nvfp4_4over6_config() is None, (
+        "the environment enables 4over6; this test proves the nvfp4_4over6= "
+        "parameter works on its own and would pass for the wrong reason: "
+        + repr({name: os.environ.get(name) for name in NVFP4_QUANT_ENV_VARS})
+    )
+
+
+def _quantize_with_setting(x, setting, sf_layout, backend, per_token_activation):
+    """Quantize ``x`` with one 4over6 setting, deriving the scale from it.
+
+    The global scale and the kernel MUST come from the same recipe: the E4M3
+    clamp appears in both, and a mismatch silently rescales the tensor.
+    """
+    global_scale = make_nvfp4_global_scale(
+        x, per_token_activation, nvfp4_4over6=setting
+    )
+    return nvfp4_quantize(
+        x,
+        global_scale,
+        sfLayout=sf_layout,
+        backend=backend,
+        per_token_activation=per_token_activation,
+        nvfp4_4over6=setting,
+    )
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_recipes_coexist_in_one_process(
+    backend: str,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """Three recipes, one process, zero ``os.environ`` mutation.
+
+    Two independent claims:
+
+    * The three recipes really are three different quantizations — if the
+      parameter were dropped on the floor they would all be identical.
+    * Re-running the FIRST recipe after the other two reproduces it
+      bit-for-bit.  That is the regression guard for the caching layers: a
+      ``@functools.cache``'d kernel getter keyed on too little, or a CuTe-DSL
+      on-disk artifact whose name omits the recipe, would serve recipe #3's
+      binary for recipe #1 on the second call.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    _assert_env_does_not_enable_4over6()
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+    m, n = FOUR_OVER_SIX_SHAPE
+    x = torch.randn((m, n), dtype=dtype)
+    sf_layout = SfLayout.layout_128x4
+
+    first = EXPLICIT_4OVER6_SETTINGS[0]
+    baseline = _quantize_with_setting(x, first, sf_layout, backend, False)
+
+    outputs = {repr(first): baseline}
+    for setting in EXPLICIT_4OVER6_SETTINGS[1:]:
+        outputs[repr(setting)] = _quantize_with_setting(
+            x, setting, sf_layout, backend, False
+        )
+
+    keys = list(outputs)
+    for i, a_key in enumerate(keys):
+        for b_key in keys[i + 1 :]:
+            q_a, sf_a = outputs[a_key]
+            q_b, sf_b = outputs[b_key]
+            assert not (torch.equal(q_a, q_b) and torch.equal(sf_a, sf_b)), (
+                f"{a_key} and {b_key} produced identical output on {backend}"
+            )
+
+    # Re-run the first recipe last: proves recipes 2 and 3 did not poison its
+    # in-memory cache entry or its on-disk CuTe-DSL artifact.
+    replay_q, replay_sf = _quantize_with_setting(x, first, sf_layout, backend, False)
+    torch.testing.assert_close(replay_q, baseline[0], rtol=0, atol=0)
+    torch.testing.assert_close(replay_sf, baseline[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("setting", EXPLICIT_4OVER6_SETTINGS, ids=repr)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_explicit_recipe_matches_te_reference(
+    backend: str,
+    dtype: torch.dtype,
+    setting,
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    """An explicitly pinned recipe must be *correct*, not merely different.
+
+    Uses the fixture for one thing only — ``disable_quant_fast_math=True``,
+    which the existing TE-reference test also needs for bitwise agreement.
+    That call leaves ``FLASHINFER_NVFP4_4OVER6`` at ``"0"``, i.e. 4over6 off,
+    so any 4over6 behaviour observed here came from the parameter.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+    m, n = FOUR_OVER_SIX_SHAPE
+    x = torch.randn((m, n), dtype=dtype)
+    sf_layout = SfLayout.layout_128x4
+
+    resolved = resolve_nvfp4_4over6(setting)
+    set_nvfp4_quant_env(disable_quant_fast_math=True)
+    assert current_nvfp4_4over6_config() is None
+
+    global_amax = torch.abs(x).max().to(torch.float32)
+    global_scale = nvfp4_global_encode_scale_te(global_amax, resolved)
+    q_out, scale_out = nvfp4_quantize(
+        x,
+        global_scale,
+        sfLayout=sf_layout,
+        backend=backend,
+        nvfp4_4over6=setting,
+    )
+
+    if resolved is None:
+        q_ref, scale_ref = ref_fp4_quant_te(x, global_amax)
+    else:
+        q_ref, scale_ref, _, _ = ref_fp4_quant_4over6_te(
+            x,
+            global_amax,
+            nvfp4_4over6_config=resolved,
+        )
+    torch.testing.assert_close(q_out, _te_ref_fp4_bytes(q_ref), rtol=0, atol=0)
+    torch.testing.assert_close(
+        scale_out,
+        _te_ref_scale_bytes_for_layout(scale_ref, sf_layout),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("per_token_activation", [False, True])
+@pytest.mark.parametrize(
+    "nvfp4_4over6_config",
+    [c for c in NVFP4_TE_REFERENCE_CONFIGS if c is not None],
+    ids=lambda config: config.id,
+)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_config_equals_env(
+    backend: str,
+    per_token_activation: bool,
+    nvfp4_4over6_config: NVFP44Over6TestConfig,
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    """The single most important test in the PR.
+
+    ``nvfp4_4over6=NVFP44Over6Config(...)`` with the environment off must be
+    bit-identical to leaving the parameter alone with the equivalent
+    ``FLASHINFER_NVFP4_4OVER6*`` variables set.  Anything less means the new
+    public API is a *different* kernel from the one users have been running,
+    and every existing accuracy result would have to be re-established.
+
+    Swept over all eight recipes and both per-token modes on both backends:
+    those are the axes that select a different recipe path.  Input dtype is
+    fixed instead of parametrized because it selects a different kernel
+    *specialization* of the same path — every extra dtype is a full CuTe-DSL
+    compile per recipe, and ``test_nvfp4_quantize_te_reference`` above already
+    sweeps dtype against the reference.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+    m, n = FOUR_OVER_SIX_SHAPE
+    x = torch.randn((m, n), dtype=torch.bfloat16)
+    sf_layout = SfLayout.layout_128x4
+
+    # The pytest-id subclass must resolve to the plain dataclass; pass the
+    # canonical value so the two legs cannot differ for that reason.
+    setting = resolve_nvfp4_4over6(nvfp4_4over6_config)
+
+    # Leg 1: recipe pinned on the call, environment explicitly 4over6-off.
+    set_nvfp4_quant_env()
+    assert current_nvfp4_4over6_config() is None
+    scale_cfg = make_nvfp4_global_scale(x, per_token_activation, nvfp4_4over6=setting)
+    out_cfg = nvfp4_quantize(
+        x,
+        scale_cfg,
+        sfLayout=sf_layout,
+        backend=backend,
+        per_token_activation=per_token_activation,
+        nvfp4_4over6=setting,
+    )
+
+    # Leg 2: recipe supplied by the environment, parameter left at FROM_ENV.
+    set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
+    assert current_nvfp4_4over6_config() == setting
+    scale_env = make_nvfp4_global_scale(
+        x, per_token_activation, nvfp4_4over6=NVFP4Recipe.FROM_ENV
+    )
+    torch.testing.assert_close(scale_env, scale_cfg, rtol=0, atol=0)
+    out_env = nvfp4_quantize(
+        x,
+        scale_env,
+        sfLayout=sf_layout,
+        backend=backend,
+        per_token_activation=per_token_activation,
+    )
+
+    assert len(out_cfg) == len(out_env)
+    names = ("quantized", "scale_factors", "per_token_scale")[: len(out_cfg)]
+    for name, cfg_tensor, env_tensor in zip(names, out_cfg, out_env, strict=True):
+        torch.testing.assert_close(
+            cfg_tensor,
+            env_tensor,
+            rtol=0,
+            atol=0,
+            msg=f"{backend} {name} differs between nvfp4_4over6= and the env",
+        )
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_setting_overrides_env(
+    backend: str,
+    dtype: torch.dtype,
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    """Documented precedence, in both directions.
+
+    ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn ``NVFP4Recipe.STANDARD`` back
+    on, and an unset environment cannot turn an explicit recipe off.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+    m, n = FOUR_OVER_SIX_SHAPE
+    x = torch.randn((m, n), dtype=dtype)
+    sf_layout = SfLayout.layout_128x4
+    recipe = NVFP4_DEFAULT_4OVER6_CONFIGS[1]
+    canonical = resolve_nvfp4_4over6(recipe)
+
+    # Reference points, taken with the environment agreeing with the parameter.
+    set_nvfp4_quant_env()
+    standard_ref = _quantize_with_setting(
+        x, NVFP4Recipe.STANDARD, sf_layout, backend, False
+    )
+    set_nvfp4_quant_env(nvfp4_4over6_config=recipe)
+    enabled_ref = _quantize_with_setting(x, canonical, sf_layout, backend, False)
+    assert not torch.equal(standard_ref[0], enabled_ref[0]), (
+        "the two reference points are identical, so this test could not "
+        "distinguish the two precedence directions"
+    )
+
+    # env ON + STANDARD -> standard output.
+    set_nvfp4_quant_env(nvfp4_4over6_config=recipe)
+    out = _quantize_with_setting(x, NVFP4Recipe.STANDARD, sf_layout, backend, False)
+    torch.testing.assert_close(out[0], standard_ref[0], rtol=0, atol=0)
+    torch.testing.assert_close(out[1], standard_ref[1], rtol=0, atol=0)
+
+    # env OFF + explicit recipe -> 4over6 output.
+    set_nvfp4_quant_env()
+    out = _quantize_with_setting(x, canonical, sf_layout, backend, False)
+    torch.testing.assert_close(out[0], enabled_ref[0], rtol=0, atol=0)
+    torch.testing.assert_close(out[1], enabled_ref[1], rtol=0, atol=0)
+
+    # FROM_ENV still follows the environment, unchanged.
+    set_nvfp4_quant_env(nvfp4_4over6_config=recipe)
+    out = _quantize_with_setting(x, NVFP4Recipe.FROM_ENV, sf_layout, backend, False)
+    torch.testing.assert_close(out[0], enabled_ref[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("backend", NVFP4_BACKENDS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_per_token_scale_recipe_mismatch_raises(
+    backend: str,
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    """A 448-derived per-token scale with a 256 recipe must not run.
+
+    Per-token mode pins the global scale to ``1 / (e4m3_max * 6)``, so the
+    clamp lives in both the scale and the kernel's candidate search.  Mixing
+    them rescales the whole tensor by 448/256 with no error anywhere - the
+    original bug.  The error names both scales so the fix is mechanical.
+
+    The identical mismatch under FROM_ENV must still run: that combination has
+    always been reachable (a caller hardcoding ``1/(448*6)`` while
+    ``FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=1``), and turning it into an
+    exception would be a breaking change in a backwards-compatible PR.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if backend == "cute-dsl" and not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+    m, n = FOUR_OVER_SIX_SHAPE
+    x = torch.randn((m, n), dtype=torch.bfloat16)
+
+    recipe_256 = NVFP44Over6Config(e4m3_max=256)
+    # Deliberately built from the *other* recipe. A host float keeps the check
+    # reachable on the CuTe-DSL path too, which never reads a device tensor.
+    scale_448 = float(
+        make_nvfp4_global_scale(x, True, nvfp4_4over6=NVFP44Over6Config()).item()
+    )
+    scale_256 = 1.0 / (nvfp4_e4m3_max(recipe_256) * FLOAT4_E2M1_MAX)
+
+    with pytest.raises(ValueError) as excinfo:
+        nvfp4_quantize(
+            x,
+            scale_448,
+            sfLayout=SfLayout.layout_linear,
+            backend=backend,
+            per_token_activation=True,
+            nvfp4_4over6=recipe_256,
+        )
+    message = str(excinfo.value)
+    assert repr(scale_448) in message, message
+    assert repr(scale_256) in message, message
+
+    # Legacy behaviour: the same mismatch under FROM_ENV is not an error.
+    set_nvfp4_quant_env(nvfp4_4over6_config=recipe_256)
+    q_out, _, per_token_scale = nvfp4_quantize(
+        x,
+        scale_448,
+        sfLayout=SfLayout.layout_linear,
+        backend=backend,
+        per_token_activation=True,
+    )
+    assert q_out.shape == (m, n // 2)
+    assert per_token_scale.numel() == m
+
+    # And the correctly paired scale is accepted under the explicit recipe.
+    q_ok, _, _ = nvfp4_quantize(
+        x,
+        scale_256,
+        sfLayout=SfLayout.layout_linear,
+        backend=backend,
+        per_token_activation=True,
+        nvfp4_4over6=recipe_256,
+    )
+    assert q_ok.shape == (m, n // 2)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

@@ -37,6 +37,12 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
+from ..quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Setting,
+    NVFP4Recipe,
+    make_nvfp4_global_scale,
+    resolve_nvfp4_4over6,
+)
 from ..trace.templates.moe import (
     sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch,
     sm90_mixed_gemm_scale_interleave_trace,
@@ -1366,6 +1372,7 @@ def prepare_cute_dsl_nvfp4_weights(
     hidden_size: int,
     intermediate_size: int,
     device: Optional[torch.device] = None,
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.STANDARD,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL NVFP4 ``cute_dsl_nvfp4`` weight view.
 
@@ -1374,6 +1381,26 @@ def prepare_cute_dsl_nvfp4_weights(
     Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.
+
+    Parameters
+    ----------
+    w1_bf16, w2_bf16 : torch.Tensor
+        Canonical BF16 expert weights.
+    num_local_experts, hidden_size, intermediate_size : int
+        Expert geometry.
+    device : torch.device, optional
+        Target device; defaults to ``w1_bf16.device``.
+    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+        The 4over6 recipe the *runtime activation* quantizer will be given.
+        It selects ``fc2_input_scale`` only -- the weights themselves are
+        quantized standard-NVFP4 either way, matching the separation
+        ``QuantConfig.nvfp4_4over6`` documents.  The GEMM2-input candidate
+        search bakes ``1 / (6 * e4m3_max)`` into its dequantization, so a
+        pinned recipe requires exactly that scale and
+        ``_moe_core_impl`` raises on anything else.  The default
+        ``NVFP4Recipe.STANDARD`` keeps the historical ``fc2_input_scale =
+        1.0``, which standard NVFP4 tolerates because it divides by the same
+        value it multiplied by.
 
     Returns
     -------
@@ -1427,11 +1454,25 @@ def prepare_cute_dsl_nvfp4_weights(
     )
 
     ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max), the
+    # only value its candidate search dequantizes correctly.  The weight
+    # tensor is passed for its device alone: with per_token_activation=True
+    # the scale is a pure function of the recipe.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    fc2_input_scale = (
+        torch.tensor([1.0], device=device, dtype=torch.float32)
+        if nvfp4_4over6_config is None
+        else make_nvfp4_global_scale(
+            w2_bf16,
+            per_token_activation=True,
+            nvfp4_4over6_config=nvfp4_4over6_config,
+        )
+    )
     return {
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
         "w1_alpha": ones,
-        "fc2_input_scale": torch.tensor([1.0], device=device, dtype=torch.float32),
+        "fc2_input_scale": fc2_input_scale,
         "w2_weight": w2_weight,
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,

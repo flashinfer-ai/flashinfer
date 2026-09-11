@@ -49,6 +49,7 @@ from flashinfer.quantization.kernels.nvfp4_quantize import (  # noqa: E402
 )
 from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: E402
     NVFP44Over6Config,
+    nvfp4_4over6_cache_key,
 )
 
 NVFP4_KERNEL_GETTERS = [
@@ -148,6 +149,94 @@ def test_nvfp4_kernel_name_distinguishes_4over6_configs(config):
         for c in others
     }
     assert len(names) == len(others)
+
+
+# Kernel names as they were produced *before* the public ``nvfp4_4over6``
+# parameter existed. The name is the artifact's directory/symbol component in
+# ``cached_ops/nvfp4_quantize_<arch>_cute_dsl/``, so changing any of these
+# strings silently invalidates every existing user's on-disk CuTe-DSL cache and
+# forces a full recompile on upgrade. The tests above only assert
+# *distinctness*, which a wholesale renaming would satisfy.
+NVFP4_LEGACY_KERNEL_NAMES = [
+    ({}, "swizzled_bfloat16_k4096_sf0_pdl1"),
+    ({"enable_pdl": False}, "swizzled_bfloat16_k4096_sf0_pdl0"),
+    ({"variant": "linear"}, "linear_bfloat16_k4096_sf0_pdl1"),
+    ({"dtype_key": "float16"}, "swizzled_float16_k4096_sf0_pdl1"),
+    ({"K": 2048}, "swizzled_bfloat16_k2048_sf0_pdl1"),
+    ({"sf_layout": SF_LAYOUT_8x4}, "swizzled_bfloat16_k4096_sf1_pdl1"),
+    ({"global_scale_is_tensor": False}, "swizzled_bfloat16_k4096_sf0_pdl1_host_sf"),
+    ({"silu_and_mul": True}, "swizzled_bfloat16_k4096_sf0_pdl1_silu"),
+    (
+        {"disable_fp4_quant_fast_math": True},
+        "swizzled_bfloat16_k4096_sf0_pdl1_nofastmath",
+    ),
+    # Suffix order is part of the string: host_sf, silu, nofastmath, 4over6.
+    (
+        {
+            "global_scale_is_tensor": False,
+            "silu_and_mul": True,
+            "disable_fp4_quant_fast_math": True,
+        },
+        "swizzled_bfloat16_k4096_sf0_pdl1_host_sf_silu_nofastmath",
+    ),
+    (
+        {"nvfp4_4over6_config": NVFP44Over6Config()},
+        "swizzled_bfloat16_k4096_sf0_pdl1_4over6_448_MAE_0",
+    ),
+    (
+        {
+            "nvfp4_4over6_config": NVFP44Over6Config(
+                e4m3_max=256, err_mode="MSE", err_use_fast_math=True
+            )
+        },
+        "swizzled_bfloat16_k4096_sf0_pdl1_4over6_256_MSE_1",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    NVFP4_LEGACY_KERNEL_NAMES,
+    ids=[name for _, name in NVFP4_LEGACY_KERNEL_NAMES],
+)
+def test_nvfp4_kernel_name_is_unchanged_from_pre_4over6_api(overrides, expected):
+    """Pin the exact legacy strings, not just their distinctness.
+
+    ``nvfp4_4over6_config=None`` in particular must produce byte-for-byte the
+    name it always has: that is the cache entry every existing user already
+    has on disk for plain NVFP4.
+    """
+    assert _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, **overrides}) == expected
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        NVFP44Over6Config(),
+        NVFP44Over6Config(e4m3_max=256),
+        NVFP44Over6Config(err_mode="MSE"),
+        NVFP44Over6Config(err_use_fast_math=True),
+        NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+    ],
+    ids=repr,
+)
+def test_nvfp4_kernel_name_suffix_is_the_shared_cache_key(config):
+    """The kernel-name suffix and ``nvfp4_4over6_cache_key`` must not drift.
+
+    Two formatters for one recipe is how a rename slips through: the MoE
+    autotuner's cache-key extras use ``nvfp4_4over6_cache_key``, so if the
+    kernel name stopped agreeing with it, the tactic cache and the kernel
+    artifact would disagree about which recipe they hold.
+    """
+    base = _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, "nvfp4_4over6_config": None})
+    name = _nvfp4_kernel_name(**{**NVFP4_NAME_BASELINE, "nvfp4_4over6_config": config})
+    if config is None:
+        # "off" is spelled as the *absence* of a suffix in the kernel name.
+        assert name == base
+        assert nvfp4_4over6_cache_key(config) == "off"
+    else:
+        assert name == f"{base}_{nvfp4_4over6_cache_key(config)}"
 
 
 def test_nvfp4_kernel_name_is_symbol_safe():

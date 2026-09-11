@@ -56,7 +56,7 @@ import weakref
 
 import torch
 
-from ...api_logging import flashinfer_api
+from ...api_logging import _is_current_stream_capturing, flashinfer_api
 from ...trace.templates.moe import (
     cute_dsl_fused_moe_nvfp4_trace,
     cute_dsl_moe_wrapper_run_trace,
@@ -73,6 +73,15 @@ from ...cute_dsl.utils import require_cute_dsl_arch as _require_cute_dsl_arch_fo
 from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
     nvfp4_quantize_per_token_cute_dsl,
+)
+from ...quantization.nvfp4_quantization_utils import (
+    FLOAT4_E2M1_MAX,
+    NVFP44Over6Config,
+    NVFP44Over6Setting,
+    NVFP4Recipe,
+    nvfp4_4over6_is_from_env,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
 )
 from ...utils import supported_compute_capability
 from .moe_utils import (
@@ -111,6 +120,61 @@ def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
         "CuTe-DSL MoE per-token FC2 input quantization supports only "
         f"torch.float16 and torch.bfloat16 intermediate dtypes, got {output_dtype}."
     )
+
+
+# Same tolerance as ``_check_per_token_global_scale`` in
+# flashinfer/quantization/fp4_quantization.py, kept as its own constant rather
+# than imported so neither guard depends on the other module's privates.
+_GEMM2_INPUT_SCALE_RTOL = 1e-3
+
+
+def _check_gemm2_input_scale(
+    fc2_input_scale: torch.Tensor | float,
+    nvfp4_4over6_config: Optional[NVFP44Over6Config],
+) -> None:
+    """Verify ``fc2_input_scale`` was built from the pinned 4over6 recipe.
+
+    The 4over6 candidate search dequantizes its sf4 / sf6 candidates as
+    ``value * sf * row_amax / (6 * e4m3_max)``, i.e. it substitutes that
+    constant for ``1 / global_scale`` instead of reading the scale the caller
+    passed.  Standard NVFP4 divides by whatever it multiplied by and so
+    tolerates an arbitrary global scale, but here the substitution is only an
+    identity when ``fc2_input_scale == 1 / (6 * e4m3_max)``; with any other
+    value the two candidates are ranked against dequantized magnitudes that
+    are off by ``6 * e4m3_max * fc2_input_scale`` and the selection stops
+    tracking the requested error metric.  Raising beats overriding the scale:
+    it is caller-supplied data from their weight pack, and quietly replacing
+    it would surprise anyone who set it deliberately.
+
+    Takes a **resolved** recipe; ``None`` (standard NVFP4) returns
+    immediately, so the non-4over6 path is untouched.
+    """
+    if nvfp4_4over6_config is None:
+        return
+    if isinstance(fc2_input_scale, torch.Tensor):
+        if fc2_input_scale.is_cuda and _is_current_stream_capturing():
+            # Reading a device tensor mid-capture is illegal, and the warmup
+            # iterations CUDA graphs require have already run this check on
+            # the same scale.
+            return
+        value = float(fc2_input_scale.reshape(-1)[0])
+    else:
+        value = float(fc2_input_scale)
+    expected = 1.0 / (nvfp4_e4m3_max(nvfp4_4over6_config) * FLOAT4_E2M1_MAX)
+    if abs(value - expected) > _GEMM2_INPUT_SCALE_RTOL * expected:
+        raise ValueError(
+            f"fc2_input_scale={value!r} does not match the requested NVFP4 "
+            f"4over6 recipe {nvfp4_4over6_config!r}, which implies "
+            f"fc2_input_scale={expected!r}.  The 4over6 candidate search "
+            "bakes 1 / (6 * e4m3_max) into its dequantization, so any other "
+            "GEMM2-input scale ranks the sf4 / sf6 candidates on the wrong "
+            "magnitudes.  Build the pack with "
+            "prepare_cute_dsl_nvfp4_weights(..., nvfp4_4over6=<the same "
+            "value>) -- also reachable as CuteDslConfig.prepare_weights -- "
+            "or the scale with "
+            "flashinfer.make_nvfp4_global_scale(x, per_token_activation=True, "
+            "nvfp4_4over6=<the same value>)."
+        )
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -179,6 +243,7 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -233,6 +298,19 @@ def _moe_core_impl(
         swiglu_limit: SwiGLU clamp limit.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
+            NVFP4Recipe.FROM_ENV (the default) reads FLASHINFER_NVFP4_4OVER6
+            and friends on every call, NVFP4Recipe.STANDARD turns 4over6 off
+            regardless of the environment, and an NVFP44Over6Config pins that
+            exact recipe with no per-field merge. Only consulted when
+            per_token_scale is given: without it the GEMM2 input comes out of
+            GEMM1's NVFP4 epilogue, which has no 4over6 variant. Pinning a
+            recipe also pins fc2_input_scale to 1 / (6 * e4m3_max) -- what
+            prepare_cute_dsl_nvfp4_weights(..., nvfp4_4over6=...) and
+            make_nvfp4_global_scale(..., per_token_activation=True) emit for
+            that recipe -- because the candidate search bakes that constant
+            into its dequantization; any other scale raises ValueError rather
+            than ranking the scale candidates on the wrong magnitudes.
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -251,6 +329,18 @@ def _moe_core_impl(
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
+
+    # A pinned recipe is either honored or refused, never silently bought for
+    # nothing: the GEMM2-input quantizer only measures what it claims to when
+    # fc2_input_scale came from the same recipe.  Resolved here instead of
+    # forwarded, because below the resolve boundary ``None`` means "4over6
+    # off" while the quantizer's ``nvfp4_4over6=`` parameter reads it as "from
+    # the environment".  FROM_ENV (the default) is left unresolved and
+    # unchecked on purpose: it must stay byte-for-byte the pre-existing
+    # behaviour, and the default path then reads neither the environment here
+    # nor the scale off the device at all.
+    if use_per_token_activation and not nvfp4_4over6_is_from_env(nvfp4_4over6):
+        _check_gemm2_input_scale(fc2_input_scale, resolve_nvfp4_4over6(nvfp4_4over6))
 
     if moe_output is None:
         moe_output = torch.empty(
@@ -346,6 +436,7 @@ def _moe_core_impl(
                 fc2_input_scale,
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
+                nvfp4_4over6=nvfp4_4over6,
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(
@@ -924,6 +1015,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -960,6 +1052,7 @@ def _cute_dsl_fused_moe_nvfp4_impl(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        nvfp4_4over6=nvfp4_4over6,
     )
 
 

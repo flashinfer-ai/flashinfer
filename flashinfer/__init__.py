@@ -80,6 +80,13 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_dequantize_paged,
     nvfp4_kv_quantize,
 )
+from .quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    NVFP4Recipe,
+    make_nvfp4_global_scale,
+    resolve_nvfp4_4over6,
+)
 from .quantization.fp8_quantization import (
     mxfp8_dequantize_host,
     mxfp8_grouped_quantize,

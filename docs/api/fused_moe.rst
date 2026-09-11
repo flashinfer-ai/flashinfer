@@ -28,6 +28,23 @@ both the TRT-LLM and CuteDSL MoE paths.
 
 .. currentmodule:: flashinfer.fused_moe
 
+Unified API Configs
+-------------------
+
+The unified MoE API is configured with a tree of frozen dataclasses; the
+rationale is recorded in ``docs/design_docs/flashinfer_moe_api.md``, which is
+not part of this Sphinx tree.
+:class:`QuantConfig` is its quantization leaf: one ``QuantVariant`` knob for
+dtype + granularity + scale convention, plus the scale-layout switches and the
+NVFP4 4over6 recipe. Passing an explicit recipe here is the supported
+alternative to the process-wide ``FLASHINFER_NVFP4_4OVER6*`` environment
+variables — the recipe itself, and the three-state precedence rule it obeys,
+are described under :ref:`apiquantization`.
+
+.. autoclass:: QuantConfig
+    :members:
+    :show-inheritance:
+
 Utility Functions
 -----------------
 
