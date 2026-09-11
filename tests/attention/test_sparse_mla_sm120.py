@@ -2372,10 +2372,18 @@ _DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 
 # (num_heads, topk, extra_topk, extra_pbs). topk=512: DeepSeek V4 Vision
 # primary candidate set (H=32/64 shards, both extra-cache page layouts).
+# (512, 128) / (512, 256): DeepSeek-V4.1's hierarchical candidate pool, which
+# pages its extra KV cache at 128 and 256 tokens.
 _DSV4_PREFILL_DUAL_CONFIGS = [
     (num_heads, 128, extra_topk, extra_pbs)
     for num_heads in _DSV4_PREFILL_DUAL_HEADS
-    for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
+    for extra_topk, extra_pbs in [
+        (128, 64),
+        (512, 64),
+        (512, 2),
+        (512, 128),
+        (512, 256),
+    ]
 ] + [
     (32, 512, 512, 64),
     (32, 512, 128, 2),
