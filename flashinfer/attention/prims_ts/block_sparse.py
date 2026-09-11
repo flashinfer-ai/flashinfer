@@ -371,9 +371,10 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         Bit ``r`` of word ``w`` selects block ``32 * w + r``; final-word
         padding bits are ignored. A proxy plan additionally consumes compact
         ``k_summary`` and ``v_summary`` with shape
-        ``[B, num_kv_blocks, Hkv, D]``. K summaries are block means and V
-        summaries are block sums; the final partial block covers only its
-        structural tokens.
+        ``[B, num_kv_blocks, Hkv, D]``. Both are block means over the block's
+        structural tokens (the final partial block averages only the tokens it
+        covers); a proxy block stands for that many identical tokens, so its
+        probability carries the block's token mass.
 
         Every row must fit the planned semantic-block capacity. Reusable runs
         trust routing values. CuTe DSL assertions can diagnose violations when
@@ -407,7 +408,7 @@ class BatchDecodeTSWrapper(_BlockSparseWrapperBase):
         k_summary : torch.Tensor, optional
             Per-block mean K tensor required by proxy plans.
         v_summary : torch.Tensor, optional
-            Per-block summed V tensor required by proxy plans.
+            Per-block mean V tensor required by proxy plans.
         kv_valid_bits : torch.Tensor, optional
             Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
             Supply it exactly when the plan enabled token validity bits.
@@ -449,8 +450,10 @@ class BlockSparseTSWrapper(BatchDecodeTSWrapper):
     query block, so every Q head in one grouped KV head consumes the same
     sparse row. A plan fixes geometry and a per-row capacity; every run
     supplies either BSR or a packed exact-block bitmask. Proxy-enabled plans
-    additionally consume caller-owned K/V summaries, while an optional token
-    mask applies only to exact routes.
+    additionally consume caller-owned K/V summaries (``k_summary`` and
+    ``v_summary`` are the per-block means of K and V over the block's
+    structural tokens), while an optional token mask applies only to exact
+    routes.
     """
 
     # The retained signature is deliberately narrower than the general wrapper:
@@ -574,7 +577,10 @@ def block_sparse_attention(
     synchronously inspected to validate canonical rows and derive their maximum
     width. Bitmask inputs use the structural KV-block count as a conservative
     capacity bound. It therefore cannot be invoked inside CUDA Graph capture;
-    plan a wrapper outside capture and capture only ``run()`` instead.
+    plan a wrapper outside capture and capture only ``run()`` instead. With
+    proxy routes, ``k_summary`` and ``v_summary`` are the per-block means of K
+    and V over the block's structural tokens; a proxy block stands for that
+    many identical tokens.
 
     Parameters
     ----------
@@ -602,7 +608,7 @@ def block_sparse_attention(
     k_summary : torch.Tensor, optional
         Per-block mean K tensor required when proxy routes are enabled.
     v_summary : torch.Tensor, optional
-        Per-block summed V tensor required when proxy routes are enabled.
+        Per-block mean V tensor required when proxy routes are enabled.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
     sparse_format : {"bsr", "bitmask"}, optional

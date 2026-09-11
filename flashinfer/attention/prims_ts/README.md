@@ -91,10 +91,12 @@ contiguous block-sparse profiles and preserve the profile's Q tile, KV route,
 and KeepsAB/SWAPAB geometry. Proxy routes currently require
 `mask_type="dense"`; paged K/V proxy execution remains unsupported. Route rows
 are owned by `(batch, KV head, Q block)`, so all Q heads in one GQA/MQA group
-share sparsity. A proxy run supplies one K arithmetic mean and one V sum per
-semantic KV block. The final partial block uses only its structural tokens.
-Optional `kv_valid_bits` filters exact K/V tokens only and does not change
-proxy summaries or their represented mass.
+share sparsity. A proxy run supplies one K arithmetic mean and one V arithmetic
+mean per semantic KV block; each proxy block then counts as its number of
+structural tokens in the softmax. V summaries must be per-block means: a
+per-block sum is not detectable and yields outputs scaled by the block mass.
+The final partial block averages only its structural tokens. Optional `kv_valid_bits` filters exact K/V tokens only and
+does not change proxy summaries or their represented mass.
 
 ## Validation
 

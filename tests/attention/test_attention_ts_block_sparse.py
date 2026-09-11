@@ -52,6 +52,7 @@ from tests.attention.prims_ts_test_utils import (
     HEAD_DIM as _HEAD_DIM,
     Patterns as _Patterns,
     REQUIRES_PRIMTS_GPU as _REQUIRES_PRIMTS_GPU,
+    block_mean,
     make_bsr,
     make_exact_block_bits,
     make_sage_params,
@@ -519,6 +520,24 @@ _GQA_CASES = (
 
 
 _PROXY_ROUTE_CASES = (
+    # The Tile-Q=8 SWAP profile keeps its own P path; its proxy branch is
+    # covered here with the same ragged tail.
+    _Case(
+        "proxy_bk8_swaps_q8",
+        1,
+        1,
+        16,
+        269,
+        8,
+        8,
+        torch.bfloat16,
+        "dense",
+        "holey",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=8,
+        expected_kv_tile=128,
+    ),
     _Case(
         "proxy_bk8_swaps",
         1,
@@ -694,20 +713,6 @@ def _make_patterns(case: _Case) -> _Patterns:
     return tuple(batches)
 
 
-def _summarize_kv(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    kv_block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    k_blocks: list[torch.Tensor] = []
-    v_blocks: list[torch.Tensor] = []
-    for begin in range(0, k.shape[1], kv_block_size):
-        end = min(begin + kv_block_size, k.shape[1])
-        k_blocks.append(k[:, begin:end].float().mean(dim=1).to(k.dtype))
-        v_blocks.append(v[:, begin:end].float().sum(dim=1).to(v.dtype))
-    return torch.stack(k_blocks, dim=1), torch.stack(v_blocks, dim=1)
-
-
 def _make_token_mask(
     case: _Case,
 ) -> tuple[torch.Tensor | None, tuple[frozenset[int], ...]]:
@@ -805,7 +810,12 @@ def _single_row_proxy_reference(
     v_summary: torch.Tensor,
     sm_scale: float,
 ) -> torch.Tensor:
-    """Evaluate one MHA row with exact tokens and proxy block summaries."""
+    """Evaluate one MHA row with exact tokens and proxy block summaries.
+
+    A proxy block of ``mass`` structural tokens stands for ``mass`` identical
+    tokens with its mean K and mean V, so its probability is weighted by the
+    mass in both the numerator and the denominator.
+    """
 
     assert case.batch_size == case.num_heads == case.effective_num_kv_heads == 1
     assert q.shape[1] <= case.q_block_size
@@ -831,9 +841,6 @@ def _single_row_proxy_reference(
     weights = torch.exp(logits - logits.amax(dim=1, keepdim=True))
     exact_count = exact_logits.shape[1]
     exact_weights = weights[:, :exact_count]
-    proxy_weights = weights[:, exact_count:]
-    numerator = exact_weights @ v[0, exact_tokens, 0].float()
-    numerator = numerator + proxy_weights @ v_summary[0, proxy_blocks, 0].float()
     proxy_masses = torch.tensor(
         [
             min(
@@ -845,11 +852,11 @@ def _single_row_proxy_reference(
         device=q.device,
         dtype=torch.float32,
     )
+    proxy_weights = weights[:, exact_count:] * proxy_masses[None, :]
+    numerator = exact_weights @ v[0, exact_tokens, 0].float()
+    numerator = numerator + proxy_weights @ v_summary[0, proxy_blocks, 0].float()
     denominator = exact_weights.sum(dim=1, keepdim=True)
-    denominator = denominator + (proxy_weights * proxy_masses[None, :]).sum(
-        dim=1,
-        keepdim=True,
-    )
+    denominator = denominator + proxy_weights.sum(dim=1, keepdim=True)
     return (numerator / denominator).to(case.dtype)[None, :, None]
 
 
@@ -4216,7 +4223,8 @@ def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
         dtype=case.dtype,
     )
     v = torch.randn_like(k)
-    k_summary, v_summary = _summarize_kv(k, v, case.kv_block_size)
+    k_summary = block_mean(k, case.kv_block_size, k.dtype)
+    v_summary = block_mean(v, case.kv_block_size, v.dtype)
     sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
     expected = torch.cat(
         [

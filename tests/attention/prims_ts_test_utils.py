@@ -234,6 +234,22 @@ def pack_token_mask(
     return torch.tensor(packed_by_batch, device=device, dtype=torch.uint32)
 
 
+def block_mean(
+    x: torch.Tensor, kv_block_size: int, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """Return the per-block means of the structural tokens of ``[B, S, H, D]``.
+
+    The result is fp32 unless ``dtype`` is given.
+    """
+
+    blocks = [
+        x[:, begin : begin + kv_block_size].float().mean(dim=1)
+        for begin in range(0, x.shape[1], kv_block_size)
+    ]
+    means = torch.stack(blocks, dim=1)
+    return means if dtype is None else means.to(dtype)
+
+
 def heavy_tailed(
     shape: tuple[int, ...], *, device: torch.device, magnitude: float = 1.0
 ) -> torch.Tensor:
