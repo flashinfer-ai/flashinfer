@@ -89,7 +89,6 @@ from .shim import (
     with_knobs,
 )
 from .shim.comm import _CompiledMega, _compute_peer_offsets
-from .shim.autotune import _autotune_knobs_impl, _CollectiveGraphTimingError
 from .shim.tuner import is_valid
 
 # Heavy kernel helpers (``mega_runner`` byte-stacking, ``mega_runner`` fp8/E8M0
@@ -162,8 +161,6 @@ __all__ = [
     "free_sym_tensor",
     "resolve_gate_up_clamp",
     "sym_zeros",
-    "_autotune_knobs_impl",
-    "_CollectiveGraphTimingError",
     "is_valid",
     "COMBINE_FORMAT_NAMES",
     "CombineFormat",

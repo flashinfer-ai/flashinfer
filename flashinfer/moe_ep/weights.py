@@ -20,7 +20,7 @@ the "unquantized" path downstream. Backends discriminate with
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import ClassVar, Optional, Union
 
 import torch
@@ -66,7 +66,6 @@ class MoEWeightPack:
         w2: torch.Tensor = None,  # type: ignore[assignment]
         w13_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
-        *,
         w13_global_scale: Optional[torch.Tensor] = None,
         w2_global_scale: Optional[torch.Tensor] = None,
     ):
@@ -124,7 +123,6 @@ class UnquantizedMoEWeights(MoEWeightPack):
         w2: torch.Tensor,
         w13_scale: None = None,
         w2_scale: None = None,
-        *,
         w13_global_scale: None = None,
         w2_global_scale: None = None,
     ) -> None:
@@ -159,8 +157,8 @@ class PrequantizedMoEWeights(MoEWeightPack):
     w2: torch.Tensor
     w13_scale: torch.Tensor
     w2_scale: torch.Tensor
-    w13_global_scale: Optional[torch.Tensor] = field(default=None, kw_only=True)
-    w2_global_scale: Optional[torch.Tensor] = field(default=None, kw_only=True)
+    w13_global_scale: Optional[torch.Tensor] = None
+    w2_global_scale: Optional[torch.Tensor] = None
 
 
 def dummy_moe_weights(

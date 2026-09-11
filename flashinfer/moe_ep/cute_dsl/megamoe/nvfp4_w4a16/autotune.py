@@ -4,14 +4,100 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence
+import math
+import statistics
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 import torch
 
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-    _autotune_knobs_impl,
-    _CollectiveGraphTimingError,
-)
+
+class _KnobFrontend(Protocol):
+    def apply_knobs(self, knobs: Dict[str, Any]) -> None: ...
+
+
+class _CollectiveGraphTimingError(RuntimeError):
+    """A private graph timing failure that must stop the collective sweep."""
+
+
+def _autotune_knobs_impl(
+    frontend: _KnobFrontend,
+    warmup_launch: Callable[[], None],
+    sample_seconds: Callable[[int], Sequence[float]],
+    candidates: List[Dict[str, Any]],
+    *,
+    label: str,
+    warmup_iters: int,
+    timed_iters: int,
+    on_winner: Optional[Callable[[Dict[str, Any], float], None]],
+) -> Dict[str, Any]:
+    """Shared sweep; sample_seconds returns local seconds with no live graph."""
+    if not candidates:
+        raise ValueError("autotune_knobs needs a non-empty candidate list.")
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import ensure_not_capturing
+
+    # The sweep owns host-side compile, allocation, timing and collectives;
+    # it must finish before the caller captures its serving graph.
+    ensure_not_capturing("knobs='auto' collective autotune sweep")
+
+    import torch.distributed as dist
+
+    collective = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if collective else 0
+
+    def _barrier() -> None:
+        if collective:
+            dist.barrier()
+
+    scores: List[float] = []
+    for knobs in candidates:
+        # A candidate failure (ctor reject / compile error) is deterministic
+        # across ranks -- same static problem, same knobs -- so scoring it inf
+        # keeps the collective iteration aligned.
+        try:
+            frontend.apply_knobs(knobs)
+            _barrier()
+            for _ in range(warmup_iters):  # first launch compiles
+                warmup_launch()
+            _barrier()
+            scores.append(statistics.median(sample_seconds(timed_iters)))
+        except _CollectiveGraphTimingError:
+            # A peer may already be waiting in a captured collective. Never
+            # advance to a different candidate after graph timing fails.
+            raise
+        except Exception as exc:  # noqa: BLE001 -- score-and-continue by design
+            warnings.warn(
+                f"[cutedsl-autotune] {label}: candidate {knobs} failed: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            scores.append(math.inf)
+        _barrier()
+
+    t = torch.tensor(scores, dtype=torch.float64, device="cuda")
+    if collective:
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)  # slowest rank = real latency
+    best = int(torch.argmin(t).item())
+    if not math.isfinite(float(t[best])):
+        raise RuntimeError(
+            f"[cutedsl-autotune] {label}: every candidate failed to compile/run."
+        )
+    winner = candidates[best]
+    frontend.apply_knobs(winner)
+    if on_winner is not None:
+        on_winner(winner, float(t[best]))
+    if rank == 0:
+        ranked = sorted(zip(t.tolist(), candidates, strict=False), key=lambda kv: kv[0])
+        summary = "\n".join(f"    {us * 1e6:10.1f} us  {knobs}" for us, knobs in ranked)
+        print(
+            f"[cutedsl-autotune] {label}: winner {winner} "
+            f"({float(t[best]) * 1e6:.1f} us median, max across ranks) "
+            f"out of {len(candidates)} candidates:\n{summary}",
+            flush=True,
+        )
+    return winner
+
 
 # Default W4A16 tactic fields.
 _SWEEP_BASE: Dict[str, Any] = {
