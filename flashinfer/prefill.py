@@ -5820,6 +5820,7 @@ def trtllm_batch_context_with_kv_cache(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    backend: str = "trtllm-gen",
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -5945,6 +5946,10 @@ def trtllm_batch_context_with_kv_cache(
         zero-initialized at allocation (e.g. via ``torch.zeros``); the kernel
         self-resets the counters after each launch, so it does not need to be
         re-zeroed between calls.
+    backend : str = "trtllm-gen"
+        The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
+        selects the separately versioned Cake FMHA product. The default remains
+        the conventional TRTLLM implementation.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -5962,6 +5967,10 @@ def trtllm_batch_context_with_kv_cache(
     )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if backend not in ("trtllm-gen", "cake"):
+        raise ValueError(
+            "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
+        )
     if not causal and window_left >= 0:
         raise NotImplementedError(
             "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
@@ -6007,7 +6016,8 @@ def trtllm_batch_context_with_kv_cache(
             key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
             value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+    if backend != "cake":
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -6110,6 +6120,54 @@ def trtllm_batch_context_with_kv_cache(
     else:
         lse_stride_tokens = 0
         lse_stride_heads = 0
+
+    if backend == "cake":
+        from .cake_fmha import (
+            get_cake_fmha_context_module,
+            select_cake_fmha_context_route,
+        )
+
+        cake_route = select_cake_fmha_context_route(
+            query.device,
+            query=query,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            out=out,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            window_left=window_left,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            key_block_scales=key_block_scales,
+            value_block_scales=value_block_scales,
+            skip_softmax_threshold_scale_factor=(skip_softmax_threshold_scale_factor),
+            is_causal=causal,
+            lse=lse,
+            kv_layout=kv_layout,
+            workspace_buffer=workspace_buffer,
+        )
+        if skip_softmax_threshold_scale_factor == 1e-30:
+            # The pinned public matrix uses 1e-30 as a numerically inert
+            # skip-softmax probe. Both exact routes and compat_v1 consume the
+            # disabled form at the FFI boundary.
+            skip_softmax_threshold_scale_factor = None
+        # All context adapters consume host scalar scales. Device scalar
+        # values are resolved only after exact route selection, preserving
+        # their public value while converting bmm1 back from log2 form.
+        if isinstance(bmm1_scale, torch.Tensor):
+            bmm1_scale = float(bmm1_scale.item()) / log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            bmm2_scale = float(bmm2_scale.item())
+        run_func = get_cake_fmha_context_module(
+            query.device, cake_route
+        ).cake_paged_attention_context
 
     run_func(
         out,
