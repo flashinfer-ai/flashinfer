@@ -29,6 +29,12 @@
 #include "cake_warp_decode_contract.cuh"
 #include "tvm_ffi_utils.h"
 
+#ifndef FLASHINFER_CAKE_WARP_DECODE_HAS_SILU
+#define FLASHINFER_CAKE_WARP_DECODE_HAS_SILU 0
+#elif FLASHINFER_CAKE_WARP_DECODE_HAS_SILU != 0 && FLASHINFER_CAKE_WARP_DECODE_HAS_SILU != 1
+#error "FLASHINFER_CAKE_WARP_DECODE_HAS_SILU must be 0 or 1"
+#endif
+
 #if !__has_include("generated/cake_warp_decode_generated_manifest.cuh")
 #error \
     "generated/cake_warp_decode_generated_manifest.cuh is required; generate the kernel manifest before building this module"
@@ -86,15 +92,16 @@ void CheckManifestStatus(const ManifestStatus& status) {
                         << " rejected the generated kernel manifest, code=" << status.code;
 }
 
-void CheckSm103a(int32_t device_id) {
+void CheckExactTarget(int32_t device_id) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(computeCapabilityMajor)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(computeCapabilityMinor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 3)
-      << "cake warp decode requires exact compute capability 10.3, got " << major << "." << minor;
+  TVM_FFI_ICHECK(major == 10 && minor == FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR)
+      << "cake warp decode requires exact compute capability 10."
+      << FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR << ", got " << major << "." << minor;
 }
 
 void CheckDtype(const TensorView& tensor, const char* name, DLDataType expected) {
@@ -194,9 +201,14 @@ Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate
   Shape shape{static_cast<int32_t>(num_tokens),        static_cast<int32_t>(hidden_size),
               static_cast<int32_t>(intermediate_size), static_cast<int32_t>(num_experts),
               static_cast<int32_t>(num_experts),       static_cast<int32_t>(top_k)};
-  TVM_FFI_ICHECK(SelectSchedule(shape).supported)
+  const Schedule schedule = SelectSchedule(shape);
+  TVM_FFI_ICHECK(schedule.supported)
       << "cake warp decode supports only (H=2048, I=512, E=512, top_k=10) or "
-         "(H=2048, I=1536, E=60, top_k=4), with 1 <= num_tokens <= 32";
+         "(H=2048, I=1536, E=60, top_k=4) with SwiGLU, or "
+         "(H=6144, I=1536, E=192, top_k=4) with SiLU, with 1 <= num_tokens <= 32";
+  TVM_FFI_ICHECK(ActivationForGeometry(schedule.geometry) != Activation::kSiLU ||
+                 FLASHINFER_CAKE_WARP_DECODE_HAS_SILU)
+      << "cake warp decode SiLU generated programs are not installed for this exact target";
   return shape;
 }
 
@@ -499,11 +511,13 @@ void CheckAllTensorArguments(
     const TensorView& gemm1_weights_u8, const TensorView& gemm1_weights_scale_e4m3,
     const TensorView& gemm2_weights_u8, const TensorView& gemm2_weights_scale_e4m3,
     const TensorView& output1_scale_scalar_f32, const TensorView& output1_scale_gate_scalar_f32,
-    const TensorView& output2_scale_scalar_f32, const Shape& shape, int64_t workspace_bytes) {
+    const TensorView& output2_scale_scalar_f32, const Shape& shape, const Schedule& schedule,
+    int64_t workspace_bytes) {
   const int32_t device_id = output_bf16.device().device_id;
   const int64_t tokens = shape.num_tokens;
   const int64_t hidden = shape.hidden_size;
   const int64_t intermediate = shape.intermediate_size;
+  const int64_t gemm1_rows = Gemm1WeightRows(shape, schedule);
   const int64_t experts = shape.num_experts;
   const int64_t top_k = shape.top_k;
 
@@ -527,9 +541,9 @@ void CheckAllTensorArguments(
   CheckShape(hidden_states_scale_e4m3, "hidden_states_scale_e4m3", {tokens, hidden / 16});
   CheckShape(topk_ids_i32, "topk_ids_i32", {tokens, top_k});
   CheckShape(topk_weights_bf16, "topk_weights_bf16", {tokens, top_k});
-  CheckShape(gemm1_weights_u8, "gemm1_weights_u8", {experts, 2 * intermediate, hidden / 2});
+  CheckShape(gemm1_weights_u8, "gemm1_weights_u8", {experts, gemm1_rows, hidden / 2});
   CheckShape(gemm1_weights_scale_e4m3, "gemm1_weights_scale_e4m3",
-             {experts, 2 * intermediate, hidden / 16});
+             {experts, gemm1_rows, hidden / 16});
   CheckShape(gemm2_weights_u8, "gemm2_weights_u8", {experts, hidden, intermediate / 2});
   CheckShape(gemm2_weights_scale_e4m3, "gemm2_weights_scale_e4m3",
              {experts, hidden, intermediate / 16});
@@ -607,7 +621,7 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
   const int64_t workspace_bytes = CheckedWorkspaceSize(shape, schedule);
   const int32_t device_id = workspace_u8.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckSm103a(device_id);
+  CheckExactTarget(device_id);
   CheckWorkspace(workspace_u8, device_id, workspace_bytes);
 
   const cudaStream_t stream = get_current_stream();
@@ -647,12 +661,12 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
 
   const int32_t device_id = output_bf16.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckSm103a(device_id);
+  CheckExactTarget(device_id);
   CheckAllTensorArguments(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
                           topk_ids_i32, topk_weights_bf16, gemm1_weights_u8,
                           gemm1_weights_scale_e4m3, gemm2_weights_u8, gemm2_weights_scale_e4m3,
                           output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
-                          output2_scale_scalar_f32, shape, workspace_bytes);
+                          output2_scale_scalar_f32, shape, schedule, workspace_bytes);
 
   const cudaStream_t stream = get_current_stream();
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -726,3 +740,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_prepare_workspace,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_release_workspace,
                               flashinfer::warp_decode::ReleaseWorkspaceReceipt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode, flashinfer::warp_decode::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::warp_decode::Run);

@@ -4438,12 +4438,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        # For NVFP4 KV, fuse q_scale and k_scale into sm_scale
+        # FA2/FA3 with a 16-bit query consumes unscaled FP8 KV values.
+        # Full-FP8 and other backends handle their scales separately.
+        apply_kv_scales = kv_cache_sf is not None or (
+            self._backend in ("fa2", "fa3") and is_float8(k) and not is_float8(q)
+        )
         if kv_cache_sf is not None:
             if q_scale is not None:
                 sm_scale *= q_scale
-            if k_scale is not None:
-                sm_scale *= k_scale
+        if apply_kv_scales and k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -4809,9 +4813,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         assert self._cached_module is not None, "cached module is not initialized"
         self._cached_module.ragged_run(*run_args)
 
-        # Apply V scaling for NVFP4 ragged KV if v_scale is provided and not equal to 1.0
+        # Apply global V calibration after attention, without changing the LSE.
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-        if kv_cache_sf is not None and v_scale is not None and not is_float_one:
+        if apply_kv_scales and v_scale is not None and not is_float_one:
             out *= v_scale
 
         return (out, lse) if return_lse else out
@@ -6261,7 +6265,7 @@ def fmha_v2_prefill_sm120(
     ``scale_bmm2`` and contains the V dequantization scale. If either is
     omitted, the kernel uses the corresponding host-encoded scale.
 
-    This entry point is validated for SM120. SM121 support is not enabled.
+    This entry point is validated for SM120 and SM121.
 
     Parameters
     ----------
@@ -6284,13 +6288,10 @@ def fmha_v2_prefill_sm120(
     scale_bmm1_d, scale_bmm2_d : torch.Tensor, optional
         Persistent one-element FP32 CUDA scale tensors overriding host scales.
     """
-    if not is_sm12x_supported(query.device) or torch.cuda.get_device_capability(
+    if not is_sm12x_supported(query.device) or get_compute_capability(
         query.device
-    ) != (12, 0):
-        raise ValueError(
-            "fmha_v2_prefill_sm120 is only supported on SM120 GPUs; "
-            "SM121 has not been validated."
-        )
+    ) not in ((12, 0), (12, 1)):
+        raise ValueError("fmha_v2_prefill_sm120 is only supported on SM120/SM121 GPUs.")
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4 or out.ndim != 4:
         raise ValueError("query, key, value, and out must be 4D BSHD tensors.")
     if query.dtype != torch.float8_e4m3fn:

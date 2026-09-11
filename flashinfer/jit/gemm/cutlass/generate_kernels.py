@@ -779,7 +779,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
             )
             operations.append(moe_gemm_operation)
 
-    small_k_shapes = [(128, token_tile, 128) for token_tile in [8, 16, 32, 40]]
+    small_k_shapes = [(128, token_tile, 128) for token_tile in [8, 16, 32, 40, 64]]
     small_k_kernel_types = [
         "single_warpgroup_prefill",
         "single_warpgroup_rolling",

@@ -564,7 +564,30 @@ _PROXY_ROUTE_CASES = (
         expected_q_tile=128,
         expected_kv_tile=128,
     ),
+    # A 128-token KV block spans two K64 route atoms; the fragment-to-origin
+    # mapping must follow the atom, not the block.
+    _Case(
+        "proxy_bk128_keeps",
+        1,
+        1,
+        64,
+        269,
+        64,
+        128,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        pattern="proxy_tail",
+        expected_q_tile=64,
+        expected_kv_tile=256,
+    ),
 )
+
+
+def _stub_block_sparse_config(_key):
+    """Stand in for the decode config where only the launch policy matters."""
+    return SimpleNamespace(uses_prepared_score_keep_words=False)
 
 
 def _make_patterns(case: _Case) -> _Patterns:
@@ -614,9 +637,14 @@ def _make_patterns(case: _Case) -> _Patterns:
                     rows.append((*range(1, 9), *range(22, 30)))
                     continue
                 if case.pattern == "proxy_tail":
-                    rows.append(
-                        (0, 32) if row_idx % 2 == 1 and num_kv_blocks > 32 else (1, 3)
-                    )
+                    if row_idx % 2 == 1 and num_kv_blocks > 32:
+                        rows.append((0, 32))
+                    elif num_kv_blocks > 3:
+                        rows.append((1, 3))
+                    else:
+                        # Three-block rows (128-token KV blocks over 269
+                        # tokens) keep the ragged final block in the set.
+                        rows.append((1, num_kv_blocks - 1))
                     continue
                 selected = {0, num_kv_blocks - 1}
                 if num_kv_blocks > 2:
@@ -2445,6 +2473,43 @@ def test_prepared_block_sparse_layout_allows_empty_route_metadata() -> None:
     assert layout.workspace_size_words == layout.route_metadata_base_word_offset
 
 
+def test_dense_keeps_plans_prepare_structural_score_words() -> None:
+    """Dense Keeps plans carry trusted score words; causal and Swaps do not."""
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        CAUSAL,
+        DENSE,
+        FmhaDecodeConfig,
+    )
+
+    def keeps_cfg(mask_type):
+        return FmhaDecodeConfig(
+            use_block_sparse=True,
+            groups_tokens_heads_q=True,
+            q_block_size=128,
+            kv_block_size=64,
+            tile_size_q=128,
+            tile_size_kv=128,
+            use_keeps_mma_ab=True,
+            mask_type=mask_type,
+        )
+
+    dense = keeps_cfg(DENSE)
+    assert dense.uses_prepared_score_keep_words
+    assert dense.trusts_prepared_score_words
+    assert not keeps_cfg(CAUSAL).uses_prepared_score_keep_words
+    swaps = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        q_block_size=32,
+        kv_block_size=32,
+        tile_size_q=32,
+        tile_size_kv=128,
+        use_keeps_mma_ab=False,
+        mask_type=DENSE,
+    )
+    assert not swaps.uses_prepared_score_keep_words
+
+
 def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> None:
     metadata = torch.empty((1, 1, 2), dtype=torch.int32)
     indices = torch.empty((0,), dtype=torch.int32)
@@ -2508,7 +2573,19 @@ def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(ValueError, match="proxy routes require mask_type='dense'"):
         cfg.validate_block_sparse_profile(heads_q_per_kv=1)
 
+    # Exact routes accept causal masking; Q64 Keeps plans use KV256 routes.
     exact_causal_cfg = FmhaDecodeConfig(
+        use_block_sparse=True,
+        groups_tokens_heads_q=True,
+        q_block_size=64,
+        kv_block_size=64,
+        tile_size_q=64,
+        tile_size_kv=256,
+        use_keeps_mma_ab=True,
+        mask_type=CAUSAL,
+    )
+    exact_causal_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+    q64_kv128_keeps_cfg = FmhaDecodeConfig(
         use_block_sparse=True,
         groups_tokens_heads_q=True,
         q_block_size=64,
@@ -2516,9 +2593,9 @@ def test_public_api_rejects_invalid_usage(monkeypatch: pytest.MonkeyPatch) -> No
         tile_size_q=64,
         tile_size_kv=128,
         use_keeps_mma_ab=True,
-        mask_type=CAUSAL,
     )
-    exact_causal_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
+    with pytest.raises(ValueError, match="requires a streamed TMEM-P profile"):
+        q64_kv128_keeps_cfg.validate_block_sparse_profile(heads_q_per_kv=1)
 
 
 def _validate_cpu_routing(
@@ -3188,7 +3265,7 @@ def test_block_sparse_clc_requires_about_two_sm_waves(
     monkeypatch.setattr(
         config_module,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3251,7 +3328,7 @@ def test_gqa_launch_spec_uses_q_token_cta_geometry(
     monkeypatch.setattr(
         config_module,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3292,7 +3369,7 @@ def test_gqa_launch_spec_uses_q_token_cta_geometry(
 
 
 @pytest.mark.parametrize("use_proxy_routes", (False, True))
-def test_proxy_routes_select_static_while_exact_routes_preserve_auto(
+def test_proxy_routes_share_exact_route_scheduler_selection(
     monkeypatch: pytest.MonkeyPatch,
     use_proxy_routes: bool,
 ) -> None:
@@ -3312,7 +3389,7 @@ def test_proxy_routes_select_static_while_exact_routes_preserve_auto(
     monkeypatch.setattr(
         block_sparse_config,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3340,11 +3417,12 @@ def test_proxy_routes_select_static_while_exact_routes_preserve_auto(
         block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
 
     policy = dict(spec.policy)
-    expected_persistent = not use_proxy_routes
-    assert len(selector_calls) == int(expected_persistent)
-    assert spec.compile_key.use_persistent_scheduler is expected_persistent
-    assert policy["scheduler"] == ("persistent" if expected_persistent else "static")
-    assert policy["use_persistent_scheduler"] is expected_persistent
+    # Proxy and exact routes consult the same launch-mode selector, so the
+    # persistent answer it returns applies to both.
+    assert len(selector_calls) == 1
+    assert spec.compile_key.use_persistent_scheduler is True
+    assert policy["scheduler"] == "persistent"
+    assert policy["use_persistent_scheduler"] is True
     assert "scheduler_policy" not in policy
 
 
@@ -3372,7 +3450,7 @@ def test_clc_capacity_gates_control_launch_resolution(
     monkeypatch.setattr(
         config_module,
         "_make_block_sparse_config",
-        lambda _key: None,
+        _stub_block_sparse_config,
     )
     monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
 
@@ -3418,10 +3496,11 @@ def test_static_fallback_reselects_sparse_load_policy(
     )
     config_calls: list[object] = []
 
-    def validate_config(key: object) -> None:
+    def validate_config(key: object) -> SimpleNamespace:
         config_calls.append(key)
         if key.use_persistent_scheduler:
             raise ValueError("reject persistent profile")
+        return _stub_block_sparse_config(key)
 
     monkeypatch.setattr(
         fmha_decode_config,
@@ -3944,7 +4023,8 @@ def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
     route_layout = _BlockSparseRouteLayout.create(
         kv_route_size=policy["tile_size_kv"],
         kv_block_size=256,
-        has_token_bits=False,
+        # Dense Keeps plans store structural score words with every route.
+        has_token_bits=True,
         route_metadata_capacity=12,
         num_rows=6,
     )
@@ -4072,7 +4152,7 @@ def test_public_block_sparse_correctness(
 @pytest.mark.parametrize(
     "case",
     _PROXY_ROUTE_CASES,
-    ids=("bk8-swaps", "bk64-keeps", "bk64-keeps-kv128"),
+    ids=lambda case: case.name,
 )
 @torch.no_grad()
 def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
