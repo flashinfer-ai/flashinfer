@@ -209,12 +209,28 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
-        if t.fc1_alpha is not None:
-            workspace.fc1_alpha.copy_(t.fc1_alpha)
-        if t.fc2_alpha is not None:
-            workspace.fc2_alpha.copy_(t.fc2_alpha)
-        if t.fc1_norm_const is not None:
-            workspace.fc1_norm_const.copy_(t.fc1_norm_const)
+        destinations = []
+        sources = []
+        for source, destination in (
+            (t.fc1_alpha, workspace.fc1_alpha),
+            (t.fc2_alpha, workspace.fc2_alpha),
+            (t.fc1_norm_const, workspace.fc1_norm_const),
+        ):
+            if source is not None:
+                destinations.append(destination)
+                sources.append(source)
+        if sources:
+            # Workspace aliases preserve the ordering of the individual copies.
+            if any(
+                torch._C._overlaps(source, destination)
+                for source in sources
+                for destination in destinations
+            ):
+                for destination, source in zip(destinations, sources, strict=True):
+                    destination.copy_(source)
+            else:
+                # Batch the common contiguous CUDA copies into one launch.
+                torch._foreach_copy_(destinations, sources)
 
     def compute(
         self,
