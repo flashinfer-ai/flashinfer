@@ -51,40 +51,11 @@ class W4A16Epilogue:
         *,
         mma_tiler_mnk,
         cluster_shape_mn,
-        use_2cta_instrs,
-        fc1_output_dtype,
-        combine_format,
-        non_ubulk_fc2_store=True,
-        in_kernel_fc2_reduce=False,
+        static_expert_shape,
         token_back_by_dispatch=False,
-        acc_dtype=cutlass.Float32,
-        allow_overlap_acc=False,
-        static_expert_shape=None,
         gate_up_clamp=None,
         epi_flag_batch=(1, 1),
     ):
-        if (
-            mma_tiler_mnk
-            not in ((128, 64, 256), (128, 128, 256), (256, 64, 256), (256, 128, 256))
-            or (
-                cluster_shape_mn != (2, 1)
-                and not (cluster_shape_mn == (1, 1) and mma_tiler_mnk == (128, 64, 256))
-            )
-            or use_2cta_instrs != (mma_tiler_mnk[0] == 256)
-        ):
-            raise ValueError("W4A16 requires a supported M/N/K tile and cluster shape.")
-        if (
-            fc1_output_dtype is not cutlass.BFloat16
-            or combine_format.act_dtype is not cutlass.BFloat16
-            or combine_format.is_quantized
-            or acc_dtype is not cutlass.Float32
-            or not non_ubulk_fc2_store
-            or in_kernel_fc2_reduce
-            or allow_overlap_acc
-        ):
-            raise ValueError(
-                "W4A16 requires FP32 accumulators and direct BF16 handoffs"
-            )
         self.token_back_by_dispatch = token_back_by_dispatch
         self.gate_up_clamp = gate_up_clamp
         fc1_batch, fc2_batch = (1, 1) if epi_flag_batch is None else epi_flag_batch
@@ -97,9 +68,7 @@ class W4A16Epilogue:
         self.cta_tile_n = mma_tiler_mnk[1]
         self.static_expert_shape = static_expert_shape
         self.acc_tmem_cols = self.cta_tile_n
-        self.intermediate_downproj = (
-            static_expert_shape[1] // 2 if static_expert_shape is not None else None
-        )
+        self.intermediate_downproj = static_expert_shape[1] // 2
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
         self.num_acc_stage = 2
         self.tmem_acc_layout_py_obj = (

@@ -721,15 +721,8 @@ class Sm100W4A16MegaMoEKernel:
         self.epilogue = W4A16Epilogue(
             mma_tiler_mnk=self.mma_tiler,
             cluster_shape_mn=self.cluster_shape_mn,
-            use_2cta_instrs=self.use_2cta_instrs,
-            fc1_output_dtype=cutlass.BFloat16,
-            combine_format=self.combine_format,
-            non_ubulk_fc2_store=True,
-            in_kernel_fc2_reduce=False,
             token_back_by_dispatch=self.token_back_by_dispatch,
             epi_flag_batch=self.epi_flag_batch,
-            acc_dtype=cutlass.Float32,
-            allow_overlap_acc=False,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
         )
