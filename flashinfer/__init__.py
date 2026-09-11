@@ -55,6 +55,19 @@ from .cascade import (
 from .cascade import merge_state as merge_state
 from .cascade import merge_state_in_place as merge_state_in_place
 from .cascade import merge_states as merge_states
+from .cake_fmha import (
+    cake_batch_context_with_kv_cache as cake_batch_context_with_kv_cache,
+)
+from .cake_fmha import (
+    cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
+)
+from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_fmha import (
+    CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
+)
+from .cake_fmha import (
+    plan_cake_fmha_request_ordered_paged_decode as plan_cake_fmha_request_ordered_paged_decode,
+)
 from .decode import (
     BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
 )
@@ -119,6 +132,33 @@ from .fused_moe import (
     trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
+_PRIMS_TS_LAZY_EXPORTS = frozenset(
+    {
+        "prims_ts_bf16_moe",
+        "prims_ts_bf16_routed_moe",
+        "prims_ts_fp4_block_scale_moe",
+        "prims_ts_fp4_block_scale_routed_moe",
+        "prims_ts_fp8_block_scale_moe",
+        "prims_ts_fp8_block_scale_routed_moe",
+        "prims_ts_fp8_per_tensor_scale_moe",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name not in _PRIMS_TS_LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import fused_moe as _fused_moe
+
+    value = getattr(_fused_moe, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+
+
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
@@ -166,19 +206,6 @@ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
-from .kda_backward import (
-    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
-)
-from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
-from .kda_training import (
-    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
-)
-from .kda_training import (
-    recurrent_kda_training_backward as recurrent_kda_training_backward,
-)
-from .kda_training import (
-    recurrent_kda_training_forward as recurrent_kda_training_forward,
-)
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )
