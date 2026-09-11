@@ -6224,11 +6224,13 @@ class MegaMoeFc12Runner(MoERunner):
             (max_rows, hidden), dtype=torch.bfloat16, device=self.device
         )
         self._permuted_output = torch.empty_like(self._permuted_input)
-        launcher_cls = (
-            Bf16Mxfp8Fc12Launcher
-            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.BF16)
-            else Bf16Fc12Launcher
-        )
+        launcher_dict = {
+            (QuantFormat.BF16, QuantFormat.BF16): Bf16Fc12Launcher,
+            (QuantFormat.MXFP8, QuantFormat.BF16): Bf16Mxfp8Fc12Launcher,
+        }
+        assert self.config.quant.pair in launcher_dict
+        launcher_cls = launcher_dict[self.config.quant.pair]
+
         self._launcher = launcher_cls(
             num_local_experts,
             max_rows,
