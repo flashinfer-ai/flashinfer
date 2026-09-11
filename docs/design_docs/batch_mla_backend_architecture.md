@@ -586,6 +586,19 @@ Successful `plan()` resets the stream binding for the new plan; failed
 replanning preserves the old binding. Before switching streams through a full
 replan, finish the old updates and graph replays, then recapture `run()` for the
 new plan.
+Before snapshotting or mutating graph buffers, `plan()` rejects a switch while
+the bound stream reports pending work through a nonblocking stream query.
+Slot events cover staging copies, not the subsequent commit kernel or replay.
+All calls on one wrapper must be serialized by the caller: the in-progress
+flag detects some overlapping calls but is not a thread-safety lock. Externally
+owned CUDA streams must remain alive throughout their bound lifecycle.
+
+Full opted-in replanning snapshots the prior schedule and reserved CSR buffers
+for rollback, including the entire `kv_indices` reservation. Temporary memory
+and copy cost scale with reserved capacity, even when the live prefix is small.
+These snapshots are confined to `plan()` and are absent from steady updates.
+`update_cuda_graph_plan()` requires a CUDA device and rejects other devices
+before accessing a CUDA stream.
 
 The three host control tensors, `qo_indptr`, `kv_indptr`, and `kv_len_arr`, must
 be contiguous CPU `torch.int32` tensors. `kv_indices` must be contiguous

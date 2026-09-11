@@ -305,6 +305,7 @@ class BatchMLAPagedAttentionWrapper:
         self._legacy_flat_csr_plan = False
         self._warned_legacy_dynamic_lse = False
         self._cuda_graph_plan_update_in_progress = False
+        self._cuda_graph_plan_update_stream: Optional[int] = None
 
     # Preferred canonical metadata form.
     @overload
@@ -484,7 +485,32 @@ class BatchMLAPagedAttentionWrapper:
         Positional arguments are deprecated; use keyword arguments for all
         ``plan()`` parameters. Flat metadata arguments are also deprecated;
         use an ``MLAPlanMetadata`` object instead.
+
+        An opted-in CUDA-graph replan snapshots the prior schedule and reserved
+        CSR buffers for rollback, including the entire ``kv_indices`` capacity.
+        This temporary memory and copy cost scales with reserved capacity and
+        is absent from steady :meth:`update_cuda_graph_plan` calls. A stream
+        switch is rejected while the previous bound stream has pending work.
         """
+        if self._enable_cuda_graph_plan_update:
+            if self._cuda_graph_plan_update_in_progress:
+                raise RuntimeError(
+                    "cannot replan while a CUDA graph plan update is in progress."
+                )
+            bound_stream = self._cuda_graph_plan_update_stream
+            if bound_stream is not None:
+                current_stream = torch.cuda.current_stream(self.device)
+                if current_stream.cuda_stream != bound_stream:
+                    # Slot events cover H2D staging, not the later commit or
+                    # replay. Query the whole bound stream before snapshots or
+                    # live writes. Same-stream replanning is already ordered.
+                    if not torch.cuda.ExternalStream(
+                        bound_stream, device=self.device
+                    ).query():
+                        raise RuntimeError(
+                            "cannot replan on another stream while the bound CUDA stream "
+                            "has pending work; finish old updates and replays first."
+                        )
         # ---------------------------------------------------------------------------
         # Normalize metadata and handle legacy forms
         # ---------------------------------------------------------------------------
@@ -738,13 +764,15 @@ class BatchMLAPagedAttentionWrapper:
             raise RuntimeError(
                 "update_cuda_graph_plan() cannot run during CUDA graph capture."
             )
-        if getattr(self, "_cuda_graph_plan_update_in_progress", False):
+        # Best-effort overlap detection only: check/set is not a lock. Callers
+        # must serialize all operations on this wrapper across host threads.
+        if self._cuda_graph_plan_update_in_progress:
             raise RuntimeError("update_cuda_graph_plan() is already in progress.")
 
         self._cuda_graph_plan_update_in_progress = True
         try:
             current_stream_pointer = current_stream.cuda_stream
-            bound_stream = getattr(self, "_cuda_graph_plan_update_stream", None)
+            bound_stream = self._cuda_graph_plan_update_stream
             if bound_stream is None:
                 self._cuda_graph_plan_update_stream = current_stream_pointer
             elif bound_stream != current_stream_pointer:
@@ -775,13 +803,19 @@ class BatchMLAPagedAttentionWrapper:
         A successful :meth:`plan` resets the binding; a failed plan preserves
         it. Before replanning on another stream, finish the old updates and
         replays, then recapture :meth:`run` for the new plan.
+        Replanning queries the bound stream without waiting and rejects a
+        stream switch while work remains. Staging events alone do not prove
+        publication or replay completion. Callers must serialize all use of
+        one wrapper; the in-progress flag is not a thread-safety lock. Keep
+        externally owned CUDA streams alive throughout the bound lifecycle.
 
         Do not use the private fast-plan bridge on an opted-in wrapper. Its
         CPU planner can overwrite pinned staging still read by a pending
         update, even on the same CUDA stream. Use separate default-off
         wrappers for legacy private planning.
 
-        ``metadata`` must be a complete CSR :class:`MLAPlanMetadata` value.
+        The wrapper device must be CUDA. ``metadata`` must be a complete CSR
+        :class:`MLAPlanMetadata` value.
         ``qo_indptr``, ``kv_indptr``, and ``kv_len_arr`` must be contiguous
         CPU ``torch.int32`` tensors. ``kv_indices`` must be a contiguous
         ``torch.int32`` tensor on the wrapper device, must not overlap any
@@ -825,6 +859,8 @@ class BatchMLAPagedAttentionWrapper:
             raise RuntimeError(
                 "the planned backend does not support CUDA graph plan updates."
             )
+        if self.device.type != "cuda":
+            raise RuntimeError("update_cuda_graph_plan() requires a CUDA device.")
         current_stream = torch.cuda.current_stream()
         if current_stream.device == self.device:
             self._update_cuda_graph_plan_on_current_device(
