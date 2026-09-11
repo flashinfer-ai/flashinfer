@@ -21,7 +21,7 @@ from .core import JitSpec, gen_jit_spec, sm103a_nvcc_flags
 from .cpp_ext import is_cuda_version_at_least
 
 
-_CUDA_SOURCE_NAME = "minimax_h3_bf16_pre_attention_sm103a.cu"
+_CUDA_SOURCE_NAME = "cake_minimax_h3_bf16_pre_attention_sm103a.cu"
 _PRECISE_MATH_FLAGS = [
     "--ftz=false",
     "--prec-div=true",

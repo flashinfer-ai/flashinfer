@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from flashinfer.diffusion_ops import minimax_h3_bf16_pre_attention
 from flashinfer.diffusion_ops.minimax_h3 import _validate_input_contract
 from flashinfer.jit import env as jit_env
-from flashinfer.jit.minimax_h3 import (
+from flashinfer.jit.cake_minimax_h3_bf16_pre_attention import (
     _minimax_h3_cuda_source,
     _minimax_h3_include_dir,
 )
@@ -96,7 +96,7 @@ FULL_CORRECTNESS_SHAPES = CENTER_SHAPES + ALIGNED_SHAPES + TAIL_SHAPES + SMOKE_S
 _SOURCE = (
     Path(__file__).resolve().parents[2]
     / "csrc"
-    / "minimax_h3_bf16_pre_attention_sm103a.cu"
+    / "cake_minimax_h3_bf16_pre_attention_sm103a.cu"
 )
 _CUDA_DEVICE = torch.device("cuda")
 _HAS_SM103A_RUNTIME = (

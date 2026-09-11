@@ -1,3 +1,18 @@
+/*
+ * Copyright (c) 2024 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 #include <cuda.h>
 #include <cuda_bf16.h>
 
@@ -9,7 +24,8 @@ struct __align__(128) FlashInferTensorMap {
 static_assert(sizeof(FlashInferTensorMap) == 128, "tensor-map ABI size mismatch");
 static_assert(alignof(FlashInferTensorMap) == 128, "tensor-map ABI alignment mismatch");
 static_assert(sizeof(CUtensorMap) == 128, "CUDA tensor-map ABI size mismatch");
-static_assert(alignof(CUtensorMap) == 128, "CUDA tensor-map ABI alignment mismatch");
+static_assert(alignof(CUtensorMap) >= 64,
+              "CUDA tensor-map ABI requires at least 64-byte alignment");
 
 #define MINIMAX_H3_INF CUDART_INF_F
 #define TMEM_NCOLS 512

@@ -14,20 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
 from typing import Final
 
 import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.cpp_ext import is_cuda_version_at_least
-from ..jit.minimax_h3 import gen_minimax_h3_bf16_pre_attention_module
-from ..trace.templates.diffusion import minimax_h3_bf16_pre_attention_trace
+from ..trace.templates.cake_minimax_h3_bf16_pre_attention import (
+    minimax_h3_bf16_pre_attention_trace,
+)
 from ..utils import (
     get_compute_capability,
-    register_custom_op,
-    register_fake_op,
     supported_compute_capability,
+)
+
+from .cake_minimax_h3_bf16_pre_attention import (
+    get_minimax_h3_bf16_pre_attention_backend,
 )
 
 
@@ -174,66 +176,6 @@ def _check_runtime_support(device: torch.device) -> None:
         raise RuntimeError("MiniMax-H3 BF16 pre-attention requires CUDA 12.9 or newer")
 
 
-@functools.cache
-def _get_module():
-    return gen_minimax_h3_bf16_pre_attention_module().build_and_load()
-
-
-@register_custom_op(
-    "flashinfer::minimax_h3_bf16_pre_attention",
-    mutates_args=("out",),
-)
-def _minimax_h3_bf16_pre_attention_impl(
-    x: torch.Tensor,
-    x_norm_weight: torch.Tensor,
-    adaln_scale: torch.Tensor,
-    adaln_shift: torch.Tensor,
-    adaln_index: torch.Tensor,
-    qkv_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    rope_cos_sin: torch.Tensor,
-    out: torch.Tensor,
-    m: int,
-    ulysses_degree: int,
-    eps: float,
-) -> None:
-    _get_module().minimax_h3_bf16_pre_attention(
-        x,
-        x_norm_weight,
-        adaln_scale,
-        adaln_shift,
-        adaln_index,
-        qkv_weight,
-        q_norm_weight,
-        k_norm_weight,
-        rope_cos_sin,
-        out,
-        m,
-        ulysses_degree,
-        eps,
-    )
-
-
-@register_fake_op("flashinfer::minimax_h3_bf16_pre_attention")
-def _minimax_h3_bf16_pre_attention_fake(
-    x: torch.Tensor,
-    x_norm_weight: torch.Tensor,
-    adaln_scale: torch.Tensor,
-    adaln_shift: torch.Tensor,
-    adaln_index: torch.Tensor,
-    qkv_weight: torch.Tensor,
-    q_norm_weight: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    rope_cos_sin: torch.Tensor,
-    out: torch.Tensor,
-    m: int,
-    ulysses_degree: int,
-    eps: float,
-) -> None:
-    pass
-
-
 @supported_compute_capability([103])
 @flashinfer_api(trace=minimax_h3_bf16_pre_attention_trace)
 def minimax_h3_bf16_pre_attention(
@@ -319,7 +261,7 @@ def minimax_h3_bf16_pre_attention(
         eps=eps,
     )
     _check_runtime_support(x.device)
-    _minimax_h3_bf16_pre_attention_impl(
+    get_minimax_h3_bf16_pre_attention_backend(backend="cake")(
         x,
         x_norm_weight,
         adaln_scale,
