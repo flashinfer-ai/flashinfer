@@ -54,6 +54,21 @@ def test_rel_tol_floor_catches_narrow_ci():
     assert [m.config.occupancy for m in ranked] == [1, 8]
 
 
+def test_gap_outside_both_rules_is_not_tied():
+    # The gap exceeds the combined error margins (0.7) and TIE_REL_TOL of the
+    # best mean (2.0), so the slower candidate must keep its latency rank
+    # even though its own margin plus the relative band (2.6) would cover it.
+    best, second = 100.0, 102.5
+    assert second - best > 0.1 + 0.6
+    assert second - best > TIE_REL_TOL * best
+    measurements = [
+        _measure(best, 0.1, occupancy=8),
+        _measure(second, 0.6, occupancy=1),
+    ]
+    ranked = rank_measurements(measurements, _key)
+    assert [m.config.occupancy for m in ranked] == [8, 1]
+
+
 def test_clear_winner_stays_first():
     measurements = [
         _measure(50.0, 0.1, occupancy=8),

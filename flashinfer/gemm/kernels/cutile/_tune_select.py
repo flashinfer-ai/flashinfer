@@ -48,10 +48,13 @@ def rank_measurements(
     """
     by_time = sorted(successes, key=lambda m: m.mean_us)
     best = by_time[0]
-    tol = max(best.error_margin_us, TIE_REL_TOL * best.mean_us)
 
     def _tied(m):
-        return m.mean_us - best.mean_us <= m.error_margin_us + tol
+        gap = m.mean_us - best.mean_us
+        return (
+            gap <= m.error_margin_us + best.error_margin_us
+            or gap <= TIE_REL_TOL * best.mean_us
+        )
 
     band = [m for m in by_time if _tied(m)]
     rest = [m for m in by_time if not _tied(m)]
