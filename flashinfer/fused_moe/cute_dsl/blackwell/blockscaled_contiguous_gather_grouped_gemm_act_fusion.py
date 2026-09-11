@@ -1760,9 +1760,6 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 cute.make_layout((1,)),
                 cutlass.Boolean,
             )
-            sfa_tail_predicate = cute.make_rmem_tensor(
-                cute.make_layout((1,)), cutlass.Boolean
-            )
             #
             # Persistent tile scheduling loop
             #
@@ -1954,6 +1951,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             tAsSFA_slice_ptr, cute.make_layout((4,))
                         )
 
+                        sfa_tail_predicate = cute.make_rmem_tensor(
+                            cute.make_layout((1,)), cutlass.Boolean
+                        )
                         sfa_tail_predicate[0] = sfa_predicate_tensor[0] & (
                             a_producer_state.count * self.cta_tile_shape_mnk_sfa[2]
                             + 4 * swizzled_iterator
