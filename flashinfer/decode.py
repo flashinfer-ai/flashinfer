@@ -4152,6 +4152,8 @@ def trtllm_batch_decode_with_kv_cache(
                     batch_size=batch_size,
                     q_len=q_len_per_req,
                     write_lse=lse is not None,
+                    num_q_heads=int(query.shape[-2]),
+                    num_kv_heads=int(k_cache.shape[-3]),
                 )
             if not isinstance(request_order_plan, CakeFmhaRequestOrderedDecodePlan):
                 raise TypeError(
@@ -4166,9 +4168,11 @@ def trtllm_batch_decode_with_kv_cache(
                 request_order_plan.batch_size != batch_size
                 or request_order_plan.q_len != q_len_per_req
                 or request_order_plan.write_lse is not (lse is not None)
+                or request_order_plan.num_q_heads != query.shape[-2]
+                or request_order_plan.num_kv_heads != k_cache.shape[-3]
             ):
                 raise ValueError(
-                    "request_order_plan does not match batch, q_len, or LSE mode"
+                    "request_order_plan does not match batch, q_len, heads, or LSE mode"
                 )
             _run_cake_fmha_request_ordered_paged_decode(
                 backend="cake",

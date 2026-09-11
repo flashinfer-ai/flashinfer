@@ -51,6 +51,8 @@ class CakeFmhaRequestOrderedDecodePlan:
     grid: tuple[int, int, int]
     total_tiles: int
     write_lse: bool
+    num_q_heads: int = 8
+    num_kv_heads: int = 1
 
 
 def _request_ordered_plan_from_route(
@@ -66,11 +68,14 @@ def _request_ordered_plan_from_route(
         grid=(grid_x, grid_y, grid_z),
         total_tiles=int(plan["total_tiles"]),
         write_lse=bool(plan["write_lse"]),
+        num_q_heads=int(plan.get("num_q_heads", 8)),
+        num_kv_heads=int(plan.get("num_kv_heads", 1)),
     )
 
 
 def _fallback_cake_fmha_request_ordered_plan(
-    *, batch_size: int, q_len: int, write_lse: bool
+    *, batch_size: int, q_len: int, write_lse: bool,
+    num_q_heads: int = 8, num_kv_heads: int = 1,
 ) -> CakeFmhaRequestOrderedDecodePlan:
     if batch_size <= 0 or q_len not in (1, 6):
         raise ValueError(
@@ -80,7 +85,7 @@ def _fallback_cake_fmha_request_ordered_plan(
         f"fallback_q{q_len}_ordered_s1_lse" if write_lse else f"fallback_q{q_len}"
     )
     matches = []
-    for route in get_cake_fmha_request_ordered_manifest()["routes"]:
+    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)["routes"]:
         plan = route["build_plan"]
         if (
             plan["route_slug"] == route_slug
@@ -104,9 +109,11 @@ def _fallback_cake_fmha_request_ordered_plan(
         batch_size=batch_size,
         q_len=q_len,
         workspace_parts=1,
-        grid=(q_len, 1, batch_size),
-        total_tiles=batch_size * q_len,
+        grid=(q_len, num_q_heads // 8, batch_size),
+        total_tiles=batch_size * q_len * (num_q_heads // 8),
         write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
     )
 
 
@@ -117,6 +124,8 @@ def plan_cake_fmha_request_ordered_paged_decode(
     request_order_case: Literal["identity", "length_desc"] = "length_desc",
     real_batch_size: int | None = None,
     write_lse: bool = False,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 1,
 ) -> CakeFmhaRequestOrderedDecodePlan:
     """Select an exported schedule from host-visible immutable metadata.
 
@@ -136,7 +145,7 @@ def plan_cake_fmha_request_ordered_paged_decode(
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
 
     exact = []
-    for route in get_cake_fmha_request_ordered_manifest()["routes"]:
+    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)["routes"]:
         args = route["args"]
         plan = route["build_plan"]
         if (
@@ -161,6 +170,8 @@ def plan_cake_fmha_request_ordered_paged_decode(
         batch_size=batch_size,
         q_len=q_len,
         write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
     )
 
 
@@ -173,10 +184,12 @@ def _is_authenticated_request_ordered_plan(
         batch_size=plan.batch_size,
         q_len=plan.q_len,
         write_lse=plan.write_lse,
+        num_q_heads=plan.num_q_heads,
+        num_kv_heads=plan.num_kv_heads,
     )
     if plan == fallback:
         return True
-    for route in get_cake_fmha_request_ordered_manifest()["routes"]:
+    for route in get_cake_fmha_request_ordered_manifest(plan.num_q_heads, plan.num_kv_heads)["routes"]:
         build_plan = route["build_plan"]
         if (
             build_plan["ordered"] is True
@@ -301,9 +314,9 @@ def _run_cake_fmha_request_ordered_paged_decode(
             f"request-ordered Cake FMHA requires a 152-SM device, got {sm_count}"
         )
     batch_size, q_len = plan.batch_size, plan.q_len
-    if query.shape != (batch_size * q_len, 8, 256):
+    if query.shape != (batch_size * q_len, plan.num_q_heads, 256):
         raise ValueError(
-            "request-ordered Cake FMHA requires Q shape [batch*q_len, 8, 256]"
+            "request-ordered Cake FMHA requires Q shape [batch*q_len, plan.num_q_heads, 256]"
         )
     if query.dtype != torch.bfloat16 or not query.is_contiguous():
         raise TypeError("request-ordered Cake FMHA requires contiguous BF16 Q")
@@ -318,7 +331,7 @@ def _run_cake_fmha_request_ordered_paged_decode(
     if (
         key_cache.ndim != 4
         or value_cache.ndim != 4
-        or tuple(key_cache.shape[1:]) != (1, 64, 256)
+        or tuple(key_cache.shape[1:]) != (plan.num_kv_heads, 64, 256)
         or value_cache.shape != key_cache.shape
         or key_cache.dtype != torch.float8_e4m3fn
         or value_cache.dtype != torch.float8_e4m3fn
@@ -327,7 +340,7 @@ def _run_cake_fmha_request_ordered_paged_decode(
     ):
         raise TypeError(
             "request-ordered Cake FMHA requires FP8 E4M3 HND K/V with a "
-            "contiguous head dimension and shape [pages, 1, 64, 256]"
+            "contiguous head dimension and shape [pages, plan.num_kv_heads, 64, 256]"
         )
     if max_seq_len <= 0:
         raise ValueError("request-ordered Cake FMHA requires max_seq_len > 0")
@@ -426,7 +439,7 @@ def _run_cake_fmha_request_ordered_paged_decode(
         partial_lse = lse_arg
         completion = seq_lens.view(torch.uint32)
     else:
-        completion_elems = batch_size * q_len
+        completion_elems = batch_size * q_len * (plan.num_q_heads // 8)
         if (
             completion_buffer is None
             or completion_buffer.device != query.device
@@ -436,10 +449,10 @@ def _run_cake_fmha_request_ordered_paged_decode(
         ):
             raise ValueError(
                 "split request-order plans require a zero-initialized contiguous "
-                "int32/uint32 multi_ctas_kv_counter_buffer with batch*q_len elements"
+                "int32/uint32 multi_ctas_kv_counter_buffer with batch*q_len*(num_q_heads/8) elements"
             )
         completion = completion_buffer[:completion_elems].view(torch.uint32)
-        rows = batch_size * q_len * 8 * plan.workspace_parts
+        rows = batch_size * q_len * plan.num_q_heads * plan.workspace_parts
         partial_o_bytes = rows * 256 * 2
         partial_lse_bytes = rows * 4
         cursor = 32 * 1024 * 1024
@@ -479,8 +492,8 @@ def _run_cake_fmha_request_ordered_paged_decode(
             bmm1_scale_log2,
             bmm2_scale,
             1,
-            8,
-            1,
+            plan.num_q_heads,
+            plan.num_kv_heads,
             batch_size,
             plan.total_tiles,
             tma_workspace,

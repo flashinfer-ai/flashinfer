@@ -54,18 +54,22 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(f"invalid request-ordered FMHA manifest: {message}")
 
 
-def _source_root() -> Path:
+def _source_root(num_q_heads: int = 8, num_kv_heads: int = 1) -> Path:
+    _require((num_q_heads, num_kv_heads) in ((8, 1), (32, 2)), "head geometry")
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    directory = "request_ordered_paged_decode" + suffix
+    manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
     installed = (
-        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / "request_ordered_paged_decode"
+        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
     )
     checkout = (
         Path(__file__).resolve().parents[2]
         / "csrc"
         / "cake_fmha"
-        / "request_ordered_paged_decode"
+        / directory
     )
     for candidate in (installed, checkout):
-        if (candidate / _MANIFEST_NAME).is_file():
+        if (candidate / manifest_name).is_file():
             return candidate
     raise FileNotFoundError(
         "request-ordered Cake FMHA sources were not found; checked "
@@ -101,17 +105,24 @@ def _verified_source(root: Path, value: object, digest: object, label: str) -> P
 
 
 @functools.cache
-def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
+def get_cake_fmha_request_ordered_manifest(
+    num_q_heads: int = 8, num_kv_heads: int = 1
+) -> dict[str, Any]:
     """Load and authenticate the generated-program route ledger."""
 
-    root = _source_root()
-    payload: Any = json.loads((root / _MANIFEST_NAME).read_text())
+    root = _source_root(num_q_heads, num_kv_heads)
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
+    payload: Any = json.loads((root / manifest_name).read_text())
     _require(isinstance(payload, dict), "root")
     _require(payload.get("schema") == _SCHEMA, "schema")
     _require(payload.get("target") == "sm_103a", "target")
     _require(payload.get("shape_count") == 43, "shape_count")
     _require(payload.get("module_count") == 13, "module_count")
-    _require(payload.get("contract") == _CONTRACT, "contract")
+    expected_contract = dict(_CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)
+    if suffix:
+        expected_contract.update(q_groups_per_kv=2, query_heads_per_work_group=8)
+    _require(payload.get("contract") == expected_contract, "contract")
     modules = payload.get("modules")
     routes = payload.get("routes")
     _require(isinstance(modules, list) and len(modules) == 13, "modules")
@@ -181,6 +192,17 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
         plan = route.get("build_plan")
         _require(isinstance(plan, dict), f"routes[{index}].build_plan")
         _require(plan.get("q_len") in (1, 6), f"routes[{index}].build_plan.q_len")
+        if suffix:
+            _require(
+                plan.get("num_q_heads") == 32 and plan.get("num_kv_heads") == 2
+                and plan.get("q_groups_per_kv") == 2,
+                f"routes[{index}].build_plan.head_geometry",
+            )
+            _require(
+                route.get("args", {}).get("params", {}).get("num_qo_heads") == 32
+                and route.get("args", {}).get("params", {}).get("num_kv_heads") == 2,
+                f"routes[{index}].args.head_geometry",
+            )
     return payload
 
 
@@ -188,8 +210,9 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
 def get_cake_fmha_request_ordered_module_spec(
     name: str,
 ) -> CakeFmhaRequestOrderedModuleSpec:
-    root = _source_root()
-    manifest = get_cake_fmha_request_ordered_manifest()
+    geometry = (32, 2) if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_") else (8, 1)
+    root = _source_root(*geometry)
+    manifest = get_cake_fmha_request_ordered_manifest(*geometry)
     matches = [module for module in manifest["modules"] if module["name"] == name]
     if len(matches) != 1:
         raise ValueError(f"unknown request-ordered FMHA module: {name}")
@@ -447,7 +470,7 @@ def load_cake_fmha_request_ordered_module(name: str):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         raise RuntimeError("request-ordered Cake FMHA requires compute capability 10.3")
     spec = get_cake_fmha_request_ordered_module_spec(name)
-    root = _source_root()
+    root = spec.binding_path.parents[2]
     cubin, build_directory = _cached_cubin(spec)
     result = cpp.load_inline(
         build_directory.name,

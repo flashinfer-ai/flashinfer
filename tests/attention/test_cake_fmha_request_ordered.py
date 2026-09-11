@@ -52,7 +52,8 @@ def _route(
     }
 
 
-def _manifest() -> dict:
+def _manifest(num_q_heads: int = 8, num_kv_heads: int = 1) -> dict:
+    assert (num_q_heads, num_kv_heads) == (8, 1)
     exact_lengths = (8193, 57345, 73729, 81921)
     return {
         "routes": [
@@ -174,8 +175,11 @@ def test_host_plan_requires_device_order_tensor() -> None:
 
 
 @pytest.mark.parametrize("q_len", (1, 6))
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), ((8, 1), (32, 2)))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_request_ordered_capture_prepares_actual_producer_q(q_len: int) -> None:
+def test_request_ordered_capture_prepares_actual_producer_q(
+    q_len: int, num_q_heads: int, num_kv_heads: int
+) -> None:
     """Two live graphs retain their own real captured-Q descriptor bindings."""
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("request-ordered Cake FMHA requires SM103")
@@ -187,12 +191,12 @@ def test_request_ordered_capture_prepares_actual_producer_q(q_len: int) -> None:
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(48320 + q_len)
     base = torch.randn(
-        batch * q_len, 8, 256, dtype=torch.bfloat16, device=device,
+        batch * q_len, num_q_heads, 256, dtype=torch.bfloat16, device=device,
         generator=generator,
     )
     key, value = (
         torch.randn(
-            batch * page_slots, 1, 64, 256, dtype=torch.float32,
+            batch * page_slots, num_kv_heads, 64, 256, dtype=torch.float32,
             device=device, generator=generator,
         ).to(torch.float8_e4m3fn)
         for _ in range(2)
@@ -204,7 +208,9 @@ def test_request_ordered_capture_prepares_actual_producer_q(q_len: int) -> None:
     order = torch.arange(batch, dtype=torch.int32, device=device)
     qk = torch.tensor([math.log2(math.e) / 16], dtype=torch.float32, device=device)
     pv = torch.ones(1, dtype=torch.float32, device=device)
-    plan = flashinfer.plan_cake_fmha_request_ordered_paged_decode(lengths, q_len)
+    plan = flashinfer.plan_cake_fmha_request_ordered_paged_decode(
+        lengths, q_len, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+    )
     assert plan.workspace_parts == 1
 
     def invoke(query, workspace, output, preparation=None):
@@ -220,14 +226,20 @@ def test_request_ordered_capture_prepares_actual_producer_q(q_len: int) -> None:
     def reference(query):
         rows = []
         for request, length in enumerate(lengths):
-            k = key[tables[request].long(), 0].float().reshape(-1, 256)[:length]
-            v = value[tables[request].long(), 0].float().reshape(-1, 256)[:length]
-            q = query.view(batch, q_len, 8, 256)[request].float()
-            scores = torch.einsum("qhd,kd->hqk", q, k) / 16
+            k = key[tables[request].long()].float().permute(0, 2, 1, 3)
+            v = value[tables[request].long()].float().permute(0, 2, 1, 3)
+            k = k.reshape(-1, num_kv_heads, 256)[:length]
+            v = v.reshape(-1, num_kv_heads, 256)[:length]
+            head_indices = torch.arange(num_q_heads, device=device) // (
+                num_q_heads // num_kv_heads
+            )
+            k, v = k[:, head_indices], v[:, head_indices]
+            q = query.view(batch, q_len, num_q_heads, 256)[request].float()
+            scores = torch.einsum("qhd,khd->hqk", q, k) / 16
             visible = length - q_len + torch.arange(q_len, device=device) + 1
             mask = torch.arange(length, device=device)[None, :] < visible[:, None]
             probabilities = scores.masked_fill(~mask[None, :, :], -torch.inf).softmax(-1)
-            rows.append(torch.einsum("hqk,kd->qhd", probabilities, v))
+            rows.append(torch.einsum("hqk,khd->qhd", probabilities, v))
         return torch.cat(rows).to(torch.bfloat16)
 
     # Keep the eager producer result alive to force an actual new Q allocation
