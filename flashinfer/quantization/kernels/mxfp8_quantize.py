@@ -37,6 +37,7 @@ from cutlass import Float32, Int32, Uint8
 
 from ...api_logging import flashinfer_api
 from ...cute_dsl.fp4_common import (
+    fmax_f32,
     ld_global_v4_u32,
     st_global_u64,
     get_ptr_as_int64,
@@ -71,6 +72,8 @@ from ..quantization_cute_dsl_utils import (
     bfloat2_max_abs_8,
     half2x4_to_fp8x8_packed,
     bfloat2x4_to_fp8x8_packed,
+    float_max_abs_8,
+    floatx8_to_fp8x8_packed,
 )
 
 
@@ -179,6 +182,7 @@ class MXFP8QuantizeLinearKernel:
         use_2t_per_sf: bool = True,
     ):
         self.is_bfloat16 = dtype == cutlass.BFloat16
+        self.is_float32 = dtype == cutlass.Float32
         self.enable_pdl = enable_pdl
         self.use_2t_per_sf = use_2t_per_sf
 
@@ -262,31 +266,61 @@ class MXFP8QuantizeLinearKernel:
             row_input = mInput[row_idx, None]
 
             if cutlass.const_expr(self.use_2t_per_sf):
-                # 2T/SF path: load 16 elements (2x128-bit), 1-shuffle reduction
-                input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
-                input_ptr_hi = get_ptr_as_int64(row_input, elem_idx + Int32(8))
-                v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
-                v4, v5, v6, v7 = ld_global_v4_u32(input_ptr_hi)
-
-                if cutlass.const_expr(self.is_bfloat16):
-                    max_all = bfloat2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
-                    local_max = bfloat2_hmax_reduce_to_f32(max_all)
+                # 2T/SF path: 16 elements/thread, 1-shuffle reduction.
+                # fp16/bf16: 2x128-bit loads (8 elts each); fp32: 4x128-bit
+                # loads (4 elts each), so lanes v0..v15 hold 16 floats.
+                if cutlass.const_expr(self.is_float32):
+                    v0, v1, v2, v3 = ld_global_v4_u32(
+                        get_ptr_as_int64(row_input, elem_idx)
+                    )
+                    v4, v5, v6, v7 = ld_global_v4_u32(
+                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
+                    )
+                    v8, v9, v10, v11 = ld_global_v4_u32(
+                        get_ptr_as_int64(row_input, elem_idx + Int32(8))
+                    )
+                    v12, v13, v14, v15 = ld_global_v4_u32(
+                        get_ptr_as_int64(row_input, elem_idx + Int32(12))
+                    )
+                    local_max = fmax_f32(
+                        float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
+                        float_max_abs_8(v8, v9, v10, v11, v12, v13, v14, v15),
+                    )
                 else:
-                    max_all = half2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
-                    local_max = hmax_reduce_to_f32(max_all)
+                    input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
+                    input_ptr_hi = get_ptr_as_int64(row_input, elem_idx + Int32(8))
+                    v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
+                    v4, v5, v6, v7 = ld_global_v4_u32(input_ptr_hi)
+
+                    if cutlass.const_expr(self.is_bfloat16):
+                        max_all = bfloat2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                        local_max = bfloat2_hmax_reduce_to_f32(max_all)
+                    else:
+                        max_all = half2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                        local_max = hmax_reduce_to_f32(max_all)
 
                 global_max = reduce_max_2threads(local_max)
             else:
-                # 4T/SF path: load 8 elements (1x128-bit), 2-shuffle reduction
-                input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
-                v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
-
-                if cutlass.const_expr(self.is_bfloat16):
-                    max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
-                    local_max = bfloat2_hmax_reduce_to_f32(max0123)
+                # 4T/SF path: 8 elements/thread, 2-shuffle reduction.
+                # fp16/bf16: 1x128-bit load; fp32: 2x128-bit loads.
+                if cutlass.const_expr(self.is_float32):
+                    v0, v1, v2, v3 = ld_global_v4_u32(
+                        get_ptr_as_int64(row_input, elem_idx)
+                    )
+                    v4, v5, v6, v7 = ld_global_v4_u32(
+                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
+                    )
+                    local_max = float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
                 else:
-                    max0123 = half2_max_abs_4(v0, v1, v2, v3)
-                    local_max = hmax_reduce_to_f32(max0123)
+                    input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
+                    v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
+
+                    if cutlass.const_expr(self.is_bfloat16):
+                        max0123 = bfloat2_max_abs_4(v0, v1, v2, v3)
+                        local_max = bfloat2_hmax_reduce_to_f32(max0123)
+                    else:
+                        max0123 = half2_max_abs_4(v0, v1, v2, v3)
+                        local_max = hmax_reduce_to_f32(max0123)
 
                 global_max = reduce_max_4threads(local_max)
 
@@ -301,7 +335,14 @@ class MXFP8QuantizeLinearKernel:
 
             # Quantize to FP8 E4M3 and pack for vectorized store
             if cutlass.const_expr(self.use_2t_per_sf):
-                if cutlass.const_expr(self.is_bfloat16):
+                if cutlass.const_expr(self.is_float32):
+                    fp8_lo = floatx8_to_fp8x8_packed(
+                        v0, v1, v2, v3, v4, v5, v6, v7, inv_scale
+                    )
+                    fp8_hi = floatx8_to_fp8x8_packed(
+                        v8, v9, v10, v11, v12, v13, v14, v15, inv_scale
+                    )
+                elif cutlass.const_expr(self.is_bfloat16):
                     fp8_lo = bfloat2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
                     fp8_hi = bfloat2x4_to_fp8x8_packed(v4, v5, v6, v7, inv_scale)
                 else:
@@ -312,7 +353,11 @@ class MXFP8QuantizeLinearKernel:
                 st_global_u64(get_ptr_as_int64(row_output, elem_idx), fp8_lo)
                 st_global_u64(get_ptr_as_int64(row_output, elem_idx + Int32(8)), fp8_hi)
             else:
-                if cutlass.const_expr(self.is_bfloat16):
+                if cutlass.const_expr(self.is_float32):
+                    fp8_packed = floatx8_to_fp8x8_packed(
+                        v0, v1, v2, v3, v4, v5, v6, v7, inv_scale
+                    )
+                elif cutlass.const_expr(self.is_bfloat16):
                     fp8_packed = bfloat2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
                 else:
                     fp8_packed = half2x4_to_fp8x8_packed(v0, v1, v2, v3, inv_scale)
@@ -366,6 +411,7 @@ class MXFP8QuantizeSwizzledKernel:
         sf_layout: int = SF_LAYOUT_128x4,
     ):
         self.is_bfloat16 = dtype == cutlass.BFloat16
+        self.is_float32 = dtype == cutlass.Float32
         self.enable_pdl = enable_pdl
         self.use_2t_per_sf = use_2t_per_sf
         self.sf_layout = sf_layout
@@ -500,32 +546,67 @@ class MXFP8QuantizeSwizzledKernel:
                         row_input = mInput[row_idx, None]
 
                         if cutlass.const_expr(self.use_2t_per_sf):
-                            input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
-                            input_ptr_hi = get_ptr_as_int64(
-                                row_input, elem_idx + Int32(8)
-                            )
-                            v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
-                            v4, v5, v6, v7 = ld_global_v4_u32(input_ptr_hi)
-                            if cutlass.const_expr(self.is_bfloat16):
-                                local_max = bfloat2_hmax_reduce_to_f32(
-                                    bfloat2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                            if cutlass.const_expr(self.is_float32):
+                                # fp32: 16 elements = 4x128-bit loads
+                                v0, v1, v2, v3 = ld_global_v4_u32(
+                                    get_ptr_as_int64(row_input, elem_idx)
+                                )
+                                v4, v5, v6, v7 = ld_global_v4_u32(
+                                    get_ptr_as_int64(row_input, elem_idx + Int32(4))
+                                )
+                                v8, v9, v10, v11 = ld_global_v4_u32(
+                                    get_ptr_as_int64(row_input, elem_idx + Int32(8))
+                                )
+                                v12, v13, v14, v15 = ld_global_v4_u32(
+                                    get_ptr_as_int64(row_input, elem_idx + Int32(12))
+                                )
+                                local_max = fmax_f32(
+                                    float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
+                                    float_max_abs_8(
+                                        v8, v9, v10, v11, v12, v13, v14, v15
+                                    ),
                                 )
                             else:
-                                local_max = hmax_reduce_to_f32(
-                                    half2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                                input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
+                                input_ptr_hi = get_ptr_as_int64(
+                                    row_input, elem_idx + Int32(8)
                                 )
+                                v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
+                                v4, v5, v6, v7 = ld_global_v4_u32(input_ptr_hi)
+                                if cutlass.const_expr(self.is_bfloat16):
+                                    local_max = bfloat2_hmax_reduce_to_f32(
+                                        bfloat2_max_abs_8(
+                                            v0, v1, v2, v3, v4, v5, v6, v7
+                                        )
+                                    )
+                                else:
+                                    local_max = hmax_reduce_to_f32(
+                                        half2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                                    )
                             global_max = reduce_max_2threads(local_max)
                         else:
-                            input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
-                            v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
-                            if cutlass.const_expr(self.is_bfloat16):
-                                local_max = bfloat2_hmax_reduce_to_f32(
-                                    bfloat2_max_abs_4(v0, v1, v2, v3)
+                            if cutlass.const_expr(self.is_float32):
+                                # fp32: 8 elements = 2x128-bit loads
+                                v0, v1, v2, v3 = ld_global_v4_u32(
+                                    get_ptr_as_int64(row_input, elem_idx)
+                                )
+                                v4, v5, v6, v7 = ld_global_v4_u32(
+                                    get_ptr_as_int64(row_input, elem_idx + Int32(4))
+                                )
+                                local_max = float_max_abs_8(
+                                    v0, v1, v2, v3, v4, v5, v6, v7
                                 )
                             else:
-                                local_max = hmax_reduce_to_f32(
-                                    half2_max_abs_4(v0, v1, v2, v3)
-                                )
+                                input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
+                                v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
+                                if cutlass.const_expr(self.is_bfloat16):
+                                    local_max = bfloat2_hmax_reduce_to_f32(
+                                        bfloat2_max_abs_4(v0, v1, v2, v3)
+                                    )
+                                else:
+                                    local_max = hmax_reduce_to_f32(
+                                        half2_max_abs_4(v0, v1, v2, v3)
+                                    )
                             global_max = reduce_max_4threads(local_max)
 
                         inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
@@ -536,7 +617,14 @@ class MXFP8QuantizeSwizzledKernel:
 
                         row_output = mOutput[row_idx, None]
                         if cutlass.const_expr(self.use_2t_per_sf):
-                            if cutlass.const_expr(self.is_bfloat16):
+                            if cutlass.const_expr(self.is_float32):
+                                fp8_lo = floatx8_to_fp8x8_packed(
+                                    v0, v1, v2, v3, v4, v5, v6, v7, inv_scale
+                                )
+                                fp8_hi = floatx8_to_fp8x8_packed(
+                                    v8, v9, v10, v11, v12, v13, v14, v15, inv_scale
+                                )
+                            elif cutlass.const_expr(self.is_bfloat16):
                                 fp8_lo = bfloat2x4_to_fp8x8_packed(
                                     v0, v1, v2, v3, inv_scale
                                 )
@@ -558,7 +646,11 @@ class MXFP8QuantizeSwizzledKernel:
                                 fp8_hi,
                             )
                         else:
-                            if cutlass.const_expr(self.is_bfloat16):
+                            if cutlass.const_expr(self.is_float32):
+                                fp8_packed = floatx8_to_fp8x8_packed(
+                                    v0, v1, v2, v3, v4, v5, v6, v7, inv_scale
+                                )
+                            elif cutlass.const_expr(self.is_bfloat16):
                                 fp8_packed = bfloat2x4_to_fp8x8_packed(
                                     v0, v1, v2, v3, inv_scale
                                 )
@@ -631,34 +723,73 @@ class MXFP8QuantizeSwizzledKernel:
                             row_input = mInput[row_idx, None]
 
                             if cutlass.const_expr(self.use_2t_per_sf):
-                                input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
-                                input_ptr_hi = get_ptr_as_int64(
-                                    row_input, elem_idx + Int32(8)
-                                )
-                                v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
-                                v4, v5, v6, v7 = ld_global_v4_u32(input_ptr_hi)
-                                if cutlass.const_expr(self.is_bfloat16):
-                                    local_max = bfloat2_hmax_reduce_to_f32(
-                                        bfloat2_max_abs_8(
-                                            v0, v1, v2, v3, v4, v5, v6, v7
+                                if cutlass.const_expr(self.is_float32):
+                                    # fp32: 16 elements = 4x128-bit loads
+                                    v0, v1, v2, v3 = ld_global_v4_u32(
+                                        get_ptr_as_int64(row_input, elem_idx)
+                                    )
+                                    v4, v5, v6, v7 = ld_global_v4_u32(
+                                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
+                                    )
+                                    v8, v9, v10, v11 = ld_global_v4_u32(
+                                        get_ptr_as_int64(row_input, elem_idx + Int32(8))
+                                    )
+                                    v12, v13, v14, v15 = ld_global_v4_u32(
+                                        get_ptr_as_int64(
+                                            row_input, elem_idx + Int32(12)
                                         )
                                     )
-                                else:
-                                    local_max = hmax_reduce_to_f32(
-                                        half2_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7)
+                                    local_max = fmax_f32(
+                                        float_max_abs_8(v0, v1, v2, v3, v4, v5, v6, v7),
+                                        float_max_abs_8(
+                                            v8, v9, v10, v11, v12, v13, v14, v15
+                                        ),
                                     )
+                                else:
+                                    input_ptr_lo = get_ptr_as_int64(row_input, elem_idx)
+                                    input_ptr_hi = get_ptr_as_int64(
+                                        row_input, elem_idx + Int32(8)
+                                    )
+                                    v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_lo)
+                                    v4, v5, v6, v7 = ld_global_v4_u32(input_ptr_hi)
+                                    if cutlass.const_expr(self.is_bfloat16):
+                                        local_max = bfloat2_hmax_reduce_to_f32(
+                                            bfloat2_max_abs_8(
+                                                v0, v1, v2, v3, v4, v5, v6, v7
+                                            )
+                                        )
+                                    else:
+                                        local_max = hmax_reduce_to_f32(
+                                            half2_max_abs_8(
+                                                v0, v1, v2, v3, v4, v5, v6, v7
+                                            )
+                                        )
                                 global_max = reduce_max_2threads(local_max)
                             else:
-                                input_ptr_i64 = get_ptr_as_int64(row_input, elem_idx)
-                                v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
-                                if cutlass.const_expr(self.is_bfloat16):
-                                    local_max = bfloat2_hmax_reduce_to_f32(
-                                        bfloat2_max_abs_4(v0, v1, v2, v3)
+                                if cutlass.const_expr(self.is_float32):
+                                    # fp32: 8 elements = 2x128-bit loads
+                                    v0, v1, v2, v3 = ld_global_v4_u32(
+                                        get_ptr_as_int64(row_input, elem_idx)
+                                    )
+                                    v4, v5, v6, v7 = ld_global_v4_u32(
+                                        get_ptr_as_int64(row_input, elem_idx + Int32(4))
+                                    )
+                                    local_max = float_max_abs_8(
+                                        v0, v1, v2, v3, v4, v5, v6, v7
                                     )
                                 else:
-                                    local_max = hmax_reduce_to_f32(
-                                        half2_max_abs_4(v0, v1, v2, v3)
+                                    input_ptr_i64 = get_ptr_as_int64(
+                                        row_input, elem_idx
                                     )
+                                    v0, v1, v2, v3 = ld_global_v4_u32(input_ptr_i64)
+                                    if cutlass.const_expr(self.is_bfloat16):
+                                        local_max = bfloat2_hmax_reduce_to_f32(
+                                            bfloat2_max_abs_4(v0, v1, v2, v3)
+                                        )
+                                    else:
+                                        local_max = hmax_reduce_to_f32(
+                                            half2_max_abs_4(v0, v1, v2, v3)
+                                        )
                                 global_max = reduce_max_4threads(local_max)
 
                             inv_e4m3_max = Float32(INV_FLOAT8_E4M3_MAX)
@@ -670,7 +801,14 @@ class MXFP8QuantizeSwizzledKernel:
 
                             row_output = mOutput[row_idx, None]
                             if cutlass.const_expr(self.use_2t_per_sf):
-                                if cutlass.const_expr(self.is_bfloat16):
+                                if cutlass.const_expr(self.is_float32):
+                                    fp8_lo = floatx8_to_fp8x8_packed(
+                                        v0, v1, v2, v3, v4, v5, v6, v7, inv_scale
+                                    )
+                                    fp8_hi = floatx8_to_fp8x8_packed(
+                                        v8, v9, v10, v11, v12, v13, v14, v15, inv_scale
+                                    )
+                                elif cutlass.const_expr(self.is_bfloat16):
                                     fp8_lo = bfloat2x4_to_fp8x8_packed(
                                         v0, v1, v2, v3, inv_scale
                                     )
@@ -692,7 +830,11 @@ class MXFP8QuantizeSwizzledKernel:
                                     fp8_hi,
                                 )
                             else:
-                                if cutlass.const_expr(self.is_bfloat16):
+                                if cutlass.const_expr(self.is_float32):
+                                    fp8_packed = floatx8_to_fp8x8_packed(
+                                        v0, v1, v2, v3, v4, v5, v6, v7, inv_scale
+                                    )
+                                elif cutlass.const_expr(self.is_bfloat16):
                                     fp8_packed = bfloat2x4_to_fp8x8_packed(
                                         v0, v1, v2, v3, inv_scale
                                     )
@@ -738,9 +880,22 @@ class MXFP8QuantizeSwizzledKernel:
 # =============================================================================
 
 
+# torch dtype -> (cache key, cutlass dtype) for the supported input dtypes.
+_CUTLASS_DTYPE_MAP = {
+    "fp16": cutlass.Float16,
+    "bf16": cutlass.BFloat16,
+    "fp32": cutlass.Float32,
+}
+_TORCH_DTYPE_KEY = {
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+    torch.float32: "fp32",
+}
+
+
 @functools.cache
 def _get_compiled_kernel_mxfp8_linear(
-    is_bfloat16: bool,
+    dtype_key: str,
     K: int,
     enable_pdl: bool = False,
     use_2t_per_sf: bool = True,
@@ -755,7 +910,7 @@ def _get_compiled_kernel_mxfp8_linear(
         Tuple of (compiled_kernel, sf_blocks_per_tb) where sf_blocks_per_tb
         is used by the caller to compute num_blocks at runtime.
     """
-    cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
+    cutlass_dtype = _CUTLASS_DTYPE_MAP[dtype_key]
     kernel_obj = MXFP8QuantizeLinearKernel(cutlass_dtype, K, enable_pdl, use_2t_per_sf)
 
     # Use symbolic M for dynamic batch sizes
@@ -790,7 +945,7 @@ def _get_compiled_kernel_mxfp8_linear(
 
 @functools.cache
 def _get_compiled_kernel_mxfp8_swizzled(
-    is_bfloat16: bool,
+    dtype_key: str,
     K: int,
     enable_pdl: bool = False,
     use_2t_per_sf: bool = True,
@@ -806,7 +961,7 @@ def _get_compiled_kernel_mxfp8_swizzled(
         Tuple of (compiled_kernel, rows_per_block) where rows_per_block
         is used by the caller to compute num_blocks at runtime.
     """
-    cutlass_dtype = cutlass.BFloat16 if is_bfloat16 else cutlass.Float16
+    cutlass_dtype = _CUTLASS_DTYPE_MAP[dtype_key]
     kernel_obj = MXFP8QuantizeSwizzledKernel(
         cutlass_dtype, K, enable_pdl, use_2t_per_sf, sf_layout=sf_layout
     )
@@ -864,7 +1019,7 @@ def mxfp8_quantize_cute_dsl(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp32.
     is_sf_swizzled_layout : bool
         Whether to use a swizzled layout (``True``) or linear (``False``).
         When ``True``, the layout is 128x4 by default; pass
@@ -889,8 +1044,8 @@ def mxfp8_quantize_cute_dsl(
     """
     from ...utils import device_support_pdl
 
-    assert input.dtype in (torch.float16, torch.bfloat16), (
-        f"Input dtype must be float16 or bfloat16, got {input.dtype}"
+    assert input.dtype in (torch.float16, torch.bfloat16, torch.float32), (
+        f"Input dtype must be float16, bfloat16, or float32, got {input.dtype}"
     )
     assert input.is_cuda, "Input must be on CUDA device"
     assert alignment % SF_VEC_SIZE == 0, (
@@ -921,7 +1076,7 @@ def mxfp8_quantize_cute_dsl(
     else:
         input_padded = input.contiguous()
 
-    is_bfloat16 = input.dtype == torch.bfloat16
+    dtype_key = _TORCH_DTYPE_KEY[input.dtype]
 
     # Cached device-specific target grid for grid size computation
     target_grid = get_num_sm(input.device) * _BLOCKS_PER_SM
@@ -944,7 +1099,7 @@ def mxfp8_quantize_cute_dsl(
         scale_output_size = padded_m * padded_sf_cols
 
         kernel_fn, rows_per_block = _get_compiled_kernel_mxfp8_swizzled(
-            is_bfloat16, padded_k, enable_pdl, use_2t, sf_layout
+            dtype_key, padded_k, enable_pdl, use_2t, sf_layout
         )
 
         num_blocks = min((padded_m + rows_per_block - 1) // rows_per_block, target_grid)
@@ -961,7 +1116,7 @@ def mxfp8_quantize_cute_dsl(
         scale_output_size = total_sf_blocks
 
         kernel_fn, sf_blocks_per_tb = _get_compiled_kernel_mxfp8_linear(
-            is_bfloat16, padded_k, enable_pdl, use_2t
+            dtype_key, padded_k, enable_pdl, use_2t
         )
 
         num_blocks = min(

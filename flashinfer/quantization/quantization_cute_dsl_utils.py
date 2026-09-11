@@ -335,6 +335,48 @@ def bfloat2_to_fp8x2_scaled(
 
 
 @dsl_user_op
+def float2_to_fp8x2_scaled(
+    f0_bits: Uint32, f1_bits: Uint32, inv_scale: Float32, *, loc=None, ip=None
+) -> Uint32:
+    """Convert 2 FP32 values (u32 bit patterns) to 2 FP8 E4M3 with scaling."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(f0_bits).ir_value(loc=loc, ip=ip),
+                Uint32(f1_bits).ir_value(loc=loc, ip=ip),
+                Float32(inv_scale).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .f32 f0, f1;
+                .reg .b16 fp8_pair;
+
+                mov.b32 f0, $1;
+                mov.b32 f1, $2;
+                mul.f32 f0, f0, $3;
+                mul.f32 f1, f1, $3;
+                // Saturate to +/-448 (E4M3 max) so inf/overflow -> max finite,
+                // not NaN, matching torch's saturating float8_e4m3fn cast.
+                min.f32 f0, f0, 0f43E00000;
+                max.f32 f0, f0, 0fC3E00000;
+                min.f32 f1, f1, 0f43E00000;
+                max.f32 f1, f1, 0fC3E00000;
+                cvt.rn.satfinite.e4m3x2.f32 fp8_pair, f1, f0;
+                cvt.u32.u16 $0, fp8_pair;
+            }
+            """,
+            "=r,r,r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def pack_fp8x8_to_u64(
     fp8_01: Uint32, fp8_23: Uint32, fp8_45: Uint32, fp8_67: Uint32, *, loc=None, ip=None
 ) -> Uint64:
@@ -691,6 +733,95 @@ def bfloat2x4_to_fp8x8_packed(
     fp8_23 = bfloat2_to_fp8x2_scaled(v1, inv_scale)
     fp8_45 = bfloat2_to_fp8x2_scaled(v2, inv_scale)
     fp8_67 = bfloat2_to_fp8x2_scaled(v3, inv_scale)
+    return pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
+
+
+@dsl_user_op
+def float4_max_abs_to_f32(
+    v0: Uint32, v1: Uint32, v2: Uint32, v3: Uint32, *, loc=None, ip=None
+) -> Float32:
+    """Max absolute value of 4 FP32 values given as u32 bit patterns."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Uint32(v0).ir_value(loc=loc, ip=ip),
+                Uint32(v1).ir_value(loc=loc, ip=ip),
+                Uint32(v2).ir_value(loc=loc, ip=ip),
+                Uint32(v3).ir_value(loc=loc, ip=ip),
+            ],
+            """
+            {
+                .reg .f32 f0, f1, f2, f3;
+                mov.b32 f0, $1;
+                mov.b32 f1, $2;
+                mov.b32 f2, $3;
+                mov.b32 f3, $4;
+                abs.f32 f0, f0;
+                abs.f32 f1, f1;
+                abs.f32 f2, f2;
+                abs.f32 f3, f3;
+                max.f32 f0, f0, f1;
+                max.f32 f2, f2, f3;
+                max.f32 $0, f0, f2;
+            }
+            """,
+            "=f,r,r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def float_max_abs_8(
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    v4: Uint32,
+    v5: Uint32,
+    v6: Uint32,
+    v7: Uint32,
+) -> Float32:
+    """
+    Compute max absolute value across 8 FP32 values (as u32 bit patterns).
+
+    Unlike the half/bfloat16 variants there is no packed lane type, so the
+    result is returned directly as Float32 (no *_reduce_to_f32 step needed).
+    """
+    from ..cute_dsl.fp4_common import fmax_f32
+
+    max0123 = float4_max_abs_to_f32(v0, v1, v2, v3)
+    max4567 = float4_max_abs_to_f32(v4, v5, v6, v7)
+    return fmax_f32(max0123, max4567)
+
+
+@cute.jit
+def floatx8_to_fp8x8_packed(
+    v0: Uint32,
+    v1: Uint32,
+    v2: Uint32,
+    v3: Uint32,
+    v4: Uint32,
+    v5: Uint32,
+    v6: Uint32,
+    v7: Uint32,
+    inv_scale: Float32,
+) -> Uint64:
+    """
+    Convert 8 FP32 values (as u32 bit patterns) to 8 FP8 E4M3 and pack into u64.
+
+    Each pair is converted to 2 FP8 values using the inverse scale, then all
+    8 FP8 values are packed into a single 64-bit value for vectorized store.
+    """
+    fp8_01 = float2_to_fp8x2_scaled(v0, v1, inv_scale)
+    fp8_23 = float2_to_fp8x2_scaled(v2, v3, inv_scale)
+    fp8_45 = float2_to_fp8x2_scaled(v4, v5, inv_scale)
+    fp8_67 = float2_to_fp8x2_scaled(v6, v7, inv_scale)
     return pack_fp8x8_to_u64(fp8_01, fp8_23, fp8_45, fp8_67)
 
 
