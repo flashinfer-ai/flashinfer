@@ -2324,8 +2324,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
-            For the ``cudnn`` backend this is interpreted in **element units**
-            (``cumsum(seq_lens_q) * num_qo_heads * head_dim_qk``), not token units.
+            Token units for every backend, including ``cudnn`` (it previously took
+            element-unit offsets; that contract has been normalized).
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
@@ -3018,11 +3018,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            if q.numel() != self._qo_indptr_last:
+            if q.size(0) != self._qo_indptr_last:
+                hint = ""
+                if q.numel() == self._qo_indptr_last:
+                    hint = (
+                        " qo_indptr looks like element-unit offsets "
+                        "(total_tokens * num_heads * head_dim); the cudnn backend now "
+                        "takes token-unit qo_indptr, like every other backend."
+                    )
                 raise ValueError(
-                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
-                    f"For cudnn paged prefill, qo_indptr uses element offsets "
-                    f"(total_tokens * num_heads * head_dim)."
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last})."
+                    + hint
                 )
         else:
             if q.size(0) != self._qo_indptr_last:
@@ -3238,17 +3244,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
-            # qo_indptr is element-unit (tokens * num_qo_heads * head_dim_qk). The O
-            # ragged offset is strided by head_dim_vo, so when head_dim_qk !=
-            # head_dim_vo the Q offset cannot be reused for O -- rescale it (only in
-            # that case, so the common head_dim_qk == head_dim_vo path is unchanged).
-            head_dim_qk = q.shape[-1]
-            head_dim_vo = out.shape[-1]
-            if head_dim_qk == head_dim_vo:
-                o_indptr = self._qo_indptr_buf
-            else:
-                o_indptr = self._qo_indptr_buf // head_dim_qk * head_dim_vo
-
+            # qo_indptr is token-unit (like every other backend). The low level
+            # consumes it directly as cu_seq_len_q / the Q and O ragged offsets,
+            # applying the per-tensor (num_heads * head_dim) multipliers itself, so
+            # head_dim_qk != head_dim_vo is handled without any offset rescaling.
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k_cache,  # Need to be changed
@@ -3266,7 +3265,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
                 batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_o=o_indptr,
+                batch_offsets_units="tokens",
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,
@@ -3610,9 +3609,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             sliding window, logits soft cap, custom mask or multi-item-scoring pointer is in
             play -- neither path accepts those, so ``auto`` stays on ``fa2`` for them.
             Otherwise ``fa2``.
-            When ``auto`` resolves to ``cudnn`` the caller's ``qo_indptr``/``kv_indptr`` keep
-            their ordinary **token** units; only an explicit ``backend="cudnn"`` uses the
-            legacy element-unit contract described under :meth:`plan`.
+            The ``cudnn`` backend takes ``qo_indptr``/``kv_indptr`` in the same **token**
+            units as every other backend, whether selected explicitly or via ``auto``.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
@@ -3729,12 +3727,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
+        # `auto` is re-resolved on every plan() (its answer depends on plan
+        # arguments such as window_left); _backend holds the resolved value.
+        self._requested_backend = backend
         self._backend = backend
         self._cached_module = None
-        # True when `auto` resolved to cudnn: the caller's indptrs are token-unit
-        # and are handed to cuDNN as-is (batch_offsets_units="tokens"). An
-        # explicit backend="cudnn" keeps the legacy element-unit contract.
-        self._cudnn_token_offsets = False
+        # cudnn: stats ragged offset so the LSE lands packed as
+        # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
         self._cudnn_stats_offsets: Optional[torch.Tensor] = None
 
     @property
@@ -3807,11 +3806,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
-            For an explicit ``backend="cudnn"`` the ``qo_indptr`` and ``kv_indptr`` are
-            interpreted in **element units** (``cumsum(seq_lens) * num_heads *
-            head_dim_qk``), not token units; when ``backend="auto"`` resolves to
-            cudnn they stay in token units. The ``cudnn`` backend also requires
-            ``kv_layout="NHD"``.
+            Token units for every backend, including ``cudnn`` (it previously took
+            element-unit offsets; that contract has been normalized). The ``cudnn``
+            backend also requires ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
             The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
         num_qo_heads : int
@@ -3900,18 +3897,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         seq_lens: Optional[torch.Tensor]
-            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+            Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
+            of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
         seq_lens_q: Optional[torch.Tensor]
-            A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
-            If not provided, will be set to the same value as ``seq_lens``.
+            Only used by the cudnn backend. A 1D int32 tensor with the q sequence length
+            of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``qo_indptr``.
         max_token_per_sequence: Optional[int],
-            Required for cudnn backend. This is the scalar max token length of each sequence.
+            Only used by the cudnn backend. The max q length of any sequence; defaults to
+            ``max(qo_indptr[1:] - qo_indptr[:-1])``.
         max_sequence_kv: Optional[int],
-            Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+            Only used by the cudnn backend. The max kv length of any sequence; defaults to
+            ``max(kv_indptr[1:] - kv_indptr[:-1])``.
         v_indptr: Optional[torch.Tensor]
-            Required for cudnn backend. This is the indptr of the value tensor.
+            Only used by the cudnn backend. Token-unit indptr of the value tensor;
+            defaults to ``kv_indptr``.
         o_indptr: Optional[torch.Tensor]
-            Required for cudnn backend. This is the indptr of the output tensor.
+            Only used by the cudnn backend. Token-unit indptr of the output tensor;
+            defaults to ``qo_indptr``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4230,7 +4232,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
+            if self._requested_backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -4306,9 +4308,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     )
                     if upgraded is not None:
                         self._backend = upgraded
-                        # cuDNN via `auto` takes the caller's token-unit
-                        # indptrs as-is (see _blackwell_ragged_auto_upgrade).
-                        self._cudnn_token_offsets = upgraded == "cudnn"
 
             get_module_args = (
                 q_data_type,
@@ -4344,44 +4343,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cudnn":
-            if self._cudnn_token_offsets:
-                # Token-unit path: the graph's padded dims come from the indptr
-                # diffs already computed above, and cuDNN reads cu_seq_lens as
-                # int32. Done once here so run() launches no conversion kernel.
-                if self._max_token_per_sequence is None:
-                    self._max_token_per_sequence = max_qo_len
-                if self._max_sequence_kv is None:
-                    self._max_sequence_kv = max_seq_in_batch
-                if (
-                    self._qo_indptr_buf.dtype != torch.int32
-                    or self._kv_indptr_buf.dtype != torch.int32
-                ):
-                    if self.is_cuda_graph_enabled:
-                        raise ValueError(
-                            "auto resolved to the cudnn backend, which reads "
-                            "qo_indptr/kv_indptr as int32; pass int32 indptr "
-                            "buffers in CUDA-graph mode"
-                        )
-                    self._qo_indptr_buf = self._qo_indptr_buf.to(torch.int32)
-                    self._kv_indptr_buf = self._kv_indptr_buf.to(torch.int32)
-                self._cudnn_stats_offsets = self._qo_indptr_buf
-            else:
-                # Element-unit (explicit backend="cudnn"): the LSE the wrapper
-                # returns is packed [total_tokens, num_qo_heads], so the stats
-                # ragged offset is the token offset times num_qo_heads, i.e. the
-                # element-unit Q offset divided by head_dim_qk. Exact division.
-                stats_offsets = torch.div(
-                    self._qo_indptr_buf, head_dim_qk, rounding_mode="floor"
-                )
-                if (
-                    self.is_cuda_graph_enabled
-                    and self._cudnn_stats_offsets is not None
-                    and self._cudnn_stats_offsets.shape == stats_offsets.shape
-                ):
-                    # keep the captured pointer stable across re-plans
-                    self._cudnn_stats_offsets.copy_(stats_offsets)
-                else:
-                    self._cudnn_stats_offsets = stats_offsets
+            # The graph's padded dims default to the indptr diffs computed
+            # above, and cuDNN reads cu_seq_lens as int32. Done once here so
+            # run() launches no conversion kernel.
+            if self._max_token_per_sequence is None:
+                self._max_token_per_sequence = max_qo_len
+            if self._max_sequence_kv is None:
+                self._max_sequence_kv = max_seq_in_batch
+            if (
+                self._qo_indptr_buf.dtype != torch.int32
+                or self._kv_indptr_buf.dtype != torch.int32
+            ):
+                if self.is_cuda_graph_enabled:
+                    raise ValueError(
+                        "the cudnn backend reads qo_indptr/kv_indptr as int32; "
+                        "pass int32 indptr buffers in CUDA-graph mode"
+                    )
+                self._qo_indptr_buf = self._qo_indptr_buf.to(torch.int32)
+                self._kv_indptr_buf = self._kv_indptr_buf.to(torch.int32)
+            self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
@@ -4570,12 +4550,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
-        if self._backend == "cudnn" and not self._cudnn_token_offsets:
-            if q.numel() != self._qo_indptr_last:
+        if self._backend == "cudnn":
+            if q.size(0) != self._qo_indptr_last:
+                hint = ""
+                if q.numel() == self._qo_indptr_last:
+                    hint = (
+                        " qo_indptr looks like element-unit offsets "
+                        "(total_tokens * num_heads * head_dim); the cudnn backend now "
+                        "takes token-unit qo_indptr, like every other backend."
+                    )
                 raise ValueError(
-                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
-                    f"For cudnn ragged prefill, qo_indptr uses element offsets "
-                    f"(total_tokens * num_heads * head_dim)."
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last})."
+                    + hint
                 )
         else:
             if q.size(0) != self._qo_indptr_last:
@@ -4830,46 +4816,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cuDNN ragged prefill backend requires kv_layout='NHD'"
                 )
-            if self._cudnn_token_offsets:
-                # `auto` path: the caller's token-unit indptrs go straight to
-                # cuDNN (mask + ragged offsets, scaled in-engine); no per-call
-                # conversion kernels. The stats ragged offset makes cuDNN write
-                # the LSE packed as [total_tokens, num_qo_heads], the wrapper's
-                # contract.
-                cudnn_batch_prefill_with_kv_cache(
-                    q,
-                    k,
-                    v,
-                    sm_scale,
-                    self._float_workspace_buffer,
-                    max_token_per_sequence=self._max_token_per_sequence,
-                    max_sequence_kv=self._max_sequence_kv,
-                    actual_seq_lens_q=None,
-                    actual_seq_lens_kv=None,
-                    return_lse=return_lse,
-                    causal=self._causal,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    batch_offsets_q=self._qo_indptr_buf,
-                    batch_offsets_k=self._kv_indptr_buf,
-                    batch_offsets_stats=(
-                        self._cudnn_stats_offsets if return_lse else None
-                    ),
-                    batch_offsets_units="tokens",
-                    is_cuda_graph_compatible=self._use_cuda_graph,
-                    out=out,
-                    lse=lse,
-                )
-                return (out, lse) if return_lse else out
-
-            if self._seq_lens_q.dim() == 1:
-                batch_size = self._seq_lens_q.shape[0]
+            # The caller's token-unit indptrs go straight to cuDNN (mask +
+            # ragged offsets, scaled in-engine); no per-call conversion kernels.
+            # actual_seq_lens_q/kv are optional: the direct path derives them
+            # from the indptrs. The stats ragged offset makes cuDNN write the
+            # LSE packed as [total_tokens, num_qo_heads], the wrapper's contract.
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
-                self._seq_lens_q = self._seq_lens_q.reshape(batch_size, 1, 1, 1)
-
+                self._seq_lens_q = self._seq_lens_q.reshape(-1, 1, 1, 1)
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
-                self._seq_lens_kv = self._seq_lens_kv.reshape(batch_size, 1, 1, 1)
+                self._seq_lens_kv = self._seq_lens_kv.reshape(-1, 1, 1, 1)
 
             cudnn_batch_prefill_with_kv_cache(
                 q,
@@ -4891,9 +4846,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 batch_offsets_v=self._v_indptr_buf,
                 batch_offsets_o=self._o_indptr_buf,
                 batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
+                batch_offsets_units="tokens",
                 is_cuda_graph_compatible=self._use_cuda_graph,
                 out=out,
                 lse=lse,
+                o_data_type=out_dtype,
             )
 
             return (out, lse) if return_lse else out

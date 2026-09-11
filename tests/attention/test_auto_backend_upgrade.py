@@ -357,39 +357,42 @@ def test_auto_cudnn_keeps_int32_token_indptr_untouched():
         workspace, "NHD", backend="auto"
     )
     wrapper.plan(indptr, indptr, 64, 8, 128, causal=True, q_data_type=DTYPE)
-    assert wrapper._backend == "cudnn" and wrapper._cudnn_token_offsets
+    assert wrapper._backend == "cudnn"
     assert torch.equal(wrapper._qo_indptr_buf, indptr)
     assert wrapper._qo_indptr_buf.dtype == torch.int32
     wrapper.run(q, k, v)
 
 
 @requires_cudnn_upgrade
-def test_explicit_cudnn_element_offsets_return_lse():
-    """Explicit backend="cudnn" keeps element-unit indptrs, and return_lse=True
-    must now work (the wrapper's packed [tokens, heads] LSE is addressed through
-    a stats ragged offset)."""
+def test_explicit_cudnn_token_indptr_return_lse():
+    """Explicit backend="cudnn" takes the same token-unit indptrs as `auto`
+    (no seq_lens / max_* needed: plan() derives them), and return_lse=True
+    works (the wrapper's packed [tokens, heads] LSE is addressed through a
+    stats ragged offset)."""
     h_qo, h_kv, d = 64, 8, 128
-    q, k, v, indptr, lens = _varlen_inputs(6, 1024, h_qo, h_kv, d, d)
+    q, k, v, indptr, _ = _varlen_inputs(6, 1024, h_qo, h_kv, d, d)
     _, out_fa2, lse_fa2 = _run_varlen("fa2", q, k, v, indptr, h_qo, h_kv, d, d)
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace, "NHD", backend="cudnn"
-    )
-    wrapper.plan(
-        indptr * h_qo * d,
-        indptr * h_kv * d,
-        h_qo,
-        h_kv,
-        d,
-        causal=True,
-        q_data_type=DTYPE,
-        kv_data_type=DTYPE,
-        seq_lens=lens.to(torch.int32).cuda(),
-        seq_lens_q=lens.to(torch.int32).cuda(),
-        max_token_per_sequence=int(lens.max()),
-        max_sequence_kv=int(lens.max()),
-    )
-    out, lse = wrapper.run(q, k, v, return_lse=True)
-    torch.cuda.synchronize()
+    resolved, out, lse = _run_varlen("cudnn", q, k, v, indptr, h_qo, h_kv, d, d)
+    assert resolved == "cudnn"
     assert lse.shape == (q.shape[0], h_qo)
     _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "explicit cudnn")
+
+
+@requires_cutlass_arch
+def test_auto_is_reresolved_on_replan():
+    """`auto` is decided per plan(), not once per wrapper: a re-plan that adds
+    a sliding window must fall back to fa2 (the upgraded kernels would drop
+    it), and a later re-plan without it must upgrade again."""
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="auto"
+    )
+    _, _, _, qo_indptr, kv_indptr = _inputs(4, 1024, 1024, 64, 8, 128, 128)
+    plan_args = (qo_indptr, kv_indptr, 64, 8, 128)
+    plan_kwargs = dict(causal=True, q_data_type=DTYPE, kv_data_type=DTYPE)
+    wrapper.plan(*plan_args, **plan_kwargs)
+    assert wrapper._backend == BLACKWELL_DEFAULT
+    wrapper.plan(*plan_args, window_left=16, **plan_kwargs)
+    assert wrapper._backend == "fa2"
+    wrapper.plan(*plan_args, **plan_kwargs)
+    assert wrapper._backend == BLACKWELL_DEFAULT
