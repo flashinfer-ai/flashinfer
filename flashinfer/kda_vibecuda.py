@@ -590,6 +590,8 @@ def _run_vibecuda_kda_prefill(
         if not use_initial_state:
             dummy_state = state.dummy_state
             initial_state_arg = dummy_state
+            if not output_final_state:
+                final_state_arg = dummy_state
         if output_final_state and initial_state is None:
             if explicit_workspace:
                 final_state_arg = _workspace_buffer(

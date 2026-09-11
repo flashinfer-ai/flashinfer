@@ -4826,7 +4826,7 @@ def test_vibecuda_prefill_rejects_non_sm100_arch(cuda_device, monkeypatch):
         ([1024] * 4, 12, True, 4108),  # packed H12: aligned beta pad, M128 route
     ],
 )
-def test_vibecuda_prefill_matches_frozen_cake(
+def test_vibecuda_prefill_matches_precision_reference(
     flash_kda_device, seq_lens, num_heads, packed, seed
 ):
     inputs = _make_inputs(
@@ -4844,33 +4844,71 @@ def test_vibecuda_prefill_matches_frozen_cake(
             device=flash_kda_device,
         )
 
-    results = {}
-    for backend in ("cake", "vibecuda"):
-        call_inputs = {**inputs, "initial_state": inputs["initial_state"].clone()}
-        output = torch.empty_like(inputs["q"])
-        results[backend] = recurrent_kda(
-            **_strict_prefill_kwargs(call_inputs),
-            seq_order=seq_order,
-            output=output,
-            output_final_state=True,
-            backend=backend,
-        )
+    expected = _reference(inputs)
+    call_inputs = {**inputs, "initial_state": inputs["initial_state"].clone()}
+    output = torch.empty_like(inputs["q"])
+    actual = recurrent_kda(
+        **_strict_prefill_kwargs(call_inputs),
+        seq_order=seq_order,
+        output=output,
+        output_final_state=True,
+        backend="vibecuda",
+    )
 
     torch.testing.assert_close(
-        results["vibecuda"][0].float(),
-        results["cake"][0].float(),
+        actual[0].float(),
+        expected[0].float(),
         atol=1e-2,
         rtol=1e-2,
     )
     torch.testing.assert_close(
-        results["vibecuda"][1].float(),
-        results["cake"][1].float(),
+        actual[1].float(),
+        expected[1].float(),
         atol=1e-2,
         rtol=1e-2,
     )
-    # The final recurrent state is written in place into the caller's
-    # initial_state by both backends.
-    assert results["vibecuda"][1] is not None
+    assert actual[1] is call_inputs["initial_state"]
+
+
+def test_vibecuda_initial_state_is_updated_in_place(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=64, packed=False, initial_state=True, seed=4209
+    )
+    expected = _reference(inputs)
+    original_state = inputs["initial_state"]
+    actual, returned_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="vibecuda",
+    )
+
+    assert returned_state is original_state
+    torch.testing.assert_close(
+        actual.float(), expected[0].float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        original_state.float(), expected[1].float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
+    flash_kda_device, monkeypatch
+):
+    monkeypatch.setattr(kda_vibecuda_api, "_vibecuda_stream_workspaces", {})
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=64, packed=False, initial_state=True, seed=4219
+    )
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="vibecuda",
+    )
+
+    assert len(kda_vibecuda_api._vibecuda_stream_workspaces) == 1
+    (workspace,) = kda_vibecuda_api._vibecuda_stream_workspaces.values()
+    assert getattr(workspace._vibecuda_state, "_state_scratch", None) is None
 
 
 def test_vibecuda_packed_prefill_sorts_sequences_on_device(flash_kda_device):
@@ -4882,26 +4920,25 @@ def test_vibecuda_packed_prefill_sorts_sequences_on_device(flash_kda_device):
         seq_lens=seq_lens, num_heads=96, packed=True, initial_state=True, seed=4210
     )
 
-    results = {}
-    for backend in ("cake", "vibecuda"):
-        call_inputs = {**inputs, "initial_state": inputs["initial_state"].clone()}
-        output = torch.empty_like(inputs["q"])
-        results[backend] = recurrent_kda(
-            **_strict_prefill_kwargs(call_inputs),
-            output=output,
-            output_final_state=True,
-            backend=backend,
-        )
+    expected = _reference(inputs)
+    call_inputs = {**inputs, "initial_state": inputs["initial_state"].clone()}
+    output = torch.empty_like(inputs["q"])
+    actual = recurrent_kda(
+        **_strict_prefill_kwargs(call_inputs),
+        output=output,
+        output_final_state=True,
+        backend="vibecuda",
+    )
 
     torch.testing.assert_close(
-        results["vibecuda"][0].float(),
-        results["cake"][0].float(),
+        actual[0].float(),
+        expected[0].float(),
         atol=1e-2,
         rtol=1e-2,
     )
     torch.testing.assert_close(
-        results["vibecuda"][1].float(),
-        results["cake"][1].float(),
+        actual[1].float(),
+        expected[1].float(),
         atol=1e-2,
         rtol=1e-2,
     )
@@ -4912,28 +4949,80 @@ def test_vibecuda_prefill_without_initial_state(flash_kda_device):
         seq_lens=[512], num_heads=96, packed=False, initial_state=False, seed=4211
     )
 
-    results = {}
-    for backend in ("cake", "vibecuda"):
-        output = torch.empty_like(inputs["q"])
-        results[backend] = recurrent_kda(
+    expected = _reference(inputs)
+    output = torch.empty_like(inputs["q"])
+    actual = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+        backend="vibecuda",
+    )
+
+    torch.testing.assert_close(
+        actual[0].float(),
+        expected[0].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual[1].float(),
+        expected[1].float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_vibecuda_prefill_runs_on_nondefault_stream(flash_kda_device, packed):
+    seq_lens = [1300, 547] if packed else [512]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=96,
+        packed=packed,
+        initial_state=True,
+        seed=4212 + packed,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    expected = _reference({**inputs, "initial_state": initial_state_seed.clone()})
+    output = torch.empty_like(inputs["q"])
+    stream = torch.cuda.Stream(device=flash_kda_device)
+    stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+
+    with torch.cuda.stream(stream):
+        actual = recurrent_kda(
             **_strict_prefill_kwargs(inputs),
             output=output,
             output_final_state=True,
-            backend=backend,
+            backend="vibecuda",
         )
+    stream.synchronize()
 
+    assert actual[0].data_ptr() == output.data_ptr()
+    assert actual[1] is inputs["initial_state"]
     torch.testing.assert_close(
-        results["vibecuda"][0].float(),
-        results["cake"][0].float(),
-        atol=1e-2,
-        rtol=1e-2,
+        actual[0].float(), expected[0].float(), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(
-        results["vibecuda"][1].float(),
-        results["cake"][1].float(),
-        atol=1e-2,
-        rtol=1e-2,
+        actual[1].float(), expected[1].float(), atol=1e-2, rtol=1e-2
     )
+
+
+def test_vibecuda_prefill_without_initial_or_final_state(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=96, packed=False, initial_state=False, seed=4214
+    )
+    expected, _ = _reference(inputs)
+    output = torch.empty_like(inputs["q"])
+    actual, final_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=False,
+        backend="vibecuda",
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    assert final_state is None
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 def test_vibecuda_prefill_rejects_token_row_strided_beta(flash_kda_device):
@@ -4992,14 +5081,7 @@ def test_vibecuda_m128_prefill_cuda_graph_capture_and_replay(flash_kda_device):
         seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4231
     )
     initial_state_seed = inputs["initial_state"].clone()
-    expected = recurrent_kda(
-        **_strict_prefill_kwargs(
-            {**inputs, "initial_state": initial_state_seed.clone()}
-        ),
-        output=torch.empty_like(inputs["q"]),
-        output_final_state=True,
-        backend="cake",
-    )
+    expected = _reference({**inputs, "initial_state": initial_state_seed.clone()})
     output = torch.empty_like(inputs["q"])
     workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
     capture_stream = torch.cuda.Stream(device=flash_kda_device)
@@ -5050,15 +5132,7 @@ def test_vibecuda_packed_prefill_cuda_graph_capture_and_replay(flash_kda_device)
     )
     initial_state_seed = inputs["initial_state"].clone()
     seq_order = torch.tensor([0, 1], dtype=torch.int32, device=flash_kda_device)
-    expected = recurrent_kda(
-        **_strict_prefill_kwargs(
-            {**inputs, "initial_state": initial_state_seed.clone()}
-        ),
-        seq_order=seq_order,
-        output=torch.empty_like(inputs["q"]),
-        output_final_state=True,
-        backend="cake",
-    )
+    expected = _reference({**inputs, "initial_state": initial_state_seed.clone()})
     output = torch.empty_like(inputs["q"])
     workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
     capture_stream = torch.cuda.Stream(device=flash_kda_device)
@@ -5098,6 +5172,109 @@ def test_vibecuda_packed_prefill_cuda_graph_capture_and_replay(flash_kda_device)
     torch.testing.assert_close(
         captured_state.float(), expected[1].float(), atol=1e-2, rtol=1e-2
     )
+
+
+def test_vibecuda_cuda_graph_refreshes_padded_beta(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[32], num_heads=12, packed=False, initial_state=True, seed=4233
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "vibecuda",
+    }
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+        inputs["initial_state"].copy_(initial_state_seed)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["beta"].fill_(2.0)
+        inputs["initial_state"].copy_(initial_state_seed)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    expected = _reference({**inputs, "initial_state": initial_state_seed.clone()})
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state is inputs["initial_state"]
+    torch.testing.assert_close(
+        captured_output.float(), expected[0].float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        captured_state.float(), expected[1].float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_vibecuda_cuda_graph_workspaces_are_isolated(flash_kda_device):
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    bundles = []
+    for seed in (4234, 4235):
+        inputs = _make_inputs(
+            seq_lens=[512],
+            num_heads=64,
+            packed=False,
+            initial_state=True,
+            seed=seed,
+        )
+        state_seed = inputs["initial_state"].clone()
+        expected = _reference({**inputs, "initial_state": state_seed.clone()})
+        output = torch.empty_like(inputs["q"])
+        workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+        call_kwargs = {
+            **_strict_prefill_kwargs(inputs),
+            "output": output,
+            "output_final_state": True,
+            "prefill_workspace": workspace,
+            "backend": "vibecuda",
+        }
+        capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+        with torch.cuda.stream(capture_stream):
+            recurrent_kda(**call_kwargs)
+            inputs["initial_state"].copy_(state_seed)
+            output.zero_()
+        capture_stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            recurrent_kda(**call_kwargs)
+        bundles.append((graph, workspace, inputs, state_seed, output, expected))
+
+    first_state = bundles[0][1]._vibecuda_state
+    second_state = bundles[1][1]._vibecuda_state
+    assert first_state is not None and second_state is not None
+    assert (
+        first_state.descriptor_storages["m64"].data_ptr()
+        != second_state.descriptor_storages["m64"].data_ptr()
+    )
+    for bundle_index in (0, 1, 0, 1):
+        graph, _workspace, inputs, state_seed, output, expected = bundles[bundle_index]
+        with torch.cuda.stream(capture_stream):
+            inputs["initial_state"].copy_(state_seed)
+            output.fill_(float("nan"))
+        capture_stream.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output.float(), expected[0].float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            inputs["initial_state"].float(),
+            expected[1].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
 
 @pytest.mark.parametrize(
