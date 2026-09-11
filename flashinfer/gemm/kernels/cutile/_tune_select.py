@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Deterministic ranking of cuTile ``exhaustive_search`` measurements.
+"""Stable ranking of cuTile ``exhaustive_search`` measurements.
 
 ``exhaustive_search`` stops sampling a candidate once its error margin drops
 below max(1% of mean, 0.5 us). For fast kernels this margin is of the same
 order as the gap between the top candidates, so a raw argmin over the mean
 latencies picks a different winner from process to process. This module
-breaks such statistical ties with a deterministic config key so that repeated
-tuning of the same shape on the same GPU selects the same kernel.
+breaks such statistical ties with a fixed config key, which reduces the
+run-to-run variance in the kernel selected for the same shape on the same
+GPU. The selection is not fully deterministic: the tie band itself still
+depends on the measured means and error margins.
 """
 
 from typing import Any, Callable, Sequence

@@ -261,9 +261,9 @@ def _autotune_configs(device=None):
 
 
 def _config_sort_key(cfg):
-    """Deterministic tie-break order: prefer the config that launches the
-    fewest CTAs, then the smallest tile. Extra occupancy only adds no-op
-    CTAs when the tile count already covers the grid."""
+    """Tie-break order among statistically tied configs: lowest occupancy
+    first, then fewest CTAs, then the smallest tile. Extra occupancy only
+    adds no-op CTAs when the tile count already covers the grid."""
     return (
         cfg.occupancy,
         cfg.num_ctas,
@@ -532,8 +532,8 @@ def _gemm_alpha_beta_cutile(
             # verify numerical correctness. We've observed configurations that
             # complete in measurable time but produce NaN on specific shape
             # combinations. Walk the success list (fastest first, statistical
-            # ties broken deterministically) and pick the first config whose
-            # output is NaN/Inf-free.
+            # ties broken by a fixed config key) and pick the first config
+            # whose output is NaN/Inf-free.
             #
             # A reference is computed from torch.mm on the same inputs; we
             # accept the cfg if its output matches the reference's overall

@@ -31,7 +31,7 @@ def _key(cfg):
 
 def test_ci_overlap_tie_prefers_key_order():
     # occupancy=8 measures fastest but within combined error margins of
-    # occupancy=1, so the deterministic key decides.
+    # occupancy=1, so the config key decides.
     measurements = [
         _measure(52.3, 0.5, occupancy=8),
         _measure(52.6, 0.5, occupancy=1),

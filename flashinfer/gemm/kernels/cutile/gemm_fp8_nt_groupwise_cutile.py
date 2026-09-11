@@ -335,7 +335,7 @@ def _w8a8_autotune_configs(block_n_quant, block_k_quant):
 
 
 def _w8a8_config_sort_key(cfg):
-    """Deterministic tie-break order among statistically tied configs."""
+    """Tie-break order among statistically tied configs."""
     return (
         cfg.occupancy,
         cfg.num_ctas,

@@ -250,9 +250,9 @@ def _bmm_bf16_autotune_configs(device=None):
 
 
 def _config_sort_key(cfg):
-    """Deterministic tie-break order: prefer the config that launches the
-    fewest CTAs, then the smallest tile. Extra occupancy only adds no-op
-    CTAs when the tile count already covers the grid."""
+    """Tie-break order among statistically tied configs: lowest occupancy
+    first, then fewest CTAs, then the smallest tile. Extra occupancy only
+    adds no-op CTAs when the tile count already covers the grid."""
     return (
         cfg.occupancy,
         cfg.num_ctas,
@@ -346,8 +346,8 @@ def _bmm_bf16_autotune_and_launch(
 
         # exhaustive_search ranks configs by latency only — verify correctness
         # (no NaN, no Inf) by re-running each ranked config in order (fastest
-        # first, statistical ties broken deterministically) and accepting the
-        # first one whose output is finite. Mirrors gemm.py.
+        # first, statistical ties broken by a fixed config key) and accepting
+        # the first one whose output is finite. Mirrors gemm.py.
         ranked = rank_measurements(result.successes, _config_sort_key)
         best_cfg = None
         for measure in ranked:
