@@ -42,7 +42,6 @@ import torch
 from flashinfer.api_logging import flashinfer_api
 
 from ...utils import device_support_pdl
-from ._tensor_aliasing import _validate_tensor_does_not_overlap_inputs
 
 _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE = 4
 _Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK = 512
@@ -142,36 +141,6 @@ def _validate_q_token_kv_block_sparse_paged_kv_cache(
             "K and V cache tensors must have matching shapes, devices, and dtypes"
         )
     return k_cache, v_cache
-
-
-def _validate_q_token_kv_block_sparse_workspace_aliasing(
-    workspace_buffer: torch.Tensor,
-    *,
-    query: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_table: torch.Tensor,
-    token_to_request: torch.Tensor,
-    query_positions: torch.Tensor,
-    qo_indptr: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-) -> None:
-    """Keep the unified workspace disjoint from every live QToken-KvBlock-Sparse-Attention tensor."""
-
-    _validate_tensor_does_not_overlap_inputs(
-        workspace_buffer,
-        "workspace_buffer",
-        ("query", query),
-        ("k_cache", k_cache),
-        ("v_cache", v_cache),
-        ("block_indices", block_indices),
-        ("block_table", block_table),
-        ("token_to_request", token_to_request),
-        ("query_positions", query_positions),
-        ("qo_indptr", qo_indptr),
-        ("out", out),
-    )
 
 
 def _validate_q_token_kv_block_sparse_locator_capacity(
@@ -397,13 +366,13 @@ class _PrimsTSQTokenKvBlockSparsePlan:
         )
         from .decode import _validate_scale
 
-        scale_qk = _validate_scale(
-            self._bmm1_scale if sm_scale is None else sm_scale,
-            "sm_scale",
+        scale_qk = (
+            self._bmm1_scale
+            if sm_scale is None
+            else _validate_scale(sm_scale, "sm_scale")
         )
-        scale_v = _validate_scale(
-            self._bmm2_scale if v_scale is None else v_scale,
-            "v_scale",
+        scale_v = (
+            self._bmm2_scale if v_scale is None else _validate_scale(v_scale, "v_scale")
         )
         self._attention_plan._run_unchecked(
             attention_query,
@@ -465,6 +434,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
     One wrapper revision owns mutable route and split-KV workspace. Runs must
     therefore be ordered on one stream or externally synchronized; unordered
     concurrent runs require distinct wrappers.
+
+    Output and workspace must be disjoint from each other and from all live
+    inputs, including the original indexer and request metadata. Storage
+    overlap is not checked; this precondition also applies after rebinding
+    inputs and across CUDA-graph replays.
     """
 
     def __init__(self) -> None:
@@ -670,6 +644,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         out : torch.Tensor, optional
             Caller-owned output with Q's logical shape and the planned output
             dtype. When omitted, the wrapper retains and reuses its output.
+            Must not overlap any input or workspace storage; this is not checked.
 
         Returns
         -------
@@ -767,18 +742,6 @@ class QTokenKvBlockSparsePagedTSWrapper:
         ):
             raise ValueError("out must match q shape and the planned output dtype")
 
-        _validate_q_token_kv_block_sparse_workspace_aliasing(
-            config.workspace_buffer,
-            query=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            block_indices=indexer_block_ids,
-            block_table=block_table,
-            token_to_request=token_to_request,
-            query_positions=query_positions,
-            qo_indptr=qo_indptr,
-            out=out,
-        )
         prepared_key = (
             _q_token_tensor_abi_key(q),
             _q_token_tensor_abi_key(indexer_block_ids),
@@ -1639,18 +1602,6 @@ def _prepare_q_token_kv_block_sparse_attention(
         max_seq_len_q=max_seq_len_q,
         sparse_block_size=sparse_block_size,
     )
-    _validate_q_token_kv_block_sparse_workspace_aliasing(
-        workspace_buffer,
-        query=query,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        block_indices=block_indices,
-        block_table=block_table,
-        token_to_request=token_to_request,
-        query_positions=query_positions,
-        qo_indptr=qo_indptr,
-        out=out,
-    )
     views = layout.bind(workspace_buffer)
     metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         block_indices,
@@ -1673,7 +1624,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         "bmm1_scale",
     )
     scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
-    attention_plan, prepared_attention_out = _prepare_prims_ts_batch_decode_plan(
+    attention_plan, _ = _prepare_prims_ts_batch_decode_plan(
         attention_query,
         paged_kv_cache,
         views.attention_workspace_buffer,
@@ -1695,12 +1646,6 @@ def _prepare_q_token_kv_block_sparse_attention(
             views.q_token_kv_block_sparse_page_memberships if group_size > 1 else None
         ),
     )
-    if (
-        prepared_attention_out.data_ptr() != attention_out.data_ptr()
-        or prepared_attention_out.shape != attention_out.shape
-        or prepared_attention_out.stride() != attention_out.stride()
-    ):
-        raise RuntimeError("prepared PrimTS output storage changed unexpectedly")
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,
         _bmm1_scale=scale_qk,
@@ -1791,6 +1736,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         cache's live V scale.
     out : torch.Tensor, optional
         Caller-owned output with the same logical shape as ``q``.
+        Must be disjoint from all inputs, including indexer/request metadata,
+        and from ``workspace_buffer``. Storage overlap is not checked.
     o_data_type : torch.dtype, optional
         Output dtype, defaulting to ``out.dtype`` or ``q.dtype``.
     qo_indptr : torch.Tensor, optional
@@ -1830,18 +1777,6 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         batch_size = int(qo_indptr.numel()) - 1
         use_packed_q = True
 
-    _validate_q_token_kv_block_sparse_workspace_aliasing(
-        workspace_buffer,
-        query=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        block_indices=indexer_block_ids,
-        block_table=block_table,
-        token_to_request=token_to_request,
-        query_positions=query_positions,
-        qo_indptr=qo_indptr,
-        out=out,
-    )
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch_size,

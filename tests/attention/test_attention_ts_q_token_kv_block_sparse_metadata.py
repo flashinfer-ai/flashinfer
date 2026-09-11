@@ -26,7 +26,6 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
     _get_prims_ts_q_token_kv_block_sparse_workspace_layout,
     _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
-    _validate_q_token_kv_block_sparse_workspace_aliasing,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
@@ -344,62 +343,6 @@ def test_q_token_kv_block_sparse_attention_apis_reject_malformed_cache_rank(
             workspace,
             out=torch.empty_like(query),
             max_seq_len_kv=1,
-        )
-
-
-@pytest.mark.parametrize(
-    "overlap_name",
-    (
-        "query",
-        "k_cache",
-        "v_cache",
-        "block_indices",
-        "block_table",
-        "token_to_request",
-        "query_positions",
-        "qo_indptr",
-        "out",
-    ),
-)
-def test_q_token_kv_block_sparse_unified_workspace_alias_guard_covers_all_live_tensors(
-    overlap_name: str,
-) -> None:
-    """Unified metadata/attention storage must not overwrite semantic inputs."""
-
-    storage = torch.empty(96, dtype=torch.uint8)
-    workspace = storage[:64]
-    overlapping = storage[32:]
-    tensors = {
-        name: torch.empty(1, dtype=torch.uint8)
-        for name in (
-            "query",
-            "k_cache",
-            "v_cache",
-            "block_indices",
-            "block_table",
-            "token_to_request",
-            "query_positions",
-            "qo_indptr",
-            "out",
-        )
-    }
-    tensors[overlap_name] = overlapping
-
-    with pytest.raises(
-        ValueError,
-        match=rf"workspace_buffer must not overlap {overlap_name} storage",
-    ):
-        _validate_q_token_kv_block_sparse_workspace_aliasing(
-            workspace,
-            query=tensors["query"],
-            k_cache=tensors["k_cache"],
-            v_cache=tensors["v_cache"],
-            block_indices=tensors["block_indices"],
-            block_table=tensors["block_table"],
-            token_to_request=tensors["token_to_request"],
-            query_positions=tensors["query_positions"],
-            qo_indptr=tensors["qo_indptr"],
-            out=tensors["out"],
         )
 
 
@@ -1453,56 +1396,6 @@ def test_q_token_kv_block_sparse_sort_union_cuda_graph_reloads_and_invalidates()
     torch.cuda.synchronize()
     expected = _reference(blocks, table, requests, positions, storage_page_size, 5)
     _assert_metadata_matches(outputs, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    "api",
-    (
-        pytest.param(
-            prepare_prims_ts_q_token_kv_block_sparse_attention,
-            marks=_REQUIRES_PRIMS_TS_ATTENTION,
-        ),
-        prims_ts_q_token_kv_block_sparse_attention,
-    ),
-)
-@pytest.mark.parametrize("overlap_name", ("block_indices", "out"))
-def test_q_token_kv_block_sparse_attention_apis_reject_unified_workspace_overlap(
-    api: object,
-    overlap_name: str,
-) -> None:
-    """Both entry points must invoke the unified workspace alias guard."""
-
-    blocks, table, requests, positions, storage_page_size = _make_case(1, 8)
-    query = torch.empty((2, 1, 1, 12, 256), dtype=torch.bfloat16, device="cuda")
-    out = torch.empty_like(query)
-    k_cache = torch.empty(
-        int(table.max().item()) + 1,
-        1,
-        storage_page_size,
-        256,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
-    v_cache = torch.empty_like(k_cache)
-    overlap = blocks if overlap_name == "block_indices" else out
-    workspace = overlap.reshape(-1).view(torch.uint8)
-
-    with pytest.raises(
-        ValueError,
-        match=rf"workspace_buffer must not overlap {overlap_name} storage",
-    ):
-        api(  # type: ignore[operator]
-            query,
-            (k_cache, v_cache),
-            blocks,
-            table,
-            requests,
-            positions,
-            workspace,
-            out=out,
-            max_seq_len_kv=table.shape[1] * storage_page_size,
-        )
 
 
 def _fixed_q_token_kv_block_sparse_shape(

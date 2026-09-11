@@ -42,6 +42,15 @@ default; callers that have already validated their inputs may use
 `validate=False` for steady-state timing or CUDA Graph capture and then own
 every dtype, device, shape, stride, alignment, value, aliasing, and lifetime
 obligation.
+
+All PrimTS APIs leave cross-tensor storage overlap unchecked, regardless of
+`validate`. Output must not overlap inputs, live metadata, or plan-owned
+buffers. Caller-provided workspace must be disjoint from the public input and
+output tensors; its internal views retain their documented layout. Callers
+must preserve these preconditions when rebinding tensors and replaying graphs.
+Writable-buffer aliasing is unsupported, not an in-place execution mode.
+TensorMap stride/alignment and workspace-capacity checks remain in place.
+
 The standalone sparse-attention example suggests G for both packed prefill
 and fixed decode using a caller-cached SM count, then fixes G for each plan.
 
@@ -172,7 +181,7 @@ proxy summaries or their represented mass.
 
 ## Validation
 
-Run the numerical, graph, scheduler/resource, alias-safety, and public-surface
+Run the numerical, graph, scheduler/resource, and public-surface
 contracts:
 
 ```bash

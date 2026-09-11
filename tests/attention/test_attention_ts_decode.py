@@ -46,22 +46,17 @@ from flashinfer.attention.prims_ts.decode import (
     _DECODE_MAX_KV_LEN,
     _DECODE_MAX_KV_TILE_SIZE,
     _DecodePlanState,
-    _DecodeRuntime,
     _make_decode_workspace_layout,
     _planned_kv_domain_has_unpaired_tail,
     _validate_prims_ts_q_token_kv_block_sparse_group_layout,
     _validate_q_token_kv_block_sparse_route_offsets_cpu,
     _validate_decode_query_head_extent,
-    _validate_decode_output_aliasing,
     _validate_decode_policy_kv_tile_size,
     _validate_decode_run_metadata_values,
     _validate_block_table_metadata,
     _validate_head_geometry,
     _validate_max_kv_len,
     _validate_storage_page_size,
-)
-from flashinfer.attention.prims_ts._tensor_aliasing import (
-    _validate_tensor_does_not_overlap_inputs,
 )
 from flashinfer.attention.prims_ts.split_kv_mode_policy import select_split_kv_modes
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
@@ -1865,56 +1860,6 @@ def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(page_
     assert cfg.supports_reduction_dtypes is (page_size == 4)
 
 
-def _decode_runtime_for_aliasing() -> _DecodeRuntime:
-    """Build the smallest runtime object accepted by the alias validator."""
-
-    return _DecodeRuntime(
-        q=torch.empty(8),
-        k_cache=torch.empty(8),
-        v_cache=torch.empty(8),
-        out=torch.empty(8),
-        num_physical_pages=1,
-        k_page_stride=8,
-        k_head_stride=8,
-        k_token_stride=8,
-        v_page_stride=8,
-        v_head_stride=8,
-        v_token_stride=8,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
-    )
-
-
-def test_attention_ts_decode_alias_guard_covers_every_live_allocation() -> None:
-    """The output may not reuse storage that remains live during a launch."""
-
-    for aliased_name in (
-        "k_cache",
-        "v_cache",
-        "seq_lens",
-        "qo_indptr",
-        "block_tables",
-        "workspace_buffer",
-    ):
-        runtime = _decode_runtime_for_aliasing()
-        metadata = {
-            "seq_lens": torch.empty(8),
-            "qo_indptr": torch.empty(8),
-            "block_tables": torch.empty(8),
-            "workspace_buffer": torch.empty(8),
-        }
-        if aliased_name in ("k_cache", "v_cache"):
-            runtime = replace(runtime, **{aliased_name: runtime.out})
-        else:
-            metadata[aliased_name] = runtime.out
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            _validate_decode_output_aliasing(runtime, **metadata)
-
-
 def test_attention_ts_decode_public_query_geometry_guards() -> None:
     """Reject unsafe Q extents and head ratios above 128."""
 
@@ -2203,23 +2148,6 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
             64,
             page_size,
             unsafe_max,
-        )
-
-
-def test_attention_ts_workspace_alias_guard() -> None:
-    """Caller-owned scratch must be disjoint from every live allocation."""
-
-    storage = torch.empty(64, dtype=torch.uint8)
-    workspace = storage[:32]
-    overlapping_query = storage[16:48]
-    with pytest.raises(
-        ValueError,
-        match="workspace_buffer must not overlap query storage",
-    ):
-        _validate_tensor_does_not_overlap_inputs(
-            workspace,
-            "workspace_buffer",
-            ("query", overlapping_query),
         )
 
 
@@ -3971,16 +3899,6 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
     )
     monkeypatch.setattr(
         decode_module,
-        "_validate_tensor_does_not_overlap_inputs",
-        fail_validation,
-    )
-    monkeypatch.setattr(
-        decode_module,
-        "_validate_decode_output_aliasing",
-        fail_validation,
-    )
-    monkeypatch.setattr(
-        decode_module,
         "_prepare_decode_runtime_unchecked",
         lambda *_args, **_kwargs: runtime,
     )
@@ -4377,42 +4295,6 @@ def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() ->
     assert rebound_seq_lens.data_ptr() != seq_lens.data_ptr()
     rebound = _run_case(wrapper, case, seq_lens=rebound_seq_lens)
     _assert_case_correct(rebound, shorter_case)
-
-
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_public_interfaces_reject_output_alias():
-    max_kv_len = 128
-    case = _make_decode_case(
-        kv_lens=(max_kv_len,),
-        num_qo_heads=8,
-        num_kv_heads=1,
-        head_dim=64,
-        seq_len_q=1,
-        page_size=16,
-        qkv_dtype=torch.bfloat16,
-        output_dtype=torch.bfloat16,
-        cache_form="combined",
-        mask_type="dense",
-        device="cuda",
-        seed=20260718,
-    )
-    seq_lens = _seq_lens_from_csr(
-        case.paged_kv_indptr,
-        case.paged_kv_last_page_len,
-        int(case.k_cache.shape[2]),
-    )
-    wrapper = _plan_case(case, max_kv_len=max_kv_len)
-
-    with pytest.raises(ValueError, match="out must not overlap query storage"):
-        _run_case(wrapper, case, out=case.q)
-    with pytest.raises(ValueError, match="out must not overlap query storage"):
-        _run_standalone(
-            case,
-            seq_lens,
-            max_kv_len=max_kv_len,
-            out=case.q,
-        )
 
 
 @pytest.mark.parametrize(

@@ -31,11 +31,6 @@ from flashinfer.trace.templates.attention import (
     prims_ts_decode_wrapper_trace_dispatch,
 )
 
-from ._tensor_aliasing import (
-    _validate_out_does_not_overlap_inputs,
-    _validate_tensor_does_not_overlap_inputs,
-)
-
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
@@ -1947,33 +1942,6 @@ def _prepare_decode_runtime(
     )
 
 
-def _validate_decode_output_aliasing(
-    runtime: _DecodeRuntime,
-    *,
-    seq_lens: torch.Tensor,
-    qo_indptr: Optional[torch.Tensor],
-    block_tables: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
-) -> None:
-    """Keep output disjoint from every live FMHA decode allocation."""
-
-    _validate_out_does_not_overlap_inputs(
-        runtime.out,
-        ("query", runtime.q),
-        ("k_cache", runtime.k_cache),
-        ("v_cache", runtime.v_cache),
-        ("seq_lens", seq_lens),
-        ("qo_indptr", qo_indptr),
-        ("block_tables", block_tables),
-        (
-            "q_token_kv_block_sparse_page_memberships",
-            q_token_kv_block_sparse_page_memberships,
-        ),
-        ("workspace_buffer", workspace_buffer),
-    )
-
-
 def _launch_decode(
     runtime: _DecodeRuntime,
     *,
@@ -2226,11 +2194,11 @@ class PrimsTSBatchDecodePlan:
     proven by the representative tensors passed to
     :func:`prepare_prims_ts_batch_decode_with_kv_cache`.
 
-    ``run`` deliberately omits the expensive cache-stride proof, workspace
-    rebinding, semantic-policy resolution, and allocation-alias proof.  A
-    framework using this interface is responsible for keeping the retained
-    tensors alive and disjoint and for not mutating metadata concurrently with
-    a launch or CUDA-graph replay that reads it.
+    ``run`` deliberately omits repeated cache-stride validation, workspace
+    rebinding, and semantic-policy resolution. Storage overlap is not checked
+    during preparation or execution. The framework must keep retained tensors
+    alive, keep output/workspace disjoint from the inputs and each other, and
+    not mutate metadata concurrently with a launch or replay that reads it.
     """
 
     _query_shape: tuple[int, ...]
@@ -3171,10 +3139,6 @@ def _prepare_prims_ts_batch_decode_plan(
         device=metadata_device,
         batch_size=batch_size,
     )
-    if metadata_device != query.device:
-        raise ValueError(
-            f"paged-KV metadata must be on {query.device}, got {metadata_device}"
-        )
     if qo_indptr is not None:
         _validate_qo_indptr(
             qo_indptr,
@@ -3275,7 +3239,6 @@ def _prepare_prims_ts_batch_decode_plan(
         head_dim=head_dim,
         total_q_tokens=int(query.shape[0]) if use_packed_q else None,
     )
-    caller_provided_out = out is not None
     if out is None:
         out = torch.empty(output_shape, device=query.device, dtype=output_dtype)
     else:
@@ -3286,44 +3249,6 @@ def _prepare_prims_ts_batch_decode_plan(
             seq_len_q=seq_len_q,
             use_packed_q=use_packed_q,
             output_dtype=output_dtype,
-        )
-    runtime = _DecodeRuntime(
-        q=query,
-        k_cache=normalized_cache.k_cache,
-        v_cache=normalized_cache.v_cache,
-        out=out,
-        num_physical_pages=normalized_cache.num_physical_pages,
-        k_page_stride=normalized_cache.k_page_stride,
-        k_head_stride=normalized_cache.k_head_stride,
-        k_token_stride=normalized_cache.k_token_stride,
-        v_page_stride=normalized_cache.v_page_stride,
-        v_head_stride=normalized_cache.v_head_stride,
-        v_token_stride=normalized_cache.v_token_stride,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
-    )
-    _validate_tensor_does_not_overlap_inputs(
-        workspace_buffer,
-        "workspace_buffer",
-        ("query", runtime.q),
-        ("k_cache", runtime.k_cache),
-        ("v_cache", runtime.v_cache),
-        ("seq_lens", seq_lens),
-        ("qo_indptr", qo_indptr),
-        ("block_table", block_table),
-        (
-            "q_token_kv_block_sparse_page_memberships",
-            q_token_kv_block_sparse_page_memberships,
-        ),
-    )
-    if caller_provided_out:
-        _validate_decode_output_aliasing(
-            runtime,
-            seq_lens=seq_lens,
-            qo_indptr=qo_indptr,
-            block_tables=block_table,
-            q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
-            workspace_buffer=workspace_buffer,
         )
     compile_spec = _make_decode_compile_spec(
         spec,
@@ -3350,10 +3275,10 @@ def _prepare_prims_ts_batch_decode_plan(
     if layout.uses_split_kv:
         workspace.split_kv_counter.zero_()
     plan = PrimsTSBatchDecodePlan(
-        _query_shape=tuple(runtime.q.shape),
-        _query_stride=tuple(runtime.q.stride()),
-        _output_shape=tuple(runtime.out.shape),
-        _output_stride=tuple(runtime.out.stride()),
+        _query_shape=tuple(query.shape),
+        _query_stride=tuple(query.stride()),
+        _output_shape=tuple(out.shape),
+        _output_stride=tuple(out.stride()),
         _device=query.device,
         _q_dtype=query.dtype,
         _output_dtype=output_dtype,
@@ -3367,7 +3292,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
     )
-    return plan, runtime.out
+    return plan, out
 
 
 @flashinfer_api
@@ -3395,6 +3320,9 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     metadata, and workspace storage stable while changing their values between launches.
     Call :meth:`PrimsTSBatchDecodePlan.run` on the hot path.  The returned plan
     is CUDA-graph compatible as long as captured tensor storage remains alive.
+
+    Output and workspace must be disjoint from each other and from all inputs.
+    Storage overlap is a caller precondition and is not checked.
 
     Parameters
     ----------
@@ -3440,7 +3368,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
 
     if not isinstance(out, torch.Tensor):
         raise TypeError("out must be a caller-owned torch.Tensor")
-    plan, prepared_out = _prepare_prims_ts_batch_decode_plan(
+    plan, _ = _prepare_prims_ts_batch_decode_plan(
         query,
         kv_cache,
         workspace_buffer,
@@ -3458,8 +3386,6 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         page_size=page_size,
         use_q_token_kv_block_sparse_route=False,
     )
-    if prepared_out is not out:
-        raise RuntimeError("prepared PrimTS output storage changed unexpectedly")
     return plan
 
 
@@ -3536,8 +3462,9 @@ def prims_ts_batch_decode_with_kv_cache(
     re-zeroed whenever an argument contributing to the semantic JIT key changes,
     because the internal section offsets can change with that key. It is exclusive
     to one in-flight launch or captured graph and must not overlap query, K/V
-    cache, metadata, or output storage. Runtime sequence lengths must remain
-    positive and no larger than ``max_seq_len``; this hot path
+    cache, metadata, or output storage. Output must also remain disjoint from
+    all inputs. Storage overlap is not checked. Runtime sequence lengths must
+    remain positive and no larger than ``max_seq_len``; this hot path
     deliberately does not read device metadata back to the host. Live table,
     length, page-ID, and packed-Q values may change between completed launches
     or graph replays only while all of their contracts remain valid. They must
@@ -3949,9 +3876,8 @@ class BatchDecodePagedTSWrapper:
         ``None`` and the plan's owned CUDA copy is used. Otherwise, ``seq_lens``
         must be supplied on every run. This ownership check is unconditional.
 
-        ``validate=True`` performs structural, value, and alias validation. It
-        reads per-run metadata values back to the host. This is the safe public
-        default.
+        ``validate=True`` performs structural and value validation. It
+        reads per-run metadata values back to the host.
         ``validate=False`` treats every run argument as a trusted binding,
         performs no explicit wrapper validation, and remains free of metadata
         device-to-host synchronization. K/V view selection, scale forwarding,
@@ -3960,6 +3886,9 @@ class BatchDecodePagedTSWrapper:
         Packed plans require ``qo_indptr`` with ``B + 1`` int32 offsets. Fixed
         plans require ``qo_indptr`` to be omitted. Per-run metadata tensors may
         change identity between ordered runs.
+
+        In either validation mode, output and workspace must be disjoint from
+        each other and from all inputs. Storage overlap is not checked.
 
         Parameters
         ----------
@@ -3986,7 +3915,7 @@ class BatchDecodePagedTSWrapper:
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         validate : bool
-            Run explicit structural, value, and alias validation. Disable only
+            Run explicit structural and value validation. Disable only
             when the caller guarantees the complete runtime contract. Sequence
             length ownership is enforced in either mode. Defaults to ``True``.
 
@@ -4015,7 +3944,6 @@ class BatchDecodePagedTSWrapper:
             effective_seq_lens = seq_lens
 
         runtime_qo_indptr = qo_indptr if state.use_packed_q else None
-        caller_provided_out = out is not None
         if validate:
             (
                 metadata_device,
@@ -4074,25 +4002,6 @@ class BatchDecodePagedTSWrapper:
                 block_tables=block_tables,
                 qo_indptr=runtime_qo_indptr,
             )
-            _validate_tensor_does_not_overlap_inputs(
-                state.workspace_buffer,
-                "workspace_buffer",
-                ("query", runtime.q),
-                ("k_cache", runtime.k_cache),
-                ("v_cache", runtime.v_cache),
-                ("seq_lens", effective_seq_lens),
-                ("qo_indptr", runtime_qo_indptr),
-                ("block_tables", block_tables),
-                ("out", runtime.out),
-            )
-            if caller_provided_out:
-                _validate_decode_output_aliasing(
-                    runtime,
-                    seq_lens=effective_seq_lens,
-                    qo_indptr=runtime_qo_indptr,
-                    block_tables=block_tables,
-                    workspace_buffer=state.workspace_buffer,
-                )
         else:
             runtime = _prepare_decode_runtime_unchecked(
                 q,
