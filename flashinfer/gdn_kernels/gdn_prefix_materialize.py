@@ -749,6 +749,10 @@ def gdn_prefix_materialize(
     # footprint on SM90/SM100-class parts (228 KB/SM); the same hardcoded-
     # blocks/SM convention as packed_kda_decode_cute's persistent schedule.
     # Capped by the item count so tiny batches do not over-launch.
+    if B == 0:
+        # An empty batch is a no-op, not an error: grid=(0,1,1) would fail
+        # with an invalid launch configuration.
+        return state
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     grid_ctas = min(B * HV, sms * 8)
 

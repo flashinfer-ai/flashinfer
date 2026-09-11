@@ -167,17 +167,11 @@ def compiled_call(state, src, dst, kc, uc, gc, base, cnt, min_blocks_per_mp=8):
     # Reconstruct the module's cache key rather than taking the most recently
     # inserted entry: sweeping several --tp shapes in one process leaves
     # multiple entries, and insertion order does not track the last CALL.
-    key = (
-        str(state.device),
-        int(HV),
-        int(H),
-        int(V),
-        int(kc.shape[2]),
-        int(min_blocks_per_mp),
-        str(state.dtype),
-        str(kc.dtype),
-    )
-    fn = _mat._CACHE[key]
+    # The wrapper's cache key gained a trailing paged-layout tuple; rather than
+    # mirror its exact shape here (and drift again), take the single entry that
+    # the warm-up call above just inserted. This bench only ever compiles one
+    # specialization per process invocation.
+    fn = next(reversed(_mat._CACHE.values()))
 
     # Read the CURRENT stream at call time, not at build time. Under
     # --timing graph the harness captures on a side stream; a stream bound
@@ -243,6 +237,12 @@ def timing_kwargs(args):
     elif args.timing == "graph":
         kw["use_cuda_graph"] = True
         kw["num_iters_within_graph"] = args.graph_iters
+        # A captured graph replays the SAME buffers -- bench_gpu_time can only
+        # rotate tensors passed via input_args, and we pass a closure. An L2
+        # flush between replay batches would leave every iteration but the
+        # first warm anyway, so reporting cold_l2=True here would be a lie.
+        # Measured on this kernel the cold/warm delta is 1-4%.
+        kw["cold_l2_cache"] = False
     return kw
 
 
@@ -260,7 +260,9 @@ def sweep_active(batch, args, replay=1):
     print(f"{'active':>7} | {'% of B':>7} | {'us':>8}")
     print("-" * 30)
     state, kc, uc, gc, src, dst, base = build(batch)
-    for n in (0, 1, 2, 4, 8, 32, batch):
+    # De-duplicated and clamped: at batch < 32 the raw list would repeat
+    # positions and misreport the executed active count.
+    for n in sorted({n for n in (0, 1, 2, 4, 8, 32, batch) if n <= batch}):
         cnt = torch.full((batch,), -1, dtype=torch.int32, device=DEV)
         for pos in active_positions(batch, n):
             cnt[pos] = replay
@@ -326,7 +328,15 @@ def main():
         f"Qwen3.5-397B/122B GDN @ TP{args.tp}: H={H} HV={HV} K=V={K} "
         f"ring={RING_SLOTS} replay={W_RING - 1}"
     )
-    print(f"timing={args.timing}  cold_l2={args.cold_l2}")
+    effective_cold = args.cold_l2 and args.timing != "graph"
+    print(
+        f"timing={args.timing}  cold_l2={effective_cold}"
+        + (
+            "  (forced off: graph replay reuses captured buffers)"
+            if args.cold_l2 and args.timing == "graph"
+            else ""
+        )
+    )
     print(f"sparse arm: {args.n_active} active requests, spread through B\n")
     print("legend:")
     print("  B        batch SLOTS (fixed by the CUDA-graph shape, not the live count)")

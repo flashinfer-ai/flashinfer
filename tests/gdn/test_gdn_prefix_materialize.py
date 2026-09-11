@@ -687,3 +687,14 @@ def test_misaligned_base_pointer_rejected():
         gdn_prefix_materialize(
             shifted, _i32([0]), _i32([1]), kc, uc, gc, _i32([0]), _i32([2])
         )
+
+
+def test_empty_batch_is_noop():
+    """B == 0 returns the state untouched instead of a zero-size grid launch."""
+    _skip_if_not_sm90_or_later()
+    state, kc, uc, gc = _make_pool(4, [8], [0], seed=61)
+    before = state.clone()
+    empty = torch.empty(0, dtype=torch.int32, device=DEV)
+    out = gdn_prefix_materialize(state, empty, empty, kc, uc, gc, empty, empty)
+    torch.cuda.synchronize()
+    assert out is state and torch.equal(state, before)
