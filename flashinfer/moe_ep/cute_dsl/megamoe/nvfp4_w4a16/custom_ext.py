@@ -65,11 +65,8 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
     def peek_ready(self):
         """Decode the sched-warp counter peek result from slot 7's bit 16.
 
-        Returns a Boolean SSA: True iff the sched-warp's enrich-time
-        peek of the fc1_done_counter (for this fc2 work tile) observed
-        saturation, allowing the TMA-B warp to skip its own spin_wait.
-        For fc1 tiles or when peek wasn't done, returns False (fc12 sched
-        ext only sets the bit on Linear2 phase work tiles).
+        True when the phase-specific counter was ready during enrichment,
+        allowing the activation loader to skip its later blocking wait.
         """
         return ((self.phase_and_peek >> Int32(PhaseBits)) & Int32(1)) != Int32(0)
 
@@ -134,7 +131,7 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
     ``phase_and_peek`` (low 16 bit BlockPhase, bit 16 sched-warp peek result);
     consumers read it through ``.phase`` and ``.peek_ready``.
 
-    `enrich_work_tile_info` packs a sched-warp counter peek for fc2 tiles.
+    `enrich_work_tile_info` packs the phase-specific readiness peek.
     `get_gmem_tensor` is phase-invariant; the caller supplies the phase-specific
     physical tensor.
     """
@@ -146,18 +143,7 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
         sf_vec_size: int,
         fc1_done_counter_ptr: Pointer,
         fc2_spin_threshold: Union[int, Int32],
-        # MegaMoE-only: when set, ``enrich_work_tile_info`` also peeks the
-        # dispatch->fc1 release-counter for fc1 phase tiles, so the fc1
-        # TMA-B warp can skip its blocking spin when the counter already
-        # shows enough arrivals.  Mirrors ``fc1_done_counter_ptr`` for the
-        # fc1->fc2 link: this side is "fc1 input ready", that side is
-        # "fc1 output done".  The threshold per-tile is the tile's
-        # ``valid_tokens_in_cta_tile`` (dispatch does not pull padding
-        # tokens), read straight off the base work tile -- no separate
-        # threshold field needed.  ``None`` in the lean fc1+fc2 path keeps
-        # ``enrich_work_tile_info`` to its existing fc2-only peek shape and
-        # this pointer is not carried through MLIR.
-        fc1_ready_counter_ptr: Optional[Pointer] = None,
+        fc1_ready_counter_ptr: Pointer,
     ):
         super().__init__(workspace=None)
         if sf_vec_size <= 0:
@@ -176,8 +162,7 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
         values: List[ir.Value] = []
         values.extend(extract_mlir_values(self.fc1_done_counter_ptr))
         values.extend(extract_mlir_values(self.fc2_spin_threshold))
-        if self.fc1_ready_counter_ptr is not None:
-            values.extend(extract_mlir_values(self.fc1_ready_counter_ptr))
+        values.extend(extract_mlir_values(self.fc1_ready_counter_ptr))
         return values
 
     def __new_from_mlir_values__(
@@ -194,15 +179,11 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
             self.fc2_spin_threshold, values[idx : idx + thresh_len]
         )
         idx += thresh_len
-        # fc1_ready_counter_ptr: prototype tells us whether it is carried.
-        if self.fc1_ready_counter_ptr is not None:
-            ready_ptr_len = len(extract_mlir_values(self.fc1_ready_counter_ptr))
-            new_ready_ptr = new_from_mlir_values(
-                self.fc1_ready_counter_ptr, values[idx : idx + ready_ptr_len]
-            )
-            idx += ready_ptr_len
-        else:
-            new_ready_ptr = None
+        ready_ptr_len = len(extract_mlir_values(self.fc1_ready_counter_ptr))
+        new_ready_ptr = new_from_mlir_values(
+            self.fc1_ready_counter_ptr, values[idx : idx + ready_ptr_len]
+        )
+        idx += ready_ptr_len
         assert idx == len(values), (
             f"W4A16Fc12SchedExtension serialization mismatch: "
             f"idx={idx} len(values)={len(values)}"
@@ -231,8 +212,7 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
           ``self.fc2_spin_threshold`` (work-tile-invariant const).
         - fc1 tiles peek the dispatch->fc1 ``fc1_ready_counter`` at the
           same slot index (``tile_n_idx``) but with ``valid_tokens_in_cta_tile`` as threshold
-          (per-tile dynamic).  This branch only emits when
-          ``self.fc1_ready_counter_ptr is not None`` (MegaMoE mode).
+          (per-tile dynamic).
         """
         # Invalid tiles keep (None_ | 0); do not index an arbitrary counter slot.
         is_valid = base_work.is_valid_tile
@@ -246,23 +226,22 @@ class W4A16Fc12SchedExtension(MoESchedExtension):
             is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
             is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
 
-            # MegaMoE-only: fc1 phase peek on fc1_ready_counter.  Threshold
+            # FC1 phase peek on fc1_ready_counter. Threshold
             # is dynamic (per-tile valid count) because dispatch does not
             # pull padding tokens, so the counter's terminal value matches
             # the tile's valid_tokens_in_cta_tile (cluster_tile_m for full
             # tiles, less for an expert's last partial tile).
-            if cutlass.const_expr(self.fc1_ready_counter_ptr is not None):
-                if is_fc1:
-                    counter_ptr = self.fc1_ready_counter_ptr + counter_slot
-                    peek_ready = spin_wait(
-                        counter_ptr,
-                        lambda v: v >= base_work.valid_tokens_in_cta_tile,
-                        peek_only=True,
-                    )
-                    peek_bit = Int32(0)
-                    if peek_ready:
-                        peek_bit = Int32(PeekReadyBit)
-                    new_phase_and_peek = base_work.phase_and_peek | peek_bit
+            if is_fc1:
+                counter_ptr = self.fc1_ready_counter_ptr + counter_slot
+                peek_ready = spin_wait(
+                    counter_ptr,
+                    lambda v: v >= base_work.valid_tokens_in_cta_tile,
+                    peek_only=True,
+                )
+                peek_bit = Int32(0)
+                if peek_ready:
+                    peek_bit = Int32(PeekReadyBit)
+                new_phase_and_peek = base_work.phase_and_peek | peek_bit
 
             # fc2 tiles can skip the later TMA-B spin (existing path).
             if is_fc2:
