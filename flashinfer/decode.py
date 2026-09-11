@@ -616,6 +616,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
+    use_inline_sf: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
 
@@ -663,6 +664,13 @@ def single_decode_with_kv_cache(
         The theta used in RoPE, if not provided, will be set to ``1e4``.
     return_lse : bool
         Whether to return the log sum exp value of the attention logits.
+    use_inline_sf : bool
+        Whether the FP8 KV cache uses the per-(token, head) *inline* scale layout: each
+        ``(token, head)`` vector stores a ``float32`` scale at its tail, padded to a 16-byte
+        slot. When enabled, ``k``/``v`` are FP8 (``e4m3``/``e5m2``) tensors whose last dim is
+        ``head_dim + 16`` (the slot size, e.g. ``144`` for ``head_dim=128``), and ``q`` must be
+        ``fp16`` (or ``bf16`` on SM80+). The scale is dequantized inside the kernel and the
+        ``fa2`` backend is forced. Defaults to ``False``.
 
     Returns
     -------
@@ -699,6 +707,26 @@ def single_decode_with_kv_cache(
     _check_kv_layout(kv_layout)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     head_dim = q.shape[-1]
+    if use_inline_sf:
+        assert k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2), (
+            f"use_inline_sf requires fp8 KV dtype, got {k.dtype}"
+        )
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            f"use_inline_sf requires fp16/bf16 Q dtype, got {q.dtype}"
+        )
+        if get_compute_capability(q.device)[0] < 8:
+            assert q.dtype == torch.float16, (
+                "use_inline_sf on SM75 only supports fp16 Q dtype"
+            )
+        # Decode requires head_dim_qk == head_dim_vo (CUDA-cores template constraint),
+        # so K and V share one head_dim; any 16-multiple is supported.
+        assert head_dim % 16 == 0, (
+            f"use_inline_sf requires head_dim to be a multiple of 16, got {head_dim}"
+        )
+        assert k.shape[-1] == head_dim + 16, (
+            f"use_inline_sf requires KV last dim = head_dim + 16 "
+            f"({head_dim + 16}), got {k.shape[-1]}"
+        )
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
     if sm_scale is None:
@@ -730,6 +758,7 @@ def single_decode_with_kv_cache(
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
             False,  # use_fp16_qk_reduction
+            use_inline_sf,
         ).run(
             q.unsqueeze(0),
             k,
@@ -766,6 +795,7 @@ def single_decode_with_kv_cache(
             PosEncodingMode[pos_encoding_mode].value,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
+            use_inline_sf,
         ).run(
             q,
             k,
@@ -1452,6 +1482,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Whether the mask is causal within each request block. Defaults to ``None``,
             which derives it from ``q_len_per_req > 1``. Only the ``prims-ts`` backend
             honors a value that differs from that default; the other backends raise.
+        use_inline_sf : bool
+            Whether the FP8 KV cache uses the per-(token, head) *inline* scale layout: each
+            ``(token, head)`` vector stores a ``float32`` scale at its tail, padded to a
+            16-byte slot. When enabled, the KV cache is FP8 (``e4m3``/``e5m2``) with last
+            dim ``head_dim + 16`` (the slot size, e.g. ``144`` for ``head_dim=128``), and
+            ``q`` must be ``fp16`` (or ``bf16`` on SM80+). The scale is dequantized inside
+            the kernel and the ``fa2`` backend is forced. Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1529,6 +1566,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
+        use_inline_sf: bool = False,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -1629,6 +1667,30 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if use_inline_sf:
+            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
+                f"use_inline_sf requires fp8 KV dtype, got {kv_data_type}"
+            )
+            assert q_data_type in (torch.float16, torch.bfloat16), (
+                f"use_inline_sf requires fp16/bf16 Q dtype, got {q_data_type}"
+            )
+            if get_compute_capability(self.device)[0] < 8:
+                assert q_data_type == torch.float16, (
+                    "use_inline_sf on SM75 only supports fp16 Q dtype"
+                )
+            # Decode requires head_dim_qk == head_dim_vo, so K and V share one head_dim;
+            # any 16-multiple is supported.
+            assert head_dim % 16 == 0, (
+                f"use_inline_sf requires head_dim to be a multiple of 16, got {head_dim}"
+            )
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise ValueError(
+                    f"use_inline_sf requires backend='fa2', got {self._backend!r}"
+                )
+        self._use_inline_sf = use_inline_sf
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -1974,6 +2036,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    use_inline_sf,
                 )
 
             args = [
@@ -2016,6 +2079,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                    use_inline_sf,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -2409,6 +2473,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             out_head_dim = (
                 v_cache.shape[-1] * 2
                 if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+                else v_cache.shape[-1] - 16
+                if getattr(self, "_use_inline_sf", False)
                 else v_cache.shape[-1]
             )
             out = torch.empty(

@@ -34,8 +34,8 @@
 namespace flashinfer {
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
-          typename Params>
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, bool USE_INLINE_SF,
+          typename AttentionVariant, typename Params>
 __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params);
 
 template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx,
@@ -146,7 +146,7 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
  * \return status Indicates whether CUDA calls are successful
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          typename AttentionVariant, typename Params>
+          bool USE_INLINE_SF, typename AttentionVariant, typename Params>
 inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
@@ -165,13 +165,18 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
     const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     gdy = num_kv_heads;
+    constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
+    constexpr uint32_t scale_smem_bytes =
+        USE_INLINE_SF ? (2U * NUM_STAGES_SMEM * CTA_TILE_KV * sizeof(float)) : 0U;
     const uint32_t smem_size =
         2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
+        std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*),
+                 2 * bdy * bdz * sizeof(float)) +
+        scale_smem_bytes;
 
-    auto kernel =
-        BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                          vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
+    auto kernel = BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM,
+                                                    tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+                                                    USE_INLINE_SF, AttentionVariant, Params>;
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;

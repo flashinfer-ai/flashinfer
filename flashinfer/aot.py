@@ -181,11 +181,15 @@ def gen_fa2(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     prefill_only: bool = False,
+    use_inline_sf: bool = False,
 ) -> Iterator[JitSpec]:
     if dtype_qo.itemsize == dtype_kv.itemsize and dtype_qo != dtype_kv:
         return
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
+    # Inline FP8 KV scale requires an FP8 KV cache and a 16-bit Q/O.
+    if use_inline_sf and dtype_kv.itemsize != 1:
+        return
 
     yield gen_batch_prefill_module(
         backend="fa2",
@@ -199,6 +203,7 @@ def gen_fa2(
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=False,
+        use_inline_sf=use_inline_sf,
     )
 
     if not prefill_only:
@@ -212,6 +217,7 @@ def gen_fa2(
             pos_encoding_mode=0,
             use_sliding_window=use_sliding_window,
             use_logits_soft_cap=use_logits_soft_cap,
+            use_inline_sf=use_inline_sf,
         )
 
 
@@ -322,6 +328,37 @@ def gen_attention(
                 use_logits_soft_cap=use_logits_soft_cap,
                 use_profiler=False,
             )
+
+    # FA2 inline FP8 KV scale (per-(token, head) scale stored inline in the KV
+    # cache slot). Covers the same config space as the non-inline FA2 path (all
+    # head_dim pairs, sliding window, logits soft cap), restricted to an FP8 KV
+    # cache and a 16-bit Q/O.
+    for (
+        (head_dim_qk, head_dim_vo),
+        dtype_qo,
+        dtype_kv,
+        use_sliding_window,
+        use_logits_soft_cap,
+    ) in product(
+        fa2_head_dim_,
+        f16_dtype_,
+        f8_dtype_,
+        use_sliding_window_,
+        use_logits_soft_cap_,
+    ):
+        # One-byte (FP8) large-head modules stay SM100+-only, matching the
+        # non-inline FA2 path.
+        if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm10_or_newer:
+            continue
+        yield from gen_fa2(
+            dtype_qo=dtype_qo,
+            dtype_kv=dtype_kv,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            use_sliding_window=use_sliding_window,
+            use_logits_soft_cap=use_logits_soft_cap,
+            use_inline_sf=True,
+        )
 
     # FA3 MHA / MQA / GQA
     if has_sm90:
