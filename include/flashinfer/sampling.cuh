@@ -339,6 +339,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        // __fmul_rn, not *: it must not be contracted into an FMA.
+        // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
         logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       }
 
@@ -399,6 +401,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          // __fmul_rn, not *: it must not be contracted into an FMA.
+          // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
           logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
         }
       }
@@ -460,6 +464,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
     float thread_max = -cuda::std::numeric_limits<float>::infinity();
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
       logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       thread_max = max(thread_max, logits_vec[j]);
     }
@@ -560,6 +566,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
       logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       float p = __expf(static_cast<float>(logits_vec[j]) - final_max) * inv_denominator;
       prob_vec[j] = static_cast<DType>(p);
