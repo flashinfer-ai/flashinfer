@@ -2046,6 +2046,66 @@ def test_natural_width_block_table_memcheck(variant):
     assert "ERROR SUMMARY: 0 errors" in report, report[-3000:]
 
 
+@pytest.mark.parametrize("variant", ["fp8", "fp4"])
+@pytest.mark.parametrize("next_n", [3, 4])
+def test_defined_output_region_fully_written_at_tile_boundary(variant, next_n):
+    """Every cell the API defines is written at seq_len=257, one past a compute
+    tile: row b*next_n + t through position seq_lens[b] - next_n + t.
+
+    The boundary is where the fp4 next_n=4 split on SM100/SM103 differs from
+    the direct path: a request's two leading rows run as an atom with context
+    255, cover two 128-token tiles instead of three, and never write column
+    256 -- which lies in their causal tail (unspecified by contract), not in
+    their defined region.  A NaN prefill of out= makes an unwritten defined
+    cell unmistakable, where torch.empty would hide it behind stale data.  The
+    benchmark's finiteness self-check relies on exactly this contract.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+
+    from flashinfer import fp4_paged_mqa_logits, fp8_paged_mqa_logits, padded_seq_len
+
+    device = "cuda"
+    B, H, D, block_size, ctx = 2, 64, 128, 64, 257
+    torch.manual_seed(3)
+    if variant == "fp8":
+        q, kv, w, seq_lens, block_tables = _make_fp8_case(
+            B, next_n, ctx, block_size, device
+        )
+        dtype = torch.float32
+
+        def call(o):
+            return fp8_paged_mqa_logits(q, kv, w, block_tables, seq_lens, ctx, out=o)
+
+    else:
+        seq_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+        block_tables, ntb = _make_paged_kv(B, block_size, seq_lens, device)
+        w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+        q_bf = torch.randn(B, next_n, H, D, device=device, dtype=torch.bfloat16)
+        qp, sfp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+        q = qp.view(torch.uint8).view(B, next_n, H, D // 2)
+        q_sf = sfp.view(torch.int32).view(B, next_n, H)
+        kv, _ = _kv_cache_cast_to_fp4(
+            torch.randn(ntb, block_size, 1, D, device=device, dtype=torch.bfloat16)
+        )
+        dtype = torch.bfloat16
+
+        def call(o):
+            return fp4_paged_mqa_logits(
+                q, q_sf, kv, w, block_tables, seq_lens, ctx, output_dtype=dtype, out=o
+            )
+
+    out = torch.full(
+        (B * next_n, padded_seq_len(ctx)), float("nan"), dtype=dtype, device=device
+    )
+    res = call(out)
+    torch.cuda.synchronize()
+    defined = _valid_causal_mask(seq_lens, next_n, ctx, device)
+    assert torch.isfinite(res.float()[defined]).all(), (
+        "an API-defined output cell was left unwritten or is non-finite"
+    )
+
+
 def test_max_seq_len_bound(monkeypatch):
     """max_seq_len must be >= max(seq_lens), or the kernel writes OOB.
 

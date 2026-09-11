@@ -140,8 +140,13 @@ def _call(kind, args, out):
 
 def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads):
     args = _make_inputs(kind, batch, seq_len, next_n, block_size, device, num_heads)
-    out = torch.empty(
-        (batch * next_n, padded_seq_len(seq_len)),
+    rows = batch * next_n
+    # NaN-filled so the self-check below is deterministic: an unwritten cell
+    # in the defined region shows up as NaN instead of whatever torch.empty
+    # happened to hand out.  Filled once, outside the timed loops.
+    out = torch.full(
+        (rows, padded_seq_len(seq_len)),
+        float("nan"),
         dtype=torch.float32 if kind == "fp8" else torch.bfloat16,
         device=device,
     )
@@ -149,15 +154,23 @@ def bench_one(kind, batch, seq_len, next_n, block_size, iters, device, num_heads
     # Warm: JIT compile + schedule-bucket compile happen here, outside timing.
     _call(kind, args, out)
     torch.cuda.synchronize()
-    # The kernels compute every column in [0, seq_len) (the caller masks the
-    # causal tail), so finite inputs must give finite logits there; columns
-    # past seq_len up to the padded pitch are scratch.  A non-finite result
-    # means _make_inputs drifted from the API's fused layout -- abort loudly
-    # (AssertionError is not swallowed by the sweep's skip handling).
-    if not torch.isfinite(out[:, :seq_len]).all():
+    # Self-check on exactly the region the API defines: row b*next_n + t holds
+    # scores for positions 0 .. seq_lens[b] - next_n + t (see the Returns
+    # section of either API).  The causal tail and the padding columns are
+    # unspecified -- the kernel may leave them unwritten (e.g. fp4 next_n=4 on
+    # SM100/SM103 runs as two atoms whose leading rows see a shorter context
+    # and cover one compute tile less at seq_len=257) -- so they are excluded.
+    # Finite inputs must give finite logits in the defined region; a NaN there
+    # means _make_inputs drifted from the API's fused layout, or the kernel
+    # left a defined cell unwritten.  Abort loudly: AssertionError is not in
+    # the sweep's skip set.
+    limits = seq_len - next_n + (torch.arange(rows, device=device) % next_n)
+    defined = torch.arange(seq_len, device=device)[None, :] <= limits[:, None]
+    if not torch.isfinite(out[:, :seq_len][defined]).all():
         raise AssertionError(
-            f"{kind} bench inputs produced non-finite logits -- _make_inputs is "
-            "no longer in the API's fused kv layout"
+            f"{kind} bench produced non-finite logits in the API-defined output "
+            "region -- _make_inputs is no longer in the API's fused kv layout, "
+            "or the kernel left a defined cell unwritten"
         )
 
     # Graph replay: device work only (the schedule recompute is captured too).
@@ -193,7 +206,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--kind", choices=["fp8", "fp4"], nargs="+", default=["fp8", "fp4"])
     p.add_argument("--batch", type=int, nargs="+", default=[1, 16, 64])
-    p.add_argument("--seq-len", type=int, nargs="+", default=[4096, 16384])
+    # 257 is the boundary case: one past a compute tile, so the fp4 next_n=4
+    # split's leading rows cover one tile less than the others and the
+    # self-check's defined-region mask is exercised on every default run.
+    p.add_argument("--seq-len", type=int, nargs="+", default=[257, 4096, 16384])
     p.add_argument("--next-n", type=int, nargs="+", default=[1, 2, 3, 4])
     p.add_argument("--block-size", type=int, default=64)
     p.add_argument(
