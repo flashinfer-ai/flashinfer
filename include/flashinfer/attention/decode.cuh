@@ -402,6 +402,7 @@ template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t 
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
 __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
+                                                             float* tmp_v,
                                                              const uint32_t bx = blockIdx.x,
                                                              const uint32_t by = blockIdx.y,
                                                              const uint32_t tx = threadIdx.x,
@@ -607,7 +608,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   }
 
   if (tz == 0) {
-    st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    const size_t o_offset =
+        (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size;
+    if (partition_kv) {
+      st.o.store(tmp_v + o_offset);
+    } else {
+      st.o.cast_store(o + o_offset);
+    }
     // write lse
     if (lse != nullptr) {
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
@@ -621,10 +628,11 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
-__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
+__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params,
+                                                  float* tmp_v) {
   extern __shared__ uint8_t smem[];
   BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
-                                    bdx, bdy, bdz, AttentionVariant>(params, smem);
+                                    bdx, bdy, bdz, AttentionVariant>(params, smem, tmp_v);
 }
 
 /*!
@@ -753,8 +761,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
-cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, bool enable_pdl,
+cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                  bool enable_pdl,
                                                   cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -806,9 +814,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         params.partition_kv = false;
 
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params, tmp_v));
         } else {
-          void* args[] = {(void*)&params};
+          void* args[] = {(void*)&params, (void*)&tmp_v};
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }
@@ -817,12 +825,11 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
         params.partition_kv = true;
         auto o = params.o;
         auto lse = params.lse;
-        params.o = tmp_v;
         params.lse = tmp_s;
         if (enable_pdl) {
-          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, params, tmp_v));
         } else {
-          void* args[] = {(void*)&params};
+          void* args[] = {(void*)&params, (void*)&tmp_v};
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         }

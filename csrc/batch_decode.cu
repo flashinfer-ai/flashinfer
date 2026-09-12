@@ -25,8 +25,8 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
-cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                  float* tmp_s, bool enable_pdl,
+cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                  bool enable_pdl,
                                                   cudaStream_t stream);
 
 }  // namespace flashinfer
@@ -218,7 +218,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         ADDITIONAL_PARAMS_SETTER
 
-        DTypeO* tmp_v = nullptr;
+        float* tmp_v = nullptr;
         float* tmp_s = nullptr;
         params.request_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.request_indices_offset);
@@ -228,7 +228,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.kv_chunk_size_ptr =
             GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_chunk_size_ptr_offset);
         if (plan_info.split_kv) {
-          tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer, plan_info.v_offset);
+          tmp_v = GetPtrFromBaseOffset<float>(float_buffer, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer, plan_info.s_offset);
           if (plan_info.enable_cuda_graph) {
             params.block_valid_mask =
