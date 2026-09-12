@@ -536,8 +536,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
-extern "C" {
-
+template <bool kTaskKindTokenMajor>
 __global__ __launch_bounds__(384) void
 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
 {
@@ -1272,6 +1271,15 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
                 int query = work_idx_l / (unsigned int)num_kv_heads;
                 int kv_head = work_idx_l % (unsigned int)num_kv_heads;
                 int group_size = num_q_heads / num_kv_heads;
+                constexpr int kAttentionTopK = 16;
+                int task_kind_base;
+                if constexpr (kTaskKindTokenMajor) {
+                    // Token-major storage is [query, kv_head, topk]. Since work_idx_l is
+                    // query * num_kv_heads + kv_head, it already linearizes the first two axes.
+                    task_kind_base = work_idx_l * kAttentionTopK;
+                } else {
+                    task_kind_base = (kv_head * total_q + query) * kAttentionTopK;
+                }
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
                 if (elect_sync()) {
@@ -1290,7 +1298,7 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
                         int valid_cols_1 = 128;
                         int batch = query / seqlen_q;
                         int query_in_batch = query - batch * seqlen_q;
-                        int selected_block = task_kind[(kv_head * total_q + query) * 16 + selected_position];
+                        int selected_block = task_kind[task_kind_base + selected_position];
                         int kv_len = task_kv_head[batch];
                         int valid_cols_0 = 0;
                         if (selected_block >= 0) {
@@ -1353,7 +1361,7 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
                         int next_valid_cols = 128;
                         int batch_1 = query / seqlen_q;
                         int query_in_batch_1 = query - batch_1 * seqlen_q;
-                        int selected_block_1 = task_kind[(kv_head * total_q + query) * 16 + selected_position_1];
+                        int selected_block_1 = task_kind[task_kind_base + selected_position_1];
                         int kv_len_1 = task_kv_head[batch_1];
                         int valid_cols_2 = 0;
                         if (selected_block_1 >= 0) {
@@ -1882,5 +1890,3 @@ kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1(const _
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
     }
 }
-
-} // extern "C"
