@@ -46,22 +46,31 @@ def _get_glibcxx_abi_build_flags() -> List[str]:
 
 @functools.cache
 def get_cuda_path() -> str:
+    """Return the canonical path of the CUDA toolkit to build against.
+
+    Resolution order: ``CUDA_HOME``, ``CUDA_PATH``, the parent of ``which
+    nvcc``, then ``/usr/local/cuda``. The result is passed through
+    :func:`os.path.realpath` because it is embedded verbatim as ``cuda_home``
+    in the generated ``build.ninja``: without canonicalization, two processes
+    that reach the same toolkit through different paths (``/usr/local/cuda``
+    vs its ``/usr/local/cuda-X.Y`` symlink target, or a different ``PATH``
+    order) write different ninja files and ninja rebuilds every object.
+    """
     cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-    if cuda_home is not None:
-        return cuda_home
-    # get output of "which nvcc"
-    nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
-    if nvcc_path.returncode == 0:
-        cuda_home = os.path.dirname(
-            os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
-        )
-    else:
-        cuda_home = "/usr/local/cuda"  # This default value is from: https://github.com/pytorch/pytorch/blob/ceb11a584d6b3fdc600358577d9bf2644f88def9/torch/utils/cpp_extension.py#L115
-        if not os.path.exists(cuda_home):
-            raise RuntimeError(
-                f"Could not find nvcc and default {cuda_home=} doesn't exist"
+    if cuda_home is None:
+        # get output of "which nvcc"
+        nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
+        if nvcc_path.returncode == 0:
+            cuda_home = os.path.dirname(
+                os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
             )
-    return cuda_home
+        else:
+            cuda_home = "/usr/local/cuda"  # This default value is from: https://github.com/pytorch/pytorch/blob/ceb11a584d6b3fdc600358577d9bf2644f88def9/torch/utils/cpp_extension.py#L115
+            if not os.path.exists(cuda_home):
+                raise RuntimeError(
+                    f"Could not find nvcc and default {cuda_home=} doesn't exist"
+                )
+    return os.path.realpath(cuda_home)
 
 
 @functools.cache
