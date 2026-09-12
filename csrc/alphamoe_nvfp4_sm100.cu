@@ -1931,7 +1931,8 @@ inline ProblemDims CheckInputs(
   CheckNoOverlap(accumulator, gemm1_weights_scale, "gemm1_weights_scale", "accumulator");
   CheckNoOverlap(accumulator, gemm2_weights, "gemm2_weights", "accumulator");
   CheckNoOverlap(accumulator, gemm2_weights_scale, "gemm2_weights_scale", "accumulator");
-  CheckNoOverlap(accumulator, output1_scale_gate_scalar, "output1_scale_gate_scalar", "accumulator");
+  CheckNoOverlap(accumulator, output1_scale_gate_scalar, "output1_scale_gate_scalar",
+                 "accumulator");
   CheckNoOverlap(accumulator, output1_scale_scalar, "output1_scale_scalar", "accumulator");
   CheckNoOverlap(accumulator, output2_scale_scalar, "output2_scale_scalar", "accumulator");
   CheckNoOverlap(accumulator, sorted_token_ids, "sorted_token_ids", "accumulator");
@@ -2043,8 +2044,8 @@ inline void Launch(const TensorView& hidden_states, const TensorView& hidden_sta
                    const TensorView& output1_scale_scalar, const TensorView& output2_scale_scalar,
                    const TensorView& sorted_token_ids, const TensorView& expert_ids,
                    const TensorView& num_tokens_post_padded, const TensorView& topk_weights,
-                   const TensorView& accumulator, const ProblemDims& dims, float routed_scaling_factor,
-                   cudaStream_t stream) {
+                   const TensorView& accumulator, const ProblemDims& dims,
+                   float routed_scaling_factor, cudaStream_t stream) {
   const CUtensorMap hidden_states_map = EncodeHiddenStatesTma(hidden_states);
   const CUtensorMap gemm1_map = EncodeGemm1WeightsTma(gemm1_weights);
   const CUtensorMap gemm2_map = EncodeGemm2WeightsTma(gemm2_weights);
@@ -2067,9 +2068,8 @@ inline void Launch(const TensorView& hidden_states, const TensorView& hidden_sta
       static_cast<float*>(output2_scale_scalar.data_ptr()),
       static_cast<int*>(sorted_token_ids.data_ptr()), static_cast<int*>(expert_ids.data_ptr()),
       static_cast<int*>(num_tokens_post_padded.data_ptr()),
-      static_cast<float*>(topk_weights.data_ptr()),
-      static_cast<float*>(accumulator.data_ptr()), dims.m, dims.k, dims.top_k, dims.block_m,
-      routed_scaling_factor, tensor_maps);
+      static_cast<float*>(topk_weights.data_ptr()), static_cast<float*>(accumulator.data_ptr()),
+      dims.m, dims.k, dims.top_k, dims.block_m, routed_scaling_factor, tensor_maps);
   CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 kernel launch");
 }
 
@@ -2085,12 +2085,11 @@ void Run(TensorView hidden_states, TensorView hidden_states_scale, TensorView ge
       << "hidden_states must be a CUDA tensor";
   ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
 
-  const ProblemDims dims =
-      CheckInputs(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
-                  gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
-                  output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
-                  num_tokens_post_padded, topk_weights, out, accumulator, top_k, block_m,
-                  routed_scaling_factor);
+  const ProblemDims dims = CheckInputs(
+      hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights,
+      gemm2_weights_scale, output1_scale_gate_scalar, output1_scale_scalar, output2_scale_scalar,
+      sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, accumulator, top_k,
+      block_m, routed_scaling_factor);
   const cudaStream_t stream = get_stream(hidden_states.device());
   Launch(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights,
          gemm2_weights_scale, output1_scale_gate_scalar, output1_scale_scalar, output2_scale_scalar,
