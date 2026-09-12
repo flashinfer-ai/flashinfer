@@ -22,7 +22,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
@@ -86,7 +86,7 @@ def _mxfp8_quant_matrix(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
-    if variant is QuantVariant.DeepSeekFp8:
+    if variant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
         x = _deepseek_dequant_activations(x_q, x_scale)
         w1 = _deepseek_dequant_weights(
             view["gemm1_weights"], view["gemm1_weights_scale"]
@@ -112,9 +112,9 @@ def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
 
 
 def _requant_intermediate(inter: torch.Tensor, variant) -> torch.Tensor:
-    if variant is QuantVariant.DeepSeekFp8:
+    if variant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
         q, sf = TrtllmFp8BlockConfig.prepare_activations(
-            inter.to(torch.bfloat16), variant=variant
+            inter.to(torch.bfloat16), quant=variant
         )
         return _deepseek_dequant_activations(q, sf)
     q, sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
@@ -255,11 +255,11 @@ def _make_block_fp8_case(
         dim=-1,
     )
 
-    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, quant=variant)
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
-        variant=variant,
+        quant=variant,
         num_local_experts=local_experts,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
@@ -273,7 +273,7 @@ def _make_block_fp8_case(
             num_experts=expert_offset + local_experts,
             top_k=TOP_K,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=expert_offset,
@@ -293,7 +293,13 @@ def _make_block_fp8_case(
     return pack, weight_pack, config, dequant
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     pack, weights, config, (x, w1, w2) = _make_block_fp8_case(variant)
     reference = _block_fp8_reference(
@@ -308,7 +314,13 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     _assert_fp8_close(layer(pack, weights), reference)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 def test_block_fp8_unpacked_routing_forwards_inputs_and_matches_reference(
     variant, weights_dtype
@@ -355,7 +367,8 @@ def test_block_fp8_unpacked_routing_forwards_inputs_and_matches_reference(
 @pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))
 def test_mxfp8_new_activation_layer_and_direct_match_reference(activation):
     pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
-        QuantVariant.MxFp8, activation=activation
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+        activation=activation,
     )
 
     def _reference(act):
@@ -365,7 +378,7 @@ def test_mxfp8_new_activation_layer_and_direct_match_reference(activation):
             w2,
             pack.topk_ids,
             pack.topk_weights,
-            QuantVariant.MxFp8,
+            QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
             activation=act,
         )
 
@@ -382,7 +395,13 @@ def test_mxfp8_new_activation_layer_and_direct_match_reference(activation):
         _assert_closer_to(direct, reference, _reference(SwiGLU()))
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
     """The unified runner forwards the SwiGLU OA params from the weight view.
 
@@ -436,7 +455,9 @@ def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
 @pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
 def test_block_fp8_swiglu_oa_params_rejected_when_malformed(key):
     """Malformed OA params fail at the runner boundary, naming the offending key."""
-    pack, weights, config, _ = _make_block_fp8_case(QuantVariant.DeepSeekFp8)
+    pack, weights, config, _ = _make_block_fp8_case(
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8)
+    )
     runner = MoELayer(config).runners[0]
     view = weights.get_view("trtllm_fp8_block")
     device = pack.hidden_states_q.device
@@ -477,7 +498,7 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.MxFp8,
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         num_local_experts=1,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
@@ -543,7 +564,7 @@ def test_mxfp8_preparation_rejects_unshufflable_dimensions(
         TrtllmFp8BlockConfig.prepare_weights(
             w1,
             w2,
-            variant=QuantVariant.MxFp8,
+            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
             num_local_experts=1,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -567,7 +588,13 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     return actual
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_from_logits_matches_prerouted(variant):
     pack, weights, config, _ = _make_block_fp8_case(variant)
     logits = torch.randn(TOKENS, NUM_EXPERTS, device="cuda", dtype=torch.float32)
@@ -613,7 +640,13 @@ def _deepseek_v3_route(logits, bias, *, top_k, n_group, topk_group, scale):
     return selected.to(torch.int32), weights
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
     num_experts = 64
     pack, weights, config, _ = _make_block_fp8_case(variant, local_experts=num_experts)
@@ -670,7 +703,13 @@ def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
     _assert_fp8_close(actual, expected)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_nonzero_expert_offset(variant):
     offset = 8
     pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
@@ -693,7 +732,13 @@ def test_block_fp8_nonzero_expert_offset(variant):
     _assert_fp8_close(actual, expected)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_prerouted_cuda_graph(variant):
     pack, weights, config, _ = _make_block_fp8_case(variant)
     layer = MoELayer(config)
@@ -877,7 +922,9 @@ def _make_per_tensor_fp8_case(
             top_k=top_k,
             method=routing_method,
         ),
-        quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        ),
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_num_experts=local_num_experts,
@@ -1183,13 +1230,13 @@ def _make_shared_expert_case(
     w1[num_experts:] *= shared_scale
     w2[num_experts:] *= shared_scale
 
-    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, quant=variant)
     # prepare_weights takes the *physical* row count, which includes the shared
     # experts; the routed-only count lives in RoutingConfig/ExpertConfig.
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
-        variant=variant,
+        quant=variant,
         num_local_experts=rows,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
@@ -1213,7 +1260,7 @@ def _make_shared_expert_case(
             topk_group=SHARED_TOPK_GROUP,
             routed_scaling_factor=SHARED_ROUTED_SCALE,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             num_fused_shared_experts=num_shared,
@@ -1261,10 +1308,10 @@ def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
         # the same launch the unified runner performs.
         fp8_quantization_type=(
             Fp8QuantizationType.MxFp8
-            if config.quant.variant is QuantVariant.MxFp8
+            if config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
             else Fp8QuantizationType.DeepSeekFp8
         ),
-        use_shuffled_weight=config.quant.variant is QuantVariant.MxFp8,
+        use_shuffled_weight=config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8),
         num_fused_shared_experts=num_shared,
         activation_type=int(config.activation.type),
         gemm1_alpha=view.get("gemm1_alpha"),
@@ -1276,8 +1323,18 @@ def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
 @pytest.mark.parametrize(
     "variant,num_shared",
     [
-        pytest.param(QuantVariant.DeepSeekFp8, 1, id="deepseek-s1"),
-        pytest.param(QuantVariant.MxFp8, 2, id="mxfp8-s2"),
+        pytest.param(
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+            1,
+            id="deepseek-s1",
+        ),
+        pytest.param(
+            QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+            2,
+            id="mxfp8-s2",
+        ),
     ],
 )
 def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
@@ -1292,7 +1349,7 @@ def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
 @pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))
 def test_mxfp8_new_activations_match_flat_launcher(activation):
     pack, weights, config, view, (logits, bias) = _make_shared_expert_case(
-        QuantVariant.MxFp8,
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         num_shared=0,
         activation=activation,
     )
@@ -1305,7 +1362,8 @@ def test_mxfp8_new_activations_match_flat_launcher(activation):
 def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
     num_shared = 1
     pack, weights, config, view, _ = _make_shared_expert_case(
-        QuantVariant.DeepSeekFp8, num_shared=num_shared
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        num_shared=num_shared,
     )
     runner = MoELayer(config).runners[0]
     device = pack.hidden_states_q.device
@@ -1324,7 +1382,9 @@ def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
 
 def test_block_fp8_fused_shared_experts_contribute():
     """Verify shared rows contribute independently of the legacy cross-check."""
-    variant = QuantVariant.DeepSeekFp8
+    variant = QuantConfig(
+        weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+    )
     num_shared = 1
     pack, weights, config, _, _ = _make_shared_expert_case(
         variant, num_shared=num_shared
@@ -1348,7 +1408,8 @@ def test_block_fp8_fused_shared_experts_contribute():
 def test_block_fp8_fused_shared_experts_cuda_graph_replay():
     """Verify that static S reaches routing during CUDA graph replay."""
     pack, weights, config, _, _ = _make_shared_expert_case(
-        QuantVariant.DeepSeekFp8, num_shared=1
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        num_shared=1,
     )
     from flashinfer.fused_moe.runners import TrtllmFp8BlockRunner
 
