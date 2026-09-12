@@ -864,20 +864,30 @@ inline cudaError_t PrefillPlanImpl(
         num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
         sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
-    plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
-        sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
 
     if constexpr (MATERIALIZE) {
       IdType* merge_indptr_h =
           GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
+    } else {
+      (void)merge_indptr_vec;
+    }
+  }
+
+  // Under CUDA graphs the kernel is launched over padded_batch_size CTAs whatever the
+  // batch turned out to be, and the plan only writes request/tile indices for the
+  // new_batch_size real ones; the mask is what keeps the padding CTAs from reading
+  // whatever the workspace held. It must therefore exist whenever there is padding,
+  // not only when the batch is split.
+  if (enable_cuda_graph) {
+    plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
+        sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
+    if constexpr (MATERIALIZE) {
       bool* block_valid_mask_h =
           GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
-      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
       for (uint32_t i = 0; i < padded_batch_size; ++i) {
         block_valid_mask_h[i] = i < new_batch_size;
       }
-    } else {
-      (void)merge_indptr_vec;
     }
   }
 
