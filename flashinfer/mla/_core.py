@@ -452,9 +452,9 @@ def _run_nvfp4_sparse_mla_sm120(
             f"NVFP4 sparse MLA supports 16, 32, 64, or 128 query heads, got {num_heads}"
         )
     topk = primary_segment.indices.shape[1]
-    if topk not in (128, 512):
+    if topk not in (128, 256, 512):
         raise ValueError(
-            f"NVFP4 sparse MLA supports primary top-k 128 or 512, got {topk}"
+            f"NVFP4 sparse MLA supports primary top-k 128, 256 or 512, got {topk}"
         )
     extra_topk = extra_segment.indices.shape[1] if extra_segment is not None else 0
     from ._sparse_mla_nvfp4_sm120_plan import (
@@ -2059,7 +2059,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SM120/SM121 sparse-cache storage format. ``"fp8"`` preserves the
         existing 584-byte DSv4 cache ABI. ``"nvfp4"`` selects the 384-byte
         group-16 NVFP4 cache ABI and its native prefill/decode kernels.
-        NVFP4 currently supports 16/32/64/128 heads, primary top-k 128 or 512,
+        NVFP4 currently supports 16/32/64/128 heads, primary top-k 128, 256 or 512,
         primary page size 64, and optional extra-cache page size 2 or 64.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)

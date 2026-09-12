@@ -188,12 +188,16 @@ void SparseMlaSm120NVFP4Prefill(TensorView q, TensorView kv_cache, TensorView in
     return;                                                                                       \
   }
   DISPATCH_NVFP4_PREFILL(16, 128)
+  DISPATCH_NVFP4_PREFILL(16, 256)
   DISPATCH_NVFP4_PREFILL(16, 512)
   DISPATCH_NVFP4_PREFILL(32, 128)
+  DISPATCH_NVFP4_PREFILL(32, 256)
   DISPATCH_NVFP4_PREFILL(32, 512)
   DISPATCH_NVFP4_PREFILL(64, 128)
+  DISPATCH_NVFP4_PREFILL(64, 256)
   DISPATCH_NVFP4_PREFILL(64, 512)
   DISPATCH_NVFP4_PREFILL(128, 128)
+  DISPATCH_NVFP4_PREFILL(128, 256)
   DISPATCH_NVFP4_PREFILL(128, 512)
 #undef DISPATCH_NVFP4_PREFILL
   TVM_FFI_ICHECK(false) << "unsupported initial NVFP4 prefill shape: heads=" << num_heads
