@@ -23,6 +23,7 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
+from flashinfer.tllm_enums import SfLayout
 from flashinfer.testing.utils import (
     bench_gpu_time,
 )
@@ -611,13 +612,15 @@ def testTrtllmFp4BlockScaleMoe(args):
         hidden_states_fp4 = hidden_states.to(torch.bfloat16)
         hidden_states_scale_linear_fp4 = None
     elif fp4_mode == "mxfp4_mxfp8":
-        if num_tokens % 128 != 0:
-            raise ValueError(
-                f"mxfp4_mxfp8 mode requires num_tokens to be a multiple of 128 "
-                f"(got {num_tokens}) because mxfp8_quantize with swizzled scale "
-                f"layout pads rows to 128-element boundaries."
-            )
-        hs_quant, hs_scale = mxfp8_quantize(hidden_states, True)
+        # The trtllm-gen routed GEMM requires the LINEAR activation SF layout
+        # ("Tokens need use SF linear layout when being routed"), so quantize
+        # non-swizzled.  This used to pass is_sf_swizzled_layout=True and work
+        # around the resulting shape error by demanding num_tokens % 128 == 0 --
+        # but that is exactly the regime where the swizzled buffer's numel
+        # coincides with the linear one, so the kernel silently read swizzled
+        # bytes as linear and produced wrong numbers instead of throwing.
+        # Linear pads no rows, so the alignment restriction is unnecessary too.
+        hs_quant, hs_scale = mxfp8_quantize(hidden_states, False)
         hidden_states_fp4 = hs_quant
         hidden_states_scale_linear_fp4 = hs_scale.view(torch.float8_e4m3fn).reshape(
             num_tokens, -1
@@ -722,6 +725,7 @@ def testTrtllmFp4BlockScaleMoe(args):
             do_finalize=True,
             enable_pdl=args.enable_pdl,
             **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
+            hidden_states_scale_layout=SfLayout.layout_linear,
         )
 
     backend = "trtllm"
@@ -2711,7 +2715,7 @@ def testUnifiedNvfp4Moe(args):
         MoELayer,
         MoEWeightPack,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         SwiGLU,
         RoutingConfig,
         TrtllmFp4Config,
@@ -2865,7 +2869,7 @@ def testUnifiedNvfp4Moe(args):
             topk_group=args.topk_group,
             routed_scaling_factor=args.routed_scaling_factor,
         ),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=local_expert_offset,

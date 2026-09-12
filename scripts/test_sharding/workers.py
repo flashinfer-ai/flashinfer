@@ -22,6 +22,11 @@ from .progress import PYTEST_EVENT_PREFIX, decode_pytest_event
 from .summary import batch_directory, batch_xml_path
 
 
+_DEFAULT_MASTER_PORT = 29500
+_MASTER_PORT_STRIDE = 100
+_MAX_TCP_PORT = 65535
+
+
 @dataclass(frozen=True)
 class BatchExecution:
     status: str
@@ -351,6 +356,15 @@ def _pytest_command(
     ]
 
 
+def _worker_master_port(worker_index: int) -> str:
+    if worker_index < 0:
+        raise ValueError("worker index must be non-negative")
+    port = _DEFAULT_MASTER_PORT + worker_index * _MASTER_PORT_STRIDE
+    if port + _MASTER_PORT_STRIDE - 1 > _MAX_TCP_PORT:
+        raise ValueError(f"worker {worker_index} has no valid rendezvous port block")
+    return str(port)
+
+
 def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
@@ -361,6 +375,10 @@ def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
     )
     if request.device is not None:
         env["CUDA_VISIBLE_DEVICES"] = request.device
+    # Isolate each concurrent worker's rendezvous and sibling TCPStore ports.
+    # Preserve explicit launcher configuration.
+    if "MASTER_PORT" not in env:
+        env["MASTER_PORT"] = _worker_master_port(request.worker_index)
     return env
 
 
@@ -370,6 +388,7 @@ def _run_pytest(
     command: list[str],
 ) -> _ProcessOutcome:
     launched_at = time.time()
+    environment = _pytest_environment(request)
     samples: list[tuple[float, float, float]] = []
     stop_monitor = threading.Event()
     monitor: threading.Thread | None = None
@@ -379,13 +398,19 @@ def _run_pytest(
     aborted = False
     exited_at: float | None = None
     output_errors: list[str] = []
+    write_console(
+        f"PYTEST BATCH START worker={request.worker_index} "
+        f"batch={request.batch.id} source={request.batch.source_file} "
+        f"device={environment.get('CUDA_VISIBLE_DEVICES', 'all')} "
+        f"master_port={environment['MASTER_PORT']}"
+    )
     with artifacts.log.open("a", encoding="utf-8") as log:
         log.write(f"command: {' '.join(command)}\n")
         log.flush()
         process = subprocess.Popen(
             command,
             cwd=request.pytest_root,
-            env=_pytest_environment(request),
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,

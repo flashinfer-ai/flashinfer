@@ -24,6 +24,7 @@
 #include "common/d2_load_b_nvfp4.cuh"
 #include "common/nvfp4_quant.cuh"
 #include "common/nvfp4_vt.cuh"
+#include "common/zero_row.cuh"
 #include "model/nvfp4_cache_traits.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
@@ -282,7 +283,11 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       __threadfence_block();
     }
 
-    const int idx = idx_raw >= 0 ? idx_raw : 0;
+    // Masked candidates gather the shared zero row, never a mutable cache
+    // slot: the BF16 rope tail has no scale in its path, so a NaN there
+    // would leak through 0 * NaN in the value MMA.
+    const bool valid = idx_raw >= 0;
+    const int idx = valid ? idx_raw : 0;
     int page;
     int slot;
     if constexpr (DUAL_CACHE) {
@@ -297,8 +302,10 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       page = idx / PAGE_BLOCK_SIZE;
       slot = idx - page * PAGE_BLOCK_SIZE;
     }
-    const uint8_t* data_src =
-        section_kv + (size_t)page * section_stride + (size_t)slot * DECODE_DATA_BYTES_PER_TOKEN;
+    const uint8_t* data_src = valid ? section_kv + (size_t)page * section_stride +
+                                          (size_t)slot * DECODE_DATA_BYTES_PER_TOKEN
+                                    : sparse_mla_zero_row;
+    static_assert(BULK_NOPE_BYTES + BULK_ROPE_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
     if (io_warp == 0 && lane == 0) mbarrier_arrive_expect_tx(sm.mbar_full(buf), BULK_TX_BYTES);
     bar_sync_t<4, DECODE_IO_WARPS * 32>();
     cp_async_bulk_g2s(fp4_dst + (size_t)entry * DECODE_KV_SMEM_STRIDE, data_src, BULK_NOPE_BYTES,

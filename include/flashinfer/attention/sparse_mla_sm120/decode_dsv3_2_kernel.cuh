@@ -13,6 +13,7 @@
 #include "common/fp8_quant.cuh"
 #include "common/online_softmax.cuh"
 #include "common/scale_mma.cuh"
+#include "common/zero_row.cuh"
 #include "model/kv_cache_traits.cuh"
 #include "model/scale_convert.cuh"
 
@@ -23,12 +24,14 @@ namespace flashinfer::sparse_mla_sm120 {
 // adapted to 656B inline-scale traits (D_NOPE=512, V_CHUNK=128,
 // N_V_CHUNKS=4, V_HAS_ROPE=false). No dual cache.
 //
-// KV gmem layout per token (KV_GMEM_STRIDE=656):
+// KV gmem layout per token (DSV3_2/GLM_NSA row = 656B):
 //   [0     : 512)  FP8 e4m3 nope, 4 tiles × 128 elements
 //   [512   : 528)  4 × FP32 scale (one per 128-elem tile)
 //   [528   : 656)  BF16 rope, 64 elements × 2B
 // DSv3.2 stores power-of-2 FP32 scales; GLM_NSA stores arbitrary FP32 scales.
-// GLM53_NOPE reuses the 656 B row with [528:656) as reserved padding — never read as rope.
+// GLM53_NOPE has a 528B payload (no rope); its gmem row advance is the runtime
+// stride_kv_row, so a legacy 656B vLLM pool and a compact 528B pool both work —
+// the [528:656) pad of a 656B row is never read.
 // The IO warp does a single bulk per token that covers both nope and inline
 // scales in one go (528 B), then a second bulk for rope (128 B). No scalar
 // scale gather phase.
@@ -263,11 +266,16 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       if (entry_idx >= DSV3_2_BI) break;
       const int cand_pos = g_start + entry_idx;
       const int idx_raw = (cand_pos < g_end) ? idx_base[cand_pos] : -1;
+      // Masked candidates gather the shared zero row, never a mutable cache
+      // slot: a NaN there would leak through 0 * NaN in the value MMA. The
+      // zero row is wide enough to cover the rope tail as well.
+      static_assert(KV_SMEM_STRIDE + D_ROPE_C * (int)sizeof(bf16) <= SPARSE_MLA_ZERO_ROW_BYTES);
       const int idx = (idx_raw >= 0) ? idx_raw : 0;
       const int block_idx_g = idx / pbs;
       const int local_idx_g = idx - block_idx_g * pbs;
-      const uint8_t* data_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
-                                 (size_t)local_idx_g * (size_t)stride_kv_row;
+      const uint8_t* data_base = (idx_raw >= 0) ? KV_cache + (size_t)block_idx_g * stride_kv_block +
+                                                      (size_t)local_idx_g * (size_t)stride_kv_row
+                                                : sparse_mla_zero_row;
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));

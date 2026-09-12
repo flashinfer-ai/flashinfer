@@ -154,6 +154,7 @@ class _FakeDist:
         self._world = world_size
         self._all_info = all_info
         self.created: list[tuple[int, ...]] = []  # sub-groups created, in order
+        self.barriers: list[Any] = []  # groups barriered on, in order
 
     def get_rank(self, group: Any = None) -> int:
         return self._rank if group is None else group.ranks.index(self._rank)
@@ -177,6 +178,9 @@ class _FakeDist:
         self.created.extend(g.ranks for g in subs)
         cur = next((g for g in subs if self._rank in g.ranks), None)
         return cur, subs
+
+    def barrier(self, group: Any = None) -> None:
+        self.barriers.append(group)
 
     def new_group(self, ranks: list[int]) -> Any:
         # Unused by the fixed Split, but recorded so a regression to the buggy
@@ -222,6 +226,10 @@ def test_torch_dist_backend_split_creates_every_subgroup_on_every_rank(
         assert fake.created == expected, f"rank {rank}: {fake.created}"
         # ...and gets back a backend scoped to its own color's sub-group.
         assert sub._group.ranks == expected[rank % 2]  # pyright: ignore[reportPrivateUsage, reportOptionalMemberAccess]
+        # Split must synchronize on the *parent* group before returning, or a
+        # rank can race ahead and tear down while a peer is still inside the
+        # sub-group rendezvous (gloo then fails connectFullMesh -- see #4193).
+        assert fake.barriers == [None], f"rank {rank}: {fake.barriers}"
 
 
 def test_split_partition_covers_all_colors_ordered_by_key() -> None:

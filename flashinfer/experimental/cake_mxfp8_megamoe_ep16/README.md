@@ -16,8 +16,18 @@ the explicit opt-in; no environment variable is required.
 - hidden size 3072 and intermediate size 5120
 - 16, 32, or 64 tokens per rank
 - BF16 activations and outputs with MXFP8 expert weights
-- balanced immutable routing prepared with the session
+- immutable routing prepared with the session, with at most 64 routes assigned
+  to any expert across all ranks
 - exact compute capability 10.3 and NVSHMEM symmetric memory
+
+Session construction materializes the eight fixed-address TMA descriptors with
+one setup kernel and synchronizes before returning. Each forward then uses
+exactly two kernels: the first publishes and dispatches BF16 rows, executes FC1
+and FC2, and returns one contribution per route; the second reduces the eight
+route contributions in a fixed order. CUDA Graph capture is not supported.
+Calls on one session must be serialized on a single CUDA stream. Recreate the
+session after 14,913,080 forwards, before its signed grid-counter epoch would
+overflow.
 
 The backend does not participate in automatic routing, autotuning, trace
 apply, or AOT packaging. It provides no compatibility guarantee while it is

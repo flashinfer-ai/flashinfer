@@ -9,7 +9,7 @@
 // Supports the V32-family dispatch grid: dedicated instantiations at
 //   num_heads ∈ {8, 16, 32, 64, 128}
 // plus one runtime-H instantiation (any num_heads <= 128 off the grid) and
-// GLM53_NOPE dedicated 32/64 + runtime-H. topk is a runtime argument — one
+// GLM53_NOPE dedicated 8/16/32/64 + runtime-H. topk is a runtime argument — one
 // instantiation serves every indices-row width.
 
 #include <cuda_runtime.h>
@@ -186,9 +186,13 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
     DSV3_2_DISPATCH_RT_MT(ModelType::GLM_NSA)
   }
   // GLM-5.3 combines its 2048 sparse selection with the 128-token
-  // indexer window. The TP1 (64-head) and TP2 (32-head) shapes keep
+  // indexer window. The TP1/TP2/TP4/TP8 (64/32/16/8-head) shapes keep
   // dedicated instantiations; any other shard rides the runtime-H fallback.
   if (mt == ModelType::GLM53_NOPE) {
+    // The public scratch allocator uses eight rows for H=8. A dedicated
+    // instantiation preserves that ABI instead of the runtime-H padded stride.
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 8)
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 16)
     DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 32)
     DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 64)
     DSV3_2_DISPATCH_RT_MT(ModelType::GLM53_NOPE)

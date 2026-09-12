@@ -99,10 +99,10 @@ _SOURCE = (
     / "cake_minimax_h3_bf16_pre_attention_sm103a.cu"
 )
 _CUDA_DEVICE = torch.device("cuda")
-_HAS_SM103A_RUNTIME = (
+_HAS_BLACKWELL_RUNTIME = (
     _SOURCE.is_file()
     and torch.cuda.is_available()
-    and get_compute_capability(_CUDA_DEVICE) == (10, 3)
+    and get_compute_capability(_CUDA_DEVICE) in {(10, 0), (10, 3)}
     and is_sm100f_supported(_CUDA_DEVICE)
 )
 _RUN_FULL = os.environ.get("FLASHINFER_RUN_FULL_MINIMAX_H3_TESTS", "0") == "1"
@@ -394,19 +394,19 @@ def _run_correctness_shape(m: int, p: int, profile: str):
 
 
 @pytest.mark.skipif(
-    not _HAS_SM103A_RUNTIME,
-    reason="requires the frozen SM103a CUDA source and an SM103a GPU",
+    not _HAS_BLACKWELL_RUNTIME,
+    reason="requires the frozen CUDA source and an SM100a or SM103a GPU",
 )
 @pytest.mark.parametrize("m,p,profile", SMOKE_SHAPES)
-def test_sm103a_smoke_correctness(m, p, profile):
+def test_blackwell_smoke_correctness(m, p, profile):
     _run_correctness_shape(m, p, profile)
 
 
 @pytest.mark.skipif(
-    not _HAS_SM103A_RUNTIME,
-    reason="requires the frozen SM103a CUDA source and an SM103a GPU",
+    not _HAS_BLACKWELL_RUNTIME,
+    reason="requires the frozen CUDA source and an SM100a or SM103a GPU",
 )
-def test_sm103a_invalid_adaln_indices_produce_zero_rows():
+def test_blackwell_invalid_adaln_indices_produce_zero_rows():
     case = _make_cuda_case(6, 8, "all_same")
     case["adaln_index"] = torch.tensor(
         [0, -1, 8, 9, -(2**31), 2**31 - 1], dtype=torch.int32, device="cuda"
@@ -418,10 +418,10 @@ def test_sm103a_invalid_adaln_indices_produce_zero_rows():
 
 
 @pytest.mark.skipif(
-    not _HAS_SM103A_RUNTIME,
-    reason="requires the frozen SM103a CUDA source and an SM103a GPU",
+    not _HAS_BLACKWELL_RUNTIME,
+    reason="requires the frozen CUDA source and an SM100a or SM103a GPU",
 )
-def test_sm103a_cuda_graph_capture():
+def test_blackwell_cuda_graph_capture():
     case = _make_cuda_case(128, 8, "production_segments")
     expected = _reference(case)
     minimax_h3_bf16_pre_attention(**case)
@@ -435,9 +435,9 @@ def test_sm103a_cuda_graph_capture():
 
 
 @pytest.mark.skipif(
-    not (_HAS_SM103A_RUNTIME and _RUN_FULL),
+    not (_HAS_BLACKWELL_RUNTIME and _RUN_FULL),
     reason="set FLASHINFER_RUN_FULL_MINIMAX_H3_TESTS=1 to run the 44-shape suite",
 )
 @pytest.mark.parametrize("m,p,profile", FULL_CORRECTNESS_SHAPES)
-def test_sm103a_full_correctness(m, p, profile):
+def test_blackwell_full_correctness(m, p, profile):
     _run_correctness_shape(m, p, profile)

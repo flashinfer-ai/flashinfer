@@ -53,8 +53,20 @@ struct PagedKVLayout {
   int stride_kv_row;
 };
 
-inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const char* name) {
+// Inline-scale rows may be padded, with a 16B-aligned row advance.
+// Footer-scale caches must keep data and scale sections packed. Their data
+// rows use an aligned stride (e.g. 576B for DSV4), separate from the total
+// payload per token (584B including footer scales). Both families require
+// 16B-aligned cache origins and block strides for cp.async.bulk.
+inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool inline_scale,
+                                           const char* name) {
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
+  TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(kv.data_ptr()) % 16, 0)
+      << name << " data pointer must be 16B-aligned (cp.async.bulk requirement)";
+  const size_t block_stride = static_cast<size_t>(kv.stride(0)) * elem_bytes;
+  TVM_FFI_ICHECK_EQ(block_stride % 16, 0)
+      << name << " block stride must be 16B-aligned (cp.async.bulk requirement)";
   if (kv.ndim() == 2) {
     const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
     TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
@@ -62,10 +74,11 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
         << " is not divisible by bytes_per_token=" << bpt;
     // A flat 2D block carries no row padding to infer, so the row advance is
     // exactly bytes_per_token.
-    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes, bpt};
+    TVM_FFI_ICHECK_GE(block_stride, block_bytes)
+        << name << " block stride is smaller than the packed block width";
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_stride, bpt};
   }
   auto row_advance = [&](int64_t token_axis) {
-    TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
     const size_t bytes = static_cast<size_t>(kv.size(-1)) * elem_bytes;
     TVM_FFI_ICHECK_GE(bytes, static_cast<size_t>(bpt))
         << name << " row width " << bytes << " is smaller than bytes_per_token=" << bpt;
@@ -75,6 +88,10 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
     const size_t advance = static_cast<size_t>(kv.stride(token_axis)) * elem_bytes;
     TVM_FFI_ICHECK_GE(advance, bytes)
         << name << " token-axis stride " << advance << " is smaller than the row width " << bytes;
+    if (inline_scale) {
+      TVM_FFI_ICHECK_EQ(advance % 16, 0) << name << " token-axis stride " << advance
+                                         << " is not 16B-aligned (cp.async.bulk requirement)";
+    }
     return static_cast<int>(advance);
   };
   if (kv.ndim() == 3) {
@@ -162,7 +179,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   // nothing beyond the window itself. Unused slots must still carry -1, which
   // the QK mask turns into -inf.
   const int bpt = bytes_per_token(mt);
-  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bpt, "kv_cache");
+  const PagedKVLayout kv_layout =
+      parse_paged_kv_layout(kv_cache, bpt, /*inline_scale=*/false, "kv_cache");
   // Footer-scale kernels (DSV4, DOTS3_SWA) gather with a tightly packed row
   // advance; only the decode-v32 path honors stride_kv_row. Reject padded rows
   // loudly instead of reading the wrong bytes.
@@ -201,7 +219,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     extra_topk_arg = static_cast<int>(eidx.size(-1));
     stride_extra_indices_token = static_cast<size_t>(eidx.stride(0));
     // The extra (dual) cache carries the same per-token layout as the main one.
-    const PagedKVLayout extra_layout = parse_paged_kv_layout(ekv, bpt, "extra_kv_cache");
+    const PagedKVLayout extra_layout =
+        parse_paged_kv_layout(ekv, bpt, /*inline_scale=*/false, "extra_kv_cache");
     TVM_FFI_ICHECK_EQ(extra_layout.stride_kv_row, bpt)
         << "decode-dsv4 extra_kv_cache requires tightly packed KV rows "
         << "(stride_kv_row == bytes_per_token=" << bpt
@@ -263,7 +282,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
       << "decode-v32 expects DSV3_2/GLM_NSA d_qk=576 or GLM53_NOPE d_qk=512; got d_qk=" << d_qk
       << " model_type=" << model_type;
 
-  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
+  const PagedKVLayout kv_layout =
+      parse_paged_kv_layout(kv_cache, bytes_per_token(mt), /*inline_scale=*/true, "kv_cache");
 
   const int* topk_len_ptr =
       topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;

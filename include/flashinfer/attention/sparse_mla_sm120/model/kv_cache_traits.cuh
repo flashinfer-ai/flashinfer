@@ -30,11 +30,17 @@
 
 #include "../arch/common.cuh"
 #include "model_type.h"
+#include "scale_spec.cuh"
 
 // KVCacheTraits<ModelType>: compile-time constants for KV cache layout.
 //
 // These determine smem strides, MMA loop counts, IO gather sizes,
 // and all dimension-dependent kernel parameters.
+//
+// Each model composes a ScaleSpec (format / group size / inline-vs-footer
+// placement) and forwards the derived constants; consumers read the forwarded
+// members (QUANT_TILE, NUM_SCALES, SCALE_FORMAT, SCALE_INLINE, ...) and never
+// the spec directly.
 //
 // The DeepSeek-family model types share: D_ROPE=64, D_V=512, HPB=16, BI=64.
 // GLM53_NOPE diverges on D_ROPE (0); DOTS3_SWA diverges on D_V (1024) and runs
@@ -51,21 +57,22 @@ struct KVCacheTraits<ModelType::DSV3_2> {
   static constexpr int D_QK = D_NOPE + D_ROPE;  // 576
   static constexpr int D_V = 512;
 
-  // FP8 quantization
-  static constexpr int QUANT_TILE = 128;
-  static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;  // 4
-  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::POW2_FP32;
+  // FP8 quantization: power-of-2 FP32 scales, inline, 128-wide groups.
+  using Scales = ScaleSpec<ScaleFormat::POW2_FP32, 128, true>;
+  static constexpr int QUANT_TILE = Scales::GROUP;
+  static constexpr int NUM_SCALES = Scales::count(D_NOPE);  // 4
+  static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
 
   // KV cache layout (FlashMLA ABI): INLINE, 656 bytes per token
   //   [0:512)   FP8 E4M3 nope (4 tiles × 128)
   //   [512:528) 4 × FP32 scale
   //   [528:656) BF16 rope (64 elements × 2B)
-  static constexpr bool SCALE_INLINE = true;
-  static constexpr int SCALE_BYTES_PER_TOKEN = NUM_SCALES * sizeof(float);  // 16
+  static constexpr bool SCALE_INLINE = Scales::INLINE;
+  static constexpr int SCALE_BYTES_PER_TOKEN = Scales::bytes_per_token(D_NOPE);  // 16
   static constexpr int KV_GMEM_STRIDE =
-      D_NOPE + SCALE_BYTES_PER_TOKEN + D_ROPE * sizeof(bf16);                 // 656
-  static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE;                         // 512
-  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE + SCALE_BYTES_PER_TOKEN;  // 528
+      D_NOPE + SCALE_BYTES_PER_TOKEN + D_ROPE * sizeof(bf16);                  // 656
+  static constexpr int KV_SCALE_GMEM_OFFSET = Scales::gmem_offset(D_NOPE, 0);  // 512
+  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE + SCALE_BYTES_PER_TOKEN;   // 528
 
   // Smem layout: bulk copy includes nope + scales (528B)
   // stride=528: 528/4=132, 132%32=4 → 4-way bank conflict (acceptable)
@@ -85,13 +92,15 @@ struct KVCacheTraits<ModelType::DSV3_2> {
   // FP32→UE8M0 scale conversion for block-scaled MMA
   // FlashMLA stores power-of-2 FP32 scales → bit-shift gives exact UE8M0
   __device__ static __forceinline__ uint8_t scale_to_ue8m0(float scale) {
-    return static_cast<uint8_t>((__float_as_uint(scale) >> 23) & 0xFF);
+    return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
   }
 };
 
 template <>
 struct KVCacheTraits<ModelType::GLM_NSA> : KVCacheTraits<ModelType::DSV3_2> {
-  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::ARBITRARY_FP32;
+  // Same geometry and inline layout as DSV3_2, with arbitrary FP32 scales.
+  using Scales = ScaleSpec<ScaleFormat::ARBITRARY_FP32, 128, true>;
+  static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
 };
 
 template <>
@@ -103,18 +112,21 @@ struct KVCacheTraits<ModelType::GLM53_NOPE> {
   static constexpr int D_QK = D_NOPE;
   static constexpr int D_V = 512;
 
-  static constexpr int QUANT_TILE = 128;
-  static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;
-  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::ARBITRARY_FP32;
+  // FP8 quantization: arbitrary FP32 scales, inline, 128-wide groups.
+  using Scales = ScaleSpec<ScaleFormat::ARBITRARY_FP32, 128, true>;
+  static constexpr int QUANT_TILE = Scales::GROUP;
+  static constexpr int NUM_SCALES = Scales::count(D_NOPE);
+  static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
 
-  // vLLM's fp8_ds_mla cache ABI remains 656 bytes/token. The first 528
-  // bytes contain the 512 FP8 latent values plus four inline FP32 scales;
-  // the trailing 128 bytes are reserved padding and must never be treated as
-  // RoPE data by this specialization.
-  static constexpr bool SCALE_INLINE = true;
-  static constexpr int SCALE_BYTES_PER_TOKEN = NUM_SCALES * sizeof(float);
-  static constexpr int KV_GMEM_STRIDE = 656;
-  static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE;
+  // The packed payload is 528 bytes/token: 512 FP8 latent values plus four
+  // inline FP32 scales. vLLM's fp8_ds_mla ABI pads the gmem row to 656B with
+  // reserved bytes that must never be treated as RoPE data; the kernels take
+  // the gmem row advance as a runtime stride, so KV_GMEM_STRIDE below is only
+  // the payload (== smem copy size), not the gmem advance.
+  static constexpr bool SCALE_INLINE = Scales::INLINE;
+  static constexpr int SCALE_BYTES_PER_TOKEN = Scales::bytes_per_token(D_NOPE);
+  static constexpr int KV_GMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;  // 528
+  static constexpr int KV_SCALE_GMEM_OFFSET = Scales::gmem_offset(D_NOPE, 0);
   static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE + SCALE_BYTES_PER_TOKEN;
   static constexpr int KV_SMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;
   static constexpr int KV_SMEM_COPY_BYTES = KV_SMEM_STRIDE;
@@ -125,7 +137,7 @@ struct KVCacheTraits<ModelType::GLM53_NOPE> {
   static constexpr bool V_HAS_ROPE = false;
 
   __device__ static __forceinline__ uint8_t scale_to_ue8m0(float scale) {
-    return static_cast<uint8_t>((__float_as_uint(scale) >> 23) & 0xFF);
+    return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
   }
 };
 
@@ -138,11 +150,13 @@ struct KVCacheTraits<ModelType::DOTS3_SWA> {
   static constexpr int D_QK = D_NOPE + D_ROPE;  // 1088
   static constexpr int D_V = D_NOPE;            // 1024, rope excluded (V_HAS_ROPE=false)
 
-  // FP8 quantization. QUANT_TILE=128 (not DSV4's 64) keeps NUM_SCALES a power
-  // of two, so the footer is 8B with no pad — unlike DSV4's 7+1.
-  static constexpr int QUANT_TILE = 128;
-  static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;  // 8
-  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::UE8M0_BYTE;
+  // FP8 quantization: UE8M0 scales, footer, 128-wide groups (not DSV4's 64),
+  // keeping NUM_SCALES a power of two so the footer is 8B with no pad —
+  // unlike DSV4's 7+1.
+  using Scales = ScaleSpec<ScaleFormat::UE8M0_BYTE, 128, false>;
+  static constexpr int QUANT_TILE = Scales::GROUP;
+  static constexpr int NUM_SCALES = Scales::count(D_NOPE);  // 8
+  static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
 
   // KV cache layout (FlashMLA ABI): FOOTER, 1160 logical bytes per token.
   // Physical layout per block (page_block_size tokens):
@@ -151,12 +165,13 @@ struct KVCacheTraits<ModelType::DOTS3_SWA> {
   //   [block_size*1152 : block_size*1160)   scale footer (8B each: 8×UE8M0)
   //
   // IO stride = 1152 (data only), 1152 % 16 = 0 ✓ for cp.async.bulk.
-  static constexpr bool SCALE_INLINE = false;
-  static constexpr int SCALE_BYTES_PER_TOKEN = 8;
+  static constexpr bool SCALE_INLINE = Scales::INLINE;
+  static constexpr int SCALE_BYTES_PER_TOKEN = Scales::bytes_per_token(D_NOPE);  // 8
   static constexpr int KV_GMEM_STRIDE =
-      D_NOPE + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;                  // 1160
-  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE;                           // 1024
-  static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE + D_ROPE * sizeof(bf16);  // 1152
+      D_NOPE + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;  // 1160
+  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE;           // 1024
+  static constexpr int KV_SCALE_GMEM_OFFSET =
+      Scales::gmem_offset(D_NOPE, D_ROPE*(int)sizeof(bf16));  // 1152
 
   // Smem layout (nope only + padding, no rope, no inline scales).
   // stride=1040: 1040/4=260, 260%32=4 → same 4-way conflict class as DSV3_2's
@@ -177,7 +192,9 @@ struct KVCacheTraits<ModelType::DOTS3_SWA> {
   static constexpr bool V_HAS_ROPE = false;
 
   // UE8M0 scales are native — no conversion needed
-  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) { return scale; }
+  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) {
+    return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+  }
 };
 
 template <>
@@ -188,10 +205,11 @@ struct KVCacheTraits<ModelType::DSV4> {
   static constexpr int D_QK = D_NOPE + D_ROPE;  // 512
   static constexpr int D_V = 512;               // = D_NOPE + D_ROPE
 
-  // FP8 quantization
-  static constexpr int QUANT_TILE = 64;
-  static constexpr int NUM_SCALES = 7;  // D_NOPE / QUANT_TILE = 448/64
-  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::UE8M0_BYTE;
+  // FP8 quantization: UE8M0 scales, footer, 64-wide groups.
+  using Scales = ScaleSpec<ScaleFormat::UE8M0_BYTE, 64, false>;
+  static constexpr int QUANT_TILE = Scales::GROUP;
+  static constexpr int NUM_SCALES = Scales::count(D_NOPE);  // 7 = 448/64
+  static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
 
   // KV cache layout (FlashMLA ABI): FOOTER, 584 logical bytes per token
   // Physical layout per block (page_block_size tokens):
@@ -201,12 +219,13 @@ struct KVCacheTraits<ModelType::DSV4> {
   //
   // stride_kv_row = 584 = logical bytes_per_token (PyTorch API stride, NOT IO stride)
   // IO stride = 576 (data only, 16B aligned for cp.async.bulk)
-  static constexpr bool SCALE_INLINE = false;  // scales in footer, not inline
-  static constexpr int SCALE_BYTES_PER_TOKEN = 8;
+  static constexpr bool SCALE_INLINE = Scales::INLINE;  // scales in footer, not inline
+  static constexpr int SCALE_BYTES_PER_TOKEN = Scales::bytes_per_token(D_NOPE);  // 8
   static constexpr int KV_GMEM_STRIDE =
-      D_NOPE + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;                  // 584
-  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE;                           // 448
-  static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE + D_ROPE * sizeof(bf16);  // 576
+      D_NOPE + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;  // 584
+  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE;           // 448
+  static constexpr int KV_SCALE_GMEM_OFFSET =
+      Scales::gmem_offset(D_NOPE, D_ROPE*(int)sizeof(bf16));  // 576
 
   // Smem layout (nope only + padding, no rope, no inline scales)
   // stride=464: 464/4=116, 116%32=20 → clean (M4b benchmark verified: 12.9 ns/MMA)
@@ -226,7 +245,9 @@ struct KVCacheTraits<ModelType::DSV4> {
   static constexpr bool V_HAS_ROPE = true;
 
   // UE8M0 scales are native — no conversion needed
-  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) { return scale; }
+  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) {
+    return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+  }
 };
 
 // ============================================================================
@@ -256,6 +277,24 @@ static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_V != D_V,
               "DOTS3_SWA is the D_V opt-out; if it ever equals 512, fold it back "
               "into the shared assert above");
+
+// ScaleSpec composition pins: the composed constants must keep the exact
+// values the hand-written layouts had (FlashMLA ABI compatibility).
+static_assert(KVCacheTraits<ModelType::DSV3_2>::NUM_SCALES == 4);
+static_assert(KVCacheTraits<ModelType::DSV3_2>::SCALE_BYTES_PER_TOKEN == 16);
+static_assert(KVCacheTraits<ModelType::DSV3_2>::KV_GMEM_STRIDE == 656);
+static_assert(KVCacheTraits<ModelType::GLM_NSA>::KV_GMEM_STRIDE == 656);
+static_assert(KVCacheTraits<ModelType::GLM_NSA>::SCALE_FORMAT == ScaleFormat::ARBITRARY_FP32);
+static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::NUM_SCALES == 4);
+static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::SCALE_BYTES_PER_TOKEN == 16);
+static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::KV_GMEM_STRIDE == 528);
+static_assert(KVCacheTraits<ModelType::DSV4>::NUM_SCALES == 7);
+static_assert(KVCacheTraits<ModelType::DSV4>::SCALE_BYTES_PER_TOKEN == 8);
+static_assert(KVCacheTraits<ModelType::DSV4>::KV_GMEM_STRIDE == 584);
+static_assert(KVCacheTraits<ModelType::DSV4>::KV_SCALE_GMEM_OFFSET == 576);
+static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::NUM_SCALES == 8);
+static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::SCALE_BYTES_PER_TOKEN == 8);
+static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::KV_GMEM_STRIDE == 1160);
 
 // Warp configuration
 static constexpr int N_MATH_WARPS = 8;

@@ -34,7 +34,7 @@ from __future__ import annotations
 import functools
 import struct
 import warnings
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -46,6 +46,9 @@ from ..trace.templates.moe import (
     sm90_mixed_gemm_weight_interleave_trace,
 )
 from ..utils import get_compute_capability, round_up
+
+if TYPE_CHECKING:
+    from .api import QuantConfig
 
 # Module-level permute-index caches. Permute indices depend on weight geometry
 # and layout parameters, so matching keys are safe to reuse across calls.
@@ -459,7 +462,7 @@ def prepare_trtllm_fp4_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
-    variant=None,
+    quant: QuantConfig,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -469,10 +472,10 @@ def prepare_trtllm_fp4_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build a TRTLLM FP4 ``trtllm_fp4_routed`` weight view.
 
-    ``NVFP4`` uses 16-element E4M3 scale blocks. ``MXFP4`` (W4A8) and
-    ``W4A16`` use the same MXFP4 weights with 32-element UE8M0 scale blocks.
-    All variants use per-expert gated-act reorder + MMA shuffle on the packed
-    weights and ``block_scale_interleave`` on the block scales.
+    NVFP4×NVFP4 uses 16-element E4M3 scale blocks. MXFP4×MXFP8 (W4A8) and
+    MXFP4×BF16 (TRTLLM W4A16) use the same MXFP4 weights with 32-element UE8M0
+    scale blocks. All pairs use per-expert gated-act reorder + MMA shuffle on
+    the packed weights and ``block_scale_interleave`` on the block scales.
 
     Parameters
     ----------
@@ -483,6 +486,8 @@ def prepare_trtllm_fp4_weights(
         ``[num_local_experts, intermediate_size, hidden_size]``.
     w2_bf16 : Tensor
         Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
+    quant : QuantConfig
+        MMA pair: NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16 (TRTLLM W4A16).
     num_local_experts, hidden_size, intermediate_size : int
         Expert geometry.
     device : torch.device, optional
@@ -500,24 +505,23 @@ def prepare_trtllm_fp4_weights(
     """
     from ..fp4_quantization import fp4_quantize
     from ..quantization.fp4_quantization import block_scale_interleave
-    from .api import QuantVariant
+    from .api import QuantFormat
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
 
-    if variant is None:
-        variant = QuantVariant.NVFP4
-    if variant not in (
-        QuantVariant.NVFP4,
-        QuantVariant.MXFP4,
-        QuantVariant.W4A16,
-    ):
+    allowed = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
+    }
+    if quant.pair not in allowed:
         raise ValueError(
-            "TRTLLM FP4 weight preparation requires QuantVariant.NVFP4, "
-            f"QuantVariant.MXFP4, or QuantVariant.W4A16; got {variant!r}."
+            "TRTLLM FP4 weight preparation requires NVFP4×NVFP4, MXFP4×MXFP8, "
+            f"or MXFP4×BF16; got {quant!r}."
         )
-    is_mxfp4 = variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
+    is_mxfp4 = quant.weight is QuantFormat.MXFP4
     sf_vec_size = 32 if is_mxfp4 else 16
     required_alignment = 128 if is_mxfp4 else sf_vec_size
     if (
@@ -525,7 +529,7 @@ def prepare_trtllm_fp4_weights(
         or intermediate_size % required_alignment != 0
     ):
         raise ValueError(
-            f"{variant.name} requires hidden_size and intermediate_size divisible "
+            f"{quant.weight.name}×{quant.activation.name} requires hidden_size and intermediate_size divisible "
             f"by {required_alignment}."
         )
 
@@ -551,7 +555,7 @@ def prepare_trtllm_fp4_weights(
     # bare AssertionError from inside the permutation.
     if gemm1_rows % epilogue_tile_m != 0:
         raise ValueError(
-            f"{variant.name} requires GEMM1 rows divisible by {epilogue_tile_m}; "
+            f"{quant.weight.name}×{quant.activation.name} requires GEMM1 rows divisible by {epilogue_tile_m}; "
             f"{type(activation).__name__} gives {gemm1_rows} rows for "
             f"intermediate_size={intermediate_size}."
         )
@@ -661,10 +665,10 @@ def prepare_trtllm_fp4_weights(
 def prepare_trtllm_fp4_activations(
     hidden_states_bf16: torch.Tensor,
     *,
-    variant,
+    quant: QuantConfig,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Prepare activations for a unified TRTLLM FP4 quantization variant."""
-    from .api import QuantVariant
+    """Prepare activations for a unified TRTLLM FP4 MMA pair."""
+    from .api import QuantFormat
 
     if hidden_states_bf16.ndim != 2:
         raise ValueError(
@@ -676,16 +680,16 @@ def prepare_trtllm_fp4_activations(
             f"hidden_states_bf16 must be torch.bfloat16, got {hidden_states_bf16.dtype}."
         )
 
-    if variant is QuantVariant.W4A16:
+    if quant.pair == (QuantFormat.MXFP4, QuantFormat.BF16):
         return hidden_states_bf16, None
-    if variant is QuantVariant.MXFP4:
+    if quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
         from ..quantization.fp8_quantization import mxfp8_quantize
 
         if hidden_states_bf16.shape[1] % 32 != 0:
             raise ValueError("MXFP4 requires hidden_size divisible by 32.")
         q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
         return q, sf.view(torch.float8_e4m3fn).reshape(hidden_states_bf16.shape[0], -1)
-    if variant is QuantVariant.NVFP4:
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         from ..fp4_quantization import fp4_quantize
 
         if hidden_states_bf16.shape[1] % 16 != 0:
@@ -702,8 +706,8 @@ def prepare_trtllm_fp4_activations(
         )
         return q, sf.view(torch.float8_e4m3fn).reshape(hidden_states_bf16.shape[0], -1)
     raise ValueError(
-        "TRTLLM FP4 activation preparation requires QuantVariant.NVFP4, "
-        f"QuantVariant.MXFP4, or QuantVariant.W4A16; got {variant!r}."
+        "TRTLLM FP4 activation preparation requires NVFP4×NVFP4, MXFP4×MXFP8, "
+        f"or MXFP4×BF16; got {quant!r}."
     )
 
 
@@ -775,7 +779,7 @@ def prepare_trtllm_fp8_block_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
-    variant,
+    quant: QuantConfig,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -787,17 +791,20 @@ def prepare_trtllm_fp8_block_weights(
     DeepSeek FP8 uses E4M3 payloads with FP32 128x128 block scales. MXFP8
     uses E4M3 payloads with linear UE8M0 scales over 32-element K blocks.
     Both native views remain in ``MajorK`` layout; the unified runner records
-    the exact variant and passes the corresponding kernel enum. Shuffled
+    the MMA pair and passes the corresponding kernel enum. Shuffled
     MXFP8 preparation requires ``hidden_size`` and ``intermediate_size`` to be
     divisible by 128 because the returned scales use TRTLLM's unpadded 128x4
     physical layout.
     """
-    from .api import QuantVariant
+    from .api import QuantFormat
 
-    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MxFp8):
+    allowed = {
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    }
+    if quant.pair not in allowed:
         raise ValueError(
-            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
-            f"got {variant!r}."
+            f"quant must be DeepSeekFp8×DeepSeekFp8 or MXFP8×MXFP8, got {quant!r}."
         )
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
@@ -814,7 +821,7 @@ def prepare_trtllm_fp8_block_weights(
     w1_bf16 = w1_bf16.to(device).contiguous()
     w2_bf16 = w2_bf16.to(device).contiguous()
 
-    if variant is QuantVariant.DeepSeekFp8:
+    if quant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
         for name, dim in (
             ("hidden_size", hidden_size),
             ("intermediate_size", intermediate_size),
@@ -898,10 +905,10 @@ def prepare_trtllm_fp8_block_weights(
 def prepare_trtllm_fp8_block_activations(
     hidden_states_bf16: torch.Tensor,
     *,
-    variant,
+    quant: QuantConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``[M, H]`` BF16 activations for TRTLLM block-FP8 MoE."""
-    from .api import QuantVariant
+    from .api import QuantFormat
 
     if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
         raise ValueError(
@@ -910,18 +917,17 @@ def prepare_trtllm_fp8_block_activations(
             f"dtype={hidden_states_bf16.dtype}."
         )
     hidden_states_bf16 = hidden_states_bf16.contiguous()
-    if variant is QuantVariant.DeepSeekFp8:
+    if quant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
         if hidden_states_bf16.shape[1] % 128 != 0:
             raise ValueError("DeepSeek FP8 hidden_size must be divisible by 128.")
         return _deepseek_fp8_quantize_activations(hidden_states_bf16)
-    if variant is QuantVariant.MxFp8:
+    if quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
         from ..quantization.fp8_quantization import mxfp8_quantize
 
         q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
         return q, sf.view(torch.uint8).reshape(hidden_states_bf16.shape[0], -1)
     raise ValueError(
-        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
-        f"got {variant!r}."
+        f"quant must be DeepSeekFp8×DeepSeekFp8 or MXFP8×MXFP8, got {quant!r}."
     )
 
 
@@ -2230,7 +2236,7 @@ def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
-    variant=None,
+    quant: QuantConfig,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -2241,7 +2247,7 @@ def prepare_cute_dsl_weights(
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
     non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
-    ``variant`` selects NVFP4/W4A4, MXFP4/W4A8, or W4A16 weights.
+    ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
     Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.
@@ -2255,14 +2261,15 @@ def prepare_cute_dsl_weights(
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
-    from .api import QuantVariant
+    from .api import QuantFormat
 
-    if variant is None:
-        variant = QuantVariant.NVFP4
-    if variant not in (QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16):
-        raise ValueError(
-            f"CuTe-DSL FP4 weight preparation does not support {variant!r}"
-        )
+    allowed = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.NVFP4, QuantFormat.BF16),
+    }
+    if quant.pair not in allowed:
+        raise ValueError(f"CuTe-DSL FP4 weight preparation does not support {quant!r}")
 
     if device is None:
         device = w1_bf16.device
@@ -2271,7 +2278,7 @@ def prepare_cute_dsl_weights(
     w1_bf16 = w1_bf16.to(device)
     w2_bf16 = w2_bf16.to(device)
 
-    is_mxfp4 = variant is QuantVariant.MXFP4
+    is_mxfp4 = quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
     if is_mxfp4 and (hidden_size % 128 or intermediate_size % 128):
         raise ValueError(
             "CuTe-DSL MXFP4 requires hidden and intermediate sizes divisible by 128"
@@ -2517,7 +2524,7 @@ def __getattr__(name: str):
     if name == "prepare_cute_dsl_nvfp4_weights":
         warnings.warn(
             "prepare_cute_dsl_nvfp4_weights is deprecated; use "
-            "prepare_cute_dsl_weights with variant=QuantVariant.NVFP4 instead.",
+            "prepare_cute_dsl_weights with NVFP4×NVFP4 instead.",
             DeprecationWarning,
             stacklevel=2,
         )

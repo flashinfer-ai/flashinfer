@@ -84,20 +84,29 @@ def _build_moe_config(variant_str):
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
         TrtllmFp4Config,
     )
 
     variant, backend = {
-        "bf16": (QuantVariant.BF16, TrtllmBf16Config()),
-        "nvfp4": (QuantVariant.NVFP4, TrtllmFp4Config()),
-        "w4a8": (QuantVariant.MXFP4, CuteDslConfig()),
+        "bf16": (
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            TrtllmBf16Config(),
+        ),
+        "nvfp4": (
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            TrtllmFp4Config(),
+        ),
+        "w4a8": (
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            CuteDslConfig(),
+        ),
     }[variant_str]
     return MoEConfig(
         routing=RoutingConfig(num_experts=NUM_EXPERTS, top_k=TOP_K),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=0,

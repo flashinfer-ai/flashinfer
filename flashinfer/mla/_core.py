@@ -689,25 +689,34 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     return out
 
 
-def _check_sm120_sparse_v32_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
+def _check_sm120_sparse_v32_kv_cache(
+    kv_cache: torch.Tensor, *, glm53_nope: bool = False
+) -> torch.Tensor:
     if kv_cache.dtype != torch.uint8:
         raise ValueError(
             "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
             f"got {kv_cache.dtype}"
         )
+    # Inline-scale caches may pad rows beyond the model's payload. GLM NoPE
+    # stores 512 FP8 values and four FP32 scales (528B); v32/GLM_NSA also
+    # stores 128B of RoPE. The binding validates the actual row stride.
+    min_row_bytes = 528 if glm53_nope else 656
+    layout_desc = (
+        f">={min_row_bytes} ({min_row_bytes}B payload, 16B-aligned padded rows allowed)"
+    )
     if kv_cache.ndim == 3:
-        if kv_cache.size(-1) != 656:
+        if kv_cache.size(-1) < min_row_bytes:
             raise ValueError(
-                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim 656, "
-                f"got {tuple(kv_cache.shape)}"
+                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim "
+                f"{layout_desc}, got {tuple(kv_cache.shape)}"
             )
         return kv_cache
     if kv_cache.ndim == 4:
-        if kv_cache.size(1) != 1 or kv_cache.size(-1) != 656:
+        if kv_cache.size(1) != 1 or kv_cache.size(-1) < min_row_bytes:
             raise ValueError(
                 "SM120 sparse MLA v32/GLM expects public HND kv_cache shape "
-                "[num_pages, 1, page_size, 656] or 3D shorthand "
-                f"[num_pages, page_size, 656], got {tuple(kv_cache.shape)}"
+                f"[num_pages, 1, page_size, {layout_desc}] or 3D shorthand "
+                f"[num_pages, page_size, {layout_desc}], got {tuple(kv_cache.shape)}"
             )
         return kv_cache
     raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
@@ -824,7 +833,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
             f"{expected_block_tables_shape}, got {tuple(block_tables.shape)}"
         )
 
-    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache)
+    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache, glm53_nope=glm53_nope)
     topk_length = _normalize_sm120_sparse_v32_topk_length(
         seq_lens,
         batch_size=batch_size,
@@ -3450,7 +3459,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]`` and uses
         the query-compatible dense dtype. For the SM120/SM121 v32/GLM sparse
         backend, this is a packed uint8 cache with 656 bytes per token, shaped
-        ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``.
+        ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``;
+        for GLM-5.3 NoPE the payload is 528 bytes per token and padded rows
+        (any last dim >= 528, including a legacy 656 pool) are accepted.
     workspace_buffer : torch.Tensor
         Pre-allocated workspace buffer. Must be zero-initialized on first use
         by kernels that use semaphore state.

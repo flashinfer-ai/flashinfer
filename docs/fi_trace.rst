@@ -191,6 +191,12 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.gdn_prefill``
      - ``chunk_gated_delta_rule``
      - ``gdn``
+   * - ``flashinfer.gdn2_prefill``
+     - ``chunk_gated_delta_rule2``
+     - ``gdn2``
+   * - ``flashinfer.gdp_prefill``
+     - ``chunk_gated_delta_product``
+     - ``gdp``
    * - ``flashinfer.fused_moe``
      - ``trtllm_fp8_block_scale_moe`` (6 routing types)
      - ``moe``

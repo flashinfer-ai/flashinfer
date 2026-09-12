@@ -25,9 +25,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+import tvm_ffi
 
-from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
+from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from .jit import (
     load_cake_mxfp8_megamoe_ep16_module,
 )
@@ -40,13 +41,11 @@ _HIDDEN = 3072
 _INTERMEDIATE = 5120
 _FC1_ROWS = 2 * _INTERMEDIATE
 _MAX_TOKENS_PER_RANK = 64
-_MAX_RECV_TOKENS = _WORLD_SIZE * _MAX_TOKENS_PER_RANK
-_MAX_ROUTES = _MAX_RECV_TOKENS * _TOP_K
-_ROWS_PER_EXPERT = 128
-_TOTAL_EXPERT_ROWS = _LOCAL_EXPERTS * _ROWS_PER_EXPERT
-_THREADS = 256
-_SUPPORTED_TOKENS = (16, 32, 64)
-_ROUTE_GROUPS = _LOCAL_EXPERTS // _TOP_K
+_EXPERT_ROW_SEGMENTS = (32, 16, 16)
+_EXPERT_ROWS = sum(_EXPERT_ROW_SEGMENTS)
+_SUPPORTED_TOKENS = (16, 32, _MAX_TOKENS_PER_RANK)
+_FUSED_GRID_CTAS = 144
+_MAX_LAUNCH_EPOCH = (2**31 - 1) // _FUSED_GRID_CTAS - 1
 
 
 def _require_tensor(
@@ -71,21 +70,23 @@ def _require_tensor(
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
 
 
-def _interleave_gate_up_128(w13: torch.Tensor) -> torch.Tensor:
+def _interleave_gate_up_16(w13: torch.Tensor) -> torch.Tensor:
+    experts, rows, hidden = w13.shape
+    if rows % 32:
+        raise ValueError("gate/up rows must be divisible by 32")
+    intermediate = rows // 2
     result = torch.empty_like(w13)
     result_blocks = result.view(
-        _LOCAL_EXPERTS,
-        _INTERMEDIATE // 128,
+        experts,
+        intermediate // 16,
         2,
-        128,
-        _HIDDEN,
+        16,
+        hidden,
     )
-    gate = w13[:, :_INTERMEDIATE].view(
-        _LOCAL_EXPERTS, _INTERMEDIATE // 128, 128, _HIDDEN
-    )
-    up = w13[:, _INTERMEDIATE:].view(_LOCAL_EXPERTS, _INTERMEDIATE // 128, 128, _HIDDEN)
-    result_blocks[:, :, 0].copy_(up)
-    result_blocks[:, :, 1].copy_(gate)
+    gate = w13[:, :intermediate].view(experts, intermediate // 16, 16, hidden)
+    up = w13[:, intermediate:].view(experts, intermediate // 16, 16, hidden)
+    result_blocks[:, :, 0].copy_(gate)
+    result_blocks[:, :, 1].copy_(up)
     return result
 
 
@@ -107,38 +108,17 @@ def _quantize_mxfp8_block32(weight: torch.Tensor) -> tuple[torch.Tensor, torch.T
             .reshape(experts, row_end - row_begin, columns // 32, 32)
         )
         block_max = values.abs().amax(dim=-1)
-        scale_seed = torch.clamp(block_max, min=1.0e-7) / 448.0
-        bits = scale_seed.contiguous().view(torch.int32)
-        codes = ((bits >> 23) & 255) + (((bits & 0x7FFFFF) + 0x7FFFFF) >> 23)
-        codes.clamp_(1, 254)
-        decoded = torch.exp2(codes.float() - 127.0)
+        safe_max = torch.clamp(block_max, min=1.0e-30)
+        scale_exp = torch.ceil(torch.log2(safe_max * (1.0 / 448.0)))
+        codes = torch.clamp(scale_exp + 127.0, min=0.0, max=254.0).to(torch.int32)
+        codes = torch.where(block_max == 0, torch.zeros_like(codes), codes)
+        decoded = torch.pow(2.0, codes.float() - 127.0)
         block_quantized = (values / decoded.unsqueeze(-1)).to(torch.float8_e4m3fn)
         quantized[:, row_begin:row_end].copy_(
             block_quantized.reshape(experts, row_end - row_begin, columns)
         )
         scale_codes[:, row_begin:row_end].copy_(codes.to(torch.uint8))
     return quantized, scale_codes
-
-
-def _pack_scale_n256_k128(scales: torch.Tensor) -> torch.Tensor:
-    experts, rows, block_columns = scales.shape
-    columns = block_columns * 32
-    if rows % 256 or columns % 128:
-        raise ValueError("N256/K128 scale packing requires aligned dimensions")
-    return (
-        scales.view(
-            experts,
-            rows // 256,
-            2,
-            4,
-            32,
-            columns // 128,
-            4,
-        )
-        .permute(0, 1, 5, 2, 4, 3, 6)
-        .contiguous()
-        .view(-1)
-    )
 
 
 def _pack_scale_n128_k128(scales: torch.Tensor) -> torch.Tensor:
@@ -185,12 +165,12 @@ def preprocess_cake_mxfp8_megamoe_ep16_weights(
         dtype=torch.bfloat16,
         device=w13.device,
     )
-    interleaved_w13 = _interleave_gate_up_128(w13)
+    interleaved_w13 = _interleave_gate_up_16(w13)
     w13_fp8, w13_scale_plain = _quantize_mxfp8_block32(interleaved_w13)
     w2_fp8, w2_scale_plain = _quantize_mxfp8_block32(w2)
     return CakeMxfp8MegaMoeEp16Weights(
         w13=w13_fp8,
-        w13_scale=_pack_scale_n256_k128(w13_scale_plain),
+        w13_scale=_pack_scale_n128_k128(w13_scale_plain),
         w2=w2_fp8,
         w2_scale=_pack_scale_n128_k128(w2_scale_plain),
     )
@@ -209,23 +189,32 @@ class _SymmetricTensor:
         return self.tensor
 
 
-@dataclass(frozen=True)
-class _PreparedRouting:
-    topk_ids: torch.Tensor
-    source_ranks: torch.Tensor
-    source_tokens: torch.Tensor
-    local_groups: torch.Tensor
-    local_rows: torch.Tensor
-    work_count: int
+def _validate_gathered_routing_capacity(gathered: torch.Tensor) -> None:
+    if not bool(torch.all((gathered >= 0) & (gathered < _EXPERTS)).item()):
+        raise ValueError(f"topk_ids must contain expert IDs in [0, {_EXPERTS})")
+    route_counts = torch.bincount(gathered.reshape(-1), minlength=_EXPERTS)
+    max_expert_load = int(route_counts.max().item())
+    if max_expert_load > _EXPERT_ROWS:
+        raise ValueError(
+            "EP16 routing exceeds the per-expert capacity: "
+            f"maximum load is {max_expert_load}, capacity is {_EXPERT_ROWS}"
+        )
 
 
-def _prepare_balanced_routing(
+def _validate_launch_epoch(epoch: int) -> None:
+    if epoch < 0 or epoch > _MAX_LAUNCH_EPOCH:
+        raise RuntimeError(
+            "Cake MXFP8 MegaMoE session launch epoch is exhausted; "
+            "create a new session before submitting another forward"
+        )
+
+
+def _validate_routing_capacity(
     topk_ids: torch.Tensor,
     *,
     process_group: dist.ProcessGroup,
-    rank: int,
     device: torch.device,
-) -> _PreparedRouting:
+) -> None:
     tokens = int(topk_ids.shape[0])
     if tokens not in _SUPPORTED_TOKENS:
         raise ValueError(
@@ -243,56 +232,7 @@ def _prepare_balanced_routing(
         (_WORLD_SIZE * tokens, _TOP_K), dtype=torch.int64, device=device
     )
     dist.all_gather_into_tensor(gathered, topk_ids, group=process_group)
-    first = gathered[:, 0]
-    expected = (
-        first[:, None] + torch.arange(_TOP_K, dtype=torch.int64, device=device)[None, :]
-    )
-    valid = bool(
-        torch.all((first >= 0) & (first < _EXPERTS) & ((first % _TOP_K) == 0)).item()
-        and torch.equal(gathered, expected)
-        and torch.all(gathered < _EXPERTS).item()
-    )
-    if not valid:
-        raise ValueError("topk_ids do not satisfy the balanced EP16 route contract")
-
-    owner = first // _LOCAL_EXPERTS
-    owned_tokens = torch.nonzero(owner == rank, as_tuple=False).flatten()
-    owned_groups = ((first[owned_tokens] - rank * _LOCAL_EXPERTS) // _TOP_K).to(
-        torch.int32
-    )
-    ordered_tokens: list[torch.Tensor] = []
-    ordered_groups: list[torch.Tensor] = []
-    ordered_rows: list[torch.Tensor] = []
-    for local_group in range(_ROUTE_GROUPS):
-        group_tokens = owned_tokens[owned_groups == local_group]
-        group_count = int(group_tokens.numel())
-        if group_count > 32:
-            raise ValueError("balanced EP16 route exceeds the 32-row expert capacity")
-        ordered_tokens.append(group_tokens)
-        ordered_groups.append(
-            torch.full((group_count,), local_group, dtype=torch.int32, device=device)
-        )
-        ordered_rows.append(torch.arange(group_count, dtype=torch.int32, device=device))
-
-    recv_tokens = torch.cat(ordered_tokens)
-    work_count = int(recv_tokens.numel())
-    if work_count > _MAX_TOKENS_PER_RANK:
-        raise ValueError("balanced EP16 owner work exceeds the prepared capacity")
-    padding = torch.zeros(
-        (_MAX_TOKENS_PER_RANK - work_count,), dtype=torch.int32, device=device
-    )
-
-    def padded(values: torch.Tensor) -> torch.Tensor:
-        return torch.cat((values.to(torch.int32), padding))
-
-    return _PreparedRouting(
-        topk_ids=topk_ids,
-        source_ranks=padded(recv_tokens // tokens),
-        source_tokens=padded(recv_tokens % tokens),
-        local_groups=padded(torch.cat(ordered_groups)),
-        local_rows=padded(torch.cat(ordered_rows)),
-        work_count=work_count,
-    )
+    _validate_gathered_routing_capacity(gathered)
 
 
 def _allocate_symmetric(
@@ -343,7 +283,7 @@ class _Workspace:
         *,
         device: torch.device,
         group_name: str,
-        routing: _PreparedRouting,
+        tokens: int,
     ) -> None:
         self.flags = _allocate_symmetric(
             (2,),
@@ -353,115 +293,79 @@ class _Workspace:
             world_size=_WORLD_SIZE,
         )
         self.flags.tensor.zero_()
-        self.hidden = _allocate_symmetric(
-            (_MAX_TOKENS_PER_RANK, _HIDDEN),
-            torch.uint8,
+        self.published_hidden = _allocate_symmetric(
+            (tokens, _HIDDEN),
+            torch.bfloat16,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
         )
-        self.hidden_scale = _allocate_symmetric(
-            (_MAX_TOKENS_PER_RANK, _HIDDEN // 32),
-            torch.uint8,
-            device=device,
-            group_name=group_name,
-            world_size=_WORLD_SIZE,
-        )
-        self.topk_ids = _allocate_symmetric(
-            (_MAX_TOKENS_PER_RANK, _TOP_K),
+        self.published_topk_ids = _allocate_symmetric(
+            (tokens, _TOP_K),
             torch.int32,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
         )
-        self.topk_weights = _allocate_symmetric(
-            (_MAX_TOKENS_PER_RANK, _TOP_K),
+        self.published_topk_weights = _allocate_symmetric(
+            (tokens, _TOP_K),
             torch.float32,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
         )
-        self.input_ready = _allocate_symmetric(
-            (_MAX_TOKENS_PER_RANK, _WORLD_SIZE),
-            torch.uint32,
-            device=device,
-            group_name=group_name,
-            world_size=_WORLD_SIZE,
-        )
-        self.input_ready.tensor.zero_()
-        self.token_back_ready = _allocate_symmetric(
-            (_WORLD_SIZE,),
-            torch.uint32,
-            device=device,
-            group_name=group_name,
-            world_size=_WORLD_SIZE,
-        )
-        self.token_back_ready.tensor.zero_()
-        self.output = _allocate_symmetric(
-            (_MAX_TOKENS_PER_RANK, _HIDDEN),
+        self.route_terms = _allocate_symmetric(
+            (tokens, _TOP_K, _HIDDEN),
             torch.bfloat16,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
         )
 
-        self.route_weights = torch.empty(
-            _MAX_ROUTES, dtype=torch.float32, device=device
-        )
-        self.route_map = torch.empty(
-            _TOTAL_EXPERT_ROWS, dtype=torch.int32, device=device
-        )
-        self.fc1_input = torch.empty(
-            (_ROUTE_GROUPS, _ROWS_PER_EXPERT, _HIDDEN),
-            dtype=torch.float8_e4m3fn,
-            device=device,
-        )
-        self.fc1_input_scale = torch.empty(
-            _ROUTE_GROUPS * (_HIDDEN // 128) * 512,
-            dtype=torch.uint8,
-            device=device,
-        )
-        self.fc2_input = torch.empty(
-            (_LOCAL_EXPERTS, _ROWS_PER_EXPERT, _INTERMEDIATE),
-            dtype=torch.float8_e4m3fn,
-            device=device,
-        )
-        self.fc2_input_scale = torch.empty(
-            _LOCAL_EXPERTS * (_INTERMEDIATE // 128) * 512,
-            dtype=torch.uint8,
-            device=device,
-        )
-        self.fc1_tile_expert = torch.arange(
-            _LOCAL_EXPERTS, dtype=torch.int32, device=device
-        ).repeat_interleave(_INTERMEDIATE // 128)
-        self.fc1_tile_m = torch.arange(
-            0, _INTERMEDIATE, 128, dtype=torch.int32, device=device
-        ).repeat(_LOCAL_EXPERTS)
-        self.fc2_tile_expert = torch.arange(
-            _LOCAL_EXPERTS, dtype=torch.int32, device=device
-        ).repeat_interleave(_HIDDEN // 128)
-        self.fc2_tile_m = torch.arange(
-            0, _HIDDEN, 128, dtype=torch.int32, device=device
-        ).repeat(_LOCAL_EXPERTS)
-        self.expert_row_offsets = torch.arange(
-            0, _TOTAL_EXPERT_ROWS, _ROWS_PER_EXPERT, dtype=torch.int32, device=device
-        )
-        self.ones = torch.ones(_LOCAL_EXPERTS, dtype=torch.float32, device=device)
-        self.zeros = torch.zeros(_LOCAL_EXPERTS, dtype=torch.float32, device=device)
-        self.infinities = torch.full(
-            (_LOCAL_EXPERTS,), float("inf"), dtype=torch.float32, device=device
-        )
-        self.local_terms = torch.empty(
-            (_MAX_ROUTES, _HIDDEN),
+        self.activation_bf16 = torch.empty(
+            (_LOCAL_EXPERTS, _EXPERT_ROWS, _HIDDEN),
             dtype=torch.bfloat16,
             device=device,
         )
-        self.fc1_done = torch.zeros((1,), dtype=torch.uint32, device=device)
-        self.work_source_ranks = routing.source_ranks
-        self.work_source_tokens = routing.source_tokens
-        self.work_local_groups = routing.local_groups
-        self.work_local_rows = routing.local_rows
-        self.work_count = routing.work_count
+        self.fc1_workspace_bf16 = torch.empty(
+            (_LOCAL_EXPERTS, _EXPERT_ROWS, _INTERMEDIATE),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.fc2_output_bf16 = torch.empty(
+            (_LOCAL_EXPERTS, _EXPERT_ROWS, _HIDDEN),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.route_map_i32 = torch.empty(
+            (_LOCAL_EXPERTS, _EXPERT_ROWS),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.route_scale_f32 = torch.empty(
+            (_LOCAL_EXPERTS, _EXPERT_ROWS),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.route_counts_u32 = torch.zeros(
+            (_LOCAL_EXPERTS,),
+            dtype=torch.uint32,
+            device=device,
+        )
+        self.fc1_done = torch.zeros(
+            (_LOCAL_EXPERTS * len(_EXPERT_ROW_SEGMENTS),),
+            dtype=torch.uint32,
+            device=device,
+        )
+        self.publication_done = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.publication_visible = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.dispatch_done = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.compute_done = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.return_done = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.return_visible = torch.zeros(1, dtype=torch.uint32, device=device)
+        self.output_bf16 = torch.empty(
+            (tokens, _HIDDEN), dtype=torch.bfloat16, device=device
+        )
         self.tma_backing, self.tma_workspace = _aligned_workspace(1024, device=device)
 
     def destroy(self) -> None:
@@ -472,11 +376,11 @@ class CakeMxfp8MegaMoeEp16:
     """Prepared EP16 MXFP8 MegaMoE session for exact SM103a devices.
 
     The route supports 512 experts, hidden size 3072, intermediate size 5120,
-    top-k 8, 16/32/64 tokens per rank, and balanced groups of eight experts.
-    Routing is prepared once at construction and must remain immutable.
-    Construction owns all symmetric memory and scratch storage.
-    :meth:`run` submits on the current CUDA stream without allocating and can
-    be captured by a caller-owned CUDA Graph after one warmup call.
+    top-k 8, 16/32/64 tokens per rank, and up to 64 routes per expert. Routing
+    is validated once at construction and must remain immutable. Construction
+    owns all symmetric memory and scratch storage. A session must be used
+    serially from one CUDA stream. :meth:`run` submits without allocating, and
+    CUDA Graph capture is not supported.
     """
 
     def __init__(
@@ -501,18 +405,17 @@ class CakeMxfp8MegaMoeEp16:
             )
         self._validate_weights(weights, device=device)
         self.weights = weights
-        self._routing = _prepare_balanced_routing(
+        _validate_routing_capacity(
             topk_ids,
             process_group=self._group,
-            rank=self.rank,
             device=device,
         )
         self.tokens = int(topk_ids.shape[0])
         self._routing_ids_ptr = int(topk_ids.data_ptr())
         self._w13 = weights.w13.view(torch.uint8)
-        self._w13_scale = weights.w13_scale.view(_LOCAL_EXPERTS, -1, 32, 32)
+        self._w13_scale = weights.w13_scale.view(torch.uint8).reshape(-1, 128)
         self._w2 = weights.w2.view(torch.uint8)
-        self._w2_scale = weights.w2_scale.view(_LOCAL_EXPERTS, -1, 16, 32)
+        self._w2_scale = weights.w2_scale.view(torch.uint8).reshape(-1, 128)
 
         group_name = self._group.group_name
         _enable_symm_mem_for_group(group_name)
@@ -522,14 +425,23 @@ class CakeMxfp8MegaMoeEp16:
         self._workspace = _Workspace(
             device=device,
             group_name=group_name,
-            routing=self._routing,
+            tokens=self.tokens,
         )
-        self._output = self._workspace.output.tensor[: self.tokens]
+        self._output = self._workspace.output_bf16
         self._module = load_cake_mxfp8_megamoe_ep16_module(device=device)
-        self._persistent_grid = min(
-            128,
-            int(torch.cuda.get_device_properties(device).multi_processor_count) & ~1,
-        )
+        with torch.cuda.device(device), tvm_ffi.use_torch_stream():
+            self._module.setup_tma(
+                self._w13,
+                self._w13_scale,
+                self._workspace.activation_bf16,
+                self._w2,
+                self._w2_scale,
+                self._workspace.fc1_workspace_bf16,
+                self._workspace.tma_workspace,
+            )
+        self._launch_epoch = 0
+        torch.cuda.synchronize(device=device)
+        dist.barrier(group=self._group)
 
     @staticmethod
     def _validate_weights(
@@ -549,7 +461,7 @@ class CakeMxfp8MegaMoeEp16:
         _require_tensor(
             weights.w13_scale,
             name="weights.w13_scale",
-            shape=(_LOCAL_EXPERTS * (_FC1_ROWS // 256) * (_HIDDEN // 128) * 1024,),
+            shape=(_LOCAL_EXPERTS * _FC1_ROWS * (_HIDDEN // 32),),
             dtype=torch.uint8,
             device=device,
         )
@@ -563,14 +475,14 @@ class CakeMxfp8MegaMoeEp16:
         _require_tensor(
             weights.w2_scale,
             name="weights.w2_scale",
-            shape=(_LOCAL_EXPERTS * (_HIDDEN // 128) * (_INTERMEDIATE // 128) * 512,),
+            shape=(_LOCAL_EXPERTS * _HIDDEN * (_INTERMEDIATE // 32),),
             dtype=torch.uint8,
             device=device,
         )
 
     @property
     def workspace_output(self) -> torch.Tensor:
-        """Return the fixed-token caller-visible symmetric output view."""
+        """Return the fixed-token caller-visible output tensor."""
 
         return self._output
 
@@ -584,12 +496,17 @@ class CakeMxfp8MegaMoeEp16:
     ) -> torch.Tensor:
         """Submit one allocation-free forward on the current CUDA stream."""
 
+        device = self.weights.w13.device
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake MXFP8 MegaMoE does not support CUDA Graph capture"
+                )
         tokens = int(hidden_states.shape[0])
         if tokens != self.tokens:
             raise ValueError(
                 f"session was prepared for {self.tokens} tokens, got {tokens}"
             )
-        device = self.weights.w13.device
         _require_tensor(
             hidden_states,
             name="hidden_states",
@@ -626,95 +543,47 @@ class CakeMxfp8MegaMoeEp16:
             raise ValueError("out must alias session.workspace_output")
 
         workspace = self._workspace
-        self._module.run(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            workspace.hidden.tensor,
-            workspace.hidden_scale.tensor,
-            workspace.topk_ids.tensor,
-            workspace.topk_weights.tensor,
-            tokens,
-            _WORLD_SIZE,
-            self.rank,
-            workspace.flags.peers,
-            workspace.input_ready.tensor,
-            workspace.input_ready.peers,
-            tokens,
-            1,
-            1,
-            self._w13,
-            workspace.fc1_input.view(torch.uint8),
-            self._w13_scale,
-            workspace.fc1_input_scale.view(_ROUTE_GROUPS, -1, 16, 32),
-            workspace.fc2_input,
-            workspace.fc2_input_scale,
-            workspace.fc1_input.view(torch.uint8),
-            workspace.fc1_input_scale,
-            workspace.route_map,
-            workspace.route_weights,
-            workspace.work_source_ranks,
-            workspace.work_source_tokens,
-            workspace.work_local_groups,
-            workspace.work_local_rows,
-            workspace.fc1_tile_expert,
-            workspace.fc1_tile_m,
-            workspace.expert_row_offsets,
-            workspace.ones,
-            workspace.infinities,
-            workspace.ones,
-            workspace.zeros,
-            self._w2,
-            workspace.fc2_input.view(torch.uint8),
-            self._w2_scale,
-            workspace.fc2_input_scale.view(_LOCAL_EXPERTS, -1, 16, 32),
-            workspace.local_terms,
-            workspace.fc2_tile_expert,
-            workspace.fc2_tile_m,
-            workspace.fc1_done,
-            0,
-            tokens * _TOP_K,
-            workspace.work_count,
-            tokens,
-            _FC1_ROWS,
-            _HIDDEN // 128,
-            _LOCAL_EXPERTS * (_INTERMEDIATE // 128),
-            1,
-            _ROWS_PER_EXPERT,
-            _HIDDEN,
-            _INTERMEDIATE // 128,
-            _LOCAL_EXPERTS * (_HIDDEN // 128),
-            _WORLD_SIZE,
-            self.rank,
-            workspace.flags.peers,
-            workspace.hidden.tensor,
-            workspace.hidden.peers,
-            workspace.hidden_scale.tensor,
-            workspace.hidden_scale.peers,
-            workspace.topk_weights.tensor,
-            workspace.topk_weights.peers,
-            workspace.input_ready.tensor,
-            workspace.input_ready.peers,
-            _WORLD_SIZE,
-            self.rank,
-            workspace.flags.peers,
-            workspace.token_back_ready.tensor,
-            workspace.token_back_ready.peers,
-            _WORLD_SIZE,
-            self.rank,
-            workspace.flags.peers,
-            workspace.output.tensor,
-            workspace.output.peers,
-            workspace.tma_workspace,
-            self._persistent_grid,
-            1,
-            1,
-            workspace.token_back_ready.tensor,
-            out,
-            1,
-            1,
-            1,
-        )
+        launch_epoch = self._launch_epoch
+        _validate_launch_epoch(launch_epoch)
+        with torch.cuda.device(device), tvm_ffi.use_torch_stream():
+            self._module.run(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                self._w13,
+                self._w13_scale,
+                workspace.activation_bf16,
+                self._w2,
+                self._w2_scale,
+                workspace.fc1_workspace_bf16,
+                workspace.fc2_output_bf16,
+                workspace.route_map_i32,
+                workspace.route_scale_f32,
+                workspace.route_counts_u32,
+                workspace.fc1_done,
+                workspace.publication_done,
+                workspace.publication_visible,
+                workspace.dispatch_done,
+                workspace.compute_done,
+                workspace.return_done,
+                workspace.return_visible,
+                launch_epoch,
+                tokens,
+                _WORLD_SIZE,
+                self.rank,
+                workspace.flags.peers,
+                workspace.published_hidden.tensor,
+                workspace.published_hidden.peers,
+                workspace.published_topk_ids.tensor,
+                workspace.published_topk_ids.peers,
+                workspace.published_topk_weights.tensor,
+                workspace.published_topk_weights.peers,
+                workspace.route_terms.tensor,
+                workspace.route_terms.peers,
+                out,
+                workspace.tma_workspace,
+            )
+        self._launch_epoch = launch_epoch + 1
         return out
 
 

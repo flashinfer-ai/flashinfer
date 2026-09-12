@@ -19,7 +19,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     TrtllmMxInt4Config,
@@ -204,7 +204,7 @@ def _make_case(
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
         ),
-        quant=QuantConfig(variant=QuantVariant.MxInt4),
+        quant=QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=local_expert_offset,
@@ -321,7 +321,7 @@ def test_mxint4_runner_arch_support(monkeypatch, compute_capability, supported):
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=8, top_k=2),
-        quant=QuantConfig(variant=QuantVariant.MxInt4),
+        quant=QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=256),
         backend=BackendOptions((TrtllmMxInt4Config(),)),
     )
