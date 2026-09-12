@@ -95,6 +95,7 @@ from .jit.cake_kda_packed_t1 import (
     CAKE_KDA_PACKED_T1_VARIANTS,
     gen_cake_kda_packed_t1_module,
 )
+from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
@@ -561,6 +562,9 @@ def gen_all_modules(
     has_flash_kda_packed_t1_sm100f = sm_capabilities.get(
         "flash_kda_packed_t1_sm100f", False
     )
+    has_cake_megamoe_topk_reduce_sm100a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm100a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
@@ -731,6 +735,8 @@ def gen_all_modules(
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
+        if has_cake_megamoe_topk_reduce_sm100a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
@@ -823,12 +829,15 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
-            jit_specs.append(gen_moe_alltoall_module())
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
             # compilation. has_sm100 implies CUDA >= 12.8, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
+        if has_sm100a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm100a"))
+        if has_sm103a_exact:
+            jit_specs.append(gen_moe_alltoall_module("sm103a"))
         jit_specs.append(gen_vllm_comm_module())
         # No architecture gate: the kernels use only plain PTX loads/stores
         # and CUDA IPC, and target PCIe machines without NVLink, which is
@@ -1246,6 +1255,10 @@ def detect_sm_capabilities():
         "flash_kda_packed_t1_sm100f": (
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
+        ),
+        "cake_megamoe_topk_reduce_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
         ),
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
