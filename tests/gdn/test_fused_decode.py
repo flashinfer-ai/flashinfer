@@ -44,10 +44,8 @@ flashinfer/gdn_kernels/experimental/README.md):
   to the composable path;
 - no environment gate: the retired kill switch (and any other
   FLASHINFER_* variable) changes nothing about dispatch or the probe;
-- the shape of the shipped registry (decode batches 1/2/4/8 per impl) and
-  the batches deliberately left off it: 16/24/32 must not dispatch, must
-  not be reported supported by the routing probe, and must stay
-  bit-identical to the composable path;
+- the exact per-geometry, per-implementation registry surface and the batches
+  deliberately left off each measured-win window;
 - DS-dense conv pools staying kernel-supported (registry-gated: dispatch
   requires a DS row, correctness checked with a patched registry) and
   unrecognized conv-state stride patterns falling back cleanly;
@@ -154,10 +152,11 @@ PORTABLE_CUTE_MATH_PRIMITIVES = frozenset(
     }
 )
 
+# Default Qwen3.6-27B surface used by the unparameterized guard tests below.
 REGISTERED_BATCHES = (1, 2, 4, 8)
-# Batches the kernels handle but the registry deliberately does not list:
-# faster in a kernel A/B, no end-to-end serving win, so they keep the stock
-# path (rationale in flashinfer/gdn_kernels/experimental/README.md).
+# Batches the kernels handle for that geometry but the registry omits: faster
+# in a kernel A/B, no end-to-end serving win, so they keep the stock path
+# (rationale in flashinfer/gdn_kernels/experimental/README.md).
 UNREGISTERED_BATCHES = (16, 24, 32)
 
 
@@ -179,6 +178,7 @@ class Geometry(NamedTuple):
     d: int
     conv_width: int
     conv_state_len: int
+    impls: tuple
     batches: tuple
 
     @property
@@ -199,9 +199,38 @@ class Geometry(NamedTuple):
         )
 
 
-QWEN_27B = Geometry("qwen3.6-27b", 5120, 96, 10240, 48, 128, 4, 3, (1, 2, 4, 8))
-QWEN_35B_A3B = Geometry("qwen3.6-35b-a3b", 2048, 64, 8192, 32, 128, 4, 3, (1, 2, 4))
-GEOMETRIES = (QWEN_27B, QWEN_35B_A3B)
+QWEN_27B = Geometry(
+    "qwen3.6-27b", 5120, 96, 10240, 48, 128, 4, 3, SHIPPED_IMPLS, (1, 2, 4, 8)
+)
+QWEN_35B_A3B = Geometry(
+    "qwen3.6-35b-a3b", 2048, 64, 8192, 32, 128, 4, 3, SHIPPED_IMPLS, (1, 2, 4)
+)
+QWEN35_27B_TP2 = Geometry(
+    "qwen3.5-27b-tp2",
+    5120,
+    48,
+    5120,
+    24,
+    128,
+    4,
+    3,
+    (_CUDA_IMPL,),
+    (1, 2, 4, 8, 16),
+)
+QWEN35_35B_A3B_TP2 = Geometry(
+    "qwen3.5-35b-a3b-tp2",
+    2048,
+    32,
+    4096,
+    16,
+    128,
+    4,
+    3,
+    (_CUDA_IMPL,),
+    (1, 2, 4, 8, 16, 24, 32),
+)
+GEOMETRIES = (QWEN_27B, QWEN_35B_A3B, QWEN35_27B_TP2, QWEN35_35B_A3B_TP2)
+TP2_GEOMETRIES = (QWEN35_27B_TP2, QWEN35_35B_A3B_TP2)
 
 # The geometry the un-parameterized tests below build inputs for.  It is the
 # first registered one; the per-geometry tests cover the rest.
@@ -213,9 +242,9 @@ D = QWEN_27B.d
 CONV_WIDTH = QWEN_27B.conv_width
 CONV_STATE_LEN = QWEN_27B.conv_state_len
 # One distinct pool slot per row of the largest batch any test builds inputs
-# for -- the 16/24/32 guard rows included: they never dispatch, but they still
-# run the composable path over `state_indices`, and `_make_inputs` walks the
-# slots downwards from POOL-1.  A pool that only just fits (or does not fit)
+# for. The default Qwen3.6-27B 16/24/32 guard rows never dispatch, but they
+# still run the composable path over `state_indices`, and `_make_inputs` walks
+# the slots downwards from POOL-1. A pool that only just fits (or does not fit)
 # the batch runs off the bottom, where torch's negative-index wrap silently
 # aliases two batch rows onto one state slot and makes the comparison
 # meaningless instead of failing.
@@ -908,7 +937,7 @@ def test_unrecognized_conv_state_strides_fall_back():
 
 
 def test_supported_probe():
-    """The routing probe answers exactly the registry as shipped.
+    """The routing probe answers the default Qwen3.6-27B surface as shipped.
 
     It is the consumer's gating decision, so it must accept the registered
     batches and layout and decline everything else -- unregistered batches,
@@ -1157,7 +1186,7 @@ def test_non_registered_batch_falls_back():
 
 @pytest.mark.parametrize("B", UNREGISTERED_BATCHES)
 def test_batch_above_registered_surface_does_not_dispatch(B: int):
-    """Batches off the shipped surface keep the stock path.
+    """Batches off the Qwen3.6-27B shipped surface keep the stock path.
 
     The kernels handle 16/24/32 — they are benchmarked there and beat the
     stock chain in isolation — but the registry lists only the batches with
@@ -1824,8 +1853,15 @@ def test_registry_shape_and_stats():
         by_impl.setdefault(row["impl"], {}).setdefault(
             tuple(row[field] for field in specialized_gdn._GEOMETRY_FIELDS), set()
         ).add(row["b"])
-    expected = {geometry.key(): set(geometry.batches) for geometry in GEOMETRIES}
-    assert by_impl == {_CUTEDSL_IMPL: expected, _CUDA_IMPL: expected}
+    expected = {
+        impl_name: {
+            geometry.key(): set(geometry.batches)
+            for geometry in GEOMETRIES
+            if impl_name in geometry.impls
+        }
+        for impl_name in SHIPPED_IMPLS
+    }
+    assert by_impl == expected
     assert not set(UNREGISTERED_BATCHES) & set(QWEN_27B.batches)
     stats = specialized_gdn.gdn_fused_decode_stats()
     assert stats["registry_entries"] == len(rows)
@@ -1876,20 +1912,23 @@ def test_registered_geometry_tiling_is_exact():
         # CUDA impl: warps own whole groups of state rows, block is 256 threads.
         assert d % 8 == 0, f"{why}: warps own whole groups of state rows"
         assert n_ba <= 256, f"{why}: the gate reduction fits one block"
-        # CuTe-DSL impl: the K-split and conv tile must divide exactly.
-        assert hidden % cutedsl.KS == 0, f"{why}: hidden divisible by the K-split"
-        assert qkv_dim % cutedsl.CONV_TILE == 0, f"{why}: qkv_dim divisible by the tile"
-        assert d % cutedsl.RPB == 0, f"{why}: rows-per-block divides D"
-        # And the derived tile counts are the exact integers the kernel uses.
-        gqa, nrb, kchunk, nconv = cutedsl._derived(hidden, qkv_dim, hv, h_q, d)
-        assert (gqa, nrb, kchunk, nconv) == (
-            hv // h_q,
-            d // cutedsl.RPB,
-            hidden // cutedsl.KS,
-            qkv_dim // cutedsl.CONV_TILE,
-        )
-        # The impl's own guard must accept every geometry we ship.
-        cutedsl._check_geometry(hidden, n_ba, qkv_dim, h_q, hv, d)
+        if _CUTEDSL_IMPL in geometry.impls:
+            # CuTe-DSL impl: the K-split and conv tile must divide exactly.
+            assert hidden % cutedsl.KS == 0, f"{why}: hidden divisible by the K-split"
+            assert qkv_dim % cutedsl.CONV_TILE == 0, (
+                f"{why}: qkv_dim divisible by the tile"
+            )
+            assert d % cutedsl.RPB == 0, f"{why}: rows-per-block divides D"
+            # And the derived tile counts are the exact integers the kernel uses.
+            gqa, nrb, kchunk, nconv = cutedsl._derived(hidden, qkv_dim, hv, h_q, d)
+            assert (gqa, nrb, kchunk, nconv) == (
+                hv // h_q,
+                d // cutedsl.RPB,
+                hidden // cutedsl.KS,
+                qkv_dim // cutedsl.CONV_TILE,
+            )
+            # The impl's own guard must accept every geometry we ship for it.
+            cutedsl._check_geometry(hidden, n_ba, qkv_dim, h_q, hv, d)
 
 
 def test_cutedsl_geometry_guard_rejects_a_mis_tiling_geometry():
@@ -1945,12 +1984,14 @@ def test_cuda_scratch_cache_is_scoped_to_geometry():
     assert len(set(keys)) == len(keys)
 
 
-@pytest.mark.parametrize("impl_name", [_CUTEDSL_IMPL, _CUDA_IMPL])
 @pytest.mark.parametrize(
-    "geometry,B",
+    "impl_name,geometry,B",
     [
-        pytest.param(geometry, B, id=f"{geometry.name}-batch-{B}")
+        pytest.param(
+            impl_name, geometry, B, id=f"{impl_name}-{geometry.name}-batch-{B}"
+        )
         for geometry in GEOMETRIES
+        for impl_name in geometry.impls
         for B in geometry.batches
     ],
 )
@@ -1982,6 +2023,182 @@ def test_every_registered_geometry_matches_composable(
     torch.testing.assert_close(out, ref_out, atol=ATOL, rtol=RTOL)
     assert torch.equal(conv_state, ref_conv_state)
     torch.testing.assert_close(ssm_state, ref_ssm_state, atol=ATOL, rtol=RTOL)
+
+
+TP2_CASES = [
+    pytest.param(geometry, B, id=f"{geometry.name}-batch-{B}")
+    for geometry in TP2_GEOMETRIES
+    for B in geometry.batches
+]
+
+
+def _clone_inputs(inputs: dict) -> dict:
+    """Clone tensors so candidate and reference own independent state pools."""
+    return {
+        key: value.clone() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+
+
+def _assert_result_close(candidate, reference) -> None:
+    torch.testing.assert_close(candidate[0], reference[0], atol=ATOL, rtol=RTOL)
+    assert torch.equal(candidate[1], reference[1])
+    torch.testing.assert_close(candidate[2], reference[2], atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.parametrize(
+    "geometry,B",
+    [
+        pytest.param(QWEN35_27B_TP2, 24, id="qwen3.5-27b-tp2-batch-24"),
+        pytest.param(QWEN35_27B_TP2, 32, id="qwen3.5-27b-tp2-batch-32"),
+        pytest.param(QWEN35_35B_A3B_TP2, 3, id="qwen3.5-35b-a3b-tp2-batch-3"),
+    ],
+)
+def test_tp2_unregistered_shapes_fail_closed(geometry: Geometry, B: int):
+    """Unregistered TP2 shapes use the bit-exact composable path."""
+    _skip_if_no_specialized()
+    inputs = _make_inputs(B, padded_pool=False, seed=20264824 + B, geometry=geometry)
+    reference = _clone_inputs(inputs)
+    assert not _matched_rows(inputs)
+    assert not gfd.gdn_fused_decode_step_supported(
+        B,
+        hidden_size=geometry.hidden,
+        n_ba=geometry.n_ba,
+        qkv_dim=geometry.qkv_dim,
+        num_qk_heads=geometry.h_q,
+        num_v_heads=geometry.hv,
+        head_dim=geometry.d,
+        conv_width=geometry.conv_width,
+        conv_state_len=geometry.conv_state_len,
+    )
+
+    impls = [
+        impl
+        for impl in (
+            specialized_gdn._load_impl(_CUTEDSL_IMPL),
+            specialized_gdn._load_impl(_CUDA_IMPL),
+        )
+        if impl is not None
+    ]
+    counts_before = [impl.launch_count() for impl in impls]
+    candidate_result = gdn_fused_decode_step(**inputs)
+    reference_result = gfd._gdn_fused_decode_step_fallback(**reference)
+    assert [impl.launch_count() for impl in impls] == counts_before
+    for candidate_tensor, reference_tensor in zip(
+        candidate_result, reference_result, strict=True
+    ):
+        assert torch.equal(candidate_tensor, reference_tensor)
+
+
+@pytest.mark.parametrize("geometry,B", TP2_CASES)
+def test_tp2_cuda_stateful_sequence_matches_composable(geometry: Geometry, B: int):
+    """Every TP2 row preserves recurrent state over changing inputs."""
+    _skip_if_no_specialized()
+    cuda = _impl(_CUDA_IMPL)
+    candidate = _make_inputs(B, padded_pool=False, seed=20260824 + B, geometry=geometry)
+    reference = _clone_inputs(candidate)
+    launches_before = cuda.launch_count()
+
+    for step in range(4):
+        if step:
+            fresh = _make_inputs(
+                B,
+                padded_pool=False,
+                seed=20260824 + B + 1000 * step,
+                geometry=geometry,
+            )
+            for field in ("hidden_states", "mixed_qkv"):
+                candidate[field].copy_(fresh[field])
+                reference[field].copy_(fresh[field])
+        _assert_result_close(
+            gdn_fused_decode_step(**candidate),
+            gfd._gdn_fused_decode_step_fallback(**reference),
+        )
+
+    assert cuda.launch_count() == launches_before + 4
+    assert specialized_gdn.gdn_fused_decode_stats()["failed_impls"] == []
+
+
+@pytest.mark.parametrize("geometry,B", TP2_CASES)
+def test_tp2_cuda_changing_input_graph_replay(geometry: Geometry, B: int):
+    """Every TP2 row remains correct across changing-input graph replays."""
+    _skip_if_no_specialized()
+    cuda = _impl(_CUDA_IMPL)
+    warm = _make_inputs(B, padded_pool=False, seed=20261824 + B, geometry=geometry)
+    gdn_fused_decode_step(**warm)
+    torch.cuda.synchronize()
+    assert specialized_gdn.gdn_fused_decode_stats()["served_impls"] == [_CUDA_IMPL]
+
+    candidate = _make_inputs(B, padded_pool=False, seed=20262824 + B, geometry=geometry)
+    reference = _clone_inputs(candidate)
+    initial_conv = candidate["conv_state"].clone()
+    initial_ssm = candidate["ssm_state"].clone()
+    out = torch.empty(
+        (B, 1, geometry.hv, geometry.d), dtype=torch.bfloat16, device="cuda"
+    )
+    assert cuda.ready_for_graph_capture(
+        _signature_for(candidate),
+        candidate["hidden_states"],
+        candidate["conv_state"],
+        candidate["scale"],
+    )
+    launches_before = cuda.launch_count()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gdn_fused_decode_step(out=out, **candidate)
+    assert cuda.launch_count() == launches_before + 1
+    candidate["conv_state"].copy_(initial_conv)
+    candidate["ssm_state"].copy_(initial_ssm)
+
+    for step in range(3):
+        fresh = _make_inputs(
+            B,
+            padded_pool=False,
+            seed=20262824 + B + 1000 * step,
+            geometry=geometry,
+        )
+        for field in ("hidden_states", "mixed_qkv"):
+            candidate[field].copy_(fresh[field])
+            reference[field].copy_(fresh[field])
+        graph.replay()
+        reference_result = gfd._gdn_fused_decode_step_fallback(**reference)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, reference_result[0], atol=ATOL, rtol=RTOL)
+        assert torch.equal(candidate["conv_state"], reference["conv_state"])
+        torch.testing.assert_close(
+            candidate["ssm_state"], reference["ssm_state"], atol=ATOL, rtol=RTOL
+        )
+
+    assert specialized_gdn.gdn_fused_decode_stats()["failed_impls"] == []
+
+
+@pytest.mark.parametrize("geometry", TP2_GEOMETRIES, ids=lambda geometry: geometry.name)
+def test_tp2_cuda_padded_rows_do_not_update_state(geometry: Geometry):
+    """TP2 graph padding writes zero output without touching either state pool."""
+    _skip_if_no_specialized()
+    cuda = _impl(_CUDA_IMPL)
+    B = 4
+    candidate = _make_inputs(B, padded_pool=False, seed=20263824, geometry=geometry)
+    candidate["state_indices"].copy_(
+        torch.tensor([POOL - 1, POOL - 3, -1, -1], device="cuda", dtype=torch.int32)
+    )
+    reference = _clone_inputs(candidate)
+    before = _clone_inputs(candidate)
+
+    launches_before = cuda.launch_count()
+    candidate_result = gdn_fused_decode_step(**candidate)
+    assert cuda.launch_count() == launches_before + 1
+    _assert_result_close(
+        candidate_result, gfd._gdn_fused_decode_step_fallback(**reference)
+    )
+    assert torch.count_nonzero(candidate_result[0][2:]) == 0
+    unchanged = [slot for slot in range(POOL) if slot not in {POOL - 1, POOL - 3}]
+    assert torch.equal(
+        candidate["conv_state"][unchanged], before["conv_state"][unchanged]
+    )
+    assert torch.equal(
+        candidate["ssm_state"][unchanged], before["ssm_state"][unchanged]
+    )
 
 
 if __name__ == "__main__":
