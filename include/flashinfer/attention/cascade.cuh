@@ -369,10 +369,17 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
+/*!
+ * \brief Load one vector asynchronously using cp.async-supported transfer widths.
+ * \tparam vec_size The number of elements in the vector.
+ * \tparam DType The vector element type.
+ * \param dst The destination address in shared memory.
+ * \param src The source address in global memory.
+ * \param pred Whether the source data should be loaded.
+ */
 template <uint32_t vec_size, typename DType>
 __device__ __forceinline__ void LoadVectorAsync(DType* dst, const DType* src, bool pred) {
-  constexpr uint32_t chunk_size =
-      std::min(vec_size, 32U / static_cast<uint32_t>(sizeof(DType)));
+  constexpr uint32_t chunk_size = std::min(vec_size, 32U / static_cast<uint32_t>(sizeof(DType)));
   constexpr uint32_t chunk_bits = chunk_size * sizeof(DType) * 8;
   static_assert(vec_size % chunk_size == 0);
 #pragma unroll

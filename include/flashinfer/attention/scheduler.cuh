@@ -483,8 +483,12 @@ inline cudaError_t DecodePlanImpl(size_t& float_workspace_size_out, size_t& int_
     if constexpr (MATERIALIZE) {
       float_allocator = AlignedAllocator(float_buffer, float_workspace_size_in_bytes);
     }
+    // Split-KV decode keeps partial outputs in FP32 until the final reduction. Keep this type in
+    // sync with BatchDecodeWithPagedKVCacheDispatched.
+    using DTypePartialO = float;
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(float), 16, "batch_decode_tmp_v");
+        num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypePartialO), 16,
+        "batch_decode_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * sizeof(float), 16, "batch_decode_tmp_s");
 
