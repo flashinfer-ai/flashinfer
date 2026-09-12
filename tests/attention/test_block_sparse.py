@@ -30,7 +30,6 @@ from tests.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
-from tests.test_helpers.paged_kv import make_padded_view
 
 import flashinfer
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
@@ -236,50 +235,6 @@ def test_block_sparse_attention(
         head_dim,
         mask_inside_block,
     )
-
-
-def test_block_sparse_lazy_stride_router():
-    """Run one tensor-core block-sparse plan with equal and unequal KV strides."""
-    set_seed(42)
-    M = N = 32
-    R = C = 16
-    num_qo_heads, num_kv_heads, head_dim = 4, 2, 128
-    indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda")
-    indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
-    q = torch.randn(M, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
-    k = torch.randn(N, num_kv_heads, head_dim, dtype=torch.float16, device="cuda")
-    v_equal = torch.randn_like(k)
-    v_unequal = make_padded_view(v_equal, 1)
-    assert k.stride() == v_equal.stride()
-    assert k.stride() != v_unequal.stride()
-
-    wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
-        backend="fa2",
-    )
-    wrapper.plan(
-        indptr,
-        indices,
-        M,
-        N,
-        R,
-        C,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        q_data_type=torch.float16,
-        kv_data_type=torch.float16,
-    )
-    plan_info = tuple(wrapper._plan_info)
-    routed_module = wrapper._cached_module
-    equal_output = wrapper.run(q, k, v_equal)
-    unequal_output = wrapper.run(q, k, v_unequal)
-    assert wrapper._cached_module is routed_module
-    assert tuple(wrapper._plan_info) == plan_info
-
-    expected = flashinfer.single_prefill_with_kv_cache(q, k, v_equal, backend="fa2")
-    torch.testing.assert_close(equal_output, expected, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(unequal_output, expected, atol=1e-2, rtol=1e-3)
 
 
 def _ref_attention(

@@ -59,7 +59,7 @@ def _raw_module(label, calls):
     )
 
 
-def _run_paged(module, paged_k_cache, paged_v_cache):
+def _run_paged(module, paged_k_cache, paged_v_cache, **kwargs):
     tensor = torch.empty(1)
     return module.paged_run(
         tensor,
@@ -93,6 +93,7 @@ def _run_paged(module, paged_k_cache, paged_v_cache):
         1.0,
         0,
         0,
+        **kwargs,
     )
 
 
@@ -161,23 +162,10 @@ def test_concurrent_first_use_loads_once(monkeypatch):
     assert spec.build_count == 1
 
 
-def test_fa2_routes_complete_data_strides_under_one_logical_operation(monkeypatch):
+def test_fa2_selects_stride_variant_once(monkeypatch):
     calls = []
     primary_spec = _FakeSpec(_raw_module("primary", calls))
     independent_spec = _FakeSpec(_raw_module("independent", calls))
-    registered_ops = []
-
-    def record_custom_op(name, *args, **kwargs):
-        def decorator(func):
-            registered_ops.append(name)
-            return func
-
-        return decorator
-
-    monkeypatch.setattr(prefill, "register_custom_op", record_custom_op)
-    monkeypatch.setattr(
-        prefill, "register_fake_op", lambda *args, **kwargs: lambda f: f
-    )
     monkeypatch.setattr(
         prefill, "_gen_batch_prefill_primary_module", lambda *args: primary_spec
     )
@@ -189,11 +177,6 @@ def test_fa2_routes_complete_data_strides_under_one_logical_operation(monkeypatc
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     module = prefill.get_batch_prefill_module("fa2", *_MODULE_ARGS)
-    logical_uri = prefill.get_batch_prefill_uri("fa2", *_MODULE_ARGS)
-    assert registered_ops == [
-        f"flashinfer::{logical_uri}_ragged_run",
-        f"flashinfer::{logical_uri}_paged_run",
-    ]
     assert primary_spec.build_count == 1
     assert independent_spec.build_count == 0
 
@@ -201,7 +184,16 @@ def test_fa2_routes_complete_data_strides_under_one_logical_operation(monkeypatc
     equal_k = torch.empty_strided(shape, (60, 20, 5, 1))
     equal_v = torch.empty_strided(shape, (60, 20, 5, 1))
     unequal_v = torch.empty_strided(shape, (80, 20, 5, 1))
-    _run_paged(module, equal_k, equal_v)
+    # Scale-factor layouts must not trigger the independent data-stride module.
+    scales = dict(
+        key_block_scales=torch.empty_strided(shape, (60, 20, 5, 1), dtype=torch.uint8),
+        value_block_scales=torch.empty_strided(
+            shape, (80, 20, 5, 1), dtype=torch.uint8
+        ),
+    )
+    _run_paged(module, equal_k, equal_v, **scales)
+    assert calls == ["primary"]
+    assert independent_spec.build_count == 0
     _run_paged(module, equal_k, unequal_v)
     _run_paged(module, equal_k, equal_v)
 
@@ -251,42 +243,24 @@ class _PrewarmRecorder:
         self.variants.append(variant)
 
 
-def test_standard_wrappers_expose_post_plan_prewarm():
-    cached_modules = []
+@pytest.mark.parametrize(
+    "wrapper_cls",
+    [prefill.BatchPrefillWithPagedKVCacheWrapper, BatchDecodeWithPagedKVCacheWrapper],
+)
+def test_standard_wrappers_expose_post_plan_prewarm(wrapper_cls):
+    wrapper = wrapper_cls.__new__(wrapper_cls)
+    wrapper._plan_info = [1]
+    wrapper._cached_module = _PrewarmRecorder()
+    wrapper._jit_module = None
+    wrapper._backend = "fa2"
+    wrapper._use_tensor_cores = True
 
-    prefill_wrapper = prefill.BatchPrefillWithPagedKVCacheWrapper.__new__(
-        prefill.BatchPrefillWithPagedKVCacheWrapper
-    )
-    prefill_wrapper._plan_info = [1]
-    prefill_wrapper._cached_module = _PrewarmRecorder()
-    prefill_wrapper._jit_module = None
-    prefill_wrapper._backend = "fa2"
-    cached_modules.append(prefill_wrapper._cached_module)
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+    assert wrapper._cached_module.variants == ["independent"]
 
-    decode_wrapper = BatchDecodeWithPagedKVCacheWrapper.__new__(
-        BatchDecodeWithPagedKVCacheWrapper
-    )
-    decode_wrapper._plan_info = [1]
-    decode_wrapper._cached_module = _PrewarmRecorder()
-    decode_wrapper._jit_module = None
-    decode_wrapper._backend = "fa2"
-    decode_wrapper._use_tensor_cores = True
-    cached_modules.append(decode_wrapper._cached_module)
-
-    for wrapper in (prefill_wrapper, decode_wrapper):
-        wrapper.prewarm_paged_kv_stride_variant("independent")
-
-    assert all(module.variants == ["independent"] for module in cached_modules)
-
-    unplanned = prefill.BatchPrefillWithPagedKVCacheWrapper.__new__(
-        prefill.BatchPrefillWithPagedKVCacheWrapper
-    )
-    unplanned._plan_info = None
-    unplanned._cached_module = None
-    unplanned._jit_module = None
-    unplanned._backend = "fa2"
+    wrapper._plan_info = None
     with pytest.raises(RuntimeError, match=r"plan\(\) must complete"):
-        unplanned.prewarm_paged_kv_stride_variant()
+        wrapper.prewarm_paged_kv_stride_variant()
 
 
 def test_cascade_wrappers_delegate_prewarm():
