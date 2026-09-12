@@ -532,7 +532,7 @@ def test_alphamoe_nvfp4_rejects_invalid_host_contracts():
     assert misaligned_w1.data_ptr() % 16 != 0
     misaligned_w1_args = list(args)
     misaligned_w1_args[2] = misaligned_w1
-    with pytest.raises(ValueError, match="gemm1_weights.*16-byte aligned"):
+    with pytest.raises(ValueError, match=r"gemm1_weights.*16-byte aligned"):
         alphamoe_nvfp4_aligned_moe(*misaligned_w1_args)
 
     aliased_storage = torch.empty(
