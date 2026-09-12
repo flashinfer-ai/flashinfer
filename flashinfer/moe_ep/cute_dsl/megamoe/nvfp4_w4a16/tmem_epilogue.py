@@ -357,27 +357,29 @@ class Fc2OutputRouter:
             iter_axis
         ]
 
-        valid = cute.make_rmem_tensor((copy_iters,), cutlass.Int32)
-        dst_ptrs = cute.make_rmem_tensor((copy_iters,), cutlass.Int64)
+        # Adjacent 16-BF16 stores share a token and one aligned 32-hidden
+        # region. H%32 makes their hidden validity identical, including tails.
+        valid = cute.make_rmem_tensor((copy_iters // 2,), cutlass.Int32)
+        dst_ptrs = cute.make_rmem_tensor((copy_iters // 2,), cutlass.Int64)
 
-        for iter_idx in cutlass.range_constexpr(copy_iters):
+        for pair_idx in cutlass.range_constexpr(copy_iters // 2):
             coord = eval_function_mapping(
                 self.output_mappings,
                 epi_tid=self.epi_tid,
-                iter_idx=iter_idx,
+                iter_idx=2 * pair_idx,
             )
             token_in_tile = cutlass.Int32(coord["token_in_cta_tile"])
             hidden_in_tile = cutlass.Int32(coord["hidden_in_cta_tile"])
 
-            valid[iter_idx] = cutlass.Int32(0)
-            dst_ptrs[iter_idx] = cutlass.Int64(0)
+            valid[pair_idx] = cutlass.Int32(0)
+            dst_ptrs[pair_idx] = cutlass.Int64(0)
 
             token_valid = token_in_tile < self.valid_tokens_this_cta_tile
             hidden_valid = hidden_in_tile < cutlass.Int32(
                 self.valid_hidden_this_cta_tile
             )
             if token_valid and hidden_valid:
-                valid[iter_idx] = cutlass.Int32(1)
+                valid[pair_idx] = cutlass.Int32(1)
                 md = TokenSrcMetadata.load(
                     self.metadata.iterator.toint()
                     + Int64(token_in_tile) * Int64(TokenSrcMetadata.nbytes)
@@ -388,7 +390,7 @@ class Fc2OutputRouter:
                 dst_topk = md.src_topk
                 # Int64 token coord: domain_offset on (token, topk, hidden)
                 # computes dst_token*K*H, which overflows int32 once T*K*H > 2^31.
-                dst_ptrs[iter_idx] = self.peer_rank_ptr_mapper.ptr_map_to_rank(
+                dst_ptrs[pair_idx] = self.peer_rank_ptr_mapper.ptr_map_to_rank(
                     cute.domain_offset(
                         (Int64(dst_token), dst_topk, dst_hidden), self.base_outputs
                     ).iterator,
@@ -437,9 +439,11 @@ class Fc2OutputRouter:
                     Int64(dst_tokens), None, dst_hidden
                 ].iterator.toint()
         else:
-            # comm: read the pointer / validity prefetched by prefetch().
-            addr = self.dst_ptrs[iter_idx]
-            pred = self.valid[iter_idx]
+            # Preserve the hidden stride; compact BF16 rows fold this to 32B.
+            addr = self.dst_ptrs[iter_idx // 2] + (
+                Int64(iter_idx % 2) * Int64(self.base_outputs.stride[2]) * Int64(32)
+            )
+            pred = self.valid[iter_idx // 2]
         ptr = cute.make_ptr(
             self.base_outputs.element_type,
             addr,
