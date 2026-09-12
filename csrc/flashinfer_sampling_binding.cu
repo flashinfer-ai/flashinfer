@@ -65,7 +65,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
-                        TensorView row_states_buffer);
+                        bool is_deterministic, TensorView row_states_buffer);
 
 void top_k_mask_logits(TensorView logits, TensorView mask_logits,
                        Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,

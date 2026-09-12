@@ -143,7 +143,17 @@ struct RadixRowState {
   int arrival_counter;         // For inter-CTA synchronization
   int output_counter;          // For collecting top-k indices (RadixTopK)
   float sum_topk;              // For RenormProb: sum of top-k elements
+  // For deterministic RenormProb: fixed-point sum of top-k elements. Integer
+  // atomics are associative, so the accumulated value is independent of CTA
+  // arrival order (float atomicAdd on sum_topk is not).
+  unsigned long long sum_topk_fixed;
 };
+
+// 2^44 fixed-point scale for the deterministic renorm sum. Probability inputs
+// keep row sums near 1, far below the 2^20 overflow bound of a u64
+// accumulator at this scale; the quantization error (<= 2^-44 per CTA
+// contribution) is below fp32 ulp at probability magnitudes.
+constexpr double kRenormDeterministicScale = 17592186044416.0;  // 2^44
 
 constexpr uint32_t RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP = 256;
 
@@ -1759,8 +1769,8 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
  * Finds the k-th largest probability, then normalizes all probs >= pivot to sum to 1,
  * setting all others to 0. Reuses the shared load+radix-select helper.
  */
-template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, typename DType,
-          typename IdType>
+template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, bool SINGLE_CTA, bool DETERMINISTIC,
+          typename DType, typename IdType>
 __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_MultiCTA(
     DType* probs,          // [batch, vocab_size]
     DType* renormed_prob,  // [batch, vocab_size]
@@ -1850,22 +1860,41 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       __syncthreads();
 
       if constexpr (!SINGLE_CTA) {
-        // Multi-CTA: atomic add to global sum
+        // Multi-CTA: accumulate the group sum. The deterministic path uses
+        // fixed-point integer atomics (order-independent); the default path
+        // keeps float atomicAdd, whose CTA-arrival-order-dependent rounding
+        // makes results vary across invocations.
         if (tx == 0) {
           if (cta_in_group == 0) {
-            state->sum_topk = 0.0f;  // First CTA initializes
+            if constexpr (DETERMINISTIC) {
+              state->sum_topk_fixed = 0;  // First CTA initializes
+            } else {
+              state->sum_topk = 0.0f;  // First CTA initializes
+            }
           }
         }
         // Barrier for initialization
         AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
         if (tx == 0 && block_sum > 0) {
-          atomicAdd(&state->sum_topk, block_sum);
+          if constexpr (DETERMINISTIC) {
+            atomicAdd(&state->sum_topk_fixed,
+                      static_cast<unsigned long long>(
+                          double(block_sum) * kRenormDeterministicScale + 0.5));
+          } else {
+            atomicAdd(&state->sum_topk, block_sum);
+          }
         }
 
         // Barrier to ensure all CTAs have contributed
         AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-        normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
+        float group_sum;
+        if constexpr (DETERMINISTIC) {
+          group_sum = float(double(state->sum_topk_fixed) / kRenormDeterministicScale);
+        } else {
+          group_sum = state->sum_topk;
+        }
+        normalizer = math::ptx_rcp(max(group_sum, 1e-8f));
       } else {
         // Single-CTA: use block_sum directly
         if (tx == 0) {
@@ -1945,22 +1974,39 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     __syncthreads();
 
     if constexpr (!SINGLE_CTA) {
-      // Multi-CTA: atomic add to global sum
+      // Multi-CTA: accumulate the group sum. See the k >= vocab_size branch
+      // above for the deterministic-vs-float-atomic rationale.
       if (tx == 0) {
         if (cta_in_group == 0) {
-          state->sum_topk = 0.0f;  // First CTA initializes
+          if constexpr (DETERMINISTIC) {
+            state->sum_topk_fixed = 0;  // First CTA initializes
+          } else {
+            state->sum_topk = 0.0f;  // First CTA initializes
+          }
         }
       }
       // Barrier for initialization
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
       if (tx == 0 && block_sum > 0) {
-        atomicAdd(&state->sum_topk, block_sum);
+        if constexpr (DETERMINISTIC) {
+          atomicAdd(
+              &state->sum_topk_fixed,
+              static_cast<unsigned long long>(double(block_sum) * kRenormDeterministicScale + 0.5));
+        } else {
+          atomicAdd(&state->sum_topk, block_sum);
+        }
       }
 
       // Barrier to ensure all CTAs have contributed
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-      normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
+      float group_sum;
+      if constexpr (DETERMINISTIC) {
+        group_sum = float(double(state->sum_topk_fixed) / kRenormDeterministicScale);
+      } else {
+        group_sum = state->sum_topk;
+      }
+      normalizer = math::ptx_rcp(max(group_sum, 1e-8f));
     } else {
       // Single-CTA: use block_sum directly
       if (tx == 0) {
@@ -2000,7 +2046,7 @@ template <typename DType, typename IdType>
 cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdType* top_k_arr,
                                         uint32_t batch_size, uint32_t top_k_val,
                                         uint32_t vocab_size, RadixRowState* row_states_buffer,
-                                        cudaStream_t stream = 0) {
+                                        bool deterministic = false, cudaStream_t stream = 0) {
   using OrderedType = typename RadixTopKTraits<DType>::OrderedType;
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), vocab_size);
@@ -2043,28 +2089,24 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
   uint32_t total_ctas = num_groups * ctas_per_group;
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      auto kernel =
-          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      auto kernel =
-          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    // Single-CTA sums with a block reduction in a fixed order, so it is
+    // already deterministic; the DETERMINISTIC path only changes multi-CTA
+    // accumulation.
+    auto kernel =
+        RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, false, DType, IdType>;
+    if (!single_cta) {
+      kernel = deterministic ? RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
+                                                                  true, DType, IdType>
+                             : RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
+                                                                  false, DType, IdType>;
     }
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    dim3 nblks(total_ctas);
+    dim3 nthrs(BLOCK_THREADS);
+    void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
+                    &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
 
   return cudaSuccess;
