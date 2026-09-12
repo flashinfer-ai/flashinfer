@@ -669,7 +669,21 @@ def _fold_trtllm_nvfp4_activation_scale(
     output1_gate = view.get("output1_scale_gate_scalar")
     if act.hidden_states_scale_global is None:
         return output1, output1_gate
-    inv_scale = 1.0 / act.hidden_states_scale_global
+    scale = act.hidden_states_scale_global
+    if scale.device != act.hidden_states_q.device:
+        raise ValueError(
+            "hidden_states_scale_global must be on the same device as hidden_states_q."
+        )
+    if scale.dtype != torch.float32:
+        raise ValueError("hidden_states_scale_global must have dtype torch.float32.")
+    if scale.numel() != 1:
+        raise ValueError("hidden_states_scale_global must contain exactly one element.")
+    scale = scale.reshape(1)
+    if not torch.isfinite(scale).all().item():
+        raise ValueError("hidden_states_scale_global must be finite.")
+    if not (scale > 0).all().item():
+        raise ValueError("hidden_states_scale_global must be positive.")
+    inv_scale = scale.reciprocal()
     if output1 is not None:
         output1 = (output1 * inv_scale).contiguous()
     if output1_gate is not None:
@@ -4094,7 +4108,7 @@ class CuteDslRunner(MoERunner):
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
-                v["w1_alpha"],
+                w1_alpha,
                 v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
