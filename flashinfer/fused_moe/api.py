@@ -614,6 +614,8 @@ _CUTLASS_W4A16_ARCHS = (90,)
 
 _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 _CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_MXFP4_ARCHS = (120, 121)
+_CUTILE_W4A16_ARCHS = (89, 90, 120, 121)
 _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Swiglu,
     ActivationType.SwigluStep,
@@ -1132,7 +1134,12 @@ class CuTileNvfp4Config:
         source_format: str = "modelopt",
         device=None,
     ):
-        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
         from .prepare import prepare_cutile_nvfp4_weights
 
         return prepare_cutile_nvfp4_weights(
@@ -1152,6 +1159,86 @@ class CuTileNvfp4Config:
 
     def __repr__(self) -> str:
         return "CuTileNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Bf16Config(CuTileNvfp4Config):
+    """cuTile NVFP4-weight x BF16-activation backend.
+
+    Uses the same prepared weight view as :class:`CuTileNvfp4Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_W4A16_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Config:
+    """cuTile MXFP4-weight x MXFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w2_fp4,
+        w2_block_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the shared ``cutile_mxfp4`` weight view.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
+        from .prepare import prepare_cutile_mxfp4_weights
+
+        return prepare_cutile_mxfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w2_fp4,
+            w2_block_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Config()"
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Bf16Config(CuTileMxfp4Config):
+    """cuTile MXFP4-weight x BF16-activation backend.
+
+    Uses the same prepared weight view as :class:`CuTileMxfp4Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_W4A16_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Bf16Config()"
 
 
 @dataclass(frozen=True)
@@ -1663,6 +1750,9 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
@@ -1686,6 +1776,9 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
@@ -1752,6 +1845,8 @@ _DEFAULT_BACKEND = BackendOptions(
         CutlassBf16Config(),
         CutlassW4A16Config(),
         CuteDslConfig(),
+        CuTileMxfp4Bf16Config(),
+        CuTileNvfp4Bf16Config(),
     )
 )
 

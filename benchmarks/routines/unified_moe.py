@@ -1,4 +1,4 @@
-"""Apples-to-apples benchmarks for unified CUTLASS and cuTile MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, and b12x MoE runners."""
 
 from __future__ import annotations
 
@@ -11,14 +11,20 @@ import torch
 from torch.nn import functional as F
 
 import flashinfer
-from flashinfer import ActivationType, fp4_quantize
+from flashinfer import ActivationType
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     ActivationConfig,
     BackendOptions,
+    B12xNvfp4Config,
+    B12xW4A16Config,
     CutlassBf16Config,
     CutlassNvfp4Config,
+    CutlassW4A16Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
@@ -32,7 +38,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     ReLU,
     ReLU2,
     RoutingConfig,
@@ -40,6 +46,10 @@ from flashinfer.fused_moe import (
     SiTU,
     SwiGLU,
     SwiGLUStep,
+)
+from flashinfer.fused_moe.prepare import (
+    _quantize_mxfp4_linear,
+    _swizzle_cutile_fp4_scales,
 )
 from flashinfer.testing.utils import bench_gpu_time
 from flashinfer.utils import get_compute_capability
@@ -62,6 +72,12 @@ _BACKEND_CONFIGS = {
     ("bf16", "cutile"): CuTileBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
+    ("nvfp4", "b12x"): B12xNvfp4Config,
+    ("nvfp4_w4a16", "cutile"): CuTileNvfp4Bf16Config,
+    ("nvfp4_w4a16", "b12x"): B12xW4A16Config,
+    ("mxfp4", "cutile"): CuTileMxfp4Config,
+    ("mxfp4_w4a16", "cutlass"): CutlassW4A16Config,
+    ("mxfp4_w4a16", "cutile"): CuTileMxfp4Bf16Config,
 }
 
 _ACTIVATIONS = {
@@ -85,7 +101,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile"),
+        choices=("cutlass", "cutile", "b12x"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -93,8 +109,10 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         "--quant-variant",
         "--quant_variant",
         dest="quant_variant",
-        choices=("bf16", "nvfp4"),
+        choices=("bf16", "nvfp4", "nvfp4_w4a16", "mxfp4", "mxfp4_w4a16"),
         default="bf16",
+        help="Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations "
+        "(not the legacy QuantVariant.MXFP4 preset with MXFP8 activations).",
     )
     parser.add_argument(
         "--activation-type",
@@ -176,22 +194,48 @@ def _quantize_cutile_nvfp4_source(weight: torch.Tensor):
     """Quantize canonical BF16 weights into cuTile's checkpoint input layout."""
     num_experts, rows, cols = weight.shape
     global_scales = torch.ones(num_experts, dtype=torch.float32, device=weight.device)
-    packed_experts = []
-    scale_experts = []
-    for expert in range(num_experts):
-        packed, scale = fp4_quantize(
-            weight[expert],
-            global_scale=global_scales[expert : expert + 1],
-            sf_vec_size=16,
-            is_sf_swizzled_layout=False,
-            enable_pdl=False,
+    flat_weight = weight.reshape(-1, cols)
+    packed = torch.empty(
+        flat_weight.shape[0], cols // 2, dtype=torch.uint8, device=weight.device
+    )
+    scale = torch.empty(
+        flat_weight.shape[0],
+        cols // 16,
+        dtype=torch.float8_e4m3fn,
+        device=weight.device,
+    )
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    chunk_rows = max(1, 8 * 1024 * 1024 // cols)
+    for begin in range(0, flat_weight.shape[0], chunk_rows):
+        end = min(begin + chunk_rows, flat_weight.shape[0])
+        groups = flat_weight[begin:end].float().reshape(-1, cols // 16, 16)
+        chunk_scale = (groups.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
+        values = groups / chunk_scale.float().clamp_min(2.0**-9).unsqueeze(-1)
+        codes = torch.bucketize(values.abs(), boundaries, right=False)
+        codes |= (values < 0).to(torch.int64) << 3
+        codes = codes.reshape(end - begin, cols)
+        packed[begin:end].copy_(
+            (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
         )
-        packed_experts.append(packed)
-        scale_experts.append(scale.view(torch.float8_e4m3fn).reshape(rows, cols // 16))
+        scale[begin:end].copy_(chunk_scale)
     return (
-        torch.stack(packed_experts).contiguous(),
-        torch.stack(scale_experts).contiguous(),
+        packed.reshape(num_experts, rows, cols // 2),
+        scale.reshape(num_experts, rows, cols // 16),
         global_scales,
+    )
+
+
+def _quantize_cutile_mxfp4_source(weight: torch.Tensor):
+    """Quantize canonical BF16 weights into logical MXFP4 checkpoint tensors."""
+    num_experts, rows, cols = weight.shape
+    packed, scale = _quantize_mxfp4_linear(weight.reshape(-1, cols))
+    return (
+        packed.reshape(num_experts, rows, cols // 2),
+        scale.view(torch.float8_e8m0fnu).reshape(num_experts, rows, cols // 32),
     )
 
 
@@ -215,17 +259,52 @@ def _prepare_weight_view(
     if quant_variant == "bf16" or backend == "cutlass":
         return config_type.prepare_weights(w1, w2, **common)
 
-    w1_q, w1_scale, w1_global = _quantize_cutile_nvfp4_source(w1)
-    w2_q, w2_scale, w2_global = _quantize_cutile_nvfp4_source(w2)
-    return config_type.prepare_weights(
-        w1_q,
-        w1_scale,
-        w1_global,
-        w2_q,
-        w2_scale,
-        w2_global,
-        **common,
-    )
+    if quant_variant.startswith("nvfp4"):
+        w1_q, w1_scale, w1_global = _quantize_cutile_nvfp4_source(w1)
+        w2_q, w2_scale, w2_global = _quantize_cutile_nvfp4_source(w2)
+        if backend == "b12x":
+            # b12x consumes swizzled scales with padding per expert, not
+            # cuTile's logical checkpoint scales (notably for ragged N).
+            w1_scale = _swizzle_cutile_fp4_scales(w1_scale, scale_block_size=16)
+            w2_scale = _swizzle_cutile_fp4_scales(w2_scale, scale_block_size=16)
+            if quant_variant == "nvfp4":
+                from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+                return {
+                    "w1_weight": w1_q,
+                    "w1_weight_sf": convert_sf_to_mma_layout(
+                        w1_scale,
+                        m=w1.shape[1],
+                        k=w1.shape[2],
+                        num_groups=args.num_experts,
+                        sf_vec_size=16,
+                    ),
+                    "w1_alpha": w1_global,
+                    "w2_weight": w2_q,
+                    "w2_weight_sf": convert_sf_to_mma_layout(
+                        w2_scale,
+                        m=w2.shape[1],
+                        k=w2.shape[2],
+                        num_groups=args.num_experts,
+                        sf_vec_size=16,
+                    ),
+                    "w2_alpha": w2_global,
+                    "fc2_input_scale": torch.ones(1, device=device),
+                }
+            common = {"activation": activation}
+        return config_type.prepare_weights(
+            w1_q,
+            w1_scale,
+            w1_global,
+            w2_q,
+            w2_scale,
+            w2_global,
+            **common,
+        )
+
+    w1_q, w1_scale = _quantize_cutile_mxfp4_source(w1)
+    w2_q, w2_scale = _quantize_cutile_mxfp4_source(w2)
+    return config_type.prepare_weights(w1_q, w1_scale, w2_q, w2_scale, **common)
 
 
 def _reference_moe(
@@ -316,12 +395,16 @@ def _reference_activation(
 
 
 def _config_for_backend(args, activation, backend_config) -> MoEConfig:
-    quant_variant = (
-        QuantVariant.BF16 if args.quant_variant == "bf16" else QuantVariant.NVFP4
-    )
+    weight_format, activation_format = {
+        "bf16": (QuantFormat.BF16, QuantFormat.BF16),
+        "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        "nvfp4_w4a16": (QuantFormat.NVFP4, QuantFormat.BF16),
+        "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
+        "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
+    }[args.quant_variant]
     return MoEConfig(
         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
-        quant=QuantConfig(variant=quant_variant),
+        quant=QuantConfig(weight=weight_format, activation=activation_format),
         experts=ExpertConfig(intermediate_size=args.intermediate_size),
         activation=activation,
         backend=BackendOptions((backend_config,)),
@@ -402,7 +485,13 @@ def run_unified_moe_test(args):
     results = []
 
     for backend in args.backends:
-        config_type = _BACKEND_CONFIGS[(args.quant_variant, backend)]
+        config_type = _BACKEND_CONFIGS.get((args.quant_variant, backend))
+        if config_type is None:
+            print(
+                f"[INFO] {backend} has no {args.quant_variant} unified MoE "
+                "comparison backend; skipping."
+            )
+            continue
         if not config_type.supported(arch):
             print(
                 f"[INFO] {backend} does not support {args.quant_variant} "
@@ -445,6 +534,8 @@ def run_unified_moe_test(args):
 
         refcheck_passed: bool | str = ""
         if reference is not None:
+            # Quantized modes are compared with the original BF16 weights, so
+            # their tolerance includes the expected FP4 weight error.
             rtol, atol = (3e-2, 5e-1) if args.quant_variant == "bf16" else (0.25, 1.0)
             try:
                 torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
@@ -464,7 +555,11 @@ def run_unified_moe_test(args):
             median_time,
             is_gated=activation.is_gated,
         )
-        weight_format = "nvfp4" if args.quant_variant == "nvfp4" else None
+        weight_format = (
+            None
+            if args.quant_variant == "bf16"
+            else ("nvfp4" if args.quant_variant.startswith("nvfp4") else "mxfp4")
+        )
         weight_dtype = torch.uint8 if weight_format else torch.bfloat16
         tb_per_sec = calculate_moe_kernel_bandwidth(
             args.num_tokens,
@@ -500,13 +595,13 @@ def run_unified_moe_test(args):
             top_k=args.top_k,
             routing_method="precomputed",
             input_dtype=args.input_dtype,
-            weight_dtype="nvfp4" if weight_format else "bfloat16",
+            weight_dtype=weight_format or "bfloat16",
             activation_type=activation.type.name,
             quant_variant=args.quant_variant,
             autotune=args.autotune,
             tactic=repr(tuple(tactic) if isinstance(tactic, (tuple, list)) else tactic),
             refcheck_passed=refcheck_passed,
-            fp4_mode="nvfp4" if weight_format else "",
+            fp4_mode=weight_format or "",
             cold_l2_cache=True,
         )
         results.append(current)

@@ -103,6 +103,12 @@ cuTile Fused MoE
 
     CuTileBf16Config
     CuTileBf16Runner
+    CuTileMxfp4Bf16Config
+    CuTileMxfp4Bf16Runner
+    CuTileMxfp4Config
+    CuTileMxfp4Runner
+    CuTileNvfp4Bf16Config
+    CuTileNvfp4Bf16Runner
     CuTileNvfp4Config
     CuTileNvfp4Runner
 
