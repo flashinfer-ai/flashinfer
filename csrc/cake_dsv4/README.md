@@ -61,8 +61,10 @@ each comparison's stated API boundary. Launch gaps are excluded and
 overlapping kernel intervals are counted once. Each comparison uses three
 independent groups with equal ABBA and BAAB ordering within every group;
 results use pooled active-union medians. The
-[94-case comparison CSV](../../benchmarks/data/sparse_mla_dsv4/cake_export/rows.csv)
-contains all three comparisons for each canonical case.
+[94-case comparison table in PR #4573](https://github.com/flashinfer-ai/flashinfer/pull/4573)
+contains all 14 recorded columns for every canonical case, including shape
+fields and the baseline latency, candidate latency, and speedup for each of
+the three comparisons.
 
 Selected sealed-row benchmark runtime sums to **19,937.948 s** across the 94 disjoint rows; this is harness runtime, not GPU active time. The corrected measurement campaign's physical turnaround was **4,221.966 s** (2026-09-12T13:51:04.703Z to 2026-09-12T15:01:26.669Z), including unsuccessful measurement attempts and retries. This elapsed interval covers the corrected campaign, before final qualification and publication; concurrent step durations are not added to obtain elapsed time.
 

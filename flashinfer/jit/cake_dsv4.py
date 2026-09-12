@@ -70,12 +70,11 @@ def gen_cake_dsv4_module(variant: str) -> JitSpec:
         name=f"cake_dsv4_{variant}_sm103a",
         sources=sources,
         extra_cuda_cflags=[*sm103a_nvcc_flags, *contract["compile_flags"]],
+        # The generated contract owns the fast-math decision.
+        use_fast_math=False,
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
         extra_ldflags=["-lcuda"],
     )
-    # The generic JIT adds fast math unconditionally. The generated production
-    # contract owns that decision, including variants that omit fast math.
-    spec.extra_cuda_cflags.remove("-use_fast_math")
     logger.info(f"Generated CAKE DSv4 {variant} JIT spec: {spec.name}")
     return spec
 
@@ -142,6 +141,8 @@ def gen_cake_dsv4_program(program_id: str) -> JitSpec:
         name=f"cake_dsv4_{program_id}_sm103a",
         sources=sources,
         extra_cuda_cflags=[*sm103a_nvcc_flags, *contract["compile_flags"]],
+        # The generated contract owns the fast-math decision.
+        use_fast_math=False,
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
         extra_ldflags=[
             "-Wl,--no-as-needed",
@@ -154,7 +155,6 @@ def gen_cake_dsv4_program(program_id: str) -> JitSpec:
             ),
         ],
     )
-    spec.extra_cuda_cflags.remove("-use_fast_math")
     logger.info(f"Generated CAKE DSv4 {program_id} program JIT spec: {spec.name}")
     return spec
 
