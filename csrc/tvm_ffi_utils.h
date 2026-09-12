@@ -22,6 +22,7 @@
 #include <tvm/ffi/function.h>
 
 #include <flashinfer/layout.cuh>
+#include <type_traits>
 
 #include "dlpack/dlpack.h"
 
@@ -60,6 +61,19 @@ constexpr int64_t int64_code = encode_dlpack_dtype(dl_int64);
 constexpr int64_t float8_e4m3fn_code = encode_dlpack_dtype(dl_float8_e4m3fn);
 constexpr int64_t float8_e5m2_code = encode_dlpack_dtype(dl_float8_e5m2);
 constexpr int64_t float4_e2m1fn_code = encode_dlpack_dtype(dl_float4_e2m1fn);
+
+// DLDataType of a module's compiled IdType, so index tensors can be checked
+// against the type the module was built for instead of a hard-coded dl_int32.
+template <typename IdType>
+inline constexpr DLDataType dl_dtype_for() {
+  static_assert(std::is_same_v<IdType, int32_t> || std::is_same_v<IdType, int64_t>,
+                "dl_dtype_for only supports int32_t or int64_t index types");
+  if constexpr (std::is_same_v<IdType, int32_t>) {
+    return dl_int32;
+  } else {
+    return dl_int64;
+  }
+}
 
 constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 

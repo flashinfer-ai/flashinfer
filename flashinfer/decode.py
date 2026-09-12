@@ -65,6 +65,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_index_tensor,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -899,18 +900,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
-            of the buffer should be ``[batch_size + 1]``.
+            of the buffer should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D,
+            contiguous, and on the same device as ``float_workspace_buffer``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
         paged_kv_indices_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
-            (``max_num_pages``) during the lifecycle of this wrapper.
+            (``max_num_pages``) during the lifecycle of this wrapper. Must be ``torch.int32``,
+            1D, contiguous, and on the same device as ``float_workspace_buffer``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
         paged_kv_last_page_len_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page, the
-            size of the buffer should be ``[batch_size]``.
+            size of the buffer should be ``[batch_size]``. Must be ``torch.int32``, 1D,
+            contiguous, and on the same device as ``float_workspace_buffer``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
         backend : str
@@ -993,11 +997,28 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise ValueError(
                     "paged_kv_last_page_len_buffer should be a torch.Tensor in cudagraph mode"
                 )
+            # Graph replays read these buffers by address; pin dtype, rank,
+            # device and layout once.
+            _check_index_tensor(
+                paged_kv_last_page_len_buffer,
+                "paged_kv_last_page_len_buffer",
+                device=self.device,
+                contiguous=True,
+            )
             self._fixed_batch_size = len(paged_kv_last_page_len_buffer)
-            if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
-                raise ValueError(
-                    "The size of paged_kv_indptr_buffer should be batch_size + 1"
-                )
+            _check_index_tensor(
+                paged_kv_indptr_buffer,
+                "paged_kv_indptr_buffer",
+                expected_len=self._fixed_batch_size + 1,
+                device=self.device,
+                contiguous=True,
+            )
+            _check_index_tensor(
+                paged_kv_indices_buffer,
+                "paged_kv_indices_buffer",
+                device=self.device,
+                contiguous=True,
+            )
         else:
             self._fixed_batch_size = 0
 
@@ -1542,7 +1563,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * self._float_workspace_buffer.element_size()
         )
 
+        _check_index_tensor(last_page_len, "last_page_len")
         batch_size = len(last_page_len)
+        _check_index_tensor(indptr, "indptr", expected_len=batch_size + 1)
+        _check_index_tensor(indices, "indices")
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if window_right != 0 and self._backend != "cute-dsl":
@@ -1600,13 +1624,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 # later in plan()
                 self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
         else:
-            self._paged_kv_indptr_buf = indptr.to(
+            # .to() leaves a strided same-device tensor strided; the kernel needs
+            # contiguous memory.
+            self._paged_kv_indptr_buf = indptr.contiguous().to(
                 self.device, non_blocking=non_blocking
             )
-            self._paged_kv_indices_buf = indices.to(
+            self._paged_kv_indices_buf = indices.contiguous().to(
                 self.device, non_blocking=non_blocking
             )
-            self._paged_kv_last_page_len_buf = last_page_len.to(
+            self._paged_kv_last_page_len_buf = last_page_len.contiguous().to(
                 self.device, non_blocking=non_blocking
             )
             self._qo_indptr_buf = qo_indptr_host.to(
@@ -2739,17 +2765,20 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
         indptr_buffer : torch.Tensor
             The user reserved buffer on GPU to store the indptr of the paged kv cache, should
             be large enough to store the indptr of maximum batch size (``[max_batch_size + 1]``)
-            during the lifecycle of this wrapper.
+            during the lifecycle of this wrapper. Must be ``torch.int32``, 1D, contiguous, and
+            on the same device as ``workspace_buffer``.
 
         indices_buffer : torch.Tensor
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
-            (``max_num_pages``) during the lifecycle of this wrapper.
+            (``max_num_pages``) during the lifecycle of this wrapper. Must be ``torch.int32``,
+            1D, contiguous, and on the same device as ``workspace_buffer``.
 
         last_page_len_buffer : torch.Tensor
             The user reserved buffer on GPU to store the number of entries in the last page,
             should be large enough to store the maximum batch size (``[max_batch_size]``)
-            during the lifecycle of this wrapper.
+            during the lifecycle of this wrapper. Must be ``torch.int32``, 1D, contiguous, and
+            on the same device as ``workspace_buffer``.
 
         use_tensor_cores : bool
             Whether to use tensor cores for the computation. Will be faster for large group
@@ -4524,7 +4553,10 @@ def fast_decode_plan(
     - Remove unnecessary device-to-device copy for the cuda graph buffers.
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
+    _check_index_tensor(last_page_len, "last_page_len")
     batch_size = len(last_page_len)
+    _check_index_tensor(indptr, "indptr", expected_len=batch_size + 1)
+    _check_index_tensor(indices, "indices")
     if getattr(self, "_backend", None) == "prims-ts":
         raise NotImplementedError(
             "fast_decode_plan is not supported by the prims-ts decode backend"
@@ -4598,9 +4630,11 @@ def fast_decode_plan(
         if self.use_tensor_cores and q_len_per_req > 1:
             self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
     else:
-        self._paged_kv_indptr_buf = indptr
-        self._paged_kv_indices_buf = indices
-        self._paged_kv_last_page_len_buf = last_page_len
+        # No device copy here by design; .contiguous() is a no-op for the
+        # contiguous tensors this path expects.
+        self._paged_kv_indptr_buf = indptr.contiguous()
+        self._paged_kv_indices_buf = indices.contiguous()
+        self._paged_kv_last_page_len_buf = last_page_len.contiguous()
         if self.use_tensor_cores:
             self._qo_indptr_buf = qo_indptr_host.to(
                 self.device, non_blocking=non_blocking
