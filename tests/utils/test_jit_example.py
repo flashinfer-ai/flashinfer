@@ -11,7 +11,14 @@ from flashinfer.jit.attention import (
     gen_customize_single_prefill_module,
 )
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
-from flashinfer.utils import MaskMode, get_compute_capability, is_sm90a_supported
+from tests.test_helpers.alibi_reference import alibi_attention
+
+from flashinfer.utils import (
+    MaskMode,
+    get_alibi_slopes,
+    get_compute_capability,
+    is_sm90a_supported,
+)
 
 
 def test_single_decode_mask():
@@ -989,14 +996,7 @@ struct FlashCustomMask : AttentionVariantBase {
     )
 
 
-@pytest.mark.parametrize("use_tensor_cores", [False, True])
-def test_batch_decode_jit_wellknown_alibi_buffer(use_tensor_cores):
-    """Issue #1044 (decode): JIT variants using well-known additional tensor name
-    (maybe_alibi_slopes) should auto-inject the internal buffer without the user
-    having to pass it via *args."""
-    torch.manual_seed(42)
-
-    variant_decl = r"""
+flash_alibi_decode_decl = r"""
 struct FlashAlibiDecode : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
@@ -1021,14 +1021,10 @@ struct FlashAlibiDecode : AttentionVariantBase {
   });
 };
 """
-    num_qo_heads = 32
-    num_kv_heads = 32
-    head_dim = 128
-    batch_size = 4
-    seq_len = 128
-    page_size = 1
 
-    jit_args = (
+
+def flash_alibi_decode_jit_args(use_tensor_cores, head_dim=128):
+    return (
         f"batch_decode_alibi_wellknown_{use_tensor_cores}",
         torch.float16,
         torch.float16,
@@ -1041,8 +1037,25 @@ struct FlashAlibiDecode : AttentionVariantBase {
         ["sm_scale"],
         ["double"],
         "FlashAlibiDecode",
-        variant_decl,
+        flash_alibi_decode_decl,
     )
+
+
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_batch_decode_jit_wellknown_alibi_buffer(use_tensor_cores):
+    """Issue #1044 (decode): JIT variants using well-known additional tensor name
+    (maybe_alibi_slopes) should auto-inject the internal buffer without the user
+    having to pass it via *args."""
+    torch.manual_seed(42)
+
+    num_qo_heads = 32
+    num_kv_heads = 32
+    head_dim = 128
+    batch_size = 4
+    seq_len = 128
+    page_size = 1
+
+    jit_args = flash_alibi_decode_jit_args(use_tensor_cores, head_dim)
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
@@ -1082,6 +1095,105 @@ struct FlashAlibiDecode : AttentionVariantBase {
     sm_scale = 1.0 / math.sqrt(head_dim)
     o = wrapper.run(q, (k_cache, v_cache), sm_scale)
     assert o.shape == (batch_size, num_qo_heads, head_dim)
+
+
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_batch_decode_jit_custom_alibi_slopes(use_tensor_cores):
+    """A JIT module that declares maybe_alibi_slopes receives the caller's
+    alibi_slopes instead of the auto-injected built-in buffer."""
+    torch.manual_seed(42)
+    num_heads, head_dim, batch_size, seq_len = 32, 128, 4, 128
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        kv_layout="NHD",
+        use_tensor_cores=use_tensor_cores,
+        jit_args=flash_alibi_decode_jit_args(use_tensor_cores, head_dim),
+        backend="fa2",
+    )
+    kv_indptr = torch.arange(0, batch_size * seq_len + 1, seq_len, dtype=torch.int32)
+    kv_indices = torch.arange(0, batch_size * seq_len, dtype=torch.int32)
+    last_page_len = torch.full((batch_size,), 1, dtype=torch.int32)
+    # This rank's slice of a 64-head model's slopes, which differs from the
+    # built-in slopes for 32 heads. No pos_encoding_mode: the variant decides
+    # how the tensor is used.
+    slopes = get_alibi_slopes(2 * num_heads, device="cuda")[num_heads:]
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_heads,
+        num_heads,
+        head_dim,
+        1,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        alibi_slopes=slopes,
+    )
+    q = torch.randn(batch_size, num_heads, head_dim, dtype=torch.float16, device="cuda")
+    k_cache = torch.randn(
+        batch_size * seq_len, num_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    v_cache = torch.randn_like(k_cache)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    o = wrapper.run(q, (k_cache, v_cache), sm_scale)
+    # The variant adds the bias before the softmax scale, so the reference
+    # (which scales the scores by 1/sqrt(head_dim) but not the bias) needs the
+    # scaled slopes.
+    mask = torch.ones(1, seq_len, dtype=torch.bool, device="cuda")
+    for i in range(batch_size):
+        rows = slice(i * seq_len, (i + 1) * seq_len)
+        o_ref = alibi_attention(
+            q[i : i + 1], k_cache[rows], v_cache[rows], mask, slopes=slopes * sm_scale
+        )
+        torch.testing.assert_close(o[i : i + 1], o_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_batch_decode_jit_rejects_alibi_slopes_without_tensor(use_tensor_cores):
+    """A JIT module that does not declare maybe_alibi_slopes cannot honor
+    alibi_slopes, so plan() must reject them instead of dropping them."""
+    jit_args = (
+        f"batch_decode_flash_sigmoid_sm80_{use_tensor_cores}",  # uri
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        torch.int32,  # idtype
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
+        [],  # additional_tensor_names
+        [],  # additional_tensor_dtypes
+        ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
+        ["double", "double"],  # additional_scalar_dtypes
+        "FlashSigmoid",
+        flash_sigmoid_sm80_decl,
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer,
+        kv_layout="NHD",
+        use_tensor_cores=use_tensor_cores,
+        jit_args=jit_args,
+        backend="fa2",
+    )
+    batch_size, seq_len, num_heads = 4, 128, 32
+    kv_indptr = torch.arange(0, batch_size * seq_len + 1, seq_len, dtype=torch.int32)
+    kv_indices = torch.arange(0, batch_size * seq_len, dtype=torch.int32)
+    last_page_len = torch.full((batch_size,), 1, dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="does not declare"):
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            last_page_len,
+            num_heads,
+            num_heads,
+            128,
+            1,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            alibi_slopes=get_alibi_slopes(num_heads, device="cuda"),
+        )
 
 
 if __name__ == "__main__":

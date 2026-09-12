@@ -70,7 +70,10 @@ from .utils import (
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
     get_alibi_slopes,
-    _get_cache_alibi_slopes_buf,
+    _check_alibi_slopes,
+    _check_alibi_slopes_backend,
+    _resolve_alibi_slopes,
+    _stage_alibi_slopes,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     _get_range_buf,
@@ -576,6 +579,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: Literal[False] = False,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> torch.Tensor: ...
 
 
@@ -596,6 +600,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: Literal[True] = True,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -616,6 +621,7 @@ def single_decode_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     return_lse: bool = False,
+    alibi_slopes: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
 
@@ -663,6 +669,13 @@ def single_decode_with_kv_cache(
         The theta used in RoPE, if not provided, will be set to ``1e4``.
     return_lse : bool
         Whether to return the log sum exp value of the attention logits.
+    alibi_slopes : Optional[torch.Tensor]
+        Caller-supplied ALiBi slopes, one ``float32`` value per query head,
+        shape: ``[num_qo_heads]``, contiguous, on the same device as ``q``. Only
+        valid with ``pos_encoding_mode="ALIBI"``. ``None`` (default) uses the
+        slopes :func:`flashinfer.utils.get_alibi_slopes` computes for
+        ``num_qo_heads`` heads. Under tensor parallelism pass this rank's slice
+        of the slopes computed for the global head count.
 
     Returns
     -------
@@ -712,6 +725,11 @@ def single_decode_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
     num_qo_heads = q.shape[0]
+    alibi_slopes = _check_alibi_slopes(
+        alibi_slopes, num_qo_heads, q.device, pos_encoding_mode
+    )
+    if alibi_slopes is None and pos_encoding_mode == "ALIBI":
+        alibi_slopes = get_alibi_slopes(num_qo_heads, device=q.device)
 
     lse = None
     if return_lse:
@@ -741,9 +759,7 @@ def single_decode_with_kv_cache(
             TensorLayout[kv_layout].value,
             window_left,
             None,  # packed_custom_mask
-            get_alibi_slopes(num_qo_heads, device=q.device)
-            if pos_encoding_mode == "ALIBI"
-            else None,
+            alibi_slopes,
             logits_soft_cap,
             sm_scale,
             None,  # scale_q, not supported yet
@@ -773,9 +789,7 @@ def single_decode_with_kv_cache(
             tmp,
             out,
             lse,
-            get_alibi_slopes(num_qo_heads, device=q.device)
-            if pos_encoding_mode == "ALIBI"
-            else None,
+            alibi_slopes,
             TensorLayout[kv_layout].value,
             window_left,
             logits_soft_cap,
@@ -1021,6 +1035,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     device=float_workspace_buffer.device,
                 )
         self._backend = backend
+        self._alibi_slopes: Optional[torch.Tensor] = None
+        self._alibi_slopes_buf: Optional[torch.Tensor] = None
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -1420,6 +1436,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_theta : Optional[float]
             Base value for the RoPE frequencies.  Only consulted when
             ``pos_encoding_mode != "NONE"``.  Defaults to ``1e4`` when ``None``.
+        alibi_slopes : Optional[torch.Tensor]
+            Caller-supplied ALiBi slopes, one ``float32`` value per query head,
+            shape: ``[num_qo_heads]``, contiguous, on the wrapper's device. Only
+            valid with ``pos_encoding_mode="ALIBI"`` and only supported by the
+            ``fa2`` backend; a custom JIT module receives the tensor as its
+            ``maybe_alibi_slopes`` input regardless of ``pos_encoding_mode`` and
+            must declare it. ``None`` (default) uses the slopes
+            :func:`flashinfer.utils.get_alibi_slopes` computes for
+            ``num_qo_heads`` heads. Under tensor parallelism pass this rank's
+            slice of the slopes computed for the global head count. The values
+            are copied into a wrapper-owned buffer, so the tensor may be freed or
+            reused afterwards and a later :meth:`plan` with new slopes also
+            updates a captured CUDA graph.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         seq_lens: Optional[torch.Tensor]
@@ -1529,6 +1558,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
+        alibi_slopes: Optional[torch.Tensor] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -1545,6 +1575,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        jit_tensor_names = (
+            self._jit_additional_tensor_names if self._jit_module is not None else None
+        )
+        alibi_slopes = _check_alibi_slopes(
+            alibi_slopes,
+            num_qo_heads,
+            self.device,
+            pos_encoding_mode,
+            require_alibi_mode=jit_tensor_names is None,
+        )
+        _check_alibi_slopes_backend(alibi_slopes, self._backend, jit_tensor_names)
         if window_right != 0 and self._backend != "cute-dsl":
             raise NotImplementedError(
                 "BatchDecodeWithPagedKVCacheWrapper only supports window_right != 0 "
@@ -1752,6 +1793,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._sm_scale = sm_scale
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
+            self._alibi_slopes, self._alibi_slopes_buf = _stage_alibi_slopes(
+                alibi_slopes, self._alibi_slopes_buf
+            )
             return
         if self._backend == "cute-dsl":
             if logits_soft_cap is not None and logits_soft_cap > 0:
@@ -1962,6 +2006,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "q_len_per_req > 1 is currently only supported on the "
                         "fa2 tensor-core backend."
                     )
+                _check_alibi_slopes_backend(alibi_slopes, self._backend, None)
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -2042,6 +2087,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._alibi_slopes, self._alibi_slopes_buf = _stage_alibi_slopes(
+            alibi_slopes, self._alibi_slopes_buf
+        )
         self._q_len_per_req = q_len_per_req
         self._is_causal = is_causal
 
@@ -2522,8 +2570,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         {
                             "maybe_custom_mask": None,
                             "maybe_mask_indptr": None,
-                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                                q.shape[1], q.device
+                            "maybe_alibi_slopes": lambda: _resolve_alibi_slopes(
+                                self._alibi_slopes, q.shape[1], q.device
                             ),
                         },
                         args,
@@ -2541,7 +2589,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 run_args += [
                     None,  # packed_custom_mask
                     None,  # mask_indptr_buf
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    _resolve_alibi_slopes(self._alibi_slopes, q.shape[1], q.device),
                     None,  # maybe_prefix_len_ptr
                     None,  # maybe_token_pos_in_items_ptr
                     None,  # maybe_max_item_len_ptr
@@ -2632,8 +2680,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     prepare_jit_additional_args(
                         self._jit_additional_tensor_names,
                         {
-                            "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
-                                q.shape[1], q.device
+                            "maybe_alibi_slopes": lambda: _resolve_alibi_slopes(
+                                self._alibi_slopes, q.shape[1], q.device
                             ),
                         },
                         args,
@@ -2641,7 +2689,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
             else:
                 run_args += [
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    _resolve_alibi_slopes(self._alibi_slopes, q.shape[1], q.device),
                     logits_soft_cap,
                     sm_scale,
                     rope_scale,
