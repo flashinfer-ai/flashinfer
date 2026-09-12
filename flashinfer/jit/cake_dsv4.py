@@ -3,18 +3,36 @@
 from __future__ import annotations
 
 import functools
-import json
 from pathlib import Path
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 
 
-def _get_csrc_dir() -> Path:
-    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_dsv4"
+_ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+
+# Populated by the generated-program integration callback from the resolved
+# in-memory bundle. These explicit registrations are the runtime build contract.
+_ARCH_REGISTRATIONS = {
+    "sm_100a": {"variants": {}, "programs": {}},
+    "sm_103a": {"variants": {}, "programs": {}},
+}
+
+
+def _get_csrc_dir(arch: str) -> Path:
+    if arch not in _ARCH_NVCC_FLAGS:
+        raise ValueError(f"unsupported CAKE DSv4 architecture: {arch}")
+    arch_dir = arch
+    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_dsv4" / arch_dir
     if installed.exists():
         return installed
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_dsv4"
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_dsv4" / arch_dir
     if checkout.exists():
         return checkout
     raise FileNotFoundError(
@@ -38,15 +56,14 @@ def _get_include_dir() -> Path:
 
 
 @functools.cache
-def _module_metadata() -> dict:
-    path = _get_csrc_dir() / "cake_dsv4_modules.json"
-    return json.loads(path.read_text(encoding="utf-8"))["variants"]
+def _module_metadata(arch: str) -> dict:
+    return _ARCH_REGISTRATIONS[arch]["variants"]
 
 
-def get_cake_dsv4_spec(variant: str) -> dict:
+def get_cake_dsv4_spec(variant: str, *, arch: str) -> dict:
     """Return the generated physical build and argument contract."""
     try:
-        return _module_metadata()[variant]
+        return _module_metadata(arch)[variant]
     except KeyError as exc:
         raise ValueError(
             f"CAKE DSv4 variant has no generated source contract: {variant}"
@@ -54,11 +71,13 @@ def get_cake_dsv4_spec(variant: str) -> dict:
 
 
 @functools.cache
-def gen_cake_dsv4_module(variant: str) -> JitSpec:
-    contract = get_cake_dsv4_spec(variant)
-    if contract["arch"] != "sm_103a":
-        raise ValueError(f"unsupported CAKE DSv4 architecture: {contract['arch']}")
-    csrc_dir = _get_csrc_dir()
+def gen_cake_dsv4_module(variant: str, *, arch: str) -> JitSpec:
+    contract = get_cake_dsv4_spec(variant, arch=arch)
+    if contract["arch"] != arch:
+        raise ValueError(
+            f"CAKE DSv4 contract architecture {contract['arch']} does not match {arch}"
+        )
+    csrc_dir = _get_csrc_dir(arch)
     sources = [csrc_dir / name for name in contract["sources"]]
     missing = [path for path in sources if not path.is_file()]
     if missing:
@@ -67,12 +86,16 @@ def gen_cake_dsv4_module(variant: str) -> JitSpec:
             + ", ".join(str(path) for path in missing)
         )
     spec = gen_jit_spec(
-        name=f"cake_dsv4_{variant}_sm103a",
+        name=f"cake_dsv4_{variant}_{arch.replace('_', '')}_{contract['identity']}",
         sources=sources,
-        extra_cuda_cflags=[*sm103a_nvcc_flags, *contract["compile_flags"]],
+        extra_cuda_cflags=[
+            *_ARCH_NVCC_FLAGS[arch],
+            *contract["compile_flags"],
+            *contract.get("host_linkage_flags", ()),
+        ],
         # The generated contract owns the fast-math decision.
         use_fast_math=False,
-        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
+        extra_include_paths=[csrc_dir, csrc_dir.parent.parent, _get_include_dir()],
         extra_ldflags=["-lcuda"],
     )
     logger.info(f"Generated CAKE DSv4 {variant} JIT spec: {spec.name}")
@@ -80,22 +103,21 @@ def gen_cake_dsv4_module(variant: str) -> JitSpec:
 
 
 @functools.cache
-def get_cake_dsv4_module(variant: str):
-    loaded = gen_cake_dsv4_module(variant).build_and_load()
+def get_cake_dsv4_module(variant: str, *, arch: str):
+    loaded = gen_cake_dsv4_module(variant, arch=arch).build_and_load()
     logger.info(f"Loaded CAKE DSv4 {variant} module")
     return loaded
 
 
 @functools.cache
-def _program_metadata() -> dict:
-    path = _get_csrc_dir() / "cake_dsv4_modules.json"
-    return json.loads(path.read_text(encoding="utf-8"))["programs"]
+def _program_metadata(arch: str) -> dict:
+    return _ARCH_REGISTRATIONS[arch]["programs"]
 
 
-def get_cake_dsv4_program_spec(program_id: str) -> dict:
+def get_cake_dsv4_program_spec(program_id: str, *, arch: str) -> dict:
     """Return the generated family signature, routes, and build contract."""
     try:
-        return _program_metadata()[program_id]
+        return _program_metadata(arch)[program_id]
     except KeyError as exc:
         raise ValueError(
             f"CAKE DSv4 program has no generated source contract: {program_id}"
@@ -103,11 +125,13 @@ def get_cake_dsv4_program_spec(program_id: str) -> dict:
 
 
 @functools.cache
-def get_cake_dsv4_program_for_variant(variant: str) -> tuple[str, dict] | None:
+def get_cake_dsv4_program_for_variant(
+    variant: str, *, arch: str
+) -> tuple[str, dict] | None:
     """Find the generated family whose selected route starts with this variant."""
     matches = [
         (program_id, contract)
-        for program_id, contract in _program_metadata().items()
+        for program_id, contract in _program_metadata(arch).items()
         if any(route["stage_variants"][0] == variant for route in contract["routes"])
     ]
     if len(matches) > 1:
@@ -118,12 +142,14 @@ def get_cake_dsv4_program_for_variant(variant: str) -> tuple[str, dict] | None:
 
 
 @functools.cache
-def gen_cake_dsv4_program(program_id: str) -> JitSpec:
+def gen_cake_dsv4_program(program_id: str, *, arch: str) -> JitSpec:
     """Describe a family host library linked to separately compiled variants."""
-    contract = get_cake_dsv4_program_spec(program_id)
-    if contract["arch"] != "sm_103a":
-        raise ValueError(f"unsupported CAKE DSv4 architecture: {contract['arch']}")
-    csrc_dir = _get_csrc_dir()
+    contract = get_cake_dsv4_program_spec(program_id, arch=arch)
+    if contract["arch"] != arch:
+        raise ValueError(
+            f"CAKE DSv4 contract architecture {contract['arch']} does not match {arch}"
+        )
+    csrc_dir = _get_csrc_dir(arch)
     sources = [csrc_dir / name for name in contract["sources"]]
     missing = [path for path in sources if not path.is_file()]
     if missing:
@@ -132,18 +158,22 @@ def gen_cake_dsv4_program(program_id: str) -> JitSpec:
             + ", ".join(str(path) for path in missing)
         )
     dependency_paths = [
-        gen_cake_dsv4_module(variant).get_library_path().resolve()
+        gen_cake_dsv4_module(variant, arch=arch).get_library_path().resolve()
         for variant in contract["dependencies"]
     ]
     # Device translation units retain their individual generated compiler flags.
     # This translation unit contains only the family selector and ordered calls.
     spec = gen_jit_spec(
-        name=f"cake_dsv4_{program_id}_sm103a",
+        name=f"cake_dsv4_{program_id}_{arch.replace('_', '')}_{contract['identity']}",
         sources=sources,
-        extra_cuda_cflags=[*sm103a_nvcc_flags, *contract["compile_flags"]],
+        extra_cuda_cflags=[
+            *_ARCH_NVCC_FLAGS[arch],
+            *contract["compile_flags"],
+            *contract.get("host_linkage_flags", ()),
+        ],
         # The generated contract owns the fast-math decision.
         use_fast_math=False,
-        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
+        extra_include_paths=[csrc_dir, csrc_dir.parent.parent, _get_include_dir()],
         extra_ldflags=[
             "-Wl,--no-as-needed",
             *(str(path) for path in dependency_paths),
@@ -160,11 +190,11 @@ def gen_cake_dsv4_program(program_id: str) -> JitSpec:
 
 
 @functools.cache
-def get_cake_dsv4_program(program_id: str):
+def get_cake_dsv4_program(program_id: str, *, arch: str):
     """Build variant dependencies, then load the compiled family entry points."""
-    for variant in get_cake_dsv4_program_spec(program_id)["dependencies"]:
-        get_cake_dsv4_module(variant)
-    loaded = gen_cake_dsv4_program(program_id).build_and_load()
+    for variant in get_cake_dsv4_program_spec(program_id, arch=arch)["dependencies"]:
+        get_cake_dsv4_module(variant, arch=arch)
+    loaded = gen_cake_dsv4_program(program_id, arch=arch).build_and_load()
     logger.info(f"Loaded CAKE DSv4 {program_id} program")
     return loaded
 

@@ -1,4 +1,4 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM103."""
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import threading
 from typing import Literal, Union
 
 import torch
+
+from ..utils import get_compute_capability
 
 
 _HEAD_DIM = 512
@@ -15,14 +17,19 @@ _scale_cache_lock = threading.Lock()
 _descriptor_cache: dict[tuple, torch.Tensor] = {}
 
 
-def _module(kind: str):
+def _target_arch(device: torch.device) -> str:
+    major, minor = get_compute_capability(device)
+    return f"sm_{major}{minor}a"
+
+
+def _module(kind: str, *, arch: str):
     from ..jit.cake_dsv4 import get_cake_dsv4_module
 
-    return get_cake_dsv4_module(kind)
+    return get_cake_dsv4_module(kind, arch=arch)
 
 
-def _variant_module(variant: str):
-    return _module(variant)
+def _variant_module(variant: str, *, arch: str):
+    return _module(variant, arch=arch)
 
 
 def _launch_program(variant: str, *, stream: int, **values) -> None:
@@ -31,7 +38,8 @@ def _launch_program(variant: str, *, stream: int, **values) -> None:
         get_cake_dsv4_program_for_variant,
     )
 
-    selected = get_cake_dsv4_program_for_variant(variant)
+    arch = _target_arch(values["Q"].device)
+    selected = get_cake_dsv4_program_for_variant(variant, arch=arch)
     if selected is None:
         raise ValueError(f"CAKE DSv4 variant has no compiled program: {variant}")
     program_id, contract = selected
@@ -42,7 +50,8 @@ def _launch_program(variant: str, *, stream: int, **values) -> None:
         *signature["scalar_names"],
     )
     args = [values[name] for name in names]
-    getattr(get_cake_dsv4_program(program_id), contract["entry"])(*args, stream)
+    program = get_cake_dsv4_program(program_id, arch=arch)
+    getattr(program, contract["entry"])(*args, stream)
 
 
 def _stream_ptr(device: torch.device) -> int:
@@ -335,7 +344,8 @@ def _launch_variant(
     """Bind the generated ABI with descriptors retained for the module lifetime."""
     from ..jit.cake_dsv4 import get_cake_dsv4_spec
 
-    contract = get_cake_dsv4_spec(variant)
+    arch = _target_arch(workspace.device)
+    contract = get_cake_dsv4_spec(variant, arch=arch)
     arg_plan = contract["arg_plan"]
     input_plan = [
         (kind, name) for kind, name in arg_plan if kind not in ("workspace", "grid")
@@ -370,7 +380,7 @@ def _launch_variant(
             bound_args.append(next(inputs))
     # Direct-source bindings use the target FFI current stream. The old explicit
     # stream value belongs to Python orchestration, not the generated ABI.
-    return getattr(_variant_module(variant), f"run_{variant}")(*bound_args)
+    return getattr(_variant_module(variant, arch=arch), contract["entry"])(*bound_args)
 
 
 def _partition_workspace(workspace, out, num_query_tokens, num_heads, num_splits):

@@ -844,9 +844,10 @@ def test_fp8_prefill_keeps_batch_and_cache_layout_predicates(
     )
 
 
-def test_unexported_variant_fails():
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_unexported_variant_fails(arch):
     with pytest.raises(ValueError, match="no generated source contract"):
-        get_cake_dsv4_spec("unexported_variant")
+        get_cake_dsv4_spec("unexported_variant", arch=arch)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

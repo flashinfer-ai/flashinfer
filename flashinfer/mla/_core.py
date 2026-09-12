@@ -1370,8 +1370,10 @@ def _resolve_dsv4_sparse_mla_backend(
         )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and cc != (10, 3):
-        raise ValueError(f"backend='cake' requires SM103, got SM{cc[0]}{cc[1]}")
+    if requested_backend == "cake" and not is_sm100_family:
+        raise ValueError(
+            f"backend='cake' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
 
@@ -1986,7 +1988,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
         only when ``"cute-dsl"`` is requested explicitly. Source-level CAKE
         kernels are selected only when ``"cake"`` is requested explicitly on
-        SM103.
+        SM100/SM103.
     hca_swa_indices : Optional[torch.Tensor]
         Absolute SWA token-row indices, shape ``[B * Q, 128]`` INT32. Ring
         rotation and wraparound are supported. Every entry, including masked
