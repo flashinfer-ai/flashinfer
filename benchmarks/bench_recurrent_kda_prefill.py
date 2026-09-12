@@ -25,9 +25,11 @@ The FlashInfer candidate is always invoked through the public
 device/shape policy, while ``nonpersistent`` supplies the same explicit
 workspace and packed sequence order used by the historical benchmark to keep
 B200 on the direct schedule family. ``--backend`` selects one public API
-backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
-over the same case set. The resolved backend, logical schedule, physical module
-variants, and target are recorded during untimed warmup. With
+backend per invocation; compare auto, CuTe DSL, Cake, and cuDNN with separate
+commands over the same case set. ``--backend cudnn`` runs the fused cuDNN
+SM100 engine, which takes packed input only, so fixed-layout cases are dropped
+and recorded as skip entries. The resolved backend, logical schedule, physical
+module variants, and target are recorded during untimed warmup. With
 ``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
 reported:
 
@@ -37,8 +39,11 @@ reported:
 
 All paths use the same deterministic tensors and seeds. Preinitialized
 rotating state buffers ensure every timed invocation sees the same initial
-state. The FlashInfer path updates each state slot in place inside the kernel;
-it has no state scratch or copy-back. Allocation, metadata, sequence ordering,
+state. The candidate lets ``recurrent_kda`` allocate its own output, so no
+backend is charged a copy another avoids; the FlashKDA peer scopes keep the
+preallocated outputs ``_fwd_raw`` requires. Cake and CuTe DSL update the state
+slot in the kernel, while cuDNN allocates its final state and copies it back
+inside the timed scope. Metadata, sequence ordering,
 build/JIT, and state-pool reset are outside the measured region.
 """
 
@@ -64,6 +69,7 @@ FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
 DEFAULT_LEGACY_STATE_ROTATIONS = 1024
 DEFAULT_H12_STATE_ROTATIONS = 4096
 DEFAULT_PRODUCTION_STATE_BUDGET_BYTES = 8 * 1024**3
+STATE_DTYPE = torch.bfloat16
 _CUPTI_ESTIMATE_CALLS_PER_BLOCK = 1 + 5
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 BENCHMARKS_DIR = Path(__file__).resolve().parent
@@ -85,7 +91,6 @@ class PreparedCase:
     peer_raw_run: Optional[Callable[[], None]]
     peer_adapted_run: Optional[Callable[[], None]]
     reset_state_pools: Callable[[], None]
-    candidate_output: torch.Tensor
     candidate_state_pool: torch.Tensor
     peer_raw_output: Optional[torch.Tensor]
     peer_raw_final_state: Optional[torch.Tensor]
@@ -248,7 +253,7 @@ def _default_state_rotations(case: Case) -> int:
     )
     if case not in PRODUCTION_CASES:
         return base
-    state_bytes = len(case.seq_lens) * case.num_heads * 128 * 128 * 2
+    state_bytes = len(case.seq_lens) * case.num_heads * 128 * 128 * STATE_DTYPE.itemsize
     budget_capacity = max(8, DEFAULT_PRODUCTION_STATE_BUDGET_BYTES // state_bytes)
     return min(base, budget_capacity)
 
@@ -423,12 +428,11 @@ def _make_case(
             device="cuda",
         )
         * 0.25
-    ).to(torch.bfloat16)
+    ).to(STATE_DTYPE)
     candidate_state_pool = _make_state_pool(initial_state, state_rotations)
-    candidate_output = torch.empty_like(q)
     candidate_workspace = (
         RecurrentKDAPrefillWorkspace(q.device)
-        if candidate_route == "nonpersistent"
+        if candidate_route == "nonpersistent" and candidate_backend != "cudnn"
         else None
     )
     state_cursors = {"pr": [0], "adapted": [0]}
@@ -449,7 +453,9 @@ def _make_case(
             dtype=torch.int32,
             device="cuda",
         )
-        if case.packed and candidate_route == "nonpersistent"
+        if case.packed
+        and candidate_route == "nonpersistent"
+        and candidate_backend != "cudnn"
         else None
     )
     scale = float(1.0 / np.sqrt(128.0))
@@ -461,7 +467,7 @@ def _make_case(
                 f"PR state rotations exhausted: {state_index} >= {state_rotations}"
             )
         state_cursors["pr"][0] += 1
-        return recurrent_kda(
+        output, final_state = recurrent_kda(
             q=q,
             k=k,
             v=v,
@@ -471,8 +477,7 @@ def _make_case(
             dt_bias=dt_bias,
             scale=scale,
             initial_state=candidate_state_pool[state_index],
-            output=candidate_output,
-            output_final_state=False,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=-5.0,
@@ -482,6 +487,7 @@ def _make_case(
             prefill_workspace=candidate_workspace,
             backend=candidate_backend,
         )
+        return output, final_state
 
     peer_raw_run = None
     peer_adapted_run = None
@@ -575,10 +581,13 @@ def _make_case(
     # harness while keeping route logging out of every timed call.
     kda_prefill_module = import_module("flashinfer.kda_prefill")
     kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
+    cudnn_module = import_module("flashinfer.cudnn")
     original_get_module = kda_prefill_module._get_flash_kda_prefill_module
     original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
+    original_cudnn_run = cudnn_module.cudnn_recurrent_kda
     resolved_cake_routes = []
     resolved_backends = []
+    resolved_cudnn_calls = []
 
     def recording_get_module(variant, target):
         resolved_cake_routes.append((variant, target))
@@ -588,16 +597,33 @@ def _make_case(
         resolved_backends.append("cute-dsl")
         return original_cute_run(**kwargs)
 
+    def recording_cudnn_run(*call_args, **kwargs):
+        resolved_cudnn_calls.append("cudnn")
+        return original_cudnn_run(*call_args, **kwargs)
+
     kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
     kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
+    cudnn_module.cudnn_recurrent_kda = recording_cudnn_run
     try:
         candidate_run()
         torch.cuda.synchronize()
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
         kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
+        cudnn_module.cudnn_recurrent_kda = original_cudnn_run
         reset_state_pools()
-    if resolved_backends:
+    if resolved_cudnn_calls:
+        if len(resolved_cudnn_calls) != 1 or resolved_backends or resolved_cake_routes:
+            raise RuntimeError(
+                "expected exactly one cuDNN route during warmup, got "
+                f"cudnn={resolved_cudnn_calls}, backends={resolved_backends}, "
+                f"cake={resolved_cake_routes}"
+            )
+        resolved_backend = "cudnn"
+        resolved_variant = "frost"
+        resolved_target = "sm100"
+        resolved_physical_variants = ["frost"]
+    elif resolved_backends:
         if resolved_backends != ["cute-dsl"] or resolved_cake_routes:
             raise RuntimeError(
                 "expected exactly one CuTe DSL route during warmup, got "
@@ -634,6 +660,7 @@ def _make_case(
         "candidate_route": candidate_route,
         "requested_backend": candidate_backend,
         "resolved_backend": resolved_backend,
+        "state_dtype": str(initial_state.dtype).removeprefix("torch."),
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -642,7 +669,6 @@ def _make_case(
         peer_raw_run=peer_raw_run,
         peer_adapted_run=peer_adapted_run,
         reset_state_pools=reset_state_pools,
-        candidate_output=candidate_output,
         candidate_state_pool=candidate_state_pool,
         peer_raw_output=peer_raw_output,
         peer_raw_final_state=peer_raw_final_state,
@@ -661,7 +687,7 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
     assert prepared.peer_adapted_output is not None
     assert prepared.peer_adapted_state_pool is not None
     prepared.reset_state_pools()
-    prepared.candidate_run()
+    candidate_output, _ = prepared.candidate_run()
     prepared.peer_raw_run()
     prepared.peer_adapted_run()
     torch.cuda.synchronize()
@@ -671,7 +697,7 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
     comparisons = (
         (
             "raw_output_max_abs",
-            prepared.candidate_output,
+            candidate_output,
             prepared.peer_raw_output,
         ),
         (
@@ -681,7 +707,7 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
         ),
         (
             "adapted_output_max_abs",
-            prepared.candidate_output,
+            candidate_output,
             prepared.peer_adapted_output,
         ),
         ("adapted_state_max_abs", candidate_state, adapted_state),
@@ -751,7 +777,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "cute-dsl", "cake"),
+        choices=("auto", "cute-dsl", "cake", "cudnn"),
         default="auto",
         help=(
             "Select one backend for this invocation of the public recurrent_kda "
@@ -835,6 +861,28 @@ def main() -> None:
         "production": PRODUCTION_CASES,
     }[args.case_set]
     results = []
+    if args.backend == "cudnn":
+        fixed = [case for case in selected_cases if not case.packed]
+        if fixed:
+            names = [case.name for case in fixed]
+            print(
+                f"Skipping {len(fixed)} fixed-layout case(s) under --backend cudnn "
+                f"(packed input only): {', '.join(names)}"
+            )
+            results.extend(
+                {
+                    "name": case.name,
+                    "layout": "fixed",
+                    "requested_backend": args.backend,
+                    "skipped": True,
+                    "skip_reason": (
+                        "the cuDNN linear-attention engines accept packed THD "
+                        "input only"
+                    ),
+                }
+                for case in fixed
+            )
+            selected_cases = [case for case in selected_cases if case.packed]
     for case in selected_cases:
         state_rotations = args.state_rotations
         if state_rotations is None:

@@ -26,6 +26,7 @@ static_assert(alignof(FlashInferTensorMap) == 128, "tensor-map ABI alignment mis
 static_assert(sizeof(CUtensorMap) == 128, "CUDA tensor-map ABI size mismatch");
 static_assert(alignof(CUtensorMap) >= 64,
               "CUDA tensor-map ABI requires at least 64-byte alignment");
+#include <cuda_fp8.h>
 
 #define MINIMAX_H3_INF CUDART_INF_F
 #define TMEM_NCOLS 512
@@ -97,6 +98,10 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
 }
 
+__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
+  asm volatile("mbarrier.init.b64 [%0], %1;" ::"l"(mbar_addr), "r"(count));
+}
+
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
   uint32_t token;
   asm volatile(
@@ -127,37 +132,106 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
   return token;
 }
 
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
+// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
+// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
+  uint32_t ticks = 0x989680;
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
       "LAB_WAIT:\n\t"
       "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
+      " P1, [%0], %1, %2;\n\t"
       "@P1 bra.uni DONE;\n\t"
       "bra.uni LAB_WAIT;\n\t"
       "DONE:\n\t"
       "}\n" ::"r"(mbar_addr),
-      "r"(phase)
+      "r"(phase), "r"(ticks)
+      : "memory");
+}
+
+// Exact source ports may request the PTX suspendTimeHint operand explicitly.
+// The hint is expressed in nanoseconds and is kept separate from the canonical
+// no-hint CTA helper so unrelated schedules retain their existing retry path.
+__device__ __forceinline__ void mbarrier_wait_suspend(int mbar_addr, int phase,
+                                                      uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_SUSPEND:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra.uni DONE_SUSPEND;\n\t"
+      "bra.uni LAB_WAIT_SUSPEND;\n\t"
+      "DONE_SUSPEND:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
       : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-  uint32_t ticks = 0x989680;
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
       "LAB_WAIT_CLUSTER:\n\t"
       "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-      " P1, [%0], %1, %2;\n\t"
+      " P1, [%0], %1;\n\t"
       "@P1 bra.uni DONE_CLUSTER;\n\t"
       "bra.uni LAB_WAIT_CLUSTER;\n\t"
       "DONE_CLUSTER:\n\t"
       "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(ticks)
+      "r"(phase)
+      : "memory");
+}
+
+__device__ __forceinline__ void mbarrier_wait_hint(int mbar_addr, int phase,
+                                                   uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      ".reg .u32 WAIT_ADDR;\n\t"
+      "mov.u32 WAIT_ADDR, %0;\n\t"
+      "LAB_WAIT_HINT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
+      " P1, [WAIT_ADDR], %1, %2;\n\t"
+      "@P1 bra.uni DONE_HINT;\n\t"
+      "bra.uni LAB_WAIT_HINT;\n\t"
+      "DONE_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
+      : "memory");
+}
+
+// Exact unqualified CTA wait used by source schedules whose PTX intentionally
+// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
+__device__ __forceinline__ void mbarrier_wait_relaxed_hint(int mbar_addr, int phase,
+                                                           uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_RELAXED_HINT:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra DONE_RELAXED_HINT;\n\t"
+      "bra LAB_WAIT_RELAXED_HINT;\n\t"
+      "DONE_RELAXED_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint));
+}
+
+__device__ __forceinline__ void mbarrier_wait_cluster_hint(int mbar_addr, int phase,
+                                                           uint32_t suspend_time_hint) {
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1;\n\t"
+      "LAB_WAIT_CLUSTER_HINT:\n\t"
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+      " P1, [%0], %1, %2;\n\t"
+      "@P1 bra.uni DONE_CLUSTER_HINT;\n\t"
+      "bra.uni LAB_WAIT_CLUSTER_HINT;\n\t"
+      "DONE_CLUSTER_HINT:\n\t"
+      "}\n" ::"r"(mbar_addr),
+      "r"(phase), "r"(suspend_time_hint)
       : "memory");
 }
 
@@ -167,10 +241,33 @@ __device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, ui
   }
 }
 
+__device__ __forceinline__ void mbarrier_wait_token_suspend(int mbar_addr, int phase,
+                                                            uint32_t token,
+                                                            uint32_t suspend_time_hint) {
+  if (token == 0) {
+    mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
+  }
+}
+
 __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase,
                                                             uint32_t token) {
   if (token == 0) {
     mbarrier_wait_cluster(mbar_addr, phase);
+  }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_hint(int mbar_addr, int phase, uint32_t token,
+                                                         uint32_t suspend_time_hint) {
+  if (token == 0) {
+    mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
+  }
+}
+
+__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(int mbar_addr, int phase,
+                                                                 uint32_t token,
+                                                                 uint32_t suspend_time_hint) {
+  if (token == 0) {
+    mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
   }
 }
 
@@ -278,12 +375,14 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
     __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap qkv_weight, int M, int P,
     float eps) {
   const int tid = threadIdx.x;
-  const int warp = make_warp_uniform(tid / 32);
-  const int lane = tid % 32;
+  const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+  uint32_t lane;
+  asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
   extern __shared__ __align__(1024) char smem_raw[];
   int smem;
   smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
   const int mbar_base = smem;
 #define a_full_addr (mbar_base + 0)
 #define b_full_addr (mbar_base + 16)
@@ -292,6 +391,7 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
 
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
+  volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 56);
 
   // Kernel setup ops
   __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -311,7 +411,7 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   float* smem_norm_partials = reinterpret_cast<float*>(smem_raw + 165888);
   const int smem_norm_partials_addr = smem + 165888;
 
-  // Mbarrier init (4 groups, 7 barriers)
+  // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 7 barriers)
   // Mbarriers at smem_raw[0..56)
 
   if (warp == 0) {
@@ -336,7 +436,6 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   __syncwarp();
 
   // TMEM alloc (512 columns, 512 used)
-  volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 56);
   if (warp == 0) {
     int _tmem_hold = smem + 56;
     asm volatile(
@@ -376,7 +475,7 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
       for (int row_group = 0; row_group < BLOCK_M / 4; row_group++) {
         int row_slot = warp / 4;
         int warp_in_row = warp % 4;
-        int thread_in_row = warp_in_row * 32 + lane;
+        int thread_in_row = (unsigned int)(warp_in_row * 32) + lane;
         int local_row = row_group * 4 + row_slot;
         int global_row = off_m + local_row;
         float sum_sq = 0.0f;
@@ -650,7 +749,7 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
       int off_n_4 = group_n_2 * GROUP_N * BLOCK_N;
       int warp_in_wg = warp % 4;
       int row_addr = warp_in_wg * 32 << 16;
-      int local_row_2 = warp_in_wg * 32 + lane;
+      int local_row_2 = (unsigned int)(warp_in_wg * 32) + lane;
       int global_row_2 = off_m_3 + local_row_2;
       int safe_global_row = ((global_row_2 < M) ? global_row_2 : M - 1);
       int heads_per_destination = NUM_HEADS / P;
@@ -1227,8 +1326,9 @@ void ConfigureKernel() {
   status = cudaGetDeviceProperties(&properties, device);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to query CUDA device properties: " << cudaGetErrorString(status);
-  TVM_FFI_CHECK(properties.major == 10 && properties.minor == 3, RuntimeError)
-      << "MiniMax-H3 BF16 pre-attention requires compute capability 10.3";
+  TVM_FFI_CHECK(properties.major == 10 && (properties.minor == 0 || properties.minor == 3),
+                RuntimeError)
+      << "MiniMax-H3 BF16 pre-attention requires compute capability 10.0 or 10.3";
   status = cudaFuncSetAttribute(kernel_minimax_h3_bf16_pre_attention_destination_major_005f_v1,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kDynamicSmemBytes);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
