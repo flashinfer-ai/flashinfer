@@ -196,6 +196,7 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_inline_sf: bool = False,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -217,6 +218,7 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        use_inline_sf,
     ).build_and_load()
 
 
@@ -1152,6 +1154,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_inline_sf: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1180,6 +1183,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_inline_sf: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1862,10 +1866,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
             self._jit_additional_scalar_names = list(jit_args[9])
+            self._jit_use_inline_sf = bool(jit_kwargs.get("use_inline_sf", False))
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
             self._jit_additional_scalar_names = []
+            self._jit_use_inline_sf = False
 
         if variant_owns_mask and self._jit_module is None:
             raise ValueError(
@@ -2484,6 +2490,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"got backend={self._backend!r}"
                 )
         self._use_inline_sf = use_inline_sf
+        if self._jit_module is not None and self._jit_use_inline_sf != use_inline_sf:
+            raise ValueError(
+                "use_inline_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_inline_sf="
+                f"{self._jit_use_inline_sf}, plan() passed use_inline_sf={use_inline_sf}"
+            )
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -3693,9 +3705,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_use_inline_sf = bool(jit_kwargs.get("use_inline_sf", False))
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_use_inline_sf = False
 
         if variant_owns_mask and self._jit_module is None:
             raise ValueError(
@@ -4010,6 +4024,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     f"got backend={self._backend!r}"
                 )
         self._use_inline_sf = use_inline_sf
+        if self._jit_module is not None and self._jit_use_inline_sf != use_inline_sf:
+            raise ValueError(
+                "use_inline_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_inline_sf="
+                f"{self._jit_use_inline_sf}, plan() passed use_inline_sf={use_inline_sf}"
+            )
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
