@@ -35,7 +35,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
@@ -292,12 +292,13 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         * 0.02
     ).to(torch.bfloat16)
     hidden_q, hidden_scale = TrtllmFp4Config.prepare_activations(
-        hidden, variant=QuantVariant.NVFP4
+        hidden,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
     weight_view = TrtllmFp4Config.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         num_local_experts=geometry.num_experts,
         hidden_size=geometry.hidden_size,
         intermediate_size=geometry.intermediate_size,
@@ -815,7 +816,7 @@ def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
             top_k=geometry.top_k,
             method=RoutingMethodType.TopK,
         ),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=geometry.intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions((CakeWarpDecodeConfig(),)),

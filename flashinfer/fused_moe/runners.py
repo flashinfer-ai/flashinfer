@@ -73,7 +73,6 @@ from .api import (
     MoEWeightPack,
     QuantConfig,
     QuantFormat,
-    QuantVariant,
     RoutingInputMode,
 )
 from .utils import (
@@ -521,27 +520,15 @@ class MoERunner(TunableRunner):
         quant = self.config.quant
         pair = quant.pair
         if pair not in self.supported_quant_variants:
-            variant = quant.variant
-            extra = f" QuantVariant.{variant.name}." if variant is not None else ""
             raise NotImplementedError(
                 f"{type(self).__name__} does not support weight={quant.weight.name}, "
-                f"activation={quant.activation.name}.{extra}"
+                f"activation={quant.activation.name}."
             )
         if quant.output not in self.supported_output_formats:
             names = ", ".join(fmt.name for fmt in self.supported_output_formats)
             raise NotImplementedError(
                 f"{type(self).__name__} does not support output={quant.output.name}; "
                 f"supported outputs are {names}."
-            )
-        if quant.variant is None:
-            # Transitional guard: runner build paths and weight preparation
-            # still dispatch on QuantVariant, so a pair without a legacy
-            # variant would pass capability checks and fail later. Lift this
-            # once dispatch keys on quant.pair (config-merge follow-up).
-            raise NotImplementedError(
-                f"{type(self).__name__}: weight={quant.weight.name}, "
-                f"activation={quant.activation.name} has no QuantVariant mapping; "
-                "runner dispatch is not yet pair-keyed."
             )
         if self.supported_activation_classes_by_quant:
             # Strict lookup: a runner that declares per-quant capabilities must
@@ -3795,23 +3782,20 @@ class CuteDslRunner(MoERunner):
                 f"{type(self).__name__} requires do_finalize=True."
             )
         if (
-            self.config.quant.variant is not QuantVariant.NVFP4
+            self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
             and self.config.quant.per_token_scale
         ):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support per-token "
-                f"{self.config.quant.variant.name} activation scales."
+                f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
+                "activation scales."
             )
-        if self.config.quant.variant is QuantVariant.MXFP4 and isinstance(
-            self.config.activation, SiTU
-        ):
+        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
             raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if (
-            self.config.quant.variant is QuantVariant.MXFP4
-            and not self.config.finalize.use_fused_finalize
-        ):
+        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
             raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if self.config.quant.variant is QuantVariant.MXFP4 and hasattr(self, "device"):
+        if mxfp4_mxfp8 and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
@@ -3840,7 +3824,7 @@ class CuteDslRunner(MoERunner):
         # CuteDslRunner. Keep the original blast radius -- only the NVFP4 path
         # reaches the SM107 rubin kernels. MXFP4/W4A8 is already declined on
         # SM107 above, and W4A16 gates itself via require_cute_dsl_arch().
-        if self.config.quant.variant is not QuantVariant.NVFP4:
+        if self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             return
 
         # check_support() is also exercised on runners built with __new__ and only
@@ -3900,7 +3884,10 @@ class CuteDslRunner(MoERunner):
             if self.config.execution.enable_pdl is None
             else self.config.execution.enable_pdl
         )
-        if self.config.quant.variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
+        if self.config.quant.pair in (
+            (QuantFormat.NVFP4, QuantFormat.NVFP4),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        ):
             self._inner = CuteDslFusedMoERunner(
                 forward_impl=_cute_dsl_fused_moe_impl,
                 num_experts=routing.num_experts,
@@ -3912,12 +3899,12 @@ class CuteDslRunner(MoERunner):
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
                 quant_mode=(
                     "w4a8"
-                    if self.config.quant.variant is QuantVariant.MXFP4
+                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
                     else "w4a4"
                 ),
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
-        elif self.config.quant.variant is QuantVariant.W4A16:
+        elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
             self._inner = CuteDslFusedMoEW4A16Runner(
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
@@ -3929,7 +3916,7 @@ class CuteDslRunner(MoERunner):
             )
         else:
             raise NotImplementedError(
-                f"CuteDslRunner does not support {self.config.quant.variant}."
+                f"CuteDslRunner does not support {self.config.quant}."
             )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
@@ -3999,15 +3986,19 @@ class CuteDslRunner(MoERunner):
                 "the same typed activation."
             )
 
-        quant_variant = self.config.quant.variant
+        pair = self.config.quant.pair
         use_per_token_activation = bool(self.config.quant.per_token_scale)
         if (
-            quant_variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
+            pair
+            in (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            )
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            is_mxfp4 = quant_variant is QuantVariant.MXFP4
+            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
             hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
@@ -4031,7 +4022,7 @@ class CuteDslRunner(MoERunner):
                 moe_output,
             ]
         elif (
-            quant_variant is QuantVariant.NVFP4
+            pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
             and use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is not None
@@ -4056,7 +4047,7 @@ class CuteDslRunner(MoERunner):
                 moe_output,
             ]
         elif (
-            quant_variant is QuantVariant.W4A16
+            pair == (QuantFormat.NVFP4, QuantFormat.BF16)
             and act.hidden_states_scale is None
             and act.per_token_scale is None
         ):
@@ -4227,11 +4218,15 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 f"{type(self).__name__} cannot express SiTU(linear_scale=None); "
                 "the TRT-LLM ABI has no unclamped linear-branch encoding."
             )
-        variant = self.config.quant.variant
-        if self.config.quant.pair in self.supported_quant_variants:
-            if self.config.quant.per_token_scale and variant is not QuantVariant.NVFP4:
+        pair = self.config.quant.pair
+        if pair in self.supported_quant_variants:
+            if self.config.quant.per_token_scale and pair != (
+                QuantFormat.NVFP4,
+                QuantFormat.NVFP4,
+            ):
                 raise NotImplementedError(
-                    f"{type(self).__name__} does not support per-token scale for {variant.name}."
+                    f"{type(self).__name__} does not support per-token scale for "
+                    f"{pair[0].name}×{pair[1].name}."
                 )
 
             from ..utils import get_compute_capability
@@ -4249,13 +4244,16 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     f"{type(self).__name__} does not support SiTU on SM107 with "
                     "the currently pinned Rubin BMM artifact."
                 )
-            if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
+            if pair in (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            ):
                 supported = compute_capability in ((10, 0), (10, 3), (10, 7))
             else:
                 supported = compute_capability in ((10, 0), (10, 7))
             if not supported:
                 raise NotImplementedError(
-                    f"TRTLLM {variant.name} is unsupported on "
+                    f"TRTLLM {pair[0].name}×{pair[1].name} is unsupported on "
                     f"SM{compute_capability[0]}{compute_capability[1]}."
                 )
 
@@ -4279,18 +4277,18 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._activation_type = int(config.activation.type)
         self._tune_max_num_tokens = execution.tune_max_num_tokens
 
-        variant = config.quant.variant
-        if variant is QuantVariant.MXFP4:
+        pair = config.quant.pair
+        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             dtype_act = DtypeTrtllmGen.MxE4m3
             dtype_weights = DtypeTrtllmGen.MxE2m1
-        elif variant is QuantVariant.W4A16:
+        elif pair == (QuantFormat.MXFP4, QuantFormat.BF16):
             dtype_act = DtypeTrtllmGen.Bfloat16
             dtype_weights = DtypeTrtllmGen.MxE2m1
         else:
-            # Harmless construction default; check_support rejects unknown variants.
+            # Harmless construction default; check_support rejects unknown pairs.
             dtype_act = DtypeTrtllmGen.E2m1
             dtype_weights = DtypeTrtllmGen.E2m1
-        self._variant = variant
+        self._pair = pair
         self._dtype_act = dtype_act
         self._dtype_weights = dtype_weights
         self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
@@ -4360,7 +4358,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         hidden_size: int,
     ) -> torch.Tensor | None:
         num_tokens = act.hidden_states_q.shape[0]
-        if self._variant is QuantVariant.NVFP4:
+        if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
             if act.hidden_states_q.dtype != torch.uint8:
                 raise TypeError(
                     "NVFP4 hidden_states_q must be packed uint8, got "
@@ -4382,7 +4380,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 scale = scale.view(torch.float8_e4m3fn)
             scale_dtype = torch.float8_e4m3fn
             sf_vec_size = 16
-        elif self._variant is QuantVariant.MXFP4:
+        elif self._pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             if act.hidden_states_q.dtype != torch.float8_e4m3fn:
                 raise TypeError(
                     "MXFP4×MXFP8 hidden_states_q must be float8_e4m3fn, got "
@@ -4520,7 +4518,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = (
             act.hidden_states_q.shape[1] * 2
-            if self._variant is QuantVariant.NVFP4
+            if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
             else act.hidden_states_q.shape[1]
         )
         hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
@@ -4560,12 +4558,16 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             )
             routing_logits = act.routing_logits
             if (
-                self._variant in (QuantVariant.MXFP4, QuantVariant.W4A16)
+                self._pair
+                in (
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                    (QuantFormat.MXFP4, QuantFormat.BF16),
+                )
                 and routing_logits.dtype != torch.bfloat16
             ):
                 raise TypeError(
-                    f"{self._variant.name} FromLogits requires bfloat16 "
-                    f"routing_logits, got {routing_logits.dtype}."
+                    f"{self._pair[0].name}×{self._pair[1].name} FromLogits requires "
+                    f"bfloat16 routing_logits, got {routing_logits.dtype}."
                 )
             routing_bias = act.routing_bias
             topk_ids = act.hidden_states_q.new_empty(
@@ -4739,9 +4741,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         super().__init__()
         from ..tllm_enums import DtypeTrtllmGen, Fp8QuantizationType
         from ..utils import device_support_pdl
-        from .api import QuantVariant
+        from .api import QuantFormat
 
-        if config.quant.variant is QuantVariant.MxFp8:
+        if config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8):
             dtype = DtypeTrtllmGen.MxE4m3
             fp8_type = Fp8QuantizationType.MxFp8
         else:
@@ -4753,11 +4755,11 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self.config = config
         self.device = device
         self._module: Any = None
-        self._variant = config.quant.variant
+        self._pair = config.quant.pair
         self._dtype_act = dtype
         self._dtype_weights = dtype
         self._fp8_quantization_type = fp8_type
-        self._use_shuffled_weight = config.quant.variant is QuantVariant.MxFp8
+        self._use_shuffled_weight = self._pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
 
         routing = config.routing
         experts = config.experts
@@ -4824,7 +4826,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         view: dict,
         hidden_size: int,
     ) -> torch.Tensor:
-        from .api import QuantVariant
+        from .api import QuantFormat
 
         if act.hidden_states_q.dtype != torch.float8_e4m3fn:
             raise TypeError(
@@ -4835,7 +4837,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         if scale is None:
             raise ValueError("TrtllmFp8BlockRunner requires hidden_states_scale.")
         num_tokens = act.hidden_states_q.shape[0]
-        if self._variant is QuantVariant.DeepSeekFp8:
+        if self._pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
             expected_scale = (hidden_size // 128, num_tokens)
             if scale.dtype != torch.float32 or tuple(scale.shape) != expected_scale:
                 raise ValueError(

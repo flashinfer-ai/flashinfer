@@ -23,7 +23,7 @@ from flashinfer.fused_moe import (
     MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
@@ -94,7 +94,7 @@ def _config(
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions((CakeWarpDecodeConfig(backend="cake"),)),
@@ -205,13 +205,15 @@ def test_config_preparation_delegates_to_trtllm_physical_view(monkeypatch):
         intermediate_size=1536,
     )
     assert result is expected
-    assert calls[0][1]["variant"] is QuantVariant.NVFP4
+    assert calls[0][1]["quant"] == QuantConfig(
+        weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+    )
     assert calls[0][1]["activation"] == SwiGLU()
-    with pytest.raises(ValueError, match="requires QuantVariant.NVFP4"):
+    with pytest.raises(ValueError, match=r"NVFP4×NVFP4"):
         CakeWarpDecodeConfig.prepare_weights(
             object(),
             object(),
-            variant=QuantVariant.MXFP4,
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
             num_local_experts=60,
             hidden_size=2048,
             intermediate_size=1536,
