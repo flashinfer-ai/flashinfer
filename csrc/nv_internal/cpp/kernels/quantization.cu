@@ -743,6 +743,22 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;
+
+  // Zero unwritten padding (masked rows and the [m, padded_m) scale region) so
+  // it can't retain stale NaN; real rows are overwritten below (Issue #3057)
+  {
+    int const m_per_expert = m_topk / n_experts;
+    int const padded_m = (m_per_expert + 127) / 128 * 128;
+    int const scales_k = k / CVT_FP4_SF_VEC_SIZE;
+    int const padded_k = (scales_k + 3) / 4 * 4;
+    int const padded_k_int32 = padded_k / 4;
+    size_t const out_bytes = static_cast<size_t>(m_topk) * (k / 2);
+    size_t const scale_bytes =
+        static_cast<size_t>(n_experts) * padded_m * padded_k_int32 * sizeof(int32_t);
+    TLLM_CUDA_CHECK(cudaMemsetAsync(output, 0, out_bytes, stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(output_scale, 0, scale_bytes, stream));
+  }
+
   bool const disableFP4QuantFastMath = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
   bool const use4Over6 = tensorrt_llm::common::getEnvNVFP4Use4Over6();
 
