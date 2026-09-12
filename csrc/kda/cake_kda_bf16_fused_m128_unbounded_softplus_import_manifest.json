@@ -1,0 +1,79 @@
+{
+  "architecture_artifacts_are_separate": true,
+  "generated_invariants": [
+    "six fence.proxy.tensormap::generic.acquire.sys operations",
+    "CTA barrier after tensor-map acquisition"
+  ],
+  "generated_source_text_equal_across_architectures": true,
+  "integration_patches": [
+    {
+      "id": "allow_exact_state_alias",
+      "reason": "the public recurrent API permits initial_state and final_state to alias exactly",
+      "scope": [
+        "initial_state restrict qualifier",
+        "final_state restrict qualifier"
+      ]
+    },
+    {
+      "id": "use_cake_kda_export_name",
+      "reason": "identify the generated implementation as Cake KDA without changing the sealed source identity",
+      "scope": [
+        "frozen CUDA filename",
+        "exported CUDA kernel symbol"
+      ]
+    }
+  ],
+  "profiles": {
+    "sm100_bt64_unbounded_softplus": {
+      "arch": "sm_100a",
+      "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm100",
+      "profile_path": "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm100.json",
+      "profile_sha256": "0ced4cd5c789677875771e2e5731ac4097fe1b1dcb0be5b763a57be73221c09d",
+      "variant": "bt64_unbounded_softplus"
+    },
+    "sm100_unbounded_softplus": {
+      "arch": "sm_100a",
+      "profile": "flashkda-bf16-fused-m128-unbounded-softplus-sm100",
+      "profile_path": "flashkda_bf16_fused_m128_unbounded_softplus_sm100.json",
+      "profile_sha256": "2902deb070cdf84ad277ac2c35ac921f11c75f34e50f4f9ae9405d2e9288c2b8",
+      "variant": "unbounded_softplus"
+    },
+    "sm103_bt64_unbounded_softplus": {
+      "arch": "sm_103a",
+      "profile": "flashkda-bf16-fused-m128-bt64-unbounded-softplus-sm103",
+      "profile_path": "flashkda_bf16_fused_m128_bt64_unbounded_softplus_sm103.json",
+      "profile_sha256": "e6e1bf91a604dc857164238a6c4a94d36cdfda305eaac07f055ea31ec312fdda",
+      "variant": "bt64_unbounded_softplus"
+    },
+    "sm103_unbounded_softplus": {
+      "arch": "sm_103a",
+      "profile": "flashkda-bf16-fused-m128-unbounded-softplus-sm103",
+      "profile_path": "flashkda_bf16_fused_m128_unbounded_softplus_sm103.json",
+      "profile_sha256": "2f186bdd334aced41d8b1fc531567e0477d5919914126a4a8357d3c08f1728c9",
+      "variant": "unbounded_softplus"
+    }
+  },
+  "schema_version": 2,
+  "variants": {
+    "bt64_unbounded_softplus": {
+      "binding_path": "csrc/kda/cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu",
+      "frozen_path": "csrc/kda/cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu",
+      "frozen_sha256": "140f3a37d8201509b94482ed8a052700469c587f0dc094d6e93cce9f82ef12ec",
+      "module_ident": "cake_kda_bf16_fused_m128_6e53073ae4",
+      "raw_bytes": 317175,
+      "raw_sha256": "83be16e6aaddf87a37a0380325a78bc3d48bcd9875d3df318b0ac88ef6183539",
+      "smem_bytes": 232448,
+      "source_module_ident": "flashkda_bf16_fused_m128_6e53073ae4"
+    },
+    "unbounded_softplus": {
+      "binding_path": "csrc/kda/cake_kda_bf16_fused_m128_unbounded_softplus_binding.cu",
+      "frozen_path": "csrc/kda/cake_kda_bf16_fused_m128_unbounded_softplus.cu",
+      "frozen_sha256": "a207895766071dc5259771e19a6857d0ddbf5e8bd983274e76c74f08ec65625a",
+      "module_ident": "cake_kda_bf16_fused_m128_73277a98ca",
+      "raw_bytes": 177223,
+      "raw_sha256": "2e482de1d19e8a583ee11812e0f53bafc00ac5222a762069b2082beb465baf9a",
+      "smem_bytes": 227328,
+      "source_module_ident": "flashkda_bf16_fused_m128_73277a98ca"
+    }
+  }
+}

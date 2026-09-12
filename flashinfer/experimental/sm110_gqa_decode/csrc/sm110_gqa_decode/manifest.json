@@ -1,0 +1,148 @@
+{
+  "architecture": "sm_110a",
+  "contract": {
+    "dtype": "float16",
+    "gqa_group_size": 4,
+    "head_dim": 128,
+    "kv_shape": "[batch, 2, 8, capacity, 128]",
+    "num_kv_heads": 8,
+    "num_q_heads": 32,
+    "q_shape": "[batch, 32, 128]",
+    "sequence_lengths_shape": "[batch]"
+  },
+  "dispatch": {
+    "capacity_ge_65": "long",
+    "capacity_le_64": "short"
+  },
+  "files": [
+    {
+      "bytes": 71368,
+      "path": "sm_110a/sm110_gqa_decode_short_kernel.cu",
+      "sha256": "cde47b558892afa85b0bff49108e501001083b18607da93bb2fcc2af212d6cfd"
+    },
+    {
+      "bytes": 21799,
+      "path": "sm_110a/sm110_gqa_decode_short_binding.cu",
+      "sha256": "b7e506d52daf4bdbb72fa6d7066d5586f8ea36b4f227e7521724b5cd5a74fb99"
+    },
+    {
+      "bytes": 85496,
+      "path": "sm_110a/sm110_gqa_decode_long_kernel.cu",
+      "sha256": "b12d66c637ea25052797d7feea0742714e7a3ec3a3292eeb0091a4798a41af60"
+    },
+    {
+      "bytes": 21792,
+      "path": "sm_110a/sm110_gqa_decode_long_binding.cu",
+      "sha256": "3f0011101c00d2c27f28c5adbd16ec03a68fb4231a1fc7345d0653c51dad60a6"
+    }
+  ],
+  "routes": [
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 50176,
+      "ffi_entry": "run_short",
+      "files": [
+        "sm_110a/sm110_gqa_decode_short_kernel.cu",
+        "sm_110a/sm110_gqa_decode_short_binding.cu"
+      ],
+      "kernel_symbol": "kernel_sm110_gqa_decode_short",
+      "role": "short"
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 50944,
+      "ffi_entry": "run_long",
+      "files": [
+        "sm_110a/sm110_gqa_decode_long_kernel.cu",
+        "sm_110a/sm110_gqa_decode_long_binding.cu"
+      ],
+      "kernel_symbol": "kernel_sm110_gqa_decode_long",
+      "role": "long"
+    }
+  ],
+  "schema": "flashinfer-sm110-gqa-decode-export-v1"
+}

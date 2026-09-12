@@ -162,9 +162,9 @@ inline void CheckFlashKDATarget(int32_t device_id) {
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
 #if defined(FLASHINFER_FLASH_KDA_TARGET_FAMILY)
-  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
       << "this FlashKDA module was compiled for the SM100 family "
-         "(compute capability 10.0 or 10.3), got "
+         "(compute capability 10.0, 10.3 or 10.7), got "
       << major << "." << minor;
 #else
   TVM_FFI_ICHECK(major == 10 && minor == kFlashKDATargetMinor)
@@ -185,16 +185,18 @@ inline void CheckFlashKDAPersistentDevice(int32_t device_id) {
       << minor;
 }
 
-inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const TensorView& v,
-                                 const TensorView& g, const TensorView& beta,
-                                 const TensorView& beta_tma, const TensorView& A_log,
-                                 const TensorView& dt_bias, const TensorView& cu_seqlens,
-                                 const TensorView& seq_order, const TensorView& initial_state,
-                                 const TensorView& out, const TensorView& final_state,
-                                 const TensorView& descriptor_storage, int64_t prepare_descriptors,
-                                 int64_t num_heads, int64_t use_initial_state,
-                                 int64_t store_final_state, double scale, double lower_bound,
-                                 bool allow_serving_layouts = false, int64_t state_pool_slots = 0) {
+inline int64_t ServingStateElementBytes(DLDataType state_dtype);
+
+inline int64_t CheckCommonInputs(
+    const TensorView& q, const TensorView& k, const TensorView& v, const TensorView& g,
+    const TensorView& beta, const TensorView& beta_tma, const TensorView& A_log,
+    const TensorView& dt_bias, const TensorView& cu_seqlens, const TensorView& seq_order,
+    const TensorView& initial_state, const TensorView& out, const TensorView& final_state,
+    const TensorView& descriptor_storage, int64_t prepare_descriptors, int64_t num_heads,
+    int64_t use_initial_state, int64_t store_final_state, double scale, double lower_bound,
+    bool allow_serving_layouts = false, int64_t state_pool_slots = 0,
+    bool allow_pair_packed_beta_tma = false, DLDataType state_dtype = dl_bfloat16,
+    bool final_state_is_fp32 = false) {
   TVM_FFI_ICHECK(prepare_descriptors == 0 || prepare_descriptors == 1)
       << "prepare_descriptors must be 0 or 1, got " << prepare_descriptors;
   TVM_FFI_ICHECK(num_heads > 0 && num_heads <= std::numeric_limits<int32_t>::max())
@@ -210,6 +212,9 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
       << "lower_bound must be finite, negative, and representable as "
          "float32, got "
       << lower_bound;
+  ServingStateElementBytes(state_dtype);
+  const DLDataType final_state_dtype = final_state_is_fp32 ? dl_float32 : state_dtype;
+  ServingStateElementBytes(final_state_dtype);
 
   const int32_t device_id = q.device().device_id;
   CheckCudaTensor(q, "q", device_id);
@@ -237,9 +242,9 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   CheckDtype(dt_bias, "dt_bias", dl_float32);
   CheckDtype(cu_seqlens, "cu_seqlens", dl_int64);
   CheckDtype(seq_order, "seq_order", dl_int32);
-  CheckDtype(initial_state, "initial_state", dl_bfloat16);
+  CheckDtype(initial_state, "initial_state", state_dtype);
   CheckDtype(out, "out", dl_bfloat16);
-  CheckDtype(final_state, "final_state", dl_bfloat16);
+  CheckDtype(final_state, "final_state", final_state_dtype);
   CheckDtype(descriptor_storage, "descriptor_storage", dl_uint8);
 
   if (!allow_serving_layouts) {
@@ -285,12 +290,25 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   const int64_t padded_beta_tma_heads = RoundUpBetaTmaHeads(num_heads);
   const int64_t beta_tma_heads = beta_tma.size(beta_tma.ndim() - 1);
   const bool direct_beta_tma = allow_serving_layouts && beta_tma_heads == num_heads;
-  TVM_FFI_ICHECK(
-      beta_tma.ndim() >= 2 && (beta_tma_heads == padded_beta_tma_heads || direct_beta_tma) &&
-      beta_tma.numel() % beta_tma_heads == 0 && beta_tma.numel() / beta_tma_heads >= token_count)
+  const bool pair_packed_beta_tma = allow_pair_packed_beta_tma && num_heads == 12 &&
+                                    beta_tma_heads == 24 && token_count % 2 == 0 &&
+                                    beta_tma.numel() == token_count * num_heads;
+  TVM_FFI_ICHECK(beta_tma.ndim() >= 2 &&
+                 (((beta_tma_heads == padded_beta_tma_heads || direct_beta_tma) &&
+                   beta_tma.numel() % beta_tma_heads == 0 &&
+                   beta_tma.numel() / beta_tma_heads >= token_count) ||
+                  pair_packed_beta_tma))
       << "beta_tma must have at least [tokens, H] direct storage or "
-         "[tokens, round_up(H, 8)] padded storage";
-  CheckNoPartialOverlapOrExactAlias(beta, "beta", beta_tma, "beta_tma");
+         "[tokens, round_up(H, 8)] padded storage, or the enabled H12 "
+         "[tokens / 2, 24] pair-packed alias";
+  if (pair_packed_beta_tma) {
+    const TensorByteRange beta_range = GetTensorByteRange(beta, "beta");
+    const TensorByteRange beta_tma_range = GetTensorByteRange(beta_tma, "beta_tma");
+    TVM_FFI_ICHECK(beta_range.begin == beta_tma_range.begin && beta_range.end == beta_tma_range.end)
+        << "pair-packed beta_tma must exactly alias beta storage";
+  } else {
+    CheckNoPartialOverlapOrExactAlias(beta, "beta", beta_tma, "beta_tma");
+  }
   if (!direct_beta_tma) {
     CheckNoOverlap(beta_tma, "beta_tma", q, "q");
     CheckNoOverlap(beta_tma, "beta_tma", k, "k");
@@ -377,12 +395,33 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   return num_seqs;
 }
 
-inline int64_t ResolveAndCheckServingStatePool(
+inline int64_t ServingStateElementBytes(DLDataType state_dtype) {
+  if (state_dtype.code == dl_bfloat16.code && state_dtype.bits == dl_bfloat16.bits &&
+      state_dtype.lanes == dl_bfloat16.lanes) {
+    return sizeof(__nv_bfloat16);
+  }
+  if (state_dtype.code == dl_float32.code && state_dtype.bits == dl_float32.bits &&
+      state_dtype.lanes == dl_float32.lanes) {
+    return sizeof(float);
+  }
+  TVM_FFI_ICHECK(false) << "serving state dtype must be bfloat16 or float32";
+  return 0;
+}
+
+inline bool IsServingStateFloat32(DLDataType state_dtype) {
+  ServingStateElementBytes(state_dtype);
+  return state_dtype.code == dl_float32.code && state_dtype.bits == dl_float32.bits &&
+         state_dtype.lanes == dl_float32.lanes;
+}
+
+inline int64_t ResolveAndCheckServingStatePoolForDtype(
     const TensorView& state_indices, const TensorView& initial_state, const TensorView& final_state,
     int32_t device_id, int64_t num_seqs, int64_t num_heads, int64_t state_slot_stride,
-    int64_t use_state_indices, int64_t use_initial_state, int64_t store_final_state) {
+    int64_t use_state_indices, int64_t use_initial_state, int64_t store_final_state,
+    DLDataType state_dtype) {
   TVM_FFI_ICHECK(use_state_indices == 0 || use_state_indices == 1)
       << "use_state_indices must be 0 or 1, got " << use_state_indices;
+  const int64_t state_element_bytes = ServingStateElementBytes(state_dtype);
   const int64_t compact_slot_stride = num_heads * kHeadDim * kHeadDim;
   TVM_FFI_ICHECK(state_slot_stride >= compact_slot_stride)
       << "state_slot_stride must cover one [H, 128, 128] state";
@@ -410,6 +449,8 @@ inline int64_t ResolveAndCheckServingStatePool(
       continue;
     }
     const TensorView& state = *named.tensor;
+    CheckCudaTensorDevice(state, named.name, device_id);
+    CheckDtype(state, named.name, state_dtype);
     TVM_FFI_ICHECK(state.ndim() == 4 && state.size(1) == num_heads && state.size(2) == kHeadDim &&
                    state.size(3) == kHeadDim)
         << named.name << " pool must have shape [N_pool, H, 128, 128]";
@@ -417,7 +458,7 @@ inline int64_t ResolveAndCheckServingStatePool(
                    state.stride(1) == kHeadDim * kHeadDim && state.stride(0) == state_slot_stride)
         << named.name << " pool must be contiguous inside each slot and match state_slot_stride";
     TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0 &&
-                   state_slot_stride * sizeof(__nv_bfloat16) % 16 == 0)
+                   state_slot_stride % (16 / state_element_bytes) == 0)
         << named.name << " pool base and slot stride must be 16-byte aligned";
     if (pool_slots == 0) {
       pool_slots = state.size(0);
@@ -431,11 +472,20 @@ inline int64_t ResolveAndCheckServingStatePool(
   return pool_slots;
 }
 
-inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
-                                         const TensorView& checkpoint_cu_starts, int32_t device_id,
-                                         int64_t num_seqs, int64_t num_heads,
-                                         int64_t checkpoint_every_n_tokens,
-                                         int64_t checkpoint_token_granularity = 32) {
+inline int64_t ResolveAndCheckServingStatePool(
+    const TensorView& state_indices, const TensorView& initial_state, const TensorView& final_state,
+    int32_t device_id, int64_t num_seqs, int64_t num_heads, int64_t state_slot_stride,
+    int64_t use_state_indices, int64_t use_initial_state, int64_t store_final_state) {
+  return ResolveAndCheckServingStatePoolForDtype(
+      state_indices, initial_state, final_state, device_id, num_seqs, num_heads, state_slot_stride,
+      use_state_indices, use_initial_state, store_final_state, dl_bfloat16);
+}
+
+inline void CheckServingCheckpointInputsForStateDtype(
+    const TensorView& state_checkpoints, const TensorView& checkpoint_cu_starts, int32_t device_id,
+    int64_t num_seqs, int64_t num_heads, int64_t checkpoint_every_n_tokens, DLDataType state_dtype,
+    int64_t checkpoint_token_granularity = 32) {
+  ServingStateElementBytes(state_dtype);
   TVM_FFI_ICHECK(checkpoint_token_granularity > 0)
       << "checkpoint_token_granularity must be positive";
   TVM_FFI_ICHECK(checkpoint_every_n_tokens >= 0 &&
@@ -445,6 +495,8 @@ inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
   if (checkpoint_every_n_tokens == 0) {
     return;
   }
+  TVM_FFI_ICHECK(!IsServingStateFloat32(state_dtype))
+      << "FP32 serving state does not support state checkpoints";
   CheckCudaTensor(state_checkpoints, "state_checkpoints", device_id);
   CheckCudaTensor(checkpoint_cu_starts, "checkpoint_cu_starts", device_id);
   CheckDtype(state_checkpoints, "state_checkpoints", dl_bfloat16);
@@ -457,6 +509,16 @@ inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
       << "state_checkpoints base address must be 16-byte aligned";
   TVM_FFI_ICHECK(checkpoint_cu_starts.ndim() == 1 && checkpoint_cu_starts.numel() == num_seqs + 1)
       << "checkpoint_cu_starts must have shape [N+1]";
+}
+
+inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
+                                         const TensorView& checkpoint_cu_starts, int32_t device_id,
+                                         int64_t num_seqs, int64_t num_heads,
+                                         int64_t checkpoint_every_n_tokens,
+                                         int64_t checkpoint_token_granularity = 32) {
+  CheckServingCheckpointInputsForStateDtype(state_checkpoints, checkpoint_cu_starts, device_id,
+                                            num_seqs, num_heads, checkpoint_every_n_tokens,
+                                            dl_bfloat16, checkpoint_token_granularity);
 }
 
 inline void CheckServingAuxiliaryNoOverlap(
@@ -506,13 +568,11 @@ inline void CheckServingAuxiliaryNoOverlap(
 inline void PackBetaForTmaIfNeeded(const TensorView& beta, const TensorView& beta_tma,
                                    int64_t num_heads, int64_t beta_token_stride,
                                    cudaStream_t stream) {
-  // Full chunks TMA-load an eight-head, ChunkTokens-row beta box.  A distinct
-  // beta_tma allocation therefore needs materialization even when only its
-  // token extent, rather than its head extent, is padded.
+  // TMA may require separate storage for either token or head padding. Head
+  // counts can therefore match even though beta_tma is an uninitialized
+  // workspace; only an exact pointer alias is already populated.
   const int64_t padded_num_heads = beta_tma.size(beta_tma.ndim() - 1);
-  const TensorByteRange beta_range = GetTensorByteRange(beta, "beta");
-  const TensorByteRange beta_tma_range = GetTensorByteRange(beta_tma, "beta_tma");
-  if (beta_range.begin == beta_tma_range.begin && beta_range.end == beta_tma_range.end) {
+  if (beta_tma.data_ptr() == beta.data_ptr()) {
     return;
   }
   const int64_t token_count = beta.numel() / num_heads;
@@ -563,6 +623,26 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
+  if constexpr (ValueRows == 128 && ChunkTokens == 16) {
+    TVM_FFI_ICHECK(d1 >= ValueRows && d1 % 64 == 0 && d2 >= 1 && outer2 > 0)
+        << "v cannot encode the (64, 1, 16, 1) split-panel TMA box";
+    uint64_t global_dim[4] = {64, static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2),
+                              static_cast<uint64_t>(d1 / 64)};
+    uint64_t global_strides[3] = {static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
+                                  static_cast<uint64_t>(d1 * d2 * sizeof(__nv_bfloat16)),
+                                  static_cast<uint64_t>(64 * sizeof(__nv_bfloat16))};
+    uint32_t box_dim[4] = {64, 1, ChunkTokens, 1};
+    uint32_t elem_strides[4] = {1, 1, 1, 1};
+    CUtensorMap tensor_map{};
+    const CUresult result =
+        cuTensorMapEncodeTiled(&tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, tensor.data_ptr(),
+                               global_dim, global_strides, box_dim, elem_strides,
+                               CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                               CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TVM_FFI_ICHECK(result == CUDA_SUCCESS)
+        << "cuTensorMapEncodeTiled failed for split-panel v with CUresult=" << int(result);
+    return tensor_map;
+  }
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
   TVM_FFI_ICHECK(global_dim[0] >= ValueRows && global_dim[1] >= 1 && global_dim[2] > 0)
@@ -581,6 +661,16 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   TVM_FFI_ICHECK(result == CUDA_SUCCESS)
       << "cuTensorMapEncodeTiled failed for v with CUresult=" << int(result);
   return tensor_map;
+}
+
+template <int ValueRows, int ChunkTokens, bool QkStyleLayout>
+inline CUtensorMap EncodeValueTmaForKernel(const TensorView& tensor) {
+  if constexpr (QkStyleLayout) {
+    static_assert(ValueRows == 128);
+    return EncodeQkTma<ChunkTokens>(tensor, "v");
+  } else {
+    return EncodeValueTma<ValueRows, ChunkTokens>(tensor);
+  }
 }
 
 template <int ChunkTokens>
@@ -608,14 +698,17 @@ inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
   return tensor_map;
 }
 
-template <int ChunkTokens>
+template <int ChunkTokens, bool PairPacked = false>
 inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
   static_assert(ChunkTokens == 16 || ChunkTokens == 32);
+  static_assert(!PairPacked || ChunkTokens == 32);
+  constexpr uint32_t kBoxHeads = PairPacked ? 24 : 8;
+  constexpr uint32_t kBoxTokens = PairPacked ? ChunkTokens / 2 + 1 : ChunkTokens;
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t outer1 = tensor.numel() / d1;
   uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
-  TVM_FFI_ICHECK(global_dim[0] >= 8 && global_dim[1] >= ChunkTokens)
-      << "beta_tma cannot encode the (8, " << ChunkTokens << ") TMA box";
+  TVM_FFI_ICHECK(global_dim[0] >= kBoxHeads && global_dim[1] >= kBoxTokens)
+      << "beta_tma cannot encode the (" << kBoxHeads << ", " << kBoxTokens << ") TMA box";
   TVM_FFI_ICHECK(tensor.stride(tensor.ndim() - 1) == 1 && tensor.stride(tensor.ndim() - 2) >= d1)
       << "beta_tma must have unit head stride and non-overlapping token rows";
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0)
@@ -624,7 +717,7 @@ inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
       << "beta_tma token stride must be a multiple of 16 bytes";
   uint64_t global_strides[1] = {
       static_cast<uint64_t>(tensor.stride(tensor.ndim() - 2) * sizeof(__nv_bfloat16))};
-  uint32_t box_dim[2] = {8, ChunkTokens};
+  uint32_t box_dim[2] = {kBoxHeads, kBoxTokens};
   uint32_t elem_strides[2] = {1, 1};
   CUtensorMap tensor_map{};
   const CUresult result =
@@ -682,13 +775,16 @@ struct TensorMapWords {
 };
 
 static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords source) {
-  const uint32_t index = threadIdx.x;
-  if (index < TensorMapWords::kWordCount) {
-    destination[index] = source.words[index];
+  if (threadIdx.x == 0) {
+    for (uint32_t index = 0; index < TensorMapWords::kWordCount; ++index) {
+      destination[index] = source.words[index];
+    }
+    asm volatile("fence.proxy.tensormap::generic.release.sys;" ::: "memory");
   }
 }
 
-template <int ValueRows, int ChunkTokens = 32>
+template <int ValueRows, int ChunkTokens = 32, bool PairPackedBeta = false,
+          int ValueTmaRows = ValueRows, bool QkStyleValueTma = false>
 inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, const TensorView& v,
                                      const TensorView& g, const TensorView& beta_tma,
                                      const TensorView& out, const TensorView& descriptor_storage,
@@ -702,14 +798,17 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
            "this exact workspace and tensor signature before capture";
 
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
-        EncodeQkTma<ChunkTokens>(q, "q"),          EncodeQkTma<ChunkTokens>(k, "k"),
-        EncodeValueTma<ValueRows, ChunkTokens>(v), EncodeGateTma<ChunkTokens>(g),
-        EncodeBetaTma<ChunkTokens>(beta_tma),      EncodeOutputTma<ValueRows, ChunkTokens>(out),
+        EncodeQkTma<ChunkTokens>(q, "q"),
+        EncodeQkTma<ChunkTokens>(k, "k"),
+        EncodeValueTmaForKernel<ValueTmaRows, ChunkTokens, QkStyleValueTma>(v),
+        EncodeGateTma<ChunkTokens>(g),
+        EncodeBetaTma<ChunkTokens, PairPackedBeta>(beta_tma),
+        EncodeOutputTma<ValueRows, ChunkTokens>(out),
     };
     static_assert(sizeof(host_maps) == kDescriptorStorageBytes);
     TensorMapWords words{};
     std::memcpy(words.words, host_maps.data(), sizeof(host_maps));
-    PublishTensorMaps<<<1, 128, 0, stream>>>(
+    PublishTensorMaps<<<1, 1, 0, stream>>>(
         reinterpret_cast<uint64_t*>(descriptor_storage.data_ptr()), words);
     CheckCuda(cudaGetLastError(), "PublishTensorMaps launch");
   }

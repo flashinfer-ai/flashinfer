@@ -17,6 +17,15 @@ PYTORCH_INDEX_PATTERN = re.compile(r"^(?:nightly/)?cu[0-9]+$")
 IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9._-]*$")
 CUDNN_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 ARCH_LIST_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[a-z]?(?: [0-9]+\.[0-9]+[a-z]?)*$")
+DEPENDENCY_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+DEPENDENCY_VERSION_PATTERN = re.compile(
+    r"^(?P<release>[0-9]+(?:\.[0-9]+)*)(?:(?P<phase>a|b|rc)(?P<serial>[0-9]+))?$"
+)
+DEPENDENCY_SPECIFIER_PATTERN = re.compile(
+    r"^(?P<operator>==|>=)(?P<version>[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?)$"
+)
+DEPENDENCY_EXTRA_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CUDA_MAJOR_PATTERN = re.compile(r"^[0-9]+$")
 
 
 class ConfigError(ValueError):
@@ -45,6 +54,170 @@ def _entries(config: dict[str, Any], section: str) -> list[dict[str, Any]]:
     return [
         _mapping(entry, f"{section}[{index}]") for index, entry in enumerate(entries)
     ]
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    match = DEPENDENCY_VERSION_PATTERN.fullmatch(version)
+    if match is None:
+        raise ConfigError(f"invalid dependency version: {version!r}")
+    release = tuple(int(part) for part in match.group("release").split("."))
+    release = (*release, *(0 for _ in range(4 - len(release))))
+    phase = match.group("phase")
+    phase_rank = {"a": 0, "b": 1, "rc": 2, None: 3}[phase]
+    serial = int(match.group("serial") or 0)
+    return (*release, phase_rank, serial)
+
+
+def _toml_string_arrays(path: Path, section: str) -> dict[str, list[str]]:
+    """Read the simple string arrays used by a pyproject table."""
+    values: dict[str, list[str]] = {}
+    in_section = False
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            if in_section:
+                break
+            in_section = stripped == f"[{section}]"
+            continue
+        if not in_section or not stripped or stripped.startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_-]+)\s*=\s*(\[.*\])", stripped)
+        if match is None:
+            raise ConfigError(f"cannot parse {section} entry in {path}: {stripped!r}")
+        try:
+            parsed = json.loads(match.group(2))
+        except json.JSONDecodeError as error:
+            raise ConfigError(
+                f"cannot parse {section}.{match.group(1)}: {error}"
+            ) from error
+        if not isinstance(parsed, list) or not all(
+            isinstance(item, str) for item in parsed
+        ):
+            raise ConfigError(f"{section}.{match.group(1)} must be a string array")
+        values[match.group(1)] = parsed
+    if not in_section and not values:
+        raise ConfigError(f"missing [{section}] in {path}")
+    return values
+
+
+def _dependency_requirement(
+    package: str,
+    dependency: dict[str, Any],
+    specifier_field: str,
+    cuda_major: str | None = None,
+) -> str:
+    extras = dependency.get("cuda_major_extras", {}).get(cuda_major, [])
+    package_spec = package
+    if extras:
+        package_spec += f"[{','.join(extras)}]"
+    return f"{package_spec}{dependency[specifier_field]}"
+
+
+def _validate_dependency_policy(
+    config: dict[str, Any], repo_root: Path, cuda_majors: set[str]
+) -> None:
+    policy = _mapping(config.get("dependency_policy"), "dependency_policy")
+    if not policy:
+        raise ConfigError("dependency_policy must not be empty")
+
+    requirements_path = repo_root / "requirements.txt"
+    requirements = {
+        line.strip()
+        for line in requirements_path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    optional_dependencies = _toml_string_arrays(
+        repo_root / "pyproject.toml", "project.optional-dependencies"
+    )
+
+    for package, raw_dependency in policy.items():
+        if DEPENDENCY_PACKAGE_PATTERN.fullmatch(package) is None:
+            raise ConfigError(f"invalid dependency package name: {package!r}")
+        context = f"dependency_policy.{package}"
+        dependency = _mapping(raw_dependency, context)
+        expected_fields = {
+            "provider_build_specifier",
+            "cuda_extra_specifier",
+            "ci_image_specifier",
+            "cuda_major_extras",
+        }
+        if set(dependency) != expected_fields:
+            raise ConfigError(
+                f"{context} fields must be {sorted(expected_fields)}, "
+                f"got {sorted(dependency)}"
+            )
+
+        versions = {}
+        expected_operators = {
+            "provider_build_specifier": ">=",
+            "cuda_extra_specifier": ">=",
+            "ci_image_specifier": "==",
+        }
+        for field, expected_operator in expected_operators.items():
+            specifier = _string(
+                dependency, field, context, DEPENDENCY_SPECIFIER_PATTERN
+            )
+            match = DEPENDENCY_SPECIFIER_PATTERN.fullmatch(specifier)
+            assert match is not None
+            if match.group("operator") != expected_operator:
+                raise ConfigError(
+                    f"{context}.{field} must use {expected_operator!r}, "
+                    f"got {specifier!r}"
+                )
+            versions[field] = match.group("version")
+        if _version_key(versions["provider_build_specifier"]) > _version_key(
+            versions["cuda_extra_specifier"]
+        ):
+            raise ConfigError(
+                f"{context}.provider_build_specifier must not exceed "
+                f"{context}.cuda_extra_specifier"
+            )
+        if _version_key(versions["ci_image_specifier"]) < _version_key(
+            versions["cuda_extra_specifier"]
+        ):
+            raise ConfigError(
+                f"{context}.ci_image_specifier must satisfy the CUDA-extra specifier"
+            )
+
+        extras_by_major = _mapping(
+            dependency["cuda_major_extras"], f"{context}.cuda_major_extras"
+        )
+        for cuda_major, extras in extras_by_major.items():
+            if CUDA_MAJOR_PATTERN.fullmatch(cuda_major) is None:
+                raise ConfigError(f"{context} has invalid CUDA major: {cuda_major!r}")
+            if not isinstance(extras, list) or not extras:
+                raise ConfigError(f"{context} extras for CUDA {cuda_major} are empty")
+            if len(extras) != len(set(extras)) or any(
+                not isinstance(extra, str)
+                or DEPENDENCY_EXTRA_PATTERN.fullmatch(extra) is None
+                for extra in extras
+            ):
+                raise ConfigError(
+                    f"{context} extras for CUDA {cuda_major} are invalid: {extras!r}"
+                )
+
+        base_requirement = _dependency_requirement(
+            package, dependency, "provider_build_specifier"
+        )
+        if base_requirement not in requirements:
+            raise ConfigError(
+                f"requirements.txt must contain the provider-build floor "
+                f"{base_requirement!r}"
+            )
+
+        for cuda_major in cuda_majors:
+            extra_name = f"cu{cuda_major}"
+            cuda_requirement = _dependency_requirement(
+                package,
+                dependency,
+                "cuda_extra_specifier",
+                cuda_major,
+            )
+            if cuda_requirement not in optional_dependencies.get(extra_name, []):
+                raise ConfigError(
+                    f"pyproject.toml {extra_name} extra must contain "
+                    f"{cuda_requirement!r}"
+                )
 
 
 def _validate_identity(entry: dict[str, Any], context: str) -> tuple[str, str, str]:
@@ -105,7 +278,6 @@ def _validate_devcontainer(
 def validate_cuda_config(config: Any, repo_root: Path) -> None:
     """Validate matrix syntax, safe values, and cross-file consistency."""
     config = _mapping(config, "CUDA configuration")
-    _mapping(config.get("build_dependencies"), "build_dependencies")
     runtime_entries = _entries(config, "runtime")
     jit_entries = _entries(config, "jit_cache")
 
@@ -144,6 +316,11 @@ def validate_cuda_config(config: Any, repo_root: Path) -> None:
                     f"runtime and JIT-cache {label} {field} values differ: "
                     f"{runtime[field]!r} != {jit[field]!r}"
                 )
+
+    cuda_majors = {
+        entry["version"].split(".", 1)[0] for entry in [*runtime_entries, *jit_entries]
+    }
+    _validate_dependency_policy(config, repo_root, cuda_majors)
 
 
 def main() -> int:
