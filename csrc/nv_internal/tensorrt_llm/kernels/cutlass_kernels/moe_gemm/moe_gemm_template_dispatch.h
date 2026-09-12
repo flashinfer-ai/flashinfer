@@ -684,8 +684,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
     if (sm == 90) {
       using Tile = cutlass_extensions::CutlassTileConfigSM90;
       using Schedule = cutlass_extensions::MainloopScheduleType;
-      for (Tile tile : {Tile::CtaShape128x8x128B, Tile::CtaShape128x16x128B,
-                        Tile::CtaShape128x32x128B, Tile::CtaShape128x40x128B}) {
+      for (Tile tile :
+           {Tile::CtaShape128x8x128B, Tile::CtaShape128x16x128B, Tile::CtaShape128x32x128B,
+            Tile::CtaShape128x40x128B, Tile::CtaShape128x64x128B}) {
         for (Schedule schedule :
              {Schedule::SINGLE_WARPGROUP_PREFILL, Schedule::SINGLE_WARPGROUP_ROLLING}) {
           CutlassGemmConfig config(tile, schedule, cutlass_extensions::EpilogueScheduleType::AUTO,

@@ -1,0 +1,25 @@
+{
+  "arch": "sm_100a",
+  "compile_flags": [],
+  "constraints": {
+    "capacities": [
+      256,
+      4096
+    ],
+    "dtype": "bfloat16",
+    "hidden_size": 4096,
+    "top_k": 6
+  },
+  "kernel_count": 1,
+  "kernel_symbols": [
+    "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
+  ],
+  "launch": {
+    "block_threads": 256,
+    "dynamic_smem_bytes": 0,
+    "grid_x": "4 * num_tokens"
+  },
+  "schema_version": 1,
+  "source_sha256": "721e39685cc4f217b6e15a32dc0359cbcd0d2cee671da8fab3b6dd5aa536ee89",
+  "tma_abi": "pointer"
+}

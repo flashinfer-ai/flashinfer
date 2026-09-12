@@ -61,7 +61,6 @@ from ...placeholder_helpers import (
 from .helpers_common import (
     _TASK_CACHE_KV_PAGE_IDX_UB,
     _TASK_CACHE_KV_RAW_TILE_BASE,
-    _TASK_CACHE_KV_REQUEST_BEGIN,
     Constexpr,
     DecodeGenResourceBase,
     ResourceVars,
@@ -498,6 +497,10 @@ class SmemKvTileResource(DecodeGenResourceBase):
     tma_desc_v: cutlass.Pointer | None = None
     tma_desc_k_atom: cutlass.Pointer | None = None
     tma_desc_v_atom: cutlass.Pointer | None = None
+    tma_desc_k_summary: cutlass.Pointer | None = None
+    tma_desc_v_summary: cutlass.Pointer | None = None
+    tma_desc_k_summary_atom: cutlass.Pointer | None = None
+    tma_desc_v_summary_atom: cutlass.Pointer | None = None
     sparse_kv_metadata: "SmemBlockSparseKvMetadataResource | None" = None
     page_offsets_kv: "SmemPageOffsetsKvResource | None" = None
     seqlens_kv: cute.Pointer | None = None
@@ -704,14 +707,23 @@ class SmemKvTileResource(DecodeGenResourceBase):
             assert self.sparse_kv_metadata is not None
             assert self.tma_desc_k_atom is not None
             assert self.tma_desc_v_atom is not None
-            # The positional TensorMaps keep the decode ABI stable. The
-            # primary K/V descriptors are KV128 for coarse routes and one atom
-            # for fine routes. The auxiliary slots always expose the atom
-            # descriptor and alias the primary descriptor for fine routes.
+            # K/V and summary sources expose the same primary/atom descriptor
+            # pair. Route kind selects the source; the geometry below alone
+            # selects the physical copy policy.
             tma_desc_atom = (
                 self.tma_desc_v_atom
                 if cutlass.const_expr(self.kv_kind == KV_KIND_V)
                 else self.tma_desc_k_atom
+            )
+            tma_desc_summary = (
+                self.tma_desc_v_summary
+                if cutlass.const_expr(self.kv_kind == KV_KIND_V)
+                else self.tma_desc_k_summary
+            )
+            tma_desc_summary_atom = (
+                self.tma_desc_v_summary_atom
+                if cutlass.const_expr(self.kv_kind == KV_KIND_V)
+                else self.tma_desc_k_summary_atom
             )
             kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
             head_dim_stage = cfg.head_dim_kv_stage
@@ -776,6 +788,12 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 # join unrelated entries and must prove physical adjacency.
                 fragment_chunk_elems = chunk_hd * 64
                 if prims.elect_sync():
+                    route_tma_desc = tma_desc
+                    route_tma_desc_atom = tma_desc_atom
+                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                        if self.sparse_kv_metadata.route_is_proxy():
+                            route_tma_desc = tma_desc_summary
+                            route_tma_desc_atom = tma_desc_summary_atom
                     origin0, _ = self.sparse_kv_metadata.route_tma_coordinate(
                         Int32(0),
                         logical_b_idx,
@@ -801,7 +819,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                             local_tile_offset = chunk_idx * tile_chunk_elems
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 stage_base.subview(local_tile_offset),
-                                tma_desc,
+                                route_tma_desc,
                                 (
                                     Int32(global_head_dim_offset),
                                     origin0,
@@ -833,7 +851,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                             if adjacent:
                                 prims.cp_async_bulk_tensor_shared_cta_global(
                                     stage_base.subview(local_tile_offset),
-                                    tma_desc,
+                                    route_tma_desc,
                                     (
                                         Int32(global_head_dim_offset),
                                         origin0,
@@ -845,7 +863,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                             else:
                                 prims.cp_async_bulk_tensor_shared_cta_global(
                                     stage_base.subview(local_tile_offset),
-                                    tma_desc_atom,
+                                    route_tma_desc_atom,
                                     (
                                         Int32(global_head_dim_offset),
                                         origin0,
@@ -858,7 +876,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                     stage_base.subview(
                                         local_tile_offset + fragment_chunk_elems
                                     ),
-                                    tma_desc_atom,
+                                    route_tma_desc_atom,
                                     (
                                         Int32(global_head_dim_offset),
                                         origin1,
@@ -876,6 +894,10 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 atom_chunk_elems = chunk_hd * kv_atom_size
                 atoms_per_route = cfg.tile_size_kv // kv_atom_size
                 if prims.elect_sync():
+                    route_tma_desc_atom = tma_desc_atom
+                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                        if self.sparse_kv_metadata.route_is_proxy():
+                            route_tma_desc_atom = tma_desc_summary_atom
                     stage_base = self._stage_base(stage_info)
                     # Reuse each retained origin across all head-dimension
                     # chunks. The copies still target disjoint SMEM regions
@@ -914,7 +936,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                 stage_base.subview(
                                     local_tile_offset + atom_idx * atom_chunk_elems
                                 ),
-                                tma_desc_atom,
+                                route_tma_desc_atom,
                                 (
                                     Int32(global_head_dim_offset),
                                     origin,
@@ -1133,8 +1155,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     page_idx_kv: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
-    paged_kv_indptr: cute.Pointer | None = None
-    paged_kv_indices: cute.Pointer | None = None
+    block_tables: cute.Pointer | None = None
+    block_table_row_stride: cutlass.Int64 = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
     b_idx: Int32 = None
@@ -1334,10 +1356,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         pages_per_tile = Int32(cfg.tile_size_kv // cfg.num_tokens_per_page)
         if cutlass.const_expr(self.use_native_paged_kv):
             task_cache = _decode_gen_task_cache(stage_info)
-            request_begin = Int32(task_cache[_TASK_CACHE_KV_REQUEST_BEGIN])
             page_idx_ub = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
-            page_table_offset = request_begin
-            page_idx_kv = self.paged_kv_indices
+            page_table_offset = (
+                cutlass.Int64(logical_b_idx) * self.block_table_row_stride
+            )
+            page_idx_kv = self.block_tables
         else:
             if cutlass.const_expr(self.seqlens_kv is None):
                 page_idx_ub = Int32(cfg.max_num_pages_per_seq_kv - 1)
@@ -1487,6 +1510,10 @@ class SmemKvResource(DecodeGenResourceBase):
     tma_desc_v: cutlass.Pointer | None = None
     tma_desc_k_atom: cutlass.Pointer | None = None
     tma_desc_v_atom: cutlass.Pointer | None = None
+    tma_desc_k_summary: cutlass.Pointer | None = None
+    tma_desc_v_summary: cutlass.Pointer | None = None
+    tma_desc_k_summary_atom: cutlass.Pointer | None = None
+    tma_desc_v_summary_atom: cutlass.Pointer | None = None
     sparse_kv_metadata0: "SmemBlockSparseKvMetadataResource | None" = None
     sparse_kv_metadata1: "SmemBlockSparseKvMetadataResource | None" = None
     page_offsets_kv: SmemPageOffsetsKvResource | None = None
@@ -1922,6 +1949,29 @@ class SmemKvResource(DecodeGenResourceBase):
             ):
                 assert self.page_offsets_kv is not None
                 dense_page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+            # Select the logical source before the constexpr 4 x 2 loop so K/V
+            # and summary routes retain one physical KV256 staging body.
+            route_tma_desc = tma_desc
+            if cutlass.const_expr(cfg.use_block_sparse):
+                sparse_tma_desc = (
+                    self.tma_desc_v_atom
+                    if cutlass.const_expr(kv_kind == KV_KIND_V)
+                    else self.tma_desc_k_atom
+                )
+                assert sparse_tma_desc is not None
+                route_tma_desc = sparse_tma_desc
+                if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                    assert sparse_kv_metadata is not None
+                    summary_tma_desc = (
+                        self.tma_desc_v_summary_atom
+                        if cutlass.const_expr(kv_kind == KV_KIND_V)
+                        else self.tma_desc_k_summary_atom
+                    )
+                    assert summary_tma_desc is not None
+                    route_is_proxy = sparse_kv_metadata.route_is_proxy()
+                    route_tma_desc = (
+                        summary_tma_desc if route_is_proxy else sparse_tma_desc
+                    )
             for semantic_block in cutlass.range_constexpr(4):
                 token_coord = Int32(0)
                 storage_coord = logical_b_idx
@@ -1950,15 +2000,9 @@ class SmemKvResource(DecodeGenResourceBase):
                         )
 
                     if cutlass.const_expr(cfg.use_block_sparse):
-                        sparse_tma_desc = (
-                            self.tma_desc_v_atom
-                            if cutlass.const_expr(kv_kind == KV_KIND_V)
-                            else self.tma_desc_k_atom
-                        )
-                        assert sparse_tma_desc is not None
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             stage_base.subview(block_base),
-                            sparse_tma_desc,
+                            route_tma_desc,
                             (
                                 Int32(dim_half * 64),
                                 token_coord,

@@ -14,7 +14,10 @@
 #   FI_NCCL_VERSION  nvidia-nccl-<cuXX> pin (default 2.30.7). FI_-prefixed
 #                 because NVIDIA base images export NCCL_VERSION as the Debian
 #                 package version (e.g. 2.28.3-1), which is not a valid pip pin.
-#   NCCL4PY_SPEC  nccl4py pin (default nccl4py[<cuXX>]==0.3.1)
+#   NCCL_EXT_SPEC nccl-extensions pin (default nccl-extensions[<cuXX>]==0.1.0).
+#                 nccl.ep lives here since it moved out of nccl4py (0.4.1).
+#   NCCL4PY_SPEC  nccl4py pin (default nccl4py[<cuXX>]==0.5.0); supplies
+#                 nccl.core.Communicator in the same `nccl` namespace.
 #   FI_EP_PREWARM 1 runs the ~25-min trtllm fused-MoE JIT prewarm (default 0).
 #                 Set to 1 when baking container-save images for torchrun jobs
 #                 (lazy JIT under torchrun outlives the NCCL watchdog); PR CI
@@ -34,7 +37,8 @@ fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
 NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
-NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.3.1}"
+NCCL_EXT_SPEC="${NCCL_EXT_SPEC:-nccl-extensions[${CU}]==0.1.0}"
+NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.5.0}"
 CUDA_CORE_VERSION="${CUDA_CORE_VERSION:-1.0.1}"
 CUDA_BINDINGS_VERSION="${CUDA_BINDINGS_VERSION:-13.2.0}"
 DEEPGEMM_SRC="${DEEPGEMM_SRC:-/tmp/DeepGEMM}"
@@ -47,17 +51,78 @@ nvcc --version | grep release || true
 
 echo "== pin NCCL-EP runtime wheels to ep_bench's verified set =="
 # PIP_CONSTRAINT= overrides the NVIDIA base image's constraint file (which pins
-# nvidia-nccl-<cuXX> to torch's 2.30.4) so we install the 2.30.7 that nccl4py 0.3.1's
-# libnccl_ep.so expects. --no-deps on the NCCL wheels keeps the base torch intact;
+# nvidia-nccl-<cuXX> to torch's 2.30.4) so we install the 2.30.7 that
+# nccl-extensions 0.1.0's libnccl_ep.so expects. --no-deps on the NCCL wheels
+# keeps the base torch intact;
 # nccl.ep additionally imports cuda.core / cuda.bindings, installed explicitly at
 # ep_bench's exact versions (cuda-core 1.0.1, cuda-bindings 13.2.0).
 PIP_CONSTRAINT="" pip install --no-cache-dir --no-deps \
     "nvidia-nccl-${CU}==${NCCL_VERSION}" \
-    "${NCCL4PY_SPEC}"
+    "${NCCL4PY_SPEC}" \
+    "${NCCL_EXT_SPEC}"
 PIP_CONSTRAINT="" pip install --no-cache-dir \
     "cuda-core==${CUDA_CORE_VERSION}" \
     "cuda-bindings==${CUDA_BINDINGS_VERSION}"
-python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + nccl4py import OK')"
+
+# Put the wheel's libnccl AHEAD of any system copy. Installing the 2.30.7 wheel
+# is not enough: NGC images ship /usr/lib/<triple>/libnccl.so.2.30.4, the linker
+# finds it first, and torch loads it before flashinfer is imported. Since
+# nccl-extensions 0.1.0, libnccl_ep is built against 2.30.7 and hard-refuses an
+# older runtime ("NCCL library is too old" -> ncclInvalidUsage, process abort),
+# so the older system copy silently breaks every NCCL-EP collective. nccl-ep
+# 0.1.0 tolerated 2.30.4, which is why this only began to matter with the move
+# off nccl4py. Persist it too, so later `srun`/exec shells in a saved container
+# inherit it.
+NCCL_WHEEL_LIB="$(python -c "import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], 'lib'))")"
+# ldconfig, not just LD_LIBRARY_PATH: an `export` here dies with this script
+# and never reaches whatever runs the tests, and /etc/profile.d is only read by
+# login shells. Registering the directory in the loader cache makes EVERY
+# process in the image resolve libnccl.so.2 to the wheel's copy with no env
+# plumbing at all. LD_LIBRARY_PATH is still exported for the rest of THIS
+# script, and profile.d is kept as a belt-and-braces for interactive shells.
+echo "${NCCL_WHEEL_LIB}" > /etc/ld.so.conf.d/000-flashinfer-nccl.conf
+ldconfig
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
+cat > /etc/profile.d/flashinfer-nccl.sh <<EOF
+export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:\${LD_LIBRARY_PATH:-}
+EOF
+chmod +x /etc/profile.d/flashinfer-nccl.sh
+echo "== libnccl pinned to ${NCCL_WHEEL_LIB} =="
+ldconfig -p | grep -E "libnccl\.so\.2" || true
+
+python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep (nccl-extensions) + nccl.core (nccl4py) import OK')"
+
+# Assert the libnccl that actually LOADS meets libnccl_ep's build-time floor.
+# Cheap here, and far clearer than a mid-collective abort on a compute node.
+python - <<'PYEOF'
+import ctypes
+lib = ctypes.CDLL("libnccl.so.2")
+out = ctypes.c_int()
+assert lib.ncclGetVersion(ctypes.byref(out)) == 0, "ncclGetVersion failed"
+code = out.value
+got = (code // 10000, (code // 100) % 100, code % 100)
+print("loaded libnccl version:", ".".join(map(str, got)))
+assert got >= (2, 30, 7), (
+    f"loaded libnccl {got} < 2.30.7 required by nccl-extensions' libnccl_ep; "
+    "a system libnccl is shadowing the wheel (check ldconfig -p / LD_LIBRARY_PATH)"
+)
+PYEOF
+
+# Same check with LD_LIBRARY_PATH cleared: proves the ldconfig pin holds for
+# processes that do not inherit this script's environment (e.g. the test suite).
+env -u LD_LIBRARY_PATH python - <<'PYEOF'
+import ctypes
+lib = ctypes.CDLL("libnccl.so.2")
+out = ctypes.c_int()
+assert lib.ncclGetVersion(ctypes.byref(out)) == 0, "ncclGetVersion failed"
+code = out.value
+got = (code // 10000, (code // 100) % 100, code % 100)
+print("loaded libnccl version (clean env):", ".".join(map(str, got)))
+assert got >= (2, 30, 7), (
+    f"loaded libnccl {got} < 2.30.7 with LD_LIBRARY_PATH unset — the ldconfig "
+    "pin in /etc/ld.so.conf.d/000-flashinfer-nccl.conf did not take effect"
+)
+PYEOF
 
 echo "== install DeepGEMM + NVSHMEM / CUTLASS DSL deps =="
 PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
@@ -77,8 +142,9 @@ PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
 )
 
 echo "== build & install FlashInfer (NCCL-EP + Mega path) =="
-# The EP backends are ON by default now: NCCL-EP needs no build step (nccl4py
-# is a base dependency of flashinfer-python), so only NIXL-EP is opted out.
+# The EP backends are ON by default now: NCCL-EP needs no build step
+# (nccl-extensions is a base dependency of flashinfer-python), so only NIXL-EP
+# is opted out.
 # PIP_CONSTRAINT= so the build hook's --no-deps NCCL floor upgrade
 # (_ensure_nccl_floor, nvidia-nccl-cu13>=2.30.7) isn't blocked by the base
 # image's constraint file — a no-op here since 2.30.7 is already pinned above.
@@ -90,7 +156,7 @@ cd "${FI_SRC}"
 # without this upgrade.
 PIP_CONSTRAINT="" pip install --no-cache-dir -U \
     "setuptools>=77" "packaging>=24" \
-    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"
+    "apache-tvm-ffi>=0.1.11,<0.2"
 PIP_CONSTRAINT="" BUILD_NIXL_EP=0 \
     pip install --no-cache-dir --no-build-isolation -e .
 

@@ -4,6 +4,7 @@ import os
 import signal
 import time
 from contextlib import suppress
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from scripts.test_sharding.workers import (
     BatchExecutionRequest,
     _BatchProgress,
     _forward_pytest_output,
+    _pytest_environment,
+    _worker_master_port,
     execute_batch,
 )
 
@@ -166,6 +169,54 @@ def _fake_batch_request(tmp_path: Path) -> BatchExecutionRequest:
         monitor_memory=False,
         memory_interval=1,
     )
+
+
+@pytest.mark.parametrize("worker_count", [1, 2, 4, 8])
+def test_pytest_workers_get_isolated_default_master_port_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_count: int
+) -> None:
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    request = _fake_batch_request(tmp_path)
+
+    ports = [
+        int(
+            _pytest_environment(replace(request, worker_index=worker_index))[
+                "MASTER_PORT"
+            ]
+        )
+        for worker_index in range(worker_count)
+    ]
+
+    assert ports == [29500 + worker_index * 100 for worker_index in range(worker_count)]
+    blocks = [set(range(port, port + 100)) for port in ports]
+    assert all(
+        left.isdisjoint(right)
+        for left_index, left in enumerate(blocks)
+        for right in blocks[left_index + 1 :]
+    )
+
+
+def test_explicit_master_port_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MASTER_PORT", "31234")
+
+    environment = _pytest_environment(
+        replace(_fake_batch_request(tmp_path), worker_index=360)
+    )
+
+    assert environment["MASTER_PORT"] == "31234"
+
+
+def test_worker_master_port_defines_a_valid_block() -> None:
+    assert _worker_master_port(0) == "29500"
+    assert _worker_master_port(3) == "29800"
+    assert _worker_master_port(359) == "65400"
+
+    with pytest.raises(ValueError, match="non-negative"):
+        _worker_master_port(-1)
+    with pytest.raises(ValueError, match="no valid rendezvous port block"):
+        _worker_master_port(360)
 
 
 def _install_fake_pytest(
