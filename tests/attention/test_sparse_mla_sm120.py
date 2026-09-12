@@ -2961,12 +2961,16 @@ _DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 _DSV4_PREFILL_DUAL_CONFIGS = [
     (num_heads, 128, extra_topk, extra_pbs)
     for num_heads in _DSV4_PREFILL_DUAL_HEADS
-    for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
+    for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2), (512, 32)]
 ] + [
     (32, 512, 512, 64),
     (32, 512, 128, 2),
     (64, 512, 512, 64),
     (64, 512, 128, 2),
+    # DeepSeek-V4.1 ratio-2 compressed layers page their extra KV at 32 tokens;
+    # (16, 128, 512, 32) is the TP=4 shape on 4x RTX PRO 6000, (32, ...) TP=2.
+    (16, 128, 512, 32),
+    (32, 128, 512, 32),
 ]
 
 
