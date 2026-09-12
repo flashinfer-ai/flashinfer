@@ -86,6 +86,11 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
         for t in tuning.TUNE_THREADS
         if b > policy.CE_MAX_PIECES or t != policy.CE_THREADS
     }
+    expected_rejected |= {
+        (int(IpcVariant.COPY_ENGINE_RING_MEMOP), b, t)
+        for b in tuning.TUNE_BLOCKS
+        for t in tuning.TUNE_THREADS
+    }
     assert rejected == expected_rejected
 
     # World size 4: no FLAT_STAGED, and threads must be at least world_size
@@ -93,7 +98,12 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
     rejected4 = set(grid) - set(tuning.candidate_tactics(4))
     # The island schedule is a 4+4 decomposition, so world size 4 rejects it.
     assert all(
-        t[0] in (int(IpcVariant.FLAT_STAGED), int(IpcVariant.COPY_ENGINE_ISLAND))
+        t[0]
+        in (
+            int(IpcVariant.FLAT_STAGED),
+            int(IpcVariant.COPY_ENGINE_ISLAND),
+            int(IpcVariant.COPY_ENGINE_RING_MEMOP),
+        )
         or (
             t[0] == int(IpcVariant.COPY_ENGINE_RING)
             and (t[1] > policy.CE_MAX_PIECES or t[2] != policy.CE_THREADS)
@@ -240,9 +250,9 @@ def test_the_prefill_screen_keeps_every_measured_prefill_winner() -> None:
     every configuration a real search actually picked.
     """
     for world_size, payload, winner in _MEASURED_PREFILL_WINNERS:
-        assert payload >= tuning.PREFILL_SCREEN_BYTES, (
-            f"{payload} is below the screen; this row proves nothing"
-        )
+        assert (
+            payload >= tuning.PREFILL_SCREEN_BYTES
+        ), f"{payload} is below the screen; this row proves nothing"
         tactics = tuning.candidate_tactics(world_size, numel=payload // 2, elem_size=2)
         assert winner in tactics, (
             f"world_size={world_size} payload={payload}: the screen dropped "
@@ -272,9 +282,9 @@ def test_the_grid_can_express_every_measured_winner() -> None:
     assert set(_MEASURED_WINNERS) == set(_WORLD_SIZES), "a world size lost its winners"
     for world_size, winners in sorted(_MEASURED_WINNERS.items()):
         unreachable = sorted(set(winners) - set(tuning.candidate_tactics(world_size)))
-        assert not unreachable, (
-            f"world size {world_size}: the grid cannot name {unreachable}"
-        )
+        assert (
+            not unreachable
+        ), f"world size {world_size}: the grid cannot name {unreachable}"
 
 
 @pytest.mark.xfail(
@@ -379,6 +389,7 @@ def test_cache_key_extras_separate_every_workspace_dimension() -> None:
         ("max_blocks", 32),
         ("max_numel", 6144 * 64),
         ("dtype", torch.float16),
+        ("memop_supported", True),
     ):
         assert tuning.cache_key_extras(**{**base, field: other}) != reference, field
 
@@ -409,6 +420,7 @@ def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -
     assert tuning.cache_covers_workspace(**tuned)
     for field, other in (
         ("max_numel", 6144 * 256),
+        ("memop_supported", True),
         ("world_size", 8),
         ("max_blocks", 32),
         ("profile", PROFILE_SWITCHPAIR),
@@ -505,9 +517,9 @@ def test_verdict_reduces_with_max_over_wrong() -> None:
         tuning.dist = real_dist
 
     assert calls, "the verdict must be reduced, not decided locally"
-    assert all(op is real_dist.ReduceOp.MAX for op in calls), (
-        f"a wrong-flag verdict must reduce with MAX (logical OR), got {calls}"
-    )
+    assert all(
+        op is real_dist.ReduceOp.MAX for op in calls
+    ), f"a wrong-flag verdict must reduce with MAX (logical OR), got {calls}"
 
 
 def test_tuning_config_is_shared_and_its_mapper_is_stable() -> None:
@@ -523,12 +535,12 @@ def test_tuning_config_is_shared_and_its_mapper_is_stable() -> None:
     )
     config = tuning.pcie_ipc_tuning_config()
     (spec,) = config.dynamic_tensor_specs
-    assert spec.input_idx == (0,) and spec.dim_idx == (0,), (
-        "only the batch dimension may bucket; hidden must stay exact in the key"
-    )
-    assert config.constraint_specs == (), (
-        "a constraint dim is stored as -1, which would erase hidden from the key"
-    )
+    assert spec.input_idx == (0,) and spec.dim_idx == (
+        0,
+    ), "only the batch dimension may bucket; hidden must stay exact in the key"
+    assert (
+        config.constraint_specs == ()
+    ), "a constraint dim is stored as -1, which would erase hidden from the key"
 
 
 def test_batch_buckets_never_exceed_the_batch_they_stand_for() -> None:
@@ -570,15 +582,15 @@ def test_pinning_a_searched_dimension_moved_the_tune_version() -> None:
     """
     assert tuning.PCIE_IPC_TUNE_VERSION >= 3
     stale = IpcLaunchConfig(blocks=1, threads=512, variant=IpcVariant.COPY_ENGINE_RING)
-    assert not policy._is_launchable(8, stale, 128), (
-        "this is the configuration whose rejection motivated the bump"
-    )
+    assert not policy._is_launchable(
+        8, stale, 128
+    ), "this is the configuration whose rejection motivated the bump"
 
 
 def test_custom_op_name_is_stable() -> None:
     """It is baked into every persisted cache key; renaming it orphans the file."""
     assert tuning.PCIE_IPC_CUSTOM_OP == "flashinfer::pcie_ipc_all_reduce"
-    assert tuning.PCIE_IPC_TUNE_VERSION == 3
+    assert tuning.PCIE_IPC_TUNE_VERSION == 4
 
 
 def test_pack_config_is_injective_over_the_candidate_space() -> None:
@@ -645,3 +657,15 @@ def test_unrelated_autotune_context_preserves_workspace_cache(monkeypatch) -> No
     assert tuner.loaded == [workspace._tune_cache]
     assert tuner.lookups == 1
     assert result == IpcLaunchConfig(16, 256, IpcVariant.STAGED)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_memop_candidate_requires_group_capability_and_single_piece(world_size):
+    common = dict(world_size=world_size, numel=12 * 1024 * 1024 // 2)
+    legacy = set(tuning.candidate_tactics(**common, memop_supported=False))
+    enabled = set(tuning.candidate_tactics(**common, memop_supported=True))
+    expected = {(6, 1, 256)} if world_size in (4, 8) else set()
+    assert enabled - legacy == expected
+    assert legacy <= enabled
+    assert tuning.TUNE_RANK_ROUNDS == 3
+    assert tuning.TUNE_SURVIVORS == 48

@@ -101,6 +101,8 @@ def get_pcie_ipc_comm_module():
         init=init,
         dispose=dispose,
         all_reduce=all_reduce,
+        memop_supported=module.pcie_ipc_memop_supported,
+        set_memop_enabled=module.pcie_ipc_set_memop_enabled,
     )
 
 
@@ -204,6 +206,7 @@ class PcieIpcAllReduceWorkspace:
         self.max_numel = max_numel
         self.max_blocks = max_blocks
         self.profile = ""
+        self.memop_supported = False
         self.profile_reason = ""
         # Resolved launch configurations, keyed exactly. Consulted before any
         # AutoTuner call because even a pure cache lookup there takes a global
@@ -270,6 +273,7 @@ class PcieIpcAllReduceWorkspace:
             self.profile = decision.profile
             self.profile_reason = decision.reason
             module = get_pcie_ipc_comm_module()
+            local_memop_supported = bool(module.memop_supported())
             nbytes = module.workspace_size(
                 self.world_size, max_numel, self.elem_size, max_blocks
             )
@@ -278,6 +282,9 @@ class PcieIpcAllReduceWorkspace:
             self._joint_check({"error": f"{type(e).__name__}: {e}"}, "preparing")
             raise  # unreachable: _joint_check raises on every rank
         self._joint_check({"error": None}, "preparing")
+        capabilities = [None] * self.world_size
+        dist.all_gather_object(capabilities, local_memop_supported, group=group)
+        self.memop_supported = self.world_size in (4, 8) and all(capabilities)
 
         # --- stage 3: allocate and share, then bind --------------------------
         # NOTE: create_shared_buffer() runs its own all_gather_object and
@@ -290,6 +297,7 @@ class PcieIpcAllReduceWorkspace:
             self._handle = module.init(
                 self._ipc_ptrs, self.rank, max_numel, self.elem_size, max_blocks
             )
+            module.set_memop_enabled(self._handle, self.memop_supported)
             # init() zeroes this rank's slab; no peer may push into it until
             # every rank has done so.
             torch.cuda.synchronize(self.device)
@@ -466,7 +474,11 @@ class PcieIpcAllReduceWorkspace:
         # Settled against the loaded keys, where the answer is known, rather
         # than inferred from a miss later.
         self._tuned_configs_loaded = exists and cache_covers_workspace(
-            self.world_size, self.profile, self.max_blocks, self.max_numel
+            self.world_size,
+            self.profile,
+            self.max_blocks,
+            self.max_numel,
+            self.memop_supported,
         )
         self._joint_check(
             {

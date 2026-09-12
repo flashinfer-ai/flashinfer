@@ -18,7 +18,7 @@
 #include <cstdint>
 
 #include "flashinfer/comm/pcie_ipc_all_reduce.cuh"
-#include "flashinfer/comm/pcie_ipc_ce_ring.cuh"
+#include "flashinfer/comm/pcie_ipc_ce_memop.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace fi = flashinfer::comm::pcie_ipc;
@@ -39,6 +39,8 @@ struct PcieIpcHandle {
   fi::WorkspaceLayout layout;
   fi::CeResources ce;
   bool ce_ready;
+  bool launched;
+  bool memop_configured;
   int rank;
   int world_size;
   int max_blocks;
@@ -51,6 +53,10 @@ struct PcieIpcHandle {
 template <typename T>
 cudaError_t dispatch_one(const PcieIpcHandle* h, const T* in, T* out, int64_t numel, int blocks,
                          int threads, fi::Variant algo, bool use_pdl, cudaStream_t stream) {
+  if (algo == fi::Variant::kCopyEngineRingMemop) {
+    return fi::ce_ring_all_reduce_memop<T>(in, out, numel, h->views, h->rank, h->world_size,
+                                          h->layout, h->ce, blocks, threads, stream);
+  }
   if (algo == fi::Variant::kCopyEngineRing) {
     return fi::ce_ring_all_reduce_flat<T>(in, out, numel, h->views, h->rank, h->world_size,
                                           h->layout, h->ce, blocks, threads, stream);
@@ -114,7 +120,8 @@ int64_t pcie_ipc_workspace_size(int64_t world_size, int64_t max_numel, int64_t e
       << "only 2-byte dtypes (bfloat16, float16) are supported, got elem_size " << elem_size;
   TVM_FFI_ICHECK_GT(max_blocks, 0) << "max_blocks must be positive";
   return fi::workspace_size(static_cast<int>(world_size), max_numel, static_cast<int>(elem_size),
-                            static_cast<int>(max_blocks));
+                            static_cast<int>(max_blocks)) +
+         static_cast<int64_t>(fi::ce_binary_flag_bytes(static_cast<int>(world_size)));
 }
 
 /*!
@@ -151,13 +158,18 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   handle->layout = fi::compute_workspace_layout(world_size, max_numel, static_cast<int>(elem_size),
                                                 static_cast<int>(max_blocks));
   handle->views = fi::make_peer_views(ptrs, world_size, static_cast<int>(rank), handle->layout);
+  for (int peer = 0; peer < world_size; ++peer) {
+    handle->ce.binary_flags[peer] = reinterpret_cast<int32_t*>(
+        reinterpret_cast<char*>(ptrs[peer]) + handle->layout.total_bytes);
+  }
   handle->rank = static_cast<int>(rank);
   handle->world_size = world_size;
   handle->max_blocks = static_cast<int>(max_blocks);
   handle->max_numel = max_numel;
   handle->elem_size = static_cast<int>(elem_size);
 
-  cudaError_t err = cudaMemset(reinterpret_cast<void*>(ptrs[rank]), 0, handle->layout.total_bytes);
+  cudaError_t err = cudaMemset(reinterpret_cast<void*>(ptrs[rank]), 0,
+                               handle->layout.total_bytes + fi::ce_binary_flag_bytes(world_size));
   if (err != cudaSuccess) {
     delete handle;
     TVM_FFI_LOG_AND_THROW(RuntimeError)
@@ -174,6 +186,32 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   }
   handle->ce_ready = true;
   return reinterpret_cast<fptr_t>(handle);
+}
+
+// Query before group agreement; a rank-local decision must never select a wire protocol.
+bool pcie_ipc_memop_supported() {
+  int ordinal = 0, major = 0, minor = 0, supported = 0;
+  CUdevice device;
+  if (cudaGetDevice(&ordinal) != cudaSuccess || cuDeviceGet(&device, ordinal) != CUDA_SUCCESS) {
+    return false;
+  }
+  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != CUDA_SUCCESS ||
+      cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != CUDA_SUCCESS ||
+      cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, device) != CUDA_SUCCESS) {
+    return false;
+  }
+  return major == 12 && minor == 0 && supported != 0;
+}
+
+// Called once after communicator-wide capability agreement and before any launch.
+void pcie_ipc_set_memop_enabled(fptr_t handle, bool enabled) {
+  auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
+  TVM_FFI_ICHECK(!h->launched && !h->memop_configured)
+      << "memory-operation protocol must be configured once before the first launch";
+  TVM_FFI_ICHECK(!enabled || (h->world_size != 2 && pcie_ipc_memop_supported()))
+      << "memory-operation protocol requires SM120 and stream memory operation support";
+  h->ce.memop_enabled = enabled;
+  h->memop_configured = true;
 }
 
 void pcie_ipc_dispose(fptr_t handle) {
@@ -194,6 +232,7 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
   ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   auto stream = get_stream(inp.device());
+  h->launched = true;
 
   TVM_FFI_ICHECK(inp.IsContiguous() && out.IsContiguous()) << "input and output must be contiguous";
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(inp.dtype()), encode_dlpack_dtype(out.dtype()))
@@ -244,7 +283,8 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
     TVM_FFI_ICHECK_EQ(blocks % 4, 0)
         << "the TP8 topology kernel requires blocks divisible by 4, got " << blocks;
   }
-  if (algo == fi::Variant::kCopyEngineRing || algo == fi::Variant::kCopyEngineIsland) {
+  if (algo == fi::Variant::kCopyEngineRing || algo == fi::Variant::kCopyEngineIsland ||
+      algo == fi::Variant::kCopyEngineRingMemop) {
     // `blocks` carries the sub-chunk depth here, not a grid size; see
     // IpcVariant.COPY_ENGINE_RING in pcie_ipc_policy.py, and kCeAddThreads for
     // why the thread count is fixed rather than searched. The candidate grid
@@ -299,6 +339,8 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   }
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_memop_supported, pcie_ipc_memop_supported);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_set_memop_enabled, pcie_ipc_set_memop_enabled);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_workspace_size, pcie_ipc_workspace_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_init, pcie_ipc_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_dispose, pcie_ipc_dispose);

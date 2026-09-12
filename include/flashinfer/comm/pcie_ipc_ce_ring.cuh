@@ -47,6 +47,9 @@ namespace pcie_ipc {
 // captured graph keeps references to recorded events, a lifetime rule Python
 // cannot enforce. Created in pcie_ipc_init, destroyed in pcie_ipc_dispose.
 struct CeResources {
+  int32_t* binary_flags[kMaxWorldSize];
+  bool memop_enabled;
+
   cudaStream_t copy_stream;
   cudaStream_t flag_stream;
   cudaEvent_t input_ready;
