@@ -423,6 +423,8 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
 }
 #endif
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 static void launchClusterKernel(Data& data, int numThreadsHist, void* stream) {
   LAUNCH_ROUTING_DEEPSEEK(data,
                           /*coopLaunch=*/false, routingIndicesClusterKernel, NumBlocksPerCluster,
@@ -620,8 +622,9 @@ void run(Data& data, void* stream) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+}  // namespace routingDeepSeek
+
 #undef LAUNCH_DEEPSEEK_WITH_TOPK
 #undef LAUNCH_ROUTING_DEEPSEEK
 
-}  // namespace routingDeepSeek
 }  // namespace moe::dev::routing

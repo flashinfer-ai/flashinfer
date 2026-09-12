@@ -149,6 +149,29 @@ class UlyssesCommunicator:
         backend: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
     ):
+        r"""Construct a Ulysses communicator.
+
+        Parameters
+        ----------
+        group : Optional[ProcessGroup], optional
+            Process group spanning the participating ranks. ``None`` uses
+            ``torch.distributed.group.WORLD``.
+        max_elems : int
+            Per-rank upper bound on the number of elements communicated by a
+            single collective call. Used to size the backend workspace.
+        dtype : torch.dtype
+            Element dtype for collective operands. Must be one of
+            ``torch.float16``, ``torch.bfloat16``, or ``torch.float32``.
+        backend : str, default = "auto"
+            Backend selection policy. ``"auto"`` probes topology and prefers
+            NVLink when supported, otherwise falls back to NCCL. ``"nvlink"``
+            forces the NVLink backend and raises if unavailable. ``"nccl"``
+            forces the NCCL path.
+        device : Optional[Union[torch.device, str, int]], optional
+            CUDA device bound to this rank. ``None`` uses the current CUDA
+            device. Strings and integers are normalized to an explicit CUDA
+            ordinal.
+        """
         self._state = _CLOSED  # flipped to OPEN only when construction succeeds
         self._nvlink_armed = False  # joint property: set on all ranks or none
         # opaque NVLink-backend handle (a C++ UlyssesA2A* as an int) from
@@ -650,6 +673,17 @@ class UlyssesCommunicator:
         ``[rank * H_local, (rank+1) * H_local)`` of every token. Runs on the
         current CUDA stream. Returns the input unchanged when
         ``world_size == 1``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Contiguous 4-D CUDA tensor with shape ``[B, S_local, H, D]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor with shape ``[B, S_global, H_local, D]`` on the same device
+            and dtype as ``x``.
         """
         self._validate(x, "scatter_heads")
         B, S_local, H, D = x.shape
@@ -681,6 +715,17 @@ class UlyssesCommunicator:
         Inverse of :meth:`scatter_heads`: gather all head slices for this
         rank's local sequence shard. Runs on the current CUDA stream. Returns
         the input unchanged when ``world_size == 1``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Contiguous 4-D CUDA tensor with shape ``[B, S_global, H_local, D]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor with shape ``[B, S_local, H, D]`` on the same device and
+            dtype as ``x``.
         """
         self._validate(x, "gather_heads")
         B, S_global, H_local, D = x.shape
@@ -958,6 +1003,26 @@ def ulysses_a2a(
     tensors of the same dtype (float32/float16/bfloat16). All ranks must call
     with consistent geometry in the same order; a mismatch is a collective
     failure (hang or corruption), as with any collective.
+
+    Parameters
+    ----------
+    fa : int
+        Opaque backend handle returned by :func:`init_ulysses_a2a`.
+    inp : torch.Tensor
+        Contiguous 4-D CUDA input tensor.
+    out : torch.Tensor
+        Contiguous 4-D CUDA output tensor written in place.
+    B : int
+        Batch size.
+    S_local : int
+        Local sequence length per rank.
+    H : int
+        Global head count.
+    D : int
+        Head dimension.
+    mode : int
+        ``0`` for scatter-heads input all-to-all, ``1`` for gather-heads
+        output all-to-all.
     """
     if type(fa) is not int or fa == 0:
         raise ValueError(

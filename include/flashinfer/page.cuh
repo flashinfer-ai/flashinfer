@@ -43,6 +43,9 @@ struct paged_kv_t {
   uint32_t stride_page;
   uint32_t stride_n;
   uint32_t stride_h;
+  uint32_t v_stride_page;
+  uint32_t v_stride_n;
+  uint32_t v_stride_h;
 
   // Internal layout:
   // [max_num_pages, num_heads, page_size, head_dim] if layout == HND
@@ -69,6 +72,9 @@ struct paged_kv_t {
         stride_page(0),
         stride_n(0),
         stride_h(0),
+        v_stride_page(0),
+        v_stride_n(0),
+        v_stride_h(0),
         k_data(nullptr),
         v_data(nullptr),
         indices(nullptr),
@@ -103,10 +109,13 @@ struct paged_kv_t {
         last_page_len(last_page_len),
         rope_pos_offset(rope_pos_offset) {
     stride_page = num_heads * page_size * head_dim;
+    v_stride_page = stride_page;
     this->k_data = k_data;
     this->v_data = v_data;
     stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
     stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
+    v_stride_n = stride_n;
+    v_stride_h = stride_h;
   }
 
   /*!
@@ -138,10 +147,39 @@ struct paged_kv_t {
         last_page_len(last_page_len),
         rope_pos_offset(rope_pos_offset) {
     stride_page = kv_strides[0];
+    v_stride_page = stride_page;
     this->k_data = k_data;
     this->v_data = v_data;
     stride_n = layout == QKVLayout::kHND ? kv_strides[2] : kv_strides[1];
     stride_h = layout == QKVLayout::kHND ? kv_strides[1] : kv_strides[2];
+    v_stride_n = stride_n;
+    v_stride_h = stride_h;
+  }
+
+  /*!
+   * \brief Construct a paged key-value cache with independent K/V strides.
+   */
+  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
+                                      uint32_t batch_size, QKVLayout layout, DType* k_data,
+                                      DType* v_data, const int64_t* k_strides,
+                                      const int64_t* v_strides, IdType* indices, IdType* indptr,
+                                      IdType* last_page_len, IdType* rope_pos_offset = nullptr)
+      : num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        indices(indices),
+        indptr(indptr),
+        last_page_len(last_page_len),
+        rope_pos_offset(rope_pos_offset) {
+    stride_page = k_strides[0];
+    v_stride_page = v_strides[0];
+    this->k_data = k_data;
+    this->v_data = v_data;
+    stride_n = layout == QKVLayout::kHND ? k_strides[2] : k_strides[1];
+    stride_h = layout == QKVLayout::kHND ? k_strides[1] : k_strides[2];
+    v_stride_n = layout == QKVLayout::kHND ? v_strides[2] : v_strides[1];
+    v_stride_h = layout == QKVLayout::kHND ? v_strides[1] : v_strides[2];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
@@ -162,6 +200,12 @@ struct paged_kv_t {
                                                              size_t entry_idx,
                                                              size_t feat_idx) const {
     return page_idx * stride_page + head_idx * stride_h + entry_idx * stride_n + feat_idx;
+  }
+
+  __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
+                                                               size_t entry_idx,
+                                                               size_t feat_idx) const {
+    return page_idx * v_stride_page + head_idx * v_stride_h + entry_idx * v_stride_n + feat_idx;
   }
 
   /*!
@@ -199,13 +243,29 @@ struct paged_kv_t {
 
   __device__ __forceinline__ DType* get_v_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
-    return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    return v_data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+  }
+
+  __device__ __forceinline__ size_t protective_get_k_offset(IdType page_iter, uint32_t head_idx,
+                                                            uint32_t entry_idx, uint32_t feat_idx,
+                                                            IdType last_indptr) const {
+    return protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
+  }
+
+  __device__ __forceinline__ size_t protective_get_v_offset(IdType page_iter, uint32_t head_idx,
+                                                            uint32_t entry_idx, uint32_t feat_idx,
+                                                            IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      return get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return 0;
+    }
   }
 
   __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
                                                          uint32_t entry_idx, uint32_t feat_idx,
                                                          IdType last_indptr) const {
-    return v_data + protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
+    return v_data + protective_get_v_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
   }
 };
 
@@ -248,7 +308,9 @@ __device__ __forceinline__ uint8_t nvfp4_append_quantize_e2m1(float value) {
   return sign | code;
 }
 
-template <typename DType>
+// precise_rounding uses IEEE-rounded reciprocals so the output stays
+// bit-reproducible under -use_fast_math (which lowers 1/x to rcp.approx).
+template <typename DType, bool precise_rounding = false>
 __device__ __forceinline__ void nvfp4_append_quantize_block(
     const DType* __restrict__ input, const float global_scale, const size_t input_base,
     const uint32_t dim_base, uint8_t* __restrict__ packed_out, uint8_t* __restrict__ sf_out) {
@@ -263,14 +325,16 @@ __device__ __forceinline__ void nvfp4_append_quantize_block(
 
   float sf_value = 0.0f;
   if (amax > 0.0f && global_scale > 0.0f) {
-    sf_value = amax / (6.0f * global_scale);
+    sf_value =
+        precise_rounding ? amax * __frcp_rn(6.0f * global_scale) : amax / (6.0f * global_scale);
   }
   __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
   *sf_out = sf_fp8.__x;
 
   const float sf_rounded = static_cast<float>(sf_fp8);
   const float output_scale = (amax > 0.0f && sf_rounded > 0.0f && global_scale > 0.0f)
-                                 ? (1.0f / (sf_rounded * global_scale))
+                                 ? (precise_rounding ? __frcp_rn(sf_rounded * global_scale)
+                                                     : (1.0f / (sf_rounded * global_scale)))
                                  : 0.0f;
 
 #pragma unroll
@@ -871,6 +935,96 @@ cudaError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv, DType*
                   (void*)&nnz,
                   (void*)&append_ckv_stride_n,
                   (void*)&append_kpe_stride_n};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  return cudaSuccess;
+}
+
+// kpe stays FP8: rope channels are several times hotter than ckv channels in
+// DeepSeek-family latents, so quantizing them to E2M1 dominates the error.
+template <uint32_t head_dim_ckv, uint32_t head_dim_kpe, typename DType, typename IdType>
+__global__ void NVFP4QuantizeAppendPagedKVMlaCacheKernel(
+    paged_kv_mla_t<uint8_t, IdType> paged_kv_mla, const DType* __restrict__ append_ckv,
+    const DType* __restrict__ append_kpe, IdType* __restrict__ batch_indices,
+    IdType* __restrict__ positions, uint32_t nnz, size_t append_ckv_stride_n,
+    size_t append_kpe_stride_n, uint8_t* __restrict__ ckv_sf, size_t ckv_sf_stride_page,
+    size_t ckv_sf_stride_n, float ckv_scale, float kpe_scale) {
+  constexpr uint32_t SF_VEC_SIZE = 16;
+  constexpr uint32_t PACKED_PER_SF = SF_VEC_SIZE / 2;
+  constexpr uint32_t NUM_SF_BLOCKS = head_dim_ckv / SF_VEC_SIZE;
+  static_assert(head_dim_ckv % SF_VEC_SIZE == 0);
+
+  const uint32_t tx = threadIdx.x;
+  const uint32_t cta_id = blockIdx.x;
+  const uint32_t num_ctas = gridDim.x;
+  const float kpe_inv_scale = __frcp_rn(kpe_scale);
+
+  for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
+    uint32_t page_iter, entry_idx;
+    paged_kv_mla.page_size.divmod(
+        paged_kv_mla.indptr[batch_indices[i]] * paged_kv_mla.page_size + positions[i], page_iter,
+        entry_idx);
+    const IdType page_idx = __ldg(paged_kv_mla.indices + page_iter);
+    if (tx < NUM_SF_BLOCKS) {
+      uint8_t* packed_out = paged_kv_mla.ckv_data + paged_kv_mla.get_elem_offset_ckv(
+                                                        page_idx, entry_idx, tx * PACKED_PER_SF);
+      uint8_t* sf_out = ckv_sf + page_idx * ckv_sf_stride_page + entry_idx * ckv_sf_stride_n + tx;
+      nvfp4_append_quantize_block<DType, /*precise_rounding=*/true>(
+          append_ckv, ckv_scale, static_cast<size_t>(i) * append_ckv_stride_n, tx * SF_VEC_SIZE,
+          packed_out, sf_out);
+    }
+    if (tx < head_dim_kpe) {
+      const float value =
+          nvfp4_append_to_float(append_kpe[static_cast<size_t>(i) * append_kpe_stride_n + tx]) *
+          kpe_inv_scale;
+      uint8_t* kpe_out =
+          paged_kv_mla.kpe_data + paged_kv_mla.get_elem_offset_kpe(page_idx, entry_idx, tx);
+      *kpe_out = __nv_fp8_e4m3(value).__x;
+    }
+  }
+}
+
+template <typename DType, typename IdType>
+cudaError_t NVFP4QuantizeAppendPagedKVMlaCache(
+    paged_kv_mla_t<uint8_t, IdType> paged_kv, DType* append_ckv, DType* append_kpe,
+    IdType* batch_indices, IdType* positions, uint32_t nnz, size_t append_ckv_stride_n,
+    size_t append_kpe_stride_n, uint8_t* ckv_sf, size_t ckv_sf_stride_page, size_t ckv_sf_stride_n,
+    float ckv_scale, float kpe_scale, cudaStream_t stream = nullptr) {
+  constexpr uint32_t HEAD_CKV_DIM = 512;
+  constexpr uint32_t HEAD_KPE_DIM = 64;
+  FLASHINFER_CHECK(paged_kv.head_dim_ckv == HEAD_CKV_DIM / 2,
+                   "packed head_dim_ckv must be equal to 256");
+  FLASHINFER_CHECK(paged_kv.head_dim_kpe == HEAD_KPE_DIM, "head_dim_kpe must be equal to 64");
+  if (nnz == 0) {
+    return cudaSuccess;
+  }
+
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+  constexpr uint32_t num_threads = HEAD_KPE_DIM;
+  uint32_t smem_size = 0;
+  auto kernel = NVFP4QuantizeAppendPagedKVMlaCacheKernel<HEAD_CKV_DIM, HEAD_KPE_DIM, DType, IdType>;
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                     num_threads, smem_size));
+  num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(int(nnz), num_sms));
+  dim3 nblks(num_blocks_per_sm * num_sms);
+  dim3 nthrs(num_threads);
+  void* args[] = {(void*)&paged_kv,
+                  (void*)&append_ckv,
+                  (void*)&append_kpe,
+                  (void*)&batch_indices,
+                  (void*)&positions,
+                  (void*)&nnz,
+                  (void*)&append_ckv_stride_n,
+                  (void*)&append_kpe_stride_n,
+                  (void*)&ckv_sf,
+                  (void*)&ckv_sf_stride_page,
+                  (void*)&ckv_sf_stride_n,
+                  (void*)&ckv_scale,
+                  (void*)&kpe_scale};
   FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   return cudaSuccess;
 }

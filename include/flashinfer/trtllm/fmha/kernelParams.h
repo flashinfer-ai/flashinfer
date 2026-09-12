@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2011-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2011-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification, are not permit-
  * ted.
@@ -79,6 +79,11 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor. The field order must
+  // stay in sync with the kernels or every later field is misread by the cubins.
+  float const* ptrDsv4InvRopeCosSinCache;
+  // DSv4 output scales. RopeQuant cubins interpret this as packed UE8M0 bytes in INT32 storage.
+  float* ptrDsv4OScale;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -130,6 +135,8 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // Padded token dimension for the DSv4 fused packed UE8M0 scale layout.
+  int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
   float mInflateMax;
@@ -195,7 +202,7 @@ struct KernelParams {
   template <class FmhaOptions>
   static auto makeTmaShapeStrideQ(FmhaOptions const& options, bool groupsHeadsQ,
                                   bool groupsTokensHeadsQ, int32_t tileSizeQ,
-                                  int32_t numEltsInClampedHeadDimQ) {
+                                  int32_t tileSizePerCtaQ, int32_t numEltsInClampedHeadDimQ) {
     //
     // The Q has shape of [numTokens * numHeadsQPerKv, numHeadsKv * 1, headDim]
     // when grouping headsQ, otherwise it would be [numTokens, numHeadsQPerKv * numHeadsKv,
@@ -265,8 +272,10 @@ struct KernelParams {
     // The tile shape for TMA.
     auto tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ), 1, 1,
                                             static_cast<uint32_t>(tileSizeQ)};
-    // The number of tokensQ per CTA.
-    int32_t numTokensPerCtaQ{tileSizeQ};
+    // The number of tokensQ per CTA (the CTA covers all Q tile instances).
+    int32_t numTokensPerCtaQ{tileSizePerCtaQ};
+    // The number of tokensQ loaded by one Q tile instance (the TMA box covers one instance).
+    int32_t numTokensPerTileQ{tileSizeQ};
     // Re-compute the number of tokensQ per CTA if groupsHeadsQ is enabled.
     if (groupsHeadsQ) {
       if (groupsTokensHeadsQ) {
@@ -275,13 +284,15 @@ struct KernelParams {
         // tensor to [numTokensQ, numGroupedHeads, numHeads, headDimQ] and we might want to revisit
         // this in the future.
         numTokensPerCtaQ = static_cast<int32_t>(numTokensPerCtaQ / numGroupedHeads);
+        numTokensPerTileQ = static_cast<int32_t>(numTokensPerTileQ / numGroupedHeads);
       } else {
-        numGroupedHeads = tileSizeQ;
+        numGroupedHeads = tileSizePerCtaQ;
         numTokensPerCtaQ = 1;
+        numTokensPerTileQ = 1;
       }
       tileShapes = std::vector<uint32_t>{static_cast<uint32_t>(numEltsInClampedHeadDimQ),
                                          static_cast<uint32_t>(numGroupedHeads), 1,
-                                         static_cast<uint32_t>(numTokensPerCtaQ)};
+                                         static_cast<uint32_t>(numTokensPerTileQ)};
     }
 
     return std::make_tuple(shape, stride, tileShapes, numTokensPerCtaQ);
@@ -382,8 +393,11 @@ struct KernelParams {
       strideBatch = options.vStrideBatch;
     }
 
-    // Ragged layout has no batch stride; reset negative overflow to 0 for TMA descriptor.
-    if (!isPagedKv(options.mQkvLayout) && !isContiguousKv(options.mQkvLayout) && strideBatch < 0) {
+    // The TRTLLM-GEN ragged prefill launcher uses SeparateQkv for packed non-paged
+    // K/V. makeShapeKv collapses non-paged/non-contiguous K/V to a singleton batch
+    // dimension, so the TMA descriptor must not inherit a synthetic numel-derived
+    // batch stride. Zero handles both negative and positive int32 wraparound.
+    if (isSeparateQkv(options.mQkvLayout)) {
       strideBatch = 0;
     }
 
@@ -677,7 +691,7 @@ struct KernelParams {
     // Shape/stride for gmem tensor Q.
     auto [shapeQ, strideQ, tileShapeQ, numTokensPerCtaQ] =
         makeTmaShapeStrideQ(options, kernelMeta.mGroupsHeadsQ, kernelMeta.mGroupsTokensHeadsQ,
-                            kernelMeta.mTileSizeQ, numEltsInClampedHeadDimQ);
+                            kernelMeta.mTileSizeQ, kernelMeta.mStepQ, numEltsInClampedHeadDimQ);
     // Build tma descriptor for Q.
     params.tmaQ_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeQ, shapeQ, strideQ, tileShapeQ,
                                         const_cast<void*>(qPtr));
@@ -829,6 +843,8 @@ struct KernelParams {
     params.ptrO = options.oPtr;
     // The output scaling factor buffer.
     params.ptrSfO = options.oSfPtr;
+    params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
+    params.ptrDsv4OScale = options.dsv4OScalePtr;
 
     // TRT-LLM restrictions: the quantization scales must be on the device.
     params.ptrOutputScale = options.outputScalePtr;
@@ -891,6 +907,7 @@ struct KernelParams {
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
+    params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;

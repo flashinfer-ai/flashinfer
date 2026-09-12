@@ -164,7 +164,7 @@ python -m pip install dist/*.whl
 
 ```bash
 # flashinfer-jit-cache (customize for your target GPUs)
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f"
+export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f"
 cd flashinfer-jit-cache
 python -m build --no-isolation --wheel
 python -m pip install dist/*.whl
@@ -226,9 +226,10 @@ Users can customize their own attention variants with additional parameters. For
 
 ## CUDA Support
 
-**Supported CUDA Versions:** 12.6, 12.8, 13.0, 13.1
+**Supported CUDA Versions:** 12.9, 13.0, and 13.4 (PyTorch nightly)
 
 > **Note:** FlashInfer strives to follow PyTorch's supported CUDA versions plus the latest CUDA release.
+> CUDA 13.4 wheels are built with the preview toolkit and PyTorch nightly; runtime CI currently covers CUDA 12.9 and 13.0.
 
 ## Adoption
 

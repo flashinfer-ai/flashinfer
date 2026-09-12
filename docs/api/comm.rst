@@ -33,6 +33,35 @@ Mapping Utilities
 
     Mapping
 
+All-Gather Matmul
+-----------------
+
+``all_gather_matmul`` keeps its architecture-based default routing when
+``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
+the source-built fused backend for contiguous bfloat16 or float16 inputs with
+``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
+memory backend, and a two- or four-rank NCCL process group. The local input may
+be an ordinary contiguous CUDA tensor because Cake uses internal symmetric
+scratch and flags for remote access and synchronization. Unsupported explicit
+Cake requests raise instead of silently falling back.
+The packaged manifest carries the exact dynamic shared-memory requirement
+resolved for every generated main route; the loader validates that value
+against the packaged CUDA source before compiling the host launcher.
+
+``prepare_all_gather_matmul`` prepares the source-built packed-QKV route for
+SM103, bfloat16, four-rank NCCL groups, contiguous ``[M, 8192]`` inputs, and a
+contiguous ``[8192, 2560]`` weight, where ``M`` is a positive multiple of 128.
+It binds the weight and process group once and returns a callable that accepts
+a contiguous input with the same shape, dtype, and device. Both
+``backend="auto"`` and ``backend="cake"`` select this prepared route.
+Unsupported configurations raise during preparation instead of falling back.
+
+.. autosummary::
+    :toctree: ../generated
+
+    all_gather_matmul
+    prepare_all_gather_matmul
+
 TensorRT-LLM AllReduce
 ----------------------
 
@@ -143,6 +172,91 @@ vLLM AllReduce
     vllm_get_graph_buffer_ipc_meta
     vllm_meta_size
 
+PCIe IPC AllReduce
+------------------
+
+Custom all-reduce for intra-node PCIe machines without NVLink. Admission is a
+capability check — world size, dtype, workspace capacity, and enough payload
+for every rank to own a share — and shapes it rejects fall back to the caller's
+own collective.
+
+.. code-block:: python
+
+    import flashinfer.comm as comm
+
+    # Collective: every rank builds the workspace with identical arguments.
+    # Size max_numel to the real workload -- an oversized one costs latency.
+    ws = comm.PcieIpcAllReduceWorkspace(group=group, max_numel=128 * 6144)
+
+    for x in activations:                     # same shapes, same order, all ranks
+        if ws.supports(x):
+            y = ws.all_reduce(x)              # out-of-place
+        else:
+            y = x.clone()
+            dist.all_reduce(y, group=group)   # unsupported shape: fall back
+
+    ws.destroy()                              # collective; all ranks together
+
+``supports()`` is a pure function of shape and dtype, so every rank reaches the
+same answer without agreeing on one at runtime. It says nothing about speed: a
+supported shape runs a seed launch configuration — one crossover keyed on the
+payload in bytes, no per-machine constants — and warns once per workspace until
+:meth:`~PcieIpcAllReduceWorkspace.tune` has measured the real one and persisted
+it, since the crossovers depend on the fabric.
+:func:`get_pcie_ipc_launch_config` exposes that seed for a
+``(world_size, numel, elem_size)`` triple, and returns ``None`` only for shapes
+the kernels cannot run.
+
+The kernels spin on peer flags with no timeout, so ranks that disagree on
+shape, dtype or call order hang rather than raise. One workspace serves one
+CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
+ordering the two if a move is genuinely needed.
+
+Two data planes
+~~~~~~~~~~~~~~~
+
+Above roughly a megabyte the workspace can move the payload with the copy
+engines instead of with SM load/store. The reason is not that the copy engine
+is faster per hop — in isolation the two are comparable — but that it keeps
+its throughput when every rank transfers at once, where SM peer traffic loses
+bandwidth to the concurrency. So the gap widens with world size, which is what
+makes a second plane worth having at these payload sizes.
+
+It is a second protocol rather than a flag on the existing kernels. The SM path
+encodes readiness in the payload — ``+0.0`` means "not yet written" — which a
+copy engine can neither produce nor observe, so the ring synchronises through
+monotonic flags on side streams instead. Nothing about the SM kernels changes.
+
+Both planes are ordinary tuner candidates, so nothing needs to be declared at
+the call site and there is no notion of a prefill or decode "phase": the
+configuration follows the payload in bytes.
+:class:`PcieIpcVariant` gains ``COPY_ENGINE_RING``, a flat neighbour ring, and
+``COPY_ENGINE_ISLAND``, a 4+4 decomposition offered only at world size 8 and
+only on ``rootcplx-noswitch``, where a ring's two socket-crossing hops would
+otherwise set the pace. On that variant ``blocks`` carries the ring's sub-chunk
+depth rather than a grid size.
+
+.. warning::
+
+    Tuning covers the batch sizes it is given, and shapes above the largest one
+    are served by whatever was measured there. Leave ``tune_batches`` unset and
+    the ladder is derived from ``max_numel``, which covers everything the
+    workspace admits; pass it explicitly and the top of the range is yours to
+    get right. :meth:`~PcieIpcAllReduceWorkspace.tune` warns when an explicit
+    list leaves a gap, and refuses to persist results measured below the
+    default sample counts, since a table that is quietly wrong is worse than
+    one that is missing.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PcieIpcAllReduceWorkspace
+    PcieIpcLaunchConfig
+    PcieIpcVariant
+    get_pcie_ipc_launch_config
+    probe_pcie_ipc_rank_topology
+    resolve_pcie_ipc_profile
+
 Ulysses Context-Parallel All-to-All
 -----------------------------------
 
@@ -252,12 +366,15 @@ Topology Probing and Backend Selection
 .. autosummary::
     :toctree: ../generated
 
-    resolve_ulysses_backend
-    decide_ulysses_backend
-    probe_ulysses_rank_topology
     UlyssesBackendDecision
     UlyssesRankTopology
     UlyssesBackendError
+
+.. autofunction:: resolve_ulysses_backend
+
+.. autofunction:: decide_ulysses_backend
+
+.. autofunction:: probe_ulysses_rank_topology
 
 Raw Kernel Entry Points (advanced)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

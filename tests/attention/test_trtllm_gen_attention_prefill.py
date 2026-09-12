@@ -46,6 +46,207 @@ from tests.attention.test_trtllm_gen_attention_decode import (
 )
 
 
+_SPCOMPRESS_TILE_GEOMETRY = {
+    # (head_dim, q_dtype, kv_dtype) -> (tile_size_kv, num_tokens_per_cta)
+    (128, "fp8", "fp8"): (128, 128),
+    (256, "fp8", "fp8"): (128, 128),
+}
+
+
+def _spcompress_reference(
+    ref_q: torch.Tensor,
+    k_flat: torch.Tensor,
+    v_flat: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    sm_scale: float,
+    *,
+    causal: bool,
+    window_left: int,
+    chunked_attention_size: int,
+    sink: torch.Tensor | None,
+    tile_size_kv: int,
+    num_tokens_per_cta: int,
+) -> torch.Tensor:
+    """Vectorized port of FmhaReference.cu:218-363's spcompress path.
+
+    Departs from the kernel's per-tile online-softmax structure: builds the
+    full [Lq, Lk] sparsity mask in one pass, then runs a single dense softmax.
+    Online-softmax is a numerical-stability rewrite, not part of the math
+    being verified - folding it out trades a per-tile Python loop for a
+    handful of large tensor ops, which is what makes long-sequence
+    parametrizations practical.
+
+    Returns fp32 [sumSeqQ, num_qo_heads, head_dim].
+    """
+    qo_indptr_cpu = qo_indptr.cpu()
+    kv_indptr_cpu = kv_indptr.cpu()
+    batch_size = qo_indptr_cpu.numel() - 1
+    num_qo_heads = ref_q.shape[1]
+    num_kv_heads = k_flat.shape[1]
+    head_dim = ref_q.shape[-1]
+    head_grp = num_qo_heads // num_kv_heads
+    device = ref_q.device
+
+    out = torch.zeros(
+        ref_q.shape[0], num_qo_heads, head_dim, device=device, dtype=torch.float32
+    )
+
+    # tile_size_kv % 4 must be 0 for the group-to-tile mapping below to hold:
+    # otherwise a group-of-4 along K could straddle a tile boundary and the
+    # interior/boundary lookup wouldn't be well-defined.
+    assert tile_size_kv % 4 == 0, "tile_size_kv must be a multiple of 4"
+
+    for i in range(batch_size):
+        q0 = int(qo_indptr_cpu[i].item())
+        q1 = int(qo_indptr_cpu[i + 1].item())
+        kv0 = int(kv_indptr_cpu[i].item())
+        kv1 = int(kv_indptr_cpu[i + 1].item())
+        seq_len_q = q1 - q0
+        seq_len_kv = kv1 - kv0
+        if seq_len_q == 0 or seq_len_kv == 0:
+            continue
+
+        # Causal Q-row -> K offset: each Q row i sees K rows [0, seqOffsetQ + i].
+        seq_offset_q = seq_len_kv - seq_len_q if causal else 0
+
+        q_b = ref_q[q0:q1].float()  # [Lq, Hq, D]
+        k_b = k_flat[kv0:kv1].float()  # [Lk, Hkv, D]
+        v_b = v_flat[kv0:kv1].float()  # [Lk, Hkv, D]
+        if head_grp > 1:
+            k_b = k_b.repeat_interleave(head_grp, dim=1)
+            v_b = v_b.repeat_interleave(head_grp, dim=1)
+
+        q_t = q_b.transpose(0, 1)  # [Hq, Lq, D]
+        k_t = k_b.transpose(0, 1)  # [Hq, Lk, D]
+        v_t = v_b.transpose(0, 1)  # [Hq, Lk, D]
+
+        # Full QK^T scaled. [Hq, Lq, Lk]
+        logits = torch.matmul(q_t, k_t.transpose(-1, -2)) * sm_scale
+
+        # Causal / sliding-window / chunked mask.
+        row_q_pos = torch.arange(seq_len_q, device=device) + seq_offset_q  # [Lq]
+        k_pos = torch.arange(seq_len_kv, device=device)  # [Lk]
+        if causal:
+            attn_mask = k_pos.unsqueeze(0) <= row_q_pos.unsqueeze(1)  # [Lq, Lk]
+        else:
+            attn_mask = torch.ones(
+                (seq_len_q, seq_len_kv), dtype=torch.bool, device=device
+            )
+        if window_left >= 0:
+            attn_mask = attn_mask & (
+                row_q_pos.unsqueeze(1) - k_pos.unsqueeze(0) <= window_left
+            )
+        if chunked_attention_size > 0:
+            q_chunk = (row_q_pos // chunked_attention_size).unsqueeze(1)
+            k_chunk = (k_pos // chunked_attention_size).unsqueeze(0)
+            attn_mask = attn_mask & (q_chunk == k_chunk)
+        # Apply causal mask before computing top-2 so masked positions can't
+        # be preferred over finite ones (they're already -inf).
+        logits = torch.where(attn_mask.unsqueeze(0), logits, float("-inf"))
+
+        # Per-(cta-chunk, kv-tile) interior status, vectorized over both
+        # axes. Formula matches FmhaReference.cu - interior iff the tile
+        # lies strictly inside the chunk's [last_start, first_end] window.
+        num_chunks = (seq_len_q + num_tokens_per_cta - 1) // num_tokens_per_cta
+        num_tiles = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
+        cta_starts = (
+            torch.arange(num_chunks, device=device) * num_tokens_per_cta
+        )  # [num_chunks]
+        if causal:
+            ki_first_end = seq_offset_q + cta_starts + 1
+            ki_last_end = seq_offset_q + cta_starts + num_tokens_per_cta
+        else:
+            ki_first_end = torch.full_like(cta_starts, seq_len_kv)
+            ki_last_end = torch.full_like(cta_starts, seq_len_kv)
+        if window_left >= 0:
+            ki_last_start = (ki_last_end - (window_left + 1)).clamp(min=0)
+        elif chunked_attention_size > 0:
+            ki_last_start = (
+                (seq_offset_q + cta_starts) // chunked_attention_size
+            ) * chunked_attention_size
+        else:
+            ki_last_start = torch.zeros_like(cta_starts)
+
+        tile_starts = (
+            torch.arange(num_tiles, device=device) * tile_size_kv
+        )  # [num_tiles]
+        tile_ends = (tile_starts + tile_size_kv).clamp(max=seq_len_kv)
+        is_interior = (tile_starts.unsqueeze(0) >= ki_last_start.unsqueeze(1)) & (
+            tile_ends.unsqueeze(0) <= ki_first_end.unsqueeze(1)
+        )  # [num_chunks, num_tiles]
+
+        # Apply 2:4 keep-largest in groups of 4 along K, but only inside
+        # interior tiles. Tail of < 4 elements is always dense (matches the
+        # kernel's `numGroups = numEltsInTile / 4` truncation).
+        n_full_groups = seq_len_kv // 4
+        if n_full_groups > 0:
+            groups_per_tile = tile_size_kv // 4
+            q_chunk_of_row = (
+                torch.arange(seq_len_q, device=device) // num_tokens_per_cta
+            )
+            tile_of_group = (
+                torch.arange(n_full_groups, device=device) // groups_per_tile
+            )
+            interior_per_group = is_interior[q_chunk_of_row][:, tile_of_group]
+            # [Lq, n_full_groups]
+
+            grouped = logits[..., : n_full_groups * 4].reshape(
+                num_qo_heads, seq_len_q, n_full_groups, 4
+            )
+            _, top_idx = torch.topk(grouped, k=2, dim=-1)
+            top2_keep = torch.zeros_like(grouped, dtype=torch.bool)
+            top2_keep.scatter_(-1, top_idx, True)
+            keep_groups = torch.where(
+                interior_per_group.view(1, seq_len_q, n_full_groups, 1),
+                top2_keep,
+                torch.ones_like(top2_keep),
+            )
+            keep_head = keep_groups.reshape(num_qo_heads, seq_len_q, n_full_groups * 4)
+            tail_len = seq_len_kv - n_full_groups * 4
+            if tail_len > 0:
+                keep_tail = torch.ones(
+                    num_qo_heads,
+                    seq_len_q,
+                    tail_len,
+                    dtype=torch.bool,
+                    device=device,
+                )
+                keep_mask = torch.cat([keep_head, keep_tail], dim=-1)
+            else:
+                keep_mask = keep_head
+            logits = torch.where(keep_mask, logits, float("-inf"))
+
+        # Sink: virtual K column at logit value sink[h], V row of zeros.
+        # Mathematically equivalent to the kernel's per-CTA sink fold because
+        # the sink logit is tile-invariant.
+        if sink is not None:
+            sink_col = (
+                sink.float().view(num_qo_heads, 1, 1).expand(num_qo_heads, seq_len_q, 1)
+            )
+            logits = torch.cat([logits, sink_col], dim=-1)
+            v_padded = torch.cat(
+                [
+                    v_t,
+                    torch.zeros(
+                        num_qo_heads, 1, head_dim, device=device, dtype=torch.float32
+                    ),
+                ],
+                dim=1,
+            )
+        else:
+            v_padded = v_t
+
+        # Single dense softmax. Rows with all -inf produce NaN; zero them so
+        # those Q positions contribute zeros to the output.
+        probs = torch.softmax(logits, dim=-1)
+        probs = torch.nan_to_num(probs, nan=0.0)
+        out_b = torch.matmul(probs, v_padded)  # [Hq, Lq, D]
+        out[q0:q1] = out_b.transpose(0, 1)
+
+    return out
+
+
 def _test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -68,6 +269,8 @@ def _test_trtllm_batch_prefill(
     uses_shared_paged_kv_idx: bool = True,
     return_lse: bool | None = None,
     provide_lse: bool = False,
+    use_fp16_softmax: bool = False,
+    uses_spcompress: bool = False,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -82,10 +285,30 @@ def _test_trtllm_batch_prefill(
 
     # NVFP4 KV cache constraints
     if kv_dtype == "nvfp4":
+        if compute_capability == (10, 7):
+            pytest.skip("KV Cache NVFP4 is not supported on SM107")
         if q_dtype != "fp8":
             pytest.skip("NVFP4 KV cache requires FP8 query")
         if o_dtype != "fp8":
             pytest.skip("NVFP4 KV cache only supports FP8 output")
+
+    # Cubin-variant selectors. trtllm-gen only exports the Fp16Softmax / Spcomp
+    # variants for sm107a, and the Python layer raises rather than falling back.
+    if (use_fp16_softmax or uses_spcompress) and compute_capability != (10, 7):
+        pytest.skip(
+            "use_fp16_softmax / uses_spcompress are only supported on SM107 (Rubin)"
+        )
+
+    if uses_spcompress:
+        if q_dtype != "fp8":
+            pytest.skip("uses_spcompress requires FP8 Q")
+        if kv_dtype == "nvfp4":
+            pytest.skip("uses_spcompress is not shipped for NVFP4 KV")
+        if (head_dim, q_dtype, kv_dtype) not in _SPCOMPRESS_TILE_GEOMETRY:
+            pytest.skip(
+                f"no spcompress tile geometry for "
+                f"(head_dim={head_dim}, q_dtype={q_dtype}, kv_dtype={kv_dtype})"
+            )
 
     # Set up test parameters
     torch.manual_seed(0)
@@ -156,7 +379,34 @@ def _test_trtllm_batch_prefill(
     }
     lse_ref = None
     sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
-    if head_dim > 256:
+    if uses_spcompress:
+        # Boundary tiles attend densely; interior tiles get 2:4 keep-largest along K.
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
+            kv_layout,
+        )
+        tile_size_kv, num_tokens_per_cta = _SPCOMPRESS_TILE_GEOMETRY[
+            (head_dim, q_dtype, kv_dtype)
+        ]
+        output_ref = _spcompress_reference(
+            ref_q,
+            k_flat,
+            v_flat,
+            q_indptr,
+            kv_indptr_tokens,
+            sm_scale,
+            causal=causal,
+            window_left=window_left,
+            chunked_attention_size=0,
+            sink=(sink if enable_sink else None),
+            tile_size_kv=tile_size_kv,
+            num_tokens_per_cta=num_tokens_per_cta,
+        )
+    elif head_dim > 256:
         # FlashInfer's own FA2/FA3 kernels don't support head_dim > 256;
         # fall back to a PyTorch SDPA reference (causal/windowed only, no sink support).
         assert not enable_sink, (
@@ -234,6 +484,8 @@ def _test_trtllm_batch_prefill(
         and o_dtype != "nvfp4"
         and kv_dtype != "nvfp4"
         and q_dtype != "fp8"
+        and not use_fp16_softmax
+        and not uses_spcompress
     )
     if (return_lse or provide_lse) and not check_lse:
         pytest.skip("LSE contract validation requires a reliable LSE reference")
@@ -291,6 +543,8 @@ def _test_trtllm_batch_prefill(
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
         lse=provided_lse,
         return_lse=effective_return_lse,
+        use_fp16_softmax=use_fp16_softmax,
+        uses_spcompress=uses_spcompress,
     )
     if expects_lse:
         if effective_return_lse:
@@ -367,8 +621,12 @@ def _test_trtllm_batch_prefill(
         )
 
     if (
-        o_dtype != "nvfp4" and kv_dtype != "nvfp4" and uses_shared_paged_kv_idx
-    ):  # wrapper api does not support fp4 output/kv or separate KV page indices yet.
+        o_dtype != "nvfp4"
+        and kv_dtype != "nvfp4"
+        and uses_shared_paged_kv_idx
+        and not use_fp16_softmax
+        and not uses_spcompress
+    ):  # wrapper api does not support fp4 output/kv, separate KV page indices, or the cubin-variant flags.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -570,6 +828,70 @@ def test_trtllm_batch_prefill_bs1(
     )
 
 
+@pytest.mark.parametrize("kv_layout", ["HND"])
+@pytest.mark.parametrize(
+    "batch_size,page_size,num_kv_heads,head_grp_size",
+    [
+        (4, 16, 2, 1),
+    ],
+)
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp16"),
+        ("fp8", "fp8", "fp8"),
+    ],
+)
+@pytest.mark.parametrize(
+    "head_dim,window_left",
+    [
+        (128, -1),
+        (256, -1),
+        (128, 127),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [None])
+@pytest.mark.parametrize("enable_sink", [False, True])
+@pytest.mark.parametrize("max_q_len", [511, 3023])
+@pytest.mark.parametrize("max_kv_len", [2047, 8192])
+def test_trtllm_batch_prefill_cubin_variants(
+    kv_layout: str,
+    batch_size: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    window_left: int,
+    q_dtype: str,
+    o_dtype: str,
+    kv_dtype: str,
+    enable_pdl: bool,
+    enable_sink: bool,
+    max_q_len: int,
+    max_kv_len: int,
+    head_dim: int,
+):
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        batch_size,
+        page_size,
+        num_kv_heads,
+        head_grp_size,
+        True,
+        window_left,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        enable_pdl,
+        enable_sink,
+        max_q_len,
+        max_kv_len,
+        False,
+        head_dim,
+        uses_spcompress=True,
+    )
+
+
 @pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
 @pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_prefill_dynamic_page_size_gqa(
@@ -690,15 +1012,24 @@ def test_trtllm_gen_prefill(
     causal: bool,
     skips_softmax: bool,
     enable_sink: bool,
+    use_fp16_softmax: bool = False,
 ) -> None:
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
+    if use_fp16_softmax:
+        if backend == "cute-dsl":
+            pytest.skip("use_fp16_softmax is only supported by the trtllm-gen backend")
+        if compute_capability != (10, 7):
+            # trtllm-gen only exports the Fp16Softmax cubin variants for sm107a.
+            pytest.skip("use_fp16_softmax=True is only supported on SM107 (Rubin)")
 
     head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
     if backend == "cute-dsl":
+        if compute_capability == (10, 7):
+            pytest.skip("cute-dsl FMHA prefill is not yet enabled on SM107")
         if head_dim_qk == 192:
             pytest.skip("cute-dsl does not support bf16 with head_dim=192")
 
@@ -828,20 +1159,49 @@ def test_trtllm_gen_prefill(
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         out=output,
         backend=backend,
+        use_fp16_softmax=use_fp16_softmax,
     )
+    out_atol, out_rtol = 1e-2, 1e-2
+    lse_atol, lse_rtol = 1e-3, 1e-3
+    if use_fp16_softmax:
+        out_atol, out_rtol = 3e-2, 3e-2
+        lse_atol, lse_rtol = 1e-2, 1e-2
     torch.testing.assert_close(
         output_trtllm,
         output_ref,
-        atol=1e-2,
-        rtol=1e-2,
+        atol=out_atol,
+        rtol=out_rtol,
     )
     if lse_ref is not None:
         torch.testing.assert_close(
             lse_trtllm,
             lse_ref,
-            atol=1e-3,
-            rtol=1e-3,
+            atol=lse_atol,
+            rtol=lse_rtol,
         )
+
+
+@pytest.mark.parametrize(
+    "mla_dimensions", [deepseek_mla_dimensions, smaller_mla_dimensions]
+)
+@pytest.mark.parametrize("causal", [True, False])
+def test_trtllm_gen_prefill_use_fp16_softmax(
+    mla_dimensions: MLAHeadDimensions,
+    causal: bool,
+) -> None:
+    test_trtllm_gen_prefill(
+        backend="trtllm-native",
+        mla_dimensions=mla_dimensions,
+        batch_size=4,
+        s_qo=64,
+        s_kv=64,
+        num_kv_heads=16,
+        head_grp_size=1,
+        causal=causal,
+        skips_softmax=False,
+        enable_sink=False,
+        use_fp16_softmax=True,
+    )
 
 
 @pytest.mark.parametrize("backend", ["cute-dsl"])
@@ -870,6 +1230,8 @@ def test_trtllm_gen_prefill_fp8(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if compute_capability == (10, 7):
+        pytest.skip("cute-dsl FMHA prefill is not yet enabled on SM107")
 
     head_dim_qk = mla_dimensions.qk_nope_head_dim + mla_dimensions.qk_rope_head_dim
     head_dim_vo = mla_dimensions.v_head_dim

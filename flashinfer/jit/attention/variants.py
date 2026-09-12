@@ -38,8 +38,9 @@ struct AttentionSink : AttentionVariantBase {
   REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
     float log_sink = (kv_tile_idx == 0 && qo_head_idx < params.num_qo_heads) ? params.sink[qo_head_idx] * math::log2e : -math::inf;
     float m_new = (log_sink > m) ? log_sink : m;
-    scale = math::ptx_exp2(m - m_new);
-    float d_new = math::ptx_exp2(log_sink - m_new) + d * scale;
+    // max() drops the NaN from (-inf) - (-inf) on chunks whose rows are fully masked.
+    scale = math::ptx_exp2(max(m - m_new, -math::inf));
+    float d_new = math::ptx_exp2(max(log_sink - m_new, -math::inf)) + d * scale;
     // Update m and d
     m = m_new;
     d = d_new;
@@ -87,7 +88,9 @@ struct OnlineSoftmaxWithSink {
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
         float scores_max_cur = row_max(mi);
-        scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * sm_scale_log2);
+        // max() drops the NaN from (-inf) - (-inf) on fully masked rows.
+        scores_scale(mi) =
+            exp2f(max((scores_max_prev(mi) - scores_max_cur) * sm_scale_log2, -math::inf));
         row_sum(mi) *= scores_scale(mi);
       }
       // perform exp2 on scores

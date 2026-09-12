@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Union
 
@@ -38,6 +39,7 @@ def _get_cuda_stream_ptr() -> int:
 
 SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
+    ActivationType.GegluTanh,
     ActivationType.Relu2,
 )
 
@@ -52,6 +54,26 @@ def normalize_cute_dsl_moe_activation_type(
             f"Unsupported activation_type {activation_type!r}; expected {expected}"
         )
     return activation_type, is_gated_activation(activation_type)
+
+
+def validate_cute_dsl_moe_situ_config(
+    activation_type: ActivationType,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+) -> None:
+    """Validate the optional SiTU variant of the SwiGLU epilogue."""
+    if situ_beta is None:
+        if situ_linear_beta is not None:
+            raise ValueError("situ_linear_beta requires situ_beta")
+        return
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError("SiTU parameters require ActivationType.Swiglu")
+    if not math.isfinite(situ_beta) or situ_beta <= 0:
+        raise ValueError("situ_beta must be positive and finite")
+    if situ_linear_beta is not None and (
+        not math.isfinite(situ_linear_beta) or situ_linear_beta <= 0
+    ):
+        raise ValueError("situ_linear_beta must be positive and finite when set")
 
 
 def get_max_num_tiles(
@@ -226,6 +248,7 @@ def moe_permute(
         top_k,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
@@ -627,6 +650,11 @@ def moe_sort(
 
     # Use pre-allocated buffers if provided, otherwise allocate new ones
     # Pre-allocation is required for CUDA graph compatibility
+    #
+    # Entries outside the active prefix are intentionally uninitialized.
+    # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
+    # that count. Rubin multi-CTA tactics, which would require rounded/padded
+    # metadata entries, are rejected before moe_sort.
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:

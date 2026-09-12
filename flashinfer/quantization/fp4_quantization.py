@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -37,8 +37,10 @@ from ..jit import (
     sm120a_nvcc_flags,
     sm120f_nvcc_flags,
     sm110a_nvcc_flags,
+    sm107a_nvcc_flags,
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     sm90a_nvcc_flags,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
@@ -172,6 +174,13 @@ def gen_fp4_quantization_sm103_module() -> JitSpec:
     return gen_fp4_quantization_module(sm103a_nvcc_flags, "103")
 
 
+def gen_fp4_quantization_sm107_module() -> JitSpec:
+    from flashinfer.compilation_context import cutlass_supports_sm107
+
+    nvcc_flags = sm107a_nvcc_flags if cutlass_supports_sm107() else sm100f_nvcc_flags
+    return gen_fp4_quantization_module(nvcc_flags, "107")
+
+
 def gen_fp4_quantization_sm90_module() -> JitSpec:
     return gen_fp4_quantization_module(sm90a_nvcc_flags, "90")
 
@@ -225,11 +234,12 @@ def gen_fp4_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitS
 
 @functools.cache
 def get_fp4_quantization_module(backend: str = "100"):
-    backend_modules = {
+    backend_modules: Dict[str, Callable[..., JitSpec]] = {
         "121": gen_fp4_quantization_sm121_module,
         "120f": gen_fp4_quantization_sm120f_module,
         "120": gen_fp4_quantization_sm120_module,
         "110": gen_fp4_quantization_sm110_module,
+        "107": gen_fp4_quantization_sm107_module,
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
@@ -479,6 +489,41 @@ def get_fp4_quantization_module(backend: str = "100"):
         )
 
     @register_custom_op(
+        "flashinfer::nvfp4_quant_and_per_token_scale_out_sm100",
+        mutates_args=("output", "output_scale", "output_per_token_scale"),
+    )
+    def nvfp4_quant_and_per_token_scale_out_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        output: torch.Tensor,
+        output_scale: torch.Tensor,
+        output_per_token_scale: torch.Tensor,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> None:
+        module.nvfp4_quant_and_per_token_scale(
+            input,
+            scale_inv,
+            output,
+            output_scale,
+            output_per_token_scale,
+            expanded_idx_to_permuted_idx,
+            sf_layout,
+        )
+
+    @register_fake_op("flashinfer::nvfp4_quant_and_per_token_scale_out_sm100")
+    def _fake_nvfp4_quant_and_per_token_scale_out_sm100(
+        input: torch.Tensor,
+        scale_inv: float,
+        output: torch.Tensor,
+        output_scale: torch.Tensor,
+        output_per_token_scale: torch.Tensor,
+        expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
+        sf_layout: int = SfLayout.layout_linear.value,
+    ) -> None:
+        pass
+
+    @register_custom_op(
         "flashinfer::nvfp4_quant_and_per_token_scale_sm100",
         mutates_args=(""),
     )
@@ -507,7 +552,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             (out_scale_rows, out_scale_cols), dtype=torch.uint8
         )
         output_per_token_scale = input.new_empty((m,), dtype=torch.float32)
-        module.nvfp4_quant_and_per_token_scale(
+        nvfp4_quant_and_per_token_scale_out_sm100(
             input,
             scale_inv,
             output,
@@ -798,6 +843,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
         nvfp4_quant_and_per_token_scale_sm100=nvfp4_quant_and_per_token_scale_sm100,
+        nvfp4_quant_and_per_token_scale_out_sm100=nvfp4_quant_and_per_token_scale_out_sm100,
         silu_and_mul_scaled_nvfp4_experts_quantize_sm100=silu_and_mul_scaled_nvfp4_experts_quantize_sm100,
         scaled_fp4_grouped_quant_sm100=scaled_fp4_grouped_quant_sm100,
     )
@@ -2040,7 +2086,7 @@ def get_fp4_kv_quantization_module():
 _NVFP4_BLOCK_SIZE = 16
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
     return True
 
@@ -2087,7 +2133,7 @@ def nvfp4_kv_dequantize(
     return output
 
 
-@supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 89, 90, 100, 103, 107, 110, 120, 121])
 def _nvfp4_paged_kv_dequant_check(*args, **kwargs):
     return True
 
@@ -2196,7 +2242,7 @@ def nvfp4_kv_dequantize_paged(
     )
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _nvfp4_kv_quant_check(input, global_scale):
     return True
 
