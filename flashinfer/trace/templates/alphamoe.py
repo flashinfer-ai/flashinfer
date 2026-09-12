@@ -27,9 +27,7 @@ _WEIGHT_AXES = {
 
 _WEIGHT_INPUTS = {
     "gemm1_weights": Tensor(["num_experts", "gated_size", "hidden_size"]),
-    "gemm1_weights_scale": Tensor(
-        ["num_experts", "gated_blocks", "hidden_blocks"]
-    ),
+    "gemm1_weights_scale": Tensor(["num_experts", "gated_blocks", "hidden_blocks"]),
 }
 
 _WEIGHT_CONSTRAINTS = [
@@ -76,9 +74,7 @@ alphamoe_fp8_block_scale_aligned_moe_trace = TraceTemplate(
         "hidden_states": Tensor(["num_tokens", "hidden_size"]),
         "hidden_states_scale": Tensor(["num_tokens", "hidden_blocks"]),
         **_WEIGHT_INPUTS,
-        "gemm2_weights": Tensor(
-            ["num_experts", "hidden_size", "intermediate_size"]
-        ),
+        "gemm2_weights": Tensor(["num_experts", "hidden_size", "intermediate_size"]),
         "gemm2_weights_scale": Tensor(
             ["num_experts", "hidden_blocks", "intermediate_blocks"]
         ),
@@ -97,9 +93,7 @@ alphamoe_fp8_block_scale_aligned_moe_trace = TraceTemplate(
             description="Initial BF16 accumulator; omitted output starts at zero.",
         ),
     },
-    outputs={
-        "output": Tensor(["num_tokens", "hidden_size"], dtype="bfloat16")
-    },
+    outputs={"output": Tensor(["num_tokens", "hidden_size"], dtype="bfloat16")},
     constraints=[
         *_WEIGHT_CONSTRAINTS,
         "gated_size == 2 * intermediate_size",

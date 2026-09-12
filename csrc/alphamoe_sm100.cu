@@ -1165,8 +1165,7 @@ inline ProblemDims CheckInputs(
 
   TVM_FFI_ICHECK(hidden_states.stride(1) == 1)
       << "hidden_states must have unit innermost stride, got " << hidden_states.stride(1);
-  TVM_FFI_ICHECK(hidden_states.stride(0) > 0 &&
-                 hidden_states.stride(0) >= hidden_states.size(1) &&
+  TVM_FFI_ICHECK(hidden_states.stride(0) > 0 && hidden_states.stride(0) >= hidden_states.size(1) &&
                  hidden_states.stride(0) % 16 == 0)
       << "hidden_states row stride must be positive, non-overlapping, and 16-byte aligned, got "
       << hidden_states.stride(0) << " for row width " << hidden_states.size(1);

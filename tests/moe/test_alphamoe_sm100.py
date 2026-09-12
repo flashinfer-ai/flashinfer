@@ -277,12 +277,8 @@ def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
         pair_indices = torch.nonzero(pair_expert == expert, as_tuple=False).flatten()
         if pair_indices.numel() == 0:
             continue
-        w1 = case["w1"][expert].float() * _expand_block_scales(
-            case["w1_scale"][expert]
-        )
-        w2 = case["w2"][expert].float() * _expand_block_scales(
-            case["w2_scale"][expert]
-        )
+        w1 = case["w1"][expert].float() * _expand_block_scales(case["w1_scale"][expert])
+        w2 = case["w2"][expert].float() * _expand_block_scales(case["w2_scale"][expert])
         token_indices = torch.div(pair_indices, top_k, rounding_mode="floor")
         gate_up = x[token_indices] @ w1.transpose(0, 1)
         gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]

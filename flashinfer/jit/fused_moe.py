@@ -468,7 +468,9 @@ def gen_alphamoe_sm100_module() -> JitSpec:
         current_compilation_context.TARGET_CUDA_ARCHS & {(10, "0a"), (10, "3a")}
     )
     if not targets:
-        raise RuntimeError("AlphaMoE W8A8 requires an SM100a or SM103a compilation target")
+        raise RuntimeError(
+            "AlphaMoE W8A8 requires an SM100a or SM103a compilation target"
+        )
     if not is_cuda_version_at_least("12.8"):
         raise RuntimeError("AlphaMoE W8A8 on SM100a requires CUDA 12.8 or newer")
     if (10, "3a") in targets and not is_cuda_version_at_least("12.9"):
