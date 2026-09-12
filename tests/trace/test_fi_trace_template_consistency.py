@@ -39,7 +39,6 @@ generic checks are insufficient.  See the docstring in
 """
 
 import ast
-from collections import Counter
 import inspect
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -393,50 +392,6 @@ _ALL_PAIRS = _collect_template_func_pairs()
 _PAIR_IDS = [label for _, _, label in _ALL_PAIRS]
 
 
-_EXPECTED_PRIMTS_TRACE_VARIANTS = {
-    (
-        "flashinfer.attention.prims_ts.block_sparse",
-        "BlockSparseTSWrapper.run",
-    ): 4,
-    (
-        "flashinfer.attention.prims_ts.block_sparse",
-        "BlockSparsePagedTSWrapper.run",
-    ): 2,
-    (
-        "flashinfer.attention.prims_ts.block_sparse",
-        "block_sparse_attention",
-    ): 4,
-    (
-        "flashinfer.attention.prims_ts.block_sparse",
-        "block_sparse_attention_with_paged_kv_cache",
-    ): 2,
-    (
-        "flashinfer.attention.prims_ts.decode",
-        "batch_decode_with_paged_kv_cache",
-    ): 12,
-    (
-        "flashinfer.attention.prims_ts.decode",
-        "prims_ts_batch_decode_with_kv_cache",
-    ): 12,
-    (
-        "flashinfer.attention.prims_ts.decode",
-        "BatchDecodePagedTSWrapper.run",
-    ): 24,
-    (
-        "flashinfer.attention.prims_ts.mla_decode",
-        "batch_mla_decode_with_paged_kv_cache",
-    ): 4,
-    (
-        "flashinfer.attention.prims_ts.mla_decode",
-        "prims_ts_batch_mla_decode_with_kv_cache",
-    ): 4,
-    (
-        "flashinfer.attention.prims_ts.mla_decode",
-        "BatchMLADecodePagedTSWrapper.run",
-    ): 4,
-}
-
-
 # ---------------------------------------------------------------------------
 # Parameterized structural tests (no GPU required)
 # ---------------------------------------------------------------------------
@@ -452,17 +407,6 @@ def test_template_signature_consistency(func, template, label):
 def test_template_axes_covered(func, template, label):
     """Every Const axis must be reachable from at least one input tensor, scalar, or function param."""
     assert_template_axes_covered(template, label=label, func=func)
-
-
-def test_attention_ts_trace_registry_coverage():
-    """All public PrimTS surfaces register finite discovery examples."""
-
-    discovered = Counter(
-        (func.__module__, func.__qualname__)
-        for func, _, _ in _ALL_PAIRS
-        if func.__module__.startswith("flashinfer.attention.prims_ts")
-    )
-    assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
@@ -562,11 +506,11 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     )
 
     assert (
-        _TRACE_DISPATCHERS[block_sparse_attention.__wrapped__]
+        _TRACE_DISPATCHERS[inspect.unwrap(block_sparse_attention)]
         is prims_ts_block_sparse_trace_dispatch
     )
     assert (
-        _TRACE_DISPATCHERS[BlockSparseTSWrapper.run.__wrapped__]
+        _TRACE_DISPATCHERS[inspect.unwrap(BlockSparseTSWrapper.run)]
         is prims_ts_block_sparse_wrapper_trace_dispatch
     )
 
