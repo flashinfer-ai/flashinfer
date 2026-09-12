@@ -18,6 +18,7 @@ def _compile(
     narrow_offsets=False,
     native_fp4=None,
     persistent_ctas=0,
+    compact_metadata=False,
 ):
     import cutlass
     import cutlass.cute as cute
@@ -79,12 +80,14 @@ def _compile(
         narrow_offsets=narrow_offsets,
         native_fp4=native_fp4,
         use_ws=use_ws,
+        compact_metadata=compact_metadata,
     )
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_decode",
         f"h64_s1_c{compressed_k}_split{int(split)}"
         f"_dq{dequant_warps}_phase{phase_chunks}_i{32 if narrow_offsets else 64}"
-        f"_nativefp4{int(native_fp4)}_ws{int(use_ws)}_ctas{persistent_ctas}_sm{sm_count}",
+        f"_nativefp4{int(native_fp4)}_ws{int(use_ws)}_ctas{persistent_ctas}_sm{sm_count}"
+        f"_meta16{int(compact_metadata)}",
         lambda: cute.compile(
             kernel,
             q,
@@ -234,6 +237,12 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
                 phase_chunks,
                 narrow_offsets,
                 persistent_ctas=persistent_ctas,
+                # Signed Int32 metadata stores 16-byte units. Prove the
+                # complete pools fit before selecting this specialization.
+                compact_metadata=(
+                    bool(persistent_ctas)
+                    and max(swa_cache.numel(), global_cache.numel()) < 2**35
+                ),
             )
             workspace = (
                 torch.empty(

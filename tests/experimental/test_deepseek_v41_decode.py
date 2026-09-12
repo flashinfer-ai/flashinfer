@@ -247,6 +247,47 @@ def test_cache_offsets_above_two_gib(batch):
     check(args, out, lse)
 
 
+@pytest.mark.parametrize("pool_index,width,ids_index", [(1, 528, 3), (2, 288, 4)])
+@pytest.mark.parametrize("below_limit", [True, False])
+def test_persistent_metadata_capacity_boundary(
+    pool_index, width, ids_index, below_limit
+):
+    gate()
+    batch = torch.cuda.get_device_properties("cuda").multi_processor_count + 1
+    args = list(make_case(batch, 512))
+    small = args[pool_index]
+    page_bytes = 64 * width
+    limit = 2**35  # Signed Int32 offsets expressed in 16-byte units.
+    pages = (
+        (limit - 1) // page_bytes
+        if below_limit
+        else (limit + page_bytes - 1) // page_bytes + small.shape[0]
+    )
+    if torch.cuda.mem_get_info()[0] < pages * page_bytes + 2 * 1024**3:
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < pages * page_bytes + 2 * 1024**3:
+            pytest.skip("Capacity-boundary validation needs a 32-GiB cache pool")
+    # Only the tail is initialized; the oracle continues to use the small pool.
+    large = torch.empty((pages, 64, 1, width), device="cuda", dtype=torch.uint8)
+    first_page = pages - small.shape[0]
+    large[first_page:].copy_(small)
+    actual = list(args)
+    actual[pool_index] = large
+    actual[ids_index] = args[ids_index] + first_page * 64
+    out, lse, plan = deepseek_v41_decode(*actual)
+    check(args, out, lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        deepseek_v41_decode(*actual, plan=plan)
+    args[0].mul_(0.75)
+    args[ids_index].copy_(args[ids_index].flip(-1))
+    actual[ids_index].copy_(actual[ids_index].flip(-1))
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    check(args, out, lse)
+
+
 @pytest.mark.parametrize(
     "levels",
     [

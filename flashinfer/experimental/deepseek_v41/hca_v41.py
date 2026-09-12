@@ -111,6 +111,7 @@ class BlackwellV41MixedCacheDecode:
         narrow_offsets: bool = False,
         native_fp4: bool = False,
         use_ws: bool = False,
+        compact_metadata: bool = False,
     ):
         """Initializes the configuration for a Blackwell Heavily Compressed Attention (HCA) kernel.
 
@@ -147,7 +148,13 @@ class BlackwellV41MixedCacheDecode:
         # RoPE-rotated by the caller; the kernel does not see rope as a
         # separate path.
         self.use_ws = use_ws
-        self.slot_storage_dtype = cutlass.Int64 if is_persistent else cutlass.Int32
+        self.compact_metadata = is_persistent and compact_metadata
+        self.metadata_shift = 4 if self.compact_metadata else 0
+        self.slot_storage_dtype = (
+            cutlass.Int64
+            if is_persistent and not self.compact_metadata
+            else cutlass.Int32
+        )
         self.slot_storage_multiplier = 2 if is_persistent else 1
         self.latent_dim = 512
         self.acc_dtype = acc_dtype
@@ -666,9 +673,10 @@ class BlackwellV41MixedCacheDecode:
                 self.acc_dtype, 2 * self.num_compute_warps * self.threads_per_warp
             ]
             # Nonpersistent CTAs store Int32 page-table slots. Persistent CTAs
-            # share Int64 data offsets followed by Int64 scale offsets instead,
-            # avoiding repeated address arithmetic in the dequant warps. The
-            # first plane uses -1 for invalid keys in both representations.
+            # share data offsets followed by scale offsets: Int32 units of
+            # 16 bytes for pools below 32 GiB, otherwise Int64 byte offsets.
+            # Both avoid repeated address arithmetic in the dequant warps;
+            # the first plane uses -1 for invalid keys in every representation.
             smem_slots: cute.struct.MemRange[
                 self.slot_storage_dtype,
                 (self.window_len + self.max_topk) * self.slot_storage_multiplier,
@@ -1055,7 +1063,7 @@ class BlackwellV41MixedCacheDecode:
                     self.threads_per_warp * len(self.dequant_warp_ids),
                 )
                 next_offsets = cute.make_rmem_tensor(
-                    cute.make_layout(2 * slots_per_thread), cutlass.Int64
+                    cute.make_layout(2 * slots_per_thread), self.slot_storage_dtype
                 )
                 if work_tile.is_valid_tile:
                     self.prefetch_request_offsets(
@@ -1854,18 +1862,25 @@ class BlackwellV41MixedCacheDecode:
 
     @cute.jit
     def slot_offsets(self, key, slot):
-        # DS4.1's fixed D512 cache layout: 64 rows/page, MXFP8 window
-        # (512 data + 16 scale bytes/row), FP4 compressed (256 + 32).
-        # Widen before page-byte multiplication: pools can exceed 2 GiB.
-        width = cutlass.Int64(256)
-        scale_bytes = cutlass.Int64(32)
+        # Fixed D512/page64 layout. Compact metadata uses signed Int32 units
+        # of 16 bytes after the host proves both pools fit below 32 GiB;
+        # otherwise retain Int64 byte offsets. Both use -1 for invalid data.
+        width = self.slot_storage_dtype(256 >> self.metadata_shift)
+        scale_width = self.slot_storage_dtype(32 >> self.metadata_shift)
         if key < self.window_len:
-            width = cutlass.Int64(512)
-            scale_bytes = cutlass.Int64(16)
-        page_base = cutlass.Int64(slot // 64) * 64 * (width + scale_bytes)
-        local = cutlass.Int64(slot % 64)
-        data = cutlass.select_(slot >= 0, page_base + local * width, cutlass.Int64(-1))
-        scale = page_base + 64 * width + local * scale_bytes
+            width = self.slot_storage_dtype(512 >> self.metadata_shift)
+            scale_width = self.slot_storage_dtype(16 >> self.metadata_shift)
+        # Valid slots are nonnegative. Unsigned bit operations avoid signed
+        # divmod fixups; invalid arithmetic is discarded by the data sentinel.
+        uslot = cutlass.Uint32(slot)
+        page_base = self.slot_storage_dtype(uslot & cutlass.Uint32(0xFFFFFFC0)) * (
+            width + scale_width
+        )
+        local = self.slot_storage_dtype(uslot & cutlass.Uint32(63))
+        data = cutlass.select_(
+            slot >= 0, page_base + local * width, self.slot_storage_dtype(-1)
+        )
+        scale = page_base + 64 * width + local * scale_width
         return data, scale
 
     @cute.jit
@@ -2188,7 +2203,13 @@ class BlackwellV41MixedCacheDecode:
         scale_bytes: cutlass.Constexpr,
     ):
         if cutlass.const_expr(self.is_persistent):
-            return slots[key], slots[self.window_len + self.max_topk + key]
+            data = slots[key]
+            scale = slots[self.window_len + self.max_topk + key]
+            if cutlass.const_expr(self.compact_metadata):
+                # Widen before reconstructing byte offsets above 2 GiB.
+                return cutlass.Int64(data) << 4, cutlass.Int64(scale) << 4
+            else:
+                return data, scale
         slot = slots[key]
         page = self.offset_dtype(slot // page_size)
         local = slot % page_size

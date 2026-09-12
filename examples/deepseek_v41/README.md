@@ -32,10 +32,13 @@ CUDA version requirement.
 Frost keeps the measured split schedule for small batches and selects
 WS QK/PV with fused softmax/correction for K512/B128+. When that batch exceeds
 the device's SM count, CTAs process multiple requests through the same pipeline.
-Dequant warps prefetch the next request's indices and compute 64-bit cache
+Dequant warps prefetch the next request's indices and compute cache
 offsets in registers while the current request finishes. An existing boundary
 barrier protects publication of this metadata into shared memory, where it
 avoids repeated address calculation during gathers.
+When both complete cache pools fit below 32 GiB, metadata uses 32-bit offsets
+in 16-byte units; larger pools retain 64-bit byte offsets. This preserves support
+for cache addresses above 2 GiB while reducing shared metadata traffic.
 This is internal scheduling in one implementation and requires no API selector.
 
 Decode currently accepts contiguous BF16 queries `[B,1,64,512]`, 64-token pages,
