@@ -43,6 +43,8 @@ enum class Attention_mask_type {
   CAUSAL,
   // Causal mask + attend to the specific sliding window or chunk.
   SLIDING_OR_CHUNKED_CAUSAL,
+  // Bidirectional sliding window attention.
+  BIDIRECTIONAL_SLIDING_WINDOW,
   // The custom mask input.
   CUSTOM_MASK,
 };
@@ -57,6 +59,8 @@ static inline std::string mask_type_to_string(Attention_mask_type mask_type) {
       return "causal";
     case Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL:
       return "sliding_or_chunked_causal";
+    case Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW:
+      return "bidirectional_sliding_window";
     case Attention_mask_type::CUSTOM_MASK:
       return "custom_mask";
     default:
@@ -272,7 +276,9 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   int num_grouped_heads = 1;
 
   // Sliding Window Attention
-  // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
+  // Causal sliding window: attend [max(0, query_idx + 1 - sliding_window_size), query_idx].
+  // Bidirectional sliding window: attend
+  // [max(0, query_idx - sliding_window_size / 2), min(S - 1, query_idx + sliding_window_size / 2)].
   int sliding_window_size = INT_MAX;
 
   // The chunked attention size (<= 0 means no chunked attention).
