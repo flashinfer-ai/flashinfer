@@ -267,7 +267,7 @@ def recurrent_kda(
             ``NotImplementedError`` carrying the reason when that engine cannot
             serve the call. It is never selected implicitly, and it covers
             ordinary multi-token prefill only: no speculative decode, no state
-            pool, no ``initial_state_source``.
+            pool, no ``initial_state_source``, no state checkpoints.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -297,7 +297,9 @@ def recurrent_kda(
                 ("seq_order", seq_order is not None),
                 ("prefill_workspace", prefill_workspace is not None),
                 ("ssm_state_indices", ssm_state_indices is not None),
-                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
                 ("checkpoint_state_indices", checkpoint_state_indices is not None),
                 ("disable_state_update", disable_state_update),
                 ("correction_cache", correction_cache is not None),

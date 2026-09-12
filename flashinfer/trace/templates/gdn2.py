@@ -134,7 +134,7 @@ def _gdn2_prefill_init(
         "q": qkv(num_q_heads, True),
         "k": qkv(num_k_heads, True),
         "v": qkv(num_v_heads, False),
-        "g": channel_gate(torch.float32),
+        "g": channel_gate(torch.float32).log(),
         "beta": channel_gate(torch.bfloat16),
         "w": channel_gate(torch.bfloat16),
         "cu_seqlens": torch.tensor(cum, dtype=torch.int64, device=device),
@@ -182,7 +182,7 @@ gdn2_prefill_trace = TraceTemplate(
         ),
         "g": Tensor(
             ["total_seq_len", "num_v_heads", "head_size"],
-            description="Channel-wise forget gate in linear space, per key channel.",
+            description="Channel-wise forget gate as the natural-log decay, per key channel.",
         ),
         "beta": Tensor(
             ["total_seq_len", "num_v_heads", "head_size"],

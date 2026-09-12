@@ -21,7 +21,7 @@ from typing import Optional, Union
 import torch
 
 from ..api_logging import flashinfer_api
-from ..utils import _get_cache_buf
+from ..utils import _get_cache_buf, get_device_index
 
 try:
     import cudnn
@@ -31,10 +31,20 @@ except Exception:
     cudnn = None
     CUDNN_AVAILABLE = False
 
-_MIN_FRONTEND_VERSION = (1, 28)
+_MIN_FRONTEND_VERSION = (1, 29)
 
-# Global cudnn handle. need to make it per device in future
-_cudnn_handle = None
+
+def _linear_gate(g: Optional[torch.Tensor], ones_shape, dtype, device):
+    """The GDN / GDP forget gate for the graph as linear alpha
+    (``gate_domain="linear"``); all-ones when ``None``."""
+    if g is None:
+        g = torch.ones(*ones_shape, dtype=dtype, device=device)
+    return g
+
+
+# One cuDNN handle per device: a handle binds the device that is current when
+# it is created and only takes streams of that device.
+_cudnn_handles: dict = {}
 
 
 def _check_cudnn_frontend(feature: str) -> None:
@@ -58,12 +68,13 @@ def _check_cudnn_frontend(feature: str) -> None:
 
 
 def _create_cudnn_handle(stream: torch.cuda.Stream):
-    global _cudnn_handle
-
-    if _cudnn_handle is None:
-        _cudnn_handle = cudnn.create_handle()
-    cudnn.set_stream(_cudnn_handle, stream.cuda_stream)
-    return _cudnn_handle
+    handle = _cudnn_handles.get(stream.device_index)
+    if handle is None:
+        with torch.cuda.device(stream.device_index):
+            handle = cudnn.create_handle()
+        _cudnn_handles[stream.device_index] = handle
+    cudnn.set_stream(handle, stream.cuda_stream)
+    return handle
 
 
 # Tensor ids
@@ -74,7 +85,7 @@ class UIDs(Enum):
     K_UID = 2  # Key tensor
     V_UID = 3  # Value tensor
 
-    G_UID = 10  # Forget gate, log space
+    G_UID = 10  # Forget gate
     BETA_UID = 11  # Update / erase gate
     W_UID = 12  # GDN-2 write gate
 
@@ -111,12 +122,14 @@ def _la_graph_key_fn(
     safe_gate: bool,
     gate_lower_bound: Optional[float],
     batch_invariant: bool,
+    gate_domain: str = "log",
 ):
     def layout(t):
         return None if t is None else (t.shape, t.stride(), t.dtype)
 
     return (
         family,
+        get_device_index(q.device),
         layout(q),
         layout(k),
         layout(v),
@@ -136,6 +149,7 @@ def _la_graph_key_fn(
         safe_gate,
         gate_lower_bound,
         batch_invariant,
+        gate_domain,
     )
 
 
@@ -165,6 +179,7 @@ if CUDNN_AVAILABLE:
         safe_gate: bool,
         gate_lower_bound: Optional[float],
         batch_invariant: bool,
+        gate_domain: str = "log",
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
 
@@ -225,6 +240,7 @@ if CUDNN_AVAILABLE:
                 attrs["gate_lower_bound"] = gate_lower_bound
             if family == "gdp":
                 attrs["num_householder"] = num_householder
+            attrs["gate_domain"] = gate_domain
 
             O, fs, _checkpoints = getattr(graph, family)(**ports, **attrs)
 
@@ -266,6 +282,7 @@ def _run_la_graph(
     safe_gate: bool,
     gate_lower_bound: Optional[float],
     batch_invariant: bool,
+    gate_domain: str = "log",
 ) -> None:
     graph, _ = _build_la_graph(
         family,
@@ -288,6 +305,7 @@ def _run_la_graph(
         safe_gate=safe_gate,
         gate_lower_bound=gate_lower_bound,
         batch_invariant=batch_invariant,
+        gate_domain=gate_domain,
     )
 
     var_map = {
@@ -353,7 +371,7 @@ def cudnn_chunk_gated_delta_rule(
 
     Argument meanings match :func:`flashinfer.chunk_gated_delta_rule`.
 
-    Requires cudnn-frontend 1.28+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself: it declines a graph it cannot serve (the
     per-engine reason lands in the frontend's log).
 
@@ -365,9 +383,9 @@ def cudnn_chunk_gated_delta_rule(
         has to be contiguous.
     g : torch.Tensor, optional
         Per-head forget gate in linear space (``alpha = exp(log_g)``), shape
-        ``[total_seq_len, num_sab_heads]``. cuDNN's gate is natural-log, so
-        this is converted; the conversion keeps ``g``'s own dtype, which cuDNN
-        reads at float32, bfloat16 or float16. All-ones when ``None``.
+        ``[total_seq_len, num_sab_heads]``, passed to cuDNN as is
+        (``gate_domain="linear"``) at ``g``'s own dtype, which cuDNN reads at
+        float32, bfloat16 or float16. All-ones when ``None``.
     beta : torch.Tensor, optional
         Per-head update gate ``[total_seq_len, num_sab_heads]``, post-sigmoid,
         in float32 or ``q.dtype``. All-ones when ``None``.
@@ -412,11 +430,7 @@ def cudnn_chunk_gated_delta_rule(
     v_dim = v.shape[2]
     num_sab_heads = max(num_q_heads, v.shape[1])
 
-    g_log = (
-        torch.zeros(total, num_sab_heads, dtype=q.dtype, device=q.device)
-        if g is None
-        else torch.log(g)
-    )
+    g_in = _linear_gate(g, (total, num_sab_heads), q.dtype, q.device)
     if beta is None:
         beta = torch.ones(total, num_sab_heads, dtype=torch.float32, device=q.device)
 
@@ -444,7 +458,7 @@ def cudnn_chunk_gated_delta_rule(
         q,
         k,
         v,
-        g_log,
+        g_in,
         beta,
         cu_seqlens,
         output,
@@ -456,6 +470,7 @@ def cudnn_chunk_gated_delta_rule(
         safe_gate=False,
         gate_lower_bound=None,
         batch_invariant=bool(batch_invariant),
+        gate_domain="linear",
     )
     if not output_final_state:
         return output
@@ -487,7 +502,7 @@ def cudnn_chunk_gated_delta_product(
     updates and the readout following the last one. ``num_householder == 1``
     is exactly :func:`cudnn_chunk_gated_delta_rule`.
 
-    Requires cudnn-frontend 1.28+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself: it declines a graph it cannot serve (the
     per-engine reason lands in the frontend's log).
 
@@ -504,9 +519,9 @@ def cudnn_chunk_gated_delta_product(
         ``num_k_heads`` must equal ``num_q_heads`` or ``num_v_heads``.
     g : torch.Tensor, optional
         Per-head forget gate in linear space (``alpha = exp(log_g)``), shape
-        ``[total_seq_len, num_sab_heads]`` at real-token rows. cuDNN's gate is
-        natural-log, so this is converted; the conversion keeps ``g``'s own
-        dtype. All-ones when ``None``.
+        ``[total_seq_len, num_sab_heads]`` at real-token rows, passed to cuDNN
+        as is (``gate_domain="linear"``) at ``g``'s own dtype. All-ones when
+        ``None``.
     beta : torch.Tensor, optional
         Per-head, per-Householder update gate
         ``[total_seq_len * num_householder, num_sab_heads]``, post-sigmoid,
@@ -548,11 +563,7 @@ def cudnn_chunk_gated_delta_product(
     num_sab_heads = max(num_q_heads, v.shape[1])
     n = int(num_householder)
 
-    g_log = (
-        torch.zeros(total, num_sab_heads, dtype=q.dtype, device=q.device)
-        if g is None
-        else torch.log(g)
-    )
+    g_in = _linear_gate(g, (total, num_sab_heads), q.dtype, q.device)
     if beta is None:
         beta = torch.ones(
             total * n, num_sab_heads, dtype=torch.float32, device=q.device
@@ -582,7 +593,7 @@ def cudnn_chunk_gated_delta_product(
         q,
         k,
         v,
-        g_log,
+        g_in,
         beta,
         cu_seqlens,
         output,
@@ -595,6 +606,7 @@ def cudnn_chunk_gated_delta_product(
         safe_gate=False,
         gate_lower_bound=None,
         batch_invariant=bool(batch_invariant),
+        gate_domain="linear",
     )
     if not output_final_state:
         return output
@@ -628,12 +640,12 @@ def cudnn_chunk_gated_delta_rule2(
 
     .. math::
 
-        S_t &= \mathrm{diag}(g_t) S_{t-1} \\
+        S_t &= \mathrm{diag}(e^{g_t}) S_{t-1} \\
         v^{new}_t &= w_t \odot v_t - (\beta_t \odot k_t)^\top S_t \\
         S_t &\mathrel{+}= k_t \otimes v^{new}_t \\
         o_t &= \mathrm{scale} \cdot q_t^\top S_t
 
-    Requires cudnn-frontend 1.28+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself.
 
     Parameters
@@ -642,10 +654,10 @@ def cudnn_chunk_gated_delta_rule2(
         ``[total_seq_len, num_q_heads / num_k_heads / num_v_heads, 128]``,
         packed.
     g : torch.Tensor, optional
-        Channel-wise forget gate in linear space, shape
-        ``[total_seq_len, num_sab_heads, 128]``. Converted to cuDNN's log-space
-        gate at ``g``'s own dtype, which cuDNN reads at float32, bfloat16 or
-        float16. All-ones when ``None``.
+        Channel-wise forget gate as the natural-log decay, shape
+        ``[total_seq_len, num_sab_heads, 128]``, passed to cuDNN as is
+        (``gate_domain="log"``) at ``g``'s own dtype, which cuDNN reads at
+        float32, bfloat16 or float16. All-zeros when ``None``.
     beta : torch.Tensor, optional
         Channel-wise erase gate ``[total_seq_len, num_sab_heads, 128]``,
         converted to ``q.dtype``. All-ones when ``None``.
@@ -685,11 +697,8 @@ def cudnn_chunk_gated_delta_rule2(
     v_dim = v.shape[2]
     num_sab_heads = max(num_q_heads, v.shape[1])
 
-    g_log = (
-        torch.zeros(total, num_sab_heads, head_dim, dtype=q.dtype, device=q.device)
-        if g is None
-        else torch.log(g)
-    )
+    if g is None:
+        g = torch.zeros(total, num_sab_heads, head_dim, dtype=q.dtype, device=q.device)
     if beta is None:
         beta = torch.ones(
             total, num_sab_heads, head_dim, dtype=q.dtype, device=q.device
@@ -725,7 +734,7 @@ def cudnn_chunk_gated_delta_rule2(
         q,
         k,
         v,
-        g_log,
+        g,
         beta,
         cu_seqlens,
         output,
@@ -738,6 +747,7 @@ def cudnn_chunk_gated_delta_rule2(
         safe_gate=False,
         gate_lower_bound=None,
         batch_invariant=bool(batch_invariant),
+        gate_domain="log",
     )
     if not output_final_state:
         return output
@@ -769,9 +779,9 @@ def cudnn_recurrent_kda(
 
     Argument meanings match :func:`flashinfer.recurrent_kda`, restricted to the
     ordinary multi-token prefill subset: no speculative decode, no state pool,
-    no ``initial_state_source``.
+    no ``initial_state_source``, no state checkpoints.
 
-    Requires cudnn-frontend 1.28+ with the ``cutedsl`` extra. Everything else
+    Requires cudnn-frontend 1.29+ with the ``cutedsl`` extra. Everything else
     the engine decides for itself.
 
     Parameters

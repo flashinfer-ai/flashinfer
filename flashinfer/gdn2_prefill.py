@@ -51,7 +51,7 @@ def chunk_gated_delta_rule2(
 
     .. math::
 
-        S_t &= \mathrm{diag}(g_t) S_{t-1} \\
+        S_t &= \mathrm{diag}(e^{g_t}) S_{t-1} \\
         v^{new}_t &= w_t \odot v_t - (\beta_t \odot k_t)^\top S_t \\
         S_t &\mathrel{+}= k_t \otimes v^{new}_t \\
         o_t &= \mathrm{scale} \cdot q_t^\top S_t
@@ -73,9 +73,10 @@ def chunk_gated_delta_rule2(
         one a multiple of the other.  Strides are honored, so only the innermost
         dimension has to be contiguous.
     g : torch.Tensor, optional
-        Channel-wise forget gate in linear space (``alpha``, elementwise in
-        ``(0, 1]``), shape ``[total_seq_len, num_sab_heads, head_size]``, at
-        float32, bfloat16 or float16.  All-ones (no decay) when ``None``.
+        Channel-wise forget gate as the natural-log decay (``ln alpha``,
+        elementwise ``<= 0``), shape ``[total_seq_len, num_sab_heads,
+        head_size]``, at float32, bfloat16 or float16.  All-zeros (no decay)
+        when ``None``.
     beta : torch.Tensor, optional
         Channel-wise erase gate ``[total_seq_len, num_sab_heads, head_size]``,
         post-sigmoid, read at ``q.dtype``.  All-ones when ``None``.
@@ -118,7 +119,7 @@ def chunk_gated_delta_rule2(
 
     Note
     ----
-    Requires an SM100-family (Blackwell) device and cudnn-frontend 1.28+ with
+    Requires an SM100-family (Blackwell) device and cudnn-frontend 1.29+ with
     the ``cutedsl`` extra (``pip install 'nvidia-cudnn-frontend[cutedsl]'``).
     Everything finer -- head dims, input dtypes, head-count relations -- is the
     engine's call: a graph it cannot serve is declined by cuDNN (the per-engine

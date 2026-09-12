@@ -124,7 +124,7 @@ def chunk_gated_delta_product(
 
     Note
     ----
-    Requires an SM100-family (Blackwell) device and cudnn-frontend 1.28+ with
+    Requires an SM100-family (Blackwell) device and cudnn-frontend 1.29+ with
     the ``cutedsl`` extra (``pip install 'nvidia-cudnn-frontend[cutedsl]'``).
     Everything finer -- head dims, input dtypes, head-count relations -- is the
     engine's call: a graph it cannot serve is declined by cuDNN (the per-engine

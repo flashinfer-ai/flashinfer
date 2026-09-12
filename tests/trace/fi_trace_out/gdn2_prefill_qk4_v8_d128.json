@@ -83,7 +83,7 @@
         "head_size"
       ],
       "dtype": "float32",
-      "description": "Channel-wise forget gate in linear space, per key channel."
+      "description": "Channel-wise forget gate as the natural-log decay, per key channel."
     },
     "beta": {
       "shape": [

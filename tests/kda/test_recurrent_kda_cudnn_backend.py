@@ -647,6 +647,8 @@ def test_cudnn_backend_replays_under_cuda_graph_capture():
         "seq_order",
         "prefill_workspace",
         "ssm_state_indices",
+        "state_checkpoints",
+        "checkpoint_cu_starts",
         "checkpoint_every_n_tokens",
     ],
 )
@@ -655,6 +657,10 @@ def test_cudnn_backend_names_the_unsupported_argument(argument):
     device = torch.device("cuda")
     inputs = _make_inputs([256], 4, seed=3)
     indices = torch.zeros(1, dtype=torch.int32, device=device)
+    checkpoints = torch.zeros(
+        4, 4, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    cu_starts = torch.tensor([0, 4], dtype=torch.int64, device=device)
     values = {
         "num_spec_tokens": 2,
         "num_accepted_tokens": indices,
@@ -665,16 +671,14 @@ def test_cudnn_backend_names_the_unsupported_argument(argument):
         "seq_order": indices,
         "prefill_workspace": RecurrentKDAPrefillWorkspace(device),
         "ssm_state_indices": indices,
+        "state_checkpoints": checkpoints,
+        "checkpoint_cu_starts": cu_starts,
         "checkpoint_every_n_tokens": 64,
     }
     kwargs = _gate_kwargs(inputs)
     if argument == "checkpoint_every_n_tokens":
-        kwargs["state_checkpoints"] = torch.zeros(
-            4, 4, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device=device
-        )
-        kwargs["checkpoint_cu_starts"] = torch.tensor(
-            [0, 4], dtype=torch.int64, device=device
-        )
+        kwargs["state_checkpoints"] = checkpoints
+        kwargs["checkpoint_cu_starts"] = cu_starts
     with pytest.raises(NotImplementedError, match=argument):
         _run(inputs, **{argument: values[argument]}, **kwargs)
 

@@ -119,7 +119,7 @@ def _make_inputs(
         "v": torch.randn(
             total, num_v_heads, HEAD_DIM, dtype=dtype, device=device
         ).contiguous(),
-        "g": torch.exp(
+        "g": (
             -F.softplus(
                 torch.randn(
                     total, num_sab_heads, HEAD_DIM, dtype=torch.float32, device=device
@@ -159,7 +159,7 @@ def _serial(inputs, *, scale=None, l2norm=False, initial_state=...):
         inputs["k"],
         inputs["v"],
         inputs["cu_seqlens"],
-        alpha=inputs["g"],
+        alpha=inputs["g"].float().exp(),
         beta=inputs["beta"],
         w=inputs["w"],
         initial_state=initial_state,
@@ -244,7 +244,7 @@ def test_gdn2_with_channel_constant_gates_matches_gdn(use_initial_state):
     )
     gdn2_out, gdn2_state = _run(
         inputs,
-        g=broadcast(scalar_g, torch.float32),
+        g=broadcast(scalar_g.log(), torch.float32),
         beta=broadcast(scalar_beta, inputs["q"].dtype),
         w=broadcast(scalar_beta, inputs["q"].dtype),
         initial_state=None if state is None else state.clone(),
@@ -275,7 +275,7 @@ def test_gdn2_honors_scale():
 
 
 def test_gdn2_defaults_gates_to_ones():
-    """Omitting g/beta/w selects the identity gates."""
+    """Omitting g/beta/w selects the identity gates: a zero log gate, unit beta and w."""
     device = torch.device("cuda")
     num_heads = 4
     inputs = _make_inputs([256], num_heads, num_heads, num_heads, seed=31)
@@ -283,7 +283,7 @@ def test_gdn2_defaults_gates_to_ones():
     implicit = _run(inputs, g=None, beta=None, w=None)
     explicit = _run(
         inputs,
-        g=torch.ones(total, num_heads, HEAD_DIM, dtype=torch.float32, device=device),
+        g=torch.zeros(total, num_heads, HEAD_DIM, dtype=torch.float32, device=device),
         beta=torch.ones(
             total, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
         ),

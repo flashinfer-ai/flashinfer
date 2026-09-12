@@ -34,7 +34,7 @@ except Exception:
 
 HEAD_DIM = 128
 
-MIN_FRONTEND_VERSION = (1, 28)
+MIN_FRONTEND_VERSION = (1, 29)
 
 SUPPORTED_COMPUTE_CAPABILITIES = frozenset(
     {(10, 0), (10, 1), (10, 2), (10, 3), (10, 7)}
