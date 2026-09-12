@@ -2045,6 +2045,40 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._q_len_per_req = q_len_per_req
         self._is_causal = is_causal
 
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Load a lazy tensor-core paged-KV-stride variant after :meth:`plan`.
+
+        Call this method before CUDA graph capture when a planned standard FA2
+        tensor-core decode wrapper will receive K and V tensors with different
+        data strides.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        if (
+            getattr(self, "_plan_info", None) is None
+            or getattr(self, "_cached_module", None) is None
+        ):
+            raise RuntimeError(
+                "plan() must complete before prewarming a paged-KV-stride variant."
+            )
+        if not self.use_tensor_cores:
+            raise RuntimeError("Paged-KV-stride prewarm requires tensor-core decode.")
+        if self._jit_module is not None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is not supported for a custom JIT module."
+            )
+        if self._backend != "fa2":
+            raise RuntimeError(
+                "Paged-KV-stride prewarm requires a standard FA2 plan, "
+                f"got backend={self._backend!r}."
+            )
+        self._cached_module.prewarm_paged_kv_stride_variant(variant)
+
     begin_forward = plan
 
     def forward(

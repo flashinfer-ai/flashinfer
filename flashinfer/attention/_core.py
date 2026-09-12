@@ -390,6 +390,8 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             "use_sliding_window": window_left >= 0,
             "use_fp16_qk_reduction": use_fp16_qk_reduction,
             "pos_encoding_mode": PosEncodingMode[pos_encoding_mode].value,
+            "paged_kv_stride_mode": ("independent" if backend == "fa2" else "runtime"),
+            "module_surface": "full",
         }
 
         super().__init__(

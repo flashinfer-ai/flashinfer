@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 import jinja2
 import torch
@@ -102,6 +102,62 @@ class _BatchMLAModuleProxy:
 
     def plan(self, *args: object) -> object:
         return self.plan_with_staged_workspace_bytes(*args)[0]
+
+
+BatchPrefillPagedKVStrideMode = Literal["runtime", "equal", "independent"]
+BatchPrefillModuleSurface = Literal["full", "paged"]
+
+_BATCH_PREFILL_MODULE_URI_SUFFIX = {
+    ("runtime", "full"): "",
+    ("equal", "full"): "_kv_stride_equal",
+    ("independent", "full"): "_kv_stride_independent",
+    ("independent", "paged"): "_paged_kv_stride_independent",
+}
+
+
+def _validate_batch_prefill_module_mode(
+    backend: str,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
+    module_surface: BatchPrefillModuleSurface,
+) -> None:
+    if paged_kv_stride_mode not in ("runtime", "equal", "independent"):
+        raise ValueError(
+            "paged_kv_stride_mode must be one of 'runtime', 'equal', or "
+            f"'independent', got {paged_kv_stride_mode!r}"
+        )
+    if module_surface not in ("full", "paged"):
+        raise ValueError(
+            f"module_surface must be either 'full' or 'paged', got {module_surface!r}"
+        )
+    if (paged_kv_stride_mode, module_surface) not in _BATCH_PREFILL_MODULE_URI_SUFFIX:
+        raise ValueError(
+            "Unsupported batch-prefill mode/surface combination: "
+            f"mode={paged_kv_stride_mode!r}, surface={module_surface!r}"
+        )
+    if backend != "fa2" and (paged_kv_stride_mode, module_surface) != (
+        "runtime",
+        "full",
+    ):
+        raise ValueError(
+            "Paged KV stride specialization is supported only for the FA2 "
+            "backend, got "
+            f"backend={backend!r}, mode={paged_kv_stride_mode!r}, "
+            f"surface={module_surface!r}"
+        )
+
+
+def _get_batch_prefill_module_uri(
+    base_uri: str,
+    backend: str,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
+    module_surface: BatchPrefillModuleSurface,
+) -> str:
+    """Return a content-unique URI for one validated batch-prefill artifact."""
+    _validate_batch_prefill_module_mode(backend, paged_kv_stride_mode, module_surface)
+    return (
+        base_uri
+        + _BATCH_PREFILL_MODULE_URI_SUFFIX[(paged_kv_stride_mode, module_surface)]
+    )
 
 
 def get_single_decode_uri(
@@ -1022,7 +1078,7 @@ def gen_batch_decode_module(
     )
 
 
-def gen_batch_prefill_module(
+def _gen_batch_prefill_module(
     backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -1034,8 +1090,11 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
+    module_surface: BatchPrefillModuleSurface,
 ) -> JitSpec:
-    uri = get_batch_prefill_uri(
+    base_uri = get_batch_prefill_uri(
         backend,
         dtype_q,
         dtype_kv,
@@ -1047,6 +1106,9 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+    )
+    uri = _get_batch_prefill_module_uri(
+        base_uri, backend, paged_kv_stride_mode, module_surface
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1148,6 +1210,132 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+        module_surface=module_surface,
+    )
+
+
+def gen_batch_prefill_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    """Generate the public full batch-prefill module with runtime stride dispatch."""
+    return _gen_batch_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        paged_kv_stride_mode="runtime",
+        module_surface="full",
+    )
+
+
+def _gen_batch_prefill_primary_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    """Generate the internal full FA2 primary with equal-stride paged kernels."""
+    return _gen_batch_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        paged_kv_stride_mode="equal",
+        module_surface="full",
+    )
+
+
+def _gen_batch_prefill_independent_full_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    """Generate the feasibility-only full FA2 independent-stride module."""
+    return _gen_batch_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        paged_kv_stride_mode="independent",
+        module_surface="full",
+    )
+
+
+def _gen_batch_prefill_independent_paged_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> JitSpec:
+    """Generate the internal paged-only FA2 independent-stride module."""
+    return _gen_batch_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        paged_kv_stride_mode="independent",
+        module_surface="paged",
     )
 
 
@@ -1196,6 +1384,8 @@ def gen_batch_prefill_attention_sink_module(
         use_logits_soft_cap=False,
         use_fp16_qk_reduction=False,
         fp8_enabled=False,
+        paged_kv_stride_mode="independent" if backend == "fa2" else "runtime",
+        module_surface="full",
     )
 
 
@@ -1679,7 +1869,10 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
+    module_surface: BatchPrefillModuleSurface = "full",
 ) -> JitSpec:
+    _validate_batch_prefill_module_mode(backend, paged_kv_stride_mode, module_surface)
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
     if require_fp4_kv_cache:
         missing_sf_tensors = [
@@ -1708,6 +1901,12 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "paged_kv_stride_mode": paged_kv_stride_mode,
+        "same_kv_strides_values": {
+            "runtime": ["true", "false"],
+            "equal": ["true"],
+            "independent": ["false"],
+        }[paged_kv_stride_mode],
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1735,10 +1934,12 @@ def gen_customize_batch_prefill_module(
         ) as f:
             paged_kernel_inst_templ = jinja2.Template(f.read())
 
-        with open(
-            jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja"
-        ) as f:
-            ragged_kernel_inst_templ = jinja2.Template(f.read())
+        ragged_kernel_inst_templ = None
+        if module_surface == "full":
+            with open(
+                jit_env.FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja"
+            ) as f:
+                ragged_kernel_inst_templ = jinja2.Template(f.read())
 
         kwargs |= {
             "additional_params_decl": additional_params_decl,
@@ -1763,26 +1964,37 @@ def gen_customize_batch_prefill_module(
             )
             write_if_different(dest_path, source)
 
-            dest_path = (
-                gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
-            )
-            source_paths.append(dest_path)
-            source = ragged_kernel_inst_templ.render(
-                mask_mode=mask_mode_literal[mask_mode],
-                **kwargs,
-            )
-            write_if_different(dest_path, source)
+            if ragged_kernel_inst_templ is not None:
+                dest_path = (
+                    gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
+                )
+                source_paths.append(dest_path)
+                source = ragged_kernel_inst_templ.render(
+                    mask_mode=mask_mode_literal[mask_mode],
+                    **kwargs,
+                )
+                write_if_different(dest_path, source)
 
-        for filename in [
-            "batch_prefill.cu",
-            "batch_prefill_jit_binding.cu",
-        ]:
+        host_sources = (
+            ["batch_prefill.cu", "batch_prefill_jit_binding.cu"]
+            if module_surface == "full"
+            else [
+                "batch_prefill_paged.cu",
+                "batch_prefill_paged_jit_binding.cu",
+            ]
+        )
+        for filename in host_sources:
             src_path = jit_env.FLASHINFER_CSRC_DIR / filename
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             with open(src_path, "r") as f:
                 source = f.read()
             write_if_different(dest_path, source)
+
+        paged_header = "batch_prefill_paged.cuh"
+        with open(jit_env.FLASHINFER_CSRC_DIR / paged_header, "r") as f:
+            source = f.read()
+        write_if_different(gen_directory / paged_header, source)
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)

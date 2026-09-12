@@ -38,6 +38,11 @@ constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
 constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};
 constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 
+#define PAGED_KV_STRIDE_MODE_RUNTIME 0
+#define PAGED_KV_STRIDE_MODE_EQUAL 1
+#define PAGED_KV_STRIDE_MODE_INDEPENDENT 2
+#define PAGED_KV_STRIDE_MODE PAGED_KV_STRIDE_MODE_{{ paged_kv_stride_mode | upper }}
+
 
 struct RaggedParams {
   using DTypeQ = DTypeQ;

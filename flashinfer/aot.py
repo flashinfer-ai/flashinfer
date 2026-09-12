@@ -44,6 +44,7 @@ from .jit.attention import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.modules import _gen_batch_prefill_primary_module
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
@@ -187,7 +188,7 @@ def gen_fa2(
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
 
-    yield gen_batch_prefill_module(
+    yield _gen_batch_prefill_primary_module(
         backend="fa2",
         dtype_q=dtype_qo,
         dtype_kv=dtype_kv,
