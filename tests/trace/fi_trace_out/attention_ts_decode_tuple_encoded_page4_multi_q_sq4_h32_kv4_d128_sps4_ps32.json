@@ -1,5 +1,5 @@
 {
-  "name": "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
+  "name": "attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32",
   "description": "One-shot PrimTS GQA decode over a fixed row-strided page table using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
   "op_type": "gqa_paged",
   "tags": [
@@ -36,7 +36,8 @@
     },
     "page_size": {
       "type": "const",
-      "value": 32
+      "value": 4,
+      "description": "Semantic size addressed by encoded subpage locators."
     },
     "max_pages_per_seq": {
       "type": "var",
@@ -45,11 +46,17 @@
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "storage_page_size": {
+      "type": "const",
+      "value": 32
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (4, 16, 32, 64, 128)",
+    "storage_page_size > page_size",
+    "storage_page_size % page_size == 0",
     "max_pages_per_seq * page_size >= max(seq_lens_kv)",
     "min(seq_lens_kv) >= 1",
     "num_qo_heads % num_kv_heads == 0",
@@ -72,7 +79,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -81,7 +88,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -145,6 +152,11 @@
       "shape": null,
       "dtype": "dtype",
       "optional": true
+    },
+    "semantic_page_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Semantic page size, fixed to four for encoded locators."
     }
   },
   "outputs": {

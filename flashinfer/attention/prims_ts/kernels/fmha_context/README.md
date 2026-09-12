@@ -89,8 +89,8 @@ device. Cumulative offsets, sequence lengths, and variable-window metadata must
 be compact CUDA `torch.int32` tensors on that device and at least 4-byte
 aligned. `block_tables` instead permits the row-strided layout documented
 below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
-or active plan-owned scale/scratch storage. The launch conservatively rejects
-overlapping storage spans. The API returns O only; rowwise LSE and other
+or active plan-owned scale/scratch storage. This is an unchecked caller
+precondition in both validation modes. The API returns O only; rowwise LSE and other
 softmax state remain internal to the kernel.
 
 ## Tensor and metadata layouts
@@ -181,7 +181,7 @@ tightest valid length flags for its temporary plan and conservatively keeps the
 V-tail clear.
 
 With the default `validate=True`, `run()` checks tensor structure, shapes,
-dtypes, devices, scales, output, aliasing, page-table strides, sequence
+dtypes, devices, scales, output, page-table strides, sequence
 lengths, and active page IDs. Those metadata checks read device values back to
 the host and may synchronize. Caller-provided variable-window CTA starts are
 also checked against the exact minimum of the corresponding per-token starts.

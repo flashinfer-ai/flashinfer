@@ -1,9 +1,9 @@
 {
-  "name": "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "One-shot PrimTS GQA decode over a fixed row-strided page table using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
+  "name": "prims_ts_batch_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_s2048_ps32",
+  "description": "Standalone PrimTS GQA decode over a fixed row-strided page metadata using the tuple HND cache form and caller-owned workspace. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
   "op_type": "gqa_paged",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.decode.batch_decode_with_paged_kv_cache",
+    "fi_api:flashinfer.attention.prims_ts.decode.prims_ts_batch_decode_with_kv_cache",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental"
@@ -36,7 +36,12 @@
     },
     "page_size": {
       "type": "const",
-      "value": 32
+      "value": 4,
+      "description": "Semantic size addressed by encoded subpage locators."
+    },
+    "workspace_size": {
+      "type": "var",
+      "description": "Caller workspace size in bytes."
     },
     "max_pages_per_seq": {
       "type": "var",
@@ -45,21 +50,33 @@
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "max_seq_len": {
+      "type": "const",
+      "value": 2048,
+      "description": "Exact compiled maximum KV sequence length."
+    },
+    "storage_page_size": {
+      "type": "const",
+      "value": 32
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (4, 16, 32, 64, 128)",
-    "max_pages_per_seq * page_size >= max(seq_lens_kv)",
-    "min(seq_lens_kv) >= 1",
+    "storage_page_size > page_size",
+    "storage_page_size % page_size == 0",
+    "max_pages_per_seq * page_size >= max(seq_lens)",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_seq_len",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 128",
-    "window_left == -1 or mask_type == 'causal'",
     "kv_layout == 'HND'",
+    "window_left == -1 or mask_type == 'causal'",
     "seq_len_q >= 2"
   ],
   "inputs": {
-    "q": {
+    "query": {
       "shape": [
         "batch_size",
         "seq_len_q",
@@ -72,7 +89,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -81,10 +98,17 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "int8",
+      "description": "Exclusive caller-owned int8/uint8 scratch buffer."
     },
     "block_tables": {
       "shape": [
@@ -93,11 +117,20 @@
       ],
       "dtype": "int32"
     },
-    "seq_lens_kv": {
+    "seq_lens": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32"
+    },
+    "max_seq_len": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "seq_len_q": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
     },
     "qo_indptr": {
       "shape": [
@@ -106,14 +139,24 @@
       "dtype": "int32",
       "optional": true
     },
-    "seq_len_q": {
+    "max_seq_len_q": {
       "shape": null,
       "dtype": "int32",
       "optional": true
     },
-    "max_seq_len_q": {
+    "bmm1_scale": {
       "shape": null,
-      "dtype": "int32",
+      "dtype": "float32",
+      "optional": true
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "out_dtype": {
+      "shape": null,
+      "dtype": "dtype",
       "optional": true
     },
     "mask_type": {
@@ -131,20 +174,10 @@
       "dtype": "string",
       "optional": true
     },
-    "bmm1_scale": {
+    "semantic_page_size": {
       "shape": null,
-      "dtype": "float32",
-      "optional": true
-    },
-    "bmm2_scale": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
-    },
-    "out_dtype": {
-      "shape": null,
-      "dtype": "dtype",
-      "optional": true
+      "dtype": "int32",
+      "description": "Semantic page size, fixed to four for encoded locators."
     }
   },
   "outputs": {
