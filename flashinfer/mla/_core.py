@@ -1371,9 +1371,7 @@ def _resolve_dsv4_sparse_mla_backend(
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
     if requested_backend == "cake" and not is_sm100_family:
-        raise ValueError(
-            f"backend='cake' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
-        )
+        raise ValueError(f"backend='cake' requires SM100/SM103, got SM{cc[0]}{cc[1]}")
     return cast(Literal["trtllm-gen", "cute-dsl", "sparse", "cake"], requested_backend)
 
 
