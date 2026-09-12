@@ -95,6 +95,24 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
+from .cake_megamoe_topk_reduce import (
+    gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_uri as get_cake_megamoe_topk_reduce_uri,
+)
+from .cake_megamoe_topk_reduce import (
+    load_cake_megamoe_topk_reduce_module as load_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    is_cake_megamoe_topk_reduce_module_loaded as is_cake_megamoe_topk_reduce_module_loaded,
+)
+from .cake_megamoe_topk_reduce import (
+    run_cake_megamoe_topk_reduce as run_cake_megamoe_topk_reduce,
+)
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (

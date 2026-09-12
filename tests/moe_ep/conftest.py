@@ -18,6 +18,12 @@ sys.path[:] = [
 ]
 
 
+def pytest_make_parametrize_id(config, val, argname):
+    from tests.moe.utils import parametrize_id
+
+    return parametrize_id(val)
+
+
 @pytest.fixture
 def dist_not_initialized():
     """Hide a prior torch.distributed init from bootstrap validation.

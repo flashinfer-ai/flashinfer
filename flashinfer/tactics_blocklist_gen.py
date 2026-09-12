@@ -42,6 +42,7 @@ from .fused_moe import (
     trtllm_fp8_block_scale_moe,
 )
 from .tactics_blocklist import TacticsBlocklist
+from .tllm_enums import SfLayout
 from .utils import device_support_pdl
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -148,6 +149,9 @@ def _probe_fp4(device, num_tokens, num_experts, hidden_size, intermediate_size, 
                 activation_type=ActivationType.Swiglu,
                 output=None,
                 tune_max_num_tokens=num_tokens,
+                # Quantized above with is_sf_swizzled_layout=False; declare it
+                # rather than relying on the deprecated layout inference.
+                hidden_states_scale_layout=SfLayout.layout_linear,
             )
     except Exception as e:
         print(f"    WARNING: FP4 probe raised: {e}")
