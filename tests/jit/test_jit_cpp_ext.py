@@ -378,9 +378,7 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa2", 512, 512) in calls
 
 
-def test_get_cuda_version_warns_on_cross_major_toolkit_mismatch(
-    monkeypatch, caplog
-):
+
     cpp_ext.get_cuda_version.cache_clear()
     monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda-13.0")
     monkeypatch.setattr(cpp_ext.torch.version, "cuda", "12.9")
