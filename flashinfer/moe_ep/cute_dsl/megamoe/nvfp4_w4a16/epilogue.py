@@ -64,6 +64,7 @@ class W4A16Epilogue:
         self.cluster_tile_intermediate_downproj = (
             self._EpilogueFc1IntermediateDownTileSize * cluster_shape_mn[0]
         )
+        self.cluster_tile_hidden = self._EpilogueFc2HiddenTileSize * cluster_shape_mn[0]
         self.cta_tile_m = self._EpilogueFc2HiddenTileSize
         self.cta_tile_n = mma_tiler_mnk[1]
         self.static_expert_shape = static_expert_shape
@@ -217,13 +218,17 @@ class W4A16Fc2Epilogue(EpilogueContext):
         hidden_base_this_cta_tile = work_tile_info.tile_m_idx * cutlass.Int32(
             self.cta_tile_m
         )
-        valid_hidden_this_cta_tile = (
-            cutlass.Int32(self.fc2_output.shape[2]) - hidden_base_this_cta_tile
-        )
-        if valid_hidden_this_cta_tile < 0:
-            valid_hidden_this_cta_tile = 0
-        if valid_hidden_this_cta_tile > self._EpilogueFc2HiddenTileSize:
-            valid_hidden_this_cta_tile = self._EpilogueFc2HiddenTileSize
+        valid_hidden_this_cta_tile = self._EpilogueFc2HiddenTileSize
+        if cutlass.const_expr(
+            self.static_expert_shape[2] % self.cluster_tile_hidden != 0
+        ):
+            valid_hidden_this_cta_tile = (
+                cutlass.Int32(self.static_expert_shape[2]) - hidden_base_this_cta_tile
+            )
+            if valid_hidden_this_cta_tile < 0:
+                valid_hidden_this_cta_tile = 0
+            if valid_hidden_this_cta_tile > self._EpilogueFc2HiddenTileSize:
+                valid_hidden_this_cta_tile = self._EpilogueFc2HiddenTileSize
 
         metadata_u32 = None
         peer_rank_ptr_mapper = None
@@ -542,10 +547,13 @@ class W4A16Fc1Epilogue(EpilogueContext):
 
             token_in_tile = subtile_idx * 64 + half * 32 + lane
             output_column = work_tile_info.tile_m_idx * 64 + warp_idx * 16
-            if (
-                token_in_tile < work_tile_info.valid_tokens_in_cta_tile
-                and output_column < real_fc1_output.shape[1]
+            in_bound = token_in_tile < work_tile_info.valid_tokens_in_cta_tile
+            if cutlass.const_expr(
+                self.intermediate_downproj % self.cluster_tile_intermediate_downproj
+                != 0
             ):
+                in_bound = in_bound and output_column < real_fc1_output.shape[1]
+            if in_bound:
                 token_row = work_tile_info.tile_n_idx * self.cta_tile_n + token_in_tile
                 output = cute.make_rmem_tensor((16,), cutlass.BFloat16)
                 output.store(transposed_output.load().to(cutlass.BFloat16))

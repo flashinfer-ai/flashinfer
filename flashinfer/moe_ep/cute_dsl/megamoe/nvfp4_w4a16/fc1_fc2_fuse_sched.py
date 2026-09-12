@@ -848,14 +848,34 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         is_fc1 = state.current_phase == Int32(BlockPhase.Linear1)
         if is_fc1:
             num_fc1_intermediate_blocks = self._num_fc1_intermediate_blocks
-            cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
+            if const_expr(
+                isinstance(self._num_fc1_intermediate_blocks, int)
+                and self._num_fc1_intermediate_blocks > 0
+                and self._num_fc1_intermediate_blocks
+                & (self._num_fc1_intermediate_blocks - 1)
+                == 0
+            ):
+                cluster_token_block_idx = local_id >> Int32(
+                    self._num_fc1_intermediate_blocks.bit_length() - 1
+                )
+            else:
+                cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
             cluster_intermediate_or_hidden_block_idx = (
                 local_id - cluster_token_block_idx * num_fc1_intermediate_blocks
             )
         else:
             num_fc2_hidden_blocks = self._num_fc2_hidden_blocks
             # Keep token-block as the slow axis in both phases.
-            cluster_token_block_idx = local_id // num_fc2_hidden_blocks
+            if const_expr(
+                isinstance(self._num_fc2_hidden_blocks, int)
+                and self._num_fc2_hidden_blocks > 0
+                and self._num_fc2_hidden_blocks & (self._num_fc2_hidden_blocks - 1) == 0
+            ):
+                cluster_token_block_idx = local_id >> Int32(
+                    self._num_fc2_hidden_blocks.bit_length() - 1
+                )
+            else:
+                cluster_token_block_idx = local_id // num_fc2_hidden_blocks
             cluster_intermediate_or_hidden_block_idx = (
                 local_id - cluster_token_block_idx * num_fc2_hidden_blocks
             )
