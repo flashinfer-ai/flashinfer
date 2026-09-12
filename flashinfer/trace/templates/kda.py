@@ -47,6 +47,7 @@ recurrent_kda_trace = TraceTemplate(
         "v": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
         "g": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
         "beta": Tensor(["batch_size", "seq_len", "num_v_heads"]),
+        "ssm_state_indices": Tensor(["batch_size"], dtype="int32", optional=True),
         "initial_state": Tensor(
             ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
             optional=True,
@@ -108,7 +109,7 @@ recurrent_kda_trace = TraceTemplate(
             dtype_from="q",
         ),
         "final_state": Tensor(
-            ["state_pool_size", "num_v_heads", "head_dim", "head_dim"],
+            ["batch_size", "num_v_heads", "head_dim", "head_dim"],
             dtype="bfloat16",
             optional=True,
         ),
