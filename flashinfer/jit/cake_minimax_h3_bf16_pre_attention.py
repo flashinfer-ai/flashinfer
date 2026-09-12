@@ -17,7 +17,7 @@ limitations under the License.
 from pathlib import Path
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm103a_nvcc_flags
+from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 from .cpp_ext import is_cuda_version_at_least
 
 
@@ -62,15 +62,16 @@ def _minimax_h3_include_dir() -> Path:
 
 
 def gen_minimax_h3_bf16_pre_attention_module() -> JitSpec:
-    """Return the SM103a-only JIT spec for fused BF16 pre-attention."""
+    """Return the SM100a/SM103a fatbin JIT spec for fused BF16 pre-attention."""
 
     if not is_cuda_version_at_least("12.9"):
-        raise RuntimeError("SM103a compilation requires CUDA 12.9 or newer")
+        raise RuntimeError("SM100a/SM103a compilation requires CUDA 12.9 or newer")
     source = _minimax_h3_cuda_source()
     return gen_jit_spec(
-        "minimax_h3_bf16_pre_attention_sm103a_v1",
+        "minimax_h3_bf16_pre_attention_sm100a_sm103a_v1",
         [source],
-        extra_cuda_cflags=sm103a_nvcc_flags + _PRECISE_MATH_FLAGS,
+        extra_cuda_cflags=list(dict.fromkeys(sm100a_nvcc_flags + sm103a_nvcc_flags))
+        + _PRECISE_MATH_FLAGS,
         extra_include_paths=[_minimax_h3_include_dir()],
     )
 
