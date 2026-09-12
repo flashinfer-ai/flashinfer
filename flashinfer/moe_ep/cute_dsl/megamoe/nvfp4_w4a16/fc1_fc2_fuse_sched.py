@@ -839,6 +839,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         params = self.params
         cta_tile_m = params.cta_tile_shape_mnk[0]
 
+        # Work IDs advance monotonically into the current expert's interval,
+        # so local_id is nonnegative as required by fast divmod.
         local_id = cluster_linear_tile_idx - state.current_expert_tile_start
 
         # Prebind due to DSL AST.
@@ -851,12 +853,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             if const_expr(
                 isinstance(self._num_fc1_intermediate_blocks, int)
                 and self._num_fc1_intermediate_blocks > 0
-                and self._num_fc1_intermediate_blocks
-                & (self._num_fc1_intermediate_blocks - 1)
-                == 0
             ):
-                cluster_token_block_idx = local_id >> Int32(
-                    self._num_fc1_intermediate_blocks.bit_length() - 1
+                cluster_token_block_idx = local_id // cute.fast_divmod_create_divisor(
+                    self._num_fc1_intermediate_blocks, loc=loc, ip=ip
                 )
             else:
                 cluster_token_block_idx = local_id // num_fc1_intermediate_blocks
@@ -869,10 +868,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             if const_expr(
                 isinstance(self._num_fc2_hidden_blocks, int)
                 and self._num_fc2_hidden_blocks > 0
-                and self._num_fc2_hidden_blocks & (self._num_fc2_hidden_blocks - 1) == 0
             ):
-                cluster_token_block_idx = local_id >> Int32(
-                    self._num_fc2_hidden_blocks.bit_length() - 1
+                cluster_token_block_idx = local_id // cute.fast_divmod_create_divisor(
+                    self._num_fc2_hidden_blocks, loc=loc, ip=ip
                 )
             else:
                 cluster_token_block_idx = local_id // num_fc2_hidden_blocks
