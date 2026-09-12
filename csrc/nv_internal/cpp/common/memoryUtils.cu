@@ -14,11 +14,25 @@
  * limitations under the License.
  */
 
+// Detect AddressSanitizer before any include: <sanitizer/asan_interface.h> is shipped by the
+// sanitizer runtime (libasan) rather than by the compiler itself on some distros (e.g. Fedora),
+// so including it unconditionally breaks the JIT build on hosts that never asked for ASan.
+#ifdef __has_feature
+#if __has_feature(address_sanitizer)
+#define TLLM_HAS_ASAN
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define TLLM_HAS_ASAN
+#endif
+
 #include <curand_kernel.h>
-#include <sanitizer/asan_interface.h>
 #include <sys/stat.h>
 
 #include <unordered_map>
+
+#if defined(TLLM_HAS_ASAN)
+#include <sanitizer/asan_interface.h>
+#endif
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
@@ -27,14 +41,6 @@
 
 namespace tensorrt_llm {
 namespace common {
-
-#ifdef __has_feature
-#if __has_feature(address_sanitizer)
-#define TLLM_HAS_ASAN
-#endif
-#elif defined(__SANITIZE_ADDRESS__)
-#define TLLM_HAS_ASAN
-#endif
 
 cudaError_t cudaMemcpyAsyncSanitized(void* dst, void const* src, size_t count,
                                      enum cudaMemcpyKind kind, cudaStream_t stream) {
