@@ -57,6 +57,32 @@ def _setup_mla_inputs(batch_size, max_seq_len, page_size, dtype, device):
     return q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table
 
 
+def _planned_cutlass_backend(
+    *,
+    output_dtype=torch.bfloat16,
+    output_scale="none",
+    batch_size=1,
+    page_size=1,
+):
+    from flashinfer.mla._batch_mla._backends.cutlass_backend import (
+        _BatchMLAPagedAttentionCutlassBackend,
+    )
+
+    backend = _BatchMLAPagedAttentionCutlassBackend(torch.empty(16, dtype=torch.uint8))
+    backend._batch_size = batch_size
+    backend._page_size = page_size
+    backend._head_dim_ckv = 512
+    backend._head_dim_kpe = 64
+    backend._q_data_type = torch.bfloat16
+    backend._kv_data_type = torch.bfloat16
+    backend._output_dtype = output_dtype
+    backend._output_scale = output_scale
+    backend._kv_len = torch.tensor([1], dtype=torch.int32)
+    backend._page_table = torch.zeros((1, 128), dtype=torch.int32)
+    backend._empty_lse = torch.empty(0, dtype=torch.float32)
+    return backend
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024])
 @pytest.mark.parametrize("page_size", [1, 16])
@@ -228,26 +254,154 @@ def test_cutlass_mla_bf16_output_unchanged():
     torch.testing.assert_close(o1, o2, rtol=1e-3, atol=1e-3)
 
 
-def test_cutlass_mla_fp8_non_cutlass_backend_rejected():
-    """o_scale with non-cutlass backend should raise ValueError.
+def test_planned_cutlass_fp8_output_uses_ckv_width_and_preserves_identity():
+    class _FakeModule:
+        def cutlass_mla_paged_attention(self, *args):
+            self.args = args
 
-    We directly set _backend to 'fa2' without calling plan() to avoid
-    JIT compilation dependencies. The o_scale check happens before any
-    module call.
-    """
-    device = torch.device("cuda:0")
-
-    q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table = _setup_mla_inputs(
-        1, 128, 1, torch.float16, device
+    backend = _planned_cutlass_backend(
+        output_dtype=torch.float8_e4m3fn,
+        output_scale="per-tensor",
     )
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
-    # Force backend without plan() to avoid JIT compilation
-    wrapper._backend = "fa2"
+    backend._cached_module = _FakeModule()
+    query = torch.empty((1, 128, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((1, 1, 576), dtype=torch.bfloat16)
+    out = torch.empty((1, 128, 512), dtype=torch.float8_e4m3fn)
 
-    out_fp8 = torch.empty(1, 128, 512, dtype=torch.float8_e4m3fn, device=device)
-    with pytest.raises(ValueError, match="o_scale is only supported with the cutlass"):
-        wrapper.run(q_nope, q_pe, ckv_cache, kpe_cache, out=out_fp8, o_scale=0.1)
+    actual = backend.run_from_wrapper(
+        query=query,
+        kv_cache=kv_cache,
+        out=out,
+        lse=None,
+        return_lse=False,
+        profiler_buffer=None,
+        kv_len=None,
+        page_table=None,
+        return_lse_base_on_e=False,
+        o_scale=0.25,
+        ckv_scale=None,
+        ckv_scale_arr=None,
+        kpe_scale=None,
+    )
+
+    assert actual is out
+    assert backend._cached_module.args[1] is out
+
+
+@pytest.mark.parametrize(
+    "field,match",
+    [
+        ("query_dtype", "query dtype.*planned"),
+        ("kv_dtype", "KV cache dtype.*planned"),
+        ("kv_len_dtype", "kv_len must have dtype torch.int32"),
+        ("page_table_dtype", "page_table must have dtype torch.int32"),
+    ],
+)
+def test_planned_cutlass_run_enforces_planned_dtypes(field, match):
+    backend = _planned_cutlass_backend()
+    backend._cached_module = object()
+    query = torch.empty((1, 128, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((1, 1, 576), dtype=torch.bfloat16)
+    if field == "query_dtype":
+        query = query.to(torch.float16)
+    elif field == "kv_dtype":
+        kv_cache = kv_cache.to(torch.float16)
+    elif field == "kv_len_dtype":
+        backend._kv_len = backend._kv_len.to(torch.int64)
+    else:
+        backend._page_table = backend._page_table.to(torch.int64)
+
+    with pytest.raises(ValueError, match=match):
+        backend.run_from_wrapper(
+            query=query,
+            kv_cache=kv_cache,
+            out=None,
+            lse=None,
+            return_lse=False,
+            profiler_buffer=None,
+            kv_len=None,
+            page_table=None,
+            return_lse_base_on_e=False,
+            o_scale=None,
+            ckv_scale=None,
+            ckv_scale_arr=None,
+            kpe_scale=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("short_kv_len", "kv_len.*one entry"),
+        ("batch", "query batch size.*planned"),
+        ("page_size", "KV cache page size.*planned"),
+    ],
+)
+def test_planned_cutlass_run_enforces_planned_metadata_shape(mutation, match):
+    backend = _planned_cutlass_backend()
+    backend._cached_module = object()
+    query = torch.empty((1, 128, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((1, 1, 576), dtype=torch.bfloat16)
+    kv_len = backend._kv_len
+    page_table = backend._page_table
+    if mutation == "short_kv_len":
+        query = torch.empty((2, 128, 576), dtype=torch.bfloat16)
+        page_table = torch.zeros((2, 128), dtype=torch.int32)
+    elif mutation == "batch":
+        query = torch.empty((2, 128, 576), dtype=torch.bfloat16)
+        kv_len = torch.tensor([1, 1], dtype=torch.int32)
+        page_table = torch.zeros((2, 128), dtype=torch.int32)
+    else:
+        kv_cache = torch.empty((1, 2, 576), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match=match):
+        backend.run_from_wrapper(
+            query=query,
+            kv_cache=kv_cache,
+            out=None,
+            lse=None,
+            return_lse=False,
+            profiler_buffer=None,
+            kv_len=kv_len,
+            page_table=page_table,
+            return_lse_base_on_e=False,
+            o_scale=None,
+            ckv_scale=None,
+            ckv_scale_arr=None,
+            kpe_scale=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "output_dtype,output_scale",
+    [
+        (torch.float8_e4m3fn, "none"),
+        (torch.bfloat16, "per-tensor"),
+    ],
+)
+def test_cutlass_plan_rejects_impossible_output_contract(output_dtype, output_scale):
+    from flashinfer.mla._batch_mla._backends.cutlass_backend import (
+        _BatchMLAPagedAttentionCutlassBackend,
+    )
+
+    backend = _BatchMLAPagedAttentionCutlassBackend(torch.empty(16, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="output"):
+        backend.plan(
+            num_heads=128,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=1,
+            causal=False,
+            sm_scale=1.0 / math.sqrt(192),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            output_dtype=output_dtype,
+            output_scale=output_scale,
+            use_profiler=False,
+            batch_size=1,
+            kv_len=torch.tensor([1], dtype=torch.int32),
+            page_table=torch.zeros((1, 128), dtype=torch.int32),
+        )
 
 
 if __name__ == "__main__":

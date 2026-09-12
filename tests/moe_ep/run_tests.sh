@@ -6,6 +6,7 @@
 #   bash tests/moe_ep/run_tests.sh unit          # host-only pytest
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
+#   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
@@ -25,6 +26,8 @@
 #   - multirank/smoke/correctness: nccl.ep importable (built by the install above)
 #   - multirank/smoke/correctness: >=4 GPUs
 #   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
+#   - bf16-rank-major: one x86_64 node with 8x B200, CUDA 12.8+ nvcc,
+#     cuda-bindings, and PyTorch CUDA symmetric-memory support
 #   - optional NIXL smoke: BUILD_NIXL_EP=1 install
 
 set -uo pipefail
@@ -113,8 +116,11 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_cudagraph_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
@@ -152,6 +158,13 @@ run_multirank() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_split_kernels.py -v \
     -m "nvep and gpu_4" --backend=nccl_ep || rc=1
+
+  # CUDA-graph capture of the split path (Handle.update). nccl_ep only --
+  # nixl_ep has no update()/InitHandle split to capture.
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_cudagraph_multirank.py -v \
+    -m "nvep and gpu_4" || rc=1
 
   if have_nixl_ep; then
     "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
@@ -273,6 +286,29 @@ run_mega() {
   return "${rc}"
 }
 
+# The rank-major source bundle has an exact eight-rank contract. Keep this
+# separate from the four-rank mega/all targets and do not honor NPROC_MULTIRANK.
+# See docs/design_docs/moe_ep_bf16_rank_major_gpu_tests.md for requirements.
+run_bf16_rank_major() {
+  "${PY}" -c '
+import platform
+import torch
+
+if platform.machine() != "x86_64":
+    raise SystemExit("BF16 rank-major regression requires x86_64")
+if torch.cuda.device_count() != 8:
+    raise SystemExit("BF16 rank-major regression requires exactly 8 visible B200 GPUs")
+for device in range(8):
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (10, 0) or "B200" not in props.name:
+        raise SystemExit(f"BF16 rank-major regression requires B200; GPU {device}: {props.name}")
+' || return 1
+  "${TORCHRUN}" --standalone --nproc_per_node=8 -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py -v \
+    -m "gpu_8 and arch_blackwell"
+}
+
 # 4-GPU Hopper sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (layer-vs-direct-shim parity on
 # real cross-rank EP traffic).  Own torchrun pytest process: the SM90 and
 # SM100 kernel trees share top-level module names and are mutually exclusive
@@ -295,6 +331,17 @@ run_sm90_push() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm90_push_fp8_kernel.py \
     tests/moe_ep/test_sm90_push_fp8_backend.py -v
+}
+
+# 4-GPU Blackwell-consumer sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank.
+# Own torchrun pytest process for the same reason as run_mega_sm90: the
+# SM120 kernel tree shares top-level module names with the SM100/SM90 trees
+# and is mutually exclusive per process (and is excluded from run_unit).
+run_mega_sm120() {
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py -v \
+    -m "gpu_4 and arch_sm120"
 }
 
 # Fault tolerance. Split into a pytest half (a STALLED rank -- every process
@@ -395,13 +442,15 @@ case "${1:-all}" in
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
+  bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200 GPUs)" run_bf16_rank_major; print_summary ;;
   mega_sm90) run_section "sm90_fp8_fp8_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90; print_summary ;;
+  mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   sm90_push) run_section "sm90_fp8_fp8_bf16_push_cuda kernel + backend (2 Hopper GPUs)" run_sm90_push; print_summary ;;
   smoke) run_section "smoke scripts" run_smoke; print_summary ;;
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|mega_sm90|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|multirank|sm90_push|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm120|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

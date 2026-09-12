@@ -14,12 +14,20 @@ CuTe DSL implementations for a strict ordinary multi-token prefill subset.
 
     RecurrentKDAPrefillWorkspace
 
-.. currentmodule:: flashinfer.kda
+.. note::
 
-.. autosummary::
-    :toctree: ../generated
-
-    RecurrentKDAPrefillWrapper
+    ``flashinfer.RecurrentKDAPrefillWrapper`` is **experimental**, so it has no
+    generated reference page here until it graduates. Calling ``plan`` or
+    ``run`` is itself the opt-in and needs no environment variable; each warns
+    once per process. It is limited to compute capability 10.0 and 10.3, is
+    specific to the CuTe DSL backend, and fixes the sequence count and packed
+    token extent after the first warmup run. Its planning implementation lives
+    in ``flashinfer.experimental.kda_prefill_wrapper``; it contains no kernels
+    of its own, and the kernels it dispatches to are the stable AOT-registered
+    ones, alongside a package README. ``examples/experimental/kda_prefill_wrapper.py``
+    is a runnable plan-and-run example. See
+    `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for the
+    graduation plan.
 
 Backend selection
 -----------------
@@ -66,9 +74,22 @@ CUDA 12.8 predates the family target, so CC 10.0 uses legacy exact
 ``sm_100a`` modules. With CUDA 12.9 or newer, JIT and AOT compile one
 ``sm_100f`` module per schedule for both CC 10.0 and CC 10.3. Cache keys also
 include the frozen module identity so an older schedule cannot satisfy a
-refreshed request. Runtime routing remains device-specific: persistent M128
-is restricted to measured 148/152-SM CC 10.0 devices. CC 10.3 uses the direct
-schedules, with a tensor-core state-decay specialization for uniform, complete
+refreshed request. Runtime routing remains device-specific. The legacy
+head-grouped and mixed-length persistent M128 routes remain restricted to
+measured 148/152-SM CC 10.0 devices. On validated 148/152-SM CC 10.0 or CC 10.3
+devices, eligible uniform eager calls with a caller-owned in-place initial and
+final state may instead split only the recurrence chains that create a partial
+final device wave. An occupancy and roofline model
+uses the live SM count plus the frozen schedule's thread, shared-memory,
+tensor-memory, BF16, HBM, state-transfer, and refill costs; it selects
+recurrence pieces only when their dependency-DAG critical path is shorter than
+direct M128. Intermediate BF16 states use device-scope release/acquire
+handoffs, and each consumer CTA resets its ready counter before it completes so
+subsequent eager launches start from the same state. This route is not selected
+when the caller supplies an explicit workspace or ``seq_order``; CUDA Graph
+capture therefore continues through the existing non-piece routes.
+
+CC 10.3 also has a tensor-core state-decay specialization for uniform, complete
 N32 work when there are at least 64 heads, at least 96 sequence/head tasks,
 and the maximum sequence length is a multiple of 32 and at least 256. Mixed or
 partial N32 tails retain scalar state decay. On either capability, fixed-layout
@@ -130,24 +151,27 @@ BT16 prepare/chain route: dense fixed ``B=1,H=60..64`` inputs qualify from
 M128 shapes qualify from 65,536 tokens for one to eight sequence/head tasks,
 or from 4,096 tokens for nine to 32 tasks when two CTAs per task fit. N16
 alternatives additionally depend on SM count, chain waves, and sequence
-length. Supplying ``seq_order`` disables persistent host task-bin planning but
-does not suppress BT16 or otherwise force direct M128. Remaining eligible
-inputs select the shape-appropriate non-persistent or general M128 schedule.
+length. Uniform work may use the recurrence-piece route described above when
+its modeled critical path wins. Supplying ``seq_order`` disables persistent
+host task-bin planning but does not suppress BT16 or otherwise force direct
+M128. Remaining eligible inputs select the shape-appropriate non-persistent or
+general M128 schedule.
 The scalar-prepare/S8 BT16 pair is submitted by one native Cake binding, which
 performs both launch plans before enqueueing either kernel so the dependent
 launches do not expose a Python/FFI inter-kernel gap. CUDA Graph capture still
 records the same two kernels and preserves the workspace contract below.
 
-For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
-caches a stable decreasing-length order on the host. CuTe DSL decomp retains
-the original sequence order because its CTA grid fits in one wave.
-``flashinfer.RecurrentKDAPrefillWrapper`` provides the explicit planned path
-needed for packed engine CUDA Graph capture: ``plan`` builds the order and the
-decomp ``cu_chunks`` prefix, then ``run`` consumes fixed-address buffers. The
-decomp prep kernel binary-searches this compact prefix instead of carrying a
-dense chunk-to-sequence tensor. The number of sequences, total tokens, and
-total BT=16 chunks are fixed by the first plan so the metadata and launch
-geometry remain valid across CUDA Graph replays.
+For packed CuTe DSL engine calls, omitting ``seq_order`` generates a stable
+decreasing-length order on the device. CuTe DSL decomp retains the original
+sequence order in the eager path because its CTA grid fits in one wave.
+``flashinfer.RecurrentKDAPrefillWrapper`` (experimental) provides fixed-address
+metadata for CUDA Graph capture: ``plan`` only copies packed offsets into its
+device buffer, while a captured GPU prepass generates the order and decomp
+``cu_chunks`` prefix before the recurrent kernels run. The decomp prep kernel
+binary-searches this compact prefix instead of carrying a dense
+chunk-to-sequence tensor. Its workspace and launch use a graph-static chunk
+capacity derived from tensor shapes, while the GPU prefix supplies the actual
+chunk count on each replay.
 
 State and graph semantics
 -------------------------

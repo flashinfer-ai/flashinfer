@@ -39,6 +39,31 @@ from tests.attn_scores.test_attn_scores import (
 
 DEVICE = "cuda"
 
+_SM107_UNSUPPORTED_KERNEL_TESTS = frozenset(
+    {
+        "test_adv_context_boundaries_fp8",
+        "test_adv_degenerate_values_fp8",
+        "test_adv_determinism_fp8",
+        "test_adv_fp4_boundaries",
+        "test_adv_fp4_max_next_n_small_ctx",
+        "test_adv_guards_raise",
+        "test_adv_interspersed_zero_row_uses_correct_q",
+        "test_adv_new_guards_raise",
+        "test_adv_shared_physical_blocks_fp8",
+        "test_adv_skewed_varlen_fp8",
+        "test_adv_zero_length_row_not_executed",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_sm107_unsupported_kernel_tests(request):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        return
+    test_name = getattr(request.node, "originalname", request.node.name)
+    if test_name in _SM107_UNSUPPORTED_KERNEL_TESTS:
+        pytest.skip("paged MQA logits kernels support SM100 and SM103, not SM107")
+
 
 def _skip_if_not_sm100():
     if not is_sm100a_supported(torch.device(DEVICE)):

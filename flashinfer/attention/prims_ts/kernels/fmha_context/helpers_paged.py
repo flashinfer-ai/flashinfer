@@ -14,11 +14,9 @@
 
 """Paged-KV helpers for the task-scheduled FMHA *context* kernel.
 
-Mirrors the decode-side helpers in
-``../fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py`` but is stripped
-down to what context needs: context has no multi-CTA-KV split, folds any
-sliding-window prefix into ``kv_tile_start``, and uses one
-``kv_tile_start + loop_offset`` expression for the current K/V tile index.
+Context has no multi-CTA-KV split, folds any sliding-window prefix into
+``kv_tile_start``, and uses one ``kv_tile_start + loop_offset`` expression for
+the current K/V tile index. Page IDs come from fixed row-strided block tables.
 """
 
 import cutlass
@@ -48,6 +46,19 @@ def _load_runtime_seq_len_kv(
 def _runtime_last_valid_page_idx(cfg: FmhaConfig, seq_len_kv: Int32) -> Int32:
     num_pages = cute.ceil_div(seq_len_kv, cfg.num_tokens_per_page)
     return cute.math.max(num_pages - Int32(1), Int32(0))
+
+
+@cute.jit
+def _load_block_table_row_bounds(
+    block_table_row_stride: Int32,
+    cfg: FmhaConfig,
+    seq_len_kv: Int32,
+    batch_coord: Int32,
+) -> tuple[Int32, Int32]:
+    """Return one fixed-table row base and runtime-valid inclusive page bound."""
+
+    row_begin = batch_coord * block_table_row_stride
+    return row_begin, _runtime_last_valid_page_idx(cfg, seq_len_kv)
 
 
 @cute.jit
