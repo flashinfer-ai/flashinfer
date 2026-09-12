@@ -37,6 +37,30 @@ def _load_cake_benchmark_module():
     return module
 
 
+@pytest.mark.parametrize("metric", ["max_abs", "max_rel"])
+def test_candidate_error_comparison_uses_observed_errors(metric):
+    module = _load_cake_benchmark_module()
+    report = {
+        f"{backend}_truth_{component}": {
+            "max_abs": 0.01,
+            "max_rel": 0.01,
+            "tolerance_passed": True,
+        }
+        for backend in ("cake", "vibecuda")
+        for component in ("out", "final_states")
+    }
+    assert module._candidate_error_comparison(report) == {
+        "out": True,
+        "final_states": True,
+    }
+    report["vibecuda_truth_out"][metric] = 0.02
+    report["vibecuda_truth_final_states"][metric] = 0.005
+    assert module._candidate_error_comparison(report) == {
+        "out": False,
+        "final_states": True,
+    }
+
+
 def _assert_cute_parity(actual, expected, *, nheads, ngroups):
     torch.testing.assert_close(actual[0], expected[0], atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(actual[1], expected[1], atol=1e-2, rtol=1e-2)
@@ -819,7 +843,9 @@ def test_source_public_api_signatures_are_stable():
         _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True)
         == expected_run
     )
-    assert _signature_contract(module.ssd_combined_fwd) == expected_run
+    assert _signature_contract(module.ssd_combined_fwd) == expected_run + (
+        ("backend", positional, "cake"),
+    )
 
     helper_names = (
         "seq_idx",
@@ -893,7 +919,7 @@ def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
     assert runner._backend == "cake"
     assert runner._cake_runner.__class__ is CakeRunner
 
-    with pytest.raises(ValueError, match="backend must be 'cute' or 'cake'"):
+    with pytest.raises(ValueError, match="backend"):
         module.SSDCombined(128, 8, 64, 128, 8, backend="unknown")
 
 
@@ -973,6 +999,25 @@ def test_source_public_backend_constructor_validation_without_gpu(
 
     with pytest.raises(exception, match=match):
         module.SSDCombined(**constructor)
+
+
+@pytest.mark.parametrize(
+    "capability,capacity", [((7, 5), 163840), ((8, 6), 101376), ((8, 9), 101376)]
+)
+def test_vibecuda_constructor_rejects_unsupported_device(
+    monkeypatch, capability, capacity
+):
+    from types import SimpleNamespace
+
+    utils = importlib.import_module("flashinfer.utils")
+    monkeypatch.setattr(utils, "get_compute_capability", lambda *_: capability)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_: SimpleNamespace(shared_memory_per_block_optin=capacity),
+    )
+    with pytest.raises(ValueError, match="opt-in shared memory"):
+        SSDCombined(128, 8, 64, 128, 8, backend="vibecuda")
 
 
 def _public_runner_without_constructor(backend, cake_result=None):
