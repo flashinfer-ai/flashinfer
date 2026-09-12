@@ -458,6 +458,48 @@ def interleave_moe_weights_for_sm90_mixed_gemm(
     return out
 
 
+def _resolve_nvfp4_expert_global_scales(
+    scales,
+    *,
+    num_local_experts: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Normalize an NVFP4 global scale to contiguous float32 ``[E]``."""
+    if scales is None:
+        return torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    if not isinstance(scales, torch.Tensor):
+        scales = torch.tensor(scales, device=device, dtype=torch.float32)
+    else:
+        scales = scales.to(device=device, dtype=torch.float32)
+    scales = scales.reshape(-1)
+    if scales.numel() == 1:
+        scales = scales.expand(num_local_experts)
+    elif scales.numel() != num_local_experts:
+        raise ValueError(
+            f"{name} must be scalar or have {num_local_experts} elements, "
+            f"got {scales.numel()}."
+        )
+    if not bool(torch.isfinite(scales).all().item()) or not bool(
+        (scales > 0).all().item()
+    ):
+        raise ValueError(f"{name} must contain only finite positive values.")
+    return scales.contiguous()
+
+
+def _resolve_nvfp4_scalar_global_scale(
+    scale,
+    *,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    """Normalize an NVFP4 global scale to a positive float32 ``[1]`` tensor."""
+    resolved = _resolve_nvfp4_expert_global_scales(
+        scale, num_local_experts=1, device=device, name=name
+    )
+    return resolved.reshape(1)
+
+
 def prepare_trtllm_fp4_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -469,6 +511,9 @@ def prepare_trtllm_fp4_weights(
     activation=None,
     device: Optional[torch.device] = None,
     permute_cache: Optional[dict] = None,
+    gemm1_scales_global=None,
+    gemm2_scales_global=None,
+    intermediate_scale_global=None,
 ) -> Dict[str, torch.Tensor]:
     """Build a TRTLLM FP4 ``trtllm_fp4_routed`` weight view.
 
@@ -522,6 +567,18 @@ def prepare_trtllm_fp4_weights(
             f"or MXFP4×BF16; got {quant!r}."
         )
     is_mxfp4 = quant.weight is QuantFormat.MXFP4
+    calibrated_scales = (
+        gemm1_scales_global,
+        gemm2_scales_global,
+        intermediate_scale_global,
+    )
+    if any(scale is not None for scale in calibrated_scales) and quant.pair != (
+        QuantFormat.NVFP4,
+        QuantFormat.NVFP4,
+    ):
+        raise ValueError(
+            "Calibrated global scales are supported only for NVFP4×NVFP4."
+        )
     sf_vec_size = 32 if is_mxfp4 else 16
     required_alignment = 128 if is_mxfp4 else sf_vec_size
     if (
@@ -545,7 +602,6 @@ def prepare_trtllm_fp4_weights(
 
     epilogue_tile_m = 128  # TRTLLM kernel-internal constant
 
-    w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
     # The alignment check above bounds intermediate_size, but the scale
@@ -559,36 +615,87 @@ def prepare_trtllm_fp4_weights(
             f"{type(activation).__name__} gives {gemm1_rows} rows for "
             f"intermediate_size={intermediate_size}."
         )
-    w1_flat = w1_bf16.view(num_local_experts * gemm1_rows, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=w1_gs,
-        sf_vec_size=sf_vec_size,
-        sf_use_ue8m0=is_mxfp4,
-        is_sf_swizzled_layout=False,
+    g1_gs = _resolve_nvfp4_expert_global_scales(
+        gemm1_scales_global,
+        num_local_experts=num_local_experts,
+        device=device,
+        name="gemm1_scales_global",
     )
-    g1_w = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2).view(
-        torch.uint8
+    g2_gs = _resolve_nvfp4_expert_global_scales(
+        gemm2_scales_global,
+        num_local_experts=num_local_experts,
+        device=device,
+        name="gemm2_scales_global",
     )
-    g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, gemm1_rows, hidden_size // sf_vec_size
+    c_gs = _resolve_nvfp4_scalar_global_scale(
+        intermediate_scale_global,
+        device=device,
+        name="intermediate_scale_global",
     )
 
-    w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat,
-        global_scale=w2_gs,
-        sf_vec_size=sf_vec_size,
-        sf_use_ue8m0=is_mxfp4,
-        is_sf_swizzled_layout=False,
-    )
-    g2_w = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2).view(
-        torch.uint8
-    )
-    g2_s = w2_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, hidden_size, intermediate_size // sf_vec_size
-    )
+    if gemm1_scales_global is None:
+        w1_flat = w1_bf16.view(num_local_experts * gemm1_rows, hidden_size)
+        w1_q_flat, w1_sf_flat = fp4_quantize(
+            w1_flat,
+            global_scale=torch.ones(1, device=device, dtype=torch.float32),
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=is_mxfp4,
+            is_sf_swizzled_layout=False,
+        )
+        g1_w = w1_q_flat.view(
+            num_local_experts, gemm1_rows, hidden_size // 2
+        ).view(torch.uint8)
+        g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
+            num_local_experts, gemm1_rows, hidden_size // sf_vec_size
+        )
+    else:
+        w1_q, w1_sf = [], []
+        for expert in range(num_local_experts):
+            q, sf = fp4_quantize(
+                w1_bf16[expert],
+                global_scale=g1_gs[expert : expert + 1],
+                sf_vec_size=sf_vec_size,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+            )
+            w1_q.append(q)
+            w1_sf.append(sf)
+        g1_w = torch.stack(w1_q).view(torch.uint8)
+        g1_s = torch.stack(w1_sf).view(torch.float8_e4m3fn).reshape(
+            num_local_experts, gemm1_rows, hidden_size // sf_vec_size
+        )
+
+    if gemm2_scales_global is None:
+        w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+        w2_q_flat, w2_sf_flat = fp4_quantize(
+            w2_flat,
+            global_scale=torch.ones(1, device=device, dtype=torch.float32),
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=is_mxfp4,
+            is_sf_swizzled_layout=False,
+        )
+        g2_w = w2_q_flat.view(
+            num_local_experts, hidden_size, intermediate_size // 2
+        ).view(torch.uint8)
+        g2_s = w2_sf_flat.view(torch.float8_e4m3fn).reshape(
+            num_local_experts, hidden_size, intermediate_size // sf_vec_size
+        )
+    else:
+        w2_q, w2_sf = [], []
+        for expert in range(num_local_experts):
+            q, sf = fp4_quantize(
+                w2_bf16[expert],
+                global_scale=g2_gs[expert : expert + 1],
+                sf_vec_size=sf_vec_size,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=False,
+            )
+            w2_q.append(q)
+            w2_sf.append(sf)
+        g2_w = torch.stack(w2_q).view(torch.uint8)
+        g2_s = torch.stack(w2_sf).view(torch.float8_e4m3fn).reshape(
+            num_local_experts, hidden_size, intermediate_size // sf_vec_size
+        )
 
     g1_w_sh, g1_s_sh, g2_w_sh, g2_s_sh = [], [], [], []
     for i in range(num_local_experts):
@@ -650,9 +757,9 @@ def prepare_trtllm_fp4_weights(
         "gemm1_weights_scale": gemm1_scale,
         "gemm2_weights": torch.stack(g2_w_sh),
         "gemm2_weights_scale": gemm2_scale,
-        "output1_scale_scalar": ones,
-        "output1_scale_gate_scalar": ones,
-        "output2_scale_scalar": ones,
+        "output1_scale_scalar": (c_gs / g1_gs).contiguous(),
+        "output1_scale_gate_scalar": (1.0 / g1_gs).contiguous(),
+        "output2_scale_scalar": (1.0 / (c_gs * g2_gs)).contiguous(),
     }
     if not is_mxfp4 and activation.is_gated:
         # NVFP4 gated kernels consume a per-expert gate alpha; non-gated
@@ -666,6 +773,7 @@ def prepare_trtllm_fp4_activations(
     hidden_states_bf16: torch.Tensor,
     *,
     quant: QuantConfig,
+    hidden_states_scale_global=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prepare activations for a unified TRTLLM FP4 MMA pair."""
     from .api import QuantFormat
@@ -678,6 +786,14 @@ def prepare_trtllm_fp4_activations(
     if hidden_states_bf16.dtype != torch.bfloat16:
         raise TypeError(
             f"hidden_states_bf16 must be torch.bfloat16, got {hidden_states_bf16.dtype}."
+        )
+
+    if hidden_states_scale_global is not None and quant.pair != (
+        QuantFormat.NVFP4,
+        QuantFormat.NVFP4,
+    ):
+        raise ValueError(
+            "hidden_states_scale_global is supported only for NVFP4×NVFP4."
         )
 
     if quant.pair == (QuantFormat.MXFP4, QuantFormat.BF16):
@@ -694,9 +810,11 @@ def prepare_trtllm_fp4_activations(
 
         if hidden_states_bf16.shape[1] % 16 != 0:
             raise ValueError("NVFP4 requires hidden_size divisible by 16.")
-        # The unified NVFP4 weight view currently fixes its epilogue scalars at
-        # one, so activation preparation must use the matching global scale.
-        global_scale = torch.ones(1, device=hidden_states_bf16.device)
+        global_scale = _resolve_nvfp4_scalar_global_scale(
+            hidden_states_scale_global,
+            device=hidden_states_bf16.device,
+            name="hidden_states_scale_global",
+        )
         q, sf = fp4_quantize(
             hidden_states_bf16,
             global_scale=global_scale,
@@ -2242,6 +2360,9 @@ def prepare_cute_dsl_weights(
     intermediate_size: int,
     activation=None,
     device: Optional[torch.device] = None,
+    gemm1_scales_global=None,
+    gemm2_scales_global=None,
+    intermediate_scale_global=None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
@@ -2270,6 +2391,18 @@ def prepare_cute_dsl_weights(
     }
     if quant.pair not in allowed:
         raise ValueError(f"CuTe-DSL FP4 weight preparation does not support {quant!r}")
+    calibrated_scales = (
+        gemm1_scales_global,
+        gemm2_scales_global,
+        intermediate_scale_global,
+    )
+    if any(scale is not None for scale in calibrated_scales) and quant.pair != (
+        QuantFormat.NVFP4,
+        QuantFormat.NVFP4,
+    ):
+        raise ValueError(
+            "Calibrated global scales are supported only for NVFP4×NVFP4."
+        )
 
     if device is None:
         device = w1_bf16.device
@@ -2284,7 +2417,23 @@ def prepare_cute_dsl_weights(
             "CuTe-DSL MXFP4 requires hidden and intermediate sizes divisible by 128"
         )
     sf_vec_size = 32 if is_mxfp4 else 16
-    gs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    g1_gs = _resolve_nvfp4_expert_global_scales(
+        gemm1_scales_global,
+        num_local_experts=num_local_experts,
+        device=device,
+        name="gemm1_scales_global",
+    )
+    g2_gs = _resolve_nvfp4_expert_global_scales(
+        gemm2_scales_global,
+        num_local_experts=num_local_experts,
+        device=device,
+        name="gemm2_scales_global",
+    )
+    c_gs = _resolve_nvfp4_scalar_global_scale(
+        intermediate_scale_global,
+        device=device,
+        name="intermediate_scale_global",
+    )
 
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
@@ -2293,15 +2442,32 @@ def prepare_cute_dsl_weights(
         if activation.is_gated
         else w1_bf16
     )
-    w1_flat = w1_interleaved.view(num_local_experts * gemm1_rows, hidden_size)
-    w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat,
-        global_scale=gs,
-        sf_vec_size=sf_vec_size,
-        sf_use_ue8m0=is_mxfp4,
-        is_sf_swizzled_layout=True,
-    )
-    w1_weight = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2)
+    if gemm1_scales_global is None:
+        w1_flat = w1_interleaved.view(num_local_experts * gemm1_rows, hidden_size)
+        w1_q_flat, w1_sf_flat = fp4_quantize(
+            w1_flat,
+            global_scale=torch.ones(1, device=device, dtype=torch.float32),
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=is_mxfp4,
+            is_sf_swizzled_layout=True,
+        )
+        w1_weight = w1_q_flat.view(
+            num_local_experts, gemm1_rows, hidden_size // 2
+        )
+    else:
+        w1_q, w1_sf = [], []
+        for expert in range(num_local_experts):
+            q, sf = fp4_quantize(
+                w1_interleaved[expert],
+                global_scale=g1_gs[expert : expert + 1],
+                sf_vec_size=sf_vec_size,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=True,
+            )
+            w1_q.append(q)
+            w1_sf.append(sf)
+        w1_weight = torch.stack(w1_q)
+        w1_sf_flat = torch.cat([sf.reshape(-1) for sf in w1_sf])
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
         m=gemm1_rows,
@@ -2310,15 +2476,32 @@ def prepare_cute_dsl_weights(
         sf_vec_size=sf_vec_size,
     )
 
-    w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
-    w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat,
-        global_scale=gs,
-        sf_vec_size=sf_vec_size,
-        sf_use_ue8m0=is_mxfp4,
-        is_sf_swizzled_layout=True,
-    )
-    w2_weight = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
+    if gemm2_scales_global is None:
+        w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
+        w2_q_flat, w2_sf_flat = fp4_quantize(
+            w2_flat,
+            global_scale=torch.ones(1, device=device, dtype=torch.float32),
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=is_mxfp4,
+            is_sf_swizzled_layout=True,
+        )
+        w2_weight = w2_q_flat.view(
+            num_local_experts, hidden_size, intermediate_size // 2
+        )
+    else:
+        w2_q, w2_sf = [], []
+        for expert in range(num_local_experts):
+            q, sf = fp4_quantize(
+                w2_bf16[expert],
+                global_scale=g2_gs[expert : expert + 1],
+                sf_vec_size=sf_vec_size,
+                sf_use_ue8m0=False,
+                is_sf_swizzled_layout=True,
+            )
+            w2_q.append(q)
+            w2_sf.append(sf)
+        w2_weight = torch.stack(w2_q)
+        w2_sf_flat = torch.cat([sf.reshape(-1) for sf in w2_sf])
     w2_weight_sf = convert_sf_to_mma_layout(
         w2_sf_flat,
         m=hidden_size,
@@ -2331,13 +2514,13 @@ def prepare_cute_dsl_weights(
     view = {
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
-        "w1_alpha": ones,
+        "w1_alpha": (1.0 / g1_gs).contiguous(),
         "w2_weight": w2_weight,
         "w2_weight_sf": w2_weight_sf,
-        "w2_alpha": ones,
+        "w2_alpha": (1.0 / (c_gs * g2_gs)).contiguous(),
     }
     if not is_mxfp4:
-        view["fc2_input_scale"] = gs
+        view["fc2_input_scale"] = c_gs
     return view
 
 
