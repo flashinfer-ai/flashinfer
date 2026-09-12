@@ -36,7 +36,8 @@ namespace flashinfer {
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
-__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params);
+__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params,
+                                                  float* tmp_v);
 
 template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx,
           uint32_t bdy, uint32_t bdz, uint32_t tile_size_qo_heads, typename AttentionVariant,

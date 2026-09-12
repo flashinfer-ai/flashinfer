@@ -239,6 +239,67 @@ def _run_batch_decode_with_paged_kv_cache_case(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
 
 
+def test_batch_decode_split_kv_preserves_fp32_partials():
+    """Split-KV must not round partial outputs before the final merge."""
+    torch.manual_seed(0)
+    num_qo_heads, num_kv_heads, head_dim = 32, 4, 128
+    kv_len, page_size = 16384, 16
+    num_pages = kv_len // page_size
+
+    q = torch.randn(
+        1, num_qo_heads, head_dim, device="cuda:0", dtype=torch.bfloat16
+    )
+    kv = (
+        torch.randn(
+            num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float32,
+        )
+        * 0.5
+    ).to(torch.bfloat16)
+    kv_indptr = torch.tensor([0, num_pages], device="cuda:0", dtype=torch.int32)
+    kv_indices = torch.arange(num_pages, device="cuda:0", dtype=torch.int32)
+    last_page_len = torch.tensor([page_size], device="cuda:0", dtype=torch.int32)
+
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(512 * 1024 * 1024, dtype=torch.int8, device="cuda:0"),
+        "NHD",
+        use_tensor_cores=False,
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        data_type=torch.bfloat16,
+        q_data_type=torch.bfloat16,
+    )
+    assert wrapper._plan_info[9], "test configuration must exercise split-KV"
+    output = wrapper.run(q, kv)[0]
+
+    k = kv[:, 0].reshape(-1, num_kv_heads, head_dim).float()
+    v = kv[:, 1].reshape(-1, num_kv_heads, head_dim).float()
+    group_size = num_qo_heads // num_kv_heads
+    reference = torch.empty_like(output, dtype=torch.float32)
+    for head_idx in range(num_qo_heads):
+        scores = (
+            q[0, head_idx].float() @ k[:, head_idx // group_size].T
+        ) / math.sqrt(head_dim)
+        reference[head_idx] = torch.softmax(scores, dim=-1) @ v[
+            :, head_idx // group_size
+        ]
+
+    mismatches = torch.count_nonzero(output != reference.to(torch.bfloat16))
+    assert mismatches.item() <= reference.numel() // 100
+
+
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
