@@ -173,6 +173,40 @@ XQA
     xqa
     xqa_mla
 
+Experimental: PagedAttention
+============================
+
+:class:`flashinfer.prefill.PagedAttention` is the experimental successor to
+:class:`~flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` for paged
+attention over the existing fa2/fa3, cuDNN, and trtllm-gen kernels. One
+:class:`~flashinfer.prefill.PagedAttentionMetadata` object per scheduler step
+(token-unit ``qo_indptr``, per-request ``kv_seq_lens``, a dense block table via
+``.dense(...)`` or flat page ids via ``.csr(...)``, required host maxes,
+optional CPU mirrors for a zero-sync plan); :func:`resolve_paged_attention`
+answers at engine init which backends can run a configuration and why the
+others cannot; ``plan()`` declares the LSE base (``lse_mode``) and ``run()``
+takes the per-layer ``sm_scale`` and, for an fp8 KV cache, the per-tensor
+``k_scale`` / ``v_scale``. ``PagedAttention(use_cuda_graph=True)`` reserves
+metadata storage so a captured ``run()`` can be re-planned and replayed. Calling any of these is the opt-in (an
+``ExperimentalWarning`` is emitted once); see the tracking issue
+`#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
+graduation plan.
+
+.. currentmodule:: flashinfer.prefill
+
+.. autosummary::
+    :toctree: ../generated
+
+    resolve_paged_attention
+
+.. autoclass:: PagedAttention
+    :members: plan, run, explain, backend
+
+    .. automethod:: __init__
+
+.. autoclass:: PagedAttentionMetadata
+    :members: dense, csr
+
 flashinfer.prefill
 ==================
 
@@ -208,6 +242,16 @@ Batch Prefill/Append Attention
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
 
     .. automethod:: __init__
+
+.. note::
+
+    :class:`BatchPrefillWithPagedKVCacheWrapper` is **superseded** by the
+    experimental :class:`~flashinfer.prefill.PagedAttention` (above) and is
+    scheduled for deprecation once that API graduates (tracking:
+    `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_). It
+    remains fully supported and receives bug fixes; new integrations should
+    start from the unified API, which is the only path on which ``backend="auto"``
+    can select the cuDNN and trtllm-gen kernels.
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
