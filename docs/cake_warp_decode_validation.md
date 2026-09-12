@@ -258,3 +258,19 @@ Omitting `--sanitizer-tokens` launches every selector boundary for the selected
 geometry. Workspace preparation remains outside the launch-only call on
 non-default stream A, the call runs on distinct non-default stream B, and the
 receipt is released only after stream B has completed.
+
+## Public model comparison results
+
+The [448-row comparison report](cake_warp_decode_results/performance-448.public.md)
+covers seven public model configurations, T1–32, on SM100 and SM103. All rows
+passed the source/export fidelity and correctness requirements. The report
+retains hardware/source cohorts and each official comparison’s independently
+paired export denominator; it includes favorable and unfavorable results.
+[JSON](cake_warp_decode_results/performance-448.public.json) and
+[CSV](cake_warp_decode_results/performance-448.public.csv) are available for analysis.
+
+These are CUPTI measurements with cold L2 and symmetric external CUDA Graph
+populations, not whole-model throughput. Reported native runtime totals marked
+with ≥ are observed lower bounds because some historical invocations retained
+nonterminal progress records; terminal managed physical intervals remain included.
+Measurement, native, worker and physical durations overlap and must not be added.
