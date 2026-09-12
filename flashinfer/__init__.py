@@ -169,6 +169,7 @@ with contextlib.suppress(ImportError):
         CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
+        W4A16PackedWeights as W4A16PackedWeights,
         cute_dsl_fused_moe_bf16 as cute_dsl_fused_moe_bf16,
         CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )

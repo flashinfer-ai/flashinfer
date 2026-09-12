@@ -14,8 +14,10 @@ from .moe_dispatch import (
     launch_sm120_static_moe,
     launch_sm120_dynamic_moe,
     launch_sm120_moe,
+    launch_sm120_w4a16_moe_prepared,
     _get_weight_views,
 )
+from .moe_w4a16_prepare import W4A16PackedWeights
 
 __all__ = [
     "MoEStaticKernel",
@@ -31,4 +33,6 @@ __all__ = [
     "launch_sm120_static_moe",
     "launch_sm120_dynamic_moe",
     "launch_sm120_moe",
+    "launch_sm120_w4a16_moe_prepared",
+    "W4A16PackedWeights",
 ]
