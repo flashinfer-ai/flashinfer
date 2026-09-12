@@ -1748,6 +1748,7 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric(
 
 
 _PLAN_INFO_CTA_TILE_Q_IDX = 3  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
+_PLAN_INFO_SPLIT_KV_IDX = 14  # PrefillPlanInfo::ToVector layout (scheduler.cuh)
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
@@ -1888,6 +1889,214 @@ def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
         o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].float()
         torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
+
+
+def _nvfp4_paged_run(
+    workspace_buffer,
+    q,
+    q_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_len,
+    packed,
+    scale_factors,
+    scales,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    *,
+    disable_split_kv,
+):
+    """One FA2 NVFP4 paged prefill run; returns (output, split_kv_selected)."""
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        page_size,
+        head_dim_vo=head_dim_vo,
+        causal=False,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+        disable_split_kv=disable_split_kv,
+    )
+    out = wrapper.run(
+        q,
+        packed,
+        kv_cache_sf=scale_factors,
+        k_scale=scales[0],
+        v_scale=scales[1],
+    )
+    return out, bool(wrapper._plan_info[_PLAN_INFO_SPLIT_KV_IDX])
+
+
+@pytest.mark.parametrize("head_dim_qk,head_dim_vo", [(128, 128), (512, 256)])
+@pytest.mark.parametrize("qo_len,kv_len", [(1, 8192), (16, 4096)])
+def test_nvfp4_paged_split_kv_matches_gated_result(
+    head_dim_qk, head_dim_vo, qo_len, kv_len, monkeypatch
+):
+    """Exercise the path ``_nvfp4_kv_requires_disabled_split_kv`` disables, on the
+    architectures where it is still disabled.
+
+    The gate is an empirical workaround for corruption reported when a short
+    query attends a long KV range, and by its own docstring the root cause is
+    unconfirmed. ``_NVFP4_SPLIT_KV_BROKEN_ARCHS`` keeps it in force on
+    SM120/121 only. The two existing gate tests
+    (``test_nvfp4_split_kv_gate_dtype_logic`` and
+    ``test_nvfp4_split_kv_gate_arch_scope`` in
+    ``test_nvfp4_attention_sm120.py``) check the dtype classification and the
+    architecture scoping without a GPU, so nothing currently runs the gated
+    configuration on hardware. This test does, so that the workaround's premise
+    is falsifiable in CI on the parts that pay for it.
+
+    It runs the same inputs twice through the FA2 NVFP4 paged prefill entry
+    point -- once with split-KV force-disabled, which is what the gate does
+    today, and once with it allowed -- and requires that allowing it does not
+    move the result away from a float32 dequantization oracle. The oracle is
+    built from ``nvfp4_to_float`` on the exact quantized bytes the kernel
+    reads, so it is a dequantization reference rather than a requantized
+    approximation, as in
+    ``test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric`` above.
+
+    ``qo_len << kv_len`` at ``batch_size`` 1 with few heads is the regime the
+    gate exists for and the only one where split-KV is what supplies the
+    parallelism, so the split-enabled plan is asserted rather than skipped: if
+    the planner stops splitting here the gate has become a no-op and that
+    should surface as a failure, not as a silently vacuous pass. Both a
+    symmetric ``head_dim`` and the asymmetric Gemma-4 (512, 256) shape the gate
+    was added alongside are covered.
+    """
+    if head_dim_qk != head_dim_vo:
+        skip_if_nvfp4_asymmetric_unsupported(head_dim_qk)
+    else:
+        skip_if_head_dim_unsupported(head_dim_qk)
+
+    device = torch.device("cuda:0")
+    if (
+        get_compute_capability(device)
+        not in flashinfer.prefill._NVFP4_SPLIT_KV_BROKEN_ARCHS
+    ):
+        pytest.skip("the NVFP4 split-KV gate is not in force on this architecture")
+
+    torch.manual_seed(42)
+    batch_size = 1
+    page_size = 16
+    num_kv_heads = 2
+    num_qo_heads = 8
+    num_pages = kv_len // page_size
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k_packed, k_sf, k_scale = create_nvfp4_kv(
+        (num_pages, page_size, num_kv_heads, head_dim_qk // 2), device
+    )
+    v_packed, v_sf, v_scale = create_nvfp4_kv(
+        (num_pages, page_size, num_kv_heads, head_dim_vo // 2), device
+    )
+    if head_dim_qk != head_dim_vo:
+        # the asymmetric path's reason to exist: unequal K/V stride families
+        assert k_packed.stride() != v_packed.stride()
+        assert k_sf.stride() != v_sf.stride()
+
+    q_indptr = torch.tensor([0, batch_size * qo_len], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32, device=device)
+    kv_last_page_len = torch.tensor([page_size], dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def run(disable_split_kv):
+        return _nvfp4_paged_run(
+            workspace_buffer,
+            q,
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            (k_packed, v_packed),
+            (k_sf, v_sf),
+            (float(k_scale.item()), float(v_scale.item())),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            head_dim_vo,
+            page_size,
+            disable_split_kv=disable_split_kv,
+        )
+
+    o_gated, gated_split = run(disable_split_kv=True)
+
+    # plan() consults the gate and force-disables split-KV for NVFP4 KV on this
+    # architecture, so disable_split_kv=False alone would be overridden and the
+    # configuration under test would never run. Bypass the gate itself, exactly
+    # as test_nvfp4_split_kv_gate_arch_scope does, and leave the kernel alone.
+    monkeypatch.setattr(
+        flashinfer.prefill,
+        "_nvfp4_kv_requires_disabled_split_kv",
+        lambda kv_data_type, device: False,
+    )
+    o_split, split_selected = run(disable_split_kv=False)
+
+    assert not gated_split, "disable_split_kv=True must not select split-KV"
+    assert split_selected, (
+        f"the planner did not select split-KV at qo_len={qo_len} kv_len={kv_len} "
+        f"head_dim_qk={head_dim_qk}; the gate is a no-op for this shape and this "
+        "test would not be exercising it"
+    )
+    assert torch.isfinite(o_gated).all() and torch.isfinite(o_split).all()
+
+    # float32 dequantization oracle on the same quantized bytes the kernel read
+    k_deq = (
+        nvfp4_to_float(k_packed, k_sf, k_scale)
+        .reshape(num_pages * page_size, num_kv_heads, head_dim_qk)[:kv_len]
+        .float()
+    )
+    v_deq = (
+        nvfp4_to_float(v_packed, v_sf, v_scale)
+        .reshape(num_pages * page_size, num_kv_heads, head_dim_vo)[:kv_len]
+        .float()
+    )
+    group_size = num_qo_heads // num_kv_heads
+    logits = torch.einsum(
+        "qhd,khd->hqk",
+        q.float(),
+        k_deq.repeat_interleave(group_size, dim=1),
+    ) * (head_dim_qk**-0.5)
+    o_ref = torch.einsum(
+        "hqk,khd->qhd",
+        torch.softmax(logits, dim=-1),
+        v_deq.repeat_interleave(group_size, dim=1),
+    )
+
+    # NVFP4 is 4-bit; same relaxed tolerance the other NVFP4 paged tests use.
+    torch.testing.assert_close(o_gated.float(), o_ref, rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(o_split.float(), o_ref, rtol=1e-1, atol=1e-1)
+
+    # The property that matters, stated scale-free: allowing split-KV must not
+    # move the result meaningfully further from the oracle than the gated run
+    # already is. Split-KV changes the softmax reduction order, so some drift is
+    # expected -- the largest split/non-split ratio reported on an affected part
+    # is ~1.4x (issue #4749) -- and 2x leaves room for that without admitting
+    # the corruption the gate was added for.
+    err_gated = (o_gated.float() - o_ref).norm() / o_ref.norm()
+    err_split = (o_split.float() - o_ref).norm() / o_ref.norm()
+    assert err_split <= 2.0 * err_gated + 1e-6, (
+        f"split-KV is further from the dequantization oracle than the gated run: "
+        f"rel_l2 {err_split:.8f} vs {err_gated:.8f}"
+    )
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
