@@ -128,6 +128,20 @@ def test_shard_count_precedence_is_cli_then_environment_then_one(
     )
 
 
+@pytest.mark.parametrize("gpu_count", [1, 2, 4, 8])
+def test_default_worker_count_matches_visible_gpu_count(
+    monkeypatch: pytest.MonkeyPatch, gpu_count: int
+) -> None:
+    monkeypatch.delenv("UNIT_TEST_WORKERS", raising=False)
+    monkeypatch.setenv(
+        "CUDA_VISIBLE_DEVICES", ",".join(str(index) for index in range(gpu_count))
+    )
+
+    args = unit_test_runner._parser().parse_args(["run"])
+
+    assert args.workers == gpu_count
+
+
 def test_explicit_zero_deadline_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -410,7 +424,7 @@ def test_optional_timing_files_use_first_matching_rows(tmp_path: Path) -> None:
     assert set(manifest["estimate_files"]) == {"duration", "overhead"}
 
 
-def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
+def test_manifest_resume_does_not_depend_on_timing_inputs(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_sample.py").write_text("def test_case(): pass\n", encoding="utf-8")
@@ -428,8 +442,8 @@ def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
     assert created.returncode == 0, created.stdout
     assert reused.returncode == 0, reused.stdout
     assert "Using plan" in reused.stdout
-    assert changed.returncode == 3
-    assert "estimate_files" in changed.stdout
+    assert changed.returncode == 0, changed.stdout
+    assert "Using plan" in changed.stdout
 
 
 def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> None:
@@ -562,6 +576,55 @@ def test_sm90():
     assert [node["nodeid"] for node in isolated_nodes] == [
         f"{isolated.name}::test_sm90"
     ]
+    assert [node["order"] for node in isolated_nodes] == [0]
+
+
+def test_collection_isolates_sm120_swapab_multirank_modules(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    for backend in ("sm100", "sm90", "sm120"):
+        tree = suite / backend
+        tree.mkdir()
+        (tree / "common.py").write_text(f"BACKEND = {backend!r}\n", encoding="utf-8")
+
+    def _write(name: str, backend: str, test_name: str) -> Path:
+        path = suite / name
+        path.write_text(
+            f"""\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent / "{backend}"))
+import common
+
+if common.BACKEND != "{backend}":
+    raise RuntimeError("vendored common modules cannot share one process")
+
+def {test_name}():
+    pass
+""",
+            encoding="utf-8",
+        )
+        return path
+
+    _write("test_aaa_sm100.py", "sm100", "test_sm100")
+    sm90 = _write("test_moe_ep_sm90_pull_fp8_mega_multirank.py", "sm90", "test_sm90")
+    sm120 = _write(
+        "test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py", "sm120", "test_sm120"
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 20, 0)
+
+    assert [node["nodeid"] for node in nodes] == [
+        "test_aaa_sm100.py::test_sm100",
+        f"{sm90.name}::test_sm90",
+        f"{sm120.name}::test_sm120",
+    ]
+    assert [node["order"] for node in nodes] == [0, 1, 2]
+
+    isolated_nodes = runner._collect_nodes(REPO_ROOT, sm120, 15, 0)
+
+    assert [node["nodeid"] for node in isolated_nodes] == [f"{sm120.name}::test_sm120"]
     assert [node["order"] for node in isolated_nodes] == [0]
 
 
@@ -1335,6 +1398,99 @@ def test_regular():
     assert result.returncode == 0, result.stdout + result.stderr
     assert (state / "solo-devices").read_text(encoding="utf-8") == "0,1"
     assert (state / "regular-devices").read_text(encoding="utf-8") in {"0", "1"}
+
+
+@pytest.mark.parametrize("worker_count", [1, 2, 4, 8])
+def test_workers_export_disjoint_master_port_blocks_for_visible_gpu_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_count: int
+) -> None:
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    state = tmp_path / "port-state"
+    state.mkdir()
+    source = """\
+import os
+import time
+from pathlib import Path
+
+def test_worker_port():
+    state = Path(os.environ["PORT_STATE"])
+    record = state / (Path(__file__).stem + ".port")
+    record.write_text(
+        os.environ["CUDA_VISIBLE_DEVICES"] + ":" + os.environ["MASTER_PORT"],
+        encoding="utf-8",
+    )
+    deadline = time.monotonic() + 10
+    while len(list(state.glob("*.port"))) < int(os.environ["EXPECTED_WORKERS"]):
+        assert time.monotonic() < deadline, "parallel worker did not start"
+        time.sleep(0.05)
+"""
+    for index in range(worker_count):
+        (suite / f"test_{index}.py").write_text(source, encoding="utf-8")
+
+    visible_devices = ",".join(str(index) for index in range(worker_count))
+
+    result = _run(
+        tmp_path,
+        "run",
+        suite,
+        "--workers",
+        str(worker_count),
+        env_override={
+            "CUDA_VISIBLE_DEVICES": visible_devices,
+            "EXPECTED_WORKERS": str(worker_count),
+            "PORT_STATE": str(state),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assignments = {
+        tuple(int(value) for value in path.read_text(encoding="utf-8").split(":"))
+        for path in state.glob("*.port")
+    }
+    assert assignments == {
+        (worker_index, 29500 + worker_index * 100)
+        for worker_index in range(worker_count)
+    }
+    for _, port in assignments:
+        assert f"master_port={port}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("master_port", "extra", "expected_returncode"),
+    [
+        ("65534", (), 0),
+        ("65535", (), 4),
+        ("65535", ("--dist_init_method=tcp://localhost:41000",), 0),
+    ],
+)
+def test_comm_conftest_validates_sibling_master_port(
+    master_port: str, extra: tuple[str, ...], expected_returncode: int
+) -> None:
+    environment = os.environ.copy()
+    environment["MASTER_PORT"] = master_port
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "tests/comm/test_mixed_comm.py",
+            *extra,
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.returncode == expected_returncode
+    if expected_returncode:
+        assert "MASTER_PORT must be between" in result.stdout + result.stderr
 
 
 def test_long_running_dispatches_first_and_solo_runs_after_non_solo_finalized(

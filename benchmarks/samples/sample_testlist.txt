@@ -21,6 +21,9 @@
 # PrimTS speculative MLA decode
 --routine BatchMLAPagedAttentionWrapper --backends prims-ts trtllm-native --page_size 32 --batch_size 4 --s_qo 4 --s_kv 4096 --num_qo_heads 32 --num_kv_heads 1 --head_dim_ckv 512 --head_dim_kpe 64 -vv --refcheck --q_dtype bfloat16 --kv_dtype bfloat16 --case_tag "PrimTS-MLA-decode-SQ4"
 
+# DeepSeek-V4 sparse MLA long-query prefill on SM100/SM103
+--routine trtllm_batch_decode_sparse_mla_dsv4 --backends trtllm-gen --page_size 256 --compressed_page_size 64 --batch_size 1 --s_qo 16384 --s_kv 16384 --num_qo_heads 16 --num_kv_heads 1 --head_dim_qk 512 --head_dim_vo 512 --swa_topk 128 --compressed_topk 1920 --q_dtype fp8_e4m3 --kv_dtype fp8_e4m3 --out_dtype bfloat16 --no_cuda_graph --refcheck -vv --generate_repro_command --case_tag "DeepSeek-V4-sparse-MLA-prefill"
+
 ## FP8 bmm
 --routine bmm_fp8 --batch_size 64 --m 4 --n 1024 --k 7168 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass --refcheck -vv --generate_repro_command
 
@@ -50,6 +53,15 @@
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 2 --top_k 2 --cutlass_variant nvfp4 --quantized_input --input_dtype float16 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_weights_quantized"
 --routine cutlass_fused_moe --num_tokens 32 --hidden_size 128 --intermediate_size 128 --num_experts 8 --top_k 2 --cutlass_variant base --input_dtype float16 --tp_size 2 --tp_rank 0 --ep_size 4 --ep_rank 0 -vv --generate_repro_command --case_tag "cutlass_moe_nvfp4_ep_tp"
+
+# Unified MoE API: CUTLASS vs cuTile on representative model shapes
+# Qwen3.6-35B-A3B: SwiGLU, H=2048, I=512, E=256, top-k=8
+--routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_bf16"
+--routine unified_moe --backends cutlass cutile --quant-variant nvfp4 --num_tokens 128 --hidden_size 2048 --intermediate_size 512 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "qwen3.6_35b_a3b_w4a4"
+
+# NVIDIA Nemotron-3.5-Lightning-30B-A3B: ReLU2, H=2688, I=1856, E=128, top-k=6
+--routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_bf16"
+--routine unified_moe --backends cutlass cutile --quant-variant nvfp4 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_w4a4"
 
 # CuteDSL NVFP4 MoE (Blackwell SM10.0/SM10.3 only; SwiGLU only)
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "cute_dsl_moe_large"

@@ -192,6 +192,7 @@ from .fmha_tasks import (
 from .helpers import (
     bottom_right_window_max_tiles,
     bottom_right_window_tile_start,
+    variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
 
@@ -234,13 +235,14 @@ def _init_causal_domain_state(
     task: Task,
     *,
     num_kv_tiles: int | Int32,
-    cta_m: int | Int32,
-    kv_n: int | Int32,
+    tile_size_q: int | Int32,
+    tile_size_kv: int | Int32,
     q_offset: int | Int32,
     seq_idx: int,
     batch_idx: int | None,
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
+    seq_lens_kv: cute.Pointer | None,
     runtime_kv_tile_multiple: int,
     reverse_seq_tiles: int | Int32 | None,
     offset: int,
@@ -252,26 +254,28 @@ def _init_causal_domain_state(
     """Initialize causal-domain fields and the static validation domain."""
     static_domain = None
     if isinstance(num_kv_tiles, int):
-        assert isinstance(cta_m, int) and isinstance(kv_n, int)
+        assert isinstance(tile_size_q, int) and isinstance(tile_size_kv, int)
         if packed_window:
             static_domain = min(
                 num_kv_tiles,
                 bottom_right_window_max_tiles(
-                    q_tile_m=cta_m,
-                    kv_tile_n=kv_n,
+                    q_tile_m=tile_size_q,
+                    kv_tile_n=tile_size_kv,
                     window_size_left=window_size_left,
                 ),
             )
         else:
             seq_coord = 0
-            max_q_row = q_offset + seq_coord * cta_m + cta_m - 1
-            causal_n = max_q_row // kv_n + 1
-            static_domain = max(cta_m // kv_n, min(num_kv_tiles, causal_n))
+            max_q_row = q_offset + seq_coord * tile_size_q + tile_size_q - 1
+            causal_n = max_q_row // tile_size_kv + 1
+            static_domain = max(
+                tile_size_q // tile_size_kv, min(num_kv_tiles, causal_n)
+            )
         if window_size_left > 0 and not packed_window:
             static_domain -= bottom_right_window_tile_start(
                 seq_coord=0,
-                q_tile_m=cta_m,
-                kv_tile_n=kv_n,
+                q_tile_m=tile_size_q,
+                kv_tile_n=tile_size_kv,
                 q_offset=q_offset,
                 window_size_left=window_size_left,
             )
@@ -280,10 +284,8 @@ def _init_causal_domain_state(
         static_domain = max(static_domain, 0)
     _init_task_with_domain(task, kwargs, static_domain, task_init=task_init)
     task._num_kv_tiles = num_kv_tiles
-    # M dimension size for Q*K.
-    task._cta_m = cta_m
-    # N dimension size for Q*K.
-    task._kv_n = kv_n
+    task._tile_size_q = tile_size_q
+    task._tile_size_kv = tile_size_kv
     task._q_offset = q_offset
     # Index of the sequence coordinate in tile_coord.
     task._seq_idx = seq_idx
@@ -293,6 +295,7 @@ def _init_causal_domain_state(
     task._batch_idx = batch_idx
     task._cum_seqlen_q = cum_seqlen_q
     task._cum_seqlen_k = cum_seqlen_k
+    task._seq_lens_kv = seq_lens_kv
     task._runtime_kv_tile_multiple = runtime_kv_tile_multiple
     task._reverse_seq_tiles = reverse_seq_tiles
     # Offset adjusts the domain count.
@@ -314,13 +317,14 @@ class CausalDomainTask(Task):
     def __init__(
         self,
         num_kv_tiles: int | Int32,
-        cta_m: int | Int32,
-        kv_n: int | Int32,
+        tile_size_q: int | Int32,
+        tile_size_kv: int | Int32,
         q_offset: int | Int32 = 0,
         seq_idx: int = 0,
         batch_idx: int | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
+        seq_lens_kv: cute.Pointer | None = None,
         runtime_kv_tile_multiple: int = 1,
         reverse_seq_tiles: int | Int32 | None = None,
         offset: int = 0,
@@ -332,16 +336,15 @@ class CausalDomainTask(Task):
 
         Args:
             num_kv_tiles: Total number of K/V tiles in the sequence.
-            cta_m: Number of Q rows covered by one CTA tile.
-            kv_n: Number of K/V rows covered by one K-loop iteration.
+            tile_size_q: Number of Q rows covered by one CTA tile.
+            tile_size_kv: Number of K/V rows covered by one K-loop iteration.
             q_offset: Causal row-index shift for S_q < S_kv.
             seq_idx: Index of the sequence coordinate in ``tile_coord``.
             batch_idx: Index of the request coordinate in ``tile_coord`` for
                 packed causal launches.
-            cum_seqlen_q: Live packed-Q cumulative offsets. Together with
-                ``cum_seqlen_k``, selects a request-local causal domain.
-            cum_seqlen_k: Live packed-K/V cumulative offsets. Paged context
-                passes its plan-time logical-K snapshot through this tensor.
+            cum_seqlen_q: Per-run packed-Q cumulative offsets.
+            cum_seqlen_k: Per-run packed-K/V cumulative offsets for contiguous K/V.
+            seq_lens_kv: Per-run K/V lengths for paged K/V.
             runtime_kv_tile_multiple: Round a request-local K/V tile count up
                 to this multiple. Query-paired zero-offset causal scheduling
                 uses two to retain its synthetic peer-0 tail slot.
@@ -359,13 +362,14 @@ class CausalDomainTask(Task):
         _init_causal_domain_state(
             self,
             num_kv_tiles=num_kv_tiles,
-            cta_m=cta_m,
-            kv_n=kv_n,
+            tile_size_q=tile_size_q,
+            tile_size_kv=tile_size_kv,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
+            seq_lens_kv=seq_lens_kv,
             runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             reverse_seq_tiles=reverse_seq_tiles,
             offset=offset,
@@ -387,16 +391,19 @@ class CausalDomainTask(Task):
         num_kv_tiles = self._num_kv_tiles
         runtime_q_tile_active = None
         if cutlass.const_expr(self._cum_seqlen_q is not None):
-            assert self._cum_seqlen_k is not None
             assert self._batch_idx is not None
             batch_coord = Int32(tile_coord[self._batch_idx])
             q_begin = Int32(self._cum_seqlen_q[batch_coord])
-            k_begin = Int32(self._cum_seqlen_k[batch_coord])
             seqlen_q = Int32(self._cum_seqlen_q[batch_coord + Int32(1)]) - q_begin
-            seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
-            runtime_q_tile_active = Int32(seq_coord * self._cta_m < seqlen_q)
+            if cutlass.const_expr(self._seq_lens_kv is not None):
+                seqlen_k = Int32(self._seq_lens_kv[batch_coord])
+            else:
+                assert self._cum_seqlen_k is not None
+                k_begin = Int32(self._cum_seqlen_k[batch_coord])
+                seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
+            runtime_q_tile_active = Int32(seq_coord * self._tile_size_q < seqlen_q)
             q_offset = seqlen_k - seqlen_q
-            num_kv_tiles = cute.ceil_div(seqlen_k, self._kv_n)
+            num_kv_tiles = cute.ceil_div(seqlen_k, self._tile_size_kv)
             if cutlass.const_expr(self._runtime_kv_tile_multiple > 1):
                 num_kv_tiles = (
                     cute.ceil_div(num_kv_tiles, self._runtime_kv_tile_multiple)
@@ -404,24 +411,24 @@ class CausalDomainTask(Task):
                 )
         if self._packed_window:
             max_window_tiles = bottom_right_window_max_tiles(
-                q_tile_m=self._cta_m,
-                kv_tile_n=self._kv_n,
+                q_tile_m=self._tile_size_q,
+                kv_tile_n=self._tile_size_kv,
                 window_size_left=self._window_size_left,
             )
             result = _domain_min(num_kv_tiles, max_window_tiles)
         else:
-            max_q_row = q_offset + seq_coord * self._cta_m + self._cta_m - 1
-            causal_n = max_q_row // self._kv_n + 1
+            max_q_row = q_offset + seq_coord * self._tile_size_q + self._tile_size_q - 1
+            causal_n = max_q_row // self._tile_size_kv + 1
             # Softmax assumes there is at least one Q-tile-width of K work.
             result = _domain_max(
-                self._cta_m // self._kv_n,
+                self._tile_size_q // self._tile_size_kv,
                 _domain_min(num_kv_tiles, causal_n),
             )
         if self._window_size_left > 0 and not self._packed_window:
             result -= bottom_right_window_tile_start(
                 seq_coord=seq_coord,
-                q_tile_m=self._cta_m,
-                kv_tile_n=self._kv_n,
+                q_tile_m=self._tile_size_q,
+                kv_tile_n=self._tile_size_kv,
                 q_offset=q_offset,
                 window_size_left=self._window_size_left,
             )
@@ -434,7 +441,9 @@ class CausalDomainTask(Task):
             # those slots instead of traversing K/V according to a large
             # bottom-right offset. Resource-level ragged extents suppress the
             # dummy Q/O traffic; the minimum domains preserve task handoffs.
-            minimum_domain = max(self._cta_m // self._kv_n - self._offset, 0)
+            minimum_domain = max(
+                self._tile_size_q // self._tile_size_kv - self._offset, 0
+            )
             result = (
                 runtime_q_tile_active * result
                 + (Int32(1) - runtime_q_tile_active) * minimum_domain
@@ -448,13 +457,14 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
     def __init__(
         self,
         num_kv_tiles: int | Int32,
-        cta_m: int | Int32,
-        kv_n: int | Int32,
+        tile_size_q: int | Int32,
+        tile_size_kv: int | Int32,
         q_offset: int | Int32 = 0,
         seq_idx: int = 0,
         batch_idx: int | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
+        seq_lens_kv: cute.Pointer | None = None,
         runtime_kv_tile_multiple: int = 1,
         reverse_seq_tiles: int | Int32 | None = None,
         offset: int = 0,
@@ -468,9 +478,9 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         ----------
         num_kv_tiles : int or Int32
             Total number of K/V tiles in the sequence.
-        cta_m : int or Int32
+        tile_size_q : int or Int32
             Number of Q rows covered by one CTA tile.
-        kv_n : int or Int32
+        tile_size_kv : int or Int32
             Number of K/V rows covered by one K-loop iteration.
         q_offset : int or Int32
             Causal row-index shift for S_q < S_kv.
@@ -479,8 +489,10 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         batch_idx : int or None
             Index of the request coordinate for packed causal launches.
         cum_seqlen_q, cum_seqlen_k : cute.Tensor or None
-            Live cumulative offsets used to derive the request-local causal
-            shift and K/V tile count.
+            Per-run cumulative offsets used to derive request-local causal
+            shifts for contiguous packed input.
+        seq_lens_kv : cute.Pointer or None
+            Per-run K/V lengths used for paged input.
         runtime_kv_tile_multiple : int
             Request-local K/V tile-count alignment for paired-tail scheduling.
         reverse_seq_tiles : int or Int32 or None
@@ -499,13 +511,14 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         _init_causal_domain_state(
             self,
             num_kv_tiles=num_kv_tiles,
-            cta_m=cta_m,
-            kv_n=kv_n,
+            tile_size_q=tile_size_q,
+            tile_size_kv=tile_size_kv,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
+            seq_lens_kv=seq_lens_kv,
             runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             reverse_seq_tiles=reverse_seq_tiles,
             offset=offset,
@@ -515,7 +528,80 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         )
 
 
-DomainPolicyValue = int | bool | Int32 | type[Task] | cute.Tensor
+class VariableWindowDomainTask(Task):
+    """Task whose K-loop domain comes from packed-Q window endpoints."""
+
+    def __init__(
+        self,
+        variable_window_token_starts: cute.Tensor,
+        variable_window_token_ends: cute.Tensor,
+        variable_window_cta_starts: cute.Tensor,
+        num_kv_tiles: int | Int32,
+        q_stride: int | Int32,
+        tile_size_q: int,
+        tile_size_kv: int,
+        seq_idx: int,
+        batch_idx: int,
+        offset: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize a variable-window task domain.
+
+        Args:
+            variable_window_token_starts: Flattened inclusive K-token start for
+                every Q row, laid out with ``q_stride`` rows per batch.
+            variable_window_token_ends: Flattened inclusive K-token end for
+                every Q row, using the same layout as the start tensor.
+            variable_window_cta_starts: Precomputed minimum K-token start for
+                each Q CTA, used as the common K/V load origin.
+            num_kv_tiles: Planned maximum number of K/V tiles.
+            q_stride: Number of Q rows per batch in the flattened bound tensors.
+            tile_size_q: Number of Q rows covered by one CTA.
+            tile_size_kv: Number of K/V tokens covered by one loop tile.
+            seq_idx: Index of the Q-sequence coordinate in ``tile_coord``.
+            batch_idx: Index of the batch coordinate in ``tile_coord``.
+            offset: Domain-count decrement. Zero selects N; one selects N-1.
+            **kwargs: Remaining ``Task`` arguments, including the required
+                captured ``schedule``.
+        """
+        if kwargs.get("schedule") is None:
+            raise ValueError("VariableWindow domain tasks require a captured schedule")
+        super().__init__(**kwargs)
+        self._variable_window_token_starts = variable_window_token_starts
+        self._variable_window_token_ends = variable_window_token_ends
+        self._variable_window_cta_starts = variable_window_cta_starts
+        self._num_kv_tiles = num_kv_tiles
+        self._q_stride = q_stride
+        self._tile_size_q = tile_size_q
+        self._tile_size_kv = tile_size_kv
+        self._seq_idx = seq_idx
+        self._batch_idx = batch_idx
+        self._offset = offset
+
+    def get_domain(self, tile_coord: cute.Coord) -> Int32:
+        """Return the number of K tiles intersecting this Q CTA's bounds."""
+        seq_coord = Int32(tile_coord[self._seq_idx])
+        batch_coord = Int32(tile_coord[self._batch_idx])
+        first_local_q = seq_coord * self._tile_size_q
+        last_local_q = cute.math.min(
+            first_local_q + self._tile_size_q - Int32(1),
+            self._q_stride - Int32(1),
+        )
+        packed_q_base = batch_coord * self._q_stride
+        first_k = variable_window_cta_min_start(
+            self._variable_window_cta_starts,
+            batch_coord=batch_coord,
+            seq_coord=seq_coord,
+            q_stride=self._q_stride,
+            tile_size_q=self._tile_size_q,
+        )
+        last_k = Int32(self._variable_window_token_ends[packed_q_base + last_local_q])
+        first_k_tile = first_k // self._tile_size_kv
+        last_k_tile = (last_k + self._tile_size_kv) // self._tile_size_kv
+        return last_k_tile - first_k_tile - self._offset
+
+
+DomainPolicyValue = int | bool | Int32 | type[Task] | cute.Tensor | cute.Pointer
 DomainKwargs = dict[str, DomainPolicyValue]
 
 
@@ -578,9 +664,14 @@ def build_context_task_manager(
     tma_o_desc: cutlass.Pointer | None,
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
+    variable_window_token_starts: cute.Tensor | None = None,
+    variable_window_token_ends: cute.Tensor | None = None,
+    variable_window_cta_starts: cute.Tensor | None = None,
+    variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
-    g_page_idx_kv: cute.Pointer | None = None,
+    g_block_tables: cute.Pointer | None = None,
+    block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     num_kv_tiles: int | Int32,
@@ -873,7 +964,11 @@ def build_context_task_manager(
         q_offset=q_offset,
         cfg=cfg,
         seqlens_kv=g_seq_lens_kv,
+        block_table_row_stride=block_table_row_stride,
         max_seq_len_kv=max_seq_len_kv,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_cta_starts=variable_window_cta_starts,
+        variable_window_q_stride=variable_window_q_stride,
         name="gmem_qkv",
     )
     smem_q = SmemQResource(
@@ -886,7 +981,7 @@ def build_context_task_manager(
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None
     if cfg.stages_page_offsets_in_smem:
         smem_page_offsets_kv = SmemPageOffsetsKvResource(
-            page_idx_kv=g_page_idx_kv,
+            block_tables=g_block_tables,
             pipeline_config=smem_page_offsets_pipeline_cfg,
             cfg=cfg,
             name="smem_page_offsets_kv",
@@ -898,7 +993,7 @@ def build_context_task_manager(
             # public paged API supplies one shared page-ID row, so it retains
             # one stage for both sides.
             smem_page_offsets_v = SmemPageOffsetsKvResource(
-                page_idx_kv=g_page_idx_kv,
+                block_tables=g_block_tables,
                 pipeline_config=smem_page_offsets_v_pipeline_cfg,
                 cfg=cfg,
                 page_table_is_v=True,
@@ -911,7 +1006,7 @@ def build_context_task_manager(
         cfg=cfg,
         page_offsets_kv=smem_page_offsets_kv,
         page_offsets_v=smem_page_offsets_v,
-        page_idx_kv=g_page_idx_kv,
+        block_tables=g_block_tables,
         name="smem_kv",
     )
 
@@ -997,6 +1092,11 @@ def build_context_task_manager(
         q_offset=q_offset,
         cum_seqlen_q=cum_seqlen_q,
         cum_seqlen_k=cum_seqlen_k,
+        seq_lens_kv=g_seq_lens_kv,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
+        variable_window_cta_starts=variable_window_cta_starts,
+        variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         name="tmem_sp0",
     )
@@ -1055,6 +1155,11 @@ def build_context_task_manager(
             q_offset=q_offset,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
+            seq_lens_kv=g_seq_lens_kv,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
+            variable_window_cta_starts=variable_window_cta_starts,
+            variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             name="tmem_sp1",
         )
@@ -1138,6 +1243,7 @@ def build_context_task_manager(
         **domain_n_kwargs,
     )
     mma_task = create_mma_task(
+        gmem_qkv,
         smem_q,
         smem_kv,
         tmem_sp0,
@@ -1852,24 +1958,27 @@ def _configure_common_launch_flags(
     is_causal: bool,
     balance_causal_workload: bool,
     window_size_left: int,
+    has_variable_window: bool,
 ) -> None:
     """Fill launch flags shared by query-paired and head-paired modes."""
     cfg.h_r = h_r
     cfg.is_causal = is_causal
     cfg.balance_causal_workload = balance_causal_workload
     cfg.window_size_left = window_size_left
+    cfg.has_variable_window = has_variable_window
 
 
 def _causal_domain_kwargs(
     *,
     num_kv_tiles: int | Int32,
-    cta_m: int,
-    kv_n: int,
+    tile_size_q: int,
+    tile_size_kv: int,
     q_offset: int | Int32,
     seq_idx: int,
     batch_idx: int | None = None,
     cum_seqlen_q: cute.Tensor | None = None,
     cum_seqlen_k: cute.Tensor | None = None,
+    seq_lens_kv: cute.Pointer | None = None,
     runtime_kv_tile_multiple: int = 1,
     offset: int,
     reverse_seq_tiles: int | Int32 | None = None,
@@ -1886,8 +1995,8 @@ def _causal_domain_kwargs(
     result: DomainKwargs = {
         "task_class": CausalDomainTask,
         "num_kv_tiles": num_kv_tiles,
-        "cta_m": cta_m,
-        "kv_n": kv_n,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": tile_size_kv,
         "q_offset": q_offset,
         "seq_idx": seq_idx,
         "offset": offset,
@@ -1895,14 +2004,17 @@ def _causal_domain_kwargs(
     if reverse_seq_tiles is not None:
         result["reverse_seq_tiles"] = reverse_seq_tiles
     if cum_seqlen_q is not None:
-        if batch_idx is None or cum_seqlen_k is None:
+        if batch_idx is None or (cum_seqlen_k is None and seq_lens_kv is None):
             raise ValueError(
-                "runtime causal domains require batch_idx and both cumulative "
-                "sequence-length tensors"
+                "runtime causal domains require batch_idx, cumulative Q offsets, "
+                "and cumulative K offsets or paged K/V lengths"
             )
         result["batch_idx"] = batch_idx
         result["cum_seqlen_q"] = cum_seqlen_q
-        result["cum_seqlen_k"] = cum_seqlen_k
+        if cum_seqlen_k is not None:
+            result["cum_seqlen_k"] = cum_seqlen_k
+        if seq_lens_kv is not None:
+            result["seq_lens_kv"] = seq_lens_kv
         if runtime_kv_tile_multiple > 1:
             result["runtime_kv_tile_multiple"] = runtime_kv_tile_multiple
     if window_size_left is not None:
@@ -1919,6 +2031,11 @@ def _select_fmha_domain_policy(
     q_offset: int | Int32,
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
+    seq_lens_kv: cute.Pointer | None = None,
+    variable_window_token_starts: cute.Tensor | None = None,
+    variable_window_token_ends: cute.Tensor | None = None,
+    variable_window_cta_starts: cute.Tensor | None = None,
+    variable_window_q_stride: int | Int32 = 0,
 ) -> FmhaDomainPolicy:
     """Select loop domains and softmax masks for the configured FMHA mode."""
     seq_idx = cfg.work_tile_coord_indices[0]
@@ -1928,13 +2045,40 @@ def _select_fmha_domain_policy(
         if cfg.uses_causal_reversed_head_batch_seq_tile_order
         else None
     )
+    if cfg.has_variable_window:
+        if (
+            variable_window_token_starts is None
+            or variable_window_token_ends is None
+            or variable_window_cta_starts is None
+        ):
+            raise ValueError("VariableWindow domain requires start and end tensors")
+        base_kwargs: DomainKwargs = {
+            "task_class": VariableWindowDomainTask,
+            "variable_window_token_starts": variable_window_token_starts,
+            "variable_window_token_ends": variable_window_token_ends,
+            "variable_window_cta_starts": variable_window_cta_starts,
+            "num_kv_tiles": num_kv_tiles,
+            "q_stride": variable_window_q_stride,
+            "tile_size_q": cfg.cta_tiler[0],
+            "tile_size_kv": cfg.kv_tile_n,
+            "seq_idx": seq_idx,
+            "batch_idx": batch_idx,
+        }
+        domain_n_kwargs = {**base_kwargs, "offset": 0}
+        domain_n_minus_1_kwargs = {**base_kwargs, "offset": 1}
+        return FmhaDomainPolicy(
+            domain_n_kwargs=domain_n_kwargs,
+            domain_n_minus_1_kwargs=domain_n_minus_1_kwargs,
+            softmax0_domain_kwargs=domain_n_kwargs,
+            softmax1_domain_kwargs=domain_n_kwargs,
+        )
     # Head-paired causal/window: both peers use the same Q sequence tile from
     # adjacent Q heads, so both softmax tasks share the same causal tail domain.
     if cfg.head_paired and cfg.is_causal:
         causal_n = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.q_tile_m,
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.q_tile_m,
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             offset=0,
@@ -1944,8 +2088,8 @@ def _select_fmha_domain_policy(
         )
         causal_n_minus_1 = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.q_tile_m,
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.q_tile_m,
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             offset=1,
@@ -1998,39 +2142,42 @@ def _select_fmha_domain_policy(
         )
         causal_n = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.cta_tiler[0],
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.cta_tiler[0],
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
+            seq_lens_kv=seq_lens_kv,
             runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             offset=0,
             reverse_seq_tiles=reverse_seq_tiles,
         )
         causal_n_minus_1 = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.cta_tiler[0],
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.cta_tiler[0],
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
+            seq_lens_kv=seq_lens_kv,
             runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             offset=1,
             reverse_seq_tiles=reverse_seq_tiles,
         )
         causal_n_minus_2 = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.cta_tiler[0],
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.cta_tiler[0],
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
+            seq_lens_kv=seq_lens_kv,
             runtime_kv_tile_multiple=runtime_kv_tile_multiple,
             offset=2,
             reverse_seq_tiles=reverse_seq_tiles,
@@ -2085,10 +2232,15 @@ def build_fmha_task_manager(
     cum_seqlen_q: cute.Tensor | None,
     cum_seqlen_k: cute.Tensor | None,
     num_kv_tiles: int | Int32,
+    variable_window_token_starts: cute.Tensor | None = None,
+    variable_window_token_ends: cute.Tensor | None = None,
+    variable_window_cta_starts: cute.Tensor | None = None,
+    variable_window_q_stride: int | Int32 = 0,
     scale_softmax_log2: cute.Tensor | None = None,
     output_scale: cute.Tensor | None = None,
     q_offset: int | Int32 = 0,
-    g_page_idx_kv: cute.Pointer | None = None,
+    g_block_tables: cute.Pointer | None = None,
+    block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     is_persistent: bool = True,
@@ -2148,14 +2300,19 @@ def build_fmha_task_manager(
         q_offset=effective_q_offset,
         # A uniform packed plan remains uniform under its replay contract, so
         # keep that specialization free of redundant GMEM indptr loads. Mixed
-        # packed and paged plans derive their causal domain from live Q and
-        # logical-K cumulative offsets instead.
+        # packed and paged plans derive their causal domain from per-run Q
+        # offsets and the corresponding contiguous or paged K/V lengths.
         cum_seqlen_q=(
             cum_seqlen_q if cfg.has_varlen and not cfg.has_uniform_varlen else None
         ),
         cum_seqlen_k=(
             cum_seqlen_k if cfg.has_varlen and not cfg.has_uniform_varlen else None
         ),
+        seq_lens_kv=(g_seq_lens_kv if cfg.use_paged_kv else None),
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
+        variable_window_cta_starts=variable_window_cta_starts,
+        variable_window_q_stride=variable_window_q_stride,
     )
 
     return build_context_task_manager(
@@ -2167,9 +2324,14 @@ def build_fmha_task_manager(
         tma_o_desc=tma_o_desc,
         cum_seqlen_q=cum_seqlen_q,
         cum_seqlen_k=cum_seqlen_k,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
+        variable_window_cta_starts=variable_window_cta_starts,
+        variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        g_page_idx_kv=g_page_idx_kv,
+        g_block_tables=g_block_tables,
+        block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
         num_kv_tiles=domain_num_kv_tiles,
@@ -2230,6 +2392,18 @@ class FmhaTs:
         grouped-query attention with an even repeat count.
     enable_skip_correction : bool, optional
         Enable skip-correction for softmax rescaling (default: True).
+    uses_ldtm_stat : bool, optional
+        Use ``tcgen05.ld.red.max`` (LDTM.STAT) to fuse the per-chunk row_max
+        into the TMEM S load on the non-masked path (default: False). The
+        context runner enables this by default on SM103 (B300) and SM107
+        (Rubin).
+    use_paged_kv : bool, optional
+        Read K/V from a physical page pool through a fixed block table.
+    num_tokens_per_page : int, optional
+        Number of K/V tokens stored in each physical page (default: 32).
+    max_kv_len : int, optional
+        Planned upper bound for each request's K/V length. Paged kernels derive
+        their static page and tile capacity from this bound (default: 1).
     causal_single_kv_tile : bool, optional
         Use the fixed causal one-K/V-tile task domains. The context runner
         enables this only for query-paired, fixed-length inputs whose K/V
@@ -2250,11 +2424,13 @@ class FmhaTs:
         is_clc_dynamic: bool = False,
         head_paired: bool = False,
         window_size_left: int = 0,
+        has_variable_window: bool = False,
         h_r: int = 1,
         enable_skip_correction: bool = True,
+        uses_ldtm_stat: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
-        max_num_pages_per_seq_kv: int = 1,
+        max_kv_len: int = 1,
         causal_single_kv_tile: bool = False,
         exhaustive_deadlock_race_check: bool = True,
     ) -> None:
@@ -2276,6 +2452,14 @@ class FmhaTs:
             raise ValueError("CLC dynamic scheduling requires persistent mode")
         if head_paired and not is_persistent:
             raise ValueError("Head-paired scheduling requires persistent mode")
+        if has_variable_window and (is_causal or window_size_left > 0):
+            raise ValueError(
+                "VariableWindow bounds replace causal and sliding-window masks"
+            )
+        if has_variable_window and use_paged_kv:
+            raise NotImplementedError(
+                "variable-window masking is not supported for paged context"
+            )
         validate_head_paired_head_ratio(head_paired=head_paired, h_r=h_r)
         if use_paged_kv:
             if num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
@@ -2284,10 +2468,9 @@ class FmhaTs:
                     f"{_SUPPORTED_CONTEXT_PAGE_SIZES}; got "
                     f"{num_tokens_per_page}"
                 )
-            if max_num_pages_per_seq_kv < 1:
+            if max_kv_len < 1:
                 raise ValueError(
-                    f"max_num_pages_per_seq_kv must be >= 1, got "
-                    f"{max_num_pages_per_seq_kv}"
+                    f"max_kv_len must be >= 1 for paged context, got {max_kv_len}"
                 )
         self.is_persistent = is_persistent
         self.is_causal = is_causal
@@ -2314,7 +2497,9 @@ class FmhaTs:
         cfg.stats_via_smem = single_instance_persistent or (not cfg.single_qkv_instance)
         cfg.fuse_epilogue_into_correction = cfg.single_qkv_instance
         cfg.num_tokens_per_page = num_tokens_per_page
-        cfg.max_num_pages_per_seq_kv = max_num_pages_per_seq_kv
+        cfg.max_num_pages_per_seq_kv = (
+            max_kv_len + num_tokens_per_page - 1
+        ) // num_tokens_per_page
         cfg.causal_single_kv_tile = causal_single_kv_tile
         # FP16/BF16 causal attention retains the default 192/96/32
         # softmax/correction/auxiliary split. Other topologies start from
@@ -2325,6 +2510,7 @@ class FmhaTs:
             cfg.num_regs_correction = 88
             cfg.num_regs_other = 56
         cfg.enable_skip_correction = enable_skip_correction
+        cfg.uses_ldtm_stat = uses_ldtm_stat
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
@@ -2361,6 +2547,7 @@ class FmhaTs:
                 is_causal=is_causal,
                 balance_causal_workload=balance_causal_workload,
                 window_size_left=window_size_left,
+                has_variable_window=has_variable_window,
             )
             _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
             return
@@ -2428,6 +2615,7 @@ class FmhaTs:
             is_causal=is_causal,
             balance_causal_workload=balance_causal_workload,
             window_size_left=window_size_left,
+            has_variable_window=has_variable_window,
         )
         _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
 
@@ -2449,8 +2637,11 @@ class FmhaTs:
         cum_seqlen_k: cute.Tensor | None = None,
         max_seqlen_q: Int32 | None = None,
         max_seqlen_k: Int32 | None = None,
-        page_idx_kv: cute.Tensor | None = None,
+        block_tables: cute.Tensor | None = None,
         seq_lens_kv: cute.Tensor | None = None,
+        variable_window_token_starts: cute.Tensor | None = None,
+        variable_window_token_ends: cute.Tensor | None = None,
+        variable_window_cta_starts: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -2461,6 +2652,27 @@ class FmhaTs:
         quantization scales into these runtime tensors.
         """
         cfg = self.cfg
+        if cutlass.const_expr(
+            cfg.use_paged_kv
+            and (
+                cum_seqlen_q is None
+                or block_tables is None
+                or seq_lens_kv is None
+                or max_seqlen_q is None
+                or max_seqlen_k is None
+            )
+        ):
+            raise ValueError(
+                "paged context requires qo_indptr, block_tables, seq_lens_kv, "
+                "max_seqlen_q, and max_seqlen_k"
+            )
+        if cutlass.const_expr(cfg.has_variable_window):
+            if cutlass.const_expr(
+                variable_window_token_starts is None
+                or variable_window_token_ends is None
+                or variable_window_cta_starts is None
+            ):
+                raise ValueError("VariableWindow requires start and end tensors")
 
         # Create TMA descriptors. Both query-paired and head-paired modes use
         # the same logical Q/K/V/O tensor-map boxes after FmhaConfig lowers the
@@ -2531,8 +2743,9 @@ class FmhaTs:
             # Q/O use the packed sequence axis as a ragged TMA dimension.
             # Dense TMA bounds only see the full sum_seqlen tensor and cannot
             # prevent a partial final tile from crossing into the next packed
-            # sequence.  K/V can keep dense descriptors because invalid K/V
-            # lanes are masked out before softmax/PV consumes them.
+            # sequence. Paged K/V keep native page-pool descriptors. Invalid K
+            # scores are masked before softmax; invalid V rows are overwritten
+            # in SMEM after their TMA stage completes and before PV MMA.
             tma_q_desc = create_tensor_map_ragged_from_tensor(
                 q_cute,
                 box_dims=q_box_dims,
@@ -2551,12 +2764,14 @@ class FmhaTs:
             )
 
         if cutlass.const_expr(cfg.use_paged_kv):
-            # Paged-KV path: K/V are pool tensors with shape
+            # Paged-KV path: K/V are compact pool tensors with shape
             # (total_pages, h_kv, num_tokens_per_page, d). The TMA box covers
             # one page × one d-fragment; the loader stitches pages and d-halves
-            # together via per-fragment coords. Inner d-tile must equal
-            # tma_copy_kv_granu_inner (64 fp16 = 128 B) to match the s128b
-            # swizzle the contiguous path uses.
+            # together via per-fragment coordinates. Keep both descriptors on
+            # the native rank-4 view. Synthetic ragged V maps with numeric-zero
+            # OOB fill have triggered mixed-specialization SM100 aborts; their
+            # special-NaN alternative is also invalid because tcgen05.mma
+            # propagates the NaN instead of treating it as a zero operand.
             paged_kv_box_dims = (
                 1,
                 1,
@@ -2675,13 +2890,18 @@ class FmhaTs:
 
         block_size = cfg.block_warps * 32
 
-        # Paged-KV side-channel data: page table iterator + per-batch K/V
-        # length lookup. None in the contiguous path; the kernel branches on
-        # ``cfg.use_paged_kv`` so passing None is safe.
-        page_idx_kv_iter = (
-            page_idx_kv.iterator
-            if cutlass.const_expr(page_idx_kv is not None)
+        # Paged-KV side-channel data: one fixed row-strided page table plus
+        # per-batch K/V lengths. None in the contiguous path; the kernel
+        # branches on ``cfg.use_paged_kv`` so passing None is safe.
+        block_tables_iter = (
+            block_tables.iterator
+            if cutlass.const_expr(block_tables is not None)
             else None
+        )
+        block_table_row_stride = (
+            Int32(block_tables.stride[0])
+            if cutlass.const_expr(block_tables is not None)
+            else Int32(0)
         )
         seq_lens_kv_iter = (
             seq_lens_kv.iterator
@@ -2702,9 +2922,14 @@ class FmhaTs:
             q_offset,
             cum_seqlen_q,
             cum_seqlen_k,
-            page_idx_kv_iter,
+            block_tables_iter,
+            block_table_row_stride,
             seq_lens_kv_iter,
             Int32(s_k),
+            variable_window_token_starts,
+            variable_window_token_ends,
+            variable_window_cta_starts,
+            Int32(s_q),
             self.is_persistent,
             self.is_clc_dynamic,
         ).launch(
@@ -2737,9 +2962,14 @@ class FmhaTs:
         q_offset: Int32,
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None,
-        page_idx_kv: cute.Pointer | None,
+        block_tables: cute.Pointer | None,
+        block_table_row_stride: Int32,
         seq_lens_kv: cute.Pointer | None,
         max_seq_len_kv: Int32 | None,
+        variable_window_token_starts: cute.Tensor | None,
+        variable_window_token_ends: cute.Tensor | None,
+        variable_window_cta_starts: cute.Tensor | None,
+        variable_window_q_stride: Int32,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
     ) -> None:
@@ -2792,10 +3022,15 @@ class FmhaTs:
             tma_o_desc=tma_o_desc.get_ptr(),
             cum_seqlen_q=cum_seqlen_q,
             cum_seqlen_k=cum_seqlen_k,
-            g_page_idx_kv=page_idx_kv,
+            g_block_tables=block_tables,
+            block_table_row_stride=block_table_row_stride,
             g_seq_lens_kv=seq_lens_kv,
             max_seq_len_kv=max_seq_len_kv,
             num_kv_tiles=num_kv_tiles,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
+            variable_window_cta_starts=variable_window_cta_starts,
+            variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             q_offset=q_offset,
