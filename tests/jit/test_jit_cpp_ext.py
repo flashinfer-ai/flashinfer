@@ -272,6 +272,16 @@ def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
         attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.uint8)
 
 
+def test_fa2_fp8_large_head_uses_sm80_flags(monkeypatch):
+    monkeypatch.setattr(
+        attention_modules.current_compilation_context, "TARGET_CUDA_ARCHS", {(8, 0)}
+    )
+
+    flags = attention_modules._fa2_head_dim_nvcc_flags(512, 512, torch.float8_e4m3fn)
+    assert flags is not None
+    assert any("sm_80" in flag for flag in flags)
+
+
 @pytest.mark.parametrize(
     ("head_dim_qk", "head_dim_vo", "supported"),
     [

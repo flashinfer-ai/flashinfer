@@ -264,9 +264,9 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
-    # For 16-bit KV, head_dim > 256 FA2 modules use the Ampere+ large-head path.
-    # NVFP4 KV large-head is validated for FA2 batch prefill on SM8+; other
-    # one-byte large-head modules stay SM100+-only until validated separately.
+    # For 16-bit and FP8 KV, head_dim > 256 FA2 modules use the Ampere+
+    # large-head path. NVFP4 KV large-head is validated for FA2 batch prefill
+    # on SM8+, while NVFP4 decode remains SM100+-only.
     from .jit.core import current_compilation_context
 
     has_sm8_or_newer = any(
@@ -275,7 +275,6 @@ def gen_attention(
     has_sm10_or_newer = any(
         major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
     )
-
     # FA2 MHA / MQA / GQA
     for (
         (head_dim_qk, head_dim_vo),
@@ -292,12 +291,8 @@ def gen_attention(
     ):
         large_head = head_dim_qk > 256 or head_dim_vo > 256
         nvfp4_large_head = large_head and _is_nvfp4_kv_dtype(dtype_kv)
-        if large_head:
-            if dtype_kv.itemsize == 1 and not nvfp4_large_head:
-                if not has_sm10_or_newer:
-                    continue
-            elif not has_sm8_or_newer:
-                continue
+        if large_head and not has_sm8_or_newer:
+            continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
@@ -1146,7 +1141,7 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        # Note: head_dim=512 (FA2 prefill/decode, SM100+) excluded to reduce
+        # Note: head_dim=512 (FA2 prefill/decode, SM80+) excluded to reduce
         # space in the jit-cache wheel.
         "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],

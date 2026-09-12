@@ -1258,14 +1258,13 @@ def _fa2_head_dim_nvcc_flags(
 ) -> Optional[List[str]]:
     """Return arch flags for FA2 large-head modules.
 
-    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
-    can opt into the same arch set only for validated FA2 prefill read paths.
-    Other one-byte large-head modules remain restricted to SM100+ until those
-    variants are validated separately.
+    For 16-bit and FP8 KV, head_dim > 256 uses the Ampere+ large-head path.
+    NVFP4 KV can opt into the same arch set only for validated FA2 prefill
+    read paths; NVFP4 large-head decode remains restricted to SM100+.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
-        if dtype_kv.itemsize == 1:
-            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
+        if _is_nvfp4_kv_dtype(dtype_kv):
+            if not allow_nvfp4_sm8_large_head:
                 return current_compilation_context.get_nvcc_flags_list(
                     supported_major_versions=[10, 11, 12]
                 )
