@@ -32,7 +32,6 @@ from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ._inputs_helper import CuteDslMoEInputsHelper
 
 # Candidate tables shared by the heuristic auto-selection and the tuner's
 # tactic space.
@@ -40,6 +39,7 @@ _TILE_SIZES = (64, 128)
 _GEMM1_TILE_N_BY_TILE_SIZE = {64: (128, 64), 128: (256, 192, 128, 64)}
 _GEMM2_TILE_N_BY_TILE_SIZE = {64: (128, 64), 128: (256, 128, 64)}
 _GEMM2_CLUSTER_SHAPES = ((1, 1), (1, 2))
+_GEMM1_SWIZZLE_SIZES = (1, 8, 16)
 
 
 def _default_gemm2_tile_k(inter_per_rank: int, tile_size: int) -> int:
@@ -81,11 +81,13 @@ class Sm90MoeTactic(NamedTuple):
     """One SM90 CuTe-DSL MoE tactic; the AutoTuner passes ``-1`` for the
     default (the heuristic auto-selection). ``gemm2_tile_k`` is pinned to
     the :func:`_default_gemm2_tile_k` heuristic in the tuned tactic space;
-    explicitly constructed tactics may force either legal value. GEMM2
-    cluster multicast and raster order are independent tuned axes."""
+    explicitly constructed tactics may force either legal value. The GEMM1
+    walk swizzle and GEMM2 cluster multicast and raster order are
+    independent tuned axes."""
 
     tile_size: int
     gemm1_tile_n: int
+    gemm1_swizzle: int
     gemm2_tile_n: int
     gemm2_tile_k: int
     gemm2_cluster_shape_mn: Tuple[int, int]
@@ -95,6 +97,7 @@ class Sm90MoeTactic(NamedTuple):
 class _Sm90MoeTacticOverride(NamedTuple):
     tile_size: Optional[int]
     gemm1_tile_n: Optional[int]
+    gemm1_swizzle: Optional[int]
     gemm2_tile_n: Optional[int]
     gemm2_tile_k: Optional[int]
     gemm2_cluster_shape_mn: Optional[Tuple[int, int]]
@@ -104,12 +107,16 @@ class _Sm90MoeTacticOverride(NamedTuple):
 def _decode_sm90_moe_tactic(tactic: Any) -> _Sm90MoeTacticOverride:
     """Validate a tactic and normalize it to per-field overrides."""
     if tactic is None or tactic == -1:
-        return _Sm90MoeTacticOverride(None, None, None, None, None, None)
+        return _Sm90MoeTacticOverride(None, None, None, None, None, None, None)
     if not isinstance(tactic, (tuple, list)):
         raise TypeError("SM90 MoE tactic must be -1, None, a tuple, or a list")
-    if len(tactic) != 6:
-        raise ValueError(f"SM90 MoE tactic has {len(tactic)} fields; expected 6")
+    if len(tactic) != 7:
+        raise ValueError(f"SM90 MoE tactic has {len(tactic)} fields; expected 7")
     current = Sm90MoeTactic(*tactic)
+    if not isinstance(current.gemm1_swizzle, int) or current.gemm1_swizzle < 1:
+        raise ValueError(
+            f"GEMM1 swizzle tactic must be a positive int; got {current.gemm1_swizzle}"
+        )
     cluster_shape_mn = (
         int(current.gemm2_cluster_shape_mn[0]),
         int(current.gemm2_cluster_shape_mn[1]),
@@ -123,6 +130,7 @@ def _decode_sm90_moe_tactic(tactic: Any) -> _Sm90MoeTacticOverride:
     return _Sm90MoeTacticOverride(
         current.tile_size,
         current.gemm1_tile_n,
+        current.gemm1_swizzle,
         current.gemm2_tile_n,
         current.gemm2_tile_k,
         cluster_shape_mn,
@@ -131,13 +139,30 @@ def _decode_sm90_moe_tactic(tactic: Any) -> _Sm90MoeTacticOverride:
 
 
 def _enumerate_sm90_moe_tactics(
-    gemm1_n_size: int, hidden_size: int, intermediate_size: int
+    gemm1_n_size: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    elem_bytes: int = 2,
 ) -> List[Sm90MoeTactic]:
-    """Enumerate the legal tuned cross-product for one static geometry.
+    """Enumerate the legal tuned cross-product for one profile bucket.
 
     The sweep is capped at the top-2 legal N tiles per GEMM to bound
-    compile-cached kernel specializations.
+    compile-cached kernel specializations. Swizzle candidates that cannot
+    win are rejected:
+
+    * ``swizzle > 1`` where an expert's B exceeds L2 across many local
+      experts — their short N sweeps already share B in flight across the
+      concurrently executing M-rows, and grouping costs 2-31%.
+    * ``swizzle > 1`` when no expert can span two M-tiles (total routed
+      rows fit one tile) — provably a no-op, so the candidates only
+      profile ties.
     """
+    expert_b_bytes = gemm1_n_size * hidden_size * elem_bytes
+    swizzle_useless = expert_b_bytes >= 48 * 1024 * 1024 and num_local_experts > 16
+
     tactics: List[Sm90MoeTactic] = []
     for tile_size in _TILE_SIZES:
         g2_tile_k = _default_gemm2_tile_k(intermediate_size, tile_size)
@@ -147,28 +172,33 @@ def _enumerate_sm90_moe_tactics(
         g2_top2 = [
             n for n in _GEMM2_TILE_N_BY_TILE_SIZE[tile_size] if hidden_size % n == 0
         ][:2]
+        swizzles: Tuple[int, ...] = _GEMM1_SWIZZLE_SIZES
+        if swizzle_useless or num_tokens * top_k <= tile_size:
+            swizzles = (1,)
         for g1_n in g1_top2:
-            for g2_n in g2_top2:
-                for g2_cluster in _GEMM2_CLUSTER_SHAPES:
-                    if not _gemm2_tactic_can_implement(
-                        hidden_size,
-                        intermediate_size,
-                        (tile_size, g2_n),
-                        g2_tile_k,
-                        g2_cluster,
-                    ):
-                        continue
-                    for g2_raster in (False, True):
-                        tactics.append(
-                            Sm90MoeTactic(
-                                tile_size,
-                                g1_n,
-                                g2_n,
-                                g2_tile_k,
-                                g2_cluster,
-                                g2_raster,
+            for g1_swizzle in swizzles:
+                for g2_n in g2_top2:
+                    for g2_cluster in _GEMM2_CLUSTER_SHAPES:
+                        if not _gemm2_tactic_can_implement(
+                            hidden_size,
+                            intermediate_size,
+                            (tile_size, g2_n),
+                            g2_tile_k,
+                            g2_cluster,
+                        ):
+                            continue
+                        for g2_raster in (False, True):
+                            tactics.append(
+                                Sm90MoeTactic(
+                                    tile_size,
+                                    g1_n,
+                                    g1_swizzle,
+                                    g2_n,
+                                    g2_tile_k,
+                                    g2_cluster,
+                                    g2_raster,
+                                )
                             )
-                        )
     return tactics
 
 
@@ -176,7 +206,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
     """TunableRunner for the SM90 CuTe-DSL fused MoE.
 
     Tactic format: :class:`Sm90MoeTactic` ``(tile_size, gemm1_tile_n,
-    gemm2_tile_n, gemm2_tile_k, gemm2_cluster_shape_mn,
+    gemm1_swizzle, gemm2_tile_n, gemm2_tile_k, gemm2_cluster_shape_mn,
     gemm2_raster_along_m)``; ``None``/``-1`` selects the fallback heuristic.
 
     Args:
@@ -184,8 +214,8 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
 
     Input tensor indices follow
     :func:`~.sm90_fused_moe.cute_dsl_fused_moe_bf16`'s signature order
-    (:class:`CuteDslMoEInputsHelper`'s pre-hook replaces index 1 with
-    a balanced expert assignment during autotune profiling):
+    (index 1 is synthesized by the seeded uniform initializer during
+    autotune profiling):
         0: x (num_tokens, hidden) bf16/fp16
         1: token_selected_experts (num_tokens, top_k) int32
         2: token_final_scales (num_tokens, top_k) fp32
@@ -212,11 +242,6 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
 
-        # Balanced approx-max-load expert assignment for profiling inputs
-        # (a random assignment biases autotune picks at marginal cells).
-        self._inputs_helper = CuteDslMoEInputsHelper(
-            num_experts, top_k, num_local_experts, local_expert_offset, tse_idx=1
-        )
         seeded = lambda device: torch.Generator(device=device).manual_seed(  # noqa: E731
             515
         )
@@ -237,8 +262,8 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
                         shapes, device=device, generator=seeded(device)
                     ).to(dtype),
                 ),
-                # 1: token_selected_experts — overwritten by the
-                # pre-hook's balanced assignment; seeded fallback.
+                # 1: token_selected_experts — seeded uniform draw (with
+                # replacement); the profile's routing assignment.
                 (
                     1,
                     lambda shapes, dtype, device: torch.randint(
@@ -266,7 +291,6 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
                     ),
                 ),
             ),
-            inputs_pre_hook=self._inputs_helper.inputs_pre_hook,
             use_cold_l2_cache=True,
             value_aware_input_indices=(1, 2),
             profile_arena_input_indices=(0, 1, 2, 5),
@@ -283,10 +307,22 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         gemm1_n = inputs[3].shape[1]
         hidden = inputs[4].shape[1]
         inter = inputs[4].shape[2]
+        num_tokens = inputs[0].shape[0]
         # The heuristic auto-selection competes as an explicit candidate:
         # a tuned winner then never ranks below the default dispatch in the
         # same measurement session (no-worse-than-heuristic by construction).
-        return [-1, *_enumerate_sm90_moe_tactics(gemm1_n, hidden, inter)]
+        return [
+            -1,
+            *_enumerate_sm90_moe_tactics(
+                gemm1_n,
+                hidden,
+                inter,
+                num_tokens=num_tokens,
+                top_k=self.top_k,
+                num_local_experts=self.num_local_experts,
+                elem_bytes=inputs[0].element_size(),
+            ),
+        ]
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> Tuple[Any, ...]:
         return (
@@ -327,6 +363,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
             moe_output=moe_output,
             tile_size=tactic_override.tile_size,
             gemm1_tile_n=tactic_override.gemm1_tile_n,
+            gemm1_swizzle=tactic_override.gemm1_swizzle,
             gemm2_tile_n=tactic_override.gemm2_tile_n,
             gemm2_tile_k=tactic_override.gemm2_tile_k,
             gemm2_cluster_shape_mn=tactic_override.gemm2_cluster_shape_mn,

@@ -181,22 +181,22 @@ Tactic and fallback selection (`sm90_fused_moe.py`):
 | GEMM2 tile_n | (256, 128, 64) / (128, 64) | largest divisor of hidden |
 | GEMM2 tile_k | 64; 32 when K % 64 != 0, and on prefill tiles at I >= 384 (doubled pipeline depth: +2..6%) | shape-derived |
 | GEMM2 raster | N-major, M-major | independently autotuned; §4.6 defines the fallback |
-| GEMM1 cluster | (1,1) | fixed; (2,1) remains a validated low-level option |
-| GEMM1 raster | N-major | fixed; M-major remains a low-level option on the GEMM-level wrapper |
+| GEMM1 walk swizzle | 1, 8, 16 | independently autotuned; 1 by default |
 | GEMM2 cluster | (1,1), (1,2) | independently autotuned; illegal (1,2) topologies filtered before profiling |
 
 Dispatch goes through the FlashInfer AutoTuner:
 `cute_dsl_fused_moe_bf16` routes through
 `AutoTuner.choose_one` with `CuteDslFusedMoESm90Runner`, whose tactic space
-is `Sm90MoeTactic(tile_size, gemm1_tile_n, gemm2_tile_n, gemm2_tile_k,
-gemm2_cluster_shape_mn, gemm2_raster_along_m)` (top-2 legal N tiles per
-GEMM, tile_k pinned to the shape heuristic, and the legal cross-product of
-the two independent GEMM2 cluster/raster axes). Under the `autotune`
-context every tactic
+is `Sm90MoeTactic(tile_size, gemm1_tile_n, gemm1_swizzle, gemm2_tile_n,
+gemm2_tile_k, gemm2_cluster_shape_mn, gemm2_raster_along_m)` (top-2 legal
+N tiles per GEMM, tile_k pinned to the shape heuristic, and the legal
+cross-product of the swizzle and GEMM2 cluster/raster axes; swizzle
+candidates that cannot win are rejected per bucket — see
+`_enumerate_sm90_moe_tactics`). Under the `autotune` context every tactic
 is profiled and the per-bucket winner cached; otherwise the cached winner —
 or the heuristic auto-selection as the default tactic — dispatches.
-Explicit tile / GEMM2 cluster / raster / buffer keyword overrides bypass the
-tuner.
+Explicit tile / swizzle / GEMM2 cluster / raster / buffer keyword overrides
+bypass the tuner.
 
 **Compilation and reuse**: each low-level host module owns a process-local
 dictionary of compiled callables. On the first real launch of a specialization,
@@ -266,29 +266,29 @@ faster):
 
 | model (h / I global / E / top_k) | tp -> I/rank | T=1 | 256 | 1024 | 4096 | 16384 |
 |---|---|---|---|---|---|---|
-| Qwen3-30B-A3B (2048/768/128/8) | 1 -> 768 | 1.38x | 1.02x | 1.02x | 1.27x | 1.31x |
-| | 4 -> 192 | 1.82x | 1.24x | 1.34x | 1.75x | 1.90x |
-| Qwen3-235B-A22B (4096/1536/128/8) | 1 -> 1536 | 1.10x | 1.00x | 0.88x | 1.08x | 1.14x |
-| | 4 -> 384 | 1.48x | 1.05x | 1.09x | 1.35x | 1.38x |
-| Qwen3-Next-80B-A3B (2048/512/512/10) | 1 -> 512 | 1.70x | 0.98x | 1.03x | 1.17x | 1.48x |
-| | 4 -> 128 | 2.30x | 1.17x | 1.26x | 1.73x | 1.82x |
-| GLM-4.5-Air (4096/1408/128/8) | 1 -> 1408 | 1.14x | 1.01x | 0.89x | 1.04x | 1.13x |
-| | 4 -> 352 | 1.48x | 1.09x | 1.07x | 1.11x | 1.11x |
-| Kimi-K2 (7168/2048/384/8) | 1 -> 2048 | 1.08x | 1.00x | 1.03x | 1.02x | 1.12x |
-| | 4 -> 512 | 1.35x | 1.01x | 1.04x | 1.12x | 1.18x |
-| DeepSeek-V3 (7168/2048/256/8) | 1 -> 2048 | 1.08x | 1.00x | 1.05x | 0.86x | 1.03x |
-| | 4 -> 512 | 1.33x | 1.02x | 1.10x | 1.04x | 1.21x |
-| Mixtral-8x7B (4096/14336/8/2) | 1 -> 14336 | 1.07x | 0.85x | 0.86x | 0.89x | 0.95x |
-| | 4 -> 3584 | 1.18x | 0.90x | 1.07x | 1.07x | 1.05x |
+| Qwen3-30B-A3B (2048/768/128/8) | 1 -> 768 | 1.38x | 1.02x | 1.14x | 1.27x | 1.37x |
+| | 4 -> 192 | 1.80x | 1.22x | 1.51x | 1.76x | 1.90x |
+| Qwen3-235B-A22B (4096/1536/128/8) | 1 -> 1536 | 1.10x | 1.00x | 1.08x | 1.11x | 1.11x |
+| | 4 -> 384 | 1.49x | 1.05x | 1.25x | 1.35x | 1.41x |
+| Qwen3-Next-80B-A3B (2048/512/512/10) | 1 -> 512 | 1.70x | 0.98x | 1.03x | 1.17x | 1.42x |
+| | 4 -> 128 | 2.35x | 1.17x | 1.26x | 1.72x | 1.89x |
+| GLM-4.5-Air (4096/1408/128/8) | 1 -> 1408 | 1.15x | 1.00x | 1.05x | 1.09x | 1.12x |
+| | 4 -> 352 | 1.50x | 1.09x | 1.17x | 1.12x | 1.10x |
+| Kimi-K2 (7168/2048/384/8) | 1 -> 2048 | 1.08x | 1.00x | 1.03x | 1.02x | 1.19x |
+| | 4 -> 512 | 1.35x | 1.01x | 1.04x | 1.14x | 1.21x |
+| DeepSeek-V3 (7168/2048/256/8) | 1 -> 2048 | 1.08x | 1.00x | 1.05x | 0.89x | 1.06x |
+| | 4 -> 512 | 1.33x | 1.02x | 1.10x | 1.00x | 1.21x |
+| Mixtral-8x7B (4096/14336/8/2) | 1 -> 14336 | 1.05x | 1.05x | 0.91x | 0.98x | 1.04x |
+| | 4 -> 3584 | 1.20x | 1.10x | 1.08x | 1.05x | 1.04x |
 
-All 70 cells pass the variance gate; their geo-mean speedup is **1.16x**,
-and CuTe-DSL is faster in 59. The per-model geo-mean ranges from **0.98x**
+All 70 cells pass the variance gate; their geo-mean speedup is **1.19x**,
+and CuTe-DSL is faster in 63. The per-model geo-mean ranges from **1.05x**
 for Mixtral-8x7B to **1.41x** for Qwen3-Next-80B-A3B. The advantage grows
-with TP (smaller per-rank I) and is largest at T=1 decode (up to 2.30x);
-the losses concentrate in Mixtral's very large I/rank at mid batch sizes
-and in the T=1024 band of the h=4096 models at TP1. Across cells,
-CuTe-DSL's between-round CV has median 0.12%, p95 2.45%, and maximum
-4.23%; the baseline's has median 0.14%, p95 1.13%, and maximum 4.09%.
+with TP (smaller per-rank I) and is largest at T=1 decode (up to 2.35x);
+the remaining losses are Mixtral's T=1024 at TP1 and DeepSeek-V3's T=4096
+at TP1. Across cells, CuTe-DSL's between-round CV has median 0.12%, p95
+2.06%, and maximum 4.13%; the baseline's has median 0.13%, p95 0.97%, and
+maximum 1.43%.
 
 ## 9. Limitations
 

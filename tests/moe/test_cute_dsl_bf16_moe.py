@@ -912,3 +912,25 @@ def test_cute_dsl_bf16_moe_gemm2_bad_inputs():
             tile_shape_mn=(128, 128),
             tile_k=64,
         )
+
+
+@cute_dsl_available
+def test_sm90_moe_tactic_decode():
+    """7-field tactic decode validates field count, swizzle, cluster, raster;
+    -1/None select the all-default override."""
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import _decode_sm90_moe_tactic
+
+    override = _decode_sm90_moe_tactic([64, 128, 8, 128, 64, [1, 2], False])
+    assert override.tile_size == 64
+    assert override.gemm1_swizzle == 8
+    assert override.gemm2_cluster_shape_mn == (1, 2)
+    assert all(f is None for f in _decode_sm90_moe_tactic(-1))
+    assert all(f is None for f in _decode_sm90_moe_tactic(None))
+    with pytest.raises(ValueError, match="expected 7"):
+        _decode_sm90_moe_tactic([64, 128, 128, 64, [1, 2], False])
+    with pytest.raises(ValueError, match="swizzle"):
+        _decode_sm90_moe_tactic([64, 128, 0, 128, 64, [1, 2], False])
+    with pytest.raises(ValueError, match="cluster"):
+        _decode_sm90_moe_tactic([64, 128, 1, 128, 64, [2, 2], False])
+    with pytest.raises(ValueError, match="raster"):
+        _decode_sm90_moe_tactic([64, 128, 1, 128, 64, [1, 1], 1])

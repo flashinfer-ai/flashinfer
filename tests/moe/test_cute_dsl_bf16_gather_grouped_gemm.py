@@ -128,3 +128,62 @@ def test_cute_dsl_bf16_gather_grouped_gemm(n2, k, tile_shape_mn, num_tokens, dty
     torch.testing.assert_close(
         out[row_valid].float(), ref[row_valid], atol=2e-1, rtol=3e-2
     )
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("swizzle_size", [8, 16])
+def test_cute_dsl_bf16_gather_grouped_gemm_swizzled_walk(swizzle_size):
+    """L2-blocked persistent walk must be numerically identical to the
+    default order at a wide-N geometry (the shape class where dispatch
+    enables it)."""
+    from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+        sm90_contiguous_gather_grouped_gemm_act_fusion,
+    )
+
+    torch.manual_seed(5)
+    num_experts, top_k, n2, k, num_tokens = 8, 2, 8192, 2048, 777
+    tile_shape_mn = (128, 256)
+
+    ids = make_random_topk_ids(num_experts, num_tokens, top_k)
+    scales = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+    (
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        _expanded_to_perm,
+        permuted_idx_to_expanded_idx,
+        _total_padded,
+        num_non_exiting_tiles,
+    ) = moe_sort(ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=128)
+    permuted_m = tile_idx_to_expert_idx.numel() * 128
+
+    x = torch.randn(num_tokens, k, device="cuda", dtype=torch.bfloat16) / (k**0.25)
+    w1 = interleave_up_gate_sm90(
+        torch.randn(num_experts, n2, k, device="cuda", dtype=torch.bfloat16) / (k**0.25)
+    )
+
+    def run(swizzle):
+        return sm90_contiguous_gather_grouped_gemm_act_fusion(
+            x,
+            w1,
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            topk=top_k,
+            permuted_m=permuted_m,
+            tile_shape_mn=tile_shape_mn,
+            swizzle_size=swizzle,
+        )
+
+    baseline = run(1)
+    swizzled = run(swizzle_size)
+    # Pure schedule reorder: bitwise-identical outputs on valid rows.
+    n_tiles = int(num_non_exiting_tiles.item())
+    rows = torch.arange(permuted_m, device="cuda")
+    row_valid = (rows // 128 < n_tiles) & (
+        rows < tile_idx_to_mn_limit.long()[rows // 128]
+    )
+    assert torch.equal(baseline[row_valid], swizzled[row_valid])
