@@ -212,6 +212,16 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
             is_lse_base_on_e=is_lse_base_on_e,
         )
 
+    # CUDA graph capture uses a distinct stream, so it needs a separately
+    # rendezvoused workspace under the one-ordered-stream workspace contract.
+    graph_ws = decode_cp_a2a_lse_reduce_create_workspace(
+        max_tokens=batch + 1,
+        local_heads=local_heads,
+        cp_size=cp_size,
+        head_dim=head_dim,
+        dtype=dtype,
+        group=group,
+    )
     # Capture one invocation on every rank, then replay enough times to exercise
     # both slots and slot reuse inside a graph.
     dist.barrier(group=group)
@@ -220,7 +230,7 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
         graph_out = decode_cp_a2a_lse_reduce(
             partial_o,
             partial_lse,
-            ws,
+            graph_ws,
             cp_rank=cp_rank,
             cp_size=cp_size,
             is_lse_base_on_e=is_lse_base_on_e,
