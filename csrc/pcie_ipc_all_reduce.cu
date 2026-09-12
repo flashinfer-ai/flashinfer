@@ -18,7 +18,7 @@
 #include <cstdint>
 
 #include "flashinfer/comm/pcie_ipc_all_reduce.cuh"
-#include "flashinfer/comm/pcie_ipc_ce_memop.cuh"
+#include "flashinfer/comm/pcie_ipc_ce_ring.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace fi = flashinfer::comm::pcie_ipc;
@@ -54,8 +54,8 @@ template <typename T>
 cudaError_t dispatch_one(const PcieIpcHandle* h, const T* in, T* out, int64_t numel, int blocks,
                          int threads, fi::Variant algo, bool use_pdl, cudaStream_t stream) {
   if (algo == fi::Variant::kCopyEngineRingMemop) {
-    return fi::ce_ring_all_reduce_memop<T>(in, out, numel, h->views, h->rank, h->world_size,
-                                           h->layout, h->ce, blocks, threads, stream);
+    return fi::ce_ring_all_reduce_flat<T, true>(in, out, numel, h->views, h->rank, h->world_size,
+                                                h->layout, h->ce, blocks, threads, stream);
   }
   if (algo == fi::Variant::kCopyEngineRing) {
     return fi::ce_ring_all_reduce_flat<T>(in, out, numel, h->views, h->rank, h->world_size,
