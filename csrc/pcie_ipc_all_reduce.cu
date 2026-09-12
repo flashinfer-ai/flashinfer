@@ -55,7 +55,7 @@ cudaError_t dispatch_one(const PcieIpcHandle* h, const T* in, T* out, int64_t nu
                          int threads, fi::Variant algo, bool use_pdl, cudaStream_t stream) {
   if (algo == fi::Variant::kCopyEngineRingMemop) {
     return fi::ce_ring_all_reduce_memop<T>(in, out, numel, h->views, h->rank, h->world_size,
-                                          h->layout, h->ce, blocks, threads, stream);
+                                           h->layout, h->ce, blocks, threads, stream);
   }
   if (algo == fi::Variant::kCopyEngineRing) {
     return fi::ce_ring_all_reduce_flat<T>(in, out, numel, h->views, h->rank, h->world_size,
@@ -159,8 +159,8 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
                                                 static_cast<int>(max_blocks));
   handle->views = fi::make_peer_views(ptrs, world_size, static_cast<int>(rank), handle->layout);
   for (int peer = 0; peer < world_size; ++peer) {
-    handle->ce.binary_flags[peer] = reinterpret_cast<int32_t*>(
-        reinterpret_cast<char*>(ptrs[peer]) + handle->layout.total_bytes);
+    handle->ce.binary_flags[peer] = reinterpret_cast<int32_t*>(reinterpret_cast<char*>(ptrs[peer]) +
+                                                               handle->layout.total_bytes);
   }
   handle->rank = static_cast<int>(rank);
   handle->world_size = world_size;
@@ -195,9 +195,12 @@ bool pcie_ipc_memop_supported() {
   if (cudaGetDevice(&ordinal) != cudaSuccess || cuDeviceGet(&device, ordinal) != CUDA_SUCCESS) {
     return false;
   }
-  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) != CUDA_SUCCESS ||
-      cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) != CUDA_SUCCESS ||
-      cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, device) != CUDA_SUCCESS) {
+  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) !=
+          CUDA_SUCCESS ||
+      cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) !=
+          CUDA_SUCCESS ||
+      cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, device) !=
+          CUDA_SUCCESS) {
     return false;
   }
   return major == 12 && minor == 0 && supported != 0;

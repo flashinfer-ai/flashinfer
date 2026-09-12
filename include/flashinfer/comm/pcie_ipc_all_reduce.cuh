@@ -101,7 +101,7 @@ enum class Variant : int {
   // Copy-engine ring. Dispatched one level up, in csrc, not by all_reduce()
   // below -- see the guard at the top of that function.
   kCopyEngineRing = 4,
-  kCopyEngineIsland = 5,  // 4+4 decomposition; world_size 8 and rootcplx only
+  kCopyEngineIsland = 5,     // 4+4 decomposition; world_size 8 and rootcplx only
   kCopyEngineRingMemop = 6,  // SM120 single-piece ring with CE publication
 };
 
