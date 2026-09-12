@@ -96,7 +96,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     )
     if not torch_vs_triton_persistent:
         print_all_on_failure(
-            a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor, out_dtype
+            a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor
         )
         print("compare c_torch and c_persistent")
         print_max_diff_on_failure(c_torch, c_persistent, out_dtype)
@@ -127,7 +127,7 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
     )
     if not naive_vs_persistent:
         print_all_on_failure(
-            a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor, out_dtype
+            a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor
         )
         print("compare c_naive and c_persistent")
         print_max_diff_on_failure(c_naive, c_persistent, out_dtype)
