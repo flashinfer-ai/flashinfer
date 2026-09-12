@@ -3217,6 +3217,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"use_inline_sf requires V cache last dim = head_dim_vo + 16 "
                     f"({self._head_dim_vo + 16}), got {v_cache.shape[-1]}"
                 )
+            if v_cache.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v_cache {v_cache.dtype} does not match the "
+                    f"kv_data_type {self._cached_kv_data_type} specified in plan function."
+                )
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
@@ -4636,6 +4641,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise ValueError(
                     f"use_inline_sf requires V last dim = head_dim_vo + 16 "
                     f"({self._head_dim_vo + 16}), got {v.shape[-1]}"
+                )
+            if v.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v {v.dtype} does not match the "
+                    f"kv_data_type {self._cached_kv_data_type} specified in plan function."
                 )
 
         # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
