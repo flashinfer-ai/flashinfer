@@ -196,6 +196,9 @@ from .blackwell_bgmv_moe import (
 )
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
+from .fused_moe import (
+    gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
+)
 
 
 cuda_lib_path = os.environ.get(
