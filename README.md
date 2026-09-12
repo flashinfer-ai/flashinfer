@@ -95,8 +95,10 @@ pip install flashinfer-python
 **Package Options:**
 
 - **flashinfer-python**: Core package that compiles/downloads kernels on first use
-- **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
-- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions
+- **flashinfer-cubin**: Pre-compiled kernel binaries (datacenter GPUs). Install from
+  `https://flashinfer.ai/whl`, not PyPI.
+- **flashinfer-jit-cache**: Pre-built kernel cache for specific CUDA versions. Also on
+  `https://flashinfer.ai/whl`.
 
 **For faster initialization and offline usage**, install the optional packages to have most kernels pre-compiled:
 
@@ -105,6 +107,12 @@ pip install flashinfer-python
 flashinfer install-cubin-wheel
 flashinfer install-jit-cache-wheel
 ```
+
+> **Note:** Upgrading `flashinfer-python` while old `flashinfer-cubin` or
+> `flashinfer-jit-cache` remains installed can fail at import with a version mismatch.
+> Re-run `flashinfer install-cubin-wheel` and `flashinfer install-jit-cache-wheel`, or
+> uninstall both optional packages to use runtime JIT. On DGX Spark / GB10,
+> `flashinfer-cubin` is optional. See the [installation guide](https://docs.flashinfer.ai/installation.html).
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 
