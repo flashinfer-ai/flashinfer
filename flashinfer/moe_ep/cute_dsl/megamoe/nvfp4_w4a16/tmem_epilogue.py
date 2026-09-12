@@ -289,8 +289,8 @@ class TmemTranspose16x32:
 @dataclasses.dataclass(frozen=True)
 class W4A16EpiArgs:
     # Per-expert FP32 scales.
-    fc1_alpha: Optional[cute.Tensor]
-    fc2_alpha: Optional[cute.Tensor]
+    fc1_alpha: cute.Tensor
+    fc2_alpha: cute.Tensor
 
 
 class EpilogueContext:
@@ -456,7 +456,7 @@ class Fc2OutputRouter:
 @cute.jit
 def fc2_f2fp(
     *tensors,
-    alpha_val: Optional[cutlass.Float32] = None,
+    alpha_val: cutlass.Float32,
 ) -> cute.Tensor:
     reorder_dtype = cutlass.BFloat16
     total_size = 0
@@ -470,22 +470,17 @@ def fc2_f2fp(
             converted_acc.iterator + elems_processed,
             cute.make_layout((current_tensor_size,)),
         )
-        if cutlass.const_expr(alpha_val is None):
-            dst.store(t.load().to(reorder_dtype))
-        else:
-            if cutlass.const_expr(current_tensor_size % 2 != 0):
-                raise ValueError(
-                    "fc2_f2fp expects even elements for each input tensor."
-                )
-            scaled = cute.make_rmem_tensor((current_tensor_size,), cutlass.Float32)
-            for i in cutlass.range_constexpr(0, current_tensor_size, 2):
-                # scaled[i] = t[i] * alpha_val
-                s0, s1 = cute.arch.mul_packed_f32x2(
-                    (t[i], t[i + 1]), (alpha_val, alpha_val)
-                )
-                scaled[i] = s0
-                scaled[i + 1] = s1
-            dst.store(scaled.load().to(reorder_dtype))
+        if cutlass.const_expr(current_tensor_size % 2 != 0):
+            raise ValueError("fc2_f2fp expects even elements for each input tensor.")
+        scaled = cute.make_rmem_tensor((current_tensor_size,), cutlass.Float32)
+        for i in cutlass.range_constexpr(0, current_tensor_size, 2):
+            # scaled[i] = t[i] * alpha_val
+            s0, s1 = cute.arch.mul_packed_f32x2(
+                (t[i], t[i + 1]), (alpha_val, alpha_val)
+            )
+            scaled[i] = s0
+            scaled[i + 1] = s1
+        dst.store(scaled.load().to(reorder_dtype))
         elems_processed += current_tensor_size
     return converted_acc
 

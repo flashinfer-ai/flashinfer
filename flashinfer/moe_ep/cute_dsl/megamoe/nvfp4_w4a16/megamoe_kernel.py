@@ -191,12 +191,9 @@ class Sm100W4A16MegaMoEKernel:
                 "W4A16 requires BF16 activation/return and FP32 accumulation."
             )
 
-        self.mma_tiler_mnk = self.mma_tiler = mma_tiler_mnk
+        self.mma_tiler = mma_tiler_mnk
         self.cluster_shape_mn = cluster_shape_mnk[:2]
         self.use_2cta_instrs = use_2cta_instrs
-        self.cta_group = (
-            tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
-        )
         self.static_expert_shape = static_expert_shape
         self.num_sched_stages = num_sched_stages or 3
         self.group_hint = group_hint
@@ -204,15 +201,11 @@ class Sm100W4A16MegaMoEKernel:
         self.load_balance_mode = load_balance_mode
         self.scenario = scenario
         self.arch = get_cutedsl_target_arch()
-        self.ab_dtype = self.fc2_output_dtype = cutlass.BFloat16
-        self.acc_dtype = cutlass.Float32
-        self.combine_format = combine_format
-        self.fc2_in_kernel_topk_reduce = self.in_kernel_fc2_reduce = False
+        self.ab_dtype = cutlass.BFloat16
         self.gate_up_clamp = gate_up_clamp
         self.epi_flag_batch = epi_flag_batch
         self.flag_batch = flag_batch
 
-        self.local_rank = local_rank
         self.world_size = world_size
         self.num_topk = num_topk
         self.max_tokens_per_rank = max_tokens_per_rank
@@ -227,18 +220,11 @@ class Sm100W4A16MegaMoEKernel:
         self._fc2_k_tiles = (gateup // 2 + 255) // 256
 
         # Five independent warpgroup roles, including exactly two decoders.
-        self.epilogue_warp_id = (0, 1, 2, 3)
-        self.mma_warp_id = 4
-        self.tma_a_warp_id = 5
-        self.tma_b_warp_id = 6
-        self.sched_warp_id = 7
-        self.dispatch_warp_id = (8, 9, 10, 11)
         self.num_transform_warpgroups = 2
         self.num_transform_warps = 8
         self.transform_warp_id = tuple(range(12, 20))
         self.threads_per_cta = 640
         self.tmem_alloc_sync_bar_id = 2
-        self.tmem_dealloc_sync_bar_id = 3
         self.token_back_mode = token_back_mode
         self.token_back_by_dispatch = by_dispatch
         self.token_back_schedule_mode = (
@@ -292,7 +278,6 @@ class Sm100W4A16MegaMoEKernel:
         self._shared_region_by_name = {r.name: r for r in self._shared_region_specs}
         local_leading = self._local_offsets["l1_token_buffer"]
         shared_leading = self._shared_offsets["src_token_topk_idx"]
-        self.require_zero_workspace_leading_bytes = local_leading, shared_leading
         self.local_zero_i32_count = local_leading // 4
         self.shared_zero_i32_count = shared_leading // 4
 
@@ -715,9 +700,7 @@ class Sm100W4A16MegaMoEKernel:
         self.mixed_fc2 = self._make_mixed(
             32, c_layout_view, mix.num_load2trans_stage, self.num_activation_stages
         )
-        self.cluster_layout_vmnk = mix.cluster_layout_vmnk
-        self.num_acc_stage = self.num_acc_pipeline_stages = 2
-        self.num_tmem_alloc_cols = 512
+        self.num_acc_stage = 2
         self.epilogue = W4A16Epilogue(
             mma_tiler_mnk=self.mma_tiler,
             cluster_shape_mn=self.cluster_shape_mn,

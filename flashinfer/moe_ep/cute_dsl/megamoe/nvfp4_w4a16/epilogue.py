@@ -293,10 +293,7 @@ class W4A16Fc2Epilogue(EpilogueContext):
         acc_pipeline,
         acc_consumer_state,
     ):
-        if cutlass.const_expr(self.optional_epi_args.fc2_alpha is not None):
-            alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
-        else:
-            alpha_val = None
+        alpha_val = self.optional_epi_args.fc2_alpha[work_tile_info.expert_idx]
         acc_ready = False
         if cutlass.const_expr(not self.token_back_by_dispatch):
             # Peer routing loads need completed input metadata. Local pool
