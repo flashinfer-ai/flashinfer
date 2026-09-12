@@ -72,7 +72,7 @@ def _quantize_block_2d(values):
 
 
 def _expand_block_scales(scales):
-    return scales.repeat_interleave(_GROUP, dim=1).repeat_interleave(_GROUP, dim=2)
+    return scales.repeat_interleave(_GROUP, dim=-2).repeat_interleave(_GROUP, dim=-1)
 
 
 def _make_aligned_routing_plan(topk_ids, *, block_m, num_experts):
@@ -238,7 +238,7 @@ def _make_case(
 
 
 def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
-    """Independent torch oracle (ported from the internal contract harness).
+    """Torch reference with per-active-expert weight dequantization.
 
     Dequantized routed expert math with the kernel's source-visible rounding:
     the intermediate is requantized to FP8 per token in groups of 128, each
@@ -250,8 +250,6 @@ def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
     block_m = case["block_m"]
 
     x = case["x"].float() * case["x_scale"].repeat_interleave(_GROUP, dim=1)
-    w1 = case["w1"].float() * _expand_block_scales(case["w1_scale"])
-    w2 = case["w2"].float() * _expand_block_scales(case["w2_scale"])
 
     # Pair -> expert map from the plan, honoring the valid extent; pairs not
     # covered by the (possibly truncated) plan contribute nothing.
@@ -279,15 +277,21 @@ def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
         pair_indices = torch.nonzero(pair_expert == expert, as_tuple=False).flatten()
         if pair_indices.numel() == 0:
             continue
+        w1 = case["w1"][expert].float() * _expand_block_scales(
+            case["w1_scale"][expert]
+        )
+        w2 = case["w2"][expert].float() * _expand_block_scales(
+            case["w2_scale"][expert]
+        )
         token_indices = torch.div(pair_indices, top_k, rounding_mode="floor")
-        gate_up = x[token_indices] @ w1[expert].transpose(0, 1)
+        gate_up = x[token_indices] @ w1.transpose(0, 1)
         gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]
         activated = torch.nn.functional.silu(gate) * up
         act_q, act_scale = _quantize_per_row_group(activated)
         activated_dequant = act_q.float() * act_scale.repeat_interleave(_GROUP, dim=1)
         for base in range(0, intermediate, _GROUP):
             down = activated_dequant[:, base : base + _GROUP] @ w2[
-                expert, :, base : base + _GROUP
+                :, base : base + _GROUP
             ].transpose(0, 1)
             down *= flat_weights[pair_indices, None] * case["scaling_factor"]
             routed_bf16 = down.to(torch.bfloat16)
@@ -402,7 +406,7 @@ def test_alphamoe_sm100_guard_skips_blocks_past_plan_extent():
     visible spurious contribution to token 0.
     """
     _skip_if_not_sm100_family()
-    label, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
+    _label, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
         CONTRACT_CASES[1]
     )
     case = _make_case(m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed)
@@ -428,7 +432,7 @@ def test_alphamoe_sm100_guard_skips_blocks_past_plan_extent():
 def test_alphamoe_sm100_accumulates_into_out():
     """out is a caller-owned accumulator: result = initial value + contributions."""
     _skip_if_not_sm100_family()
-    label, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
+    _label, m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed = (
         CONTRACT_CASES[0]
     )
     case = _make_case(m, n, k, num_experts, top_k, block_m, shared, bal, scaling, seed)
@@ -466,7 +470,7 @@ def test_alphamoe_sm100_validates_tma_and_output_alignment():
     bad_pitch = bad_pitch_storage[:, :k]
     bad_pitch.copy_(original)
     case["x"] = bad_pitch
-    with pytest.raises(RuntimeError, match="row stride.*16-byte aligned"):
+    with pytest.raises(RuntimeError, match=r"row stride.*16-byte aligned"):
         _launch(case)
 
     bad_base_storage = torch.empty(

@@ -23,14 +23,15 @@
 // per-token FP8 requant, down projection, and asynchronous BF16 reduce-add
 // into a caller-owned output accumulator.
 //
-// The generated TU is embedded by a mechanical transform that does not touch
-// kernel code:
+// The generated TU is embedded with the following host adaptations:
 //   1. the fixed-width typedefs and the opaque CUtensorMap typedef of the
 //      generated prelude are dropped (the host headers below supply them);
 //   2. the generated #define block is kept verbatim; SMEM_TOTAL/THREADS are
 //      captured into constexprs for the launcher, then every generated macro
 //      is #undef'd after the kernel.
-// The kernel body is byte-identical to the generated output.
+// The device body additionally gives all-zero activation blocks a unit scale
+// so FP8 requantization preserves zero without evaluating 0 * infinity. Nonzero
+// activation blocks retain the generated scale calculation.
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -774,7 +775,10 @@ kernel_alpha_moe_w8a8_up_down(__grid_constant__ LoomTensorMap const x, __grid_co
                     uint32_t _amf_u_1 = smem_amax[consumer_tid];
                     uint32_t _amf_mask_1 = ((_amf_u_1 >> 31) - 1u) | 0x80000000u;
                     float _amf_dec_0 = __uint_as_float(_amf_u_1 ^ _amf_mask_1);
-                    smem_act_scale[consumer_tid] = _amf_dec_0 / 448.0f;
+                    // A zero block quantizes and dequantizes exactly to zero
+                    // with unit scale; its reciprocal must remain finite.
+                    smem_act_scale[consumer_tid] =
+                        _amf_dec_0 == 0.0f ? 1.0f : _amf_dec_0 / 448.0f;
                 }
                 asm volatile("barrier.sync 15, %0;" :: "r"(128));
                 const int feature_in_half = physical_row / 16 * 8 + physical_row % 8;
@@ -1225,6 +1229,9 @@ inline ProblemDims CheckInputs(
       << "num_tokens_post_padded must be a device int32 tensor with exactly one element, got "
       << num_tokens_post_padded.numel();
   TVM_FFI_ICHECK(expert_ids.numel() > 0) << "expert_ids must not be empty";
+  // Divide instead of multiplying the required capacity to avoid overflow.
+  TVM_FFI_ICHECK(expert_ids.numel() <= sorted_token_ids.numel() / block_m)
+      << "sorted_token_ids must contain at least expert_ids.numel() * block_m entries";
   TVM_FFI_ICHECK(topk_weights.size(0) == m && topk_weights.size(1) == top_k)
       << "topk_weights must have shape (" << m << ", " << top_k << "), got ("
       << topk_weights.size(0) << ", " << topk_weights.size(1) << ")";
@@ -1300,6 +1307,9 @@ void Run(TensorView hidden_states, TensorView hidden_states_scale, TensorView ge
          TensorView sorted_token_ids, TensorView expert_ids, TensorView num_tokens_post_padded,
          TensorView topk_weights, TensorView out, int64_t top_k, int64_t block_m,
          double routed_scaling_factor) {
+  TVM_FFI_ICHECK(hidden_states.device().device_type == kDLCUDA)
+      << "hidden_states must be a CUDA tensor";
+  ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   const ProblemDims dims =
       CheckInputs(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
                   gemm2_weights, gemm2_weights_scale, sorted_token_ids, expert_ids,

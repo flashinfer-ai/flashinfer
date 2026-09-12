@@ -20,8 +20,17 @@ from typing import Optional, Tuple
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..jit import gen_alphamoe_sm100_module
-from ..utils import register_custom_op
+from ..trace.templates.alphamoe import (
+    alphamoe_fp8_block_scale_aligned_moe_trace,
+    alphamoe_interleave_gated_weights_trace,
+)
+from ..utils import (
+    backend_requirement,
+    register_custom_op,
+    supported_compute_capability,
+)
 
 
 def _interleave_gated_rows(tensor: torch.Tensor, rep: int) -> torch.Tensor:
@@ -36,6 +45,7 @@ def _interleave_gated_rows(tensor: torch.Tensor, rep: int) -> torch.Tensor:
     )
 
 
+@flashinfer_api(trace=alphamoe_interleave_gated_weights_trace)
 def alphamoe_interleave_gated_weights(
     gemm1_weights: torch.Tensor,
     gemm1_weights_scale: torch.Tensor,
@@ -106,6 +116,14 @@ def get_alphamoe_sm100_module() -> SimpleNamespace:
     return SimpleNamespace(fp8_block_scale_aligned_moe=fp8_block_scale_aligned_moe)
 
 
+@supported_compute_capability([100, 103])
+def _check_alphamoe_supported(hidden_states: torch.Tensor, *args, **kwargs) -> bool:
+    """Check architecture before JIT; the binding validates the complete tensor ABI."""
+    return hidden_states.is_cuda
+
+
+@backend_requirement({}, common_check=_check_alphamoe_supported)
+@flashinfer_api(trace=alphamoe_fp8_block_scale_aligned_moe_trace)
 def alphamoe_fp8_block_scale_aligned_moe(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -136,7 +154,8 @@ def alphamoe_fp8_block_scale_aligned_moe(
     ``num_tokens * top_k``. ``expert_ids`` carries one expert index per
     ``block_m``-sized block, and ``num_tokens_post_padded`` is a device-side
     scalar naming the valid plan extent; blocks past it are skipped, so
-    worst-case-sized plan buffers are fine.
+    worst-case-sized plan buffers are fine. ``sorted_token_ids`` must still
+    contain at least ``expert_ids.numel() * block_m`` entries.
 
     Parameters
     ----------
@@ -193,7 +212,8 @@ def alphamoe_fp8_block_scale_aligned_moe(
     Notes
     -----
     Requires an SM100/SM103 (B200/B300 class) device; the kernel is a frozen
-    generated Loom schedule (see ``csrc/alphamoe_sm100/``).
+    generated schedule (see ``csrc/alphamoe_sm100.cu``), with a unit-scale
+    guard for all-zero activation blocks.
     """
     if out is None:
         out = torch.zeros(
