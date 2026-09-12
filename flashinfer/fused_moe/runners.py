@@ -911,6 +911,23 @@ class MoERunner(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
+def _fold_trtllm_nvfp4_activation_scale(
+    act: MoEActivationPack,
+    view: dict,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Fold the activation global scale into TRTLLM/Cake GEMM1 scalars."""
+    output1 = view.get("output1_scale_scalar")
+    output1_gate = view.get("output1_scale_gate_scalar")
+    if act.hidden_states_scale_global is None:
+        return output1, output1_gate
+    inv_scale = 1.0 / act.hidden_states_scale_global
+    if output1 is not None:
+        output1 = (output1 * inv_scale).contiguous()
+    if output1_gate is not None:
+        output1_gate = (output1_gate * inv_scale).contiguous()
+    return output1, output1_gate
+
+
 class CakeWarpDecodeRunner(MoERunner):
     """Exact-SM100/SM103 Cake runner for calibrated NVFP4 decode geometries.
 
@@ -1562,6 +1579,10 @@ class CakeWarpDecodeRunner(MoERunner):
                 device=device,
             )
 
+        output1_scale, output1_gate_scale = (
+            _fold_trtllm_nvfp4_activation_scale(act, view)
+        )
+
         workspace_geometry = (
             num_tokens,
             hidden_size,
@@ -1599,8 +1620,8 @@ class CakeWarpDecodeRunner(MoERunner):
             view["gemm1_weights_scale"],
             view["gemm2_weights"],
             view["gemm2_weights_scale"],
-            view["output1_scale_scalar"],
-            view["output1_scale_gate_scalar"],
+            output1_scale,
+            output1_gate_scale,
             view["output2_scale_scalar"],
         ]
         if activation_parameter_keys:
@@ -5221,6 +5242,18 @@ class CuteDslRunner(MoERunner):
         self._require_built()
         self._validate_pack_contract(act)
         v = weights.get_view(self.backend_key)
+        w1_alpha = v["w1_alpha"]
+        if act.hidden_states_scale_global is not None:
+            if self.config.quant.pair != (
+                QuantFormat.NVFP4,
+                QuantFormat.NVFP4,
+            ):
+                raise ValueError(
+                    "hidden_states_scale_global is supported only for NVFP4×NVFP4."
+                )
+            w1_alpha = (
+                w1_alpha / act.hidden_states_scale_global.to(w1_alpha.device)
+            ).contiguous()
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
@@ -5270,7 +5303,7 @@ class CuteDslRunner(MoERunner):
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
-                v["w1_alpha"],
+                w1_alpha,
                 None if mxfp8_act else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
@@ -5826,6 +5859,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         )
         routing = self.config.routing
 
+        if act.hidden_states_scale_global is not None and self._pair != (
+            QuantFormat.NVFP4,
+            QuantFormat.NVFP4,
+        ):
+            raise ValueError(
+                "hidden_states_scale_global is supported only for NVFP4×NVFP4."
+            )
+        output1_scale, output1_gate_scale = (
+            _fold_trtllm_nvfp4_activation_scale(act, v)
+        )
+
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = (
             act.hidden_states_q.shape[1] * 2
@@ -5969,8 +6013,8 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             gemm2_weights=v["gemm2_weights"],
             gemm2_weights_scale=v["gemm2_weights_scale"],
             gemm2_bias=None,
-            output1_scale_scalar=v.get("output1_scale_scalar"),
-            output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
+            output1_scale_scalar=output1_scale,
+            output1_scale_gate_scalar=output1_gate_scale,
             output2_scale_scalar=v.get("output2_scale_scalar"),
             num_experts=routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
