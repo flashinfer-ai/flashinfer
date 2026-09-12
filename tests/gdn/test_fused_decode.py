@@ -76,7 +76,6 @@ flashinfer/gdn_kernels/experimental/README.md):
 from __future__ import annotations
 
 import ast
-import functools
 import importlib
 import inspect
 import math
@@ -85,6 +84,7 @@ import pathlib
 import re
 import subprocess
 import sys
+from typing import NamedTuple
 
 import pytest
 import torch
@@ -160,13 +160,58 @@ REGISTERED_BATCHES = (1, 2, 4, 8)
 # path (rationale in flashinfer/gdn_kernels/experimental/README.md).
 UNREGISTERED_BATCHES = (16, 24, 32)
 
-HIDDEN = 5120
-N_BA = 96
-QKV_DIM = 10240
-HV = 48
-D = 128
-CONV_WIDTH = 4
-CONV_STATE_LEN = 3
+
+class Geometry(NamedTuple):
+    """One registered layer geometry.
+
+    The geometry is a compile-time parameter of both impls, so the tests
+    below are parameterized over this table rather than over module-level
+    constants: adding a model means adding registry rows and an entry here.
+    ``h_q`` is derived exactly as the dispatch guard derives it, from the
+    q/k/v split of ``qkv_dim``.
+    """
+
+    name: str
+    hidden: int
+    n_ba: int
+    qkv_dim: int
+    hv: int
+    d: int
+    conv_width: int
+    conv_state_len: int
+    batches: tuple
+
+    @property
+    def h_q(self) -> int:
+        return (self.qkv_dim - self.hv * self.d) // (2 * self.d)
+
+    def key(self) -> tuple:
+        """The geometry key the kernel modules and the registry agree on."""
+        return (
+            self.hidden,
+            self.n_ba,
+            self.qkv_dim,
+            self.h_q,
+            self.hv,
+            self.d,
+            self.conv_width,
+            self.conv_state_len,
+        )
+
+
+QWEN_27B = Geometry("qwen3.6-27b", 5120, 96, 10240, 48, 128, 4, 3, (1, 2, 4, 8))
+QWEN_35B_A3B = Geometry("qwen3.6-35b-a3b", 2048, 64, 8192, 32, 128, 4, 3, (1, 2, 4))
+GEOMETRIES = (QWEN_27B, QWEN_35B_A3B)
+
+# The geometry the un-parameterized tests below build inputs for.  It is the
+# first registered one; the per-geometry tests cover the rest.
+HIDDEN = QWEN_27B.hidden
+N_BA = QWEN_27B.n_ba
+QKV_DIM = QWEN_27B.qkv_dim
+HV = QWEN_27B.hv
+D = QWEN_27B.d
+CONV_WIDTH = QWEN_27B.conv_width
+CONV_STATE_LEN = QWEN_27B.conv_state_len
 # One distinct pool slot per row of the largest batch any test builds inputs
 # for -- the 16/24/32 guard rows included: they never dispatch, but they still
 # run the composable path over `state_indices`, and `_make_inputs` walks the
@@ -225,17 +270,30 @@ def _restrict_registry_to(monkeypatch, impl_name: str) -> None:
     monkeypatch.setattr(specialized_gdn, "load_gdn_fused_decode_registry", lambda: rows)
 
 
-def _make_conv_state(conv_layout: str, device) -> torch.Tensor:
-    """Conv-state pool as the logical [P, QKV_DIM, CONV_STATE_LEN] view the
+def _signature_for(inputs: dict) -> dict:
+    """The dispatch signature of an input set built by :func:`_make_inputs`.
+
+    ``ready_for_graph_capture`` takes the matched signature, so readiness is
+    answered about the exact variant -- including its layer geometry -- that
+    the dispatcher would run.
+    """
+    signature = specialized_gdn.signature_from_tensors(*_guard_args(inputs))
+    assert signature is not None, "test inputs must satisfy the op contract"
+    return signature
+
+
+def _make_conv_state(
+    conv_layout: str, device, geometry: Geometry = QWEN_27B
+) -> torch.Tensor:
+    """Conv-state pool as the logical [P, qkv_dim, conv_state_len] view the
     op consumes: SD = physical (state_len, dim) rows passed transposed (the
     vLLM default allocation), DS = dense (dim, state_len) rows."""
+    qkv_dim, state_len = geometry.qkv_dim, geometry.conv_state_len
     if conv_layout == "SD":
-        pool = (
-            torch.randn(POOL, CONV_STATE_LEN, QKV_DIM, device=device).bfloat16() * 0.5
-        )
+        pool = torch.randn(POOL, state_len, qkv_dim, device=device).bfloat16() * 0.5
         return pool.transpose(-1, -2)
     assert conv_layout == "DS"
-    return torch.randn(POOL, QKV_DIM, CONV_STATE_LEN, device=device).bfloat16() * 0.5
+    return torch.randn(POOL, qkv_dim, state_len, device=device).bfloat16() * 0.5
 
 
 def _make_inputs(
@@ -246,8 +304,9 @@ def _make_inputs(
     conv_layout: str = "SD",
     device="cuda",
     saturate_gate: bool = False,
+    geometry: Geometry = QWEN_27B,
 ) -> dict:
-    """Build one input set for the registered layer geometry.
+    """Build one input set for a registered layer geometry.
 
     Scales are chosen so the gates stay in their ordinary range; pass
     ``saturate_gate`` for the overflow regime random inputs never reach.
@@ -256,40 +315,44 @@ def _make_inputs(
     its own pool slot, walking downwards from ``POOL - 1``.
     """
     assert B < POOL, "every batch row needs its own state-pool slot"
+    hidden, n_ba = geometry.hidden, geometry.n_ba
+    qkv_dim, hv, d = geometry.qkv_dim, geometry.hv, geometry.d
+    conv_width = geometry.conv_width
+    padded_row_stride = hv * d * d + 4096
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     inputs = {
-        "hidden_states": torch.randn(B, HIDDEN, device=device).bfloat16() * 0.5,
-        "w_ba": torch.randn(HIDDEN, N_BA, device=device).bfloat16() * 0.02,
+        "hidden_states": torch.randn(B, hidden, device=device).bfloat16() * 0.5,
+        "w_ba": torch.randn(hidden, n_ba, device=device).bfloat16() * 0.02,
         # Serving passes mixed_qkv as a row-strided view into the wider fused
-        # qkvz projection; reproduce that layout (values live in [:, :QKV_DIM]).
-        "mixed_qkv": (torch.randn(B, QKV_DIM + 2048, device=device).bfloat16() * 0.5)[
-            :, :QKV_DIM
+        # qkvz projection; reproduce that layout (values live in [:, :qkv_dim]).
+        "mixed_qkv": (torch.randn(B, qkv_dim + 2048, device=device).bfloat16() * 0.5)[
+            :, :qkv_dim
         ],
-        "conv_weight": torch.randn(QKV_DIM, CONV_WIDTH, device=device).bfloat16() * 0.3,
-        "conv_bias": torch.randn(QKV_DIM, device=device).bfloat16() * 0.1,
-        "conv_state": _make_conv_state(conv_layout, device),
-        "A_log": torch.randn(HV, device=device).float() * 0.5,
-        "dt_bias": torch.randn(HV, device=device).bfloat16() * 0.1,
-        "scale": 1.0 / math.sqrt(D),
+        "conv_weight": torch.randn(qkv_dim, conv_width, device=device).bfloat16() * 0.3,
+        "conv_bias": torch.randn(qkv_dim, device=device).bfloat16() * 0.1,
+        "conv_state": _make_conv_state(conv_layout, device, geometry),
+        "A_log": torch.randn(hv, device=device).float() * 0.5,
+        "dt_bias": torch.randn(hv, device=device).bfloat16() * 0.1,
+        "scale": 1.0 / math.sqrt(d),
         "state_indices": torch.arange(POOL - 1, POOL - 1 - B, -1, device=device).int(),
         "use_qk_l2norm": True,
     }
     if padded_pool:
-        backing = torch.randn(POOL * PADDED_ROW_STRIDE, device=device).float() * 0.05
+        backing = torch.randn(POOL * padded_row_stride, device=device).float() * 0.05
         inputs["ssm_state"] = backing.as_strided(
-            (POOL, HV, D, D), (PADDED_ROW_STRIDE, D * D, D, 1)
+            (POOL, hv, d, d), (padded_row_stride, d * d, d, 1)
         )
     else:
-        inputs["ssm_state"] = torch.randn(POOL, HV, D, D, device=device).float() * 0.05
+        inputs["ssm_state"] = torch.randn(POOL, hv, d, d, device=device).float() * 0.05
     if saturate_gate:
         # Decay gate g = exp(-exp(A_log) * softplus(a + dt_bias)).  Push the
         # softplus argument to ~100, past the point where exp() overflows in
         # fp32 (~88.7), while keeping exp(A_log) = exp(-6) small enough that
         # the true gate stays O(1): exp(-exp(-6) * 100) = 0.78.  A softplus
         # written as log(1 + exp(x)) returns +inf here and collapses g to 0.
-        inputs["dt_bias"] = torch.full((HV,), 100.0, device=device).bfloat16()
-        inputs["A_log"] = torch.full((HV,), -6.0, device=device).float()
+        inputs["dt_bias"] = torch.full((hv,), 100.0, device=device).bfloat16()
+        inputs["A_log"] = torch.full((hv,), -6.0, device=device).float()
     return inputs
 
 
@@ -301,6 +364,7 @@ def _run_reference(
     conv_layout: str = "SD",
     saturate_gate: bool = False,
     device="cuda",
+    geometry: Geometry = QWEN_27B,
 ):
     """Composable-path result on an identically-seeded fresh input set."""
     ref_inputs = _make_inputs(
@@ -310,6 +374,7 @@ def _run_reference(
         conv_layout=conv_layout,
         saturate_gate=saturate_gate,
         device=device,
+        geometry=geometry,
     )
     out = gfd._gdn_fused_decode_step_fallback(
         ref_inputs["hidden_states"],
@@ -360,19 +425,13 @@ def _make_impls_look_cold(monkeypatch) -> tuple:
 
     Returns ``(cuda_module, cutedsl_module_or_None)``.
 
-    The CUDA impl memoizes its loaded JIT module in a module-level
-    ``functools.cache``.  Calling ``_get_module.cache_clear()`` would empty
-    that PROCESS-GLOBAL memo, and monkeypatch cannot put the entry back at
-    teardown -- so every later test (and every later call in the session)
-    pays a module reload, and a test that happens to assert on residency
-    inherits whichever order pytest chose.  Swapping in a fresh cache over
-    the same underlying function is equivalent for the test and is undone
-    automatically, because monkeypatch restores the attribute itself.
+    The CUDA impl memoizes its loaded JIT modules in a module-level dict.
+    Clearing that process-global dict would make every later test (and call
+    in the session) pay a module reload. Swapping in a fresh dict is
+    equivalent for this test and lets monkeypatch restore the real cache.
     """
     cuda = _impl(_CUDA_IMPL)
-    monkeypatch.setattr(
-        cuda, "_get_module", functools.cache(cuda._get_module.__wrapped__)
-    )
+    monkeypatch.setattr(cuda, "_modules", {})
     monkeypatch.setattr(cuda, "_barrier_cache", {})
     monkeypatch.setattr(cuda, "_scratch_cache", {})
     cutedsl = specialized_gdn._load_impl(_CUTEDSL_IMPL)
@@ -912,14 +971,13 @@ def test_registry_drives_dispatch_both_ways(monkeypatch):
 
 
 def test_no_environment_gate(monkeypatch):
-    """The package exposes no on/off variable, and the retired kill switch
-    is inert.
+    """The package exposes no on/off variable, and retired gates are inert.
 
     A brand-new API has no in-FlashInfer alternative to fall back to, so an
     environment gate here would be a second policy surface that nobody
     measures: support is this library's answer, policy is the framework's.
-    Pinned negatively so neither the retired variable nor a replacement can
-    reappear without this test failing.
+    Pinned negatively so the retired variables cannot reappear without this
+    test failing.
     """
     _skip_if_no_specialized()
     from flashinfer.gdn_kernels import experimental as experimental_pkg
@@ -934,8 +992,7 @@ def test_no_environment_gate(monkeypatch):
         ]
         assert not offenders, f"{module.__name__} exposes a gate: {offenders}"
 
-    # The retired variable (and a plausible replacement) must not change
-    # dispatch, the probe, or the numbers.
+    # Retired variables must not change dispatch, the probe, or the numbers.
     cutedsl = specialized_gdn._load_impl(_CUTEDSL_IMPL)
     cuda = _impl(_CUDA_IMPL)
 
@@ -949,7 +1006,6 @@ def test_no_environment_gate(monkeypatch):
     for name, value in (
         ("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1"),
         ("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "true"),
-        ("FLASHINFER_QWEN_GDN_FUSED_DECODE_DISABLE", "1"),
         ("FLASHINFER_ENABLE_EXPERIMENTAL_FEATURES", "0"),
     ):
         monkeypatch.setenv(name, value)
@@ -1198,7 +1254,10 @@ def test_graph_capture_after_warmup(impl_name: str, monkeypatch):
 
     inputs = _make_inputs(1, padded_pool=True, seed=seed)
     assert impl.ready_for_graph_capture(
-        inputs["hidden_states"], inputs["conv_state"], inputs["scale"]
+        _signature_for(inputs),
+        inputs["hidden_states"],
+        inputs["conv_state"],
+        inputs["scale"],
     )
 
     def _boom(*args, **kwargs):
@@ -1319,7 +1378,7 @@ def test_capture_never_compiles_a_cold_impl(monkeypatch):
     gdn_fused_decode_step(**inputs)
     assert calls["fallback"] == 1
     assert cuda.launch_count() == launches_before
-    assert not cuda._module_is_resident(), "nothing may compile during capture"
+    assert not cuda._modules, "nothing may compile during capture"
 
 
 def _cute_math_primitives_used_by_the_cutedsl_impl() -> set:
@@ -1762,19 +1821,167 @@ def test_registry_shape_and_stats():
     for row in rows:
         assert row["conv_layout"] == "SD"
         assert row["cc"] == 120
-        by_impl.setdefault(row["impl"], set()).add(row["b"])
-    assert by_impl == {
-        _CUTEDSL_IMPL: set(REGISTERED_BATCHES),
-        _CUDA_IMPL: set(REGISTERED_BATCHES),
-    }
-    assert not set(UNREGISTERED_BATCHES) & set(REGISTERED_BATCHES)
+        by_impl.setdefault(row["impl"], {}).setdefault(
+            tuple(row[field] for field in specialized_gdn._GEOMETRY_FIELDS), set()
+        ).add(row["b"])
+    expected = {geometry.key(): set(geometry.batches) for geometry in GEOMETRIES}
+    assert by_impl == {_CUTEDSL_IMPL: expected, _CUDA_IMPL: expected}
+    assert not set(UNREGISTERED_BATCHES) & set(QWEN_27B.batches)
     stats = specialized_gdn.gdn_fused_decode_stats()
     assert stats["registry_entries"] == len(rows)
     assert set(stats["impls"]) == {_CUTEDSL_IMPL, _CUDA_IMPL}
     cuda_stats = stats["impls"][_CUDA_IMPL]
     if cuda_stats["distinct_kernels_for_registry"] is not None:
-        # One B-dynamic CUDA module serves every row.
-        assert cuda_stats["distinct_kernels_for_registry"] == 1
+        # One B-dynamic CUDA module per layer geometry (the geometry is a
+        # compile-time parameter; batch, scale and conv strides are not).
+        assert cuda_stats["distinct_kernels_for_registry"] == len(GEOMETRIES)
+
+
+def test_registry_geometries_are_the_documented_surface():
+    """``registry_geometries()`` is exactly the distinct geometries the
+    registry lists, and matches the table these tests are written against.
+
+    That set is what a geometry-parameterized build (or a JIT-disabled
+    deployment restoring an AOT entry) would have to cover: one CUDA module
+    per geometry.  Needs no GPU.
+    """
+    assert specialized_gdn.registry_geometries() == [
+        geometry.key() for geometry in GEOMETRIES
+    ]
+
+
+def test_registered_geometry_tiling_is_exact():
+    """Every registered geometry satisfies the relations both kernels tile
+    on, exactly.
+
+    These are the divisibility facts the kernel bodies assume -- the CUDA
+    kernel ``static_assert``s them and the CuTe-DSL impl re-checks them at
+    dispatch -- so a registry row that broke one would mis-tile rather than
+    fail.  Asserting them here guards the registry in plain CI, with no GPU
+    and no compiler.
+    """
+    cutedsl = _impl(_CUTEDSL_IMPL)
+    for geometry in GEOMETRIES:
+        hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, state_len = geometry.key()
+        why = f"geometry {geometry.name}"
+        # Shared by both impls.
+        assert n_ba == 2 * hv, f"{why}: w_ba columns are [b gates | a decays]"
+        assert hv % h_q == 0, f"{why}: each qk-head serves whole v-heads"
+        assert qkv_dim == (2 * h_q + hv) * d, f"{why}: qkv_dim matches the head split"
+        assert d == 4 * 32, f"{why}: one D-wide row per warp, 4 channels per lane"
+        assert d & (d - 1) == 0, f"{why}: B=1 row indexing uses D as a power of two"
+        assert (conv_width, state_len) == (4, 3), (
+            f"{why}: conv taps unrolled as width 4"
+        )
+        # CUDA impl: warps own whole groups of state rows, block is 256 threads.
+        assert d % 8 == 0, f"{why}: warps own whole groups of state rows"
+        assert n_ba <= 256, f"{why}: the gate reduction fits one block"
+        # CuTe-DSL impl: the K-split and conv tile must divide exactly.
+        assert hidden % cutedsl.KS == 0, f"{why}: hidden divisible by the K-split"
+        assert qkv_dim % cutedsl.CONV_TILE == 0, f"{why}: qkv_dim divisible by the tile"
+        assert d % cutedsl.RPB == 0, f"{why}: rows-per-block divides D"
+        # And the derived tile counts are the exact integers the kernel uses.
+        gqa, nrb, kchunk, nconv = cutedsl._derived(hidden, qkv_dim, hv, h_q, d)
+        assert (gqa, nrb, kchunk, nconv) == (
+            hv // h_q,
+            d // cutedsl.RPB,
+            hidden // cutedsl.KS,
+            qkv_dim // cutedsl.CONV_TILE,
+        )
+        # The impl's own guard must accept every geometry we ship.
+        cutedsl._check_geometry(hidden, n_ba, qkv_dim, h_q, hv, d)
+
+
+def test_cutedsl_geometry_guard_rejects_a_mis_tiling_geometry():
+    """The CuTe-DSL geometry guard is a detector, not decoration.
+
+    A geometry whose v-heads do not divide into its qk-heads would silently
+    mis-map heads; the guard must raise so the dispatch layer falls back.
+    """
+    cutedsl = _impl(_CUTEDSL_IMPL)
+    with pytest.raises(RuntimeError, match="unsupported fused GDN decode geometry"):
+        # h_q=48 does not divide hv=32, and n_ba/qkv_dim no longer agree.
+        cutedsl._check_geometry(2048, 64, 8192, 48, 32, 128)
+
+
+def test_geometry_is_a_compile_time_parameter_of_the_cuda_module(monkeypatch):
+    """The CUDA JIT spec bakes the geometry in, so each geometry gets its own
+    module name and its own ``-D`` defines.
+
+    Two geometries sharing a module name would collide in the on-disk JIT
+    cache and serve one model's kernel to the other.  Needs no GPU: the spec
+    is built, not compiled, and the target arch is pinned here so the check
+    does not depend on what the node happens to have.
+    """
+    from flashinfer.jit import core as jit_core
+    from flashinfer.jit.gdn_fused_decode import gen_gdn_fused_decode_module
+
+    monkeypatch.setattr(
+        jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(12, "0a")}
+    )
+    names = set()
+    for geometry in GEOMETRIES:
+        spec = gen_gdn_fused_decode_module(*geometry.key())
+        names.add(spec.name)
+        flags = " ".join(spec.extra_cuda_cflags)
+        for key, value in zip(
+            ("HIDDEN", "N_BA", "QKV_DIM", "H_Q", "HV", "D"),
+            geometry.key(),
+            strict=False,
+        ):
+            assert f"-DFI_GDN_{key}={value}" in flags
+    assert len(names) == len(GEOMETRIES), "each geometry needs its own module name"
+
+
+def test_cuda_scratch_cache_is_scoped_to_geometry():
+    """Two geometries cannot share one launch-scratch cache entry."""
+    cuda = _impl(_CUDA_IMPL)
+    hidden_states = torch.empty((1, 1))
+    conv_state = torch.empty((1, 1, 1))
+    keys = [
+        cuda._scratch_key(geometry.key(), hidden_states, conv_state)
+        for geometry in GEOMETRIES
+    ]
+    assert len(set(keys)) == len(keys)
+
+
+@pytest.mark.parametrize("impl_name", [_CUTEDSL_IMPL, _CUDA_IMPL])
+@pytest.mark.parametrize(
+    "geometry,B",
+    [
+        pytest.param(geometry, B, id=f"{geometry.name}-batch-{B}")
+        for geometry in GEOMETRIES
+        for B in geometry.batches
+    ],
+)
+def test_every_registered_geometry_matches_composable(
+    impl_name: str, geometry: Geometry, B: int, monkeypatch
+):
+    """Each impl reproduces the composable path at every registered geometry.
+
+    Run at every registered batch with the padded pool stride, which is the
+    serving layout.  This is what makes the geometry a parameter rather than
+    a claim.
+    """
+    _skip_if_no_specialized()
+    _restrict_registry_to(monkeypatch, impl_name)
+    impl = _impl(impl_name)
+    seed = 1234
+    inputs = _make_inputs(B, padded_pool=True, seed=seed, geometry=geometry)
+    launches_before = impl.launch_count()
+    out, conv_state, ssm_state = gdn_fused_decode_step(**inputs)
+    torch.cuda.synchronize()
+    assert impl.launch_count() > launches_before, (
+        f"{impl_name} did not serve geometry {geometry.name} -- "
+        "the registry row or the dispatch guard declined it"
+    )
+    assert specialized_gdn.gdn_fused_decode_stats()["failed_impls"] == []
+    ref_out, ref_conv_state, ref_ssm_state = _run_reference(
+        B, padded_pool=True, seed=seed, geometry=geometry
+    )
+    torch.testing.assert_close(out, ref_out, atol=ATOL, rtol=RTOL)
+    assert torch.equal(conv_state, ref_conv_state)
+    torch.testing.assert_close(ssm_state, ref_ssm_state, atol=ATOL, rtol=RTOL)
 
 
 if __name__ == "__main__":

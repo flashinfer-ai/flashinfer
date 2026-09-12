@@ -39,6 +39,7 @@ recurrent_kda_trace = TraceTemplate(
         "num_checkpoint_offsets": Var(
             description="Number of packed checkpoint cumulative offsets."
         ),
+        "kg_dim": Var(description="Key/gate cache row width (2 * head_dim)."),
     },
     inputs={
         "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
@@ -82,6 +83,23 @@ recurrent_kda_trace = TraceTemplate(
         "lower_bound": Scalar("float32", optional=True),
         "num_spec_tokens": Scalar("int32", optional=True),
         "beta_is_logit": Scalar("int32", optional=True),
+        "disable_state_update": Scalar("int32", optional=True),
+        "correction_cache": Tensor(
+            ["source_pool_size", "num_v_heads", "seq_len", "head_dim"],
+            optional=True,
+            description=(
+                "Frozen-verify only: slot-indexed float32 per-token "
+                "delta-rule corrections for a commit/recovery kernel."
+            ),
+        ),
+        "kg_cache": Tensor(
+            ["source_pool_size", "num_v_heads", "seq_len", "kg_dim"],
+            optional=True,
+            description=(
+                "Frozen-verify only: slot-indexed (normalized key | raw "
+                "gate) cache; kg_dim == 2 * head_dim."
+            ),
+        ),
         "checkpoint_every_n_tokens": Scalar("int32", optional=True),
     },
     outputs={

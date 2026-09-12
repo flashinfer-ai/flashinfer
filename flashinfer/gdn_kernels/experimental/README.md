@@ -134,9 +134,10 @@ of host time per step — small, but one-directional and paid at exactly the
 shapes the registry declines.
 
 CUDA-graph contract: each impl compiles **lazily, per variant** — the first
-eager (non-capturing) dispatch of a (batch size, scale, conv-state layout)
-variant compiles and warms it (vLLM's profile run precedes its capture
-phase and plays this role).  During capture an impl is recorded only when
+eager (non-capturing) dispatch of a (layer geometry, batch size, scale,
+conv-state layout) variant compiles and warms it (vLLM's profile run
+precedes its capture phase and plays this role).  During capture an impl is
+recorded only when
 `ready_for_graph_capture` confirms this exact variant is already warm —
 never compiling, synchronizing, or allocating persistent state under
 capture — falling through to the next impl and finally to the
@@ -171,8 +172,10 @@ the op serves the composable path. It stays **correct**, and the latch clears
 the probe memo, so `gdn_fused_decode_step_supported(...)` starts answering
 `False` and a framework goes back to its own composition after at most one
 declined call per impl. If a JIT-disabled deployment needs the CUDA kernel,
-re-adding the `gen_gdn_fused_decode_module()` spec under `has_sm120` restores
-it; nothing else depends on its absence.
+re-adding the spec under `has_sm120` restores it — one per registered layer
+geometry, since the geometry is compiled in:
+`gen_gdn_fused_decode_module(*geometry) for geometry in registry_geometries()`.
+Nothing else depends on its absence.
 
 ### `@flashinfer_api` on both; `trace=` only on the op
 
@@ -239,15 +242,17 @@ Field semantics (schema_version 1):
   Shipped impls and the internal preference family each belongs
   to (neither name is public API):
   - `cutedsl_sm120_pdl` (family `cute_dsl`, preferred) — two-launch
-    CuTe-DSL kernel with PDL overlap; compiled per (batch, scale, conv
-    layout).
+    CuTe-DSL kernel with PDL overlap; compiled per (layer geometry, batch,
+    scale, conv layout).
   - `cuda_sm120_persistent` (family `cuda`) — single-launch persistent
-    CUDA kernel behind one B-dynamic JIT module
+    CUDA kernel behind one B-dynamic JIT module per layer geometry
     (`kernel/gdn_fused_decode_sm120.cu`).
 - `cc` — compute capability as `major * 10 + minor` (SM120 → `120`).
 - `b` — exact decode batch size (`hidden_states` is `(b, hidden)`).
 - `hidden`, `n_ba`, `qkv_dim`, `h_q`, `hv`, `d`, `conv_width`,
-  `conv_state_len` — exact layer geometry (`w_ba` is `(hidden, n_ba)`,
+  `conv_state_len` — exact layer geometry, and a **compile-time parameter**
+  of both impls: a new model geometry is new registry rows plus a recompile,
+  not new kernel code (`w_ba` is `(hidden, n_ba)`,
   `mixed_qkv` is `(b, qkv_dim)` with `qkv_dim = (2*h_q + hv) * d`, the conv
   pool view is `(P, qkv_dim, conv_state_len)`, `ssm_state` is
   `(P, hv, d, d)`).
@@ -280,27 +285,54 @@ served by the composable path (and reported unsupported by the probe).
 
 Keep the registry trimmed to the measured-win surface, and let the
 **end-to-end** measurement decide it — a row is a promise about serving
-behaviour, not about the kernel in isolation.  The shipped surface is
-decode batches `1/2/4/8` in the `SD` layout on SM120, per impl, for exactly
-one GDN layer geometry: `hidden=5120`, `n_ba=96`, `qkv_dim=10240`, 16 qk /
-48 v heads, `d=128`, `conv_width=4`, `conv_state_len=3`.
+behaviour, not about the kernel in isolation.  The shipped surface, per
+impl, all in the `SD` layout on SM120:
 
-**Which checkpoints those rows are valid for.** The geometry was captured
-from `nvidia/Qwen3.6-27B-NVFP4`, and the end-to-end serving sweep that
-chose the batch window ran on that checkpoint.  Matching is on the numbers
+| geometry | `hidden` | `n_ba` | `qkv_dim` | `h_q` | `hv` | `d` | batches |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.6-27B | 5120 | 96 | 10240 | 16 | 48 | 128 | 1/2/4/8 |
+| Qwen3.6-35B-A3B | 2048 | 64 | 8192 | 16 | 32 | 128 | 1/2/4 |
+
+Both geometries have `conv_width=4`, `conv_state_len=3`, and are served by
+the same kernels — only the compile-time sizes differ.  A geometry must
+satisfy the relations the kernels tile on — `n_ba == 2*hv`, `hv % h_q == 0`,
+`qkv_dim == (2*h_q + hv)*d`, `d == 128`, and `hidden`/`qkv_dim` divisible by
+the CuTe-DSL K-split and conv tile — which the CUDA kernel `static_assert`s
+and the CuTe-DSL impl checks at dispatch.
+
+**Which checkpoints those rows are valid for.** The first geometry was
+captured from `nvidia/Qwen3.6-27B-NVFP4` and the second from
+`nvidia/Qwen3.6-35B-A3B-NVFP4`, and the end-to-end serving sweep that
+chose each batch window ran on that checkpoint.  Matching is on the numbers
 and the device `cc` alone — no row names a model, and nothing in the
 dispatch path reads a model name — so *any* checkpoint whose GDN layer has
 exactly these sizes dispatches here, and a checkpoint from a neighbouring
 release (Qwen3.5-class GDN layers, other 27B variants) does so if and only
 if its layer sizes are identical, which is a property of that checkpoint
 rather than of the family name.  Anything else falls through to the
-composable path.  Batches 16/24/32 are deliberately absent even
+composable path.  For the 27B, batches 16/24/32 are deliberately absent even
 though the kernel is faster than the stock chain there in a kernel A/B
 (1.49x at 16, 1.16x at 32 under CUDA-graph replay): the serving sweep that
 covered them did not reproduce a win at the engine level, so those batches
 keep the stock path and the registry claims only what was measured.  Adding
 them back is a registry-only change once an end-to-end win is measured; no
 dispatch, kernel or consumer code has to move.
+
+## Adding a new layer geometry (a new model)
+
+No kernel or dispatch code changes:
+
+1. Add the rows to `gdn_fused_decode_registry.json` — one per (batch, impl)
+   you have an end-to-end measurement for.
+2. Add the geometry to `GEOMETRIES` in `tests/gdn/test_fused_decode.py`; the
+   correctness, tiling and registry tests are parameterized over it, and
+   `benchmarks/bench_gdn_fused_decode.py` picks the rows up from the
+   registry with no edit at all.
+
+A geometry that does not satisfy the tiling relations above cannot silently
+mis-tile: the CUDA kernel fails to compile with a named `static_assert`, and
+the CuTe-DSL impl raises at dispatch, which the dispatch layer turns into
+the composable path.
 
 ## Adding a new specialized fused-GDN-decode kernel
 
@@ -323,9 +355,13 @@ dispatch, kernel or consumer code has to move.
      and the shape that carries padding is the CUDA-graph one.  Make the
      predicate uniform over whatever unit shares a batch row (block or warp)
      so it costs a branch rather than divergence.
-   - `ready_for_graph_capture(hidden_states, conv_state, scale) -> bool` —
-     True only when this exact call can be recorded into a CUDA graph
-     without compiling, synchronizing, or allocating persistent state.
+   - `ready_for_graph_capture(signature, hidden_states, conv_state, scale)
+     -> bool` — True only when this exact call can be recorded into a CUDA
+     graph without compiling, synchronizing, or allocating persistent
+     state.  `signature` is the matched dispatch signature, so readiness is
+     checked against the exact compiled variant *including its layer
+     geometry*: a process warm for one model must not make a
+     differently-shaped model's call look capture-ready.
    - `variant_plan(rows) -> set` — distinct compiled-kernel descriptors the
      rows require (host-side planning only).
    - `launch_count() -> int`, `compiled_variant_keys() -> list[str]` —
