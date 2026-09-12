@@ -338,10 +338,7 @@ struct KernelSpec {
   uint32_t smem_bytes;
 };
 
-constexpr size_t kKernelSpecCount = FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_COUNT;
-
-constexpr std::array<KernelSpec, kKernelSpecCount> kKernelSpecs = {
-    {FLASHINFER_BLACKWELL_BF16_FP4_KERNEL_SPECS}};
+#include "flashinfer_blackwell_bf16_fp4_kernel_specs.h"
 
 inline const KernelSpec& FindKernelSpec(Component component, bool has_alpha, bool enable_pdl,
                                         int32_t m, int32_t n, int32_t k, bool flat_grid = false) {
