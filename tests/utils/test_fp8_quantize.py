@@ -82,7 +82,7 @@ def _unswizzle_mxfp8_scales_128x4(
 
 @pytest.mark.parametrize("m", [1, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 1024, 8192])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("device", ["cuda", "cpu"])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -96,6 +96,9 @@ def test_mxfp8_quantize_torch(m, k, dtype, is_sf_swizzled_layout, device, backen
             pytest.skip("cute-dsl backend only supports CUDA")
         if not is_cute_dsl_available():
             pytest.skip("CuTe-DSL is not available")
+
+    if dtype == torch.float32 and backend == "cuda" and device == "cuda":
+        pytest.skip("fp32 input is only supported by the cute-dsl backend")
 
     a = 16 * torch.randn([m, k], dtype=dtype).to(device).contiguous()
 
@@ -747,9 +750,36 @@ def test_mxfp8_quantize_torch_host(m, k, dtype, is_sf_swizzled_layout):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("elem_offset", [1, 4, 8])
+def test_mxfp8_quantize_cute_dsl_underaligned_view(dtype, elem_offset):
+    """Contiguous views with a storage offset must not fault the vector loads.
+
+    `.contiguous()` preserves contiguous views whose data_ptr is only
+    element-aligned (e.g. ``pool[off:off + m * k].view(m, k)``); the CuTe-DSL
+    kernels use 16B (fp16/bf16) or 32B (fp32) vectorized loads, so the wrapper
+    must materialize an aligned copy for such inputs.
+    """
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(0)
+    m, k = 128, 1024
+    pool = (torch.randn(m * k + 64, dtype=torch.float) * 16).to(dtype).cuda()
+    a = pool[elem_offset : elem_offset + m * k].view(m, k)
+    assert a.is_contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, True, 32, backend="cute-dsl")
+
+    _assert_mxfp8_quantize_exact(a, a_fp8, a_sf, is_sf_swizzled_layout=True)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("m", [1, 2, 3, 16, 64, 1024])
 @pytest.mark.parametrize("k", [128, 512, 1024, 8192])
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend):
@@ -758,6 +788,9 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
+
+    if dtype == torch.float32 and backend == "cuda":
+        pytest.skip("fp32 input is only supported by the cute-dsl backend")
 
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
@@ -772,7 +805,7 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
 @pytest.mark.parametrize("k", [1568])
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
 @pytest.mark.parametrize("alignment", [64, 128])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
@@ -784,6 +817,9 @@ def test_mxfp8_quantize_alignment_torch_device(
 
     if backend == "cute-dsl" and not is_cute_dsl_available():
         pytest.skip("CuTe-DSL is not available")
+
+    if dtype == torch.float32 and backend == "cuda":
+        pytest.skip("fp32 input is only supported by the cute-dsl backend")
 
     torch.random.manual_seed(0)
     a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()

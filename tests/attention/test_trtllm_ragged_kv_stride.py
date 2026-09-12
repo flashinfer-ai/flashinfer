@@ -48,9 +48,14 @@ def _run_trtllm_ragged(
     lse: torch.Tensor | None = None,
     q_lens_cpu: torch.Tensor | None = None,
     kv_lens_cpu: torch.Tensor | None = None,
-    skip_all_rows_active_check: bool = False,
+    skip_all_rows_active_check: bool | None = None,
 ):
     head_dim_qk = q.shape[2]
+    row_activity_kwargs = (
+        {}
+        if skip_all_rows_active_check is None
+        else {"skip_all_rows_active_check": skip_all_rows_active_check}
+    )
     return flashinfer.prefill.trtllm_ragged_attention_deepseek(
         query=q,
         key=k,
@@ -79,7 +84,7 @@ def _run_trtllm_ragged(
         lse=lse,
         q_seq_lens_cpu=q_lens_cpu,
         kv_seq_lens_cpu=kv_lens_cpu,
-        skip_all_rows_active_check=skip_all_rows_active_check,
+        **row_activity_kwargs,
     )
 
 
@@ -330,8 +335,8 @@ def test_trtllm_ragged_empty_kv_rows_are_neutral_and_match_compacted_call():
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_empty_kv_rows_direct_fallback_matches_cpu_mirror_path():
-    """Direct callers without CPU mirrors still get the same neutral semantics."""
+def test_trtllm_ragged_empty_kv_rows_explicit_check_matches_cpu_mirror_path():
+    """Explicit device checks retain the CPU-mirror path's neutral semantics."""
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -354,14 +359,18 @@ def test_trtllm_ragged_empty_kv_rows_direct_fallback_matches_cpu_mirror_path():
         q_indptr,
         kv_indptr,
         kv_lens,
+        skip_all_rows_active_check=False,
     )
 
     torch.testing.assert_close(fallback_output, mirror_output, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(fallback_lse, mirror_lse, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("skip_value", [None, True])
 @pytest.mark.cuda
-def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
+def test_trtllm_ragged_default_and_explicit_skip_match_checked_path(
+    monkeypatch, skip_value
+):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -389,7 +398,7 @@ def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
         q_indptr,
         kv_indptr,
         kv_lens,
-        skip_all_rows_active_check=True,
+        skip_all_rows_active_check=skip_value,
     )
     checked_output, checked_lse = _run_trtllm_ragged(
         q,
@@ -407,28 +416,44 @@ def test_trtllm_ragged_skipped_active_check_matches_checked_path(monkeypatch):
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_skipped_active_check_rejects_cpu_mirrors():
+def test_trtllm_ragged_cpu_mirrors_override_explicit_skip():
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
 
-    with pytest.raises(ValueError, match="cannot be combined"):
-        _run_trtllm_ragged(
-            q,
-            k,
-            v,
-            q_indptr,
-            kv_indptr,
-            kv_lens,
-            q_lens_cpu=q_lens.cpu(),
-            kv_lens_cpu=kv_lens.cpu(),
-            skip_all_rows_active_check=True,
-        )
+    mirror_output, mirror_lse = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+    )
+    explicit_skip_output, explicit_skip_lse = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        skip_all_rows_active_check=True,
+    )
+
+    torch.testing.assert_close(
+        explicit_skip_output, mirror_output, atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(explicit_skip_lse, mirror_lse, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("use_cpu_lens", [True, False])
+@pytest.mark.parametrize("row_validation_mode", ["cpu_mirrors", "explicit_check"])
 @pytest.mark.cuda
-def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
+def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(
+    row_validation_mode,
+):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
@@ -458,10 +483,10 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
     )
     lse = torch.full((q.shape[0], num_heads), 3.0, device=device)
 
-    cpu_lens_kwargs = (
+    row_validation_kwargs = (
         {"q_lens_cpu": q_lens.cpu(), "kv_lens_cpu": kv_lens.cpu()}
-        if use_cpu_lens
-        else {}
+        if row_validation_mode == "cpu_mirrors"
+        else {"skip_all_rows_active_check": False}
     )
     output, lse_out = _run_trtllm_ragged(
         q,
@@ -473,7 +498,7 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
         max_kv_len=0,
         out=out,
         lse=lse,
-        **cpu_lens_kwargs,
+        **row_validation_kwargs,
     )
 
     assert output.data_ptr() == out.data_ptr()
@@ -483,7 +508,7 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_capture_without_cpu_lens_raises(monkeypatch):
+def test_trtllm_ragged_explicit_check_capture_without_cpu_lens_raises(monkeypatch):
     """Capture without CPU seq-len mirrors must refuse to launch.
 
     Regression for https://github.com/flashinfer-ai/flashinfer/issues/4609:
@@ -531,11 +556,22 @@ def test_trtllm_ragged_capture_without_cpu_lens_raises(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="must be provided during CUDA graph capture"):
-        _run_trtllm_ragged(q, k, v, q_indptr, kv_indptr, kv_lens, return_lse=False)
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            return_lse=False,
+            skip_all_rows_active_check=False,
+        )
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_capture_q_empty_row_needs_cpu_mirrors(monkeypatch):
+def test_trtllm_ragged_capture_q_empty_row_explicit_check_needs_cpu_mirrors(
+    monkeypatch,
+):
     """A ``q_len == 0, kv_len > 0`` row still requires CPU mirrors under capture.
 
     The documentation used to imply mirrors were needed only for empty-KV
@@ -582,10 +618,21 @@ def test_trtllm_ragged_capture_q_empty_row_needs_cpu_mirrors(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="must be provided during CUDA graph capture"):
-        _run_trtllm_ragged(q, k, v, q_indptr, kv_indptr, kv_lens, return_lse=False)
+        _run_trtllm_ragged(
+            q,
+            k,
+            v,
+            q_indptr,
+            kv_indptr,
+            kv_lens,
+            return_lse=False,
+            skip_all_rows_active_check=False,
+        )
 
 
-@pytest.mark.parametrize("row_activity_mode", ["cpu_mirrors", "assumed_active"])
+@pytest.mark.parametrize(
+    "row_activity_mode", ["default", "assumed_active", "cpu_mirrors"]
+)
 @pytest.mark.cuda
 def test_trtllm_ragged_all_active_cuda_graph_capture_replay(row_activity_mode):
     """Trusted row metadata lets an active batch capture and replay.
@@ -633,11 +680,15 @@ def test_trtllm_ragged_all_active_cuda_graph_capture_replay(row_activity_mode):
     out = torch.empty(
         (q.shape[0], num_heads, head_dim_vo), device=device, dtype=torch.bfloat16
     )
-    row_activity_kwargs = (
-        {"q_lens_cpu": q_lens_cpu, "kv_lens_cpu": kv_lens_cpu}
-        if row_activity_mode == "cpu_mirrors"
-        else {"skip_all_rows_active_check": True}
-    )
+    if row_activity_mode == "cpu_mirrors":
+        row_activity_kwargs = {
+            "q_lens_cpu": q_lens_cpu,
+            "kv_lens_cpu": kv_lens_cpu,
+        }
+    elif row_activity_mode == "assumed_active":
+        row_activity_kwargs = {"skip_all_rows_active_check": True}
+    else:
+        row_activity_kwargs = {}
 
     def _call():
         _run_trtllm_ragged(

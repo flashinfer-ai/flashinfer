@@ -49,7 +49,6 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantFormat,
-    QuantVariant,
     RoutingConfig,
     RoutingInputMode,
 )
@@ -86,7 +85,7 @@ _CUTLASS_ACTIVATIONS = (
 def _config(**overrides) -> MoEConfig:
     values = dict(
         routing=RoutingConfig(num_experts=4, top_k=2),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=256),
         activation=SwiGLU(),
         backend=BackendOptions((CutlassBf16Config(),)),
@@ -220,7 +219,7 @@ def test_failed_support_check_does_not_authorize_build():
     runner.config = _config()
     runner._support_checked = True
 
-    with pytest.raises(NotImplementedError, match=r"QuantVariant\.BF16"):
+    with pytest.raises(NotImplementedError, match=r"weight=BF16, activation=BF16"):
         runner.check_support()
     with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
         runner.build()
@@ -852,8 +851,12 @@ def test_cutlass_per_expert_activation_overrides():
     "config,match",
     (
         (
-            _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
-            "QuantVariant.NVFP4",
+            _config(
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+                )
+            ),
+            "weight=NVFP4, activation=NVFP4",
         ),
         (
             _config(finalize=MoEFinalizeConfig(do_finalize=False)),
@@ -882,19 +885,25 @@ def test_cutlass_runner_rejects_out_of_scope_configs(config, match):
     "config,match",
     (
         (
-            _config(quant=QuantConfig(variant=QuantVariant.BF16)),
-            "QuantVariant.BF16",
+            _config(
+                quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
+            ),
+            "weight=BF16, activation=BF16",
         ),
         (
             _config(
-                quant=QuantConfig(variant=QuantVariant.NVFP4),
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+                ),
                 finalize=MoEFinalizeConfig(do_finalize=False),
             ),
             "do_finalize=True",
         ),
         (
             _config(
-                quant=QuantConfig(variant=QuantVariant.NVFP4),
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+                ),
                 experts=ExpertConfig(
                     intermediate_size=256,
                     local_expert_offset=2,
@@ -915,15 +924,41 @@ def test_cutlass_nvfp4_runner_rejects_out_of_scope_configs(config, match):
 @pytest.mark.parametrize(
     "runner_cls,quant,match",
     (
-        (CutlassFp8PerTensorRunner, QuantVariant.BF16, "QuantVariant.BF16"),
-        (CutlassFp8BlockRunner, QuantVariant.BF16, "QuantVariant.BF16"),
-        (CutlassMxfp8Mxfp4Runner, QuantVariant.BF16, "QuantVariant.BF16"),
-        (CutlassMxfp8Runner, QuantVariant.BF16, "QuantVariant.BF16"),
-        (CutlassW4A8Runner, QuantVariant.BF16, "QuantVariant.BF16"),
-        (CutlassHummingRunner, QuantVariant.BF16, "QuantVariant.BF16"),
         (
             CutlassFp8PerTensorRunner,
-            QuantVariant.FP8PerTensor,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            "weight=BF16, activation=BF16",
+        ),
+        (
+            CutlassFp8BlockRunner,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            "weight=BF16, activation=BF16",
+        ),
+        (
+            CutlassMxfp8Mxfp4Runner,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            "weight=BF16, activation=BF16",
+        ),
+        (
+            CutlassMxfp8Runner,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            "weight=BF16, activation=BF16",
+        ),
+        (
+            CutlassW4A8Runner,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            "weight=BF16, activation=BF16",
+        ),
+        (
+            CutlassHummingRunner,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            "weight=BF16, activation=BF16",
+        ),
+        (
+            CutlassFp8PerTensorRunner,
+            QuantConfig(
+                weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+            ),
             "do_finalize=True",
         ),
     ),
@@ -931,11 +966,11 @@ def test_cutlass_nvfp4_runner_rejects_out_of_scope_configs(config, match):
 def test_cutlass_quant_runners_reject_out_of_scope_configs(runner_cls, quant, match):
     if match == "do_finalize=True":
         config = _config(
-            quant=QuantConfig(variant=quant),
+            quant=quant,
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
     else:
-        config = _config(quant=QuantConfig(variant=quant))
+        config = _config(quant=quant)
     runner = runner_cls.__new__(runner_cls)
     runner.config = config
     with pytest.raises(NotImplementedError, match=match):
@@ -945,7 +980,11 @@ def test_cutlass_quant_runners_reject_out_of_scope_configs(runner_cls, quant, ma
 def test_cutlass_mxfp8_rejects_linear_scale_layout():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8, swizzled_scale_factors=False)
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP8,
+            activation=QuantFormat.MXFP8,
+            swizzled_scale_factors=False,
+        )
     )
     runner._device_arch = 100
     with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
@@ -955,7 +994,11 @@ def test_cutlass_mxfp8_rejects_linear_scale_layout():
 def test_cutlass_mxfp8_mxfp4_rejects_linear_scale_layout():
     runner = CutlassMxfp8Mxfp4Runner.__new__(CutlassMxfp8Mxfp4Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MXFP4, swizzled_scale_factors=False)
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP4,
+            activation=QuantFormat.MXFP8,
+            swizzled_scale_factors=False,
+        )
     )
     runner._device_arch = 100
     with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
@@ -968,7 +1011,11 @@ def test_cutlass_fp8_block_rejects_cuda_below_12_8(monkeypatch):
         lambda _version: False,
     )
     runner = CutlassFp8BlockRunner.__new__(CutlassFp8BlockRunner)
-    runner.config = _config(quant=QuantConfig(variant=QuantVariant.DeepSeekFp8))
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+        )
+    )
     runner._device_arch = 90
     with pytest.raises(NotImplementedError, match="requires CUDA 12.8 or newer"):
         runner.check_support()
@@ -1003,7 +1050,11 @@ def test_cutlass_fp8_per_tensor_rejects_nonscalar_activation_scale():
 
 def test_cutlass_fp8_per_tensor_pack_keeps_scalar_scale_static():
     runner = CutlassFp8PerTensorRunner.__new__(CutlassFp8PerTensorRunner)
-    runner.config = _config(quant=QuantConfig(variant=QuantVariant.FP8PerTensor))
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        )
+    )
     runner.device = torch.device("cpu")
     runner._inner = object()
     runner._built = True
@@ -1030,7 +1081,7 @@ def test_cutlass_fp8_per_tensor_pack_keeps_scalar_scale_static():
 def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
     runner = CutlassMxfp8Mxfp4Runner.__new__(CutlassMxfp8Mxfp4Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MXFP4),
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=64),
     )
@@ -1043,7 +1094,7 @@ def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
 def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=64),
     )
@@ -1053,7 +1104,7 @@ def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
         runner._pack_weight_inputs(view, hidden_size=64)
 
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=192),
     )
@@ -1064,7 +1115,7 @@ def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
 def test_cutlass_mxfp8_pack_rejects_malformed_weight_scales():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=256),
     )
@@ -1084,7 +1135,7 @@ def test_cutlass_mxfp8_pack_rejects_malformed_weight_scales():
 def test_cutlass_w4a8_pack_rejects_malformed_weight_scales():
     runner = CutlassW4A8Runner.__new__(CutlassW4A8Runner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.W4A8),
+        quant=QuantConfig(weight=QuantFormat.INT4, activation=QuantFormat.FP8PerTensor),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=256),
     )
@@ -1108,7 +1159,9 @@ def test_cutlass_w4a8_pack_rejects_malformed_weight_scales():
 def test_cutlass_humming_pack_rejects_malformed_weight_scales():
     runner = CutlassHummingRunner.__new__(CutlassHummingRunner)
     runner.config = _config(
-        quant=QuantConfig(variant=QuantVariant.Humming),
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP4, activation=QuantFormat.FP8PerTensor
+        ),
         routing=RoutingConfig(num_experts=2, top_k=2),
         experts=ExpertConfig(intermediate_size=256),
     )
@@ -1196,7 +1249,9 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
 @pytest.mark.parametrize(
     "config",
     (
-        _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
+        _config(
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        ),
         _config(finalize=MoEFinalizeConfig(do_finalize=False)),
         _config(
             experts=ExpertConfig(
@@ -2235,7 +2290,7 @@ def _make_nvfp4_case(num_tokens: int = 16, activation=None):
     ).to(torch.int32)
     topk_weights = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=-1)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassNvfp4Config(),)),
@@ -2525,7 +2580,9 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     w1_dq = view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
     w2_dq = view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        ),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassFp8PerTensorConfig(),)),
@@ -2592,7 +2649,9 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference(activation):
         "fc2_block_scale"
     ].repeat_interleave(128, dim=-2).repeat_interleave(128, dim=-1)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+        quant=QuantConfig(
+            weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+        ),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassFp8BlockConfig(),)),
@@ -2672,7 +2731,7 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
         ]
     ).to(device=device, dtype=torch.bfloat16)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.MXFP4),
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassMxfp8Mxfp4Config(),)),
@@ -2757,7 +2816,7 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
         ]
     ).to(device=device, dtype=torch.bfloat16)
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassMxfp8Config(),)),
@@ -2812,7 +2871,7 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
         device=device,
     )
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassMxfp8Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=8192),
@@ -2896,7 +2955,7 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference(activation):
         device=device,
     )
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.W4A8),
+        quant=QuantConfig(weight=QuantFormat.INT4, activation=QuantFormat.FP8PerTensor),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassW4A8Config(),)),
@@ -2959,7 +3018,9 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference(activation):
         w2.view(num_experts * hidden_size, intermediate_size)
     )
     config = _config(
-        quant=QuantConfig(variant=QuantVariant.Humming),
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP4, activation=QuantFormat.FP8PerTensor
+        ),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions((CutlassHummingConfig(),)),

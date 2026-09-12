@@ -22,7 +22,6 @@ import argparse
 
 import torch
 import torch.distributed as dist
-
 from flashinfer.moe_ep import (
     CakeMxfp8MegaMoeEp16,
     preprocess_cake_mxfp8_megamoe_ep16_weights,
@@ -47,10 +46,10 @@ def main() -> None:
 
     local_tokens = torch.arange(args.tokens, dtype=torch.int64, device=device)
     global_tokens = rank * args.tokens + local_tokens
-    owners = global_tokens % 16
-    groups = (global_tokens // 16) % 4
-    first_experts = owners * 32 + groups * 8
-    topk_ids = first_experts[:, None] + torch.arange(8, device=device)[None, :]
+    route_slots = global_tokens[:, None] * 8 + torch.arange(8, device=device)[None, :]
+    # The affine permutation spreads routes across owners while giving every
+    # expert the same global load for each supported token count.
+    topk_ids = (route_slots * 73 + 19) % 512
     topk_weights = torch.full(
         (args.tokens, 8),
         1.0 / 8.0,

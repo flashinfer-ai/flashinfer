@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""SM103 Cake warp-decode correctness and cold-L2 CUPTI benchmark harness.
+"""SM100/SM103 Cake warp-decode correctness and cold-L2 CUPTI benchmark harness.
 
 The harness deliberately prepares one TRTLLM NVFP4 physical representation and
-passes those exact tensor objects to the Cake launcher and the public
-``trtllm_fp4_block_scale_routed_moe`` baseline.  Correctness and benchmark
-preparation are kept outside timed or CUDA Graph capture regions.
+passes those exact tensor objects to every available comparison arm.  The
+SwiGLU rows use the public ``trtllm_fp4_block_scale_routed_moe`` baseline;
+standalone SiLU has no supported official peer and reports exported Cake
+absolute timing only.  Correctness and benchmark preparation are kept outside
+timed or CUDA Graph capture regions.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import torch
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    ActivationConfig,
     ActivationType,
     BackendOptions,
     CakeWarpDecodeConfig,
@@ -35,10 +38,11 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
+    SiLU,
     SwiGLU,
     TrtllmFp4Config,
     trtllm_fp4_block_scale_routed_moe,
@@ -122,16 +126,29 @@ class Geometry:
     num_experts: int
     top_k: int
     selector_boundaries: tuple[int, ...]
+    activation: ActivationConfig = SwiGLU()
 
 
 GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
+    Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
 )
+
+
+def _activation_name(geometry: Geometry) -> str:
+    return geometry.activation.type.name.lower()
+
+
+def _has_official_baseline(geometry: Geometry) -> bool:
+    return geometry.activation == SwiGLU()
 
 
 def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     """Name the fixed schedule/route-packer bucket exercised by a row."""
+    if geometry.activation == SiLU():
+        return "static_direct" if num_tokens == 1 else "persistent_direct"
+
     if geometry.num_experts == 512:
         if num_tokens == 1:
             return "static_direct"
@@ -276,7 +293,7 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
     w1 = (
         torch.randn(
             geometry.num_experts,
-            2 * geometry.intermediate_size,
+            geometry.intermediate_size * (2 if geometry.activation.is_gated else 1),
             geometry.hidden_size,
             device=device,
         )
@@ -292,15 +309,17 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         * 0.02
     ).to(torch.bfloat16)
     hidden_q, hidden_scale = TrtllmFp4Config.prepare_activations(
-        hidden, variant=QuantVariant.NVFP4
+        hidden,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
     weight_view = TrtllmFp4Config.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         num_local_experts=geometry.num_experts,
         hidden_size=geometry.hidden_size,
         intermediate_size=geometry.intermediate_size,
+        activation=geometry.activation,
         device=device,
     )
     initial_ids, initial_weights = _make_routing(geometry, mutated=False)
@@ -331,6 +350,10 @@ def _normalize_result(result: Any) -> torch.Tensor:
 
 def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
     geometry = case.geometry
+    if not _has_official_baseline(geometry):
+        raise ValueError(
+            "the official TRT-LLM NVFP4 runner does not support standalone SiLU"
+        )
     view = case.weight_view
     output = torch.empty(
         case.num_tokens,
@@ -381,6 +404,30 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
     return PreparedCall("flashinfer_trtllm_nvfp4", output, invoke)
 
 
+def _prepare_validation_reference(case: PhysicalCase) -> PreparedCall:
+    """Return the available numeric reference without inventing a SiLU peer."""
+    if _has_official_baseline(case.geometry):
+        return _prepare_baseline(case)
+    reference = _prepare_cake(case)
+    reference.name = "cake_export_repeatability"
+    return reference
+
+
+def _cake_target(device: torch.device) -> str:
+    major, minor = torch.cuda.get_device_capability(device)
+    try:
+        return {(10, 0): "sm100a", (10, 3): "sm103a"}[(major, minor)]
+    except KeyError as error:
+        raise RuntimeError(
+            "the warp-decode harness requires exact SM100 or SM103, "
+            f"got SM{major}{minor}"
+        ) from error
+
+
+def _get_cake_module(device: torch.device) -> Any:
+    return get_cake_fused_moe_warp_decode_module(_cake_target(device), device=device)
+
+
 def _cake_shape(case: PhysicalCase) -> tuple[int, int, int, int, int]:
     geometry = case.geometry
     return (
@@ -422,7 +469,7 @@ def _invoke_cake(
 
 def _prepare_cake(case: PhysicalCase) -> PreparedCall:
     geometry = case.geometry
-    module = get_cake_fused_moe_warp_decode_module(device=case.device)
+    module = _get_cake_module(case.device)
     shape = _cake_shape(case)
     workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
     if workspace_size <= 0:
@@ -511,12 +558,12 @@ def _correctness_case(fixture: PhysicalFixture, num_tokens: int) -> dict[str, An
     with torch.cuda.stream(prepare_stream):
         cake = _prepare_cake(case)
     with torch.cuda.stream(run_stream):
-        baseline = _prepare_baseline(case)
+        reference = _prepare_validation_reference(case)
         output_ptr = cake.output.data_ptr()
         workspace_ptr = cake.workspace.data_ptr()
         workspace_bytes = cake.workspace.numel()
         first = cake.invoke().clone()
-        expected = baseline.invoke().clone()
+        expected = reference.invoke().clone()
         cake.output.fill_(float("nan"))
         second = cake.invoke().clone()
     run_stream.synchronize()
@@ -531,11 +578,17 @@ def _correctness_case(fixture: PhysicalFixture, num_tokens: int) -> dict[str, An
         or cake.workspace.numel() != workspace_bytes
     ):
         raise AssertionError("Cake replaced or resized the caller-owned workspace")
+    reference.close()
     cake.close()
     return {
         "geometry": fixture.geometry.name,
+        "activation": _activation_name(fixture.geometry),
         "num_tokens": num_tokens,
         "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
+        "numeric_reference": reference.name,
+        "official_baseline": (
+            "available" if _has_official_baseline(fixture.geometry) else "N/A"
+        ),
         "prepare_stream": "non_default",
         "run_stream": "different_non_default",
         "cross_stream_prepare_run": True,
@@ -590,7 +643,7 @@ def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
     shape = _cake_shape(case)
     prepare_stream, run_stream = _distinct_nondefault_streams(case.device)
     with torch.cuda.stream(prepare_stream):
-        module = get_cake_fused_moe_warp_decode_module(device=case.device)
+        module = _get_cake_module(case.device)
         workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
         workspace_owner = torch.empty(
             workspace_size, dtype=torch.uint8, device=case.device
@@ -655,7 +708,7 @@ def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
     )
 
     with torch.cuda.stream(run_stream):
-        baseline = _prepare_baseline(case)
+        reference = _prepare_validation_reference(case)
         _expect_receipt_rejected(
             module,
             case,
@@ -671,9 +724,10 @@ def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
             workspace_replacement,
             replacement_receipt,
         ).clone()
-        expected = baseline.invoke().clone()
+        expected = reference.invoke().clone()
     run_stream.synchronize()
     replacement_diagnostic = _diagnostic(actual, expected)
+    reference.close()
     _detach_and_release_workspace_receipt(replacement_releaser)
     _expect_release_rejected(
         module,
@@ -693,8 +747,13 @@ def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
 
     return {
         "geometry": fixture.geometry.name,
+        "activation": _activation_name(fixture.geometry),
         "num_tokens": num_tokens,
         "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
+        "numeric_reference": reference.name,
+        "official_baseline": (
+            "available" if _has_official_baseline(fixture.geometry) else "N/A"
+        ),
         "same_address_new_tensor_generation": True,
         "receipt_advanced": True,
         "stale_receipt_rejected": True,
@@ -724,7 +783,7 @@ def _workspace_retirement_case(
     }:
         raise RuntimeError("failed to create a third distinct CUDA stream")
     second_stream.wait_stream(torch.cuda.current_stream(case.device))
-    module = get_cake_fused_moe_warp_decode_module(device=case.device)
+    module = _get_cake_module(case.device)
     workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
     workspace = torch.empty(workspace_size, dtype=torch.uint8, device=case.device)
     output = torch.empty(
@@ -771,13 +830,20 @@ def _workspace_retirement_case(
         replacement_receipt = None
         _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
         with torch.cuda.stream(second_stream):
-            expected = _prepare_baseline(case).invoke().clone()
+            reference = _prepare_validation_reference(case)
+            expected = reference.invoke().clone()
         second_stream.synchronize()
         replacement_diagnostic = _diagnostic(replacement, expected)
+        reference.close()
         return {
             "geometry": fixture.geometry.name,
+            "activation": _activation_name(fixture.geometry),
             "num_tokens": num_tokens,
             "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
+            "numeric_reference": reference.name,
+            "official_baseline": (
+                "available" if _has_official_baseline(fixture.geometry) else "N/A"
+            ),
             "reprepare_without_caller_stream_sync": True,
             "release_without_caller_stream_sync": True,
             "receipt_advanced": True,
@@ -815,9 +881,9 @@ def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
             top_k=geometry.top_k,
             method=RoutingMethodType.TopK,
         ),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=geometry.intermediate_size),
-        activation=SwiGLU(),
+        activation=geometry.activation,
         backend=BackendOptions((CakeWarpDecodeConfig(),)),
         execution=ExecutionConfig(
             tune_max_num_tokens=MAX_TOKENS,
@@ -839,9 +905,11 @@ def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
     # The first public call runs the real one-backend winner-selection path.
     # Its timing helper uses its own warmup/capture streams, which is the exact
     # framework path that a permanently stream-claimed workspace cannot serve.
+    with torch.cuda.stream(warmup_stream):
+        reference = _prepare_validation_reference(case)
     with autotune(True, tuning_buckets=(num_tokens,)), torch.cuda.stream(warmup_stream):
         eager = layer(activations, weights).clone()
-        expected_eager = _prepare_baseline(case).invoke().clone()
+        expected_eager = reference.invoke().clone()
     tuned_total = layer.tuner.stats.tuned_op_total_configs.get("moe_cake", 0)
     tuned_successful = layer.tuner.stats.tuned_op_successful_configs.get("moe_cake", 0)
     if tuned_total < 1 or tuned_successful < 1:
@@ -857,13 +925,19 @@ def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
     with torch.cuda.stream(replay_stream):
         graph.replay()
         replayed = captured_output.clone()
-        expected_replay = _prepare_baseline(case).invoke().clone()
+        expected_replay = reference.invoke().clone()
     replay_stream.synchronize()
     replay_diagnostic = _diagnostic(replayed, expected_replay)
+    reference.close()
     return {
         "geometry": geometry.name,
+        "activation": _activation_name(geometry),
         "num_tokens": num_tokens,
         "selector_bucket": _selector_bucket(geometry, num_tokens),
+        "numeric_reference": reference.name,
+        "official_baseline": (
+            "available" if _has_official_baseline(geometry) else "N/A"
+        ),
         "winner_backend": layer.winner_backend,
         "winner_selection_exercised": True,
         "autotune_profiling_exercised": True,
@@ -905,6 +979,7 @@ def run_sanitizer(
             rows.append(
                 {
                     "geometry": geometry.name,
+                    "activation": _activation_name(geometry),
                     "num_tokens": num_tokens,
                     "selector_bucket": _selector_bucket(geometry, num_tokens),
                     "prepare_stream": "non_default",
@@ -933,9 +1008,9 @@ def _graph_mutation_case(
     with torch.cuda.stream(prepare_stream):
         cake = _prepare_cake(case)
     with torch.cuda.stream(capture_stream):
-        baseline = _prepare_baseline(case)
+        reference = _prepare_validation_reference(case)
         warmup = cake.invoke().clone()
-        before = baseline.invoke().clone()
+        before = reference.invoke().clone()
     capture_stream.synchronize()
     warmup_diagnostic = _diagnostic(warmup, before)
 
@@ -976,7 +1051,7 @@ def _graph_mutation_case(
         graph.replay()
         replay_completion.record()
         replayed = cake.output.clone()
-        expected = baseline.invoke().clone()
+        expected = reference.invoke().clone()
 
     if replay_completion.query():
         raise AssertionError(
@@ -989,7 +1064,7 @@ def _graph_mutation_case(
     retirement_start_ns = time.monotonic_ns()
     cake.close()
     retirement_block_ms = (time.monotonic_ns() - retirement_start_ns) / 1e6
-    module = get_cake_fused_moe_warp_decode_module(device=case.device)
+    module = _get_cake_module(case.device)
     replacement_stream = torch.cuda.Stream(device=case.device)
     with torch.cuda.stream(replacement_stream):
         cake.workspace.fill_(0xA5)
@@ -1040,10 +1115,16 @@ def _graph_mutation_case(
         or cake.workspace.numel() != workspace_bytes
     ):
         raise AssertionError("CUDA Graph replay replaced the caller workspace")
+    reference.close()
     return {
         "geometry": fixture.geometry.name,
+        "activation": _activation_name(fixture.geometry),
         "num_tokens": num_tokens,
         "selector_bucket": _selector_bucket(fixture.geometry, num_tokens),
+        "numeric_reference": reference.name,
+        "official_baseline": (
+            "available" if _has_official_baseline(fixture.geometry) else "N/A"
+        ),
         "prepare_stream": "non_default",
         "capture_stream": "different_non_default",
         "replay_stream": "third_non_default",
@@ -1094,6 +1175,11 @@ def run_correctness(geometries: Sequence[Geometry], seed: int) -> dict[str, Any]
     return {
         "mode": "correctness",
         "tolerance": {"atol": ATOL, "rtol": RTOL, "comparison_dtype": "bfloat16"},
+        "standalone_silu_reference": {
+            "official_baseline": "N/A",
+            "in_harness": "cake_export_repeatability",
+            "source_export_parity": "separate release validation receipt",
+        },
         "matrix_rows": rows,
         "workspace_receipt_rows": receipt_rows,
         "workspace_retirement_rows": workspace_retirement_rows,
@@ -1257,51 +1343,79 @@ def run_benchmark(
             workspace_ptr = exported.workspace.data_ptr()
             workspace_bytes = exported.workspace.numel()
             with torch.cuda.stream(benchmark_stream):
-                baseline = _prepare_baseline(case)
                 exported_output = exported.invoke().clone()
-                baseline_output = baseline.invoke().clone()
                 torch.cuda.synchronize(case.device)
-                parity = _diagnostic(exported_output, baseline_output)
                 row: dict[str, Any] = {
                     "geometry": geometry.name,
+                    "activation": _activation_name(geometry),
                     "num_tokens": num_tokens,
                     "selector_bucket": _selector_bucket(geometry, num_tokens),
                     "prepare_stream": "non_default",
                     "benchmark_stream": "different_non_default",
                     "cross_stream_prepare_run": True,
-                    "exported_parity": parity,
+                    "exported_parity": None,
                     "exported": None,
                     "flashinfer_baseline": None,
                     "paired_rounds": [],
                     "ratios": {},
                     "status": "pass",
                 }
-                pair_records = [
-                    _paired_benchmark_round(
+                if _has_official_baseline(geometry):
+                    baseline = _prepare_baseline(case)
+                    baseline_output = baseline.invoke().clone()
+                    torch.cuda.synchronize(case.device)
+                    row["exported_parity"] = _diagnostic(
+                        exported_output, baseline_output
+                    )
+                    pair_records = [
+                        _paired_benchmark_round(
+                            exported,
+                            baseline,
+                            case,
+                            round_index=round_index,
+                            warmup=warmup,
+                            repetitions=repetitions,
+                        )
+                        for round_index in range(paired_rounds)
+                    ]
+                    exported_summary = _paired_arm_summary("exported", pair_records)
+                    baseline_summary = _paired_arm_summary("baseline", pair_records)
+                    row["timing_mode"] = "paired_official_baseline"
+                    row["exported"] = exported_summary
+                    row["flashinfer_baseline"] = baseline_summary
+                    row["paired_rounds"] = pair_records
+                    row["ratios"] = {
+                        "exported_over_flashinfer_baseline": (
+                            float(exported_summary["median_ms"])
+                            / float(baseline_summary["median_ms"])
+                        ),
+                        "worst_round_exported_over_flashinfer_baseline": max(
+                            float(record["exported_baseline_ratio"])
+                            for record in pair_records
+                        ),
+                    }
+                else:
+                    row["timing_mode"] = "exported_absolute"
+                    row["exported_parity"] = {
+                        "status": "N/A",
+                        "reason": "source/export parity is a separate release receipt",
+                    }
+                    row["exported"] = _benchmark_call(
                         exported,
-                        baseline,
                         case,
-                        round_index=round_index,
                         warmup=warmup,
                         repetitions=repetitions,
                     )
-                    for round_index in range(paired_rounds)
-                ]
-                exported_summary = _paired_arm_summary("exported", pair_records)
-                baseline_summary = _paired_arm_summary("baseline", pair_records)
-                row["exported"] = exported_summary
-                row["flashinfer_baseline"] = baseline_summary
-                row["paired_rounds"] = pair_records
-                row["ratios"] = {
-                    "exported_over_flashinfer_baseline": (
-                        float(exported_summary["median_ms"])
-                        / float(baseline_summary["median_ms"])
-                    ),
-                    "worst_round_exported_over_flashinfer_baseline": max(
-                        float(record["exported_baseline_ratio"])
-                        for record in pair_records
-                    ),
-                }
+                    row["flashinfer_baseline"] = {
+                        "status": "N/A",
+                        "reason": (
+                            "the official TRT-LLM NVFP4 runner does not support "
+                            "standalone SiLU"
+                        ),
+                    }
+                    row["ratios"] = {
+                        "exported_over_flashinfer_baseline": "N/A",
+                    }
             benchmark_stream.synchronize()
             if exported.output.data_ptr() != output_ptr:
                 raise AssertionError("benchmark replaced the caller output tensor")
@@ -1326,6 +1440,7 @@ def run_benchmark(
             "repetitions": repetitions,
             "paired_rounds": paired_rounds,
             "pair_patterns": [name for name, _ in PAIR_PATTERNS],
+            "standalone_silu": "exported Cake absolute timing only",
         },
         "rows": rows,
         "status": "pass",
@@ -1341,14 +1456,10 @@ def _selected_geometries(name: str) -> tuple[Geometry, ...]:
     return selected
 
 
-def _validate_environment(device: torch.device) -> None:
+def _validate_environment(device: torch.device) -> str:
     if device.type != "cuda":
         raise ValueError("the warp-decode harness requires a CUDA device")
-    major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) != (10, 3):
-        raise RuntimeError(
-            f"the warp-decode harness requires exact SM103, got SM{major}{minor}"
-        )
+    return _cake_target(device)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1406,11 +1517,13 @@ def main() -> None:
     args = _parse_args()
     device = torch.device(args.device)
     torch.cuda.set_device(device)
-    _validate_environment(device)
+    target = _validate_environment(device)
+    major, minor = torch.cuda.get_device_capability(device)
     geometries = _selected_geometries(args.geometry)
     report: dict[str, Any] = {
         "device": str(device),
-        "compute_capability": "sm_103",
+        "compute_capability": f"sm_{major}{minor}",
+        "target": target,
         "geometry": args.geometry,
         "seed": args.seed,
     }
