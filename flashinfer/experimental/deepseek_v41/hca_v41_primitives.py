@@ -154,10 +154,15 @@ def store_tmem_m64(fragment: cute.Tensor, dst):
 
 
 @cute.jit
-def load_cache_vector(ptr):
-    """Read one aligned 16-byte cache chunk through the public load primitive."""
+def load_cache_vector(ptr, bypass_l1: cutlass.Constexpr = False):
+    """Read one aligned cache chunk, optionally reserving L1 for scales."""
     addr = cutlass.Array(ptr.toint(), dtype=cutlass.Int32, shape=(4,), addrspace=1)
-    values = prims.load_ext(addr, count=4)
+    if cutlass.const_expr(bypass_l1):
+        values = prims.load_ext(
+            addr, count=4, cache_modifier=prims.LoadCacheModifier.CG
+        )
+    else:
+        values = prims.load_ext(addr, count=4)
     return cute.TensorSSA(values, (4,), cutlass.Int32)
 
 

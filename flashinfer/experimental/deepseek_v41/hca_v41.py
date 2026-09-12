@@ -2043,7 +2043,7 @@ class BlackwellV41MixedCacheDecode:
             cute.AddressSpace.gmem,
             assumed_align=16,
         )
-        return hw.load_cache_vector(ptr)
+        return hw.load_cache_vector(ptr, bypass_l1=self.use_ws)
 
     @cute.jit
     def _load_u16(self, pool: cute.Tensor, byte_off: cutlass.Numeric) -> cutlass.Int32:
