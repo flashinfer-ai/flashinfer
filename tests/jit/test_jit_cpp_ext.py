@@ -1,3 +1,4 @@
+import logging
 import subprocess
 from types import SimpleNamespace
 
@@ -26,6 +27,25 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     monkeypatch.setenv("FLASHINFER_NVCC_LAUNCHER", "sccache")
 
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
+
+
+def test_get_cuda_version_warns_on_cross_major_toolkit_mismatch(monkeypatch, caplog):
+    cpp_ext.get_cuda_version.cache_clear()
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda-13.0")
+    monkeypatch.setattr(cpp_ext.torch.version, "cuda", "12.9")
+    monkeypatch.setattr(
+        cpp_ext.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: "Cuda compilation tools, release 13.0, V13.0.88",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=cpp_ext.__name__):
+        assert cpp_ext.get_cuda_version() == cpp_ext.Version("13.0")
+
+    assert "/usr/local/cuda-13.0" in caplog.text
+    assert "PyTorch was built with CUDA 12.9" in caplog.text
+    assert "Set CUDA_HOME or CUDA_PATH" in caplog.text
+    cpp_ext.get_cuda_version.cache_clear()
 
 
 def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
@@ -375,3 +395,20 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa3", 512, 512) not in calls
     assert ("single", "fa2", 512, 512) in calls
     assert ("batch", "fa2", 512, 512) in calls
+
+
+def test_get_cuda_version_does_not_warn_for_same_major_toolkit(monkeypatch, caplog):
+    cpp_ext.get_cuda_version.cache_clear()
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda-12.9")
+    monkeypatch.setattr(cpp_ext.torch.version, "cuda", "12.8")
+    monkeypatch.setattr(
+        cpp_ext.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: "Cuda compilation tools, release 12.9, V12.9.86",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=cpp_ext.__name__):
+        assert cpp_ext.get_cuda_version() == cpp_ext.Version("12.9")
+
+    assert "Cross-major CUDA JIT builds" not in caplog.text
+    cpp_ext.get_cuda_version.cache_clear()
