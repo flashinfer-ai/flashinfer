@@ -26,8 +26,7 @@ namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
           typename Params>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
-                                                  bool enable_pdl,
-                                                  cudaStream_t stream);
+                                                  bool enable_pdl, cudaStream_t stream);
 
 }  // namespace flashinfer
 

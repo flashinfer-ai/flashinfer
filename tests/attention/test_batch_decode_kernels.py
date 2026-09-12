@@ -246,9 +246,7 @@ def test_batch_decode_split_kv_preserves_fp32_partials():
     kv_len, page_size = 16384, 16
     num_pages = kv_len // page_size
 
-    q = torch.randn(
-        1, num_qo_heads, head_dim, device="cuda:0", dtype=torch.bfloat16
-    )
+    q = torch.randn(1, num_qo_heads, head_dim, device="cuda:0", dtype=torch.bfloat16)
     kv = (
         torch.randn(
             num_pages,
@@ -289,12 +287,12 @@ def test_batch_decode_split_kv_preserves_fp32_partials():
     group_size = num_qo_heads // num_kv_heads
     reference = torch.empty_like(output, dtype=torch.float32)
     for head_idx in range(num_qo_heads):
-        scores = (
-            q[0, head_idx].float() @ k[:, head_idx // group_size].T
-        ) / math.sqrt(head_dim)
-        reference[head_idx] = torch.softmax(scores, dim=-1) @ v[
-            :, head_idx // group_size
-        ]
+        scores = (q[0, head_idx].float() @ k[:, head_idx // group_size].T) / math.sqrt(
+            head_dim
+        )
+        reference[head_idx] = (
+            torch.softmax(scores, dim=-1) @ v[:, head_idx // group_size]
+        )
 
     mismatches = torch.count_nonzero(output != reference.to(torch.bfloat16))
     assert mismatches.item() <= reference.numel() // 100
