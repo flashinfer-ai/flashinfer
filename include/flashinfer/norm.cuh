@@ -106,7 +106,7 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) smem[0] = sum_sq;
   }
   __syncthreads();
 
@@ -220,7 +220,7 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) smem[0] = sum_sq;
   }
   __syncthreads();
 
@@ -472,7 +472,7 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) smem[0] = sum_sq;
   }
   __syncthreads();
 
@@ -605,7 +605,7 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) smem[0] = sum_sq;
   }
   __syncthreads();
 
