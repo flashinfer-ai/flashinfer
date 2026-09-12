@@ -6,6 +6,8 @@
     "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparsePagedTSWrapper.run",
     "backend:prims-ts",
     "sparse:block",
+    "sparse-format:bsr",
+    "routes:exact",
     "status:experimental",
     "kv-cache:paged"
   ],
@@ -17,6 +19,10 @@
     "seq_len_q": {
       "type": "var",
       "description": "Fixed query length per request."
+    },
+    "max_seq_len_kv": {
+      "type": "var",
+      "description": "Static maximum logical K/V length planned for every request."
     },
     "num_qo_heads": {
       "type": "const",
@@ -30,6 +36,10 @@
       "type": "const",
       "value": 128
     },
+    "num_kv_valid_words": {
+      "type": "var",
+      "description": "Number of optional token-validity words per batch."
+    },
     "num_q_block_offsets": {
       "type": "var",
       "description": "Number of BSR row offsets per batch and KV head."
@@ -37,14 +47,6 @@
     "num_block_indices": {
       "type": "var",
       "description": "Capacity of the runtime KV-block ID tensor."
-    },
-    "num_kv_valid_words": {
-      "type": "var",
-      "description": "Number of optional token-validity words per batch."
-    },
-    "max_seq_len_kv": {
-      "type": "var",
-      "description": "Static maximum logical K/V length planned for every request."
     },
     "num_pages": {
       "type": "var",
@@ -54,18 +56,14 @@
       "type": "const",
       "value": 64
     },
-    "num_page_offsets": {
-      "type": "var",
-      "description": "Length of the request-to-page indptr array."
-    },
-    "num_page_indices": {
-      "type": "var",
-      "description": "Capacity of the runtime physical-page ID tensor; the final live page-table offset may be smaller."
-    },
     "kv_planes": {
       "type": "const",
       "value": 2,
       "description": "K/V plane count; required to be 2."
+    },
+    "max_pages_per_seq": {
+      "type": "var",
+      "description": "Fixed page-table column capacity."
     }
   },
   "constraints": [
@@ -75,13 +73,10 @@
     "q_block_size > 0",
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
-    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "kv_valid_bits is None or num_kv_valid_words == (max_seq_len_kv + 31) // 32",
+    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "mask_type is None or mask_type in ('dense', 'causal')",
-    "num_page_offsets == batch_size + 1",
-    "paged_kv_indptr[0].item() == 0",
-    "min(paged_kv_indptr[1:] - paged_kv_indptr[:-1]) >= 0",
-    "paged_kv_indptr[-1].item() <= num_page_indices",
+    "max_pages_per_seq * page_size >= max_seq_len_kv",
     "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)",
     "min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)",
     "max(seq_lens_kv) <= max_seq_len_kv",
@@ -100,6 +95,38 @@
       ],
       "dtype": "float16"
     },
+    "paged_kv_cache": {
+      "shape": [
+        "num_pages",
+        "kv_planes",
+        "num_kv_heads",
+        "page_size",
+        "head_dim"
+      ],
+      "dtype": "float16",
+      "description": "Combined K/V pages in HND layout."
+    },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32",
+      "description": "Physical page IDs in a fixed 2D table; rows may use a padded non-overlapping stride and entries beyond the live length are ignored."
+    },
+    "max_seq_len_kv": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Static maximum logical K/V length used for planning."
+    },
+    "seq_lens_kv": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Live per-request logical K/V lengths read for this call."
+    },
     "block_indptr": {
       "shape": [
         "batch_size",
@@ -107,7 +134,7 @@
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into live block_indices for this wrapper run."
+      "description": "Absolute offsets into block_indices for this call."
     },
     "block_indices": {
       "shape": [
@@ -123,7 +150,7 @@
       ],
       "dtype": "uint32",
       "optional": true,
-      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond the planned K/V capacity are ignored."
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond the K/V length are ignored; the mask applies only to exact routes."
     },
     "q_block_size": {
       "shape": null,
@@ -145,43 +172,11 @@
       "dtype": "float32",
       "optional": true
     },
-    "paged_kv_cache": {
-      "shape": [
-        "num_pages",
-        "kv_planes",
-        "num_kv_heads",
-        "page_size",
-        "head_dim"
-      ],
-      "dtype": "float16",
-      "description": "Combined K/V pages in HND layout."
-    },
-    "paged_kv_indptr": {
-      "shape": [
-        "num_page_offsets"
-      ],
-      "dtype": "int32",
-      "description": "Live request offsets into paged_kv_indices, read for this call."
-    },
-    "paged_kv_indices": {
-      "shape": [
-        "num_page_indices"
-      ],
-      "dtype": "int32",
-      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is live."
-    },
-    "max_seq_len_kv": {
+    "validate": {
       "shape": null,
-      "dtype": "int32",
+      "dtype": "bool",
       "optional": true,
-      "description": "Static maximum logical K/V length used for planning."
-    },
-    "seq_lens_kv": {
-      "shape": [
-        "batch_size"
-      ],
-      "dtype": "int32",
-      "description": "Live per-request logical K/V lengths read for this call."
+      "description": "Whether to validate per-run tensor structure and aliasing."
     }
   },
   "outputs": {

@@ -726,16 +726,14 @@ block_sparse_attention.fi_trace(
 bs_page_size = 64
 bs_pages_per_request = bs_Skv // bs_page_size
 bs_num_pages = bs_B * bs_pages_per_request
-bs_paged_kv_indptr = (
-    torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
+# Keep one spare column to demonstrate that page tables may use a padded row
+# stride: only the first ceil(seq_lens_kv[b] / page_size) entries are live.
+bs_block_table_storage = torch.full(
+    (bs_B, bs_pages_per_request + 1), -1, dtype=torch.int32, device=device
 )
-# Keep one spare entry to demonstrate that this tensor is capacity: the live
-# prefix is selected by bs_paged_kv_indptr[-1].
-bs_paged_kv_indices = torch.cat(
-    (
-        torch.arange(bs_num_pages, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-    )
+bs_block_tables = bs_block_table_storage[:, :bs_pages_per_request]
+bs_block_tables.copy_(
+    torch.arange(bs_num_pages, dtype=torch.int32, device=device).view(bs_B, -1)
 )
 bs_seq_lens_kv = torch.full((bs_B,), bs_Skv, dtype=torch.int32, device=device)
 # Exercise a live length that does not fill its last page.
@@ -756,14 +754,13 @@ for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
         save_dir=SAVE_DIR,
         q=bs_q,
         paged_kv_cache=bs_paged_cache,
-        paged_kv_indptr=bs_paged_kv_indptr,
-        paged_kv_indices=bs_paged_kv_indices,
+        block_tables=bs_block_tables,
+        seq_lens_kv=bs_seq_lens_kv,
         block_indptr=bs_block_indptr,
         block_indices=bs_block_indices,
         q_block_size=bs_q_block,
         kv_block_size=bs_kv_block,
         max_seq_len_kv=bs_Skv,
-        seq_lens_kv=bs_seq_lens_kv,
         kv_valid_bits=bs_valid_bits,
         mask_type="dense",
         out=bs_out,
@@ -815,8 +812,7 @@ with contextlib.suppress(Exception):
         bs_paged_wrapper.run(
             bs_q,
             bs_paged_cache,
-            bs_paged_kv_indptr,
-            bs_paged_kv_indices,
+            bs_block_tables,
             bs_seq_lens_kv,
             bs_block_indptr,
             bs_block_indices,

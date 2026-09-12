@@ -386,26 +386,10 @@ def _finalize_exact_route(
 
 
 @cute.jit
-def _paged_request_page_range_is_valid(
-    request_begin: cutlass.Int32,
-    request_end: cutlass.Int32,
-    num_indices: cutlass.Int32,
-    required_pages: cutlass.Int32,
-) -> cutlass.Boolean:
-    """Validate one request's page-table range before any index load."""
-
-    return cutlass.Boolean(
-        request_begin >= cutlass.Int32(0)
-        and request_begin <= request_end
-        and request_end <= num_indices
-        and request_end - request_begin >= required_pages
-    )
-
-
-@cute.jit
 def _resolve_paged_route_atom_page_id(
-    paged_kv_indices: cute.Tensor,
-    request_begin: cutlass.Int32,
+    block_tables: cute.Tensor,
+    batch_idx: cutlass.Int32,
+    block_table_row_stride: cutlass.Int64,
     logical_origin: cutlass.Int32,
     logical_origin_is_valid: cutlass.Boolean,
     lane_idx: cutlass.Int32,
@@ -419,7 +403,10 @@ def _resolve_paged_route_atom_page_id(
     if logical_origin_is_valid:
         logical_page_idx = logical_origin // cutlass.Int32(page_size)
         physical_page_id = cutlass.Int32(
-            paged_kv_indices[request_begin + logical_page_idx]
+            block_tables.iterator[
+                cutlass.Int64(batch_idx) * block_table_row_stride
+                + cutlass.Int64(logical_page_idx)
+            ]
         )
         page_id_is_valid = cutlass.Boolean(
             physical_page_id >= cutlass.Int32(0)
@@ -429,7 +416,7 @@ def _resolve_paged_route_atom_page_id(
     if lane_idx == cutlass.Int32(0):
         runtime_assert(
             page_ids_are_valid,
-            "paged_kv_indices contains an out-of-range physical page ID",
+            "block_tables contains an out-of-range physical page ID",
         )
     return physical_page_id
 
@@ -660,9 +647,9 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
         block_indices: cute.Tensor,
         kv_valid_bits: cute.Tensor,
         seq_lens_kv: cute.Tensor | None,
-        paged_kv_indptr: cute.Tensor | None,
-        paged_kv_indices: cute.Tensor | None,
+        block_tables: cute.Tensor | None,
         num_physical_kv_pages: cutlass.Int64,
+        block_table_row_stride: cutlass.Int64,
         row_route_offsets: cute.Tensor,
         route_workspace: cute.Tensor,
         max_blocks_per_row: cutlass.Int32,
@@ -675,9 +662,9 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
             block_indices,
             kv_valid_bits,
             seq_lens_kv,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             num_physical_kv_pages,
+            block_table_row_stride,
             row_route_offsets,
             route_workspace,
             max_blocks_per_row,
@@ -698,9 +685,9 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
         block_indices: cute.Tensor,
         kv_valid_bits: cute.Tensor,
         seq_lens_kv: cute.Tensor | None,
-        paged_kv_indptr: cute.Tensor | None,
-        paged_kv_indices: cute.Tensor | None,
+        block_tables: cute.Tensor | None,
         num_physical_kv_pages: cutlass.Int64,
+        block_table_row_stride: cutlass.Int64,
         row_route_offsets: cute.Tensor,
         route_workspace: cute.Tensor,
         max_blocks_per_row: cutlass.Int32,
@@ -723,7 +710,6 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
             self.cfg,
         )
 
-        request_begin = cutlass.Int32(0)
         live_seq_len_kv = cutlass.Int32(self.cfg.seq_len_kv)
         selected_block_count = row_end - row_begin
         if cutlass.const_expr(self.route_layout.is_paged):
@@ -756,24 +742,10 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                     live_seq_len_kv,
                     self.page_size,
                 )
-                request_begin = cutlass.Int32(paged_kv_indptr[batch_idx])
-                request_end = cutlass.Int32(
-                    paged_kv_indptr[batch_idx + cutlass.Int32(1)]
-                )
-                metadata_starts_at_zero = cutlass.Boolean(
-                    paged_kv_indptr[cutlass.Int32(0)] == cutlass.Int32(0)
-                )
                 runtime_assert(
-                    metadata_starts_at_zero
-                    and _paged_request_page_range_is_valid(
-                        request_begin,
-                        request_end,
-                        cutlass.Int32(cute.size(paged_kv_indices)),
-                        required_pages,
-                    ),
-                    "paged_kv_indptr row lacks the required live page capacity",
+                    required_pages <= cutlass.Int32(block_tables.shape[1]),
+                    "block_tables row lacks the required live page capacity",
                 )
-            request_begin = _warp_broadcast_i32(request_begin, 0)
 
         _, exact_route_count, total_route_count = _prepared_route_counts(
             selected_block_count,
@@ -820,8 +792,9 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
                     )
                 if cutlass.const_expr(self.route_layout.is_paged):
                     physical_page_id = _resolve_paged_route_atom_page_id(
-                        paged_kv_indices,
-                        request_begin,
+                        block_tables,
+                        batch_idx,
+                        block_table_row_stride,
                         logical_origin,
                         logical_origin_is_valid,
                         lane_idx,
