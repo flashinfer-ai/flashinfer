@@ -40,6 +40,39 @@ using FastModDivInt32 = cuda::fast_mod_div<int32_t>;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 using Dtype = Data_type;
 
+template <typename KernelMeta>
+auto enablesBf16QFp8KvKOnlyTransform(KernelMeta const& kernelMeta, int)
+    -> decltype(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform) {
+  return kernelMeta.mEnablesBf16QFp8KvKOnlyTransform;
+}
+
+template <typename KernelMeta>
+bool enablesBf16QFp8KvKOnlyTransform(KernelMeta const&, long) {
+  return false;
+}
+
+template <typename KernelMeta>
+auto usesSeparateTransformedKv(KernelMeta const& kernelMeta, int)
+    -> decltype(kernelMeta.mSeparateTransformedKv) {
+  return kernelMeta.mSeparateTransformedKv;
+}
+
+template <typename KernelMeta>
+bool usesSeparateTransformedKv(KernelMeta const&, long) {
+  return false;
+}
+
+template <typename KernelMeta>
+auto storesTransformedKvInTmem(KernelMeta const& kernelMeta, int)
+    -> decltype(kernelMeta.mStoreTransformedKvInTmem) {
+  return kernelMeta.mStoreTransformedKvInTmem;
+}
+
+template <typename KernelMeta>
+bool storesTransformedKvInTmem(KernelMeta const&, long) {
+  return false;
+}
+
 struct KernelParams {
   // TMA descriptor for Q.
   CUtensorMap tmaQ_;
@@ -197,6 +230,9 @@ struct KernelParams {
   // Whether the indices for K & V pages are shared as unified index.
   // true -> vLLM/FlashInfer; false -> TRT-LLM.
   bool mUsesSharedPagedKvIdx{true};
+
+  // FlashInfer does not enable runtime skip correction.
+  float mSkipCorrThreshold{0.f};
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -700,26 +736,48 @@ struct KernelParams {
     int32_t numKeysPerTile = isPagedKv(options.mQkvLayout)
                                  ? std::min(options.mNumTokensPerPage, kernelMeta.mTileSizeKv)
                                  : kernelMeta.mTileSizeKv;
-    // The number of elements in 128B for Q.
-    int32_t numEltsIn128BKv = (128 * 8) / get_size_in_bits(kernelMeta.mDataTypeK);
-    // The number of head elts (per token) in each block of shared memory (see above explanation).
+    auto getNumEltsInClampedHeadDim = [](Data_type dtype, int32_t headDim) {
+      int32_t const numEltsIn128B = (128 * 8) / get_size_in_bits(dtype);
+      return std::min({numEltsIn128B, headDim, 128});
+    };
+    int32_t const numEltsInClampedHeadDimK =
+        getNumEltsInClampedHeadDim(kernelMeta.mDataTypeK, options.mHeadDimQk);
+    int32_t const numEltsInClampedHeadDimV =
+        getNumEltsInClampedHeadDim(kernelMeta.mDataTypeV, options.mHeadDimV);
 
-    // HeadDim will be split into multiple headDimStages (128) if maxHeadDimKv > 128.
-    int32_t numEltsInClampedHeadDimKv = std::min({numEltsIn128BKv, maxHeadDimKv, 128});
-
-    // Do we have to transform K/V before MMA?
-    bool const transformsKv{kernelMeta.mDataTypeK != kernelMeta.mDataTypeQ};
+    // Determine the operand dtypes presented to BMM1 and BMM2.
+    Data_type dtypeBmm2 = kernelMeta.mDataTypeK != kernelMeta.mDataTypeQ ? kernelMeta.mDataTypeQ
+                                                                         : kernelMeta.mDataTypeV;
+    if (kernelMeta.mDataTypeK == DATA_TYPE_E4M3 && kernelMeta.mDataTypeV == DATA_TYPE_E2M1) {
+      dtypeBmm2 = DATA_TYPE_E4M3;
+    }
+    if (enablesBf16QFp8KvKOnlyTransform(kernelMeta, 0)) {
+      dtypeBmm2 = kernelMeta.mDataTypeV;
+    }
+    bool const transformsK{
+        kernelMeta.mDataTypeK != kernelMeta.mDataTypeQ ||
+        (usesSeparateTransformedKv(kernelMeta, 0) && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
+         kernelMeta.mDataTypeK == DATA_TYPE_E4M3 && kernelMeta.mDataTypeV == DATA_TYPE_E2M1)};
+    bool const transformsV{kernelMeta.mDataTypeV != dtypeBmm2};
     // Whether store transformed K/V in TMEM.
     bool const isSwapsMmaAb =
         isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType));
-    bool const storeTransformedKvInTmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 &&
-                                        kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
-                                        maxHeadDimKv >= 128 && isSwapsMmaAb};
+    // Older homogeneous NVFP4 packages predate the capability bit. Mixed-KV kernels must opt in:
+    // their inventory includes schedules that still consume packed V from SMEM.
+    bool const usesLegacyHomogeneousNvFp4Tmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 &&
+                                              kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
+                                              maxHeadDimKv >= 128 && isSwapsMmaAb};
+    bool const storeTransformedKvInTmem{usesLegacyHomogeneousNvFp4Tmem ||
+                                        storesTransformedKvInTmem(kernelMeta, 0)};
     // Whether swizzle is needed for K/V.
-    bool const swizzleKv{storeTransformedKvInTmem || !transformsKv};
+    bool const swizzleK{storeTransformedKvInTmem || !transformsK};
+    bool const swizzleV{storeTransformedKvInTmem || !transformsV};
+    bool const separateSmemKv{
+        (kernelMeta.mDataTypeK == DATA_TYPE_E4M3 && kernelMeta.mDataTypeV == DATA_TYPE_E2M1) ||
+        transformsK != transformsV};
     // Whether we can reshape the TMA box for K/V to widen it to 128B.
     bool const canReshapeTmaKv{isPagedKv(options.mQkvLayout) &&
-                               options.mHeadDimQk == options.mHeadDimV && !swizzleKv &&
+                               options.mHeadDimQk == options.mHeadDimV && !swizzleK && !swizzleV &&
                                canUseTmaKvReshape(options, kernelMeta.mDataTypeK, /*isK*/ true) &&
                                canUseTmaKvReshape(options, kernelMeta.mDataTypeV, /*isK*/ false)};
     // The reshape factor for K/V TMA box: aim for 128B box width.
@@ -743,13 +801,17 @@ struct KernelParams {
     auto [shapeV, strideV] =
         makeTmaShapeStrideKv(options, params, kernelMeta.mDataTypeV,
                              /*isK*/ false, storeTransformedKvInTmem, reshapeFactorKv);
-    // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
-    auto const numEltsDivisor =
-        kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;
-    // The tileShapes for K/V.
-    std::vector<uint32_t> tileShapeKv(shapeK.size(), 1);
-    tileShapeKv[0] = numEltsInClampedHeadDimKv / numEltsDivisor * reshapeFactorKv;
-    tileShapeKv[1] = numKeysPerTile / reshapeFactorKv;
+    // FP4 values are packed two per byte. Build the K/V boxes independently so kernels with
+    // separate raw-K/V pipelines preserve the compact V cache instead of padding it to K's size.
+    int32_t const numEltsDivisorK =
+        kernelMeta.mDataTypeK == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;
+    int32_t const numEltsDivisorV =
+        kernelMeta.mDataTypeV == DATA_TYPE_E2M1 && !storeTransformedKvInTmem ? 2 : 1;
+    std::vector<uint32_t> tileShapeK(shapeK.size(), 1);
+    std::vector<uint32_t> tileShapeV(shapeV.size(), 1);
+    tileShapeK[0] = numEltsInClampedHeadDimK / numEltsDivisorK * reshapeFactorKv;
+    tileShapeV[0] = numEltsInClampedHeadDimV / numEltsDivisorV * reshapeFactorKv;
+    tileShapeK[1] = tileShapeV[1] = numKeysPerTile / reshapeFactorKv;
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
     // (numTokensKvInPagedKv, headDimQk).
@@ -757,23 +819,21 @@ struct KernelParams {
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
       strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
-      tileShapeKv[1] = 1;
+      tileShapeK[1] = 1;
     }
-    // K and V might use different tileShapes.
-    std::vector<uint32_t> tileShapeK(tileShapeKv);
-    std::vector<uint32_t> tileShapeV(tileShapeKv);
-    if (!storeTransformedKvInTmem && kernelMeta.mDataTypeK != kernelMeta.mDataTypeV) {
+    if (!storeTransformedKvInTmem && !separateSmemKv &&
+        kernelMeta.mDataTypeK != kernelMeta.mDataTypeV) {
       // tileShapeKv is in dtypeK elements. When dtypeV != dtypeK, we need to express tileShapeV in
       // terms of dtypeV elements so the V TMA descriptor transfers the same number of bytes as K to
       // match barrier expectations.
-      tileShapeV[0] = tileShapeV[0] * get_size_in_bits(kernelMeta.mDataTypeK) /
+      tileShapeV[0] = tileShapeK[0] * get_size_in_bits(kernelMeta.mDataTypeK) /
                       get_size_in_bits(kernelMeta.mDataTypeV);
     }
 
     // Build tma descriptor for K.
     params.tmaK_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
-        /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+        /*swizzled = */ swizzleK, /*unpack4b = */ storeTransformedKvInTmem);
 
     bool const useSparseMlaSlidingWindowKvPool = options.mHasSlidingWindowKvPool &&
                                                  options.isSparseMla() &&
@@ -782,41 +842,35 @@ struct KernelParams {
       params.tmaKSlidingWindowKvPool_ =
           buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
                                const_cast<void*>(options.slidingWindowKvPoolPtr),
-                               /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+                               /*swizzled = */ swizzleK, /*unpack4b = */ storeTransformedKvInTmem);
     }
 
     params.tmaV_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeV, shapeV, strideV, tileShapeV, const_cast<void*>(vPtr),
-        /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+        /*swizzled = */ swizzleV, /*unpack4b = */ storeTransformedKvInTmem);
 
-    // If the KV dtype is E2m1, additional scaling factors are needed for dequant.
-    if (kernelMeta.mDataTypeKv == DATA_TYPE_E2M1) {
+    // E2M1 inputs need independent block-scale descriptors.
+    if (kernelMeta.mDataTypeK == DATA_TYPE_E2M1 || kernelMeta.mDataTypeV == DATA_TYPE_E2M1) {
       // The number of elements per SF.
       int32_t NumEltsPerSf = 16;
       // The reshape factor for K/V SF: aim for box width 128B, limit to numKeysPerTile.
       int32_t const reshapeFactorKvSf =
           std::min(128 / (maxHeadDimKv / NumEltsPerSf), numKeysPerTile);
-      // Compute the shape and stride for SF tensor.
-      // FIXME: assume K and V uses the same shape.
-      auto [shapeKvSf, strideKvSf] =
-          makeTmaShapeStrideKvSf(options, params, /*isK*/ true, reshapeFactorKvSf);
-
-      // The tileShapes for K/V.
-      std::vector<uint32_t> tileShapeKvSf(shapeKvSf.size(), 1);
-      tileShapeKvSf[0] = maxHeadDimKv / NumEltsPerSf * reshapeFactorKvSf;
-      tileShapeKvSf[1] = numKeysPerTile / reshapeFactorKvSf;
-
-      // The tile box is reshaped from (headDim / NumEltsPerSf, tileSizeKv) into
-      // (headDim / NumEltsPerSf * reshapeFactorKvSf, tileSizeKv / reshapeFactorKvSf).
-      // Build tma descriptor for K SF.
-      params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf,
-                                            tileShapeKvSf, const_cast<void*>(options.kSfBasePtr),
-                                            /*swizzled = */ false);
-
-      // Build tma descriptor for V SF.
-      params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf,
-                                            tileShapeKvSf, const_cast<void*>(options.vSfBasePtr),
-                                            /*swizzled = */ false);
+      auto buildSfDescriptor = [&](bool isK, void const* sfBasePtr) {
+        auto [shapeSf, strideSf] = makeTmaShapeStrideKvSf(options, params, isK, reshapeFactorKvSf);
+        std::vector<uint32_t> tileShapeSf(shapeSf.size(), 1);
+        int32_t const headDim = isK ? options.mHeadDimQk : options.mHeadDimV;
+        tileShapeSf[0] = headDim / NumEltsPerSf * reshapeFactorKvSf;
+        tileShapeSf[1] = numKeysPerTile / reshapeFactorKvSf;
+        return buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeSf, strideSf, tileShapeSf,
+                                    const_cast<void*>(sfBasePtr), /*swizzled = */ false);
+      };
+      if (kernelMeta.mDataTypeK == DATA_TYPE_E2M1) {
+        params.tmaKSf_ = buildSfDescriptor(/*isK=*/true, options.kSfBasePtr);
+      }
+      if (kernelMeta.mDataTypeV == DATA_TYPE_E2M1) {
+        params.tmaVSf_ = buildSfDescriptor(/*isK=*/false, options.vSfBasePtr);
+      }
     }
 
     // Shape/stride for gmem tensor O.
@@ -922,6 +976,7 @@ struct KernelParams {
     params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
     // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
     params.mUsesSharedPagedKvIdx = options.mUsesSharedPagedKvIdx;
+    params.mSkipCorrThreshold = 0.f;
     return params;
   }
 };

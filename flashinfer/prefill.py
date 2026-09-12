@@ -5810,7 +5810,10 @@ def trtllm_batch_context_with_kv_cache(
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
     kv_cache_sf: Optional[
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Union[
+            torch.Tensor,
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor]],
+        ]
     ] = None,
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     uses_shared_paged_kv_idx: bool = True,
@@ -5894,6 +5897,7 @@ def trtllm_batch_context_with_kv_cache(
         * a tuple ``(k_scales, v_scales)`` of 4-D tensors, each following
           :attr:`kv_layout`: ``[num_pages, num_kv_heads, page_size, head_dim // 16]`` for
           HND, or ``[num_pages, page_size, num_kv_heads, head_dim // 16]`` for NHD.
+          Either entry may be ``None`` when that cache uses a non-NVFP4 dtype.
         * a single 5-D tensor with shape ``[num_pages, 2, ...]`` matching the layout of
           ``kv_cache``, split on dim 1 to yield k (index 0) and v (index 1) scales.
 
@@ -5995,17 +5999,30 @@ def trtllm_batch_context_with_kv_cache(
             raise ValueError("KV Cache NVFP4 is not supported on SM107")
         if kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
-    key_block_scales, value_block_scales = (
-        _unpack_paged_kv_cache(kv_cache_sf, kv_layout)
-        if kv_cache_sf is not None
-        else (None, None)
+    key_block_scales = None
+    value_block_scales = None
+    if kv_cache_sf is not None:
+        if isinstance(kv_cache_sf, (tuple, list)):
+            if len(kv_cache_sf) != 2:
+                raise ValueError("kv_cache_sf must contain K and V scales")
+            key_block_scales, value_block_scales = kv_cache_sf
+        else:
+            key_block_scales, value_block_scales = _unpack_paged_kv_cache(
+                kv_cache_sf, kv_layout
+            )
+    if k_cache.dtype == torch.uint8 and key_block_scales is None:
+        raise ValueError("k_scales must be provided for an NVFP4 key cache")
+    if v_cache.dtype == torch.uint8 and value_block_scales is None:
+        raise ValueError("v_scales must be provided for an NVFP4 value cache")
+    is_fp8_k_nvfp4_v = (
+        k_cache.dtype == torch.float8_e4m3fn and v_cache.dtype == torch.uint8
     )
 
     # Convert NHD layout to HND if necessary
     if kv_layout == "NHD":
         k_cache = k_cache.transpose(-3, -2)
         v_cache = v_cache.transpose(-3, -2)
-        if key_block_scales is not None:
+        if key_block_scales is not None or value_block_scales is not None:
             print(
                 "[WARNING] NVFP4 KV cache with NHD layout will be converted to HND, "
                 "incurring extra transpose and contiguous copy overhead. "
@@ -6013,8 +6030,10 @@ def trtllm_batch_context_with_kv_cache(
             )
             k_cache = k_cache.contiguous()
             v_cache = v_cache.contiguous()
-            key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
-            value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
+            if key_block_scales is not None:
+                key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
+            if value_block_scales is not None:
+                value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
     if backend != "cake":
         run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
@@ -6091,6 +6110,36 @@ def trtllm_batch_context_with_kv_cache(
         check_shape_dtype_device(out, query.shape, out_dtype, query.device, "out")
     else:
         raise ValueError(f"Invalid out_dtype: {out_dtype}")
+
+    if is_fp8_k_nvfp4_v:
+        if query.dtype != torch.float8_e4m3fn or out_dtype != torch.bfloat16:
+            raise ValueError("FP8-K/NVFP4-V context requires FP8 query and BF16 output")
+        if kv_layout != "HND":
+            raise ValueError("FP8-K/NVFP4-V context currently requires HND layout")
+        head_dim = query.shape[-1]
+        if (
+            head_dim not in (128, 256)
+            or k_cache.shape[-1] != head_dim
+            or v_cache.shape[-1] * 2 != head_dim
+            or k_cache.shape[-2] != 64
+        ):
+            raise ValueError(
+                "FP8-K/NVFP4-V context requires matching head dimensions "
+                "of 128 or 256 and page size 64"
+            )
+        if (
+            not causal
+            or window_left != -1
+            or not uses_shared_paged_kv_idx
+            or skip_softmax_threshold_scale_factor is not None
+            or sinks is not None
+            or return_lse
+            or lse is not None
+        ):
+            raise ValueError(
+                "FP8-K/NVFP4-V context does not yet support non-causal, sliding-window, "
+                "separate page indices, skip-softmax, sinks, or LSE features"
+            )
 
     if isinstance(bmm1_scale, torch.Tensor):
         assert bmm1_scale.dtype == torch.float32

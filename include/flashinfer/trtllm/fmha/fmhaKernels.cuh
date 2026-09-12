@@ -235,7 +235,7 @@ class TllmGenFmhaKernel {
   }
 
   inline bool supportsGqaGroupingTokensHeadsQ(SelectKernelParams const& selectKernelParams) const {
-    return mDtypeQ == mDtypeK ||
+    return (mDtypeQ == mDtypeK && mDtypeK == mDtypeV) ||
            (isBf16QFp8KvGeneration() &&
             selectKernelParams.mBf16QFp8KvTransformMode != Bf16QFp8KvTransformMode::Full);
   }
@@ -697,9 +697,13 @@ class TllmGenFmhaKernel {
 
       // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
       // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-      // Other headDimV >= 512 shapes remain excluded because the cubin inventory is incomplete,
-      // and tileSizeQ >= 32 CGA variants can exceed the device shared-memory limit.
-      if (useCgaSmemReduction && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
+      // SM103 cannot launch the H128 FP8-K/NVFP4-V Swaps CGA kernels: their measured
+      // shared-memory requirement exceeds the 228 KiB per-block limit. Keep the launch on the
+      // equivalent global-memory reduction path, which is exported for the same selector shape.
+      bool const supportsCgaSmemReduction = !(mSM == kSM_103 && mDtypeK == DATA_TYPE_E4M3 &&
+                                              mDtypeV == DATA_TYPE_E2M1 && params.mHeadDimV == 128);
+      if (useCgaSmemReduction && supportsCgaSmemReduction && numCtasPerSeqKv > 1 &&
+          numCtasPerSeqKv <= 16 &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
           isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
           !selectKernelParams.mForceGmemReduction) {
@@ -1143,8 +1147,8 @@ class TllmGenFmhaKernel {
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
     selectKernelParams.mGroupsTokensHeadsQ = false;
 
-    // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
-    // transform paths present BF16 K to BMM1, so they can use the grouped-token cubins.
+    // Generic mixed K/V kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
+    // transform paths present BF16 K and V to the MMAs, so they can use grouped-token cubins.
     if (!supportsGqaGroupingTokensHeadsQ(selectKernelParams)) {
       selectKernelParams.mGroupsTokensHeadsQ = false;
       tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
