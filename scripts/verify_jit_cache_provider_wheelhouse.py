@@ -4,15 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from jit_cache_provider_validation import (
     Wheel,
@@ -21,15 +18,8 @@ from jit_cache_provider_validation import (
     require,
     validate_provider,
     validate_shim,
+    write_validation_report,
 )
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def validate_flashinfer_python(wheel: Wheel, expected_version: str) -> None:
@@ -92,59 +82,6 @@ print(json.dumps({
         require(result["module_count"] > 0, "Installed provider has no modules")
 
 
-def write_report(
-    wheelhouse: Path,
-    wheels: dict[str, Wheel],
-    provider: str,
-    manifest: dict[str, Any],
-    module_architectures: dict[str, list[str]],
-    ptx_modules: list[str],
-) -> None:
-    architecture_summary = {
-        "provider_only": sum(
-            targets == [provider] for targets in module_architectures.values()
-        ),
-        "mixed": sum(
-            provider in targets and targets != [provider]
-            for targets in module_architectures.values()
-        ),
-        "foreign_only": sum(
-            bool(targets) and provider not in targets
-            for targets in module_architectures.values()
-        ),
-        "no_cubin": sum(not targets for targets in module_architectures.values()),
-    }
-    report = {
-        "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "provider_id": provider,
-        "version": manifest["version"],
-        "cuda_architectures": manifest["cuda_architectures"],
-        "module_count": len(manifest["modules"]),
-        "modules": sorted(manifest["modules"]),
-        "module_cuda_architectures": module_architectures,
-        "module_cuda_architecture_summary": architecture_summary,
-        "ptx_module_count": len(ptx_modules),
-        "ptx_modules": ptx_modules,
-        "wheels": {
-            distribution: {
-                "filename": wheel.path.name,
-                "size_bytes": wheel.path.stat().st_size,
-                "sha256": sha256(wheel.path),
-            }
-            for distribution, wheel in sorted(wheels.items())
-        },
-    }
-    (wheelhouse / "wheelhouse.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n"
-    )
-    checksum_lines = [
-        f"{details['sha256']}  {details['filename']}"
-        for details in report["wheels"].values()
-    ]
-    (wheelhouse / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--wheelhouse", type=Path, required=True)
@@ -156,7 +93,7 @@ def parse_args() -> argparse.Namespace:
         "--cuda-architecture-policy",
         choices=("strict", "report"),
         default="strict",
-        help="Fail on non-provider cubins, or retain them in the inventory report",
+        help="Fail on incompatible cubins, or retain them in the inventory report",
     )
     parser.add_argument("--install-smoke", action="store_true")
     return parser.parse_args()
@@ -205,13 +142,14 @@ def main() -> int:
     if args.install_smoke:
         run_install_smoke(shim, provider_wheel, args.provider)
 
-    write_report(
+    write_validation_report(
         args.wheelhouse,
         wheels,
         args.provider,
         manifest,
         module_architectures,
         ptx_modules,
+        "wheelhouse.json",
     )
     print(
         f"Validated {args.provider}: {len(module_paths)} modules, "

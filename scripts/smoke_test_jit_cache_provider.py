@@ -6,20 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--provider", required=True)
     return parser.parse_args()
-
-
-def provider_capability(provider: str) -> tuple[int, int]:
-    match = re.fullmatch(r"sm(\d{1,2})(\d)[af]?", provider.lower())
-    if match is None:
-        raise ValueError(f"Invalid provider ID: {provider}")
-    return int(match.group(1)), int(match.group(2))
 
 
 def main() -> int:
@@ -29,15 +21,27 @@ def main() -> int:
     import torch
 
     capability = torch.cuda.get_device_capability()
-    expected_capability = provider_capability(args.provider)
-    if capability != expected_capability:
-        raise RuntimeError(
-            f"Visible GPU capability {capability} does not match "
-            f"{args.provider} ({expected_capability})"
-        )
-
     import flashinfer
     from flashinfer.jit import env as jit_env
+
+    installed_provider = next(
+        (
+            provider
+            for provider in jit_env.FLASHINFER_AOT_PROVIDERS
+            if provider.provider_id == args.provider
+        ),
+        None,
+    )
+    if installed_provider is None:
+        raise RuntimeError(f"Provider {args.provider} is not installed")
+    target_architectures = jit_env._target_cuda_architectures()
+    if not jit_env._provider_covers_targets(
+        installed_provider.cuda_architectures, target_architectures
+    ):
+        raise RuntimeError(
+            f"Provider targets {sorted(installed_provider.cuda_architectures)} are "
+            f"not compatible with visible CUDA targets {sorted(target_architectures)}"
+        )
 
     provider_path = jit_env.get_aot_path("silu_and_mul")
     expected_path_part = f"providers/{args.provider}/jit_cache"

@@ -15,7 +15,9 @@ the other logging/replay functionality tests, since it's tightly coupled with th
 
 import json
 from pathlib import Path
+import subprocess
 import sys
+import zipfile
 
 from packaging.version import Version
 import pytest
@@ -29,6 +31,13 @@ from .cli_cmd_helpers import (
 )
 
 _SOURCE_CUDA_CONFIG_PATH = Path(__file__).parents[2] / "ci" / "cuda-versions.json"
+
+
+def _mock_jit_cache_provider_inventory(monkeypatch, *provider_tags):
+    monkeypatch.setattr(
+        "flashinfer.__main__._get_available_jit_cache_provider_tags",
+        lambda *_args, **_kwargs: tuple(provider_tags),
+    )
 
 
 def test_show_config_cmd_real():
@@ -161,6 +170,7 @@ def test_install_jit_cache_wheel_cmd_minimal_does_not_add_sm80(monkeypatch):
     monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "13.0")
     monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
     monkeypatch.setattr("flashinfer.__main__.subprocess.run", mock_run)
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm120f")
 
     out = _test_cmd_helper(
         [
@@ -197,6 +207,7 @@ def test_install_jit_cache_wheel_cmd_minimal_detects_visible_sm(monkeypatch):
         "TARGET_CUDA_ARCHS",
         {(9, "0a")},
     )
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm90a")
 
     out = _test_cmd_helper(
         ["install-jit-cache-wheel", "--mode", "minimal", "--dry-run"]
@@ -207,6 +218,34 @@ def test_install_jit_cache_wheel_cmd_minimal_detects_visible_sm(monkeypatch):
         "Providers: sm90a",
         "flashinfer-jit-cache-sm90a==0.4.1+cu129",
     )
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_install_jit_cache_wheel_cmd_minimal_uses_compatible_provider(
+    monkeypatch, explicit
+):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "13.0")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(
+        flashinfer_main.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(8, "6")},
+    )
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm80", "sm89")
+    args = ["install-jit-cache-wheel", "--mode", "minimal", "--dry-run"]
+    if explicit:
+        args.extend(["--sm", "sm86"])
+
+    out = _test_cmd_helper(args)
+
+    _assert_output_contains_all(
+        out,
+        "Providers: sm80",
+        "flashinfer-jit-cache-sm80==0.4.1+cu130",
+    )
+    assert "flashinfer-jit-cache-sm86" not in out
 
 
 def test_install_jit_cache_wheel_cmd_minimal_keeps_arch_specific_target_exact(
@@ -221,6 +260,7 @@ def test_install_jit_cache_wheel_cmd_minimal_keeps_arch_specific_target_exact(
         "TARGET_CUDA_ARCHS",
         {(12, "1a")},
     )
+    _mock_jit_cache_provider_inventory(monkeypatch, "sm120f", "sm121a")
 
     out = _test_cmd_helper(
         ["install-jit-cache-wheel", "--mode", "minimal", "--dry-run"]
@@ -232,6 +272,85 @@ def test_install_jit_cache_wheel_cmd_minimal_keeps_arch_specific_target_exact(
         "flashinfer-jit-cache-sm121a==0.4.1+cu130",
     )
     assert "flashinfer-jit-cache-sm120f" not in out
+
+
+@pytest.mark.parametrize(
+    ("target", "available", "expected"),
+    [
+        ("sm86", ("sm80", "sm89"), ("sm80",)),
+        ("sm107a", ("sm100f", "sm103f", "sm107f"), ("sm107f",)),
+        ("sm121a", ("sm120f", "sm121a"), ("sm121a",)),
+    ],
+)
+def test_select_jit_cache_provider_tags_prefers_best_available(
+    target, available, expected
+):
+    from flashinfer.__main__ import _select_jit_cache_provider_tags
+
+    assert _select_jit_cache_provider_tags((target,), available) == expected
+
+
+def test_read_jit_cache_provider_tags_from_shim_metadata(tmp_path):
+    from flashinfer.__main__ import _read_jit_cache_provider_tags
+
+    wheel = tmp_path / "flashinfer_jit_cache-0.4.1+cu134-py3-none-any.whl"
+    metadata = """\
+Metadata-Version: 2.4
+Name: flashinfer-jit-cache
+Version: 0.4.1+cu134
+Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
+Requires-Dist: flashinfer-jit-cache-sm107f==0.4.1+cu134
+
+"""
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("flashinfer_jit_cache-0.4.1.dist-info/METADATA", metadata)
+
+    assert _read_jit_cache_provider_tags(wheel, "0.4.1+cu134") == (
+        "sm107f",
+        "sm80",
+    )
+
+
+def test_get_available_jit_cache_provider_tags_downloads_only_shim(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    recorded = {}
+
+    def mock_run(cmd, **kwargs):
+        recorded["cmd"] = cmd
+        recorded["kwargs"] = kwargs
+        destination = Path(cmd[cmd.index("--dest") + 1])
+        wheel = destination / "flashinfer_jit_cache-0.4.1+cu134-py3-none-any.whl"
+        metadata = """\
+Metadata-Version: 2.4
+Name: flashinfer-jit-cache
+Version: 0.4.1+cu134
+Requires-Dist: flashinfer-jit-cache-sm80==0.4.1+cu134
+
+"""
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("flashinfer_jit_cache-0.4.1.dist-info/METADATA", metadata)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(flashinfer_main.subprocess, "run", mock_run)
+
+    assert flashinfer_main._get_available_jit_cache_provider_tags(
+        "flashinfer-jit-cache==0.4.1+cu134",
+        "0.4.1+cu134",
+        "https://example.invalid/cu134",
+        nightly=False,
+    ) == ("sm80",)
+    assert "--no-deps" in recorded["cmd"]
+    assert "--only-binary=:all:" in recorded["cmd"]
+    assert recorded["cmd"][-2:] == [
+        "https://example.invalid/cu134",
+        "flashinfer-jit-cache==0.4.1+cu134",
+    ]
+    assert recorded["kwargs"] == {
+        "check": False,
+        "capture_output": True,
+        "text": True,
+    }
 
 
 def test_install_cubin_wheel_cmd_nightly_dry_run(monkeypatch):
