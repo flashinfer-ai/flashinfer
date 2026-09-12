@@ -242,14 +242,12 @@ void pod_with_kv_cache_tensor(
                 GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
             tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
             tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
-            if (plan_info.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
-            }
           }
           params.padded_batch_size = plan_info.padded_batch_size;
           params.max_total_num_rows = plan_info.total_num_rows;
           if (plan_info.enable_cuda_graph) {
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
           }

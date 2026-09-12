@@ -223,14 +223,12 @@ void batch_pod_with_kv_cache_tensor(
                 GetPtrFromBaseOffset<IdType>(int_buffer_ptr_p, plan_info_p.merge_indptr_offset);
             tmp_v_p = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr_p, plan_info_p.v_offset);
             tmp_s_p = GetPtrFromBaseOffset<float>(float_buffer_ptr_p, plan_info_p.s_offset);
-            if (plan_info_p.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr_p, plan_info_p.block_valid_mask_offset);
-            }
           }
           params.padded_batch_size = plan_info_p.padded_batch_size;
           params.max_total_num_rows = plan_info_p.total_num_rows;
           if (plan_info_p.enable_cuda_graph) {
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_buffer_ptr_p, plan_info_p.block_valid_mask_offset);
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr_p, plan_info_p.total_num_rows_offset);
           }
@@ -301,14 +299,12 @@ void batch_pod_with_kv_cache_tensor(
                 GetPtrFromBaseOffset<IdType>(int_buffer_ptr_d, plan_info_d.merge_indptr_offset);
             tmp_v_d = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr_d, plan_info_d.v_offset);
             tmp_s_d = GetPtrFromBaseOffset<float>(float_buffer_ptr_d, plan_info_d.s_offset);
-            if (plan_info_d.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr_d, plan_info_d.block_valid_mask_offset);
-            }
           }
           params.padded_batch_size = plan_info_d.padded_batch_size;
           params.max_total_num_rows = plan_info_d.total_num_rows;
           if (plan_info_d.enable_cuda_graph) {
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_buffer_ptr_d, plan_info_d.block_valid_mask_offset);
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr_d, plan_info_d.total_num_rows_offset);
           }

@@ -2468,3 +2468,117 @@ def test_paged_prefill_split_kv_empty_chunk(dtype):
     assert not o.isnan().any() and not lse.isnan().any()
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("kv_cache", ["paged", "ragged"])
+def test_batch_prefill_cuda_graph_padding_without_split_kv(kv_cache):
+    """Under CUDA graphs the prefill kernels are launched over padded_batch_size
+    CTAs; the plan writes request / tile indices only for the real ones, and the
+    padding CTAs must be masked off whether or not the batch is split. The pinned
+    int workspace is poisoned before the plan so that an unmasked padding CTA
+    would read an absurd request index."""
+    page_size, batch_size, qo_len = 16, 4, 4
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    kv_lens = [64, 65, 127, 128]
+    paged = kv_cache == "paged"
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda:0",
+    )
+    qo_indptr = torch.arange(0, batch_size + 1).int() * qo_len
+
+    if paged:
+        pages = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+        kv_indptr = torch.tensor([0] + pages).int().cumsum(0).int()
+        kv_indices = torch.arange(0, sum(pages)).int()
+        kv_last_page_len = torch.tensor(
+            [(kv_len - 1) % page_size + 1 for kv_len in kv_lens]
+        ).int()
+        kv_data = torch.randn(
+            sum(pages),
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda:0",
+        )
+        graph_bufs = {
+            "qo_indptr_buf": qo_indptr.to(0),
+            "paged_kv_indptr_buf": kv_indptr.to(0),
+            "paged_kv_indices_buf": kv_indices.to(0),
+            "paged_kv_last_page_len_buf": kv_last_page_len.to(0),
+        }
+        plan_args = (
+            kv_indptr.to(0),
+            kv_indices.to(0),
+            kv_last_page_len.to(0),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+        )
+        run_args = (kv_data,)
+        cls = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper
+    else:
+        kv_indptr = torch.tensor([0] + kv_lens).int().cumsum(0).int()
+        k = torch.randn(
+            sum(kv_lens),
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda:0",
+        )
+        v = torch.randn_like(k)
+        graph_bufs = {
+            "qo_indptr_buf": qo_indptr.to(0),
+            "kv_indptr_buf": kv_indptr.to(0),
+        }
+        plan_args = (kv_indptr.to(0), num_qo_heads, num_kv_heads, head_dim)
+        run_args = (k, v)
+        cls = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper
+
+    def plan(wrapper):
+        wrapper.plan(
+            qo_indptr.to(0),
+            *plan_args,
+            causal=True,
+            disable_split_kv=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
+
+    def workspace():
+        return torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+
+    ref_wrapper = cls(workspace(), "NHD", backend="fa2")
+    plan(ref_wrapper)
+    o_ref = ref_wrapper.run(q, *run_args)
+
+    wrapper = cls(workspace(), "NHD", backend="fa2", use_cuda_graph=True, **graph_bufs)
+    wrapper._pin_memory_int_workspace_buffer.fill_(0x7F)
+    plan(wrapper)
+
+    # padded_batch_size is derived from the device's SM count, so whether a plan pads
+    # at all depends on the GPU. Say so rather than passing vacuously where it doesn't.
+    # Fields are positional, in PrefillPlanInfo::ToVector order (scheduler.cuh).
+    info = wrapper._plan_info
+    padded_batch_size = info[0]
+    block_valid_mask_offset = info[12]
+    enable_cuda_graph, split_kv = info[13], info[14]
+    # The unsplit path is the one under test; a split plan masks its padding already.
+    assert enable_cuda_graph and not split_kv
+    mask = wrapper._int_workspace_buffer[
+        block_valid_mask_offset : block_valid_mask_offset + padded_batch_size
+    ].bool()
+    if mask.all():
+        pytest.skip(
+            f"plan did not pad on this device (padded_batch_size={padded_batch_size})"
+        )
+
+    o = wrapper.run(q, *run_args)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
