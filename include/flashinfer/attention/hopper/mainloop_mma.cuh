@@ -30,7 +30,9 @@ CUTLASS_DEVICE void mma_f16(
     uint16_t* token_pos_in_items, const int num_kv_tiles_outside_items_window = 0,
     const int num_kv_tiles_prefix = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
-  using DTypeKV = typename Ktraits::DTypeKV;
+  // P is the A operand of the PV GEMM, so it is converted to the element type of the V tile in
+  // shared memory (DTypeKV for 16-bit KV, DTypeQ when an FP8 KV cache is dequantized on load).
+  using DTypeKVMma = typename Ktraits::DTypeKVMma;
   using IdType = typename Ktraits::IdType;
   using TileShape_QKD = typename Ktraits::TileShape_QKD;
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
@@ -172,7 +174,7 @@ CUTLASS_DEVICE void mma_f16(
   }
 
   attention_updater.update</*init=*/true>(tSrS);
-  Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
+  Tensor tOrP = make_tensor(convert_type<DTypeKVMma>(tSrS).data(),
                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
 
   constexpr int n_masking_steps = MULTIITEMSCORING ? (cute::ceil_div(CTA_Q, CTA_KV) + 1)
@@ -222,7 +224,7 @@ CUTLASS_DEVICE void mma_f16(
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
-    cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
+    cute::copy(make_tensor(convert_type<DTypeKVMma>(tSrS).data(),
                            convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
                tOrP);
   }
@@ -268,7 +270,7 @@ CUTLASS_DEVICE void mma_f16(
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
-    cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
+    cute::copy(make_tensor(convert_type<DTypeKVMma>(tSrS).data(),
                            convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
                tOrP);
   }
@@ -305,7 +307,7 @@ CUTLASS_DEVICE void mma_f16(
       pipeline_v.consumer_release(smem_pipe_read_v);  // release V
       ++smem_pipe_read_k;
       ++smem_pipe_read_v;
-      cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
+      cute::copy(make_tensor(convert_type<DTypeKVMma>(tSrS).data(),
                              convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
                  tOrP);
     }
