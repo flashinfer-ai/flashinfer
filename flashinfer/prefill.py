@@ -2448,6 +2448,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        self._head_dim_qk = head_dim_qk
+        self._head_dim_vo = head_dim_vo
 
         if use_inline_sf:
             assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
@@ -3202,6 +3204,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
+        if getattr(self, "_use_inline_sf", False):
+            # Inline FP8 KV scale stores each slot as [head_dim fp8][4B f32
+            # scale][pad to 16B], so the cache last dim is head_dim + 16.
+            if k_cache.shape[-1] != self._head_dim_qk + 16:
+                raise ValueError(
+                    f"use_inline_sf requires K cache last dim = head_dim_qk + 16 "
+                    f"({self._head_dim_qk + 16}), got {k_cache.shape[-1]}"
+                )
+            if v_cache.shape[-1] != self._head_dim_vo + 16:
+                raise ValueError(
+                    f"use_inline_sf requires V cache last dim = head_dim_vo + 16 "
+                    f"({self._head_dim_vo + 16}), got {v_cache.shape[-1]}"
+                )
+
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
         # For NVFP4 KV (uint8 packed), v_cache last dim is packed bytes
@@ -3953,6 +3969,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        self._head_dim_qk = head_dim_qk
+        self._head_dim_vo = head_dim_vo
 
         if use_inline_sf:
             assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
@@ -4605,6 +4623,20 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_sf, v_sf = kv_cache_sf
             else:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+
+        if getattr(self, "_use_inline_sf", False):
+            # Inline FP8 KV scale stores each slot as [head_dim fp8][4B f32
+            # scale][pad to 16B], so the cache last dim is head_dim + 16.
+            if k.shape[-1] != self._head_dim_qk + 16:
+                raise ValueError(
+                    f"use_inline_sf requires K last dim = head_dim_qk + 16 "
+                    f"({self._head_dim_qk + 16}), got {k.shape[-1]}"
+                )
+            if v.shape[-1] != self._head_dim_vo + 16:
+                raise ValueError(
+                    f"use_inline_sf requires V last dim = head_dim_vo + 16 "
+                    f"({self._head_dim_vo + 16}), got {v.shape[-1]}"
+                )
 
         # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
         # asymmetric QK/VO; q.shape[-1] assumed QK == VO). Gate on the packed

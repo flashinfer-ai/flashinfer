@@ -727,6 +727,10 @@ def single_decode_with_kv_cache(
             f"use_inline_sf requires KV last dim = head_dim + 16 "
             f"({head_dim + 16}), got {k.shape[-1]}"
         )
+        assert v.shape[-1] == head_dim + 16, (
+            f"use_inline_sf requires KV last dim = head_dim + 16 "
+            f"({head_dim + 16}), got {v.shape[-1]}"
+        )
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
     if sm_scale is None:
@@ -2288,6 +2292,23 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+
+        if getattr(self, "_use_inline_sf", False):
+            # Inline FP8 KV scale stores each slot as [head_dim fp8][4B f32
+            # scale][pad to 16B], so the cache last dim is head_dim + 16.
+            # Decode requires head_dim_qk == head_dim_vo, so both share q's
+            # head dim.
+            expected_slot = q.shape[-1] + 16
+            if k_cache.shape[-1] != expected_slot:
+                raise ValueError(
+                    f"use_inline_sf requires K cache last dim = head_dim + 16 "
+                    f"({expected_slot}), got {k_cache.shape[-1]}"
+                )
+            if v_cache.shape[-1] != expected_slot:
+                raise ValueError(
+                    f"use_inline_sf requires V cache last dim = head_dim + 16 "
+                    f"({expected_slot}), got {v_cache.shape[-1]}"
+                )
 
         if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
             if get_compute_capability(q.device) == (10, 7):

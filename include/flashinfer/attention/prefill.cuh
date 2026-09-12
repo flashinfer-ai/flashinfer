@@ -252,8 +252,8 @@ template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           bool ENABLE_FP4_REPACK = false, bool kEnableVOSplitOpt = false,
           bool kUseInlineScale = false,
-          bool kRepackEnabled = use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(
-              ENABLE_FP4_REPACK)>
+          bool kRepackEnabled =
+              use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK)>
 struct SharedStorageQKVO
     : KVScaleFactorSmem<DTypeKV, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO>,
       KVRepackSmem<DTypeQ, DTypeKV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO,
@@ -362,17 +362,16 @@ struct SharedStorageWithRopeFreq : BaseStorage {
   alignas(16) float rope_freq_smem[4][NUM_ROPE_FREQ_ROWS][4];
 };
 
-template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_,
-          uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
-          uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
-          typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
-          typename AttentionVariant_,
-          // Defaults to the variant that allocates no staging buffer. The FA2 prefill launchers
-          // pass this explicitly; every other instantiation of KernelTraits (pod, batch_pod,
-          // persistent) has neither a repack call site nor the staging term in its shared-memory
-          // budget, so a default of true would make those paths reserve a buffer they never read.
-          bool ENABLE_FP4_REPACK_ = false, bool USE_INLINE_SF_ = false,
-          bool FORCE_DISABLE_REPACK = false>
+template <
+    MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_,
+    uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_, uint32_t NUM_WARPS_KV_,
+    PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_,
+    typename DTypeQKAccum_, typename IdType_, typename AttentionVariant_,
+    // Defaults to the variant that allocates no staging buffer. The FA2 prefill launchers
+    // pass this explicitly; every other instantiation of KernelTraits (pod, batch_pod,
+    // persistent) has neither a repack call site nor the staging term in its shared-memory
+    // budget, so a default of true would make those paths reserve a buffer they never read.
+    bool ENABLE_FP4_REPACK_ = false, bool USE_INLINE_SF_ = false, bool FORCE_DISABLE_REPACK = false>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
@@ -3322,9 +3321,9 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODI
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream) {
-#define FLASHINFER_SINGLE_PREFILL_CALL(EN)                                                    \
-  (SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,        \
-                                          USE_FP16_QK_REDUCTION, MASK_MODE, USE_INLINE_SF,   \
+#define FLASHINFER_SINGLE_PREFILL_CALL(EN)                                                 \
+  (SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,     \
+                                          USE_FP16_QK_REDUCTION, MASK_MODE, USE_INLINE_SF, \
                                           AttentionVariant, Params, EN>(params, tmp, stream))
   // Single prefill dispatches CTA_TILE_Q inside the Impl, so the eligibility probe here uses a
   // CTA that can be repack-eligible: it answers "could any CTA tile in this specialization take
@@ -5077,12 +5076,10 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                     float* tmp_s, bool enable_pdl,
                                                     cudaStream_t stream) {
-#define FLASHINFER_RAGGED_PREFILL_CALL(EN)                                               \
-  (BatchPrefillWithRaggedKVCacheDispatchedImpl<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,     \
-                                               POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, \
-                                               MASK_MODE, USE_INLINE_SF,                 \
-                                               AttentionVariant, Params, EN>(params,     \
-      tmp_v, tmp_s, enable_pdl, stream))
+#define FLASHINFER_RAGGED_PREFILL_CALL(EN)                                                       \
+  (BatchPrefillWithRaggedKVCacheDispatchedImpl<                                                  \
+      CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, \
+      USE_INLINE_SF, AttentionVariant, Params, EN>(params, tmp_v, tmp_s, enable_pdl, stream))
   FLASHINFER_DISPATCH_FP4_REPACK(typename Params::DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
                                  FLASHINFER_RAGGED_PREFILL_CALL)
 #undef FLASHINFER_RAGGED_PREFILL_CALL
@@ -5326,10 +5323,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                    cudaStream_t stream) {
 #define FLASHINFER_PAGED_PREFILL_CALL(EN)                                                          \
   (BatchPrefillWithPagedKVCacheDispatchedImpl<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,                \
-                                              POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,            \
-                                              MASK_MODE, USE_INLINE_SF,                            \
-                                              AttentionVariant, Params, EN>(params, tmp_v, tmp_s,  \
-                                                                            enable_pdl, stream))
+                                              POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, \
+                                              USE_INLINE_SF, AttentionVariant, Params, EN>(        \
+      params, tmp_v, tmp_s, enable_pdl, stream))
   FLASHINFER_DISPATCH_FP4_REPACK(typename Params::DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
                                  FLASHINFER_PAGED_PREFILL_CALL)
 #undef FLASHINFER_PAGED_PREFILL_CALL

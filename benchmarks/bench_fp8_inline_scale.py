@@ -104,11 +104,13 @@ def main():
     num_qo = num_kv_heads if not gqa else 2 * num_kv_heads
 
     def conv(x_ref):
-        # Apply the KV config to a reference tensor.
+        # Apply the KV config to a reference tensor. All configs store the same
+        # effective KV values (x_ref) so the ratios isolate the inline-scale
+        # overhead; the fp8_tensor calibration scales stay at their 1.0 default.
         if is_inline:
             return make_slot(x_ref, fp8, head_dim)
         if is_fp8:
-            return (x_ref / 10).to(fp8)
+            return x_ref.to(fp8)
         return x_ref
 
     def ragged_kv(n):
