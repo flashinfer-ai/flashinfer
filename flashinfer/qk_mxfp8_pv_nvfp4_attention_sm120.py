@@ -364,7 +364,8 @@ def qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
     unpadded_q_len : Optional[int], optional
         Logical query sequence length. This is required for correctly aligned
         causal masking when Q was padded by the quantization helper. Defaults
-        to the physical ``M_pad`` extent.
+        to the physical ``M_pad`` extent. It must be zero when ``M_pad`` is
+        zero and positive otherwise.
     unpadded_k_len : Optional[int], optional
         Logical K/V sequence length. Values at or beyond this position are
         masked before softmax. Defaults to the physical ``N_pad`` extent for
@@ -390,9 +391,13 @@ def qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
         raise ValueError(
             f"unpadded_q_len must be an integer or None, got {unpadded_q_len!r}"
         )
-    if not 0 < unpadded_q_len <= seq_len_q:
+    valid_q_len = (seq_len_q == 0 and unpadded_q_len == 0) or (
+        seq_len_q > 0 and 0 < unpadded_q_len <= seq_len_q
+    )
+    if not valid_q_len:
         raise ValueError(
-            f"unpadded_q_len must satisfy 0 < unpadded_q_len <= {seq_len_q}, "
+            "unpadded_q_len must be zero when the physical Q sequence length "
+            f"is zero, or satisfy 0 < unpadded_q_len <= {seq_len_q}; "
             f"got {unpadded_q_len}"
         )
 

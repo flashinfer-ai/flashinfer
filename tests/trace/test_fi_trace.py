@@ -190,11 +190,13 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_trace_output_dtype_precedence():
     assert default_defn["inputs"]["unpadded_k_len"]["dtype"] == "int32"
 
     alias_kwargs = dict(kwargs)
-    alias_kwargs["softmax_scale"] = alias_kwargs.pop("sm_scale")
+    alias_kwargs["softmax_scale"] = torch.tensor(
+        alias_kwargs.pop("sm_scale"), dtype=torch.float16
+    )
     alias_defn = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd.fi_trace(
         **alias_kwargs
     )
-    assert alias_defn["inputs"]["softmax_scale"]["dtype"] == "float32"
+    assert alias_defn["inputs"]["softmax_scale"]["dtype"] == "float16"
 
     dtype_defn = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd.fi_trace(
         **kwargs, out_dtype=torch.float16

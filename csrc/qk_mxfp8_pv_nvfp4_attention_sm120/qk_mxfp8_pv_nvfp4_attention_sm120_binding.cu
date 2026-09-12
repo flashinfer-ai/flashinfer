@@ -221,9 +221,14 @@ void fwd(TensorView q_fp8, TensorView k_fp8, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK_EQ(head_dim, 128) << "head_dim must be 128";
   TVM_FFI_ICHECK_EQ(seq_len_q % 128, 0) << "Q sequence length must be a multiple of 128";
   TVM_FFI_ICHECK_EQ(seq_len_k % 128, 0) << "K/V sequence length must be a multiple of 128";
-  TVM_FFI_ICHECK_GT(unpadded_q_len, 0) << "unpadded_q_len must be positive";
-  TVM_FFI_ICHECK_LE(unpadded_q_len, seq_len_q)
-      << "unpadded_q_len must not exceed the physical Q sequence length";
+  if (seq_len_q == 0) {
+    TVM_FFI_ICHECK_EQ(unpadded_q_len, 0)
+        << "unpadded_q_len must be zero when the physical Q sequence length is zero";
+  } else {
+    TVM_FFI_ICHECK_GT(unpadded_q_len, 0) << "unpadded_q_len must be positive";
+    TVM_FFI_ICHECK_LE(unpadded_q_len, seq_len_q)
+        << "unpadded_q_len must not exceed the physical Q sequence length";
+  }
   TVM_FFI_ICHECK_GT(unpadded_k_len, 0) << "unpadded_k_len must be positive";
   TVM_FFI_ICHECK_LE(unpadded_k_len, seq_len_k)
       << "unpadded_k_len must not exceed the physical K/V sequence length";

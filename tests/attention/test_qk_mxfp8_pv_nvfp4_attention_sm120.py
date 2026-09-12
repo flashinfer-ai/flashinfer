@@ -344,6 +344,8 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_rejects_invalid_lengths():
     quantized = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv(q, k, v)
 
     with pytest.raises(ValueError, match="unpadded_q_len"):
+        flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(*quantized, unpadded_q_len=0)
+    with pytest.raises(ValueError, match="unpadded_q_len"):
         flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(*quantized, unpadded_q_len=129)
     with pytest.raises(ValueError, match="unpadded_k_len"):
         flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(*quantized, unpadded_k_len=0)
@@ -355,6 +357,35 @@ def test_qk_mxfp8_pv_nvfp4_attention_sm120_rejects_invalid_lengths():
     empty = torch.empty((1, 4, 0, 128), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="sequence lengths must be positive"):
         flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv(empty, empty, empty)
+
+
+@torch.inference_mode()
+def test_qk_mxfp8_pv_nvfp4_attention_sm120_empty_prequantized_q():
+    _require_sm120()
+    device = torch.device("cuda")
+    q_fp8 = torch.empty((1, 4, 0, 128), device=device, dtype=torch.float8_e4m3fn)
+    k_fp8 = torch.empty((1, 2, 128, 128), device=device, dtype=torch.float8_e4m3fn)
+    v_fp4_t = torch.empty((1, 2, 128, 64), device=device, dtype=torch.uint8)
+    q_scale = torch.empty((1, 4, 0, 4), device=device, dtype=torch.uint8)
+    k_scale = torch.empty((1, 2, 128, 4), device=device, dtype=torch.uint8)
+    v_scale_t = torch.empty((1, 2, 128, 8), device=device, dtype=torch.float8_e4m3fn)
+
+    out, lse = flashinfer.qk_mxfp8_pv_nvfp4_attention_sm120_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp4_t,
+        q_scale,
+        k_scale,
+        v_scale_t,
+        return_lse=True,
+        unpadded_q_len=0,
+        unpadded_k_len=128,
+    )
+
+    assert out.shape == (1, 4, 0, 128)
+    assert lse.shape == (1, 4, 0)
+    assert out.numel() == 0
+    assert lse.numel() == 0
 
 
 @torch.inference_mode()
