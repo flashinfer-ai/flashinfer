@@ -811,7 +811,9 @@ def _require_prims_ts_block_sparse_wrapper_state(
 def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
     """Trace a planned contiguous block-sparse wrapper run."""
 
-    state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
+    state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BatchDecodeTSWrapper")
+    if not getattr(state, "use_block_sparse", True):
+        raise NotImplementedError("dense contiguous decode has no trace template")
     route_mode = (
         state.sparse_format,  # type: ignore[attr-defined]
         state.use_proxy_routes,  # type: ignore[attr-defined]

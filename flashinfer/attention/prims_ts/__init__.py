@@ -15,6 +15,7 @@
 """Experimental task-scheduled attention entry points."""
 
 from .block_sparse import (
+    BatchDecodeTSWrapper,
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
     block_sparse_attention,
@@ -38,8 +39,11 @@ from .mla_decode import (
     get_prims_ts_batch_mla_decode_workspace_size,
     prims_ts_batch_mla_decode_with_kv_cache,
 )
+from .sage import SageAttentionParams
 
 __all__ = [
+    "BatchDecodeTSWrapper",
+    "SageAttentionParams",
     "BlockSparseTSWrapper",
     "BlockSparsePagedTSWrapper",
     "block_sparse_attention",

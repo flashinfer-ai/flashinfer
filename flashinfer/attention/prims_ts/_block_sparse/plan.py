@@ -24,6 +24,8 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from ..decode import _dtype_key
+from ..sage import SageAttentionParams
 from .common import _SIGNED_INT32_MAX, _block_sparse_proxy_summary_geometry
 from .compiler import _get_compiled_block_sparse
 from .config import (
@@ -31,6 +33,7 @@ from .config import (
     _resolve_block_sparse_launch_spec,
 )
 from .prepared import _BlockSparseRouteLayout
+from .runtime import sage_launch_args, sage_scale_tensors
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -85,6 +88,7 @@ class _BlockSparsePlanState:
     cannot prevent in-place modification or replace graph ownership.
     """
 
+    use_block_sparse: bool
     sparse_format: Literal["bsr", "bitmask"]
     use_proxy_routes: bool
     device: torch.device
@@ -98,19 +102,26 @@ class _BlockSparsePlanState:
     kv_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    # The resolved V dtype (the K dtype unless the plan named another one).
+    value_dtype: torch.dtype
     output_dtype: torch.dtype
     use_kv_valid_bits: bool
     page_size: int | None
+    # Physical Q tile selected by the plan; Sage validation bounds the Q scale
+    # block size by it.
+    tile_size_q: int
 
-    # Only an unmasked specialization needs a shape-correct ABI placeholder.
+    # Only an unmasked block-sparse specialization needs a shape-correct ABI
+    # placeholder. A dense contiguous plan runs without a prepare kernel and
+    # owns neither the placeholder nor any route storage.
     dummy_kv_valid_bits: torch.Tensor | None
 
     # Immutable row capacities and mutable per-run route payload.
-    row_route_offsets: torch.Tensor
-    route_workspace: torch.Tensor
+    row_route_offsets: torch.Tensor | None
+    route_workspace: torch.Tensor | None
     # Semantic row bound; unlike route capacity, this distinguishes
     # multiple semantic blocks packed into one prepared route.
-    max_blocks_per_row: int
+    max_blocks_per_row: int | None
 
     policy: tuple[tuple[str, object], ...]
     compiled: Callable[..., object]
@@ -118,6 +129,23 @@ class _BlockSparsePlanState:
     # All plan-stream work happens-before run after waiting on this event.
     ready_event: torch.cuda.Event
     ready_stream_handle: int
+
+    # Sage attention scales bound at plan time; ``run()`` validates the tensors
+    # again before every launch. The launch tuple is in adapter ABI order and
+    # the named tuple lists the live tensors whose lifetime and overlap the
+    # runs track; both are empty without Sage.
+    sage: SageAttentionParams | None = None
+    sage_launch_args: tuple[torch.Tensor, ...] = ()
+    sage_tensors: tuple[tuple[str, torch.Tensor], ...] = ()
+
+
+@dataclass(frozen=True)
+class _BlockSparseRouteState:
+    """Plan-owned prepare-kernel storage; absent from a dense contiguous plan."""
+
+    dummy_kv_valid_bits: torch.Tensor | None
+    row_route_offsets: torch.Tensor
+    route_workspace: torch.Tensor
 
 
 def _allocate_dummy_kv_valid_bits(
@@ -176,20 +204,14 @@ def _record_block_sparse_plan_ready_event(
     return event
 
 
-def _build_block_sparse_plan_state(
+def _resolve_route_capacity(
     static: _BlockSparseStaticProfile,
     *,
-    device: torch.device,
-    device_index: int,
-    plan_stream: torch.cuda.Stream,
-    sparse_format: Literal["bsr", "bitmask"] = "bsr",
-    use_proxy_routes: bool = False,
-) -> _BlockSparsePlanState:
-    """Build one format- and route-specialized plan atomically."""
+    use_proxy_routes: bool,
+) -> tuple[int, int]:
+    """Return ``(max_row_route_capacity, num_rows)`` a block-sparse plan owns."""
 
     assert static.max_blocks_per_row is not None
-    if static.page_size is not None:
-        assert sparse_format == "bsr" and not use_proxy_routes
     num_rows = (
         static.batch_size
         * static.num_kv_heads
@@ -207,6 +229,66 @@ def _build_block_sparse_plan_state(
             static.kv_block_size,
         )
         max_row_route_capacity += ceil_div(num_summaries, static.kv_route_size)
+    return max_row_route_capacity, num_rows
+
+
+def _allocate_route_state(
+    static: _BlockSparseStaticProfile,
+    *,
+    max_row_route_capacity: int,
+    num_rows: int,
+    device: torch.device,
+    prepares_score_words: bool,
+) -> _BlockSparseRouteState:
+    """Allocate the mask placeholder and route storage owned by one revision."""
+
+    route_layout = _BlockSparseRouteLayout.create(
+        kv_route_size=static.kv_route_size,
+        kv_block_size=static.kv_block_size,
+        page_size=static.page_size,
+        has_token_bits=prepares_score_words,
+        route_metadata_capacity=num_rows * max_row_route_capacity,
+        num_rows=num_rows,
+    )
+    dummy_kv_valid_bits = None
+    if not static.use_kv_valid_bits:
+        dummy_kv_valid_bits = _allocate_dummy_kv_valid_bits(
+            batch_size=static.batch_size,
+            seq_len_kv=static.seq_len_kv,
+            device=device,
+        )
+    row_route_offsets, route_workspace = _allocate_route_storage(
+        device=device,
+        route_layout=route_layout,
+        uniform_row_route_capacity=max_row_route_capacity,
+    )
+    return _BlockSparseRouteState(
+        dummy_kv_valid_bits=dummy_kv_valid_bits,
+        row_route_offsets=row_route_offsets,
+        route_workspace=route_workspace,
+    )
+
+
+def _build_block_sparse_plan_state(
+    static: _BlockSparseStaticProfile,
+    *,
+    device: torch.device,
+    device_index: int,
+    plan_stream: torch.cuda.Stream,
+    sparse_format: Literal["bsr", "bitmask"] = "bsr",
+    use_proxy_routes: bool = False,
+    use_block_sparse: bool = True,
+    sage: SageAttentionParams | None = None,
+) -> _BlockSparsePlanState:
+    """Build one format- and route-specialized plan atomically."""
+
+    if static.page_size is not None:
+        assert sparse_format == "bsr" and not use_proxy_routes
+    max_row_route_capacity, num_rows = (
+        _resolve_route_capacity(static, use_proxy_routes=use_proxy_routes)
+        if use_block_sparse
+        else (0, 0)
+    )
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
             device_index=device_index,
@@ -226,37 +308,33 @@ def _build_block_sparse_plan_state(
             max_row_route_capacity=max_row_route_capacity,
             sparse_format=sparse_format,
             use_proxy_routes=use_proxy_routes,
-        )
-        policy = (
-            *spec.policy,
-            ("max_blocks_per_row", static.max_blocks_per_row),
-        )
-        route_layout = _BlockSparseRouteLayout.create(
-            kv_route_size=static.kv_route_size,
-            kv_block_size=static.kv_block_size,
-            page_size=static.page_size,
-            has_token_bits=spec.prepares_score_words,
-            route_metadata_capacity=num_rows * max_row_route_capacity,
-            num_rows=num_rows,
+            use_block_sparse=use_block_sparse,
+            out_dtype_key=(None if sage is None else _dtype_key(static.output_dtype)),
+            v_dtype_key=(
+                None
+                if static.value_dtype == static.kv_dtype
+                else _dtype_key(static.value_dtype)
+            ),
+            sage_q_block_size=static.sage_q_block_size,
+            sage_k_block_size=static.sage_k_block_size,
+            sage_v_mean=static.sage_v_mean,
         )
         compiled = _get_compiled_block_sparse(spec.compile_key)
-        dummy_kv_valid_bits = (
-            None
-            if static.use_kv_valid_bits
-            else _allocate_dummy_kv_valid_bits(
-                batch_size=static.batch_size,
-                seq_len_kv=static.seq_len_kv,
+        routes = (
+            _allocate_route_state(
+                static,
+                max_row_route_capacity=max_row_route_capacity,
+                num_rows=num_rows,
                 device=device,
+                prepares_score_words=spec.prepares_score_words,
             )
-        )
-        row_route_offsets, route_workspace = _allocate_route_storage(
-            device=device,
-            route_layout=route_layout,
-            uniform_row_route_capacity=max_row_route_capacity,
+            if use_block_sparse
+            else None
         )
         ready_event = _record_block_sparse_plan_ready_event(plan_stream)
 
     return _BlockSparsePlanState(
+        use_block_sparse=use_block_sparse,
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         device=device,
@@ -270,17 +348,22 @@ def _build_block_sparse_plan_state(
         kv_block_size=static.kv_block_size,
         q_dtype=static.q_dtype,
         kv_dtype=static.kv_dtype,
+        value_dtype=static.value_dtype,
         output_dtype=static.output_dtype,
         use_kv_valid_bits=static.use_kv_valid_bits,
         page_size=static.page_size,
-        dummy_kv_valid_bits=dummy_kv_valid_bits,
-        row_route_offsets=row_route_offsets,
-        route_workspace=route_workspace,
+        tile_size_q=static.q_tile_size,
+        dummy_kv_valid_bits=None if routes is None else routes.dummy_kv_valid_bits,
+        row_route_offsets=None if routes is None else routes.row_route_offsets,
+        route_workspace=None if routes is None else routes.route_workspace,
         max_blocks_per_row=static.max_blocks_per_row,
-        policy=policy,
+        policy=(*spec.policy, ("max_blocks_per_row", static.max_blocks_per_row)),
         compiled=compiled,
         ready_event=ready_event,
         ready_stream_handle=plan_stream.cuda_stream,
+        sage=sage,
+        sage_launch_args=sage_launch_args(sage),
+        sage_tensors=sage_scale_tensors(sage),
     )
 
 
@@ -297,14 +380,19 @@ def _wait_and_record_block_sparse_plan(
 
     if state.dummy_kv_valid_bits is not None:
         state.dummy_kv_valid_bits.record_stream(stream)
-    state.row_route_offsets.record_stream(stream)
-    state.route_workspace.record_stream(stream)
+    if state.row_route_offsets is not None:
+        state.row_route_offsets.record_stream(stream)
+    if state.route_workspace is not None:
+        state.route_workspace.record_stream(stream)
 
 
 __all__ = [
     "_BlockSparsePlanState",
+    "_BlockSparseRouteState",
     "_allocate_dummy_kv_valid_bits",
+    "_allocate_route_state",
     "_allocate_route_storage",
+    "_resolve_route_capacity",
     "_build_block_sparse_plan_state",
     "_record_block_sparse_plan_ready_event",
     "_serialize_plan",

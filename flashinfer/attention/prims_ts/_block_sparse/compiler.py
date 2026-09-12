@@ -21,10 +21,268 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from ..sage import flat_scale_numel
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
+
+
+def _make_sage_launch_kwargs():
+    """Return the JIT helper that turns Sage scale tensors into launch kwargs.
+
+    The helper is built lazily so the module imports without ``cutlass``.
+    The adapter signature always carries the V mean slot; without
+    ``sage_v_mean`` the kernel never reads the pointer, and the host binds
+    ``v_scale`` to the slot (``sage_v_mean_launch_tensor``).
+    """
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
+
+    @cute.jit
+    def sage_launch_kwargs(
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        k_summary_scale: cute.Tensor | None = None,
+    ) -> dict:
+        # Scale tensors are [heads, flat slots]; the head stride is the flat
+        # slot count of one head.
+        kwargs = {
+            "q_scale_iter": q_scale.iterator,
+            "k_scale_iter": k_scale.iterator,
+            "v_scale_iter": v_scale.iterator,
+            "v_mean_iter": v_mean.iterator,
+            "q_scale_head_stride": cutlass.Int32(q_scale.shape[1]),
+            "k_scale_head_stride": cutlass.Int32(k_scale.shape[1]),
+        }
+        if cutlass.const_expr(static_config.use_block_sparse_proxy_routes):
+            kwargs["k_summary_scale_iter"] = k_summary_scale.iterator
+            kwargs["k_summary_scale_head_stride"] = cutlass.Int32(
+                k_summary_scale.shape[1]
+            )
+        return kwargs
+
+    return sage_launch_kwargs
+
+
+def _compile_dense_contiguous(key: _BlockSparseCompileKey) -> Callable[..., object]:
+    """Compile one contiguous BSHD attention adapter without route preparation.
+
+    The dense branch consumes the same public ``[B, S, H, D]`` Q/K/V tensors as
+    the sparse branch and reaches the decode kernel directly, so no prepare
+    kernel, route workspace, or token-mask ABI takes part in the launch.
+    """
+
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda_drv
+
+    from ..kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
+    from ..kernels.fmha_decode.fmha_decode_kernel import fmha_decode_launch
+
+    config = _make_block_sparse_config(key)
+    Int32 = cutlass.Int32
+    Float32 = cutlass.Float32
+    sage_launch_kwargs = _make_sage_launch_kwargs()
+
+    @cute.jit
+    def launch_dense(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+        q_scale: cute.Tensor | None = None,
+        k_scale: cute.Tensor | None = None,
+        v_scale: cute.Tensor | None = None,
+        v_mean: cute.Tensor | None = None,
+    ) -> None:
+        null_i32 = cute.make_ptr(Int32, 0, mem_space=cutlass.AddressSpace.gmem)
+        null_f32 = cute.make_ptr(Float32, 0, mem_space=cutlass.AddressSpace.gmem)
+        sage_kwargs = {}
+        if cutlass.const_expr(static_config.use_sage_attention):
+            sage_kwargs = sage_launch_kwargs(
+                static_config, q_scale, k_scale, v_scale, v_mean
+            )
+        fmha_decode_launch(
+            (
+                Int32(static_batch_size),
+                Int32(static_num_qo_heads),
+                Int32(static_num_kv_heads),
+                Int32(static_seq_len_kv),
+                Int32(static_head_dim),
+            ),
+            q.iterator,
+            k.iterator,
+            v.iterator,
+            out.iterator,
+            null_i32,  # seqlens_kv
+            null_i32,  # cu_seqlens_q
+            Int32(0),  # total_q_tokens
+            null_i32,  # page_idx_kv
+            out.iterator,  # partial_o
+            null_f32,  # partial_stats
+            null_i32,  # split_kv_counter
+            null_f32,  # attention_sinks
+            sm_scale,
+            Float32(1.0),  # output_scale
+            Int32(
+                static_seq_len_kv * static_num_kv_heads * static_head_dim
+            ),  # kv_b_stride
+            Int32(0),  # max_active_clusters
+            stream,
+            static_config,
+            static_seq_len_kv,
+            # Contiguous K/V has no page table; the kernel parameters behind
+            # these launcher arguments are typed, so pass typed zeros rather
+            # than relying on the launcher's literal defaults.
+            block_table_capacity=Int32(0),
+            block_table_row_stride=cutlass.Int64(0),
+            num_physical_kv_pages=cutlass.Int64(0),
+            k_page_stride=cutlass.Int64(0),
+            v_page_stride=cutlass.Int64(0),
+            **sage_kwargs,
+        )
+
+    @cute.jit
+    def dense_contiguous_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        launch_dense(
+            q,
+            k,
+            v,
+            out,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+        )
+
+    @cute.jit
+    def dense_contiguous_sage_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        launch_dense(
+            q,
+            k,
+            v,
+            out,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            v_mean=v_mean,
+        )
+
+    def fake_compact(dtype: object, shape: tuple[object, ...]) -> object:
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=16,
+        )
+
+    q_shape = (key.batch_size, key.seq_len_q, key.num_qo_heads, key.head_dim)
+    kv_shape = (key.batch_size, key.seq_len_kv, key.num_kv_heads, key.head_dim)
+    tensor_fakes = [
+        fake_compact(config.q_dtype, q_shape),
+        fake_compact(config.kv_dtype, kv_shape),
+        fake_compact(config.value_dtype, kv_shape),
+        fake_compact(config.out_dtype, q_shape),
+    ]
+    adapter = dense_contiguous_adapter
+    if config.use_sage_attention:
+        adapter = dense_contiguous_sage_adapter
+        v_scale_shape = (key.num_kv_heads, key.head_dim)
+        tensor_fakes.extend(
+            (
+                fake_compact(
+                    cutlass.Float32,
+                    (
+                        key.num_qo_heads,
+                        flat_scale_numel(
+                            key.batch_size, key.seq_len_q, key.sage_q_block_size
+                        ),
+                    ),
+                ),
+                fake_compact(
+                    cutlass.Float32,
+                    (
+                        key.num_kv_heads,
+                        flat_scale_numel(
+                            key.batch_size, key.seq_len_kv, key.sage_k_block_size
+                        ),
+                    ),
+                ),
+                fake_compact(cutlass.Float32, v_scale_shape),
+                fake_compact(cutlass.Float32, v_scale_shape),
+            )
+        )
+    with torch.cuda.device(key.device_index):
+        return cute.compile(
+            adapter,
+            *tensor_fakes,
+            Float32(1.0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            config,
+            key.batch_size,
+            key.seq_len_kv,
+            key.num_qo_heads,
+            key.num_kv_heads,
+            key.head_dim,
+            options=_COMPILE_OPTIONS,
+        )
 
 
 def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
@@ -73,6 +331,65 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     Int32 = cutlass.Int32
     Int64 = cutlass.Int64
     Float32 = cutlass.Float32
+    sage_launch_kwargs = _make_sage_launch_kwargs()
+
+    @cute.jit
+    def launch_prepared(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        k_summary: cute.Tensor,
+        v_summary: cute.Tensor,
+        out: cute.Tensor,
+        route_workspace: cute.Tensor,
+        row_route_offsets: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+        q_scale: cute.Tensor | None = None,
+        k_scale: cute.Tensor | None = None,
+        k_summary_scale: cute.Tensor | None = None,
+        v_scale: cute.Tensor | None = None,
+        v_mean: cute.Tensor | None = None,
+    ) -> None:
+        """Launch attention over the prepared routes of ``route_workspace``.
+
+        Exact routes pass K/V as their own summaries. Live per-row route
+        counts occupy the first words of the run scratch.
+        """
+        sage_kwargs = {}
+        if cutlass.const_expr(static_config.use_sage_attention):
+            sage_kwargs = sage_launch_kwargs(
+                static_config, q_scale, k_scale, v_scale, v_mean, k_summary_scale
+            )
+        fmha_block_sparse_launch(
+            (
+                Int32(static_batch_size),
+                Int32(static_num_qo_heads),
+                Int32(static_num_kv_heads),
+                Int32(static_seq_len_kv),
+                Int32(static_head_dim),
+            ),
+            q.iterator,
+            k.iterator,
+            v.iterator,
+            k_summary.iterator,
+            v_summary.iterator,
+            out.iterator,
+            row_route_offsets.iterator,
+            route_workspace.iterator,
+            route_workspace.iterator + Int32(route_metadata_base),
+            sm_scale,
+            stream,
+            static_config,
+            static_seq_len_kv,
+            **sage_kwargs,
+        )
 
     @cute.jit
     def exact_bsr_adapter(
@@ -108,30 +425,84 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             max_blocks_per_row,
             stream,
         )
-        # Live per-row route counts occupy the first words of run scratch.
-        row_route_counts = route_workspace.iterator
-        route_metadata = route_workspace.iterator + Int32(route_metadata_base)
-        fmha_block_sparse_launch(
-            (
-                Int32(static_batch_size),
-                Int32(static_num_qo_heads),
-                Int32(static_num_kv_heads),
-                Int32(static_seq_len_kv),
-                Int32(static_head_dim),
-            ),
-            q.iterator,
-            k.iterator,
-            v.iterator,
-            k.iterator,
-            v.iterator,
-            out.iterator,
-            row_route_offsets.iterator,
-            row_route_counts,
-            route_metadata,
+        launch_prepared(
+            q,
+            k,
+            v,
+            k,
+            v,
+            out,
+            route_workspace,
+            row_route_offsets,
             sm_scale,
             stream,
             static_config,
+            static_batch_size,
             static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+        )
+
+    @cute.jit
+    def exact_bsr_sage_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        block_indptr: cute.Tensor,
+        block_indices: cute.Tensor,
+        kv_valid_bits: cute.Tensor,
+        row_route_offsets: cute.Tensor,
+        route_workspace: cute.Tensor,
+        max_blocks_per_row: cutlass.Int32,
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        prepare_routes(
+            block_indptr,
+            block_indices,
+            kv_valid_bits,
+            None,
+            None,
+            None,
+            Int64(0),
+            row_route_offsets,
+            route_workspace,
+            max_blocks_per_row,
+            stream,
+        )
+        launch_prepared(
+            q,
+            k,
+            v,
+            k,
+            v,
+            out,
+            route_workspace,
+            row_route_offsets,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            v_mean=v_mean,
         )
 
     @cute.jit
@@ -162,27 +533,78 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             max_blocks_per_row,
             stream,
         )
-        fmha_block_sparse_launch(
-            (
-                Int32(static_batch_size),
-                Int32(static_num_qo_heads),
-                Int32(static_num_kv_heads),
-                Int32(static_seq_len_kv),
-                Int32(static_head_dim),
-            ),
-            q.iterator,
-            k.iterator,
-            v.iterator,
-            k.iterator,
-            v.iterator,
-            out.iterator,
-            row_route_offsets.iterator,
-            route_workspace.iterator,
-            route_workspace.iterator + Int32(route_metadata_base),
+        launch_prepared(
+            q,
+            k,
+            v,
+            k,
+            v,
+            out,
+            route_workspace,
+            row_route_offsets,
             sm_scale,
             stream,
             static_config,
+            static_batch_size,
             static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+        )
+
+    @cute.jit
+    def exact_bitmask_sage_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        out: cute.Tensor,
+        exact_block_bits: cute.Tensor,
+        kv_valid_bits: cute.Tensor,
+        row_route_offsets: cute.Tensor,
+        route_workspace: cute.Tensor,
+        max_blocks_per_row: cutlass.Int32,
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        prepare_routes(
+            exact_block_bits,
+            kv_valid_bits,
+            row_route_offsets,
+            route_workspace,
+            max_blocks_per_row,
+            stream,
+        )
+        launch_prepared(
+            q,
+            k,
+            v,
+            k,
+            v,
+            out,
+            route_workspace,
+            row_route_offsets,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            v_mean=v_mean,
         )
 
     @cute.jit
@@ -221,27 +643,88 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             max_blocks_per_row,
             stream,
         )
-        fmha_block_sparse_launch(
-            (
-                Int32(static_batch_size),
-                Int32(static_num_qo_heads),
-                Int32(static_num_kv_heads),
-                Int32(static_seq_len_kv),
-                Int32(static_head_dim),
-            ),
-            q.iterator,
-            k.iterator,
-            v.iterator,
-            k_summary.iterator,
-            v_summary.iterator,
-            out.iterator,
-            row_route_offsets.iterator,
-            route_workspace.iterator,
-            route_workspace.iterator + Int32(route_metadata_base),
+        launch_prepared(
+            q,
+            k,
+            v,
+            k_summary,
+            v_summary,
+            out,
+            route_workspace,
+            row_route_offsets,
             sm_scale,
             stream,
             static_config,
+            static_batch_size,
             static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+        )
+
+    @cute.jit
+    def proxy_bsr_sage_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        k_summary: cute.Tensor,
+        v_summary: cute.Tensor,
+        out: cute.Tensor,
+        block_indptr: cute.Tensor,
+        block_indices: cute.Tensor,
+        kv_valid_bits: cute.Tensor,
+        row_route_offsets: cute.Tensor,
+        route_workspace: cute.Tensor,
+        max_blocks_per_row: cutlass.Int32,
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        k_summary_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        prepare_routes(
+            block_indptr,
+            block_indices,
+            kv_valid_bits,
+            None,
+            None,
+            None,
+            Int64(0),
+            row_route_offsets,
+            route_workspace,
+            max_blocks_per_row,
+            stream,
+        )
+        launch_prepared(
+            q,
+            k,
+            v,
+            k_summary,
+            v_summary,
+            out,
+            route_workspace,
+            row_route_offsets,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            k_summary_scale=k_summary_scale,
+            v_scale=v_scale,
+            v_mean=v_mean,
         )
 
     @cute.jit
@@ -274,27 +757,82 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             max_blocks_per_row,
             stream,
         )
-        fmha_block_sparse_launch(
-            (
-                Int32(static_batch_size),
-                Int32(static_num_qo_heads),
-                Int32(static_num_kv_heads),
-                Int32(static_seq_len_kv),
-                Int32(static_head_dim),
-            ),
-            q.iterator,
-            k.iterator,
-            v.iterator,
-            k_summary.iterator,
-            v_summary.iterator,
-            out.iterator,
-            row_route_offsets.iterator,
-            route_workspace.iterator,
-            route_workspace.iterator + Int32(route_metadata_base),
+        launch_prepared(
+            q,
+            k,
+            v,
+            k_summary,
+            v_summary,
+            out,
+            route_workspace,
+            row_route_offsets,
             sm_scale,
             stream,
             static_config,
+            static_batch_size,
             static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+        )
+
+    @cute.jit
+    def proxy_bitmask_sage_adapter(
+        q: cute.Tensor,
+        k: cute.Tensor,
+        v: cute.Tensor,
+        k_summary: cute.Tensor,
+        v_summary: cute.Tensor,
+        out: cute.Tensor,
+        exact_block_bits: cute.Tensor,
+        kv_valid_bits: cute.Tensor,
+        row_route_offsets: cute.Tensor,
+        route_workspace: cute.Tensor,
+        max_blocks_per_row: cutlass.Int32,
+        q_scale: cute.Tensor,
+        k_scale: cute.Tensor,
+        k_summary_scale: cute.Tensor,
+        v_scale: cute.Tensor,
+        v_mean: cute.Tensor,
+        sm_scale: cutlass.Float32,
+        stream: cuda_drv.CUstream,
+        static_config: cutlass.Constexpr[FmhaDecodeConfig],
+        static_batch_size: cutlass.Constexpr[int],
+        static_seq_len_kv: cutlass.Constexpr[int],
+        static_num_qo_heads: cutlass.Constexpr[int],
+        static_num_kv_heads: cutlass.Constexpr[int],
+        static_head_dim: cutlass.Constexpr[int],
+    ) -> None:
+        prepare_routes(
+            exact_block_bits,
+            kv_valid_bits,
+            row_route_offsets,
+            route_workspace,
+            max_blocks_per_row,
+            stream,
+        )
+        launch_prepared(
+            q,
+            k,
+            v,
+            k_summary,
+            v_summary,
+            out,
+            route_workspace,
+            row_route_offsets,
+            sm_scale,
+            stream,
+            static_config,
+            static_batch_size,
+            static_seq_len_kv,
+            static_num_qo_heads,
+            static_num_kv_heads,
+            static_head_dim,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            k_summary_scale=k_summary_scale,
+            v_scale=v_scale,
+            v_mean=v_mean,
         )
 
     @cute.jit
@@ -406,6 +944,17 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     q_fake = fake_compact(config.q_dtype, q_shape, 16)
     out_fake = fake_compact(config.out_dtype, q_shape, 16)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    # Contiguous K/V adapters keyed by (sparse_format, proxy routes, Sage).
+    contiguous_adapters: dict[tuple[str, bool, bool], Callable[..., object]] = {
+        ("bsr", False, False): exact_bsr_adapter,
+        ("bsr", False, True): exact_bsr_sage_adapter,
+        ("bitmask", False, False): exact_bitmask_adapter,
+        ("bitmask", False, True): exact_bitmask_sage_adapter,
+        ("bsr", True, False): proxy_bsr_adapter,
+        ("bsr", True, True): proxy_bsr_sage_adapter,
+        ("bitmask", True, False): proxy_bitmask_adapter,
+        ("bitmask", True, True): proxy_bitmask_sage_adapter,
+    }
     tensor_adapter: Callable[..., object]
     dynamic_args: tuple[object, ...]
     if key.page_size is None:
@@ -416,7 +965,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.head_dim,
         )
         k_fake = fake_compact(config.kv_dtype, kv_shape, 16)
-        v_fake = fake_compact(config.kv_dtype, kv_shape, 16)
+        v_fake = fake_compact(config.value_dtype, kv_shape, 16)
         exact_bits_fake = fake_compact(
             cutlass.Uint32,
             (
@@ -427,15 +976,59 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             ),
             4,
         )
+        sage_fakes: tuple[object, ...] = ()
+        if config.use_sage_attention:
+            # Scale arrays are [heads, flat slots]; proxy routes add the
+            # summary K scales over the num_kv_blocks-long summary sequence.
+            v_scale_shape = (key.num_kv_heads, key.head_dim)
+            sage_fakes = (
+                fake_compact(
+                    Float32,
+                    (
+                        key.num_qo_heads,
+                        flat_scale_numel(
+                            key.batch_size, key.seq_len_q, key.sage_q_block_size
+                        ),
+                    ),
+                    16,
+                ),
+                fake_compact(
+                    Float32,
+                    (
+                        key.num_kv_heads,
+                        flat_scale_numel(
+                            key.batch_size, key.seq_len_kv, key.sage_k_block_size
+                        ),
+                    ),
+                    16,
+                ),
+            )
+            if key.use_proxy_routes:
+                sage_fakes += (
+                    fake_compact(
+                        Float32,
+                        (
+                            key.num_kv_heads,
+                            flat_scale_numel(
+                                key.batch_size, num_kv_blocks, key.sage_k_block_size
+                            ),
+                        ),
+                        16,
+                    ),
+                )
+            sage_fakes += (
+                fake_compact(Float32, v_scale_shape, 16),
+                fake_compact(Float32, v_scale_shape, 16),
+            )
         common_tail = (
             valid_bits_fake,
             row_route_offsets_fake,
             route_workspace_fake,
             Int32(0),
+            *sage_fakes,
             Float32(1.0),
         )
         if key.sparse_format == "bsr" and not key.use_proxy_routes:
-            tensor_adapter = exact_bsr_adapter
             dynamic_args = (
                 q_fake,
                 k_fake,
@@ -446,7 +1039,6 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 *common_tail,
             )
         elif key.sparse_format == "bitmask" and not key.use_proxy_routes:
-            tensor_adapter = exact_bitmask_adapter
             dynamic_args = (
                 q_fake,
                 k_fake,
@@ -463,7 +1055,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.head_dim,
             )
             k_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
+            v_summary_fake = fake_compact(config.value_dtype, summary_shape, 16)
             proxy_prefix = (
                 q_fake,
                 k_fake,
@@ -472,7 +1064,6 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 v_summary_fake,
                 out_fake,
             )
-            tensor_adapter = proxy_bsr_adapter
             dynamic_args = (
                 *proxy_prefix,
                 indptr_fake,
@@ -487,8 +1078,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.head_dim,
             )
             k_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            tensor_adapter = proxy_bitmask_adapter
+            v_summary_fake = fake_compact(config.value_dtype, summary_shape, 16)
             dynamic_args = (
                 q_fake,
                 k_fake,
@@ -501,6 +1091,9 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             )
         else:
             raise AssertionError("continuous sparse_format must be 'bsr' or 'bitmask'")
+        tensor_adapter = contiguous_adapters[
+            (key.sparse_format, key.use_proxy_routes, config.use_sage_attention)
+        ]
     else:
         page_size = key.page_size
         assert page_size is not None
@@ -526,7 +1119,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.value_dtype,
             kv_shape,
             stride=(
                 v_outer_stride,
@@ -583,12 +1176,15 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
 def _get_compiled_block_sparse(
     key: _BlockSparseCompileKey,
 ) -> Callable[..., object]:
-    """Compile and cache one contiguous or paged prepare-plus-attention adapter."""
+    """Compile and cache one dense, contiguous, or paged attention adapter."""
 
+    if not key.use_block_sparse:
+        return _compile_dense_contiguous(key)
     return _compile_block_sparse(key)
 
 
 __all__ = [
     "_compile_block_sparse",
+    "_compile_dense_contiguous",
     "_get_compiled_block_sparse",
 ]

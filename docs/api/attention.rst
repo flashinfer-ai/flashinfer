@@ -54,6 +54,14 @@ FMHA Decode
 
     .. automethod:: __init__
 
+.. autoclass:: BatchDecodeTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: SageAttentionParams
+    :members:
+
 Block-Sparse FMHA
 -----------------
 

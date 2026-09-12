@@ -51,6 +51,7 @@ from ..fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM,
+    SWIZZLE_128B_ROW_BYTES,
 )
 from ...stage import FmhaStage
 from ...tensor_map import transform_ragged_coords
@@ -243,7 +244,7 @@ class SmemQResource(DecodeGenResourceBase):
             )
             leading_byte_offset = q_leading_bytes
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.use_8bit_qkv):
                 q_head_dim_stage = self.cfg.head_dim_kv_stage
                 q_tile_bytes = Int32(
                     self.cfg.tile_size_q * q_head_dim_stage * self.cfg.q_dtype_bytes
@@ -390,7 +391,7 @@ class SmemQResource(DecodeGenResourceBase):
         # barrier attached to stage_info protects this stage until QK consumes it.
         stage_elems = cfg.smem_q_tile_elements
         stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_8bit_qkv):
             if prims.elect_sync():
                 if cutlass.const_expr(cfg.num_head_dim_stages_kv == 1):
                     # FP8 with one head-dim stage is one tensor copy into the
@@ -573,7 +574,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 * self.cfg.kv_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.use_8bit_qkv):
                 leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(
@@ -582,7 +583,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 )
             if cutlass.const_expr(
                 self.kv_kind == KV_KIND_V
-                and (self.cfg.use_fp8_qkv or self.cfg.headdim == 64)
+                and (self.cfg.use_8bit_qkv or self.cfg.headdim == 64)
             ):
                 leading_byte_offset = Int32(0)
             self._desc_base = prims.Tcgen05SmemDesc.build(
@@ -728,7 +729,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
             kv_atom_size = _block_sparse_kv_atom_size(cfg.kv_block_size)
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
-            chunk_hd = min(head_dim_stage, 64)
+            # One chunk is one swizzled 128-byte row: 64 two-byte or 128
+            # one-byte elements, matching the TensorMap inner box.
+            chunk_hd = min(head_dim_stage, 128 // cfg.kv_dtype_bytes)
             num_chunks = head_dim_stage // chunk_hd
             tile_chunk_elems = chunk_hd * cfg.tile_size_kv
             if cutlass.const_expr(cfg.use_paged_kv):
@@ -956,7 +959,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_8bit_qkv):
                 if prims.elect_sync():
                     # FP8 pages are copied as one contiguous head-dim stage per
                     # page fragment.
@@ -1017,7 +1020,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_8bit_qkv):
                 if prims.elect_sync():
                     # FP8 dense K/V needs one tensor copy for the active
                     # head-dim stage.
@@ -1322,7 +1325,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         # BF16 TMA is issued only by the elected lane, so only that lane needs
         # the register cache. FP8's predicated helper builds coordinates in
         # every lane and therefore keeps the existing all-lane semantics.
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_8bit_qkv):
             fp8_page_ids = self.page_ids(tile_idx)
             for page_frag in cutlass.range_constexpr(pages_per_tile):
                 cached_page_ids[page_frag] = Int32(fp8_page_ids[page_frag])
@@ -1596,7 +1599,7 @@ class SmemKvResource(DecodeGenResourceBase):
                 * self.cfg.kv_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.use_8bit_qkv):
                 k_leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(
@@ -1605,11 +1608,13 @@ class SmemKvResource(DecodeGenResourceBase):
                 )
             v_leading_byte_offset = k_leading_byte_offset
             if cutlass.const_expr(self.cfg.tile_size_kv == 256):
-                # K spans the complete KV256 row between D64 halves. V is
-                # staged as four semantic KV64 blocks, each with D/64 adjacent
-                # D64 halves, so its MMA-K leading step is one KV64 block.
-                v_leading_byte_offset = Int32(64 * 64 * self.cfg.kv_dtype_bytes)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv or self.cfg.headdim == 64):
+                # K spans the complete KV256 row between head-dim chunks. V
+                # is staged as four semantic KV64 blocks, each holding its
+                # 128-byte head-dim chunks side by side, so the MMA-N leading
+                # step is one KV64 block of 64 swizzled 128-byte rows for
+                # every element width.
+                v_leading_byte_offset = Int32(64 * SWIZZLE_128B_ROW_BYTES)
+            elif cutlass.const_expr(self.cfg.use_8bit_qkv or self.cfg.headdim == 64):
                 v_leading_byte_offset = Int32(0)
             # Descriptor bases are advanced per stage at consumption time; the
             # swizzle parameters are invariant for the resource.
@@ -1793,7 +1798,7 @@ class SmemKvResource(DecodeGenResourceBase):
             # runtime-resolved tile_idx so the right per-tile slice is
             # selected from the shared window.
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_8bit_qkv):
                 # FP8 pages are contiguous across the staged head dimension.
                 fp8_stage_base = self._stage_base(stage_info)
                 if cutlass.const_expr(cached_page_ids is None):
@@ -1865,7 +1870,7 @@ class SmemKvResource(DecodeGenResourceBase):
                                 ),
                                 stage_info.barrier,
                             )
-        elif cutlass.const_expr(cfg.use_fp8_qkv):
+        elif cutlass.const_expr(cfg.use_8bit_qkv):
             # Dense FP8 path: one tensor TMA loads the staged K or V tile.
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
@@ -1926,12 +1931,15 @@ class SmemKvResource(DecodeGenResourceBase):
 
         The public decode TensorMaps expose KV64 (or one smaller page)
         fragments. K places semantic KV64 blocks in physical order
-        ``(0, 2, 1, 3)`` while V keeps semantic block order with adjacent D64
-        halves. Dense and paged profiles derive those fragments from one
-        contiguous tile; block-sparse profiles consume four prepared KV64
-        origins retained by the instruction-local metadata resource.
+        ``(0, 2, 1, 3)`` while V keeps semantic block order with adjacent
+        head-dim chunks. A chunk is one swizzled 128-byte row: 64 two-byte or
+        128 one-byte elements. Dense and paged profiles derive those fragments
+        from one contiguous tile; block-sparse profiles consume four prepared
+        KV64 origins retained by the instruction-local metadata resource.
         """
         cfg = self.cfg
+        chunk_hd = min(cfg.headdim, 128 // cfg.kv_dtype_bytes)
+        num_chunks = cfg.headdim // chunk_hd
         grouped_tile_idx = Int32(0)
         if cutlass.const_expr(not cfg.use_block_sparse):
             grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
@@ -1989,14 +1997,16 @@ class SmemKvResource(DecodeGenResourceBase):
                     physical_block = KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM[
                         semantic_block
                     ]
-                for dim_half in cutlass.range_constexpr(2):
+                for dim_chunk in cutlass.range_constexpr(num_chunks):
                     if cutlass.const_expr(kv_kind == KV_KIND_K):
                         block_base = (
-                            dim_half * cfg.tile_size_kv * 64 + physical_block * 64 * 64
+                            dim_chunk * cfg.tile_size_kv * chunk_hd
+                            + physical_block * 64 * chunk_hd
                         )
                     else:
                         block_base = (
-                            semantic_block * cfg.headdim * 64 + dim_half * 64 * 64
+                            semantic_block * cfg.headdim * 64
+                            + dim_chunk * 64 * chunk_hd
                         )
 
                     if cutlass.const_expr(cfg.use_block_sparse):
@@ -2004,7 +2014,7 @@ class SmemKvResource(DecodeGenResourceBase):
                             stage_base.subview(block_base),
                             route_tma_desc,
                             (
-                                Int32(dim_half * 64),
+                                Int32(dim_chunk * chunk_hd),
                                 token_coord,
                                 logical_h_k_idx,
                                 storage_coord,
@@ -2021,12 +2031,14 @@ class SmemKvResource(DecodeGenResourceBase):
                             logical_page = token_in_tile // cfg.num_tokens_per_page
                             token_in_page = token_in_tile % cfg.num_tokens_per_page
                             page_id = Int32(dense_page_ids[logical_page])
-                            smem_offset = block_base + fragment * fragment_tokens * 64
+                            smem_offset = (
+                                block_base + fragment * fragment_tokens * chunk_hd
+                            )
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 stage_base.subview(smem_offset),
                                 tma_desc,
                                 (
-                                    Int32(dim_half * 64),
+                                    Int32(dim_chunk * chunk_hd),
                                     Int32(token_in_page),
                                     logical_h_k_idx,
                                     page_id,
@@ -2039,7 +2051,7 @@ class SmemKvResource(DecodeGenResourceBase):
                             stage_base.subview(block_base),
                             tma_desc,
                             (
-                                Int32(dim_half * 64),
+                                Int32(dim_chunk * chunk_hd),
                                 tile_offset + Int32(semantic_block * 64),
                                 logical_h_k_idx,
                                 logical_b_idx,

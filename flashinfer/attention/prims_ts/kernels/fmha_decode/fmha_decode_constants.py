@@ -18,6 +18,8 @@ Keep non-obvious integer constants here with their rationale so config,
 resource, and reduction code can use named values without duplicating comments.
 """
 
+import math
+
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
 # so auto split-KV selection remains deterministic in offline/test flows.
 FALLBACK_SM_COUNT_B200 = 148
@@ -29,14 +31,24 @@ TOTAL_SMEM_BUDGET_KIB = 218
 MAX_KV_STAGE_SMEM_KIB = 144
 BYTES_PER_KIB = 1024
 
-# The supported BF16 M64N256 profile uses a 64-KiB shared K/V stage. Three
-# stages occupy 192 KiB; its 16-KiB Q stage and small metadata/barrier
-# allocations fit in the remaining SM100 budget. Persistent direct-output tail
-# correction rotates a compact 35,840-byte exchange payload over one drained
-# 64-KiB stage in this ring; split-KV keeps its fixed full exchange allocation.
-# Keep this exact-profile override separate from the conservative,
-# topology-independent MAX_KV_STAGE_SMEM_KIB inference above.
+# The M64N256 profile stages one complete 256-row K or V tile per shared-ring
+# slot, so the ring depth follows the element width. A 16-bit tile is 64 KiB:
+# three stages occupy 192 KiB, and with the 16-KiB Q stage, the dedicated tail
+# exchange, and the metadata/barrier allocations the CTA sits at about 227 KiB,
+# the SM100 carveout. A byte-wide tile (E4M3 or Int8 K with E4M3 V) is 32 KiB,
+# so three stages leave about 111 KiB unused. Block-sparse Sage kernels run
+# about 7.5% faster with four or five stages than with three and gain nothing
+# past that: a deeper ring no longer hides load latency and only adds barrier
+# traffic. Five is the byte-wide default rather than four because ptxas keeps
+# every warp role spill-free at five (and six) stages, while the four-stage
+# build demotes the persistent work-queue state to local memory in every
+# role; re-check the ptxas spill report if that state or the register split
+# per role changes. The dense static grid is the one profile that prefers
+# four (a few percent over five); it can set kv_stages explicitly. Keep both
+# exact-profile depths separate from the conservative, topology-independent
+# MAX_KV_STAGE_SMEM_KIB inference above.
 KV_TILE_256_SHARED_FIFO_STAGES = 3
+KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 5
 
 # The four semantic K64 atoms are stored in the physical K slots consumed by
 # the two interleaved QK instructions in this order.
@@ -120,6 +132,23 @@ TMEM_ROW_STRIDE = 16 << 16
 PACKED_REGISTER_BYTES = 4
 FP8_VALUES_PER_REG = 4
 FP16_VALUES_PER_REG = 2
+
+# K elements consumed by one tcgen05 MMA instruction: 32 bytes of the K-major
+# operand row, so 32 one-byte or 16 two-byte elements. A streamed K32 score
+# fragment therefore feeds one FP8 PV instruction or two 16-bit ones.
+FP8_MMA_K_STEP = 32
+FP16_MMA_K_STEP = 16
+
+# FP8 probabilities are quantized as 448 * p (the E4M3 maximum). Row sums and
+# attention-sink terms follow the same scale; the output normalization divides
+# it back out. The log2 form is the addend of the exp2-domain softmax.
+FP8_P_QUANT_SCALE = 448.0
+FP8_P_QUANT_LOG2_SCALE = math.log2(FP8_P_QUANT_SCALE)
+
+# tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
+# 128-byte swizzle atom spans one 128-byte row per K or MN index.
+SMEM_DESC_UNIT_BYTES = 16
+SWIZZLE_128B_ROW_BYTES = 128
 
 # Per-lane register ownership denominators for packed output fragments.
 FP8_OUTPUT_ELEMENTS_PER_REG_GROUP = 512
