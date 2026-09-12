@@ -16,10 +16,7 @@
 
 // Frozen AlphaMoE NVFP4 up -> SwiGLU -> down schedule.
 //
-// Loom provenance:
-//   repository: Cake
-//   commit: e2aa03274e40b03bbba5cdeb4615fa586ca4f369
-//   IR: loom/examples/weave/alpha_moe_nvfp4_up_down.py
+// Generated-device-source provenance:
 //   selector: alpha_moe_nvfp4_up_down
 //   target used for source generation: sm_100a
 //   tensor-map ABI: grid_constant
