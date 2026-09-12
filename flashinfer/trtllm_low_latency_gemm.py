@@ -152,7 +152,7 @@ def trtllm_low_latency_gemm(
     out: torch.Tensor,
 ) -> None:
     r"""GEMM optimized for low M dimension. B needs to be shuffled and its layout needs to be adjusted.
-    Only supported on Blackwell GPUs.
+    Only supported on SM10x GPUs supported by the TRT-LLM Gen backend.
 
     Parameters
     ----------
@@ -188,6 +188,20 @@ def trtllm_low_latency_gemm(
     >>> out.shape
     torch.Size([16, 2560])
     """
+
+    # The only backend is the TRT-LLM Gen FP8 kernel for supported SM10x GPUs
+    # (see gen_trtllm_low_latency_gemm_module). On other architectures --
+    # including consumer Blackwell sm_120/sm_121 -- the cubin has no matching
+    # kernel image and the launch fails opaquely. Reject early with a clear
+    # message instead. Guard lives here (not in mm_fp8) so direct callers of
+    # this exported helper are covered too.
+    major, minor = get_compute_capability(A.device)
+    if major != 10:
+        raise NotImplementedError(
+            "trtllm_low_latency_gemm / mm_fp8 requires a supported SM10x GPU; "
+            "the TRT-LLM Gen FP8 kernel is not "
+            f"available on compute capability {major}.{minor}."
+        )
 
     tuner = AutoTuner.get()
     inputs = [A, B, global_scale, out]
