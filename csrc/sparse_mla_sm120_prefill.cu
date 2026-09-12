@@ -388,6 +388,11 @@ inline bool dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size, 
 #undef DISPATCH_DOTS3_SWA_SG
 }
 
+// Dispatch a DSV4 single-cache sparse-MLA prefill to a pre-built kernel
+// instantiation. The cache must use 64-token pages; num_heads (8-128) folds
+// into 1-2 head groups and the compute mode follows the candidate count.
+// Returns false when the configuration has no instantiation so the caller
+// can fall back.
 inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, const bf16* Q,
                                  const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
@@ -436,6 +441,12 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, c
   return false;  // unreachable
 }
 
+// Dispatch a DSV4 dual-cache (hierarchical candidate pool) sparse-MLA prefill
+// to a pre-built kernel instantiation. The main cache must use 64-token pages.
+// Uniform candidate counts take the full-tile path; per-token topk lengths take
+// the length-aware path. Both select by num_heads (8-128, folded into 1-2 head
+// groups) and extra-cache page size (2, 64, 128 or 256 tokens). Returns false
+// when the configuration has no instantiation so the caller can fall back.
 inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page_block_size,
                                int extra_page_block_size, const bf16* Q, const uint8_t* KV,
                                const int32_t* indices, const uint8_t* KV_extra,
@@ -446,7 +457,8 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
                                const int* topk_length_extra_ptr, cudaStream_t stream) {
   if (page_block_size != 64) return false;
   if (topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr && topk_extra % BI == 0 &&
-      (extra_page_block_size == 64 || extra_page_block_size == 2)) {
+      (extra_page_block_size == 64 || extra_page_block_size == 2 || extra_page_block_size == 128 ||
+       extra_page_block_size == 256)) {
 #define DISPATCH_DUAL_MG_FULLTILE(NH, PBSX, NHG)                                                   \
   launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, 64, PBSX, NHG>(                             \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, topk, \
@@ -477,6 +489,10 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
 
     if (extra_page_block_size == 64) {
       DISPATCH_FULLTILE_BY_NH_PBSX(64);
+    } else if (extra_page_block_size == 128) {
+      DISPATCH_FULLTILE_BY_NH_PBSX(128);
+    } else if (extra_page_block_size == 256) {
+      DISPATCH_FULLTILE_BY_NH_PBSX(256);
     } else {
       DISPATCH_FULLTILE_BY_NH_PBSX(2);
     }
@@ -520,6 +536,15 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
     DISPATCH_BY_NH_PBSX(64);
   } else if (extra_page_block_size == 2) {
     DISPATCH_BY_NH_PBSX(2);
+  } else if (extra_page_block_size == 128) {
+    // DeepSeek-V4.1's hierarchical candidate pool pages its extra KV cache
+    // at 128 or 256 tokens. The page size is purely an addressing parameter
+    // (prefill_kv_entry_base splits a token index into page / in-page offset)
+    // and the WFP8 row-XOR swizzle is gated on the 2-token variant, so these
+    // sizes need instantiations rather than new kernel code.
+    DISPATCH_BY_NH_PBSX(128);
+  } else if (extra_page_block_size == 256) {
+    DISPATCH_BY_NH_PBSX(256);
   }
   return false;
 #undef DISPATCH_BY_NH_PBSX
