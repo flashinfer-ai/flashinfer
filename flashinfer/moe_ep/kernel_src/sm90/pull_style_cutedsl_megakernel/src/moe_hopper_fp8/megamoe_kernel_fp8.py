@@ -142,6 +142,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         grouped_token_back: bool = False,
         combine_format: str = "bf16",
         active_dispatch_warps: int = 1,
+        compact_pull_buffer: bool = True,
         fc1_store_offload: bool = True,
         fc1_early_done_publish: bool = False,
         fold_producer_warps: bool = True,
@@ -379,6 +380,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             dedup_dispatch=dedup_dispatch,
             max_tokens_per_rank=max_tokens_per_rank,
             active_dispatch_warps=active_dispatch_warps,
+            # Only the active dispatch warps get a pull-buffer slot; the idle
+            # slots would otherwise cost 3 * hidden_bytes of AB-stage SMEM.
+            compact_pull_buffer=compact_pull_buffer,
         )
         self.dedup_dispatch = dedup_dispatch
 
@@ -417,13 +421,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
 
         Must match ``TokenInPullTokenBackPush.extra_smem_storage_class``:
         ``pull_mbar[Int64, 4] + smem_expert_count[Int32, num_total_experts]
-        + pull_buffer[Uint8, 4 * hidden_bytes]``.
+        + pull_buffer[Uint8, token_comm.pull_buffer_bytes()]`` (one slot per
+        *active* dispatch warp with ``compact_pull_buffer``).
         Standalone token-back adds ``tb_pull_mbar[Int64, 4]`` and
         ``tb_pull_buffer[Uint8, 4 * tb_chunk_bytes]``.
         """
         pull_mbar_bytes = _DispatchWarpCount * 8
         expert_count_bytes = self.num_total_experts * 4
-        pull_buffer_bytes = _DispatchWarpCount * self.hidden_bytes
+        pull_buffer_bytes = self.token_comm.pull_buffer_bytes()
         total = (
             _round_up(pull_mbar_bytes, 16)
             + _round_up(expert_count_bytes, 16)

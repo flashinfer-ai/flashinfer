@@ -415,6 +415,7 @@ class TokenInPullTokenBackPush:
         max_tokens_per_rank: int = 0,
         grouped_token_back: bool = False,
         active_dispatch_warps: int = 1,
+        compact_pull_buffer: bool = False,
     ) -> None:
         self.world_size = world_size
         self.num_topk = num_topk
@@ -520,6 +521,14 @@ class TokenInPullTokenBackPush:
             )
         self.active_dispatch_warps = active_dispatch_warps
         self.active_dispatch_threads = active_dispatch_warps * self.warp_threads
+        # SMEM pull-buffer slots.  By default every physical dispatch warp
+        # owns a hidden_bytes slot even when it is idle; with
+        # compact_pull_buffer only the active warps get a slot (the idle warps
+        # never enter dispatch_warp_body, and the reuse token-back walkers are
+        # exactly the active warps and index the same slots with
+        # tb_chunk_bytes strides).  The three idle slots cost 3 * hidden_bytes
+        # (21 KiB at hidden=7168 fp8) of AB-stage SMEM per CTA.
+        self.compact_pull_buffer = bool(compact_pull_buffer)
         self.dispatch_warp_start = dispatch_warp_start
         # Warps that share this CTA with the dispatch group but are not part
         # of it. They participate in kernel-tail / dispatch-with-other
@@ -601,8 +610,18 @@ class TokenInPullTokenBackPush:
         # token-back warps run if they push the DATA plane, the SF plane, or both.
         return self.push_data or self.push_sf
 
+    def pull_buffer_bytes(self) -> int:
+        """Bytes of the dispatch pull buffer in ``extra_smem_storage_class``."""
+        if self.compact_pull_buffer:
+            # Each active warp needs one token row for dispatch and one
+            # tb_chunk_bytes piece for the reuse token-back path.
+            return self.active_dispatch_warps * max(
+                self.hidden_bytes, self.tb_chunk_bytes
+            )
+        return self.num_dispatch_warps * self.hidden_bytes
+
     def extra_smem_storage_class(self) -> type:
-        hidden_bytes = self.hidden_bytes
+        pull_buffer_bytes = self.pull_buffer_bytes()
         num_total_experts = self.num_total_experts
 
         if self.token_back_standalone:
@@ -612,7 +631,7 @@ class TokenInPullTokenBackPush:
                 smem_expert_count: cute.struct.MemRange[
                     Int32, num_total_experts
                 ]
-                pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes], 16]
+                pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, pull_buffer_bytes], 16]
                 tb_pull_mbar: cute.struct.MemRange[Int64, self.num_token_back_warps]
                 tb_pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, self.num_token_back_warps * self.tb_chunk_bytes], 16]
 
@@ -624,7 +643,7 @@ class TokenInPullTokenBackPush:
             smem_expert_count: cute.struct.MemRange[
                 Int32, num_total_experts
             ]
-            pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, self.num_dispatch_warps * hidden_bytes], 16]
+            pull_buffer: cute.struct.Align[cute.struct.MemRange[Uint8, pull_buffer_bytes], 16]
 
         return TokenCommStorage
 

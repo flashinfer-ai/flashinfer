@@ -30,11 +30,13 @@ from common.moe_utils import fmax
 from cutlass.cute.typing import Float32
 from moe_hopper_fp8.epilogue_fp8_common import (
     Fc2OutputDest,
+    bfly_transpose4_u32,
+    clamp_and_swiglu_sm90,
     consume_initial_pingpong_work,
     consume_next_pingpong_work,
-    clamp_and_swiglu_sm90,
+    pack_f32x2_to_bf16x2,
+    stg_128b_bf16x8,
     stg_fc1_block_scale_row,
-    stg_fc1_c_bf16,
     tma_store_fc1_output,
 )
 
@@ -534,19 +536,28 @@ class SwapABFp8GluEpilogue:
         tidx,
         c_scale: Float32,
     ) -> None:
-        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16.
+        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16
+        with one 16-byte store per token group.
 
         Same contract as the non-swap kernel (pre-SwiGLU, pre-clamp,
         pre-routing-weight, dequantized; ``fc1_c[pool_row, intermediate_gateup]``
         in the kernel's gate/up-interleaved order) with the swap-AB register
         layout: the CTA tile has intermediate along M and tokens along N.
         Warpgroup ``n_half`` owns accumulator rows ``[n_half * 128, +128)``
-        of the CTA tile; within a warp's 16-row slab of an M64 fragment a
-        thread holds rows ``lane_group`` (gate) and ``lane_group + 8`` (up)
-        for the token pair ``token_group * 8 + 2 * lane_mod``.  Each value is
-        a separate BF16 element of ``fc1_c`` (the tile is transposed relative
-        to the output), so the store is a scalar STG per value; only valid
-        tokens are written and the expert offset comes straight from
+        of the CTA tile; per token group a thread holds eight values
+        ``E[g][c]`` (``g`` = its lane group, class ``c = 4*m_sub + 2*t +
+        kind``, ``t`` the token parity, ``kind`` 0 = gate / 1 = up) at
+        ``C[token0 + t, c_col_base + m_sub*64 + local_warp_idx*16 + kind*8 +
+        g]``.  For a fixed class the eight lane groups therefore cover eight
+        consecutive columns (16 bytes, 16-byte aligned).  An 8x8 transpose
+        across the lane groups -- two 32-bit butterfly levels on lane-id bits
+        4 and 3 (``lane_group`` bits 2 and 1) plus one 16-bit half-word
+        exchange on bit 2 (``lane_group`` bit 0) -- leaves lane group ``g``
+        with the eight values of class ``g`` in column order, stored with one
+        ``st.global.v4`` (1 STG.128 per token group instead of 8 scalar
+        stores).  Only valid tokens are written and ``intermediate_gateup %
+        64 == 0`` keeps every chunk inside the tensor, so the row/column
+        predicate is exact; the expert offset comes straight from
         ``cumulative_data_physical_row`` (no scheduler-extension slice).
         ``c_scale``: per-tensor dequant scale, 1.0 for blockwise.
         """
@@ -554,42 +565,76 @@ class SwapABFp8GluEpilogue:
         lane_group = thread_in_warp // 4
         lane_mod = thread_in_warp % 4
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        valid_gateup_n = cutlass.Int32(gmem_fc1_c.shape[1])
+        g_c = cute.slice_(gmem_fc1_c, (None, None, 0))
         row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
-        col_wg_base = (
-            (
-                work_tile_info.tile_m_idx
-                * cutlass.Int32(self._wgmma_fragment_count)
-                + cutlass.Int32(n_half)
-            )
-            * cutlass.Int32(128)
+        c_col_base = (
+            work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
+            + cutlass.Int32(n_half)
+        ) * cutlass.Int32(128)
+        b2_set = (lane_group & cutlass.Int32(4)) != cutlass.Int32(0)
+        b1_set = (lane_group & cutlass.Int32(2)) != cutlass.Int32(0)
+        b0_set = (lane_group & cutlass.Int32(1)) != cutlass.Int32(0)
+        b2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
+        b1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
+        b0 = lane_group & cutlass.Int32(1)
+        # class g = 4*b2 + 2*b1 + b0 -> token0 + b1, column block
+        # c_col_base + b2*64 + local_warp_idx*16 + b0*8.
+        col = (
+            c_col_base
+            + b2 * cutlass.Int32(64)
             + cutlass.Int32(local_warp_idx * 16)
-            + lane_group
+            + b0 * cutlass.Int32(8)
         )
+        # prmt.b32 selectors (nibble i picks source byte i of {b, a}):
+        # 0x5410 = (a.lo, b.lo), 0x7632 = (a.hi, b.hi), 0x7610 = (a.lo, b.hi),
+        # 0x3254 = (b.lo, a.hi), 0x3276 = (b.hi, a.hi).
+        sel_send = cutlass.Uint32(0x5410) if b0_set else cutlass.Uint32(0x7632)
+        sel_a = cutlass.Uint32(0x3254) if b0_set else cutlass.Uint32(0x5410)
+        sel_b = cutlass.Uint32(0x3276) if b0_set else cutlass.Uint32(0x7610)
         for token_group in cutlass.range_constexpr(self._token_group_count):
             token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
-            token1 = token0 + cutlass.Int32(1)
-            token0_valid = token0 < valid_tokens
-            token1_valid = token1 < valid_tokens
-            row0 = row_base + token0
-            row1 = row_base + token1
-            for m_sub in cutlass.range_constexpr(2):
-                src = m_sub * self._accum_regs_per_m64 + token_group * 4
-                col_gate = col_wg_base + cutlass.Int32(m_sub * 64)
-                col_up = col_gate + cutlass.Int32(Fp8GateUpInterleave)
-                if token0_valid:
-                    stg_fc1_c_bf16(
-                        gmem_fc1_c, row0, col_gate, accumulators[src + 0] * c_scale
-                    )
-                    stg_fc1_c_bf16(
-                        gmem_fc1_c, row0, col_up, accumulators[src + 2] * c_scale
-                    )
-                if token1_valid:
-                    stg_fc1_c_bf16(
-                        gmem_fc1_c, row1, col_gate, accumulators[src + 1] * c_scale
-                    )
-                    stg_fc1_c_bf16(
-                        gmem_fc1_c, row1, col_up, accumulators[src + 3] * c_scale
-                    )
+            # W[k] = gate_k | up_k << 16 for k = m_sub*2 + t (acc regs: src+0/1
+            # gate token0/1, src+2/3 up token0/1), i.e. classes (2k, 2k+1)
+            # share one word.
+            src0 = token_group * 4
+            src1 = self._accum_regs_per_m64 + token_group * 4
+            w0 = pack_f32x2_to_bf16x2(
+                accumulators[src0 + 0] * c_scale, accumulators[src0 + 2] * c_scale,
+            )
+            w1 = pack_f32x2_to_bf16x2(
+                accumulators[src0 + 1] * c_scale, accumulators[src0 + 3] * c_scale,
+            )
+            w2 = pack_f32x2_to_bf16x2(
+                accumulators[src1 + 0] * c_scale, accumulators[src1 + 2] * c_scale,
+            )
+            w3 = pack_f32x2_to_bf16x2(
+                accumulators[src1 + 1] * c_scale, accumulators[src1 + 3] * c_scale,
+            )
+            # 32-bit levels: lane_group bit 2 <-> lane bit 4 (xor 16), bit 1
+            # <-> lane bit 3 (xor 8).  Afterwards the lane holds, for classes
+            # (4*b2 + 2*b1, +1) packed low/high, the words of the four lane
+            # groups sharing its bit 0, in ascending lane-group order.
+            y0, y1, y2, y3 = bfly_transpose4_u32(
+                w0, w1, w2, w3, b2_set, b1_set, 16, 8,
+            )
+            # 16-bit level on lane_group bit 0 (xor 4): even lane groups keep
+            # the gate (low) halves and receive the odd groups' gate halves;
+            # odd lane groups keep the up (high) halves and receive the even
+            # groups' up halves.
+            v0 = cutlass.Uint32(cute.arch.prmt(y0, y1, sel_send))
+            v1 = cutlass.Uint32(cute.arch.prmt(y2, y3, sel_send))
+            p0 = cute.arch.shuffle_sync_bfly(v0, 4)
+            p1 = cute.arch.shuffle_sync_bfly(v1, 4)
+            # Final word j = (row 2j, row 2j+1) of class g: even g = (mine,
+            # partner's), odd g = (partner's, mine).
+            o0 = cutlass.Uint32(cute.arch.prmt(y0, p0, sel_a))
+            o1 = cutlass.Uint32(cute.arch.prmt(y1, p0, sel_b))
+            o2 = cutlass.Uint32(cute.arch.prmt(y2, p1, sel_a))
+            o3 = cutlass.Uint32(cute.arch.prmt(y3, p1, sel_b))
+            token = token0 + b1
+            if token < valid_tokens and col < valid_gateup_n:
+                stg_128b_bf16x8(g_c, o0, o1, o2, o3, row_base + token, col)
 
     @cute.jit
     def _apply_fc1_topk_swapab(

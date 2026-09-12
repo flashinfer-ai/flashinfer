@@ -85,10 +85,13 @@ not picked them up):
   `__call__(..., fc1_c, output_activation, ...)` write the raw pre-SwiGLU
   fc1 gate+up accumulator (BF16, kernel gate/up-interleaved column order,
   dequantized) to an expert-major pool tensor with 128-row expert segments;
-  non-swap stores BF16 pairs straight from the wgmma fragments
-  (`epilogue_fp8.py::_store_fc1_c_m64_half`), swap-AB scatters single
-  elements from its transposed tile (`epilogue_fp8_swapab.py::
-  _store_fc1_c_swapab`); both scale modes; compiled out when off.  Host:
+  both layouts store 16 bytes per lane after a lane transpose
+  (`epilogue_fp8_common.py::bfly_transpose4_u32` / `stg_128b_bf16x8`;
+  non-swap `epilogue_fp8.py::_store_fc1_c_m64_half` = one 64-byte row run
+  per quad, swap-AB `epilogue_fp8_swapab.py::_store_fc1_c_swapab` = 8x8
+  lane-group transpose with `prmt`); GMEM pointers need
+  `make_ptr(..., assumed_align=16)` or autovec emits 16-bit stores; both
+  scale modes; compiled out when off.  Host:
   `mega_runner.py --generate_c` + `_validate_c_output`, `ImplDesc.generate_c`
   (works with any launch geometry, heuristic or explicit; no separate
   training descriptor on Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
@@ -98,6 +101,11 @@ not picked them up):
   `frontend.fc1_c` read-back, backend config knob, bench `--generate-c`,
   test `test_..._generate_c`.  Developed in the drop worktree first (branch
   `hopper_fp8_generate_c`); the vendored `src/` copies match it.
+- `compact_pull_buffer` (2026-09-12, default True; `token_comm.py`
+  `pull_buffer_bytes()`, Mega ctor kwarg, shim config, backend config /
+  pool key, bench `--[no-]compact-pull-buffer`): the dispatch pull buffer
+  holds one slot per *active* dispatch warp instead of four, freeing
+  ~21 KiB of misc SMEM per CTA for AB stages (see TUNING.md).
 - `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
   (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
   barrier / pull / reuse token-back all follow it; barrier and grid-sync

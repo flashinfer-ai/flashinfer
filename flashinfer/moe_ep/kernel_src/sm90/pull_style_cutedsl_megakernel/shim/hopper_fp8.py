@@ -170,6 +170,10 @@ class MegaMoEHopperFp8Config:
     # are FULLY idle until kernel_tail, reserved for future work.
     # Output-invariant work partitioning.
     active_dispatch_warps: int = 1
+    # Size the dispatch pull buffer by the active dispatch warps only (the
+    # idle warps' slots otherwise cost 3 * hidden bytes of AB-stage SMEM per
+    # CTA).  Output-invariant; False restores the 4-slot buffer for A/B.
+    compact_pull_buffer: bool = True
     # FC1 store offload to the empty warp (S2G + fc1_done publish leave the
     # epilogue warps).  Self-gating: active only for non-swap non-ping-pong
     # kernels with register headroom for the store server; elsewhere it
@@ -758,6 +762,7 @@ class MegaMoEHopperFp8Frontend:
             grouped_token_back=c.grouped_token_back,
             combine_format=c.combine_format,
             active_dispatch_warps=c.active_dispatch_warps,
+            compact_pull_buffer=c.compact_pull_buffer,
             fc1_store_offload=c.fc1_store_offload,
             fc1_early_done_publish=c.fc1_early_done_publish,
             fold_producer_warps=c.fold_producer_warps,
@@ -1333,6 +1338,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
+    compact_pull_buffer: bool = True,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
@@ -1474,6 +1480,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
+        compact_pull_buffer=compact_pull_buffer,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,

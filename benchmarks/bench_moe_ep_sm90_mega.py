@@ -291,6 +291,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
     )
     p.add_argument(
+        "--compact-pull-buffer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="size the dispatch pull buffer by the active dispatch warps only "
+        "(saves 3 x hidden bytes of SMEM per CTA for AB stages); "
+        "--no-compact-pull-buffer restores the 4-slot buffer",
+    )
+    p.add_argument(
         "--generate-c",
         action="store_true",
         default=False,
@@ -598,6 +606,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         grouped_token_back=args.grouped_token_back,
         combine_format=args.combine_format,
         active_dispatch_warps=args.active_dispatch_warps,
+        compact_pull_buffer=args.compact_pull_buffer,
         fc1_store_offload=args.fc1_store_offload,
         fc1_early_done_publish=args.fc1_early_done_publish,
         fold_producer_warps=args.fold_producer_warps,

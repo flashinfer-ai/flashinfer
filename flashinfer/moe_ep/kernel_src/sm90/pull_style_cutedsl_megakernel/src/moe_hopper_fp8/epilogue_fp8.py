@@ -36,11 +36,13 @@ from common.moe_utils import fmax
 from cutlass.cute.typing import Float32
 from moe_hopper_fp8.epilogue_fp8_common import (
     Fc2OutputDest,
+    bfly_transpose4_u32,
+    clamp_and_swiglu_sm90,
     consume_initial_pingpong_work,
     consume_next_pingpong_work,
-    clamp_and_swiglu_sm90,
+    pack_f32x2_to_bf16x2,
+    stg_128b_bf16x8,
     stg_fc1_block_scale_row,
-    stg_fc1_c_bf16x2,
     tma_store_fc1_output,
     tma_store_fc2_output,
 )
@@ -501,7 +503,8 @@ class Fp8GluEpilogue:
         tidx,
         c_scale: Float32,
     ) -> None:
-        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16.
+        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16
+        with 16-byte stores.
 
         Same contract as the Blackwell MXFP8 kernel's ``_store_fc1_c_subtile``:
         the pre-SwiGLU (pre-clamp, pre-routing-weight) FP32 accumulator goes
@@ -511,9 +514,20 @@ class Fp8GluEpilogue:
         ``[n_half * 128, n_half * 128 + 128)`` of the CTA tile; per 8-wide
         gate or up column group each thread holds the column pair
         ``2 * lane_mod`` for rows ``token_row0`` and ``token_row1`` (regs
-        0,1 -> row0; 2,3 -> row1).  Plain STG, no SMEM staging, so the AB
-        pipeline budget is unchanged.  Only valid token rows are written;
-        the 128-aligned pad rows keep the host's zero fill.
+        0,1 -> row0; 2,3 -> row1).
+
+        For a fixed row and pair of output groups ``(2*rh, 2*rh+1)`` the four
+        lanes of a quad hold 64 consecutive raw columns (gate/up of group
+        2*rh, gate/up of group 2*rh+1 = four 16-byte chunks), each lane
+        owning 4 bytes of every chunk.  A two-level 32-bit butterfly
+        transpose across ``lane_mod`` (lane-id bits 1 and 0) leaves lane
+        ``q`` with chunk ``q`` in column order, so one ``st.global.v4`` per
+        (row, rh) replaces four 4-byte stores and a quad writes one
+        64-byte-aligned 64-byte run of a single row.  No SMEM staging, so
+        the AB pipeline budget is unchanged.  Only valid token rows are
+        written (the 128-aligned pad rows keep the host's zero fill) and
+        ``intermediate_gateup % 64 == 0`` keeps every chunk inside the
+        tensor, so the row/column predicate is exact.
 
         ``c_scale`` restores real units: the blockwise mainloop already folds
         the block scales into the accumulator (pass 1.0), while the per-tensor
@@ -521,38 +535,58 @@ class Fp8GluEpilogue:
         ``fc1_act_weight_dequant_scale`` in the epilogue -- so does this store.
         """
         lane_mod = (tidx % WarpThreadCount) % 4
+        q_hi_set = (lane_mod & cutlass.Int32(2)) != cutlass.Int32(0)
+        q_lo_set = (lane_mod & cutlass.Int32(1)) != cutlass.Int32(0)
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
-        row0_valid = token_row0 < valid_tokens
-        row1_valid = token_row1 < valid_tokens
-        col_tile_base = (
+        valid_gateup_n = cutlass.Int32(real_fc1_c.shape[1])
+        g_c = cute.slice_(real_fc1_c, (None, None, 0))
+        col_wg_base = (
             work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
             + cutlass.Int32(n_half * 2 * Fc1EpilogueStoreTileN)
-            + 2 * lane_mod
         )
         accum_fragment_base = m_sub * self._accum_regs_per_m64
-        gmem_row0 = token_tile_base + token_row0
-        gmem_row1 = token_tile_base + token_row1
-        for output_group in cutlass.range_constexpr(
-            Fc1SubtilesPerHalf * Fc1GroupsPerSubtile
+        for rh in cutlass.range_constexpr(
+            Fc1SubtilesPerHalf * Fc1GroupsPerSubtile // 2
         ):
-            reg_base = accum_fragment_base + output_group * 8
-            col_group_base = col_tile_base + cutlass.Int32(
-                output_group * 2 * Fp8GateUpInterleave
+            og0 = 2 * rh
+            # regs: gate(og) at +0..3, up(og) at +4..7; (0,1) row0, (2,3) row1
+            rb0 = accum_fragment_base + og0 * 8
+            rb1 = rb0 + 8
+            # chunk q of this 64-byte run starts at raw column og0*16 + q*8
+            col = (
+                col_wg_base
+                + cutlass.Int32(og0 * 2 * Fp8GateUpInterleave)
+                + lane_mod * cutlass.Int32(Fp8GateUpInterleave)
             )
-            for gu in cutlass.range_constexpr(2):  # 0 = gate cols, 1 = up cols
-                rb = reg_base + gu * 4
-                col = col_group_base + cutlass.Int32(gu * Fp8GateUpInterleave)
-                if row0_valid:
-                    stg_fc1_c_bf16x2(
-                        real_fc1_c, gmem_row0, col,
-                        accumulators[rb + 0] * c_scale,
-                        accumulators[rb + 1] * c_scale,
-                    )
-                if row1_valid:
-                    stg_fc1_c_bf16x2(
-                        real_fc1_c, gmem_row1, col,
-                        accumulators[rb + 2] * c_scale,
-                        accumulators[rb + 3] * c_scale,
+            for row in cutlass.range_constexpr(2):
+                r = 2 * row
+                # chunk order along the row: gate(og0), up(og0), gate(og0+1),
+                # up(og0+1)
+                w0 = pack_f32x2_to_bf16x2(
+                    accumulators[rb0 + r] * c_scale,
+                    accumulators[rb0 + r + 1] * c_scale,
+                )
+                w1 = pack_f32x2_to_bf16x2(
+                    accumulators[rb0 + 4 + r] * c_scale,
+                    accumulators[rb0 + 5 + r] * c_scale,
+                )
+                w2 = pack_f32x2_to_bf16x2(
+                    accumulators[rb1 + r] * c_scale,
+                    accumulators[rb1 + r + 1] * c_scale,
+                )
+                w3 = pack_f32x2_to_bf16x2(
+                    accumulators[rb1 + 4 + r] * c_scale,
+                    accumulators[rb1 + 5 + r] * c_scale,
+                )
+                o0, o1, o2, o3 = bfly_transpose4_u32(
+                    w0, w1, w2, w3, q_hi_set, q_lo_set, 2, 1,
+                )
+                token_row = token_row0
+                if cutlass.const_expr(row == 1):
+                    token_row = token_row1
+                if token_row < valid_tokens and col < valid_gateup_n:
+                    stg_128b_bf16x8(
+                        g_c, o0, o1, o2, o3, token_tile_base + token_row, col,
                     )
 
     @cute.jit

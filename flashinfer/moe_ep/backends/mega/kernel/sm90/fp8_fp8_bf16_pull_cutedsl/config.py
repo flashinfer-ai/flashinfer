@@ -99,6 +99,10 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # physical warp layout stays at 4.  Output-invariant work partitioning
     # (rank-local -- no cross-rank agreement needed).
     active_dispatch_warps: int = 1
+    # Size the dispatch pull buffer by the active dispatch warps only (the
+    # idle warps' slots otherwise cost 3 x hidden bytes of AB-stage SMEM per
+    # CTA).  Output-invariant; False restores the 4-slot buffer for A/B.
+    compact_pull_buffer: bool = True
     # Empty-warp FC1 store offload (self-gating to non-swap non-ping-pong
     # with register headroom; falls back to early fc1_done publication).
     fc1_store_offload: bool = True

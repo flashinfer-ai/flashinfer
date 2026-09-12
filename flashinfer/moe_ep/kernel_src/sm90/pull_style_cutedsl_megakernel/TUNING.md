@@ -9,12 +9,13 @@ mirrors the structure of the SM100 tree's `TUNING.md`.
 Unless noted otherwise, every measurement comes from a single H200 node
 (4x NVIDIA H200 141GB, SM clock locked at 1830 MHz, EP=4) taken in one
 session: the two microbenchmark tables below and the companion
-`benchmarks/pull_and_push_comparison.md` are one 2026-09-10 session
-(current table, swap-AB N=8 rows included; sweep and pull/push comparison
-back to back on the same node), while the same-node before/after
-paragraph is the 2026-09-03 session on a different node of the same spec
-(never compare numbers across the two; node-to-node offsets of ~2% are
-documented in "Next levers") — at the
+`benchmarks/pull_and_push_comparison.md` are one 2026-09-12 session
+(current table: compact pull buffer default, 16-byte generate_c stores,
+swap-AB N=8 rows; sweep and pull/push comparison back to back on the same
+node), while the same-node before/after paragraphs are the 2026-09-12
+(compact pull buffer) and 2026-09-03 (fold layout) sessions, each on its
+own node (never compare numbers across sessions; node-to-node offsets of
+~2% are documented in "Next levers") — at the
 kernel drop's DSV4-Pro P03
 geometry: **384 experts, top-6, hidden 7168, intermediate 3072
 (post-SwiGLU; gate+up 6144), gate_up_clamp 10.0**, tokens-per-rank swept
@@ -25,10 +26,10 @@ config per point is the drop's token-bucket heuristic table
 team's 2026-08-19 four-rank H200 sweep at the same vendored kernel
 sources, plus the locally added per-bucket `token_back_mode` column from
 the 2026-08-23 epi-vs-reuse sweep — see the knob list below).
-Raw rows: `benchmark_data/20260910/20260910_081146_mega_sm90_heuristic_both.csv`
+Raw rows: `benchmark_data/20260912/20260912_025139_mega_sm90_heuristic_both.csv`
 (local archive, not committed).
 
-## Microbenchmark results (2026-09-10, heuristic launch configs, max-rank µs)
+## Microbenchmark results (2026-09-12, heuristic launch configs, max-rank µs)
 
 Two timed series per point — the difference is WHAT each call includes:
 
@@ -56,43 +57,56 @@ All other knobs are at their config defaults — notably
 `active_dispatch_warps=1` (see "The knob surface"), which lifts the
 large-token buckets by up to ~7% over the previous 4-warp fixed layout.
 
-**per_tensor** — peak 903 TFLOPS/rank:
+**per_tensor** — peak 971 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |    epi     |      791.7 |    8.0 |    941.6 |        6.5 |
-|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1245.7 |   10.2 |   1385.9 |        8.8 |
-|       32 | swap-AB M256N8 CGA2x1              |    epi     |     1423.5 |   17.8 |   1545.4 |       16.0 |
-|       64 | swap-AB M128N8 CGA1x2              |    epi     |     1681.2 |   30.2 |   1806.5 |       27.5 |
-|      128 | swap-AB ping-pong M128N8 CGA1x2    |    epi     |     1740.0 |   58.2 |   1873.0 |       53.1 |
-|      256 | swap-AB M256N32 CGA2x1             |    epi     |     1694.3 |  119.7 |   1828.0 |      108.9 |
-|      512 | swap-AB M256N64 CGA1x1             |    epi     |     1820.1 |  223.1 |   1972.1 |      201.7 |
-|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2143.9 |  378.7 |   2268.0 |      352.0 |
-|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     3046.8 |  531.0 |   3182.3 |      507.7 |
-|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     5077.0 |  640.4 |   5232.7 |      616.2 |
-|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8576.5 |  766.3 |   8813.6 |      741.6 |
-|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    14410.7 |  903.5 |  15324.9 |      852.7 |
-|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    29054.6 |  894.9 |  30619.2 |      846.5 |
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |      759.9 |    8.3 |    881.1 |        7.0 |
+|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1220.5 |   10.4 |   1347.1 |        9.2 |
+|       32 | swap-AB M256N8 CGA2x1              |    epi     |     1371.6 |   18.5 |   1488.3 |       16.6 |
+|       64 | swap-AB M128N8 CGA1x2              |    epi     |     1652.7 |   30.7 |   1770.5 |       28.0 |
+|      128 | swap-AB ping-pong M128N8 CGA1x2    |    epi     |     1746.8 |   58.0 |   1879.3 |       53.0 |
+|      256 | swap-AB M256N32 CGA2x1             |    epi     |     1646.2 |  123.1 |   1783.1 |      111.7 |
+|      512 | swap-AB M256N64 CGA1x1             |    epi     |     1728.8 |  234.6 |   1859.1 |      214.3 |
+|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2083.3 |  384.9 |   2190.3 |      363.2 |
+|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     2942.5 |  549.7 |   3065.7 |      528.2 |
+|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     4860.6 |  670.1 |   5041.6 |      643.1 |
+|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8317.2 |  788.5 |   8410.8 |      775.6 |
+|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    13401.7 |  971.0 |  14227.3 |      916.5 |
+|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    27559.7 |  941.7 |  29199.6 |      888.4 |
 
-**blockwise** — peak 828 TFLOPS/rank:
+**blockwise** — peak 848 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |    epi     |      794.3 |    7.9 |   1002.6 |        6.1 |
-|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1163.6 |   10.8 |   1397.4 |        8.8 |
-|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1647.1 |   15.4 |   1886.4 |       13.2 |
-|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1642.6 |   30.4 |   1875.2 |       26.1 |
-|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1646.3 |   61.5 |   1896.8 |       52.5 |
-|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2053.3 |   98.8 |   2277.2 |       87.0 |
-|      512 | non-swap M64N256 CGA1x1            |    epi     |     1796.0 |  225.4 |   2053.8 |      197.3 |
-|     1024 | non-swap M64N256 CGA2x2            |   reuse    |     2434.7 |  327.2 |   2655.5 |      304.0 |
-|     2048 | non-swap M64N256 CGA2x2            |   reuse    |     3269.0 |  490.5 |   3539.4 |      458.2 |
-|     4096 | non-swap M64N256 CGA1x1            |   reuse    |     5706.7 |  574.5 |   5939.7 |      546.0 |
-|     8192 | non-swap M64N256 CGA2x1            |   reuse    |     9055.4 |  721.2 |   9721.8 |      670.0 |
-|    16384 | non-swap M64N256 CGA1x2            |   reuse    |    17597.9 |  741.0 |  18970.7 |      686.6 |
-|    32768 | non-swap M64N256 CGA2x1            |   reuse    |    31310.6 |  827.6 |  34167.2 |      759.8 |
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |      778.0 |    8.0 |    986.7 |        6.2 |
+|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1123.2 |   11.3 |   1326.0 |        9.3 |
+|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1642.8 |   15.4 |   1860.2 |       13.4 |
+|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1587.5 |   31.9 |   1803.6 |       27.2 |
+|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1594.5 |   63.5 |   1821.7 |       54.7 |
+|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2037.9 |   99.5 |   2257.5 |       88.3 |
+|      512 | non-swap M64N256 CGA1x1            |    epi     |     1735.7 |  233.2 |   1960.4 |      206.7 |
+|     1024 | non-swap M64N256 CGA2x2            |   reuse    |     2418.3 |  327.2 |   2593.3 |      312.1 |
+|     2048 | non-swap M64N256 CGA2x2            |   reuse    |     3256.2 |  488.7 |   3482.8 |      465.5 |
+|     4096 | non-swap M64N256 CGA1x1            |   reuse    |     5439.4 |  594.3 |   5854.0 |      554.9 |
+|     8192 | non-swap M64N256 CGA2x1            |   reuse    |     8863.3 |  735.0 |   9565.4 |      684.6 |
+|    16384 | non-swap M64N256 CGA1x2            |   reuse    |    17226.9 |  754.9 |  18605.7 |      699.5 |
+|    32768 | non-swap M64N256 CGA2x1            |   reuse    |    30579.5 |  847.7 |  33548.0 |      773.6 |
 
-**Swap-AB N=8 rows, same node as the tables (2026-09-10)**: old table vs
+**Before/after on one node (2026-09-12 session, this table's node)** —
+`compact_pull_buffer` (default True) versus the 4-slot pull buffer, same
+tree, generate_c off, 2 interleaved rounds, e2e median: per_tensor
+geomean **+1.35%** (pt16384 +5.4, pt4096 +3.4, pt512 +2.4, pt2048 +2.3;
+the N256 cooperative and N128 ping-pong configs gain one AB stage),
+blockwise **−0.25%** (no bucket beyond −1.2%; the blockwise N256 config
+keeps 4 stages — see the knob entry); geomean e2e +0.55%, compute +0.79%.
+The 16-byte generate_c stores do not touch the generate_c=off path
+(off-vs-off within noise, −0.2%).  Against the 2026-09-10 table (a
+different node) the peaks moved 903 → 971 (per_tensor) and 828 → 848
+(blockwise) TFLOPS/rank; per the rule below, only the same-node
+before/after numbers are attributable to the code.
+
+**Swap-AB N=8 rows (2026-09-10 session, the node of the previous table)**: old table vs
 new table, interleaved 2 rounds, e2e median — pt64 **+14.1%**, pt128
 +4.7%; pt32 moved from non-swap M64N256 to cooperative swap M256N8 CGA2x1:
 +5.7% / +6.4% e2e (compute +7.4% / +7.1%) against the non-swap row, the
@@ -208,29 +222,48 @@ derived programmatically) crossed with both validated token-back modes —
   the same contract as the Blackwell MXFP8 kernel's `generate_c`.  Read it
   back from `symm_buffer.fc1_c` after the launch; segment offsets are
   `sum(round_up(count[i], 128), i < e)` over the per-expert routed-token
-  counts.  Non-swap stores BF16 pairs straight from the wgmma fragments,
-  swap-AB scatters single elements from its transposed tile; no SMEM
-  staging, so the AB pipeline budget is unchanged and the store path is
-  compiled out when off (HEAD-vs-off heuristic sweeps within run noise).
-  Cost when on (drop harness, 4x H200 at 1830 MHz, 2 interleaved rounds,
-  max-rank mega time) on the heuristic table's own configs: the swap-AB
-  buckets (8–256 tokens/rank plus pt512/1024/8192) sit at −2..+5%, i.e.
-  the transposed-tile scatter is cheap on small tiles; the non-swap
-  buckets pay +10..+20% (bw1024 +19.7, bw8192 +16.9, pt16384 +15.9,
-  bw32768 +12.2).  Pinned to non-swap M64N256 CGA1x1 for every bucket:
-  ≤512 +0..5%, 1k–8k +9..13%, 16k–32k +5..6%.  The extra BF16 gate+up
-  write is 4x the fp8 fc1 output bytes and is issued as 32-bit (non-swap)
-  or 16-bit (swap) stores; SMEM staging + TMA or quad-transposed 128-bit
-  stores are the follow-up if the training forward needs it cheaper.
-  Off costs nothing: the store path is compiled out and the HEAD-vs-off
-  heuristic sweep is within noise (drop harness geomean −0.5% / +0.0%;
-  FlashInfer bench, 2 interleaved rounds, e2e geomean −0.1%, compute
-  −0.2%).  FlashInfer bench with `--generate-c` (same node, 2 rounds, e2e
-  median): swap-AB buckets 8–256 within ±1.5%, pt512/1024/8192 −2.5..−3%,
-  non-swap buckets −8..−16% (bw1024 −15.6, bw8192 −13.3, pt16384 −12.2);
-  geomean e2e −5.1%, compute −5.4%.  Test `test_..._generate_c` (both
-  layouts x both scale modes vs the multi-rank torch reference's
-  `return_fc1_gateup`).
+  counts.  Store path (both layouts): the values go straight from the
+  wgmma fragments to GMEM as 16-byte stores after a lane transpose —
+  non-swap: a quad holds 64 consecutive raw columns of one row for each
+  pair of gate/up groups, two `shfl.bfly` levels across `lane_mod` give
+  every lane one 16-byte chunk (one `st.global.v4` per (row, pair), a quad
+  writes a 64-byte-aligned 64-byte run); swap-AB: the eight lane groups
+  hold one 16-byte chunk per (token, m_sub, gate/up), two 32-bit butterfly
+  levels on lane-group bits 2/1 plus a `prmt` half-word exchange on bit 0
+  leave each lane group one chunk (1 STG.128 per token group instead of 8
+  STG.16).  The GMEM pointer carries an explicit 16-byte alignment
+  assumption (`make_ptr(..., assumed_align=16)`): a plain `autovec_copy`
+  into the BF16 view has no alignment fact and degrades to 16-bit stores
+  — the first version's "bf16x2" pair stores compiled to `STG.E.U16`,
+  which was the whole generate_c overhead.  The row/column predicate is
+  exact (`intermediate_gateup % 64 == 0`).  No SMEM staging: a TMA-staged
+  variant (two (64x64) BF16 stages per epilogue warpgroup) was measured
+  and rejected — the 16 KB per warpgroup comes out of the AB pipeline
+  budget and drops the N256 configs from 4 to 3 stages (−10..−38% on
+  those buckets) while gaining only +2..+3% where it fits.
+  Cost when on (FlashInfer bench, 4x H200 at 1830 MHz, 2 interleaved
+  rounds, e2e median): every bucket within −1..−3% of the same tree with
+  generate_c off (geomean e2e −0.9%, compute −1.2%; was −5.2% / −5.4%
+  with the 16-bit stores: non-swap buckets −8..−16%).  Off costs nothing:
+  the store path is compiled out (off-vs-off sweeps within noise).  Test
+  `test_..._generate_c` (both layouts x both scale modes vs the multi-rank
+  torch reference's `return_fc1_gateup`).
+- `compact_pull_buffer` (default True) — size the dispatch pull buffer by
+  the *active* dispatch warps (`active_dispatch_warps` x
+  `max(hidden_bytes, tb_chunk_bytes)` = 7 KiB at hidden=7168) instead of
+  one `hidden_bytes` slot per physical dispatch warp (28 KiB): the idle
+  warps never enter the dispatch body and the reuse token-back walkers
+  are exactly the active warps, so the three idle slots were dead SMEM.
+  Token-comm misc SMEM 31264 -> 9760 B per CTA and the difference goes to
+  AB pipeline stages: per_tensor N256 coop 4 -> 5, N128 ping-pong 7 -> 8,
+  swap-AB tiles +1; blockwise N256 coop stays at 4 (its 1 KiB/stage of
+  block scales plus the 16 KiB output ring leave it ~3.6 KiB short of a
+  fifth stage — shaving that, e.g. one fewer fc2 store slot, is the
+  follow-up).  Measured (same bench, generate_c off, 2 interleaved
+  rounds): per_tensor e2e +1.35% (pt16384 +5.4, pt4096 +3.4, pt512 +2.4,
+  pt2048 +2.3), blockwise −0.25% (no bucket beyond −1.2%); geomean e2e
+  +0.55%, compute +0.79%.  Output-invariant; `False` restores the 4-slot
+  buffer for A/B (`--no-compact-pull-buffer` on the bench).
 - `fold_producer_warps` (default True; requires `active_dispatch_warps == 1`)
   — folds the TMA-A / TMA-B / scheduler warps into the three idle
   dispatch-warpgroup slots and drops the separate producer warpgroup

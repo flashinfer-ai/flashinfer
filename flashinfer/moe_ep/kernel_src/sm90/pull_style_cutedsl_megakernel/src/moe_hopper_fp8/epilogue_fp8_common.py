@@ -9,7 +9,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.typing import Float32
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int64, T
+from cutlass._mlir.dialects import llvm
 
 from common.megamoe_constants import Log2E
 from common.moe_utils import fmax, fmin
@@ -152,6 +153,100 @@ class Fc2OutputDest:
 
 
 @cute.jit
+def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32) -> cutlass.Uint32:
+    """Round two FP32 values to BF16 and pack them into one 32-bit word.
+
+    ``lo`` lands in the low half (the lower memory address), ``hi`` in the
+    high half -- i.e. the pair (col, col + 1) of a row-major BF16 row.
+    """
+    packed = llvm.inline_asm(
+        T.i32(),
+        [hi.ir_value(), lo.ir_value()],
+        "cvt.rn.bf16x2.f32 $0, $1, $2;",
+        "=r,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return cutlass.Uint32(packed)
+
+
+@cute.jit
+def bfly_transpose4_u32(
+    w0, w1, w2, w3, hi_set, lo_set,
+    hi_xor: cutlass.Constexpr, lo_xor: cutlass.Constexpr,
+):
+    """Two-level butterfly transpose of a 4x4 matrix of 32-bit words held by
+    four lanes.
+
+    The four lanes differ in two lane-id bits: ``hi_xor`` and ``lo_xor`` are
+    the corresponding shfl.bfly masks and ``hi_set`` / ``lo_set`` tell the
+    caller's lane whether each bit is set, so lane index ``q = 2*hi + lo``.
+    Lane ``q`` enters with ``V[q][0..3] = (w0, w1, w2, w3)`` -- its word for
+    each of four 16-byte chunks -- and leaves with ``V[0..3][q]``: the four
+    lanes' words for chunk ``q`` in source-lane order, i.e. the chunk's 16
+    bytes ready for one vector store.  All lanes must execute this (no
+    predication around the shuffles).
+    """
+    # Level 1: lanes with the high bit clear keep chunks {0, 1} and send
+    # {2, 3}; lanes with it set do the opposite.
+    s0 = w0 if hi_set else w2
+    s1 = w1 if hi_set else w3
+    r0 = cute.arch.shuffle_sync_bfly(s0, hi_xor)
+    r1 = cute.arch.shuffle_sync_bfly(s1, hi_xor)
+    x0 = r0 if hi_set else w0  # (lane q&1,     kept chunk 0)
+    x1 = r1 if hi_set else w1  # (lane q&1,     kept chunk 1)
+    x2 = w2 if hi_set else r0  # (lane (q&1)|2, kept chunk 0)
+    x3 = w3 if hi_set else r1  # (lane (q&1)|2, kept chunk 1)
+    # Level 2: lanes with the low bit clear keep kept-chunk 0 and send 1.
+    t0 = x0 if lo_set else x1
+    t1 = x2 if lo_set else x3
+    u0 = cute.arch.shuffle_sync_bfly(t0, lo_xor)
+    u1 = cute.arch.shuffle_sync_bfly(t1, lo_xor)
+    o0 = u0 if lo_set else x0  # source lane 0
+    o1 = x1 if lo_set else u0  # source lane 1
+    o2 = u1 if lo_set else x2  # source lane 2
+    o3 = x3 if lo_set else u1  # source lane 3
+    return o0, o1, o2, o3
+
+
+@cute.jit
+def stg_128b_bf16x8(
+    g_c: cute.Tensor, o0, o1, o2, o3, row, col,
+) -> None:
+    """One 16-byte store of eight BF16 values (packed as four u32 words, low
+    half first) to ``g_c[row, col:col+8]``; ``col`` must be a multiple of 8.
+
+    The target pointer carries an explicit 16-byte alignment assumption:
+    autovec on the plain BF16 view has no alignment fact and would split the
+    store into 16-bit pieces.
+    """
+    o_u32 = cute.make_rmem_tensor(4, cutlass.Uint32)
+    o_u32[0] = o0
+    o_u32[1] = o1
+    o_u32[2] = o2
+    o_u32[3] = o3
+    o_bf16 = cute.recast_tensor(o_u32, cutlass.BFloat16)
+    g_chunk = cute.coalesce(
+        cute.local_tile(g_c, (1, 8), (row, col // cutlass.Int32(8))),
+    )
+    dst_ptr = cute.make_ptr(
+        cutlass.BFloat16,
+        g_chunk.iterator.toint(),
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    cute.copy(
+        cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16,
+            num_bits_per_copy=128,
+        ),
+        o_bf16,
+        cute.make_tensor(dst_ptr, cute.make_layout(8)),
+    )
+
+
+@cute.jit
 def tma_store_fc1_output(
     sC,
     stage_idx,
@@ -217,58 +312,3 @@ def stg_fc1_block_scale_row(
     rmem_sf = cute.make_rmem_tensor((1,), cutlass.Float32)
     rmem_sf[0] = scale
     cute.autovec_copy(rmem_sf, gmem_sf)
-
-
-@cute.jit
-def stg_fc1_c_bf16x2(
-    real_fc1_c: cute.Tensor,
-    token_idx,
-    col_idx,
-    v0: Float32,
-    v1: Float32,
-) -> None:
-    """generate_c: store two adjacent raw FC1 accumulator values as BF16.
-
-    ``real_fc1_c`` is the scheduler-sliced ``(tokens, intermediate_gateup, 1)``
-    view of the ``fc1_c`` tensor.  The wgmma accumulator layout hands every
-    thread column PAIRS, so ``col_idx`` is even and the pair is one aligned
-    32-bit store (no SMEM staging -- the AB pipeline budget is untouched).
-    """
-    c_base = cute.local_tile(
-        real_fc1_c,
-        (1, 2, 1),
-        (token_idx, col_idx // 2, cutlass.Int32(0)),
-    )
-    gmem_c = cute.make_tensor(c_base.iterator, cute.make_layout(2))
-    rmem_f32 = cute.make_rmem_tensor((2,), Float32)
-    rmem_f32[0] = v0
-    rmem_f32[1] = v1
-    rmem_c = cute.make_rmem_tensor((2,), cutlass.BFloat16)
-    rmem_c.store(rmem_f32.load().to(cutlass.BFloat16))
-    cute.autovec_copy(rmem_c, gmem_c)
-
-
-@cute.jit
-def stg_fc1_c_bf16(
-    real_fc1_c: cute.Tensor,
-    token_idx,
-    col_idx,
-    v: Float32,
-) -> None:
-    """generate_c (swap-AB): store one raw FC1 accumulator value as BF16.
-
-    The swap-AB accumulator is transposed (intermediate along M, tokens
-    along N), so a thread's values for one token are 8 columns apart in
-    ``fc1_c`` and are written one element at a time.
-    """
-    c_base = cute.local_tile(
-        real_fc1_c,
-        (1, 1, 1),
-        (token_idx, col_idx, cutlass.Int32(0)),
-    )
-    gmem_c = cute.make_tensor(c_base.iterator, cute.make_layout(1))
-    rmem_f32 = cute.make_rmem_tensor((1,), Float32)
-    rmem_f32[0] = v
-    rmem_c = cute.make_rmem_tensor((1,), cutlass.BFloat16)
-    rmem_c.store(rmem_f32.load().to(cutlass.BFloat16))
-    cute.autovec_copy(rmem_c, gmem_c)
