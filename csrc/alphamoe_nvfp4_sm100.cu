@@ -29,6 +29,7 @@
 // layout-identical declarations below. FlashInfer then applies the explicit
 // static-ModelOpt scale ABI patch tracked in this file: three FP32 [E] launch
 // arguments, gate/up scaling before SwiGLU and down scaling before routing.
+// Weighted partial outputs also accumulate in FP32 before one final BF16 cast.
 // Therefore the body below is intentionally not byte-identical to the raw
 // generated CUDA named above; a future Loom re-export must port this patch.
 // The TVM-FFI validation, TMA encoding, and launch binding follow that body.
@@ -99,9 +100,9 @@ struct __align__(128) LoomTensorMapPack {
 #define SMEM_SMEM_ACT_SF_CP_STAGE_BYTES 1024
 #define SMEM_SMEM_ACT_SF_CP_STRIDE 1024
 #define SMEM_SMEM_OUT_OFF 150272
-#define SMEM_SMEM_OUT_STAGE_BYTES 2048
-#define SMEM_SMEM_OUT_STRIDE 2048
-#define SMEM_TOTAL 152320
+#define SMEM_SMEM_OUT_STAGE_BYTES 4096
+#define SMEM_SMEM_OUT_STRIDE 4096
+#define SMEM_TOTAL 154368
 #define THREADS 192
 
 #include <math_constants.h>
@@ -411,7 +412,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(192, 1) void
-kernel_alpha_moe_nvfp4_up_down(uint8_t* __restrict__ x_scale, uint8_t* __restrict__ w1_scale, uint8_t* __restrict__ w2_scale, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, __nv_bfloat16* __restrict__ out, int M, int K, int top_k, int route_block_m, float scaling_factor, __grid_constant__ LoomTensorMapPack<3> const _loom_tma_params)
+kernel_alpha_moe_nvfp4_up_down(uint8_t* __restrict__ x_scale, uint8_t* __restrict__ w1_scale, uint8_t* __restrict__ w2_scale, float* __restrict__ output1_scale_gate_scalar, float* __restrict__ output1_scale_scalar, float* __restrict__ output2_scale_scalar, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, float* __restrict__ topk_weights, float* __restrict__ out, int M, int K, int top_k, int route_block_m, float scaling_factor, __grid_constant__ LoomTensorMapPack<3> const _loom_tma_params)
 {
     uint64_t _loom_tma_param_base;
     asm volatile("mov.b64 %0, %1;" : "=l"(_loom_tma_param_base) : "l"((uint64_t)(&_loom_tma_params)));
@@ -448,7 +449,7 @@ kernel_alpha_moe_nvfp4_up_down(uint8_t* __restrict__ x_scale, uint8_t* __restric
     const int smem_act_scale_addr = smem + 148992;
     uint8_t* smem_act_sf_cp = reinterpret_cast<uint8_t*>(smem_raw + 149248);
     const int smem_act_sf_cp_addr = smem + 149248;
-    __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 150272);
+    float* smem_out = reinterpret_cast<float*>(smem_raw + 150272);
     const int smem_out_addr = smem + 150272;
 
     // Mbarrier init (6 groups, 16 barriers)
@@ -1582,9 +1583,9 @@ kernel_alpha_moe_nvfp4_up_down(uint8_t* __restrict__ x_scale, uint8_t* __restric
                                 int token_reduce = pair_reduce / top_k;
                                 {
                                     void* _cpred_dst_0 = reinterpret_cast<void*>(out + (token_reduce * K + ob_c * 128));
-                                    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16"
+                                    asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32"
                                         " [%0], [%1], %2;"
-                                        :: "l"(_cpred_dst_0), "r"(smem_out_addr + (unsigned int)(token_slot_reduce * 128 * 2)), "r"((uint32_t)(256))
+                                        :: "l"(_cpred_dst_0), "r"(smem_out_addr + (unsigned int)(token_slot_reduce * 128 * 4)), "r"((uint32_t)(512))
                                         : "memory");
                                 }
                             }
@@ -1797,11 +1798,11 @@ inline TensorRange GetTensorRange(const TensorView& tensor, const char* name) {
 }
 
 inline void CheckNoOverlap(const TensorView& output, const TensorView& input,
-                           const char* input_name) {
-  const TensorRange output_range = GetTensorRange(output, "out");
+                           const char* input_name, const char* output_name = "out") {
+  const TensorRange output_range = GetTensorRange(output, output_name);
   const TensorRange input_range = GetTensorRange(input, input_name);
   TVM_FFI_ICHECK(!(output_range.begin < input_range.end && input_range.begin < output_range.end))
-      << "out must not overlap " << input_name
+      << output_name << " must not overlap " << input_name
       << ": the frozen kernel asynchronously reads inputs through __restrict__ pointers/TMA";
 }
 
@@ -1812,8 +1813,8 @@ inline ProblemDims CheckInputs(
     const TensorView& output1_scale_gate_scalar, const TensorView& output1_scale_scalar,
     const TensorView& output2_scale_scalar, const TensorView& sorted_token_ids,
     const TensorView& expert_ids, const TensorView& num_tokens_post_padded,
-    const TensorView& topk_weights, const TensorView& out, int64_t top_k, int64_t block_m,
-    double routed_scaling_factor) {
+    const TensorView& topk_weights, const TensorView& out, const TensorView& accumulator,
+    int64_t top_k, int64_t block_m, double routed_scaling_factor) {
   CheckTensor(hidden_states, dl_uint8, 2, false, "hidden_states", "uint8");
   CheckTensor(hidden_states_scale, dl_float8_e4m3fn, 2, true, "hidden_states_scale",
               "float8_e4m3fn");
@@ -1832,6 +1833,7 @@ inline ProblemDims CheckInputs(
   CheckTensor(num_tokens_post_padded, dl_int32, 1, true, "num_tokens_post_padded", "int32");
   CheckTensor(topk_weights, dl_float32, 2, true, "topk_weights", "float32");
   CheckTensor(out, dl_bfloat16, 2, true, "out", "bfloat16");
+  CheckTensor(accumulator, dl_float32, 2, true, "accumulator", "float32");
 
   const int device_id = hidden_states.device().device_id;
   CheckSameDevice(hidden_states_scale, device_id, "hidden_states_scale");
@@ -1847,6 +1849,7 @@ inline ProblemDims CheckInputs(
   CheckSameDevice(num_tokens_post_padded, device_id, "num_tokens_post_padded");
   CheckSameDevice(topk_weights, device_id, "topk_weights");
   CheckSameDevice(out, device_id, "out");
+  CheckSameDevice(accumulator, device_id, "accumulator");
   CheckSm100OrSm103(device_id);
 
   TVM_FFI_ICHECK(hidden_states.stride(1) == 1)
@@ -1901,8 +1904,11 @@ inline ProblemDims CheckInputs(
   CheckShape1(output2_scale_scalar, num_experts, "output2_scale_scalar");
   CheckShape2(topk_weights, m, top_k, "topk_weights");
   CheckShape2(out, m, k, "out");
+  CheckShape2(accumulator, m, k, "accumulator");
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0)
-      << "out data pointer must be 16-byte aligned for cp.reduce.async.bulk";
+      << "out data pointer must be 16-byte aligned";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(accumulator.data_ptr()) % 16 == 0)
+      << "accumulator data pointer must be 16-byte aligned for cp.reduce.async.bulk";
 
   CheckNoOverlap(out, hidden_states, "hidden_states");
   CheckNoOverlap(out, hidden_states_scale, "hidden_states_scale");
@@ -1917,6 +1923,21 @@ inline ProblemDims CheckInputs(
   CheckNoOverlap(out, expert_ids, "expert_ids");
   CheckNoOverlap(out, num_tokens_post_padded, "num_tokens_post_padded");
   CheckNoOverlap(out, topk_weights, "topk_weights");
+
+  CheckNoOverlap(accumulator, out, "out", "accumulator");
+  CheckNoOverlap(accumulator, hidden_states, "hidden_states", "accumulator");
+  CheckNoOverlap(accumulator, hidden_states_scale, "hidden_states_scale", "accumulator");
+  CheckNoOverlap(accumulator, gemm1_weights, "gemm1_weights", "accumulator");
+  CheckNoOverlap(accumulator, gemm1_weights_scale, "gemm1_weights_scale", "accumulator");
+  CheckNoOverlap(accumulator, gemm2_weights, "gemm2_weights", "accumulator");
+  CheckNoOverlap(accumulator, gemm2_weights_scale, "gemm2_weights_scale", "accumulator");
+  CheckNoOverlap(accumulator, output1_scale_gate_scalar, "output1_scale_gate_scalar", "accumulator");
+  CheckNoOverlap(accumulator, output1_scale_scalar, "output1_scale_scalar", "accumulator");
+  CheckNoOverlap(accumulator, output2_scale_scalar, "output2_scale_scalar", "accumulator");
+  CheckNoOverlap(accumulator, sorted_token_ids, "sorted_token_ids", "accumulator");
+  CheckNoOverlap(accumulator, expert_ids, "expert_ids", "accumulator");
+  CheckNoOverlap(accumulator, num_tokens_post_padded, "num_tokens_post_padded", "accumulator");
+  CheckNoOverlap(accumulator, topk_weights, "topk_weights", "accumulator");
 
   TVM_FFI_ICHECK(num_tokens_post_padded.numel() == 1)
       << "num_tokens_post_padded must contain exactly one device-side int32 value";
@@ -2022,7 +2043,7 @@ inline void Launch(const TensorView& hidden_states, const TensorView& hidden_sta
                    const TensorView& output1_scale_scalar, const TensorView& output2_scale_scalar,
                    const TensorView& sorted_token_ids, const TensorView& expert_ids,
                    const TensorView& num_tokens_post_padded, const TensorView& topk_weights,
-                   const TensorView& out, const ProblemDims& dims, float routed_scaling_factor,
+                   const TensorView& accumulator, const ProblemDims& dims, float routed_scaling_factor,
                    cudaStream_t stream) {
   const CUtensorMap hidden_states_map = EncodeHiddenStatesTma(hidden_states);
   const CUtensorMap gemm1_map = EncodeGemm1WeightsTma(gemm1_weights);
@@ -2047,7 +2068,7 @@ inline void Launch(const TensorView& hidden_states, const TensorView& hidden_sta
       static_cast<int*>(sorted_token_ids.data_ptr()), static_cast<int*>(expert_ids.data_ptr()),
       static_cast<int*>(num_tokens_post_padded.data_ptr()),
       static_cast<float*>(topk_weights.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), dims.m, dims.k, dims.top_k, dims.block_m,
+      static_cast<float*>(accumulator.data_ptr()), dims.m, dims.k, dims.top_k, dims.block_m,
       routed_scaling_factor, tensor_maps);
   CheckCuda(cudaGetLastError(), "alphamoe_nvfp4_sm100 kernel launch");
 }
@@ -2056,8 +2077,8 @@ void Run(TensorView hidden_states, TensorView hidden_states_scale, TensorView ge
          TensorView gemm1_weights_scale, TensorView gemm2_weights, TensorView gemm2_weights_scale,
          TensorView output1_scale_gate_scalar, TensorView output1_scale_scalar,
          TensorView output2_scale_scalar, TensorView sorted_token_ids, TensorView expert_ids,
-         TensorView num_tokens_post_padded, TensorView topk_weights, TensorView out, int64_t top_k,
-         int64_t block_m, double routed_scaling_factor) {
+         TensorView num_tokens_post_padded, TensorView topk_weights, TensorView out,
+         TensorView accumulator, int64_t top_k, int64_t block_m, double routed_scaling_factor) {
   // Establish the active CUDA device before capability queries, TMA encoding,
   // function-attribute updates, stream lookup, or kernel launch.
   TVM_FFI_ICHECK(hidden_states.device().device_type == kDLCUDA)
@@ -2068,11 +2089,12 @@ void Run(TensorView hidden_states, TensorView hidden_states_scale, TensorView ge
       CheckInputs(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
                   gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
                   output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
-                  num_tokens_post_padded, topk_weights, out, top_k, block_m, routed_scaling_factor);
+                  num_tokens_post_padded, topk_weights, out, accumulator, top_k, block_m,
+                  routed_scaling_factor);
   const cudaStream_t stream = get_stream(hidden_states.device());
   Launch(hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale, gemm2_weights,
          gemm2_weights_scale, output1_scale_gate_scalar, output1_scale_scalar, output2_scale_scalar,
-         sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, out, dims,
+         sorted_token_ids, expert_ids, num_tokens_post_padded, topk_weights, accumulator, dims,
          static_cast<float>(routed_scaling_factor), stream);
 }
 

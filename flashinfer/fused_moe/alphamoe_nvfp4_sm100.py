@@ -307,6 +307,10 @@ def _alphamoe_nvfp4_aligned_moe_impl(
     block_m: int,
     routed_scaling_factor: float,
 ) -> None:
+    # Seed from the caller's output to preserve additive semantics. This
+    # temporary and both casts use the current stream; during graph capture
+    # its storage belongs to PyTorch's graph memory pool.
+    accumulator = out.to(torch.float32)
     get_alphamoe_nvfp4_sm100_module().nvfp4_aligned_moe_op(
         hidden_states,
         hidden_states_scale,
@@ -322,10 +326,12 @@ def _alphamoe_nvfp4_aligned_moe_impl(
         num_tokens_post_padded,
         topk_weights,
         out,
+        accumulator,
         top_k,
         block_m,
         routed_scaling_factor,
     )
+    out.copy_(accumulator)
 
 
 @register_fake_op("flashinfer::alphamoe_nvfp4_aligned_moe")
@@ -374,9 +380,11 @@ def alphamoe_nvfp4_aligned_moe(
 ) -> None:
     r"""Run the fused AlphaMoE NVFP4 up → SwiGLU → down kernel.
 
-    This SM100/SM103 kernel consumes a pre-aligned routing plan and accumulates
-    directly into the caller-owned BF16 ``out`` tensor. It does not run expert
-    selection and does not allocate an intermediate or output tensor.
+    This SM100/SM103 kernel consumes a pre-aligned routing plan. Contributions
+    accumulate in a temporary FP32 ``[M, K]`` buffer initialized from the
+    caller-owned BF16 ``out`` tensor, then convert back to ``out`` once. It does
+    not run expert selection. The temporary uses ``4 * M * K`` bytes and is
+    compatible with CUDA graph capture.
 
     ``hidden_states``, ``gemm1_weights``, and ``gemm2_weights`` store two E2M1
     values per ``uint8`` byte, with the even logical value in the low nibble.
@@ -434,10 +442,10 @@ def alphamoe_nvfp4_aligned_moe(
     topk_weights : torch.Tensor
         FP32 route weights ``[M, top_k]``.
     out : torch.Tensor
-        Contiguous BF16 accumulator ``[M, K]``. Contributions are added to its
-        existing values; its data pointer must be 16-byte aligned. Zero it
-        before calling when a fresh result is wanted. It must not overlap any
-        input tensor.
+        Contiguous BF16 output ``[M, K]``. Contributions are added to its existing
+        values in FP32 before the final BF16 conversion; its data pointer must
+        be 16-byte aligned. Zero it before calling when a fresh result is wanted.
+        It must not overlap any input tensor.
     top_k : int
         Routes per token.
     block_m : int
@@ -449,7 +457,8 @@ def alphamoe_nvfp4_aligned_moe(
     -----
     Logical ``K`` is derived as ``2 * hidden_states.shape[1]`` and must be at
     least 256 and divisible by 256. This function mutates ``out`` and returns
-    ``None``.
+    ``None``. The FP32 bulk reduction is order-dependent and flushes subnormal
+    inputs and results to signed zero, as specified by PTX ``cp.reduce.add.f32``.
     """
 
     _alphamoe_nvfp4_aligned_moe_impl(
