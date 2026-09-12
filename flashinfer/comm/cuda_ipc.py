@@ -47,24 +47,25 @@ def find_loaded_library(lib_name) -> Optional[str]:
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
-    found = False
+    # A plain `lib_name in line` substring match on the first hit is not enough:
+    # another loaded library can have a filename that merely contains lib_name but
+    # is not the library we want (e.g. tilelang's libcudart_stub.so vs the real
+    # libcudart.so.13). Because /proc/self/maps is address-sorted, the first hit is
+    # whichever mapping has the lowest base address, so the stub can win and later
+    # raise "undefined symbol" on load. Scan every mapping and keep only names that
+    # are really lib_name, i.e. `lib_name.so[.ver]` or `lib_name-<hash>.so[.ver]`.
+    # See https://github.com/flashinfer-ai/flashinfer/issues/3676.
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
-                found = True
-                break
-    if not found:
-        # the library is not loaded in the current process
-        return None
-    # if lib_name is libcudart, we need to match a line with:
-    # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
-    filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(lib_name), (
-        f"Unexpected filename: {filename} for library {lib_name}"
-    )
-    return path
+            if lib_name not in line or "/" not in line:
+                continue
+            path = line[line.index("/"):].strip()
+            filename = path.split("/")[-1]
+            stem = filename.rpartition(".so")[0]
+            if stem == lib_name or stem.startswith(lib_name + ".") or stem.startswith(lib_name + "-"):
+                return path
+    # the library is not loaded in the current process
+    return None
 
 
 class CudaRTLibrary:
