@@ -561,19 +561,22 @@ class B12xMoEWrapper:
                 device=self.device,
             )
 
-    def _get_output(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    def _check_run_capacity(self, num_tokens: int) -> None:
         if self.use_cuda_graph and num_tokens > self.max_num_tokens:
             raise ValueError(
                 f"num_tokens ({num_tokens}) exceeds max_num_tokens "
                 f"({self.max_num_tokens})"
             )
-        if self.use_cuda_graph:
-            return self._moe_output[:num_tokens]
-        if _is_cuda_graph_capturing():
+        if not self.use_cuda_graph and _is_cuda_graph_capturing():
             raise RuntimeError(
                 "B12xMoEWrapper must be constructed with use_cuda_graph=True "
                 "to run during CUDA graph capture."
             )
+
+    def _get_output(self, x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        self._check_run_capacity(num_tokens)
+        if self.use_cuda_graph:
+            return self._moe_output[:num_tokens]
         return torch.empty(
             (num_tokens, self.hidden_size),
             dtype=self.output_dtype,
@@ -698,12 +701,73 @@ class B12xMoEWrapper:
                 f"got {actual}, expected {expected}"
             )
 
+    def _validate_prepared_output(
+        self,
+        out: torch.Tensor,
+        x: torch.Tensor,
+        prepared_weights: "W4A16PackedWeights",
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        workspace: Any,
+    ) -> None:
+        expected_shape = (token_selected_experts.size(0), self.hidden_size)
+        if out.shape != expected_shape:
+            raise ValueError(f"out must have shape {expected_shape}, got {out.shape}")
+        if out.dtype != self.output_dtype:
+            raise TypeError(f"out must have dtype {self.output_dtype}, got {out.dtype}")
+        if out.device != x.device:
+            raise ValueError(f"out must be on {x.device}, got {out.device}")
+        out_start = out.data_ptr()
+        if not out.is_contiguous() or out_start % 16:
+            raise ValueError("out must be contiguous and 16-byte aligned")
+        if out.requires_grad:
+            raise ValueError("out must not require gradients")
+        if not out.numel():
+            return
+
+        out_end = out_start + out.numel() * out.element_size()
+        inputs = (
+            ("x", x),
+            ("token_selected_experts", token_selected_experts),
+            ("token_final_scales", token_final_scales),
+        )
+        for prefix, tensors in (
+            ("", inputs),
+            ("prepared_weights.", vars(prepared_weights).items()),
+            ("workspace.", vars(workspace).items() if workspace is not None else ()),
+        ):
+            for name, value in tensors:
+                if not isinstance(value, torch.Tensor):
+                    continue
+                # Most buffers have separate allocations. Only inspect strides
+                # when their storage address ranges could intersect the output.
+                # Address ranges also cover aliases with distinct Storage objects.
+                storage = value.untyped_storage()
+                storage_start = storage.data_ptr()
+                if (
+                    out_end <= storage_start
+                    or out_start >= storage_start + storage.nbytes()
+                ):
+                    continue
+                if value.device != out.device or not value.numel():
+                    continue
+                span = sum(
+                    (size - 1) * stride
+                    for size, stride in zip(value.shape, value.stride(), strict=True)
+                )
+                start = value.data_ptr()
+                end = start + (span + 1) * value.element_size()
+                if out_start < end and start < out_end:
+                    raise ValueError(f"out must not overlap {prefix}{name}")
+
     def run_prepared(
         self,
         x: torch.Tensor,
         prepared_weights: "W4A16PackedWeights",
         token_selected_experts: torch.Tensor,
         token_final_scales: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         r"""Run W4A16 MoE from an explicit caller-owned prepared object.
 
@@ -717,6 +781,14 @@ class B12xMoEWrapper:
             Expert assignments of shape ``[num_tokens, top_k]``.
         token_final_scales : torch.Tensor
             Routing weights of shape ``[num_tokens, top_k]``.
+        out : Optional[torch.Tensor]
+            Caller-owned output with shape ``[num_tokens, hidden_size]``, the
+            wrapper's output dtype and the input device. Must be contiguous,
+            16-byte aligned, and disjoint from inputs, prepared weights and
+            workspace. Must not require gradients. If provided, this exact
+            tensor is written and returned. For CUDA graphs, keep its storage
+            alive at the captured address through every replay. Omitting it
+            preserves the wrapper-owned output path and allocation policy.
 
         Returns
         -------
@@ -740,8 +812,20 @@ class B12xMoEWrapper:
             )
 
         num_tokens = token_selected_experts.size(0)
-        moe_output = self._get_output(x, num_tokens)
         workspace = self._get_workspace(num_tokens)
+        if out is None:
+            moe_output = self._get_output(x, num_tokens)
+        else:
+            self._check_run_capacity(num_tokens)
+            self._validate_prepared_output(
+                out,
+                x,
+                prepared_weights,
+                token_selected_experts,
+                token_final_scales,
+                workspace,
+            )
+            moe_output = out
 
         from .blackwell_sm12x.moe_dispatch import (
             launch_sm120_w4a16_moe_prepared,

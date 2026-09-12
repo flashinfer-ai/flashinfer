@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any, Callable
 
 import cuda.bindings.driver as cuda
@@ -685,11 +686,10 @@ class W4A16GemmKernel:
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
         # CTA over the full K (grid-strided waves, ragged last wave), skipping
-        # the split-K tail machinery entirely. Requires the host to bound the
-        # wave count; used by the exact-geometry hybrid decode schedule.
+        # the split-K tail machinery entirely. Route-packed prefill also uses
+        # this schedule: atomic route packing can change a row's tile position,
+        # which must not change its K partitioning and floating-point sum order.
         self.schedule_whole_tiles = bool(schedule_whole_tiles)
-        if self.schedule_whole_tiles and not self.direct_topk_routes:
-            raise ValueError("schedule_whole_tiles requires direct_topk_routes")
         if self.fused_topk_sum and not self.direct_topk_routes:
             raise ValueError("fused_topk_sum requires direct_topk_routes")
         if self.fused_topk_sum and self.fused_sum_topk < 1:
@@ -4120,6 +4120,7 @@ class W4A16FusedMoeKernel:
         direct_topk_routes: bool = False,
         tc_decode_fused_sum: bool = False,
         tc_zero_output: bool = True,
+        deterministic_tc_sum: bool = False,
         collect_activation_amax: bool = False,
         schedule_whole_tiles: bool = False,
     ):
@@ -4140,6 +4141,9 @@ class W4A16FusedMoeKernel:
         else:
             w13_layout = "packed"
         self.tc_decode_fused_sum = bool(tc_decode_fused_sum)
+        self.deterministic_tc_sum = bool(deterministic_tc_sum)
+        if self.deterministic_tc_sum and not self.tc_decode_fused_sum:
+            raise ValueError("deterministic_tc_sum requires TC-decode")
         # When two TC-decode launches share one pre-zeroed output (the NF3 hybrid
         # runs an NVFP4 launch then an NF3 launch into the same tensor), only the
         # first must zero it. Default True preserves single-launch behavior.
@@ -4224,7 +4228,7 @@ class W4A16FusedMoeKernel:
             w13_layout=w13_layout,
             single_token_route_fast_path=size_m == 1 and not self.direct_topk_routes,
             direct_topk_routes=self.direct_topk_routes,
-            fused_topk_sum=self.tc_decode_fused_sum,
+            fused_topk_sum=self.tc_decode_fused_sum and not self.deterministic_tc_sum,
             fused_sum_topk=int(top_k),
             schedule_whole_tiles=self.schedule_whole_tiles,
         )
@@ -4262,6 +4266,7 @@ class W4A16FusedMoeKernel:
             self.fast_math,
             self.direct_topk_routes,
             self.tc_zero_output,
+            self.deterministic_tc_sum,
             self.collect_activation_amax,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -4467,7 +4472,9 @@ class W4A16FusedMoeKernel:
         # barrier, FC2. The emit hooks delegate per-tile expert resolution and
         # dispatch (used by the hybrid route map); None keeps the single-tier
         # resolution inside _run_persistent_gemm.
-        if cutlass.const_expr(self.tc_decode_fused_sum):
+        if cutlass.const_expr(
+            self.tc_decode_fused_sum and not self.deterministic_tc_sum
+        ):
             # The TC-decode FC2 epilogue atomically accumulates per-route
             # partials directly into the per-token output, so the output must be
             # pre-zeroed. Previously this was a SEPARATE host-side output.zero_()
@@ -4564,10 +4571,17 @@ class W4A16FusedMoeKernel:
         if cutlass.const_expr(self.zero_fc2_output):
             self._zero_fc2_output(fc2_bf16_flat, tid, cta, grid_x, active_m)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
+        # FC1 is dead after the activation barrier. Reuse its backing workspace
+        # for per-route FC2 values, then reduce routes in a fixed FP32 order.
+        # Keeping the reduction in this persistent launch avoids another kernel
+        # launch and removes order-dependent BF16 atomic rounding.
+        fc2_target = fc2_bf16_flat
+        if cutlass.const_expr(self.deterministic_tc_sum):
+            fc2_target = fc1_bf16_flat
         self.fc2._run_persistent_gemm(
             activated_bf16_flat,
             w2_i32_flat,
-            fc2_bf16_flat,
+            fc2_target,
             w2_scales_i32_flat,
             w2_global_scale,
             packed_route_indices,
@@ -4583,6 +4597,25 @@ class W4A16FusedMoeKernel:
             active_m * Int32(self.top_k),
             fc2_emit_tile,
         )
+        if cutlass.const_expr(self.deterministic_tc_sum):
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            idx = cta * Int32(self.cta_threads) + tid
+            stride = grid_x * Int32(self.cta_threads)
+            total = active_m * Int32(self.hidden_size)
+            while idx < total:
+                token = idx // Int32(self.hidden_size)
+                col = idx - token * Int32(self.hidden_size)
+                acc = cutlass.Float32(0.0)
+                for route in cutlass.range_constexpr(self.top_k):
+                    row = token * Int32(self.top_k) + Int32(route)
+                    value = fc1_bf16_flat[row * Int32(self.hidden_size) + col].to(
+                        cutlass.Float32
+                    )
+                    acc += _materialize_w4a16_topk_route_f32(value)
+                if cutlass.const_expr(not self.tc_zero_output):
+                    acc += fc2_bf16_flat[idx].to(cutlass.Float32)
+                fc2_bf16_flat[idx] = self._cast_elem(acc)
+                idx += stride
 
     @cute.jit
     def _grid_barrier(
@@ -5471,7 +5504,15 @@ def compile_w4a16_fused_moe(
             fc2_tile_n = 512
             fc2_tile_k = ultra_fc2_tile_k
             fc2_cta_threads = 256
-    if force_tile_config is not None:
+    # The custom-op boundary re-pins the geometry selected above, including
+    # the validated TC-decode (tile_k=32, tile_n=512) override. Only alternate
+    # pins need the generic check, whose tile_k>=64 floor excludes that override.
+    if force_tile_config is not None and tuple(map(int, force_tile_config)) != (
+        fc1_tile_k,
+        fc1_tile_n,
+        fc2_tile_k,
+        fc2_tile_n,
+    ):
         # Explicit (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) pin. The
         # NF3 ("nf3_2p1") flat-span weight layout is packed for a specific CTA
         # N-tile, so hybrid deployments pin ONE tile config across every m
@@ -5535,7 +5576,9 @@ def compile_w4a16_fused_moe(
         w13_layout=w13_layout,
         direct_topk_routes=direct_topk_routes,
         tc_decode_fused_sum=tc_decode_fused_sum,
+        deterministic_tc_sum=tc_decode_fused_sum,
         collect_activation_amax=collect_activation_amax,
+        schedule_whole_tiles=not direct_topk_routes,
     )
     cache_key = (
         "w4a16_fused_moe",
@@ -5595,7 +5638,7 @@ def compile_w4a16_fused_moe(
         )
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
-        (compile_routed_rows * fc1_cols,),
+        (compile_routed_rows * max(fc1_cols, hidden_size),),
         assumed_align=16,
     )
     activated_fake = cute.runtime.make_fake_compact_tensor(
@@ -5759,6 +5802,7 @@ def compile_w4a16_fused_moe(
 
 
 def clear_w4a16_kernel_cache() -> None:
+    _resolve_w4a16_fused_launch.cache_clear()
     _CACHE.clear()
     _FUSED_CACHE.clear()
     _ACTIVATION_CACHE.clear()
@@ -5889,6 +5933,21 @@ def compile_w4a16_topk_sum(
     return result
 
 
+@lru_cache(maxsize=256)
+def _resolve_w4a16_fused_launch(
+    device: int, **options: Any
+) -> W4A16FusedMoeCompileResult:
+    """Resolve one validated, immutable launch per device and complete geometry.
+
+    The custom-op boundary receives scalar geometry rather than the prepared
+    launch object. Cache that resolution so every decode layer does not repeat
+    tile selection and construct both GEMM kernels just to hit the compile cache.
+    Tensor addresses never enter this cache; callers still pass live buffers.
+    """
+    del device  # Part of the cache key; the caller supplies current_device().
+    return compile_w4a16_fused_moe(**options)
+
+
 def _w4a16_fused_moe_launch_flat(
     a_input: torch.Tensor,
     w13_arg: torch.Tensor,
@@ -5947,7 +6006,8 @@ def _w4a16_fused_moe_launch_flat(
     activation_amax_arg = (
         activation_amax.view(-1) if activation_amax is not None else w13_global_scale
     )
-    fused = compile_w4a16_fused_moe(
+    fused = _resolve_w4a16_fused_launch(
+        int(torch.cuda.current_device()),
         size_m=size_m,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -6248,6 +6308,137 @@ def _w4a16_fused_moe_launch_fake(
     direct_topk_routes: bool,
     tc_decode_fused_sum: bool,
     stream_int: int,
+) -> None:
+    return None
+
+
+@torch.library.custom_op(
+    "flashinfer::w4a16_fused_moe_launch_compact", mutates_args=("buffers",)
+)
+def _w4a16_fused_moe_launch_compact(
+    inputs: list[torch.Tensor],
+    buffers: list[torch.Tensor],
+    geometry: list[int],
+    activation: str,
+    element_dtype: str,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    flags: list[bool],
+    scalars: list[float],
+) -> None:
+    """Group the launch contract without changing kernels or mutation ownership.
+
+    Tensor lists keep every live buffer visible to dispatch and functionalization.
+    Grouping scalar metadata avoids repeated quadratic schema argument scans in
+    the mutable custom-op dispatch path. No tensor or stream addresses are cached.
+    """
+    (
+        a_input,
+        w13_arg,
+        w2_arg,
+        w13_scale_i32,
+        w2_scale_i32,
+        w13_global_scale,
+        w2_global_scale,
+        packed_route_indices,
+        block_expert_ids,
+        packed_route_count,
+        topk_weights,
+    ) = inputs
+    (fc1_out, activated, fc2_out, fc1_scratch, fc2_scratch, workspace) = buffers
+    (
+        m,
+        size_m,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        topk,
+        moe_block_size,
+        max_m_blocks,
+        sms,
+        max_shared_mem,
+        fc1_tile_k,
+        fc1_tile_n,
+        fc2_tile_k,
+        fc2_tile_n,
+        stream_int,
+    ) = geometry
+    (
+        apply_router_weight_on_input,
+        zero_fc2_output,
+        fast_math,
+        has_swiglu_limit,
+        direct_topk_routes,
+        tc_decode_fused_sum,
+    ) = flags
+    (swiglu_limit_value, swiglu_alpha, swiglu_beta) = scalars
+
+    _w4a16_fused_moe_launch_flat(
+        a_input=a_input,
+        w13_arg=w13_arg,
+        w2_arg=w2_arg,
+        fc1_out=fc1_out,
+        activated=activated,
+        fc2_out=fc2_out,
+        w13_scale_i32=w13_scale_i32,
+        w2_scale_i32=w2_scale_i32,
+        w13_global_scale=w13_global_scale,
+        w2_global_scale=w2_global_scale,
+        packed_route_indices=packed_route_indices,
+        block_expert_ids=block_expert_ids,
+        packed_route_count=packed_route_count,
+        activation_amax=None,
+        layer_idx=0,
+        topk_weights=topk_weights,
+        fc1_scratch=fc1_scratch,
+        fc2_scratch=fc2_scratch,
+        workspace=workspace,
+        m=m,
+        size_m=size_m,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        activation=activation,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        zero_fc2_output=zero_fc2_output,
+        moe_block_size=moe_block_size,
+        max_m_blocks=max_m_blocks,
+        element_dtype=element_dtype,
+        fast_math=fast_math,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        has_swiglu_limit=has_swiglu_limit,
+        swiglu_limit_value=swiglu_limit_value,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        weight_layout=weight_layout,
+        scale_format=scale_format,
+        w13_layout=w13_layout,
+        fc1_tile_k=fc1_tile_k,
+        fc1_tile_n=fc1_tile_n,
+        fc2_tile_k=fc2_tile_k,
+        fc2_tile_n=fc2_tile_n,
+        direct_topk_routes=direct_topk_routes,
+        tc_decode_fused_sum=tc_decode_fused_sum,
+        collect_activation_amax=False,
+        stream_int=stream_int,
+    )
+
+
+@_w4a16_fused_moe_launch_compact.register_fake
+def _w4a16_fused_moe_launch_compact_fake(
+    inputs: list[torch.Tensor],
+    buffers: list[torch.Tensor],
+    geometry: list[int],
+    activation: str,
+    element_dtype: str,
+    weight_layout: str,
+    scale_format: str,
+    w13_layout: str,
+    flags: list[bool],
+    scalars: list[float],
 ) -> None:
     return None
 
@@ -6831,8 +7022,8 @@ def run_w4a16_moe(
     # TC-decode requires the inline direct-topk route path (no route-pack).
     use_tc_decode = bool(use_tc_decode and use_direct_topk_routes)
 
-    # A preplanned TC-decode launch atomically accumulates FC2 partials into the
-    # (pre-zeroed) output and emits no separate top-k sum. If it was selected but
+    # A preplanned TC-decode launch reduces FC2 partials into the
+    # output and emits no separate top-k sum. If it was selected but
     # the decode preconditions don't hold, running it would corrupt the output,
     # so fail loudly instead.
     if preplanned_tc_decode and not use_tc_decode:
@@ -6931,7 +7122,8 @@ def run_w4a16_moe(
     if int(prepared.workspace.numel()) < sms * 4 + 2:
         raise ValueError("prepared W4A16 workspace is too small for fused FC1+FC2")
     if fused_launch is None:
-        fused = compile_w4a16_fused_moe(
+        fused = _resolve_w4a16_fused_launch(
+            int(torch.cuda.current_device()),
             size_m=m,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -7044,16 +7236,14 @@ def run_w4a16_moe(
             "intermediate_cache2 is smaller than the selected W4A16 launch capacity: "
             f"capacity_rows={capacity_m}, topk={topk}"
         )
-    fc1_out = intermediate_cache13_flat[: capacity_routed_rows * fc1_cols]
+    fc1_out = intermediate_cache13_flat[
+        : capacity_routed_rows * max(fc1_cols, hidden_size)
+    ]
     activated = intermediate_cache2_flat[: capacity_routed_rows * intermediate_size]
     if use_tc_decode:
-        # FC2 atomically accumulates per-route partials directly into the
-        # per-token output, so the output is the FC2 store target and must be
-        # pre-zeroed. The fused tc_decode kernel now zeroes the output in its
-        # own prologue (before FC1, made visible by the existing post-FC1 grid
-        # barrier), so the separate host-side output.zero_() launch is removed
-        # from the decode critical path here. This drops the separate top-k-sum
-        # launch as well.
+        # The single-tier TC kernel stages route values in the dead FC1
+        # workspace, then writes a fixed-order FP32 top-k sum to this output.
+        # Its final grid barrier keeps the reduction inside the same launch.
         fc2_out = output.view(-1)
     else:
         fc2_out = intermediate_cache13_flat[: capacity_routed_rows * hidden_size]
@@ -7083,54 +7273,56 @@ def run_w4a16_moe(
     else:
         w13_arg = prepared.w13.view(torch.int32).view(-1)
         w2_arg = prepared.w2.view(torch.int32).view(-1)
-    launch_common = (
-        a_input,
-        w13_arg,
-        w2_arg,
-        fc1_out,
-        activated,
-        fc2_out,
-        prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1),
-        prepared.w13_global_scale,
-        prepared.w2_global_scale,
-        packed_route_indices,
-        block_expert_ids,
-        packed_route_count,
-    )
-    launch_tail = (
-        topk_weights,
-        fc1_scratch,
-        fc2_scratch,
-        prepared.workspace,
-        m,
-        capacity_m,
-        hidden_size,
-        intermediate_size,
-        int(prepared.num_experts),
-        topk,
-        activation,
-        bool(apply_router_weight_on_input),
-        expert_map is not None,
-        block_size_m,
-        int(fused.max_m_blocks),
-        element_dtype,
-        bool(fast_math),
-        sms,
-        max_shared_mem,
-        swiglu_limit is not None,
-        float(swiglu_limit or 0.0),
-        float(swiglu_alpha),
-        float(swiglu_beta),
-        weight_layout,
-        scale_format,
-        w13_layout,
-        int(fused.fc1_tile_k),
-        int(fused.fc1_tile_n),
-        int(fused.fc2_tile_k),
-        int(fused.fc2_tile_n),
-    )
+    w13_scale_i32 = prepared.w13_scale.view(torch.uint8).view(torch.int32).view(-1)
+    w2_scale_i32 = prepared.w2_scale.view(torch.uint8).view(torch.int32).view(-1)
     if collect_activation_amax:
+        launch_common = (
+            a_input,
+            w13_arg,
+            w2_arg,
+            fc1_out,
+            activated,
+            fc2_out,
+            w13_scale_i32,
+            w2_scale_i32,
+            prepared.w13_global_scale,
+            prepared.w2_global_scale,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+        )
+        launch_tail = (
+            topk_weights,
+            fc1_scratch,
+            fc2_scratch,
+            prepared.workspace,
+            m,
+            capacity_m,
+            hidden_size,
+            intermediate_size,
+            int(prepared.num_experts),
+            topk,
+            activation,
+            bool(apply_router_weight_on_input),
+            expert_map is not None,
+            block_size_m,
+            int(fused.max_m_blocks),
+            element_dtype,
+            bool(fast_math),
+            sms,
+            max_shared_mem,
+            swiglu_limit is not None,
+            float(swiglu_limit or 0.0),
+            float(swiglu_alpha),
+            float(swiglu_beta),
+            weight_layout,
+            scale_format,
+            w13_layout,
+            int(fused.fc1_tile_k),
+            int(fused.fc1_tile_n),
+            int(fused.fc2_tile_k),
+            int(fused.fc2_tile_n),
+        )
         assert activation_amax is not None
         assert layer_idx_int is not None
         torch.ops.flashinfer.w4a16_fused_moe_calibrated_launch(
@@ -7141,12 +7333,52 @@ def run_w4a16_moe(
             int(stream),
         )
     else:
-        torch.ops.flashinfer.w4a16_fused_moe_launch(
-            *launch_common,
-            *launch_tail,
-            bool(use_direct_topk_routes),
-            bool(use_tc_decode),
-            int(stream),
+        torch.ops.flashinfer.w4a16_fused_moe_launch_compact(
+            [
+                a_input,
+                w13_arg,
+                w2_arg,
+                w13_scale_i32,
+                w2_scale_i32,
+                prepared.w13_global_scale,
+                prepared.w2_global_scale,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                topk_weights,
+            ],
+            [fc1_out, activated, fc2_out, fc1_scratch, fc2_scratch, prepared.workspace],
+            [
+                m,
+                capacity_m,
+                hidden_size,
+                intermediate_size,
+                int(prepared.num_experts),
+                topk,
+                block_size_m,
+                int(fused.max_m_blocks),
+                sms,
+                max_shared_mem,
+                int(fused.fc1_tile_k),
+                int(fused.fc1_tile_n),
+                int(fused.fc2_tile_k),
+                int(fused.fc2_tile_n),
+                int(stream),
+            ],
+            activation,
+            element_dtype,
+            weight_layout,
+            scale_format,
+            w13_layout,
+            [
+                bool(apply_router_weight_on_input),
+                expert_map is not None,
+                bool(fast_math),
+                swiglu_limit is not None,
+                bool(use_direct_topk_routes),
+                bool(use_tc_decode),
+            ],
+            [float(swiglu_limit or 0.0), float(swiglu_alpha), float(swiglu_beta)],
         )
 
     if use_tc_decode:
