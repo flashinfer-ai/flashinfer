@@ -343,6 +343,7 @@ class JitSpecNvcc(JitSpec):
     needs_device_linking: bool = False
     post_load_adapter: Optional[Callable[[Any], Any]] = None
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -404,6 +405,7 @@ class JitSpecNvcc(JitSpec):
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
             embedded_cubins=embedded_cubins,
+            extra_cuda_cflags_by_source=self.extra_cuda_cflags_by_source,
         )
         write_if_different(ninja_path, content)
 
@@ -499,6 +501,12 @@ class JitSpecNvcc(JitSpec):
         ]
         cflags_expanded = expand_flags(cflags, common_cflags_expanded)
         cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
+        cuda_cflags_by_source = {
+            Path(source).resolve(): expand_flags(
+                build_cuda_cflags(common_cflags, flags), common_cflags_expanded
+            )
+            for source, flags in (self.extra_cuda_cflags_by_source or {}).items()
+        }
 
         # Get compilers
         cxx = os.environ.get("CXX", "c++")
@@ -514,7 +522,9 @@ class JitSpecNvcc(JitSpec):
 
             if is_cuda:
                 compiler = nvcc
-                flags = cuda_cflags_expanded
+                flags = cuda_cflags_by_source.get(
+                    source.resolve(), cuda_cflags_expanded
+                )
                 object_suffix = ".cuda.o"
             else:
                 compiler = cxx
@@ -551,7 +561,16 @@ def gen_jit_spec(
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
     use_fast_math: bool = True,
+    extra_cuda_cflags_by_source: Optional[Mapping[Union[str, Path], List[str]]] = None,
 ) -> JitSpec:
+    """Create a CUDA build specification.
+
+    For named CUDA sources, ``extra_cuda_cflags_by_source`` replaces the shared
+    ``extra_cuda_cflags`` and opts out of the default ``-use_fast_math``. Other
+    build defaults still apply; request fast math explicitly when required.
+    Sources absent from the mapping retain the shared flags and defaults,
+    including the module-wide ``use_fast_math`` setting.
+    """
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
@@ -605,6 +624,26 @@ def gen_jit_spec(
 
     if extra_cflags is not None:
         cflags += extra_cflags
+    cuda_cflags_by_source = None
+    if extra_cuda_cflags_by_source is not None:
+        cuda_sources = {
+            Path(source).resolve() for source in sources if Path(source).suffix == ".cu"
+        }
+        cuda_cflags_by_source = {}
+        for raw_source, source_flags in extra_cuda_cflags_by_source.items():
+            source = Path(raw_source).resolve()
+            if source not in cuda_sources:
+                raise ValueError(
+                    f"CUDA flags refer to a source outside this JIT spec: {source}"
+                )
+            source_defaults = [
+                flag
+                for flag in cuda_cflags
+                if flag != "-use_fast_math" and not flag.startswith("-std=")
+            ]
+            if not any(flag.startswith("-std=") for flag in source_flags):
+                source_defaults.insert(0, "-std=c++17")
+            cuda_cflags_by_source[source] = source_defaults + list(source_flags)
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
 
@@ -622,6 +661,7 @@ def gen_jit_spec(
         needs_device_linking=needs_device_linking,
         post_load_adapter=post_load_adapter,
         embedded_cubin_factory=embedded_cubin_factory,
+        extra_cuda_cflags_by_source=cuda_cflags_by_source,
     )
 
     # Register the spec in the global registry

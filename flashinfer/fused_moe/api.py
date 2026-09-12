@@ -606,8 +606,14 @@ class CakeWarpDecodeConfig:
         """Build the shared TRTLLM NVFP4 physical weight view.
 
         Register the returned dictionary with
-        ``MoEWeightPack.prepare_for("cake", view)``. The same dictionary may
-        also be registered for ``"trtllm_fp4_routed"`` without copying.
+        ``MoEWeightPack.prepare_for("cake", view)``. Default SwiGLU and SiTU
+        may register that dictionary for ``"trtllm_fp4_routed"`` as well.
+        Parameterized SwiGLU consumes logical beta/clamp here; the official
+        runner requires each divided by ``output1_scale_gate_scalar``. For
+        non-unit gate scales, prepare a separate official dictionary with those
+        derived FP32 per-expert buffers, keeping alpha and physical tensors
+        shared. Refresh the derived buffers outside timing/capture when logical
+        beta, clamp, or gate scale changes, preserving captured addresses.
         """
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
             raise ValueError(
@@ -619,7 +625,15 @@ class CakeWarpDecodeConfig:
         supported = (
             (SwiGLU(), (2048, 512, 512)),
             (SwiGLU(), (2048, 1536, 60)),
+            (SwiGLU(), (2560, 768, 384)),
             (SiLU(), (6144, 1536, 192)),
+            (SwiGLU(), (2048, 768, 128)),
+            (SwiGLU(), (4096, 1536, 128)),
+            (SwiGLU(), (2048, 512, 256)),
+            (SwiGLU(), (4096, 1024, 512)),
+            (SwiGLU(), (3072, 1536, 256)),
+            (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), (6144, 3072, 128)),
+            (SiTU(gate_scale=4.0, linear_scale=25.0), (3584, 3072, 896)),
         )
         if not any(
             activation == supported_activation and geometry == supported_geometry
@@ -628,8 +642,13 @@ class CakeWarpDecodeConfig:
             raise ValueError(
                 "Cake warp decode weight preparation supports only default "
                 "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
-                "= (2048, 512, 512) or (2048, 1536, 60), and SiLU() with "
-                "(6144, 1536, 192); got "
+                "= (2048, 512, 512), (2048, 1536, 60), (2560, 768, 384), "
+                "(2048, 768, 128), (4096, 1536, 128), (2048, 512, 256), "
+                "(4096, 1024, 512), or (3072, 1536, 256), "
+                "and SiLU() with "
+                "(6144, 1536, 192), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
+                "with (6144, 3072, 128), or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3584, 3072, 896); got "
                 f"activation={activation!r}, geometry={geometry}."
             )
         return TrtllmFp4Config.prepare_weights(

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """SM100/SM103 Cake warp-decode correctness and cold-L2 CUPTI benchmark harness.
 
-The harness deliberately prepares one TRTLLM NVFP4 physical representation and
-passes those exact tensor objects to every available comparison arm.  The
-SwiGLU rows use the public ``trtllm_fp4_block_scale_routed_moe`` baseline;
-standalone SiLU has no supported official peer and reports exported Cake
-absolute timing only.  Correctness and benchmark preparation are kept outside
-timed or CUDA Graph capture regions.
+The comparison arms share one prepared TRTLLM NVFP4 representation: activation,
+routing, packed-weight, and block-scale tensors. Parameterized SwiGLU uses
+separate official beta/clamp buffers divided by the gate scale; alpha remains
+shared. SwiGLU and SiTU rows use the public
+``trtllm_fp4_block_scale_routed_moe`` baseline. Standalone SiLU has no supported
+official peer and reports exported Cake absolute timing only. Correctness and
+benchmark preparation stay outside timed or CUDA Graph capture regions.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ import torch
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
     ActivationConfig,
-    ActivationType,
     BackendOptions,
     CakeWarpDecodeConfig,
     ExecutionConfig,
@@ -43,6 +43,7 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
     RoutingMethodType,
     SiLU,
+    SiTU,
     SwiGLU,
     TrtllmFp4Config,
     trtllm_fp4_block_scale_routed_moe,
@@ -133,6 +134,30 @@ GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 22, 23, 32)),
     Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 7, 8, 10, 11, 12, 16, 17, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 2, 32), SiLU()),
+    Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 2, 32)),
+    Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 2, 32)),
+    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 2, 32)),
+    Geometry("e256_i512_k8", 2048, 512, 256, 8, (1, 2, 32)),
+    Geometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
+    Geometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 2, 32)),
+    Geometry(
+        "e128_i3072_k4_swiglu_oa",
+        6144,
+        3072,
+        128,
+        4,
+        (1, 2, 32),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    ),
+    Geometry(
+        "e896_i3072_k16_situ",
+        3584,
+        3072,
+        896,
+        16,
+        (1, 2, 32),
+        SiTU(gate_scale=4.0, linear_scale=25.0),
+    ),
 )
 
 
@@ -141,15 +166,27 @@ def _activation_name(geometry: Geometry) -> str:
 
 
 def _has_official_baseline(geometry: Geometry) -> bool:
-    return geometry.activation == SwiGLU()
+    return isinstance(geometry.activation, (SwiGLU, SiTU))
+
+
+def _uses_activation_params(geometry: Geometry) -> bool:
+    return geometry.activation.is_gated and geometry.activation != SwiGLU()
 
 
 def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
     """Name the fixed schedule/route-packer bucket exercised by a row."""
-    if geometry.activation == SiLU():
+    key = (
+        geometry.hidden_size,
+        geometry.intermediate_size,
+        geometry.num_experts,
+        geometry.top_k,
+    )
+    if isinstance(geometry.activation, SiTU):
+        return "static_direct"
+    if key not in ((2048, 512, 512, 10), (2048, 1536, 60, 4)):
         return "static_direct" if num_tokens == 1 else "persistent_direct"
 
-    if geometry.num_experts == 512:
+    if key == (2048, 512, 512, 10):
         if num_tokens == 1:
             return "static_direct"
         if num_tokens <= 22:
@@ -255,6 +292,7 @@ class PreparedCall:
     workspace: Any = None
     workspace_receipt: Optional[int] = None
     receipt_releaser: Optional[weakref.finalize] = None
+    refresh_activation_parameters: Optional[Callable[[], None]] = None
 
     def close(self) -> None:
         """Release a public workspace receipt exactly once, if this call owns one."""
@@ -312,7 +350,7 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
         hidden,
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
-    weight_view = TrtllmFp4Config.prepare_weights(
+    weight_view = CakeWarpDecodeConfig.prepare_weights(
         w1,
         w2,
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
@@ -355,6 +393,31 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
             "the official TRT-LLM NVFP4 runner does not support standalone SiLU"
         )
     view = case.weight_view
+    official_beta = view.get("gemm1_beta")
+    official_clamp_limit = view.get("gemm1_clamp_limit")
+    refresh_activation_parameters = None
+    if geometry.name == "e128_i3072_k4_swiglu_oa":
+        # This baseline consumes beta and clamp in raw-accumulator units.
+        # Keep the logical parameter tensors supplied to warp-decode intact.
+        official_beta = torch.empty(
+            geometry.num_experts, dtype=torch.float32, device=case.device
+        )
+        official_clamp_limit = torch.empty_like(official_beta)
+
+        def refresh_parameter_buffers() -> None:
+            torch.div(
+                view["gemm1_beta"],
+                view["output1_scale_gate_scalar"],
+                out=official_beta,
+            )
+            torch.div(
+                view["gemm1_clamp_limit"],
+                view["output1_scale_gate_scalar"],
+                out=official_clamp_limit,
+            )
+
+        refresh_parameter_buffers()
+        refresh_activation_parameters = refresh_parameter_buffers
     output = torch.empty(
         case.num_tokens,
         geometry.hidden_size,
@@ -372,8 +435,8 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
             gemm1_weights_scale=view["gemm1_weights_scale"],
             gemm1_bias=None,
             gemm1_alpha=view.get("gemm1_alpha"),
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_beta=official_beta,
+            gemm1_clamp_limit=official_clamp_limit,
             gemm2_weights=view["gemm2_weights"],
             gemm2_weights_scale=view["gemm2_weights_scale"],
             gemm2_bias=None,
@@ -391,7 +454,7 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
             routing_method_type=RoutingMethodType.TopK.value,
             do_finalize=True,
             enable_pdl=True,
-            activation_type=ActivationType.Swiglu.value,
+            activation_type=geometry.activation.type.value,
             per_token_scale=None,
             output=output,
             tune_max_num_tokens=MAX_TOKENS,
@@ -401,7 +464,12 @@ def _prepare_baseline(case: PhysicalCase) -> PreparedCall:
             raise RuntimeError("TRTLLM baseline did not honor its caller output tensor")
         return output
 
-    return PreparedCall("flashinfer_trtllm_nvfp4", output, invoke)
+    return PreparedCall(
+        "flashinfer_trtllm_nvfp4",
+        output,
+        invoke,
+        refresh_activation_parameters=refresh_activation_parameters,
+    )
 
 
 def _prepare_validation_reference(case: PhysicalCase) -> PreparedCall:
@@ -447,7 +515,7 @@ def _invoke_cake(
     workspace_receipt: int,
 ) -> torch.Tensor:
     view = case.weight_view
-    module.cake_fused_moe_warp_decode(
+    inputs = (
         output,
         workspace,
         case.hidden_states_q,
@@ -461,9 +529,18 @@ def _invoke_cake(
         view["output1_scale_scalar"],
         view["output1_scale_gate_scalar"],
         view["output2_scale_scalar"],
-        workspace_receipt,
-        True,
     )
+    if _uses_activation_params(case.geometry):
+        module.cake_fused_moe_warp_decode_with_activation_params(
+            *inputs,
+            view.get("gemm1_alpha"),
+            view.get("gemm1_beta"),
+            view.get("gemm1_clamp_limit"),
+            workspace_receipt,
+            True,
+        )
+    else:
+        module.cake_fused_moe_warp_decode(*inputs, workspace_receipt, True)
     return output
 
 
@@ -1029,7 +1106,63 @@ def _graph_mutation_case(
     capture_stream.synchronize()
     initial_replay_diagnostic = _diagnostic(initial_replay, before)
 
+    activation_parameter_replays = []
+    if _uses_activation_params(fixture.geometry):
+        parameter_expert = int(case.topk_ids[0, 0].item())
+        perturbations = (
+            (
+                "gemm1_alpha",
+                1.0 if isinstance(fixture.geometry.activation, SiTU) else 0.0,
+            ),
+            (
+                "gemm1_beta",
+                0.125 if isinstance(fixture.geometry.activation, SiTU) else 4.0,
+            ),
+            ("gemm1_clamp_limit", 0.0625),
+        )
+        for name, value in perturbations:
+            parameter = fixture.weight_view.get(name)
+            if parameter is None:
+                continue
+            with torch.cuda.stream(capture_stream):
+                saved = parameter[parameter_expert].clone()
+                parameter[parameter_expert].fill_(value)
+                if reference.refresh_activation_parameters is not None and name in (
+                    "gemm1_beta",
+                    "gemm1_clamp_limit",
+                ):
+                    reference.refresh_activation_parameters()
+                graph.replay()
+                actual_parameter_output = cake.output.clone()
+                expected_parameter_output = reference.invoke().clone()
+                parameter[parameter_expert].copy_(saved)
+                if reference.refresh_activation_parameters is not None and name in (
+                    "gemm1_beta",
+                    "gemm1_clamp_limit",
+                ):
+                    reference.refresh_activation_parameters()
+            capture_stream.synchronize()
+            delta = float(
+                (before.float() - expected_parameter_output.float()).abs().max().item()
+            )
+            if delta == 0.0:
+                raise AssertionError(
+                    f"{name} mutation did not change the reference output"
+                )
+            activation_parameter_replays.append(
+                {
+                    "parameter": name,
+                    "expert": parameter_expert,
+                    "value": value,
+                    "reference_mutation_max_abs": delta,
+                    "diagnostic": _diagnostic(
+                        actual_parameter_output, expected_parameter_output
+                    ),
+                }
+            )
+
     mutated_expert = 0
+    saved_expert_tensors = []
     replay_completion = torch.cuda.Event(enable_timing=False)
     with torch.cuda.stream(replay_stream):
         fixture.stage_routes(num_tokens, mutated=True)
@@ -1045,7 +1178,9 @@ def _graph_mutation_case(
             "gemm2_weights",
             "gemm2_weights_scale",
         ):
-            fixture.weight_view[name][mutated_expert].zero_()
+            tensor = fixture.weight_view[name][mutated_expert]
+            saved_expert_tensors.append((tensor, tensor.clone()))
+            tensor.zero_()
         cake.output.fill_(float("nan"))
         torch.cuda._sleep(RETIREMENT_DELAY_CYCLES)
         graph.replay()
@@ -1103,6 +1238,14 @@ def _graph_mutation_case(
             )
     replacement_stream.synchronize()
 
+    # Each selector boundary reuses this fixture. Restore the original expert
+    # after both replay and replacement finish, so later parameter mutations
+    # still exercise its nonzero weights through the same captured pointers.
+    with torch.cuda.stream(replay_stream):
+        for tensor, saved_tensor in saved_expert_tensors:
+            tensor.copy_(saved_tensor)
+    replay_stream.synchronize()
+
     diagnostic = _diagnostic(replayed, expected)
     replacement_diagnostic = _diagnostic(replacement, expected)
     mutation_delta = float((before.float() - expected.float()).abs().max().item())
@@ -1151,6 +1294,11 @@ def _graph_mutation_case(
         "warmup": warmup_diagnostic,
         "initial_replay": initial_replay_diagnostic,
         "mutated_replay": diagnostic,
+        **(
+            {"activation_parameter_replays": activation_parameter_replays}
+            if activation_parameter_replays
+            else {}
+        ),
         "output_reused": True,
         "workspace_reused": True,
         "status": "pass",

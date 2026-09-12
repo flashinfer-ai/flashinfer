@@ -246,11 +246,16 @@ def generate_ninja_build_for_op(
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
     embedded_cubins: Optional[Mapping[str, Path]] = None,
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+    cuda_cflags_by_source = {
+        Path(source).resolve(): build_cuda_cflags(common_cflags, flags)
+        for source, flags in (extra_cuda_cflags_by_source or {}).items()
+    }
 
     ldflags = [
         "-shared",
@@ -343,6 +348,11 @@ def generate_ninja_build_for_op(
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        if source.resolve() in cuda_cflags_by_source:
+            lines.append(
+                "  cuda_cflags = "
+                + join_multiline(cuda_cflags_by_source[source.resolve()])
+            )
 
     if embedded_cubins:
         if not objects:

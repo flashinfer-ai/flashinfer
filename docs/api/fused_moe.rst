@@ -133,8 +133,16 @@ portfolio fails closed outside these contracts:
 
 * ``(activation, hidden_size, intermediate_size, num_experts, top_k)`` is
   exactly ``(SwiGLU(), 2048, 512, 512, 10)``,
-  ``(SwiGLU(), 2048, 1536, 60, 4)``, or
-  ``(SiLU(), 6144, 1536, 192, 4)``;
+  ``(SwiGLU(), 2048, 1536, 60, 4)``,
+  ``(SwiGLU(), 2560, 768, 384, 4)``,
+  ``(SiLU(), 6144, 1536, 192, 4)``,
+  ``(SwiGLU(), 2048, 768, 128, 8)``,
+  ``(SwiGLU(), 4096, 1536, 128, 8)``,
+  ``(SwiGLU(), 2048, 512, 256, 8)``,
+  ``(SwiGLU(), 4096, 1024, 512, 10)``,
+  ``(SwiGLU(), 3072, 1536, 256, 8)``,
+  ``(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4)``, or
+  ``(SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
   int32 expert IDs and BF16 routing weights;
 * quantization is NVFP4, finalization and PDL are enabled, and expert
@@ -142,15 +150,41 @@ portfolio fails closed outside these contracts:
 
 The backend reuses the physical weight and activation layouts prepared by
 ``TrtllmFp4Config``. Logical GEMM1 weights have
-``intermediate_size * (2 if activation.is_gated else 1)`` rows: SwiGLU uses
+``intermediate_size * (2 if activation.is_gated else 1)`` rows: SwiGLU and SiTU use
 ``2 * intermediate_size`` gate/up rows while standalone SiLU uses
 ``intermediate_size`` rows. The packed E2M1 weights use the production
 ``MajorK`` 32-row MMA shuffle: physical row ``p`` is restored at logical row
 ``(p & ~31) + ((p & 7) << 2) + ((p & 31) >> 3)``. Their E4M3 block scales use
-the production ``R128c4`` layout. A SwiGLU weight dictionary can therefore be
-registered for both backend keys without copying. Standalone SiLU has no
-supported TRT-LLM routed-MoE peer and its dictionary must be registered only
-for ``"cake"``::
+the production ``R128c4`` layout. Default SwiGLU and SiTU weight dictionaries
+can be registered for both backend keys without copying. Parameterized SwiGLU consumes
+the prepared per-expert ``gemm1_alpha``, ``gemm1_beta``, and ``gemm1_clamp_limit``
+FP32 tensors. SiTU consumes ``gemm1_alpha`` as its gate scale and ``gemm1_beta``
+as its linear scale, and requires no clamp tensor. The prepared values default to
+the configured activation; per-expert tensor changes are consumed on every launch
+and CUDA Graph replay.
+
+Parameterized SwiGLU uses different beta/clamp units in the two backends.
+Cake consumes the logical parameters. The official TRT-LLM runner consumes
+``beta / d`` and ``clamp_limit / d``, where
+``d = view["output1_scale_gate_scalar"]``. For non-unit gate scales, prepare a
+separate official dictionary before launching; alpha and the physical weight
+and scale tensors remain shared::
+
+    official_view = dict(view)
+    d = view["output1_scale_gate_scalar"]
+    official_view["gemm1_beta"] = (view["gemm1_beta"] / d).contiguous()
+    official_view["gemm1_clamp_limit"] = (view["gemm1_clamp_limit"] / d).contiguous()
+
+Keep the logical dictionary registered for ``"cake"`` and register
+``official_view`` for ``"trtllm_fp4_routed"``. The derived buffers are FP32
+per-expert tensors. After changing logical beta, clamp limit, or gate scale,
+refresh their contents with ``copy_`` before the next official launch or replay.
+Perform conversion outside timing and CUDA Graph capture, preserving buffer
+addresses already used by a captured graph.
+
+Standalone SiLU has no supported TRT-LLM routed-MoE peer and its dictionary
+must be registered only for ``"cake"``. The default-SwiGLU example below shares
+its dictionary directly::
 
     cake = CakeWarpDecodeConfig(backend="cake")
     activation = SwiGLU()  # Or SiLU() for H6144/I1536/E192/top-k 4.
