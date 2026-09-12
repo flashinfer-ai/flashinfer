@@ -337,6 +337,7 @@ class DSv3RoutingGroundTruth:
 
 
 def test_ground_truth_excludes_unselected_groups_with_negative_scores():
+    """Keep unselected groups excluded even when a selected expert scores below zero."""
     scores = torch.zeros((1, 8), dtype=torch.float32)
     bias = torch.tensor(
         [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
@@ -447,9 +448,7 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
 
 
 def _is_supported_dsv3_config(num_experts, n_group, topk_group, topk):
-    """Mirror ``_check_dsv3_fused_routing_supported`` so parametrized cases the
-    public API would reject are reported as skips instead of errors.
-    """
+    """Mirror the public validator so parametrized cases it rejects are skipped."""
     if n_group <= 0 or num_experts % n_group != 0:
         return False
     if topk_group <= 0 or topk_group > n_group:
@@ -460,7 +459,12 @@ def _is_supported_dsv3_config(num_experts, n_group, topk_group, topk):
     if topk > topk_group * experts_per_group:
         return False
     if n_group > 1:
-        return experts_per_group <= 32 and experts_per_group * topk_group <= 128
+        return (
+            n_group <= 8
+            and topk_group <= 4
+            and 2 <= experts_per_group <= 32
+            and experts_per_group * topk_group <= 128
+        )
     return num_experts <= 384
 
 
@@ -740,6 +744,202 @@ def test_routing_replay_out_extended(
 
     torch.testing.assert_close(topk_values, topk_values_no_replay)
     torch.testing.assert_close(topk_indices, topk_indices_no_replay)
+
+
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        pytest.param(16, 8, 4, 8, id="expert-capacity-two"),
+        pytest.param(16, 8, 2, 4, id="two-extreme-groups"),
+        pytest.param(64, 8, 4, 4, id="four-tracked-groups"),
+        pytest.param(128, 8, 4, 8, id="eight-groups-at-warp-limit"),
+        pytest.param(15, 5, 2, 6, id="five-groups-three-experts-per-group"),
+    ],
+)
+@pytest.mark.parametrize("data_type", [torch.float32, torch.float16, torch.bfloat16])
+def test_dsv3_fused_routing_grouped_small_capacity_numeric(
+    num_experts, n_group, topk_group, topk, data_type
+):
+    """Verify expert IDs and weights at legal grouped-capacity boundaries.
+
+    Widely separated biases avoid ties in expert and group selection.
+    """
+    num_tokens = 32
+    experts_per_group = num_experts // n_group
+
+    generator = torch.Generator(device="cuda").manual_seed(20240607)
+    scores = torch.randn(
+        num_tokens,
+        num_experts,
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    ).to(data_type)
+
+    # A fixed permutation ranks the groups and the experts inside a group keep a
+    # strict order, so the biased scores are unique and widely spaced.
+    group_rank = torch.randperm(n_group, device="cuda", generator=generator)
+    expert_rank = (
+        group_rank.repeat_interleave(experts_per_group) * experts_per_group
+        + torch.arange(num_experts, device="cuda") % experts_per_group
+    )
+    bias = (-expert_rank.to(torch.float32) * 64.0).to(data_type)
+
+    ground_truth = DSv3RoutingGroundTruth(
+        scores.clone(), bias.clone(), n_group, topk_group, topk, 1.0, data_type
+    )
+
+    topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
+    topk_indices = torch.zeros(num_tokens, topk, device="cuda", dtype=torch.int32)
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        1.0,
+        topk_values,
+        topk_indices,
+        launch_with_pdl=True,
+    )
+
+    # Account for float32 normalization and the output dtype's rounding.
+    rtol, atol = {
+        torch.bfloat16: (6e-3, 6e-3),
+        torch.float16: (8e-4, 8e-4),
+        torch.float32: (1e-5, 1e-5),
+    }[data_type]
+
+    for token_idx in range(num_tokens):
+        kernel_experts = set(topk_indices[token_idx].tolist())
+        reference_experts = set(ground_truth.ref_expert_indices[token_idx].tolist())
+        assert kernel_experts == reference_experts, (
+            f"token {token_idx}: kernel {sorted(kernel_experts)} != "
+            f"reference {sorted(reference_experts)}"
+        )
+
+    # Gather both outputs onto the expert axis so the comparison checks each
+    # expert weight instead of each output slot.
+    reference_weights = torch.zeros(
+        num_tokens, num_experts, device="cuda", dtype=torch.float32
+    )
+    reference_weights.scatter_(
+        1, ground_truth.ref_expert_indices, ground_truth.ref_expert_values
+    )
+    kernel_weights = torch.zeros(
+        num_tokens, num_experts, device="cuda", dtype=torch.float32
+    )
+    kernel_weights.scatter_(1, topk_indices.long(), topk_values.float())
+    torch.testing.assert_close(kernel_weights, reference_weights, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk,match",
+    [
+        pytest.param(
+            256,
+            0,
+            4,
+            8,
+            r"n_group should be greater than or equal to 1",
+            id="n-group-zero-icheck",
+        ),
+        pytest.param(
+            256,
+            16,
+            4,
+            8,
+            r"n_group should be smaller than or equal to 8",
+            id="n-group-above-warp-count-icheck",
+        ),
+        pytest.param(
+            256,
+            8,
+            0,
+            8,
+            r"topk_group should be between 1 and n_group",
+            id="topk-group-zero-icheck",
+        ),
+        pytest.param(
+            64,
+            8,
+            5,
+            8,
+            r"unsupported configuration \(n_group=8, num_experts=64, topk_group=5\)",
+            id="topk-group-above-tracked-groups-gate",
+        ),
+        pytest.param(
+            8,
+            8,
+            4,
+            4,
+            r"unsupported configuration \(n_group=8, num_experts=8, topk_group=4\)",
+            id="experts-per-group-below-top-2-gate",
+        ),
+        pytest.param(
+            256,
+            8,
+            4,
+            0,
+            r"topk should be between 1 and 8",
+            id="topk-zero-icheck",
+        ),
+        pytest.param(
+            256,
+            8,
+            4,
+            9,
+            r"topk should be between 1 and 8",
+            id="topk-above-8-icheck",
+        ),
+        pytest.param(
+            32,
+            8,
+            1,
+            8,
+            r"topk should be smaller than or equal to the number of experts reachable",
+            id="topk-above-reachable-icheck",
+        ),
+    ],
+)
+def test_dsv3_fused_routing_grouped_contract_native_bypass(
+    num_experts, n_group, topk_group, topk, match
+):
+    """``skip_check=True`` still rejects unsupported grouped configurations.
+
+    The public validator is bypassed, so the native binding and the launch gate
+    have to reject each case themselves, and none of them may write to the
+    output tensors: the sentinels below must survive the raise unchanged.
+    """
+    num_tokens = 2
+    scores = torch.zeros(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+    bias = torch.zeros(num_experts, device="cuda", dtype=torch.float32)
+    topk_values = torch.full(
+        (num_tokens, topk), -7.0, device="cuda", dtype=torch.float32
+    )
+    topk_indices = torch.full((num_tokens, topk), -1, device="cuda", dtype=torch.int32)
+    routing_replay_out = torch.full(
+        (num_tokens, topk), -3, device="cuda", dtype=torch.int16
+    )
+
+    with pytest.raises(RuntimeError, match=match):
+        fused_topk_deepseek(
+            scores,
+            bias,
+            n_group,
+            topk_group,
+            topk,
+            1.0,
+            topk_values,
+            topk_indices,
+            skip_check=True,
+            routing_replay_out=routing_replay_out,
+        )
+
+    torch.cuda.synchronize()
+    assert torch.equal(topk_values, torch.full_like(topk_values, -7.0))
+    assert torch.equal(topk_indices, torch.full_like(topk_indices, -1))
+    assert torch.equal(routing_replay_out, torch.full_like(routing_replay_out, -3))
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])

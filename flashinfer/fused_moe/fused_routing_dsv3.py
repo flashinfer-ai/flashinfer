@@ -162,10 +162,12 @@ def _check_dsv3_fused_routing_supported(
             f"Invalid configuration: topk_group ({topk_group}) must be in [1, n_group "
             f"({n_group})]"
         )
+    if topk <= 0:
+        raise ValueError(f"Invalid configuration: topk ({topk}) must be > 0")
 
     # The selected groups expose ``topk_group * num_experts / n_group`` experts,
     # and the kernel returns the top ``topk`` of exactly those candidates.
-    reachable_experts = topk_group * num_experts // n_group
+    reachable_experts = topk_group * (num_experts // n_group)
     if topk > reachable_experts:
         raise ValueError(
             f"Invalid configuration: topk ({topk}) must be <= the number of experts "
@@ -175,9 +177,29 @@ def _check_dsv3_fused_routing_supported(
 
     # Check kernel limits based on number of groups
     if n_group > 1:
-        experts_per_group = num_experts / n_group
+        experts_per_group = num_experts // n_group
         max_experts_in_selected_groups = experts_per_group * topk_group
 
+        # ``deepseek_v3_topk_kernel`` launches ``NumDeepseekExperts / WARP_SIZE``
+        # warps of the grouped schedule and keeps one group score per warp, so at
+        # most 8 groups can be scored, and it tracks at most ``MaxNumTopGroups``
+        # selected groups.
+        if n_group > 8:
+            raise ValueError(
+                f"Invalid configuration for n_group > 1: n_group ({n_group}) must be <= 8"
+            )
+        if topk_group > 4:
+            raise ValueError(
+                f"Invalid configuration for n_group > 1: topk_group ({topk_group}) must be "
+                f"<= 4"
+            )
+        # A group score is the sum of the two best experts of a group, which stays
+        # finite only for at least two experts per group.
+        if experts_per_group < 2:
+            raise ValueError(
+                f"Invalid configuration for n_group > 1: num_experts / n_group "
+                f"({experts_per_group}) must be >= 2"
+            )
         if topk > 8:
             raise ValueError(
                 f"Invalid configuration for n_group > 1: topk ({topk}) must be <= 8"
@@ -290,21 +312,25 @@ def fused_topk_deepseek(
         Per-expert routing bias of shape ``(num_experts,)``, same dtype as
         ``scores``.  Added to the sigmoid-activated scores before grouping.
     n_group : int
-        Number of expert groups.  Must satisfy ``n_group <= 32`` and
-        ``num_experts % n_group == 0``.  Typical value is 8 for DeepSeek-V3
-        with 256 experts (32 experts per group).
+        Number of expert groups.  Must satisfy ``1 <= n_group <= 8`` and
+        ``num_experts % n_group == 0``.  The grouped kernel keeps one group
+        score per warp of its launch, so at most 8 groups can be scored.
+        Typical value is 8 for DeepSeek-V3 with 256 experts (32 experts per
+        group).
     topk_group : int
-        Number of top groups to select.  Must satisfy ``topk_group <=
-        n_group`` and ``topk <= (num_experts / n_group) * topk_group``.
-        Typical value is 4.
+        Number of top groups to select.  Must satisfy ``1 <= topk_group <=
+        min(n_group, 4)`` and ``topk <= (num_experts / n_group) *
+        topk_group``; the kernel tracks at most 4 selected groups.  Typical
+        value is 4.
     topk : int
-        Number of top experts to select per token.  Must be ``<= num_experts``.
-        Hard cap ``topk <= 32``; in addition both branches of the kernel
-        require ``topk <= 8``.  Typical value is 8.
+        Number of top experts to select per token.  Must satisfy ``1 <=
+        topk <= 8`` and ``topk <= (num_experts / n_group) * topk_group``.
+        Typical value is 8.
 
         Further per-branch constraints:
 
-        - When ``n_group > 1``: ``num_experts / n_group <= 32`` and
+        - When ``n_group > 1``: ``2 <= num_experts / n_group <= 32`` (a
+          group score sums the two best experts of the group) and
           ``(num_experts / n_group) * topk_group <= 128``.
         - When ``n_group == 1``: ``num_experts <= 384``.
     routed_scaling_factor : float
@@ -334,6 +360,7 @@ def fused_topk_deepseek(
         Implementation backend. ``"default"`` preserves the existing
         FlashInfer implementation. ``"cake"`` explicitly selects the Cake
         kernel and raises when the call is outside its supported contract.
+        For ``"cake"``, single-group routing requires ``topk == 1``.
         Defaults to ``"default"``.
 
     Returns
