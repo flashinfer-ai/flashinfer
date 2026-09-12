@@ -1915,7 +1915,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         a_predicate_slice = cute.make_rmem_tensor(
                             cute.make_layout((1,)), cutlass.Boolean
                         )
-                        a_predicate_slice[0] = a_predicate_tensor[i]
+                        # Row validity does not guard a partial final K tile.
+                        a_predicate_slice[0] = a_predicate_tensor[i] & (
+                            a_producer_state.count * self.cta_tile_shape_mnk[2]
+                            + A_gmem_thread_offset
+                            < cute.size(mA_mkl, mode=[1])
+                        )
 
                         cute.copy_atom_call(
                             a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
@@ -1946,11 +1951,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             tAsSFA_slice_ptr, cute.make_layout((4,))
                         )
 
+                        sfa_tail_predicate = cute.make_rmem_tensor(
+                            cute.make_layout((1,)), cutlass.Boolean
+                        )
+                        sfa_tail_predicate[0] = sfa_predicate_tensor[0] & (
+                            a_producer_state.count * self.cta_tile_shape_mnk_sfa[2]
+                            + 4 * swizzled_iterator
+                            < cute.size(mSFA_mkl, mode=[1])
+                        )
                         cute.copy_atom_call(
                             sfa_atom_copy,
                             tAgSFA_slice,
                             tAsSFA_slice,
-                            pred=sfa_predicate_tensor,
+                            pred=sfa_tail_predicate,
                         )
 
                     a_pipeline.producer_commit(a_producer_state)
