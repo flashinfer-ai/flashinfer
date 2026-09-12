@@ -11,7 +11,13 @@ from flashinfer.jit.attention import (
     gen_customize_single_prefill_module,
 )
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
-from flashinfer.utils import MaskMode, get_compute_capability, is_sm90a_supported
+from flashinfer.utils import (
+    SINGLE_KERNEL_TMP_SIZE,
+    MaskMode,
+    TensorLayout,
+    get_compute_capability,
+    is_sm90a_supported,
+)
 
 
 def test_single_decode_mask():
@@ -1084,6 +1090,423 @@ struct FlashAlibiDecode : AttentionVariantBase {
     assert o.shape == (batch_size, num_qo_heads, head_dim)
 
 
+# Issue #2765: REGISTER_OUTPUT_TRANSFORM on the Hopper (fa3) variant helper. The variants add a
+# per-(query, head) correction to the normalized output, o[q, h, :] += corr[q, h] * hvec[h, :]
+# with q the global query row, which exercises the row, head and column coordinates of the hook.
+
+corrected_attention_sm90_decl = r"""
+struct CorrectedAttention : AttentionVariantBase {
+  float sm_scale_log2;
+  uint32_t qo_start, corr_stride;
+
+  template <typename MainloopParams, typename BlockCoord>
+  __device__ __host__ CorrectedAttention(const MainloopParams& params,
+                                         const BlockCoord& block_coord) {
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
+    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
+    qo_start = qo_indptr;
+    corr_stride = params.additional_params.corr_stride;
+  }
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
+  }
+
+  // qo_idx is request-local; qo_start makes it the global row that indexes corr.
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, d_idx, lse, {
+    const float corr =
+        params.additional_params.corr[(qo_start + qo_idx) * corr_stride + qo_head_idx];
+    const float h = params.additional_params.hvec[qo_head_idx * HEAD_DIM_VO + d_idx];
+    return output + corr * h;
+  })
+};
+"""
+
+# The same correction through the FA2 hook, which also owns the softmax normalization and has
+# no column index, so this twin adds a per-(query, head) term only.
+corrected_attention_sm80_decl = r"""
+struct CorrectedAttention : AttentionVariantBase {
+  static constexpr bool use_softmax = true;
+  uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
+
+  template <typename Params>
+  __device__ __host__ CorrectedAttention(const Params& params, uint32_t batch_idx,
+                                         uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+    sm_scale_log2 = params.sm_scale * math::log2e;
+  }
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
+    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    return output * d_rcp + params.corr[qo_idx * params.corr_stride + qo_head_idx];
+  })
+};
+"""
+
+# FP8 twin: the built-in FP8 variant plus the hook, to cover the FP8 epilogue.
+corrected_attention_fp8_sm90_decl = r"""
+#include <flashinfer/attention/hopper/variants.cuh>
+
+struct CorrectedFP8Attention : StandardFP8Attention {
+  uint32_t qo_start, corr_stride;
+
+  template <typename MainloopParams, typename BlockCoord>
+  __device__ CorrectedFP8Attention(const MainloopParams& params, const BlockCoord& block_coord)
+      : StandardFP8Attention(params, block_coord) {
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len, batch_idx] =
+        block_coord;
+    qo_start = qo_indptr;
+    corr_stride = params.additional_params.corr_stride;
+  }
+
+  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, d_idx, lse, {
+    const float corr =
+        params.additional_params.corr[(qo_start + qo_idx) * corr_stride + qo_head_idx];
+    const float h = params.additional_params.hvec[qo_head_idx * HEAD_DIM_VO + d_idx];
+    return output + corr * h;
+  })
+};
+"""
+
+# (tensor names, tensor dtypes, scalar names, scalar dtypes) shared by the fa3 variants above.
+_OUTPUT_TRANSFORM_PARAMS = (
+    ["corr", "hvec"],
+    ["float", "float"],
+    ["sm_scale", "corr_stride"],
+    ["double", "int64_t"],
+)
+
+
+def _skip_unless_sm90a():
+    """Skip unless the current device runs the fa3 (SM90a) kernels."""
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
+
+def _random_correction(nnz_qo, num_qo_heads, head_dim):
+    """Per-(query, head) factors and per-(head, column) vectors, uniform in [-1, 1)."""
+    corr = torch.rand(nnz_qo, num_qo_heads, dtype=torch.float32, device="cuda") * 2 - 1
+    hvec = (
+        torch.rand(num_qo_heads, head_dim, dtype=torch.float32, device="cuda") * 2 - 1
+    )
+    return corr, hvec
+
+
+def _attention_reference(q, k, v, causal, sm_scale):
+    """fp32 softmax attention with GQA by head repetition and a causal mask aligned to the
+    bottom right. Returns (o, lse) with lse in the log2 domain, which is what the kernels
+    store. An empty KV yields zeros and -inf."""
+    qo_len, kv_len, num_qo_heads = q.size(0), k.size(0), q.size(1)
+    if kv_len == 0:
+        o = torch.zeros(
+            qo_len, num_qo_heads, v.size(-1), dtype=torch.float32, device=q.device
+        )
+        lse = torch.full((qo_len, num_qo_heads), float("-inf"), device=q.device)
+        return o, lse
+    group_size = num_qo_heads // k.size(1)
+    kf = k.float().repeat_interleave(group_size, dim=1)
+    vf = v.float().repeat_interleave(group_size, dim=1)
+    s = torch.einsum("qhd,khd->hqk", q.float(), kf) * sm_scale
+    if causal:
+        keep = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+        s = s.masked_fill(~keep.tril(kv_len - qo_len), float("-inf"))
+    o = torch.einsum("hqk,khd->qhd", torch.softmax(s, dim=-1), vf)
+    lse = torch.logsumexp(s, dim=-1).t() * math.log2(math.e)
+    return o, lse
+
+
+def _sm90_output_transform_module(dtype):
+    """fa3 single-prefill module for CorrectedAttention with head_dim 128, cached by uri."""
+    return gen_customize_single_prefill_module(
+        "fa3",
+        f"single_prefill_output_transform_{str(dtype).split('.')[-1]}",
+        dtype,  # dtype_q
+        dtype,  # dtype_kv
+        dtype,  # dtype_o
+        128,  # head_dim_qk
+        128,  # head_dim_vo
+        *_OUTPUT_TRANSFORM_PARAMS,
+        "CorrectedAttention",
+        corrected_attention_sm90_decl,
+    ).build_and_load()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_single_prefill_sm90_output_transform(dtype, causal):
+    """fa3 single prefill through a variant whose REGISTER_OUTPUT_TRANSFORM adds
+    corr[q, h] * hvec[h, :] to the normalized output. The output must match an fp32 reference
+    and the LSE must be untouched, so it is compared with the built-in fa3 kernel."""
+    _skip_unless_sm90a()
+    torch.manual_seed(42)
+    # 333 rows = two full 128-row tiles plus a partial one; 8 query heads over 2 kv heads.
+    qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim = 333, 1027, 8, 2, 128
+    f = functools.partial(
+        single_prefill_with_kv_cache_with_jit_module,
+        _sm90_output_transform_module(dtype),
+    )
+
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda")
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    corr, hvec = _random_correction(qo_len, num_qo_heads, head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+
+    o, lse = f(
+        q,
+        k,
+        v,
+        corr,
+        hvec,
+        sm_scale,
+        corr.stride(0),
+        mask_mode=mask_mode,
+        return_lse=True,
+    )
+
+    o_ref, _ = _attention_reference(q, k, v, causal, sm_scale)
+    o_ref = o_ref + corr[:, :, None] * hvec[None, :, :]
+    _, lse_builtin = flashinfer.single_prefill_with_kv_cache(
+        q, k, v, causal=causal, backend="fa3", return_lse=True
+    )
+    # Values are O(1); the error budget is dominated by the 16-bit output rounding.
+    tol = 2e-2 if dtype == torch.float16 else 4e-2
+    torch.testing.assert_close(o.float(), o_ref, rtol=tol, atol=tol)
+    torch.testing.assert_close(lse, lse_builtin, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_batch_prefill_sm90_output_transform(causal):
+    """fa3 batch prefill, ragged and paged, through the same variant. The batch mixes a partial
+    128-row tile, a request with an empty KV (its rows come from the epilogue's zero path, so
+    the output must be exactly the correction term and the LSE -inf), a decode-like request
+    and a request spanning two tiles. corr is indexed by the global query row."""
+    _skip_unless_sm90a()
+    torch.manual_seed(42)
+    dtype = torch.float16
+    num_qo_heads, num_kv_heads, head_dim, page_size = 8, 2, 128, 16
+    qo_lens = [77, 300, 5, 130]
+    kv_lens = [77, 0, 640, 130]
+    nnz_qo, nnz_kv = sum(qo_lens), sum(kv_lens)
+    jit_args = (
+        "batch_prefill_output_transform",  # uri
+        dtype,  # dtype_q
+        dtype,  # dtype_kv
+        dtype,  # dtype_o
+        torch.int32,  # idtype
+        head_dim,  # hidden_dim_qk
+        head_dim,  # hidden_dim_vo
+        *_OUTPUT_TRANSFORM_PARAMS,
+        "CorrectedAttention",
+        corrected_attention_sm90_decl,
+    )
+
+    q = torch.randn(nnz_qo, num_qo_heads, head_dim, dtype=dtype, device="cuda")
+    k = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    v = torch.randn(nnz_kv, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    corr, hvec = _random_correction(nnz_qo, num_qo_heads, head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    qo_indptr = torch.tensor([0] + qo_lens).cumsum(0).int()
+    kv_indptr = torch.tensor([0] + kv_lens).cumsum(0).int()
+
+    o_ref = torch.empty(
+        nnz_qo, num_qo_heads, head_dim, dtype=torch.float32, device="cuda"
+    )
+    lse_ref = torch.empty(nnz_qo, num_qo_heads, dtype=torch.float32, device="cuda")
+    for i in range(len(qo_lens)):
+        q0, q1 = qo_indptr[i].item(), qo_indptr[i + 1].item()
+        k0, k1 = kv_indptr[i].item(), kv_indptr[i + 1].item()
+        o_ref[q0:q1], lse_ref[q0:q1] = _attention_reference(
+            q[q0:q1], k[k0:k1], v[k0:k1], causal, sm_scale
+        )
+    o_ref += corr[:, :, None] * hvec[None, :, :]
+
+    ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        kv_layout="NHD",
+        backend="fa3",
+        jit_args=jit_args,
+    )
+    ragged.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=causal,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = ragged.run(q, k, v, corr, hvec, sm_scale, corr.stride(0), return_lse=True)
+    torch.testing.assert_close(o.float(), o_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+    # The same KV in 16-token pages; the empty request owns no page.
+    num_pages = [(n + page_size - 1) // page_size for n in kv_lens]
+    page_indptr = torch.tensor([0] + num_pages).cumsum(0).int()
+    last_page_len = torch.tensor(
+        [
+            n - (p - 1) * page_size if p > 0 else 0
+            for n, p in zip(kv_lens, num_pages, strict=True)
+        ],
+        dtype=torch.int32,
+    )
+    k_paged = torch.zeros(
+        sum(num_pages), page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    v_paged = torch.zeros_like(k_paged)
+    for i, n in enumerate(kv_lens):
+        k0, t0 = kv_indptr[i].item(), page_indptr[i].item() * page_size
+        k_paged.view(-1, num_kv_heads, head_dim)[t0 : t0 + n] = k[k0 : k0 + n]
+        v_paged.view(-1, num_kv_heads, head_dim)[t0 : t0 + n] = v[k0 : k0 + n]
+    paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        kv_layout="NHD",
+        backend="fa3",
+        jit_args=jit_args,
+    )
+    paged.plan(
+        qo_indptr,
+        page_indptr,
+        torch.arange(sum(num_pages), dtype=torch.int32),
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+    )
+    o_paged, lse_paged = paged.run(
+        q, (k_paged, v_paged), corr, hvec, sm_scale, corr.stride(0), return_lse=True
+    )
+    torch.testing.assert_close(o_paged.float(), o_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(lse_paged, lse_ref, rtol=1e-2, atol=1e-2)
+
+    # Rows of the empty request: exactly the correction term (up to fp16 rounding) and -inf.
+    q0, q1 = qo_indptr[1].item(), qo_indptr[2].item()
+    expected = corr[q0:q1, :, None] * hvec[None, :, :]
+    for out, out_lse in ((o, lse), (o_paged, lse_paged)):
+        torch.testing.assert_close(out[q0:q1].float(), expected, rtol=2e-3, atol=2e-3)
+        assert torch.isneginf(out_lse[q0:q1]).all()
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_output_transform_fa2_fa3_parity(causal):
+    """The same per-(query, head) correction written against the FA2 hook (which also
+    normalizes) and the fa3 hook (post-normalization, hvec set to ones) must agree with each
+    other and with the fp32 reference."""
+    _skip_unless_sm90a()
+    torch.manual_seed(42)
+    dtype = torch.float16
+    qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim = 333, 1027, 8, 2, 128
+    fa2_module = gen_customize_single_prefill_module(
+        "fa2",
+        "single_prefill_output_transform_fa2",
+        dtype,  # dtype_q
+        dtype,  # dtype_kv
+        dtype,  # dtype_o
+        head_dim,  # head_dim_qk
+        head_dim,  # head_dim_vo
+        ["corr"],  # additional_tensor_names
+        ["float"],  # additional_tensor_dtypes
+        ["sm_scale", "corr_stride"],  # additional_scalar_names
+        ["double", "int64_t"],  # additional_scalar_dtypes
+        "CorrectedAttention",
+        corrected_attention_sm80_decl,
+    ).build_and_load()
+    fa3_module = _sm90_output_transform_module(dtype)
+
+    q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda")
+    k = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    v = torch.randn(kv_len, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+    corr, _ = _random_correction(qo_len, num_qo_heads, head_dim)
+    ones = torch.ones(num_qo_heads, head_dim, dtype=torch.float32, device="cuda")
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+
+    o_fa2 = single_prefill_with_kv_cache_with_jit_module(
+        fa2_module, q, k, v, corr, sm_scale, corr.stride(0), mask_mode=mask_mode
+    )
+    o_fa3 = single_prefill_with_kv_cache_with_jit_module(
+        fa3_module, q, k, v, corr, ones, sm_scale, corr.stride(0), mask_mode=mask_mode
+    )
+
+    o_ref, _ = _attention_reference(q, k, v, causal, sm_scale)
+    o_ref = o_ref + corr[:, :, None]
+    torch.testing.assert_close(o_fa2.float(), o_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(o_fa3.float(), o_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_single_prefill_sm90_fp8_output_transform(causal):
+    """The hook also runs in the fa3 FP8 epilogue, which stores the accumulator through its own
+    column handling. With the built-in FP8 variant extended by the hook, the transformed output
+    minus the built-in FP8 output must be exactly the correction term."""
+    _skip_unless_sm90a()
+    torch.manual_seed(42)
+    qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim = 333, 1027, 8, 2, 128
+    fp8, out_dtype = torch.float8_e4m3fn, torch.float16
+    jit_module = gen_customize_single_prefill_module(
+        "fa3",
+        "single_prefill_output_transform_fp8",
+        fp8,  # dtype_q
+        fp8,  # dtype_kv
+        out_dtype,  # dtype_o
+        head_dim,  # head_dim_qk
+        head_dim,  # head_dim_vo
+        *_OUTPUT_TRANSFORM_PARAMS,
+        "CorrectedFP8Attention",
+        corrected_attention_fp8_sm90_decl,
+        fp8_enabled=True,  # select the FP8 kernel template
+    ).build_and_load()
+
+    q = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda").to(fp8)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, device="cuda").to(fp8)
+    v = torch.randn(kv_len, num_kv_heads, head_dim, device="cuda").to(fp8)
+    corr, hvec = _random_correction(qo_len, num_qo_heads, head_dim)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
+
+    # single_prefill_with_kv_cache_with_jit_module allocates the output in q's dtype, so call
+    # the module directly with a 16-bit output buffer.
+    o = torch.empty(qo_len, num_qo_heads, head_dim, dtype=out_dtype, device="cuda")
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device="cuda")
+    jit_module.run(
+        q,
+        k,
+        v,
+        tmp,
+        o,
+        None,
+        mask_mode,
+        TensorLayout.NHD.value,
+        -1,
+        corr,
+        hvec,
+        sm_scale,
+        corr.stride(0),
+    )
+    o_builtin = flashinfer.single_prefill_with_kv_cache(
+        q, k, v, causal=causal, backend="fa3", o_dtype=out_dtype
+    )
+    torch.testing.assert_close(
+        o.float() - o_builtin.float(),
+        corr[:, :, None] * hvec[None, :, :],
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
 if __name__ == "__main__":
     test_single_decode_mask()
     test_flash_sigmoid()
@@ -1095,3 +1518,7 @@ if __name__ == "__main__":
     test_batch_prefill_jit_wellknown_mask_buffers()
     test_batch_decode_jit_wellknown_alibi_buffer(False)
     test_batch_decode_jit_wellknown_alibi_buffer(True)
+    test_single_prefill_sm90_output_transform(torch.float16, False)
+    test_batch_prefill_sm90_output_transform(False)
+    test_output_transform_fa2_fa3_parity(False)
+    test_single_prefill_sm90_fp8_output_transform(False)
