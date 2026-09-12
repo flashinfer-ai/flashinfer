@@ -1,3 +1,5 @@
+import json
+import shlex
 import subprocess
 from types import SimpleNamespace
 
@@ -36,6 +38,45 @@ def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
 
     assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
     assert "--compress-mode=size" in spec.extra_cuda_cflags
+
+
+def test_per_source_cuda_flags_reach_ninja_and_compile_commands(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+    monkeypatch.delenv("FLASHINFER_EXTRA_CUDAFLAGS", raising=False)
+    strict, fast, host = (
+        tmp_path / name for name in ("strict.cu", "fast.cu", "host.cu")
+    )
+    for source in (strict, fast, host):
+        source.write_text("// Compilation inputs only; no compiler is invoked.\n")
+    spec = core.gen_jit_spec(
+        name="test_per_source_cuda_flags",
+        sources=[strict, fast, host],
+        extra_cuda_cflags=["-DSHARED_ONLY"],
+        extra_cuda_cflags_by_source={strict: [], fast: ["--use_fast_math"]},
+    )
+    spec.write_ninja()
+    ninja_commands = json.loads(
+        subprocess.check_output(
+            ["ninja", "-f", str(spec.ninja_path), "-t", "compdb", "cuda_compile"],
+            text=True,
+        )
+    )
+    for records in (ninja_commands, spec.get_compile_commands()):
+        commands = {
+            record["file"]: shlex.split(record["command"]) for record in records
+        }
+        assert set(commands) == {str(source) for source in (strict, fast, host)}
+        assert not {"-use_fast_math", "--use_fast_math"}.intersection(
+            commands[str(strict)]
+        )
+        assert "--use_fast_math" in commands[str(fast)]
+        assert "-use_fast_math" in commands[str(host)]
+        assert "-DSHARED_ONLY" in commands[str(host)]
+        assert "-DSHARED_ONLY" not in commands[str(strict)]
+        assert "-DSHARED_ONLY" not in commands[str(fast)]
+        assert all("-std=c++17" in command for command in commands.values())
 
 
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
