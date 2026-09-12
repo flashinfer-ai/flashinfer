@@ -6288,6 +6288,12 @@ def trtllm_fp8_per_channel_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx).
     """
+    if hidden_states.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "FP8 per-channel MoE hidden_states must have dtype "
+            f"torch.float8_e4m3fn, got {hidden_states.dtype}."
+        )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         routing_logits,
         None,
@@ -6424,6 +6430,12 @@ def trtllm_fp8_per_channel_scale_routed_moe(
         Final MoE output when ``do_finalize`` is ``True``; otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
+    if hidden_states.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "FP8 per-channel MoE hidden_states must have dtype "
+            f"torch.float8_e4m3fn, got {hidden_states.dtype}."
+        )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         None,  # routing_logits
         topk_ids,
