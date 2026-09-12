@@ -153,6 +153,14 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
     num_kv_heads = paged_k_cache.size(2);
   }
   uint32_t head_dim_qk = q.size(2);
+  if constexpr (USE_INLINE_SF) {
+    TVM_FFI_ICHECK_EQ(paged_k_cache.size(3), head_dim_qk + 16)
+        << "use_inline_sf requires K cache last dim = head_dim_qk + 16 (" << head_dim_qk + 16
+        << "), got " << paged_k_cache.size(3);
+    TVM_FFI_ICHECK_EQ(paged_v_cache.size(3), head_dim_qk + 16)
+        << "use_inline_sf requires V cache last dim = head_dim_qk + 16 (" << head_dim_qk + 16
+        << "), got " << paged_v_cache.size(3);
+  }
   // For inline FP8 KV scale, the KV cache's last dim is slot_size (head_dim + 16); the
   // actual head dim is the slot size minus 16. Derive it from the V cache (not Q) so the
   // QK/VO equality check below stays a real validation.
