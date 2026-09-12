@@ -117,6 +117,14 @@ void top_k_mask_logits(TensorView logits, TensorView mask_logits,
     return true;
   });
 
+  if (status == cudaErrorNotSupported) {
+    TVM_FFI_ICHECK(false)
+        << "top_k_mask_logits does not support multi-CTA execution on GPUs with 16 or fewer "
+           "SMs because its cross-CTA software barrier cannot guarantee forward progress "
+        << "(vocab_size=" << vocab_size
+        << "). Use top_k_top_p_sampling_from_logits(..., filter_apply_order=\"joint\") when "
+           "joint filtering semantics are acceptable, or configure another sampling backend.";
+  }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "TopKMaskLogits failed with error code " << cudaGetErrorString(status);
 }

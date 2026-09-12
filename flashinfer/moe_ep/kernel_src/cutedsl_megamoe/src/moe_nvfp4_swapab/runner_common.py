@@ -495,6 +495,22 @@ def swiglu_fold_interleave_16(
     return swiglu_fold_interleave(c_fp32, 16, gate_up_clamp=gate_up_clamp)
 
 
+# The int32-indexed Triton helpers below (_rcp_approx_kernel,
+# _swiglu_pair_kernel) compute ``program_id * BLOCK + arange`` in int32, so
+# any launch with >= 2**31 elements would silently wrap. _pack_fp4_kernel is
+# exempt: it widens to int64 for the billion-element combine round-trip.
+_TRITON_FLAT_INDEX_LIMIT = 2**31
+
+
+def _check_triton_flat_index(n: int, label: str) -> None:
+    if n >= _TRITON_FLAT_INDEX_LIMIT:
+        raise ValueError(
+            f"{label}: {n} elements exceed the 32-bit flat-index limit "
+            f"({_TRITON_FLAT_INDEX_LIMIT}) of this Triton helper; "
+            "process the tensor in chunks."
+        )
+
+
 @functools.lru_cache(None)
 def _get_pack_fp4_triton_kernel():
     import triton
@@ -552,6 +568,8 @@ def _pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     n_pairs = flat.numel() // 2
     out = torch.empty(n_pairs, dtype=torch.uint8, device=fp32.device)
     if n_pairs > 0:
+        # No _check_triton_flat_index here: _pack_fp4_kernel indexes in int64
+        # precisely so the combine round-trip can pack > 2**31 elements.
         triton, kernel = _get_pack_fp4_triton_kernel()
         block = 1024
         grid = (triton.cdiv(n_pairs, block),)
@@ -595,6 +613,7 @@ def _rcp_approx_ftz_f32_cuda(x: torch.Tensor) -> torch.Tensor:
     if n_elements == 0:
         return y.view_as(x)
 
+    _check_triton_flat_index(n_elements, "_rcp_approx_ftz_f32_cuda")
     triton, kernel = _get_rcp_approx_triton_kernel()
     block = 1024
     grid = (triton.cdiv(n_elements, block),)
@@ -659,6 +678,7 @@ def _swiglu_pair_hw_match_cuda(gate: torch.Tensor, up: torch.Tensor) -> torch.Te
     out = torch.empty_like(gate_c)
     n_elements = gate_c.numel()
 
+    _check_triton_flat_index(n_elements, "_swiglu_pair_hw_match_cuda")
     triton, kernel = _get_swiglu_pair_hw_match_triton_kernel()
     block = 1024
     grid = (triton.cdiv(n_elements, block),)

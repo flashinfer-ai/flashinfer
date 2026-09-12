@@ -33,6 +33,7 @@ import statistics
 import subprocess
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -47,11 +48,11 @@ EVOLUTION_PEER_SHA = "cea7f46ffc190cabf82c95a39cd0d2aa6c888c17"
 DATA_SEED = 42
 PRECOMPUTED_SEQUENCE_COUNTS = (8, 16, 32, 64, 128)
 T3_LOWER_BOUND_SEQUENCE_COUNTS = (1, 2, 4, 8, 16)
+SUPPORTED_FLASH_KDA_DECODE_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 
-# Keep the measured public-export routes in one place. T1 uses a direct
-# register-state body with split16 at N8 and split8 at N16+; the exported split
-# sweep selects split4 for T2 and split2 for T4. T3 has one exact lower-bound
-# split4 specialization.
+# Keep the measured public-export routes in one place. T3 has one exact
+# lower-bound split4 specialization. The final 30-shape matrix has
+# architecture-local T1 routes and one measured SM103a T4/N8 route override.
 EXPECTED_VARIANTS_BY_T = {
     2: "d128_t2_precomputed_split4",
     3: "d128_t3_lower_bound_split4",
@@ -59,12 +60,21 @@ EXPECTED_VARIANTS_BY_T = {
     5: "d128_t5_precomputed_gram_split1",
     6: "d128_t6_precomputed_gram_split1",
 }
-EXPECTED_T1_VARIANTS_BY_N = {
-    8: "d128_t1_precomputed_direct_split16",
-    16: "d128_t1_precomputed_direct_split8",
-    32: "d128_t1_precomputed_direct_split8",
-    64: "d128_t1_precomputed_direct_split8",
-    128: "d128_t1_precomputed_direct_split8",
+EXPECTED_T1_VARIANTS_BY_ARCH_AND_N = {
+    "sm100a": {
+        8: "d128_t1_precomputed_direct_split16",
+        16: "d128_t1_precomputed_direct_split8",
+        32: "d128_t1_precomputed_direct_split8",
+        64: "d128_t1_precomputed_direct_split8",
+        128: "d128_t1_precomputed_direct_split8",
+    },
+    "sm103a": {
+        num_sequences: "d128_t1_precomputed_direct_split16"
+        for num_sequences in PRECOMPUTED_SEQUENCE_COUNTS
+    },
+}
+EXPECTED_SM103A_VARIANTS_BY_T_AND_N = {
+    (4, 8): "d128_t4_precomputed_split1",
 }
 
 
@@ -99,6 +109,24 @@ def _case_specs_for_tokens(num_tokens: int) -> tuple[dict, ...]:
 CASES = tuple(
     spec for num_tokens in range(1, 7) for spec in _case_specs_for_tokens(num_tokens)
 )
+
+
+def _hardware_metadata(device: torch.device) -> dict:
+    compute_capability = torch.cuda.get_device_capability(device)
+    properties = torch.cuda.get_device_properties(device)
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    return {
+        "device_name": properties.name,
+        "device_index": device_index,
+        "compute_capability": list(compute_capability),
+        "cuda_arch": SUPPORTED_FLASH_KDA_DECODE_ARCHS[compute_capability],
+        "multiprocessor_count": properties.multi_processor_count,
+        "total_memory_bytes": properties.total_memory,
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+    }
 
 
 def _make_case(spec: dict, device: torch.device) -> dict:
@@ -270,12 +298,25 @@ def _parse_expected_variant_overrides(values: list[str]) -> dict[int, str]:
 def _expected_variant_for_spec(
     spec: dict,
     expected_variant_overrides: dict[int, str],
+    cuda_arch: Optional[str] = None,
 ) -> str:
     num_tokens = spec["T"]
     if num_tokens in expected_variant_overrides:
         return expected_variant_overrides[num_tokens]
+    if cuda_arch is None:
+        compute_capability = torch.cuda.get_device_capability()
+        cuda_arch = SUPPORTED_FLASH_KDA_DECODE_ARCHS[compute_capability]
     if num_tokens == 1:
-        return EXPECTED_T1_VARIANTS_BY_N[spec["N"]]
+        return EXPECTED_T1_VARIANTS_BY_ARCH_AND_N[cuda_arch][spec["N"]]
+    if (
+        cuda_arch == "sm103a"
+        and (
+            num_tokens,
+            spec["N"],
+        )
+        in EXPECTED_SM103A_VARIANTS_BY_T_AND_N
+    ):
+        return EXPECTED_SM103A_VARIANTS_BY_T_AND_N[(num_tokens, spec["N"])]
     return EXPECTED_VARIANTS_BY_T[num_tokens]
 
 
@@ -441,8 +482,19 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        raise RuntimeError("this benchmark requires exact B200 / sm_100a")
+    compute_capability = torch.cuda.get_device_capability(device)
+    if compute_capability not in SUPPORTED_FLASH_KDA_DECODE_ARCHS:
+        raise RuntimeError(
+            "this benchmark requires exact CC 10.0 (SM100a; B200/GB200) "
+            "or CC 10.3 (SM103a; B300/GB300), got "
+            f"CC {compute_capability[0]}.{compute_capability[1]}"
+        )
+    hardware = _hardware_metadata(device)
+    print(
+        "Hardware: "
+        f"{hardware['device_name']} CC {hardware['compute_capability'][0]}."
+        f"{hardware['compute_capability'][1]} ({hardware['cuda_arch']})"
+    )
 
     rows = []
     cases_per_t = {
@@ -454,8 +506,11 @@ def main() -> None:
         case_ordinal_by_t[spec["T"]] += 1
         kwargs = _make_case(spec, device)
         selected_variant = None
-        expected_variant = _expected_variant_for_spec(spec, expected_variants)
+        expected_variant = None
         if args.mode == "frozen":
+            expected_variant = _expected_variant_for_spec(
+                spec, expected_variants, hardware["cuda_arch"]
+            )
             selected_variant = _assert_frozen_route(spec, kwargs, expected_variant)
         call_kwargs = dict(kwargs)
         if args.mode == "frozen":
@@ -527,6 +582,7 @@ def main() -> None:
             raise RuntimeError(f"invalid timing for {spec['name']}: {median_ms}")
         row = {
             **spec,
+            "hardware": hardware,
             "mode": args.mode,
             "data_seed": DATA_SEED,
             "case_ordinal_within_t": case_ordinal_by_t[spec["T"]],

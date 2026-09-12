@@ -14,14 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .core import JitSpec, gen_jit_spec, current_compilation_context
+from .core import (
+    JitSpec,
+    current_compilation_context,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from .utils import write_if_different
 from . import env as jit_env
 import os
 import pathlib
 import jinja2
 from itertools import product
-from typing import Dict, Tuple, List, Any
+from typing import Any, Dict, List, Literal, Tuple
 
 
 def gen_comm_alltoall_module() -> JitSpec:
@@ -211,6 +217,66 @@ def gen_vllm_comm_module() -> JitSpec:
     )
 
 
+def gen_pcie_ipc_comm_debug_module(
+    stall_ns: int,
+    stall_island: int,
+    no_block_epoch: int = 0,
+    per_block_epoch: int = 0,
+    no_barrier_entry_sync: int = 0,
+) -> JitSpec:
+    """Build the kernels with one protocol mechanism disabled. Not for shipping.
+
+    Used by the opt-in negative-control tests and by the benchmark's
+    ``--protocol-ab`` mode. Every switch produces an INCORRECT build.
+
+    ``stall_ns``/``stall_island``
+        Stall one island between the owner-pair rendezvous and the cross read.
+        The only way to open the TP8 cross-island window -- a host-side delay
+        cannot, because the pair barrier releases both islands together.
+
+    ``no_block_epoch``
+        Pin the scratch to half 0, i.e. no double buffer. Matches what the two
+        staged TP8 kernels used to do; for the others it is a protocol that
+        never shipped.
+
+    ``per_block_epoch``
+        Pick the half by per-block parity instead of per call. Matches what
+        TP2, TP4 and the TP8 pack kernel used to do. One change in grid size
+        then desynchronises the block ranges permanently.
+
+    ``no_barrier_entry_sync``
+        Drop the leading CTA barrier from the three signalling helpers. Applies
+        to every kernel that takes a barrier.
+    """
+    return gen_jit_spec(
+        f"pcie_ipc_comm_dbg{stall_ns}_{stall_island}_{no_block_epoch}"
+        f"_{per_block_epoch}_{no_barrier_entry_sync}",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+        ],
+        extra_cuda_cflags=[
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_CROSS_STALL_NS={stall_ns}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_STALL_ISLAND={stall_island}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_BLOCK_EPOCH={no_block_epoch}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_PER_BLOCK_EPOCH={per_block_epoch}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_BARRIER_ENTRY_SYNC={no_barrier_entry_sync}",
+        ],
+    )
+
+
+def gen_pcie_ipc_comm_module() -> JitSpec:
+    # No architecture restriction: the kernels use only plain PTX loads/stores
+    # and CUDA IPC, both of which predate every architecture flashinfer builds
+    # for. The target is a PCIe machine without NVLink, which is orthogonal to
+    # the SM version.
+    return gen_jit_spec(
+        "pcie_ipc_comm",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
+        ],
+    )
+
+
 def gen_ulysses_a2a_module() -> JitSpec:
     return gen_jit_spec(
         "ulysses_a2a",
@@ -220,17 +286,46 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
-def gen_moe_alltoall_module() -> JitSpec:
+MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
+
+_MOE_ALLTOALL_GENERATED_SOURCE = {
+    "sm100a": "mnnvl_moe_alltoall_sm100.cu",
+    "sm103a": "mnnvl_moe_alltoall_sm103.cu",
+}
+_MOE_ALLTOALL_NVCC_FLAGS = {
+    "sm100a": sm100a_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
+}
+
+
+def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
+    communication_kernels = (
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "tensorrt_llm"
+        / "kernels"
+        / "communicationKernels"
+    )
+    if target == "legacy":
+        module_name = "mnnvl_moe_alltoall"
+        kernel_sources = [communication_kernels / "moeAlltoAllKernels.cu"]
+        arch_flags = []
+    elif target in _MOE_ALLTOALL_GENERATED_SOURCE:
+        module_name = f"mnnvl_moe_alltoall_{target}"
+        kernel_sources = [
+            communication_kernels / "moeAlltoAllFusedKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "generated"
+            / _MOE_ALLTOALL_GENERATED_SOURCE[target],
+        ]
+        arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
+    else:
+        raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
     return gen_jit_spec(
-        "mnnvl_moe_alltoall",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "communicationKernels"
-            / "moeAlltoAllKernels.cu",
+            *kernel_sources,
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "cpp"
@@ -257,6 +352,7 @@ def gen_moe_alltoall_module() -> JitSpec:
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
         ],
         extra_cuda_cflags=[
+            *arch_flags,
             "-DENABLE_BF16",
         ],
     )

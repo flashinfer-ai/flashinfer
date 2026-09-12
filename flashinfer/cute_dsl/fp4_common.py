@@ -2675,10 +2675,57 @@ def quantize_block_fp4_fast(
 
 
 @cute.jit
+def quantize_and_pack_32(
+    values: cute.Tensor, inv_scale: Float32
+) -> Tuple[Uint64, Uint64]:
+    """Scale and pack one OCP MXFP4 block (32 E2M1 values)."""
+    q = cute.make_rmem_tensor((32,), Float32)
+    for i in cutlass.range_constexpr(32):
+        q[i] = values[i] * inv_scale
+
+    p0 = cvt_e2m1x8_f32(q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7])
+    p1 = cvt_e2m1x8_f32(q[8], q[9], q[10], q[11], q[12], q[13], q[14], q[15])
+    p2 = cvt_e2m1x8_f32(q[16], q[17], q[18], q[19], q[20], q[21], q[22], q[23])
+    p3 = cvt_e2m1x8_f32(q[24], q[25], q[26], q[27], q[28], q[29], q[30], q[31])
+    return (
+        (Uint64(p1) << Uint64(32)) | Uint64(p0),
+        (Uint64(p3) << Uint64(32)) | Uint64(p2),
+    )
+
+
+@cute.jit
+def quantize_block_mxfp4(
+    values: cute.Tensor, max_abs: Float32
+) -> Tuple[Uint64, Uint64, Uint8]:
+    """Quantize 32 floats using an OCP MXFP4 UE8M0 block scale.
+
+    E2M1's largest finite magnitude is 6, so UE8M0 encodes the power-of-two
+    ceiling of ``max_abs / 6``.  The returned pair contains 16 packed bytes.
+    """
+    scale_u32 = cvt_f32_to_ue8m0(max_abs * rcp_approx_ftz(Float32(FLOAT4_E2M1_MAX)))
+    scale_byte = Uint8(scale_u32 & Uint32(0xFF))
+    packed_lo = Uint64(0)
+    packed_hi = Uint64(0)
+    if scale_u32 != Uint32(0):
+        inv_scale = ue8m0_to_output_scale(scale_u32)
+        packed_lo, packed_hi = quantize_and_pack_32(values, inv_scale)
+    return packed_lo, packed_hi, scale_byte
+
+
+@cute.jit
 def max_abs_16(values: cute.Tensor) -> Float32:
     """Compute the maximum absolute value of 16 float32 values."""
     result = fabs_f32(values[0])
     for i in cutlass.range_constexpr(1, 16):
+        result = fmax_f32(result, fabs_f32(values[i]))
+    return result
+
+
+@cute.jit
+def max_abs_32(values: cute.Tensor) -> Float32:
+    """Compute the maximum absolute value of 32 float32 values."""
+    result = fabs_f32(values[0])
+    for i in cutlass.range_constexpr(1, 32):
         result = fmax_f32(result, fabs_f32(values[i]))
     return result
 

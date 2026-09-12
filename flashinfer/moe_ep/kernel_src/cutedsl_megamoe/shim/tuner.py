@@ -153,6 +153,17 @@ _MXFP8_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
     "load_balance_mode": "atomic_counter",
 }
 
+# TODO: WIP BF16 supports one validated fixed MMA/cluster geometry.
+_BF16_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 256, 64),
+    "cluster_shape_mnk": (2, 1, 1),
+    "use_2cta_instrs": True,
+    "flag_batch": 1,
+    "epi_flag_batch": (1, 1),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "static",
+}
+
 
 def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     """Default perf/tile knobs for a compile-time token count (buffer size).
@@ -170,6 +181,8 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
     ``mma_tiler_mnk``: the MXFP8 kernel hard-requires
     ``mma_tiler (M, N) = (256, 256)``.
 
+    ``dtype="bf16"`` -> one validated fixed MMA/cluster geometry.
+
     NVFP4 profiles were re-validated 2026-07-15 on the corrected K-major
     weight layout: the online autotuner confirmed all four non-ikr defaults
     within run noise (64/512/1024 tokens: <=1.2%); the only wins were
@@ -180,6 +193,8 @@ def default_knobs(num_tokens: int, *, dtype: str = "nvfp4") -> Dict[str, Any]:
 
     Returns a fresh dict each call.
     """
+    if dtype == "bf16":
+        return dict(_BF16_TOKEN_KNOBS)
     if dtype == "mxfp8":
         if num_tokens >= 2048:
             return dict(_MXFP8_LARGE_TOKEN_KNOBS)
@@ -227,6 +242,22 @@ def is_valid(knobs: Dict[str, Any], *, combine_format: str = "bf16") -> bool:
     return True
 
 
+def is_valid_bf16(knobs: Dict[str, Any]) -> bool:
+    """Validate the fixed geometry accepted by the BF16 kernel."""
+    return (
+        knobs.get("mma_tiler_mnk", (256, 256, 64)) == (256, 256, 64)
+        and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
+        and knobs.get("use_2cta_instrs", True)
+        and is_valid(
+            {
+                **knobs,
+                "mma_tiler_mnk": (256, 256, 64),
+                "cluster_shape_mnk": (2, 1, 1),
+            }
+        )
+    )
+
+
 def iter_candidates(
     *,
     include_correctness: bool = False,
@@ -255,7 +286,8 @@ def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
 
     Only knobs the config declares are set; ``token_back_mode`` is translated to
     the MXFP8 config's ``token_back_by_dispatch`` bool.  ``config`` is any of the
-    frontend config dataclasses (NVFP4 / MXFP8).  Passing ``knobs=None`` returns
+    frontend config dataclasses (NVFP4 / MXFP8 / BF16 — knobs a dtype's config
+    does not expose are silently dropped).  Passing ``knobs=None`` returns
     the config unchanged.
     """
     if not knobs:
@@ -279,6 +311,7 @@ __all__ = [
     "PERF_KNOBS",
     "default_knobs",
     "is_valid",
+    "is_valid_bf16",
     "iter_candidates",
     "with_knobs",
 ]

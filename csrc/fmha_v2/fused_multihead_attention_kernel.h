@@ -113,10 +113,16 @@ struct Single_cta<2> {
       sum_s = params.cu_q_seqlens[bidb];
       sum_s_kv = params.cu_kv_seqlens[bidb];
     }
-    actual_q_seqlen = params.cu_q_seqlens[bidb + 1] - params.cu_q_seqlens[bidb];
-    actual_kv_seqlen = params.cu_kv_seqlens
-                           ? (params.cu_kv_seqlens[bidb + 1] - params.cu_kv_seqlens[bidb])
-                           : actual_q_seqlen;
+    if (params.cu_q_seqlens == nullptr) {
+      // Fixed-shape BSHD inputs use params.s instead of device sequence metadata.
+      actual_q_seqlen = params.s;
+      actual_kv_seqlen = params.s;
+    } else {
+      actual_q_seqlen = params.cu_q_seqlens[bidb + 1] - params.cu_q_seqlens[bidb];
+      actual_kv_seqlen = params.cu_kv_seqlens
+                             ? (params.cu_kv_seqlens[bidb + 1] - params.cu_kv_seqlens[bidb])
+                             : actual_q_seqlen;
+    }
     actual_seqlen = actual_kv_seqlen;
     sum_mask_row = params.cu_mask_rows ? params.cu_mask_rows[bidb] : sum_s;
     bidx = sum_s * params.h + bidh;

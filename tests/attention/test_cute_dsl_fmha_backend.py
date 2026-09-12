@@ -11,12 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Frontend tests for the `cute-dsl` backend routed to the trtllm JIT FMHA kernel.
+"""Frontend tests for APIs backed by the shared CuTe DSL FMHA runner.
 
 Covers entry points:
-* `trtllm_ragged_attention_deepseek(backend="cute-dsl")` — the shared low-level API.
-* `BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")` — delegates to the former
-  for standard attention, falls back to prefill.py for ALiBi / soft-cap.
+* `trtllm_ragged_attention_deepseek(backend="cute-dsl")` — the TRT-LLM API entry.
+* `BatchPrefillWithRaggedKVCacheWrapper(backend="cute-dsl")` — independently calls
+  the runner for standard attention and uses modular prefill for ALiBi / soft-cap.
 """
 
 import math
@@ -26,15 +26,27 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.cute_dsl.utils import (
+    is_cute_dsl_arch_supported,
+    is_cute_dsl_available,
+)
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 if not is_cute_dsl_available():
     pytest.skip("CuTe DSL not available", allow_module_level=True)
 
+
+def _is_fmha_arch_supported() -> bool:
+    device = torch.device("cuda")
+    compute_capability = get_compute_capability(device)
+    if compute_capability == (10, 7):
+        return is_cute_dsl_arch_supported(*compute_capability, native_only=True)
+    return is_sm100a_supported(device)
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="CuTe DSL FMHA requires Blackwell (SM100a+)",
+    not torch.cuda.is_available() or not _is_fmha_arch_supported(),
+    reason="CuTe DSL FMHA requires a compiler with native GPU support",
 )
 
 DEVICE = "cuda"
@@ -135,8 +147,10 @@ def test_deepseek_cute_dsl(dtype_qk, dtype_vo, Dqk, Dvo):
         (torch.float8_e4m3fn, torch.float8_e4m3fn),
     ],
 )
+@pytest.mark.parametrize("scale_bmm1", [1.0, 0.8])
+@pytest.mark.parametrize("scale_bmm2", [1.0, 0.6])
 @pytest.mark.parametrize("causal", [False, True])
-def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
+def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, scale_bmm1, scale_bmm2, causal):
     torch.manual_seed(0)
     b, s, Hq, Hk, D = 2, 1024, 8, 8, 128
     qo = _indptr([s] * b)
@@ -150,13 +164,24 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
         ws, kv_layout="NHD", backend="cute-dsl"
     )
     w.plan(qo, kv, Hq, Hk, D, causal=causal, q_data_type=dtype_qk)
-    o = w.run(q, k, v)
-    ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=causal)
-    atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
+    o = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2)
+    ref = _ragged_ref(qr, kr, vr, qo, kv, sm * scale_bmm1, causal=causal) * scale_bmm2
+    low_precision = min(dtype_qk.itemsize, dtype_vo.itemsize) == 1
+    atol = 4.5e-2 if low_precision else 6e-3
+    if low_precision and get_compute_capability(torch.device(DEVICE)) == (10, 7):
+        # SM107 accumulates a rare FP8 tail outlier (one element in ~2M in the
+        # CI cases); keep the tighter envelope everywhere else.
+        atol = 8e-2
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
 
+    # Check whether the caller provided out and returned out match
+    out_buf = torch.empty_like(o)
+    o_explicit = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2, out=out_buf)
+    assert o_explicit.dtype == o.dtype
+    torch.testing.assert_close(o_explicit, o, rtol=0, atol=0)
+
     # LSE is now supported for standard attention.
-    o2, lse = w.run(q, k, v, return_lse=True)
+    o2, lse = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2, return_lse=True)
     torch.testing.assert_close(o2.float(), o.float(), atol=1e-2, rtol=1e-2)
     assert lse.shape == (total, Hq)
 
@@ -200,7 +225,7 @@ def test_cute_dsl_jit_case(monkeypatch):
 
 
 def test_batch_prefill_cute_dsl_alibi():
-    """ALiBi is unsupported by the trtllm kernel; must use prefill.py instead."""
+    """ALiBi is unsupported by the FMHA runner; use modular prefill instead."""
     torch.manual_seed(0)
     b, s, H, D = 2, 256, 8, 128
     qo = _indptr([s] * b)
@@ -277,7 +302,8 @@ def _blockscaled_dequant(x_bshd, qk_mode):
 
 @pytest.mark.parametrize("qk_mode", ["mxfp8", "nvfp4"])
 @pytest.mark.parametrize("causal", [False, True])
-def test_blockscaled_quantize_and_prefill(qk_mode, causal):
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
     """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
     from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
     from flashinfer.attention.cute_dsl.fmha_blockscaled import (
@@ -296,7 +322,7 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal):
     )
     v_store = v.to(torch.float8_e4m3fn)
     v_deq = v_store.float()
-    o = torch.empty(b, s, H, D, device=DEVICE, dtype=torch.bfloat16)
+    o = torch.empty(b, s, H, D, device=DEVICE, dtype=out_dtype)
     cute_dsl_fmha_blockscaled_prefill(
         q_store,
         k_store,
@@ -321,4 +347,6 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal):
         s_logits = s_logits.masked_fill((col > row).view(1, 1, s, s), float("-inf"))
     p = torch.softmax(s_logits, dim=-1)
     o_ref = torch.einsum("bhqk,bkhd->bqhd", p, v_deq)
-    torch.testing.assert_close(o.float(), o_ref, atol=0.1, rtol=1e-2)
+    atol = 0.25 if out_dtype == torch.float8_e4m3fn else 0.1
+    rtol = 0.1 if out_dtype == torch.float8_e4m3fn else 1e-2
+    torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)

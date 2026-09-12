@@ -386,6 +386,7 @@ def xqa(
     if (
         k_cache.dtype == torch.float8_e4m3fn
         and get_compute_capability(torch.device(device="cuda"))[0] == 9
+        and head_dim <= 256  # SM90 kernel does not support head_dim > 256
     ):
         run_sm90_fp8_mha = True
     else:
@@ -393,7 +394,7 @@ def xqa(
 
     if k_cache.dtype == torch.uint8:
         assert get_compute_capability(torch.device(device="cuda"))[0] in [12], (
-            "XQA NVFP4 KV is only supported on SM120 GPUs"
+            "XQA NVFP4 KV is only supported on SM12x GPUs"
         )
         assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
         assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"

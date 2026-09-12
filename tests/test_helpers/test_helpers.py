@@ -112,3 +112,39 @@ def assert_close_chunked(
             msg=lambda m, s=start, e=end: f"rows [{s}:{e}]: {m}",
             **kwargs,
         )
+
+
+def ref_single_prefill(q, k, v, causal=False):
+    """FP64 reference of single-request prefill attention (NHD layout).
+
+    Returns (output, lse) where lse is the base-2 logsumexp; fully masked rows
+    get lse = -inf and zero output.
+    """
+    qo_len, num_qo_heads, head_dim = q.shape
+    kv_len, num_kv_heads, _ = k.shape
+    group_size = num_qo_heads // num_kv_heads
+    scale = head_dim**-0.5
+
+    q64 = q.float().to(torch.float64)
+    k64 = k.float().to(torch.float64).repeat_interleave(group_size, dim=1)
+    v64 = v.float().to(torch.float64).repeat_interleave(group_size, dim=1)
+
+    scores = torch.einsum("qhd,khd->hqk", q64, k64) * scale
+    if causal:
+        q_pos = torch.arange(qo_len, dtype=torch.float64, device=q.device)
+        k_pos = torch.arange(kv_len, dtype=torch.float64, device=q.device)
+        mask = k_pos[None, :] - (kv_len - qo_len) > q_pos[:, None]
+        scores = scores.masked_fill(mask[None, :, :], float("-inf"))
+
+    row_max = scores.amax(dim=-1)
+    weights = torch.softmax(scores, dim=-1)
+    # softmax yields NaN on fully masked rows (all -inf scores); their output
+    # must be the zero vector.
+    weights = torch.nan_to_num(weights, nan=0.0)
+    out = torch.einsum("hqk,khd->qhd", weights.to(torch.float64), v64)
+    sum_exp = torch.exp(scores - row_max[..., None]).sum(dim=-1)
+    lse = row_max + torch.log2(sum_exp)
+    lse = torch.where(
+        torch.isneginf(row_max), torch.full_like(row_max, float("-inf")), lse
+    )
+    return out.to(q.dtype), lse.t().to(torch.float32)

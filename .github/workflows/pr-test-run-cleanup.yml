@@ -1,0 +1,120 @@
+# Deletes the PR Test run a label other than run-ci starts: it tests nothing, but
+# the PR checks box renders only a workflow's newest run, so it hides the tests
+# that are really running. pull_request_target is the only PR trigger whose token
+# can write on fork PRs; nothing from the PR is checked out or run here.
+
+name: PR Test Run Cleanup
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  actions: write
+
+jobs:
+  discard:
+    name: Discard Label-Only Run
+    if: github.event.label.name != 'run-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Discard the run this label started
+        # This job is a check on the PR: failing would add the red check it removes.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          RUNS="/repos/$REPO/actions/workflows/pr-test.yml/runs"
+          QUERY="head_sha=$HEAD_SHA&event=pull_request&per_page=100"
+
+          POLL_SECONDS=5
+          SETTLE_POLLS=$((600 / POLL_SECONDS))
+          STABLE_POLLS=$((60 / POLL_SECONDS))
+          CANCEL_SECONDS=180
+
+          # A real run looks empty until its matrix expands, so undecided is not empty.
+          kind() {
+            gh api "/repos/$REPO/actions/runs/$1/jobs?per_page=100" --jq '
+              [.jobs[]] as $j
+              | if ($j | map(.name | startswith("AOT Build Import") or startswith("JIT Unittest")) | any)
+                then "tests"
+                elif ($j | map(.name == "Setup" and .conclusion == "skipped") | any)
+                then "empty"
+                else "unsettled"
+                end' 2>/dev/null || echo "unsettled"
+          }
+
+          # Started by this same event, so a real run on top only counts if it stays.
+          IDS=""
+          FOUND=""
+          STABLE=0
+          for _ in $(seq 1 "$SETTLE_POLLS"); do
+            IDS=$(gh api "$RUNS?$QUERY" \
+              --jq '.workflow_runs | sort_by(.id) | reverse | .[].id' 2>/dev/null) || IDS=""
+            NEWEST=$(head -n 1 <<< "$IDS")
+
+            if [ -n "$NEWEST" ]; then
+              case "$(kind "$NEWEST")" in
+                empty) FOUND="$NEWEST" ;;
+                tests) STABLE=$((STABLE + 1)) ;;
+                *)     STABLE=0 ;;
+              esac
+            fi
+
+            if [ -n "$FOUND" ] || [ "$STABLE" -ge "$STABLE_POLLS" ]; then
+              break
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "No label-only run on top of this commit, leaving the PR alone"
+            exit 0
+          fi
+
+          # An untested commit keeps its label-only run: it carries the CI report.
+          HIDDEN=""
+          while read -r ID; do
+            if [ -n "$ID" ] && [ "$(kind "$ID")" == "tests" ]; then
+              HIDDEN="$ID"
+              break
+            fi
+          done <<< "$IDS"
+
+          if [ -z "$HIDDEN" ]; then
+            echo "Run $FOUND hides nothing - no run is testing this commit"
+            exit 0
+          fi
+
+          # Everything above the testing run. A run must finish before it can be
+          # deleted, so cancels go out together and share one deadline below.
+          TARGETS=""
+          while read -r ID; do
+            if [ -z "$ID" ] || [ "$ID" -le "$HIDDEN" ] || [ "$(kind "$ID")" != "empty" ]; then
+              continue
+            fi
+            TARGETS="$TARGETS $ID"
+            gh api -X POST "/repos/$REPO/actions/runs/$ID/cancel" > /dev/null 2>&1 || true
+          done <<< "$IDS"
+
+          CANCELLED_BY=$((SECONDS + CANCEL_SECONDS))
+          for ID in $TARGETS; do
+            echo "::notice::Discarding run $ID so the PR shows run $HIDDEN"
+
+            while [ "$SECONDS" -lt "$CANCELLED_BY" ]; do
+              STATUS=$(gh api "/repos/$REPO/actions/runs/$ID" --jq .status 2>/dev/null) || STATUS=""
+              if [ "$STATUS" == "completed" ]; then
+                break
+              fi
+              sleep "$POLL_SECONDS"
+            done
+
+            if gh api -X DELETE "/repos/$REPO/actions/runs/$ID" > /dev/null 2>&1; then
+              echo "Deleted run $ID"
+            else
+              echo "::warning::Could not delete run $ID"
+            fi
+          done

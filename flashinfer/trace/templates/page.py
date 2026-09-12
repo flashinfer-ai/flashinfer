@@ -686,6 +686,126 @@ append_paged_mla_kv_cache_trace = TraceTemplate(
 )
 
 
+def _nvfp4_quantize_append_paged_mla_kv_cache_init(
+    *,
+    nnz_kv: int,
+    batch_size: int = 2,
+    head_dim_ckv: int = 512,
+    head_dim_kpe: int = 64,
+    page_size: int = 64,
+    num_pages: int = 4,
+    batch_size_plus_1: int = 0,
+    num_kv_indices: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.nvfp4_quantize_append_paged_mla_kv_cache``."""
+    base = _append_paged_mla_kv_cache_init(
+        nnz_kv=nnz_kv,
+        batch_size=batch_size,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        num_pages=num_pages,
+        batch_size_plus_1=batch_size_plus_1,
+        num_kv_indices=num_kv_indices,
+        device=device,
+        seed=seed,
+    )
+    num_pages = base["ckv_cache"].shape[0]
+    base["ckv_cache"] = torch.zeros(
+        num_pages, page_size, head_dim_ckv // 2, dtype=torch.uint8, device=device
+    )
+    base["ckv_sf_cache"] = torch.zeros(
+        num_pages,
+        page_size,
+        head_dim_ckv // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    base["kpe_cache"] = torch.zeros(
+        num_pages, page_size, head_dim_kpe, dtype=torch.float8_e4m3fn, device=device
+    )
+    base["ckv_scale"] = 1.0
+    base["kpe_scale"] = 1.0
+    return base
+
+
+cast(Any, _nvfp4_quantize_append_paged_mla_kv_cache_init)._trace_init_dependencies = (
+    _append_paged_mla_kv_cache_init,
+)
+
+
+nvfp4_quantize_append_paged_mla_kv_cache_trace = TraceTemplate(
+    op_type="page_append",
+    name_prefix="nvfp4_quantize_append_paged_mla_kv_cache",
+    description=(
+        "Quantize fp16/bf16 MLA (ckv, kpe) rows into an NVFP4 MLA paged KV "
+        "cache: ckv goes to a packed uint8 E2M1 cache plus an FP8 E4M3 "
+        "per-16-channel scale cache, kpe goes to an FP8 E4M3 cache."
+    ),
+    axes={
+        "nnz_kv": Var(description="Total K/V tokens to append."),
+        "head_dim_ckv": Const(abbrev="ckv"),
+        "head_dim_kpe": Const(abbrev="kpe"),
+        "packed_head_dim_ckv": Const(abbrev="pd"),
+        "scale_dim_ckv": Const(abbrev="sd"),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(description="batch_size + 1."),
+        "num_kv_indices": Var(),
+    },
+    inputs={
+        "append_ckv": Tensor(["nnz_kv", "head_dim_ckv"]),
+        "append_kpe": Tensor(["nnz_kv", "head_dim_kpe"]),
+        "batch_indices": Tensor(["nnz_kv"], dtype="int32"),
+        "positions": Tensor(["nnz_kv"], dtype="int32"),
+        "ckv_cache": Tensor(
+            ["num_pages", "page_size", "packed_head_dim_ckv"],
+            dtype="uint8",
+        ),
+        "ckv_sf_cache": Tensor(
+            ["num_pages", "page_size", "scale_dim_ckv"],
+            dtype="float8_e4m3fn",
+        ),
+        "kpe_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_kpe"],
+            dtype="float8_e4m3fn",
+        ),
+        "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+        "ckv_scale": Scalar("float64"),
+        "kpe_scale": Scalar("float64"),
+    },
+    outputs={
+        "ckv_cache": Tensor(
+            ["num_pages", "page_size", "packed_head_dim_ckv"],
+            dtype="uint8",
+            description="Updated packed compressed KV cache (in-place).",
+        ),
+        "ckv_sf_cache": Tensor(
+            ["num_pages", "page_size", "scale_dim_ckv"],
+            dtype="float8_e4m3fn",
+            description="Updated compressed KV scale cache (in-place).",
+        ),
+        "kpe_cache": Tensor(
+            ["num_pages", "page_size", "head_dim_kpe"],
+            dtype="float8_e4m3fn",
+            description="Updated FP8 KPE cache (in-place).",
+        ),
+    },
+    constraints=[
+        "batch_size_plus_1 == batch_size + 1",
+        "packed_head_dim_ckv * 2 == head_dim_ckv",
+        "scale_dim_ckv * 16 == head_dim_ckv",
+    ],
+    tags=["status:verified"],
+    init=_nvfp4_quantize_append_paged_mla_kv_cache_init,
+)
+
+
 # ── XQA attention (paged KV + block-tables) ──────────────────────────────────
 
 _XQA_AXES: dict[str, Var | Const] = {

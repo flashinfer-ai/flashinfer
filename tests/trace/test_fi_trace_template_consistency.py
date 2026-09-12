@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,7 +38,10 @@ generic checks are insufficient.  See the docstring in
 ``flashinfer/trace/templates/__init__.py`` for the full how-to guide.
 """
 
+import ast
+from collections import Counter
 import inspect
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
@@ -50,6 +53,39 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 # Structural checker utilities
 # ---------------------------------------------------------------------------
+
+
+def test_svdquant_trace_activation_scale_tracks_variable_m():
+    from flashinfer.trace.templates.gemm import mm_nvfp4_svdquant_trace
+
+    assert isinstance(mm_nvfp4_svdquant_trace.axes["M"], Var)
+    assert isinstance(mm_nvfp4_svdquant_trace.axes["SF_A"], Var)
+    assert any(
+        constraint.startswith("SF_A ==")
+        and "M" in constraint
+        and "K_packed" in constraint
+        for constraint in mm_nvfp4_svdquant_trace.constraints
+    )
+
+
+def test_trtllm_ragged_attention_deepseek_trace_row_check_is_optional_bool():
+    from flashinfer.prefill import trtllm_ragged_attention_deepseek
+    from flashinfer.trace.templates.gemm import (
+        trtllm_ragged_attention_deepseek_trace,
+    )
+
+    row_check = trtllm_ragged_attention_deepseek_trace.inputs[
+        "skip_all_rows_active_check"
+    ]
+    assert isinstance(row_check, Scalar)
+    assert row_check.dtype == "bool"
+    assert row_check.optional is True
+    assert (
+        inspect.signature(trtllm_ragged_attention_deepseek)
+        .parameters["skip_all_rows_active_check"]
+        .default
+        is True
+    )
 
 
 def _resolved_param(json_key: str, descriptor) -> str:
@@ -125,9 +161,10 @@ def assert_template_axes_covered(
     """
     Assert that every ``Const`` axis in *template* has at least one source:
 
-    1. A tensor input whose ``dim_names`` contain the axis name, OR
-    2. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
-    3. A parameter of *func* matching the axis name (scalar-kwarg fallback for
+    1. The ``Const`` carries its own fixed ``value``, OR
+    2. A tensor input whose ``dim_names`` contain the axis name, OR
+    3. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
+    4. A parameter of *func* matching the axis name (scalar-kwarg fallback for
        integer function arguments like ``top_k``, ``n_group``, ``block_size``).
     """
     tensor_dim_names: set = set()
@@ -148,6 +185,7 @@ def assert_template_axes_covered(
         name
         for name, marker in template.axes.items()
         if isinstance(marker, Const)
+        and marker.value is None
         and name not in tensor_dim_names
         and name not in scalar_keys
         and name not in func_param_names
@@ -158,6 +196,32 @@ def assert_template_axes_covered(
         f"{pfx}Template '{template.name_prefix or template.op_type}' "
         f"has Const axes with no tensor/scalar source: {uncovered}"
     )
+
+
+_ALLOWED_CONSTRAINT_BUILTINS = {"max", "min"}
+
+
+def assert_template_constraints_valid(
+    template: TraceTemplate,
+    *,
+    label: str = "",
+) -> None:
+    """Assert constraints are expressions over declared axes and inputs."""
+    allowed_names = (
+        set(template.axes) | set(template.inputs) | _ALLOWED_CONSTRAINT_BUILTINS
+    )
+    for constraint in template.constraints:
+        expression = ast.parse(constraint, mode="eval")
+        referenced_names = {
+            node.id for node in ast.walk(expression) if isinstance(node, ast.Name)
+        }
+        unknown_names = referenced_names - allowed_names
+        pfx = f"[{label}] " if label else ""
+        assert not unknown_names, (
+            f"{pfx}Template '{template.name_prefix or template.op_type}' "
+            f"constraint {constraint!r} references undeclared names: "
+            f"{sorted(unknown_names)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +393,50 @@ _ALL_PAIRS = _collect_template_func_pairs()
 _PAIR_IDS = [label for _, _, label in _ALL_PAIRS]
 
 
+_EXPECTED_PRIMTS_TRACE_VARIANTS = {
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "BlockSparseTSWrapper.run",
+    ): 4,
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "BlockSparsePagedTSWrapper.run",
+    ): 2,
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention",
+    ): 4,
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention_with_paged_kv_cache",
+    ): 2,
+    (
+        "flashinfer.attention.prims_ts.decode",
+        "batch_decode_with_paged_kv_cache",
+    ): 12,
+    (
+        "flashinfer.attention.prims_ts.decode",
+        "prims_ts_batch_decode_with_kv_cache",
+    ): 12,
+    (
+        "flashinfer.attention.prims_ts.decode",
+        "BatchDecodePagedTSWrapper.run",
+    ): 24,
+    (
+        "flashinfer.attention.prims_ts.mla_decode",
+        "batch_mla_decode_with_paged_kv_cache",
+    ): 4,
+    (
+        "flashinfer.attention.prims_ts.mla_decode",
+        "prims_ts_batch_mla_decode_with_kv_cache",
+    ): 4,
+    (
+        "flashinfer.attention.prims_ts.mla_decode",
+        "BatchMLADecodePagedTSWrapper.run",
+    ): 4,
+}
+
+
 # ---------------------------------------------------------------------------
 # Parameterized structural tests (no GPU required)
 # ---------------------------------------------------------------------------
@@ -344,6 +452,722 @@ def test_template_signature_consistency(func, template, label):
 def test_template_axes_covered(func, template, label):
     """Every Const axis must be reachable from at least one input tensor, scalar, or function param."""
     assert_template_axes_covered(template, label=label, func=func)
+
+
+def test_attention_ts_trace_registry_coverage():
+    """All public PrimTS surfaces register finite discovery examples."""
+
+    discovered = Counter(
+        (func.__module__, func.__qualname__)
+        for func, _, _ in _ALL_PAIRS
+        if func.__module__.startswith("flashinfer.attention.prims_ts")
+    )
+    assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
+
+
+def test_attention_ts_trace_constraints_match_cache_axes():
+    """PrimTS constraints are valid expressions over defined axes."""
+    from flashinfer.trace.templates.attention import (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_block_sparse_trace_dispatch,
+        prims_ts_block_sparse_wrapper_trace_dispatch,
+        prims_ts_paged_block_sparse_trace_dispatch,
+        prims_ts_paged_block_sparse_wrapper_trace_dispatch,
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+        prims_ts_decode_wrapper_trace_dispatch,
+    )
+
+    fmha_dispatches = (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+        prims_ts_decode_wrapper_trace_dispatch,
+    )
+    mla_dispatches = (
+        prims_ts_decode_mla_trace_dispatch,
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+    )
+    block_sparse_templates = (
+        *prims_ts_block_sparse_trace_dispatch.templates,
+        *prims_ts_paged_block_sparse_trace_dispatch.templates,
+        *prims_ts_block_sparse_wrapper_trace_dispatch.templates,
+        *prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates,
+    )
+    for dispatch in (*fmha_dispatches, *mla_dispatches):
+        for template in dispatch.templates:
+            assert_template_constraints_valid(template, label=dispatch.__name__)
+    for template in block_sparse_templates:
+        assert_template_constraints_valid(template, label="prims_ts_block_sparse")
+
+    for dispatch in fmha_dispatches:
+        for template in dispatch.templates:
+            if "kv_layout" in template.inputs:
+                assert "kv_layout == 'HND'" in template.constraints
+            assert ("kv_planes == 2" in template.constraints) == (
+                "kv_planes" in template.axes
+            )
+            if "_multi_q" in template.name_prefix:
+                assert "seq_len_q >= 2" in template.constraints
+            assert "seq_len_q in (2, 4, 8)" not in template.constraints
+            assert "max_seq_len <= 16384" not in template.constraints
+    for dispatch, static_bound in (
+        (prims_ts_decode_trace_dispatch, "max_seq_len"),
+        (prims_ts_decode_wrapper_trace_dispatch, "max_kv_len"),
+    ):
+        for template in dispatch.templates:
+            assert (
+                "max_pages_per_seq * page_size >= max(seq_lens)" in template.constraints
+            )
+            assert "min(seq_lens) >= 1" in template.constraints
+            assert f"max(seq_lens) <= {static_bound}" in template.constraints
+    for template in prims_ts_decode_wrapper_trace_dispatch.templates:
+        plan_owns_seq_lens = bool(template.axes["plan_owns_seq_lens"].value)
+        assert template.inputs["seq_lens"].optional is plan_owns_seq_lens
+        assert (
+            f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}"
+            in template.tags
+        )
+    for template in attention_ts_decode_trace_dispatch.templates:
+        assert {"block_tables", "seq_lens_kv"} <= template.inputs.keys()
+        assert {
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "paged_kv_last_page_len",
+        }.isdisjoint(template.inputs)
+        assert (
+            "max_pages_per_seq * page_size >= max(seq_lens_kv)" in template.constraints
+        )
+        assert "min(seq_lens_kv) >= 1" in template.constraints
+    for dispatch in mla_dispatches:
+        for template in dispatch.templates:
+            assert ("kv_pad_dim == 1" in template.constraints) == (
+                "kv_pad_dim" in template.axes
+            )
+
+
+def test_prims_ts_block_sparse_trace_describes_gqa_contract():
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+    from flashinfer.attention.prims_ts.block_sparse import (
+        BlockSparseTSWrapper,
+        block_sparse_attention,
+    )
+    from flashinfer.trace.templates.attention import (
+        prims_ts_block_sparse_trace_dispatch,
+        prims_ts_block_sparse_wrapper_trace_dispatch,
+        prims_ts_paged_block_sparse_trace_dispatch,
+        prims_ts_paged_block_sparse_wrapper_trace_dispatch,
+    )
+
+    assert (
+        _TRACE_DISPATCHERS[block_sparse_attention.__wrapped__]
+        is prims_ts_block_sparse_trace_dispatch
+    )
+    assert (
+        _TRACE_DISPATCHERS[BlockSparseTSWrapper.run.__wrapped__]
+        is prims_ts_block_sparse_wrapper_trace_dispatch
+    )
+
+    one_shot_traces = {
+        template.name_prefix: template
+        for template in prims_ts_block_sparse_trace_dispatch.templates
+    }
+    assert set(one_shot_traces) == {
+        "prims_ts_block_sparse",
+        "prims_ts_block_sparse_bitmask",
+        "prims_ts_block_sparse_bsr_proxy",
+        "prims_ts_block_sparse_bitmask_proxy",
+    }
+    contiguous_wrapper_traces = {
+        template.name_prefix: template
+        for template in prims_ts_block_sparse_wrapper_trace_dispatch.templates
+    }
+    assert set(contiguous_wrapper_traces) == {
+        "prims_ts_block_sparse_wrapper",
+        "prims_ts_block_sparse_wrapper_bitmask",
+        "prims_ts_block_sparse_wrapper_bsr_proxy",
+        "prims_ts_block_sparse_wrapper_bitmask_proxy",
+    }
+    route_modes = {
+        ("bsr", False): ("", {"block_indptr", "block_indices"}),
+        ("bitmask", False): ("_bitmask", {"exact_block_bits"}),
+        ("bsr", True): (
+            "_bsr_proxy",
+            {"block_indptr", "block_indices", "k_summary", "v_summary"},
+        ),
+        ("bitmask", True): (
+            "_bitmask_proxy",
+            {"exact_block_bits", "k_summary", "v_summary"},
+        ),
+    }
+    all_route_inputs = {
+        "block_indptr",
+        "block_indices",
+        "exact_block_bits",
+        "k_summary",
+        "v_summary",
+    }
+    assert (
+        prims_ts_block_sparse_trace_dispatch()
+        is one_shot_traces["prims_ts_block_sparse"]
+    )
+    for (sparse_format, use_proxy_routes), (
+        suffix,
+        expected_inputs,
+    ) in route_modes.items():
+        one_shot_template = one_shot_traces[f"prims_ts_block_sparse{suffix}"]
+        wrapper_template = contiguous_wrapper_traces[
+            f"prims_ts_block_sparse_wrapper{suffix}"
+        ]
+        assert (
+            prims_ts_block_sparse_trace_dispatch(
+                sparse_format=sparse_format,
+                use_proxy_routes=use_proxy_routes,
+            )
+            is one_shot_template
+        )
+        wrapper = SimpleNamespace(
+            _plan_state=SimpleNamespace(
+                sparse_format=sparse_format,
+                use_proxy_routes=use_proxy_routes,
+            )
+        )
+        assert (
+            prims_ts_block_sparse_wrapper_trace_dispatch(self=wrapper)
+            is wrapper_template
+        )
+        for template in (one_shot_template, wrapper_template):
+            assert set(template.inputs) & all_route_inputs == expected_inputs
+            proxy_constraint = "mask_type is None or mask_type == 'dense'"
+            assert (proxy_constraint in template.constraints) == suffix.endswith(
+                "proxy"
+            )
+
+    prims_ts_block_sparse_trace = one_shot_traces["prims_ts_block_sparse"]
+    constraints = set(prims_ts_block_sparse_trace.constraints)
+    assert "num_qo_heads % num_kv_heads == 0" in constraints
+    assert "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)" in constraints
+    assert "num_qo_heads == num_kv_heads" not in constraints
+    assert "q_block_size > 0" in constraints
+    assert "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0" in constraints
+    assert "kv_block_size >= 64 or q_block_size in (8, 16, 32)" not in constraints
+    assert "MHA/GQA/MQA" in prims_ts_block_sparse_trace.description
+    assert "per-KV-head BSR" in prims_ts_block_sparse_trace.description
+
+    paged_templates = {
+        template.name_prefix: template
+        for template in prims_ts_paged_block_sparse_trace_dispatch.templates
+    }
+    tuple_trace = paged_templates["prims_ts_paged_block_sparse_tuple"]
+    combined_trace = paged_templates["prims_ts_paged_block_sparse_combined"]
+    common_inputs = {
+        "q",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "max_seq_len_kv",
+        "seq_lens_kv",
+        "block_indptr",
+        "block_indices",
+        "q_block_size",
+        "kv_block_size",
+        "kv_valid_bits",
+        "mask_type",
+        "sm_scale",
+    }
+    for template in (tuple_trace, combined_trace):
+        assert common_inputs <= template.inputs.keys()
+        assert {
+            "exact_block_bits",
+            "k_summary",
+            "v_summary",
+        }.isdisjoint(template.inputs)
+        assert "paged KV" in template.description
+        assert "max_seq_len_kv" in template.axes
+        assert "seq_len_kv" not in template.axes
+        assert template.inputs["max_seq_len_kv"].param is None
+        assert not template.inputs["seq_lens_kv"].optional
+        assert "paged_kv_indptr[-1].item() <= num_page_indices" in template.constraints
+        assert (
+            "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)"
+            in template.constraints
+        )
+        assert (
+            "min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)"
+            in template.constraints
+        )
+        assert "max(seq_lens_kv) <= max_seq_len_kv" in template.constraints
+
+    assert tuple_trace.inputs["k_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["k_cache"].tuple_idx == 0
+    assert tuple_trace.inputs["v_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["v_cache"].tuple_idx == 1
+    assert combined_trace.inputs["paged_kv_cache"].dim_names == [
+        "num_pages",
+        "kv_planes",
+        "num_kv_heads",
+        "page_size",
+        "head_dim",
+    ]
+    assert "kv_planes == 2" in combined_trace.constraints
+
+    tuple_cache = (torch.empty(1), torch.empty(1))
+    combined_cache = torch.empty(1)
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=tuple_cache)
+        is tuple_trace
+    )
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=combined_cache)
+        is combined_trace
+    )
+
+    contiguous_wrapper_trace = contiguous_wrapper_traces[
+        "prims_ts_block_sparse_wrapper"
+    ]
+    wrapper_paged_templates = {
+        template.name_prefix: template
+        for template in prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates
+    }
+    assert set(wrapper_paged_templates) == {
+        "prims_ts_paged_block_sparse_wrapper_tuple",
+        "prims_ts_paged_block_sparse_wrapper_combined",
+    }
+    for template in (
+        contiguous_wrapper_trace,
+        *wrapper_paged_templates.values(),
+    ):
+        assert "Reusable" in template.description
+        for name in ("q_block_size", "kv_block_size", "mask_type"):
+            assert template.inputs[name].optional
+    for template in wrapper_paged_templates.values():
+        assert template.inputs["max_seq_len_kv"].optional
+
+
+def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
+    """Resolve a realistic causal SQ4 trace through all six public surfaces."""
+    from flashinfer.attention.prims_ts.decode import (
+        BatchDecodePagedTSWrapper,
+        batch_decode_with_paged_kv_cache,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+        batch_mla_decode_with_paged_kv_cache,
+        prims_ts_batch_mla_decode_with_kv_cache,
+    )
+    from flashinfer.fi_trace import fi_trace
+
+    batch_size, seq_len_q, seq_len_k = 4, 4, 2048
+    page_size, num_q_heads, num_kv_heads, head_dim = 32, 32, 4, 128
+    pages_per_request = seq_len_k // page_size
+    num_pages = batch_size * pages_per_request
+    q = torch.empty(batch_size, seq_len_q, num_q_heads, head_dim, dtype=torch.bfloat16)
+    k_cache = torch.empty(
+        num_pages, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16
+    )
+    v_cache = torch.empty_like(k_cache)
+    kv_indices = torch.arange(num_pages, dtype=torch.int32)
+    fmha_block_tables = kv_indices.reshape(batch_size, pages_per_request)
+    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
+    workspace = torch.empty(4096, dtype=torch.uint8)
+
+    fmha_kwargs = {
+        "q": q,
+        "paged_kv_cache": (k_cache, v_cache),
+        "block_tables": fmha_block_tables,
+        "seq_lens_kv": seq_lens,
+        "seq_len_q": seq_len_q,
+        "mask_type": "causal",
+    }
+    fmha_standalone_kwargs = {
+        "query": q,
+        "kv_cache": (k_cache, v_cache),
+        "workspace_buffer": workspace,
+        "block_tables": fmha_block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": seq_len_k,
+        "seq_len_q": seq_len_q,
+        "mask_type": "causal",
+        "kv_layout": "HND",
+    }
+
+    fmha_wrapper = BatchDecodePagedTSWrapper()
+    fmha_wrapper._plan_state = SimpleNamespace(
+        use_packed_q=False,
+        seq_len_q=seq_len_q,
+        output_dtype=torch.bfloat16,
+        mask_type="causal",
+        window_left=-1,
+        max_kv_len=seq_len_k,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
+    )
+    fmha_definitions = (
+        batch_decode_with_paged_kv_cache.fi_trace(**fmha_kwargs),
+        prims_ts_batch_decode_with_kv_cache.fi_trace(**fmha_standalone_kwargs),
+        fi_trace(
+            fmha_wrapper.run,
+            q=q,
+            paged_kv_cache=(k_cache, v_cache),
+            seq_lens=seq_lens,
+            block_tables=fmha_block_tables,
+            validate=False,
+        ),
+    )
+
+    mla_heads, mla_head_dim, kv_lora_rank, rope_dim = 128, 576, 512, 64
+    mla_q = torch.empty(
+        batch_size, seq_len_q, mla_heads, mla_head_dim, dtype=torch.bfloat16
+    )
+    mla_cache = torch.empty(num_pages, page_size, mla_head_dim, dtype=torch.bfloat16)
+    block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(
+        batch_size, pages_per_request
+    )
+    mla_common = {
+        "query": mla_q,
+        "kv_cache": mla_cache,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": rope_dim,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "mask_type": "causal",
+    }
+    mla_wrapper = BatchMLADecodePagedTSWrapper()
+    mla_wrapper._plan_state = SimpleNamespace(
+        packed_query=False,
+        mask_type="causal",
+        max_seq_len_q=seq_len_q,
+        max_kv_len=seq_len_k,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=rope_dim,
+    )
+    mla_definitions = (
+        batch_mla_decode_with_paged_kv_cache.fi_trace(**mla_common),
+        prims_ts_batch_mla_decode_with_kv_cache.fi_trace(
+            **mla_common,
+            workspace_buffer=workspace,
+            max_seq_len=seq_len_k,
+        ),
+        fi_trace(
+            mla_wrapper.run,
+            query=mla_q,
+            kv_cache=mla_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            validate=False,
+        ),
+    )
+
+    expected_names = (
+        "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
+        "prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048",
+        "prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_"
+        "wl-1_pf0_um0_h32_kv4_d128_ps32",
+        "prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4",
+        "prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4",
+        "prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_"
+        "ckv512_kpe64_ps32_sq4",
+    )
+    definitions = (*fmha_definitions, *mla_definitions)
+    assert tuple(definition["name"] for definition in definitions) == expected_names
+    assert {"block_tables", "seq_lens_kv"} <= fmha_definitions[0]["inputs"].keys()
+    for input_name in ("block_tables", "seq_lens_kv"):
+        assert "optional" not in fmha_definitions[0]["inputs"][input_name]
+    assert {"block_tables", "seq_lens"} <= fmha_definitions[2]["inputs"].keys()
+    assert {"block_tables", "seq_lens"} <= mla_definitions[2]["inputs"].keys()
+    for definition, required_metadata in (
+        (
+            fmha_definitions[2],
+            ("block_tables", "seq_lens"),
+        ),
+        (mla_definitions[2], ("block_tables", "seq_lens")),
+    ):
+        for input_name in required_metadata:
+            assert "optional" not in definition["inputs"][input_name]
+        assert definition["inputs"]["validate"] == {
+            "shape": None,
+            "dtype": "bool",
+            "optional": True,
+            "description": "Whether to validate per-run tensors and metadata values.",
+        }
+        assert definition["inputs"]["bmm1_scale"]["optional"] is True
+        assert definition["inputs"]["bmm2_scale"]["optional"] is True
+        assert definition["outputs"]["output"].get("optional") is None
+    for definition in definitions:
+        assert definition["axes"].get("seq_len_q", {}).get("value") == seq_len_q
+        assert "unknown" not in str(definition["outputs"])
+    for definition in (
+        fmha_definitions[0],
+        fmha_definitions[1],
+        mla_definitions[0],
+        mla_definitions[1],
+    ):
+        assert definition["inputs"]["mask_type"]["optional"] is True
+    for definition in (fmha_definitions[2], mla_definitions[2]):
+        assert "mask_type" not in definition["inputs"]
+        assert "max_seq_len_q" not in definition["inputs"]
+    assert "window_left" not in fmha_definitions[2]["inputs"]
+
+
+def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
+    """An omitted out override must retain the wrapper plan's output dtype."""
+    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+    from flashinfer.fi_trace import fi_trace
+
+    batch_size, num_qo_heads, num_kv_heads = 2, 8, 2
+    head_dim, page_size, num_pages = 128, 32, 4
+    q = torch.empty(batch_size, num_qo_heads, head_dim, dtype=torch.float8_e4m3fn)
+    k_cache = torch.empty(
+        num_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        dtype=torch.float8_e4m3fn,
+    )
+    v_cache = torch.empty_like(k_cache)
+    seq_lens = torch.full((batch_size,), page_size, dtype=torch.int32)
+    block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(batch_size, -1)
+
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        use_packed_q=False,
+        seq_len_q=1,
+        output_dtype=torch.float16,
+        mask_type="dense",
+        window_left=-1,
+        max_kv_len=page_size,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
+    )
+    definition = fi_trace(
+        wrapper.run,
+        q=q,
+        paged_kv_cache=(k_cache, v_cache),
+        seq_lens=seq_lens,
+        block_tables=block_tables,
+    )
+
+    assert definition["name"] == (
+        "prims_ts_decode_wrapper_tuple_fp16_output_dense_maxq1_maxk32_"
+        "wl-1_pf0_um0_h8_kv2_d128_ps32"
+    )
+    assert definition["outputs"]["output"]["dtype"] == "float16"
+
+
+def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
+    """Bound traces enforce required metadata for each length owner."""
+    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
+    from flashinfer.fi_trace import fi_trace
+
+    total_q, page_size = 5, 32
+    qo_indptr = torch.tensor((0, 2, total_q), dtype=torch.int32)
+    seq_lens = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
+
+    fmha_wrapper = BatchDecodePagedTSWrapper()
+    fmha_wrapper._plan_state = SimpleNamespace(
+        use_packed_q=True,
+        seq_len_q=3,
+        output_dtype=torch.bfloat16,
+        mask_type="causal",
+        window_left=-1,
+        max_kv_len=2 * page_size,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+        planned_seq_lens_device=None,
+    )
+    fmha_kwargs = {
+        "q": torch.empty(total_q, 8, 128, dtype=torch.bfloat16),
+        "paged_kv_cache": (
+            torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
+            torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
+        ),
+        "seq_lens": seq_lens,
+        "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
+        "qo_indptr": qo_indptr,
+    }
+    for missing_name in (
+        "seq_lens",
+        "block_tables",
+        "qo_indptr",
+    ):
+        incomplete_kwargs = dict(fmha_kwargs)
+        incomplete_kwargs.pop(missing_name)
+        with pytest.raises(ValueError, match=missing_name):
+            fi_trace(fmha_wrapper.run, **incomplete_kwargs)
+    fmha_definition = fi_trace(fmha_wrapper.run, **fmha_kwargs)
+
+    fmha_wrapper._plan_state = SimpleNamespace(
+        **{
+            **vars(fmha_wrapper._plan_state),
+            "planned_seq_lens_device": seq_lens,
+        }
+    )
+    plan_owned_kwargs = {**fmha_kwargs, "seq_lens": None}
+    with pytest.raises(ValueError, match=r"plan-owned.*seq_lens=None"):
+        fi_trace(fmha_wrapper.run, **fmha_kwargs)
+    for missing_name in ("block_tables", "qo_indptr"):
+        incomplete_kwargs = dict(plan_owned_kwargs)
+        incomplete_kwargs.pop(missing_name)
+        with pytest.raises(ValueError, match=missing_name):
+            fi_trace(fmha_wrapper.run, **incomplete_kwargs)
+    plan_owned_definition = fi_trace(fmha_wrapper.run, **plan_owned_kwargs)
+    assert plan_owned_definition["inputs"]["seq_lens"]["optional"] is True
+    assert plan_owned_definition["inputs"]["seq_lens"]["dtype"] == "int32"
+    assert "seq-lens-source:plan" in plan_owned_definition["tags"]
+    assert "_plan_seq_lens_" in plan_owned_definition["name"]
+
+    mla_wrapper = BatchMLADecodePagedTSWrapper()
+    mla_wrapper._plan_state = SimpleNamespace(
+        packed_query=True,
+        mask_type="causal",
+        max_seq_len_q=3,
+        max_kv_len=2 * page_size,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    mla_kwargs = {
+        "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(4, page_size, 576, dtype=torch.bfloat16),
+        "block_tables": torch.tensor(((0, 1), (2, 3)), dtype=torch.int32),
+        "seq_lens": seq_lens,
+        "qo_indptr": qo_indptr,
+    }
+    for missing_name in ("block_tables", "seq_lens", "qo_indptr"):
+        incomplete_kwargs = dict(mla_kwargs)
+        incomplete_kwargs.pop(missing_name)
+        with pytest.raises(ValueError, match=missing_name):
+            fi_trace(mla_wrapper.run, **incomplete_kwargs)
+    mla_definition = fi_trace(mla_wrapper.run, **mla_kwargs)
+
+    for definition in (fmha_definition, plan_owned_definition, mla_definition):
+        assert "unknown" not in str(definition["inputs"])
+
+
+def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
+    """Same-shaped plans must not collide in name-based auto-dump deduplication."""
+    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
+    from flashinfer.fi_trace import fi_trace
+
+    total_q, page_size = 5, 32
+    qo_indptr = torch.tensor((0, 2, total_q), dtype=torch.int32)
+    seq_lens = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
+    fmha_kwargs = {
+        "q": torch.empty(total_q, 8, 128, dtype=torch.bfloat16),
+        "paged_kv_cache": (
+            torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
+            torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
+        ),
+        "seq_lens": seq_lens,
+        "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
+        "qo_indptr": qo_indptr,
+    }
+    fmha_base = {
+        "use_packed_q": True,
+        "seq_len_q": 3,
+        "output_dtype": torch.bfloat16,
+        "mask_type": "dense",
+        "window_left": -1,
+        "max_kv_len": 2 * page_size,
+        "kv_prefix_mode": "dynamic",
+        "kv_lengths_mode": "dynamic",
+        "planned_seq_lens_device": None,
+    }
+    fmha_variants = (
+        (fmha_base, seq_lens),
+        ({**fmha_base, "mask_type": "causal"}, seq_lens),
+        ({**fmha_base, "seq_len_q": 8}, seq_lens),
+        ({**fmha_base, "max_kv_len": 4 * page_size}, seq_lens),
+        ({**fmha_base, "planned_seq_lens_device": seq_lens}, None),
+        (
+            {
+                **fmha_base,
+                "kv_prefix_mode": "planned_full",
+                "planned_seq_lens_device": seq_lens,
+            },
+            None,
+        ),
+        (
+            {
+                **fmha_base,
+                "kv_lengths_mode": "planned_uniform_max",
+                "planned_seq_lens_device": seq_lens,
+            },
+            None,
+        ),
+        ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens),
+    )
+    fmha_wrapper = BatchDecodePagedTSWrapper()
+    fmha_definitions = []
+    for state, run_seq_lens in fmha_variants:
+        fmha_wrapper._plan_state = SimpleNamespace(**state)
+        fmha_definitions.append(
+            fi_trace(
+                fmha_wrapper.run,
+                **{**fmha_kwargs, "seq_lens": run_seq_lens},
+            )
+        )
+    assert len({definition["name"] for definition in fmha_definitions}) == len(
+        fmha_definitions
+    )
+    assert [
+        definition["axes"]["max_seq_len_q"]["value"]
+        for definition in fmha_definitions[:4]
+    ] == [3, 3, 8, 3]
+    assert [
+        definition["axes"]["max_kv_len"]["value"] for definition in fmha_definitions[:4]
+    ] == [64, 64, 64, 128]
+    assert "mask:dense" in fmha_definitions[0]["tags"]
+    assert "mask:causal" in fmha_definitions[1]["tags"]
+    assert "seq-lens-source:run" in fmha_definitions[0]["tags"]
+    assert "seq-lens-source:plan" in fmha_definitions[4]["tags"]
+
+    mla_kwargs = {
+        "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(4, page_size, 576, dtype=torch.bfloat16),
+        "block_tables": torch.tensor(((0, 1), (2, 3)), dtype=torch.int32),
+        "seq_lens": seq_lens,
+        "qo_indptr": qo_indptr,
+    }
+    mla_base = {
+        "packed_query": True,
+        "mask_type": "causal",
+        "max_seq_len_q": 3,
+        "max_kv_len": 2 * page_size,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+    }
+    mla_variants = (
+        mla_base,
+        {**mla_base, "mask_type": "dense"},
+        {**mla_base, "max_seq_len_q": 8},
+        {**mla_base, "max_kv_len": 4 * page_size},
+    )
+    mla_wrapper = BatchMLADecodePagedTSWrapper()
+    mla_definitions = []
+    for state in mla_variants:
+        mla_wrapper._plan_state = SimpleNamespace(**state)
+        mla_definitions.append(fi_trace(mla_wrapper.run, **mla_kwargs))
+    assert len({definition["name"] for definition in mla_definitions}) == len(
+        mla_definitions
+    )
+    assert [
+        definition["axes"]["max_seq_len_q"]["value"] for definition in mla_definitions
+    ] == [3, 3, 8, 3]
+    assert [
+        definition["axes"]["max_kv_len"]["value"] for definition in mla_definitions
+    ] == [64, 64, 64, 128]
+    assert "mask:causal" in mla_definitions[0]["tags"]
+    assert "mask:dense" in mla_definitions[1]["tags"]
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +1201,9 @@ _E2E_SKIP = {
     # Packed dimensions and the capacity-sized in-place output contract are
     # covered by the targeted AlphaMoE trace test below.
     "alphamoe_nvfp4_aligned_moe",
+    # Shared FP4 requires explicit routed/physical expert geometry and scalar
+    # routing args; covered by test_fi_trace_emits_fp4_shared_expert_definition.
+    "moe_fp4_block_scale_ds_shared_experts",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
@@ -528,8 +1355,17 @@ def test_fi_trace_complete_moe_routing(
         (3, 1, {}, "moe_fp4_block_scale_llama4_routing"),
         (4, 4, {}, "moe_fp4_block_scale_renormalize_naive_routing"),
         (5, 4, {}, "moe_fp4_block_scale_topk_routing"),
+        (1, 4, {"activation_type": 10}, "moe_fp4_block_scale_renormalize_routing"),
     ],
-    ids=["default", "renormalize", "ds", "llama4", "renormalize_naive", "topk"],
+    ids=[
+        "default",
+        "renormalize",
+        "ds",
+        "llama4",
+        "renormalize_naive",
+        "topk",
+        "situ",
+    ],
 )
 def test_fi_trace_complete_moe_fp4_routing(
     routing_method_type, top_k, extra_kwargs, expected_name_prefix
@@ -569,6 +1405,10 @@ def test_fi_trace_complete_moe_fp4_routing(
     assert defn["axes"]["num_local_experts"]["value"] == EL
     assert defn["axes"]["hidden_size"]["value"] == H
     assert defn["axes"]["top_k"]["value"] == top_k
+    if "activation_type" in extra_kwargs:
+        assert (
+            defn["axes"]["activation_type"]["value"] == extra_kwargs["activation_type"]
+        )
     assert defn["name"].startswith(expected_name_prefix)
     non_optional_unknown = [
         k
