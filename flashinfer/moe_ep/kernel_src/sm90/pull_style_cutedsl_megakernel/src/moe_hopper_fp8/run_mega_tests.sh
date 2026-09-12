@@ -278,6 +278,12 @@ declare -a TESTS=(
     "M17_mr_dynshape_balanced_topk4  | multi  | --kind fp8_e4m3 --num_tokens_per_rank 384  --num_topk 4  --num_total_experts 32  --hidden 2048 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1"
     "M18_mr_dynshape_pl_topk7        | multi  | --kind fp8_e4m3 --num_tokens_per_rank 576  --num_topk 7  --num_total_experts 64  --hidden 1536 --intermediate @M18_INTERMEDIATE@ --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --route_distribution power_law --load_balance_mode atomic_counter"
 
+    # ── GC01..GC03: generate_c — raw pre-SwiGLU fc1 gate+up output (training forward) ──
+    # Both layouts: TILE_ARGS (non-swap FP8_NON_SWAP_N or --swapab FP8_SWAP_AB_M/N) apply.
+    "GC01_single_generate_c          | single | --kind fp8_e4m3 --num_tokens_per_rank 192  --num_topk 2  --num_total_experts 8   --hidden 1024 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --ref_compute_graph transformers --generate_c"
+    "GC02_mr_balanced_generate_c     | multi  | --kind fp8_e4m3 --num_tokens_per_rank 256  --num_topk 3  --num_total_experts 24  --hidden 1536 --intermediate 2048 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --load_balance_mode atomic_counter --generate_c"
+    "GC03_mr_power_law_generate_c    | multi  | --kind fp8_e4m3 --num_tokens_per_rank 832  --num_topk 13 --num_total_experts 104 --hidden 2560 --intermediate 4096 --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1 --enable_static_expert_shape --route_distribution power_law --generate_c"
+
 )
 
 PASS_COUNT=0

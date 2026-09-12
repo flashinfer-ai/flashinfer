@@ -40,6 +40,7 @@ from moe_hopper_fp8.epilogue_fp8_common import (
     consume_next_pingpong_work,
     clamp_and_swiglu_sm90,
     stg_fc1_block_scale_row,
+    stg_fc1_c_bf16x2,
     tma_store_fc1_output,
     tma_store_fc2_output,
 )
@@ -97,6 +98,8 @@ class Fp8GluEpilogue:
         fc1_early_done_publish: bool = False,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         pingpong: bool = False,
+        generate_c: bool = False,
+        c_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ) -> None:
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout
@@ -114,6 +117,11 @@ class Fp8GluEpilogue:
         self._fc1_store_sync_bar_id = fc1_store_sync_bar_id
         self._epilogue_warp_ids = epilogue_warp_ids
         self._pingpong = pingpong
+        # generate_c (training forward): also write the raw pre-SwiGLU fc1
+        # gate+up accumulator to ``fc1_c`` (BF16, kernel column order) --
+        # same contract as the Blackwell MXFP8 kernel's generate_c.
+        self._generate_c = generate_c
+        self._c_dtype = c_dtype
         self._pingpong_order = pingpong
         self._use_2cta_instrs = use_2cta_instrs
         self._cluster_m = cluster_shape_mn[0]
@@ -329,6 +337,7 @@ class Fp8GluEpilogue:
         fc2_act_dequant_scale,
         norm_const,
         store_stage_idx,
+        gmem_fc1_c,
     ) -> None:
         """Dispatch the FC1 epilogue for one completed WGMMA task tile."""
         if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
@@ -346,6 +355,7 @@ class Fp8GluEpilogue:
                 tidx=tidx,
                 _iket_active=_iket_active,
                 store_stage_idx=store_stage_idx,
+                gmem_fc1_c=gmem_fc1_c,
             )
         else:
             self._run_fc1_epilogue_per_tensor(
@@ -365,6 +375,7 @@ class Fp8GluEpilogue:
                 fc2_act_dequant_scale=fc2_act_dequant_scale,
                 norm_const=norm_const,
                 store_stage_idx=store_stage_idx,
+                gmem_fc1_c=gmem_fc1_c,
             )
 
     @cute.jit
@@ -386,12 +397,17 @@ class Fp8GluEpilogue:
         fc2_act_dequant_scale,
         norm_const,
         store_stage_idx,
+        gmem_fc1_c,
     ) -> None:
         """FC1 per-tensor epilogue: scalar scale + FP8 store."""
         real_fc1_output, _    = sched_ext.get_gmem_tensor("d",    gmem_fc1_output,    work_tile_info)
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
             "topk", gmem_topk_scores, work_tile_info,
         )
+        if cutlass.const_expr(self._generate_c):
+            real_fc1_c, _ = sched_ext.get_gmem_tensor(
+                "c", gmem_fc1_c, work_tile_info,
+            )
 
         # Inner epilogue IKET range for non-swap-AB, FP8 per-tensor FC1.
         # WGMMA has already finished before entry. This range covers reading
@@ -431,6 +447,19 @@ class Fp8GluEpilogue:
                 topk_score1 = Float32(
                     real_topk_scores[token_tile_base + token_row1]
                 )
+            if cutlass.const_expr(self._generate_c):
+                self._store_fc1_c_m64_half(
+                    work_tile_info=work_tile_info,
+                    accumulators=accumulators,
+                    n_half=n_half,
+                    m_sub=m_sub,
+                    real_fc1_c=real_fc1_c,
+                    token_tile_base=token_tile_base,
+                    token_row0=token_row0,
+                    token_row1=token_row1,
+                    tidx=tidx,
+                    c_scale=fc1_act_weight_dequant_scale,
+                )
             for subtile_idx in cutlass.range_constexpr(
                 subtile_begin, subtile_end, 1
             ):
@@ -457,6 +486,74 @@ class Fp8GluEpilogue:
 
         if _iket_active:
             iket.range_pop()  # nswap_fc1_epi_m64n64_pt
+
+    @cute.jit
+    def _store_fc1_c_m64_half(
+        self,
+        work_tile_info,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        m_sub: cutlass.Constexpr,
+        real_fc1_c: cute.Tensor,
+        token_tile_base,
+        token_row0,
+        token_row1,
+        tidx,
+        c_scale: Float32,
+    ) -> None:
+        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16.
+
+        Same contract as the Blackwell MXFP8 kernel's ``_store_fc1_c_subtile``:
+        the pre-SwiGLU (pre-clamp, pre-routing-weight) FP32 accumulator goes
+        to ``fc1_c[pool_row, intermediate_gateup]`` in the kernel's native
+        gate/up-interleaved column order (interleave = Fp8GateUpInterleave).
+        Hopper register layout: this warpgroup owns acc columns
+        ``[n_half * 128, n_half * 128 + 128)`` of the CTA tile; per 8-wide
+        gate or up column group each thread holds the column pair
+        ``2 * lane_mod`` for rows ``token_row0`` and ``token_row1`` (regs
+        0,1 -> row0; 2,3 -> row1).  Plain STG, no SMEM staging, so the AB
+        pipeline budget is unchanged.  Only valid token rows are written;
+        the 128-aligned pad rows keep the host's zero fill.
+
+        ``c_scale`` restores real units: the blockwise mainloop already folds
+        the block scales into the accumulator (pass 1.0), while the per-tensor
+        mainloop accumulates raw fp8 x fp8 products and applies
+        ``fc1_act_weight_dequant_scale`` in the epilogue -- so does this store.
+        """
+        lane_mod = (tidx % WarpThreadCount) % 4
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        row0_valid = token_row0 < valid_tokens
+        row1_valid = token_row1 < valid_tokens
+        col_tile_base = (
+            work_tile_info.tile_n_idx * cutlass.Int32(self._cta_tile_n)
+            + cutlass.Int32(n_half * 2 * Fc1EpilogueStoreTileN)
+            + 2 * lane_mod
+        )
+        accum_fragment_base = m_sub * self._accum_regs_per_m64
+        gmem_row0 = token_tile_base + token_row0
+        gmem_row1 = token_tile_base + token_row1
+        for output_group in cutlass.range_constexpr(
+            Fc1SubtilesPerHalf * Fc1GroupsPerSubtile
+        ):
+            reg_base = accum_fragment_base + output_group * 8
+            col_group_base = col_tile_base + cutlass.Int32(
+                output_group * 2 * Fp8GateUpInterleave
+            )
+            for gu in cutlass.range_constexpr(2):  # 0 = gate cols, 1 = up cols
+                rb = reg_base + gu * 4
+                col = col_group_base + cutlass.Int32(gu * Fp8GateUpInterleave)
+                if row0_valid:
+                    stg_fc1_c_bf16x2(
+                        real_fc1_c, gmem_row0, col,
+                        accumulators[rb + 0] * c_scale,
+                        accumulators[rb + 1] * c_scale,
+                    )
+                if row1_valid:
+                    stg_fc1_c_bf16x2(
+                        real_fc1_c, gmem_row1, col,
+                        accumulators[rb + 2] * c_scale,
+                        accumulators[rb + 3] * c_scale,
+                    )
 
     @cute.jit
     def _quad_reduce_max(self, val: Float32) -> Float32:
@@ -618,6 +715,7 @@ class Fp8GluEpilogue:
         tidx,
         _iket_active,
         store_stage_idx,
+        gmem_fc1_c,
     ) -> None:
         """FC1 blockwise epilogue: per-token/per-64 scale + FP8 store."""
         # Inner epilogue IKET range for non-swap-AB, DeepGEMM-style blockwise
@@ -633,6 +731,10 @@ class Fp8GluEpilogue:
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
             "topk", gmem_topk_scores, work_tile_info,
         )
+        if cutlass.const_expr(self._generate_c):
+            real_fc1_c, _ = sched_ext.get_gmem_tensor(
+                "c", gmem_fc1_c, work_tile_info,
+            )
 
         r_layout = cute.make_layout(
             (((Fc1BlockwiseSubtileRegs,), 1),), stride=(((1,), 0),)
@@ -679,6 +781,19 @@ class Fp8GluEpilogue:
                 )
                 topk_score1 = Float32(
                     real_topk_scores[token_tile_base + token_row1]
+                )
+            if cutlass.const_expr(self._generate_c):
+                self._store_fc1_c_m64_half(
+                    work_tile_info=work_tile_info,
+                    accumulators=accumulators,
+                    n_half=n_half,
+                    m_sub=m_sub,
+                    real_fc1_c=real_fc1_c,
+                    token_tile_base=token_tile_base,
+                    token_row0=token_row0,
+                    token_row1=token_row1,
+                    tidx=tidx,
+                    c_scale=Float32(1.0),
                 )
             swiglu = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
             for subtile_idx in cutlass.range_constexpr(
@@ -1299,6 +1414,7 @@ class Fp8GluEpilogue:
         math_wg_order_state,
         epi_wg_order_barrier,
         epi_wg_order_state,
+        gmem_fc1_c,
     ):
         if cutlass.const_expr(self._pingpong_order):
             if _iket_active:
@@ -1356,6 +1472,7 @@ class Fp8GluEpilogue:
             fc2_act_dequant_scale=fc2_act_dequant_scale,
             norm_const=norm_const,
             store_stage_idx=store_stage_idx,
+            gmem_fc1_c=gmem_fc1_c,
         )
         return ab_consumer_state, math_wg_order_state, epi_wg_order_state
 
@@ -1653,6 +1770,7 @@ class Fp8GluEpilogue:
         fc1_offload_empty_mbar_ptr=None,
         fc1_offload_mbox=None,
         token_comm_args=None,
+        gmem_fc1_c=None,
     ) -> None:
         """
         Run the full FP8 fc1+fc2 fused MMA+epilogue task-tile loop.
@@ -1833,6 +1951,7 @@ class Fp8GluEpilogue:
                         math_wg_order_state=math_wg_order_state,
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1888,6 +2007,7 @@ class Fp8GluEpilogue:
                         math_wg_order_state=math_wg_order_state,
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,

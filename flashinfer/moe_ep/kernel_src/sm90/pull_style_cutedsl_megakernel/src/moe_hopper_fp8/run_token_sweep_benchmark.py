@@ -56,6 +56,11 @@ ITERS = 20
 TIMEOUT_SECONDS = 3600
 SILENCE_TIMEOUT_SECONDS = 300
 TILE_K = 128
+# Optional pinned training geometry (--training-geometry): the cooperative
+# non-swap M64 x N256 tile for every bucket, so an on/off comparison changes
+# nothing but generate_c.  generate_c itself works on every layout.
+TRAINING_TILE_MNK = (64, 256, 128)
+TRAINING_CLUSTER_MNK = (1, 1, 1)
 
 SCALE_MODES = ("per_tensor", "blockwise")
 OPERAND_ORDERS = ("non_swap_ab", "swap_ab")
@@ -67,6 +72,7 @@ RANK_MODES = (
 RANK_MODE_CHOICES = ("singlerank", "multirank", "both")
 
 DISPLAY_ENV_KEYS = (
+    "FP8_GENERATE_C",
     "PYTHON",
     "PYTHONUNBUFFERED",
     "DSV4_TOKENS_PER_RANK",
@@ -170,6 +176,7 @@ class BenchmarkCase:
     tile_m: int
     tile_n: int
     cluster_shape_mnk: tuple[int, int, int]
+    generate_c: bool = False
 
     @property
     def scale_tag(self) -> str:
@@ -193,6 +200,7 @@ class BenchmarkCase:
             f"{run_date}_{self.rank_mode}_{self.scale_tag}_{self.order_tag}_"
             f"{self.schedule_tag}_{self.cluster_tag}_"
             f"TileM{self.tile_m}_TileN{self.tile_n}"
+            + ("_genc" if self.generate_c else "")
         )
 
     def csv_path(self, output_dir: Path, run_date: str) -> Path:
@@ -369,6 +377,8 @@ def build_heuristic_jobs(
     rank_mode: str,
     scale_mode: str,
     token_sizes: Sequence[int],
+    training_geometry: bool = False,
+    generate_c: bool = False,
 ) -> tuple[BenchmarkJob, ...]:
     selected_rank_modes = (
         RANK_MODES
@@ -388,7 +398,14 @@ def build_heuristic_jobs(
                 config = select_heuristic_config(
                     selected_scale_mode, tokens_per_rank
                 ).config
-                tile_m, tile_n, tile_k = config.mma_tiler_mnk
+                if training_geometry:
+                    swap_ab, pingpong = False, False
+                    tile_m, tile_n, tile_k = TRAINING_TILE_MNK
+                    cluster_shape_mnk = TRAINING_CLUSTER_MNK
+                else:
+                    swap_ab, pingpong = config.swap_ab, config.pingpong
+                    tile_m, tile_n, tile_k = config.mma_tiler_mnk
+                    cluster_shape_mnk = config.cluster_shape_mnk
                 if tile_k != TILE_K:
                     raise ValueError(f"Heuristic tile K must be {TILE_K}, got {tile_k}")
                 case = BenchmarkCase(
@@ -396,13 +413,16 @@ def build_heuristic_jobs(
                     perf_case,
                     world_size,
                     selected_scale_mode,
-                    "swap_ab" if config.swap_ab else "non_swap_ab",
-                    config.pingpong,
+                    "swap_ab" if swap_ab else "non_swap_ab",
+                    pingpong,
                     tile_m,
                     tile_n,
-                    config.cluster_shape_mnk,
+                    cluster_shape_mnk,
+                    generate_c,
                 )
-                jobs.append(BenchmarkJob(case, tokens_per_rank, True))
+                # A pinned geometry is launched explicitly (FP8_NON_SWAP_* env,
+                # --no-heuristic) so the runner does not consult the table.
+                jobs.append(BenchmarkJob(case, tokens_per_rank, not training_geometry))
     return tuple(jobs)
 
 
@@ -441,6 +461,10 @@ def _case_environment(
             "NVSHMEM_DISABLE_NVLS": "1",
         }
     )
+    if case.generate_c:
+        env["FP8_GENERATE_C"] = "1"
+    else:
+        env.pop("FP8_GENERATE_C", None)
     if use_heuristic:
         for key in (
             "FP8_CLUSTER_SHAPE",
@@ -978,6 +1002,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Stop after the first failed or unparseable case.",
     )
     parser.add_argument(
+        "--training-geometry",
+        action="store_true",
+        help="Heuristic mode only: pin every token bucket to the non-swap training "
+        "geometry (M64 x N256, CGA 1x1, no ping-pong) instead of the table entry.",
+    )
+    parser.add_argument(
+        "--generate-c",
+        action="store_true",
+        help="Heuristic mode only: run the training forward (generate_c=True, the "
+        "raw fc1 gate+up tensor is written) on the table's launch configs "
+        "(combine with --training-geometry to pin M64N256); output stems get a "
+        "_genc suffix.",
+    )
+    parser.add_argument(
         "--no-plot",
         action="store_true",
         help="Do not invoke plot_token_sweep.py after the benchmark.",
@@ -1010,6 +1048,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.reconfigure(line_buffering=True)
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if (args.generate_c or args.training_geometry) and not args.use_heuristic:
+        raise SystemExit(
+            "--generate-c / --training-geometry apply to the heuristic-mode token sweep only"
+        )
     if not PERF_SCRIPT.is_file():
         raise FileNotFoundError(PERF_SCRIPT)
     if not PLOT_SCRIPT.is_file():
@@ -1034,6 +1076,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.rank_mode,
             args.scale_mode,
             token_sizes,
+            training_geometry=args.training_geometry,
+            generate_c=args.generate_c,
         )
         all_cases = tuple(dict.fromkeys(job.case for job in all_jobs))
         cases = tuple(

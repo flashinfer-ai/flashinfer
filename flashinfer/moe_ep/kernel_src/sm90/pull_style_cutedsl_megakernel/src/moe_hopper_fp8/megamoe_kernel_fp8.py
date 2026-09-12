@@ -145,6 +145,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         fc1_store_offload: bool = True,
         fc1_early_done_publish: bool = False,
         fold_producer_warps: bool = True,
+        generate_c: bool = False,
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -204,6 +205,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             fc1_early_done_publish=fc1_early_done_publish,
             epi_flag_batch=epi_flag_batch,
             gate_up_clamp=gate_up_clamp,
+            generate_c=generate_c,
         )
 
         self.enable_token_comm = True
@@ -874,6 +876,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         fc2_activation_dequant_scale: cute.Tensor,
         # per_tensor: (E,) FP32, used by FC2; blockwise: (E,) ones, unused.
         fc2_weight_dequant_scale: cute.Tensor,
+        # generate_c: raw pre-SwiGLU fc1 gate+up, (pool_rows, intermediate_gateup)
+        # BF16 in the kernel's gate/up-interleaved column order, expert-major
+        # pool rows padded to token_padding_block.  None unless generate_c=True.
+        fc1_c: Optional[cute.Tensor],
         # Final combined output consumed by the caller.
         output_activation: cute.Tensor,    # (T, hidden) BF16
         # Opaque workspaces.
@@ -1145,6 +1151,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             load_balance_counter=load_balance_counter,
             expert_token_sizes=expert_token_sizes,
             token_comm_args=token_comm_args,
+            fc1_c=fc1_c,
         )
         if cutlass.const_expr(getattr(self, "is_swap_ab", False)):
             Sm90SwapABSwigluFp8Fc12Kernel.__call__(self, **_fc12_kwargs)

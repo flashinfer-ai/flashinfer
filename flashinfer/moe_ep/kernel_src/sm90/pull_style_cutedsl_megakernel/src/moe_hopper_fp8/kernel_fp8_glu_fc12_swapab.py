@@ -113,7 +113,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         fc1_early_done_publish: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
+        generate_c: bool = False,
     ) -> None:
+        # generate_c (training forward): the FC1 epilogue also writes the raw
+        # pre-SwiGLU gate+up accumulator to the caller's ``fc1_c`` tensor
+        # (BF16, kernel column order).  Off by default; compiled out when False.
+        self.generate_c = generate_c
+        self.c_dtype = cutlass.BFloat16
         # v1 only implements the static scheduler. Dynamic CLC with drain
         # auxiliary warps remains future work.
         if not force_static_sched:
@@ -433,6 +439,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_output_rcp_limit=self.fp8_output_rcp_limit,
             pingpong=self.pingpong,
+            generate_c=self.generate_c,
+            c_dtype=self.c_dtype,
         )
         self.epilogue = SwapABFp8GluEpilogue(**_epi_common)
 
@@ -660,6 +668,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # ``cutlass.const_expr(token_comm_args is not None)`` so they vanish
         # at codegen time on the lean path.
         token_comm_args=None,
+        fc1_c: Optional[cute.Tensor] = None,  # generate_c: (tokens_sum_padded, intermediate_gateup) BF16
     ) -> None:
         """Launch the fused fc1+fc2 GLU FP8 kernel."""
 
@@ -756,6 +765,19 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 stride=(fc1_output.stride[0], fc1_output.stride[1], 0),
             ),
         )
+        # generate_c: raw fc1 gate+up output as a (tokens_sum, intermediate_gateup,
+        # fake-L=1) view; the epilogue indexes it with the expert's
+        # cumulative_data_physical_row directly.  Placeholder when off.
+        if cutlass.const_expr(self.generate_c):
+            fc1_c_gemm = cute.make_tensor(
+                fc1_c.iterator,
+                cute.make_layout(
+                    (fc1_c.shape[0], fc1_c.shape[1], 1),
+                    stride=(fc1_c.stride[0], fc1_c.stride[1], 0),
+                ),
+            )
+        else:
+            fc1_c_gemm = fc1_output_gemm
 
         # ── GEMM-domain transform for fc2 phase ──
         #
@@ -1091,6 +1113,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             fc1_weight_dequant_scale,
             fc1_output_gemm,
             fc1_output_sf_gemm,
+            fc1_c_gemm,
             # GEMM-domain tensors (fc2)
             fc2_weight_gemm,
             fc2_weight_sf_gemm,
@@ -1148,6 +1171,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         fc1_weight_dequant_scale: cute.Tensor,
         fc1_output_gemm: cute.Tensor,
         fc1_output_sf_gemm: cute.Tensor,
+        fc1_c_gemm: cute.Tensor,
         # GEMM-domain tensors (fc2)
         fc2_weight_gemm: cute.Tensor,
         fc2_weight_sf_gemm: cute.Tensor,
@@ -1890,6 +1914,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 tma_atom_fc1_output=tma_atom_fc1_output,
                 gmem_fc1_output=tma_tensor_fc1_output,
                 gmem_fc1_output_sf=fc1_output_sf_gemm,
+                gmem_fc1_c=fc1_c_gemm,
                 smem_activation_sf=sActivationSf,
                 smem_weight_sf=sWeightSf,
                 gmem_topk_scores=topk_scores,

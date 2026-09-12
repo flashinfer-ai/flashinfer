@@ -199,6 +199,38 @@ derived programmatically) crossed with both validated token-back modes —
   beyond the count skip the whole dispatch body and only rejoin at
   kernel_tail.  With the default count of 1 those three idle slots host
   the TMA-A / TMA-B / scheduler roles (`fold_producer_warps`, below).
+- `generate_c` (default False; training forward) — the FC1 epilogue also
+  writes the raw pre-SwiGLU gate+up accumulator (pre-clamp, pre-routing-
+  weight, dequantized) as BF16 to an expert-major pool tensor
+  `fc1_c[pool_row, 2·intermediate]` in the kernel's gate/up-interleaved
+  column order, each local expert's segment padded to 128 rows (pad rows
+  stay zero; row order inside a segment is the dispatch arrival order) —
+  the same contract as the Blackwell MXFP8 kernel's `generate_c`.  Read it
+  back from `symm_buffer.fc1_c` after the launch; segment offsets are
+  `sum(round_up(count[i], 128), i < e)` over the per-expert routed-token
+  counts.  Non-swap stores BF16 pairs straight from the wgmma fragments,
+  swap-AB scatters single elements from its transposed tile; no SMEM
+  staging, so the AB pipeline budget is unchanged and the store path is
+  compiled out when off (HEAD-vs-off heuristic sweeps within run noise).
+  Cost when on (drop harness, 4x H200 at 1830 MHz, 2 interleaved rounds,
+  max-rank mega time) on the heuristic table's own configs: the swap-AB
+  buckets (8–256 tokens/rank plus pt512/1024/8192) sit at −2..+5%, i.e.
+  the transposed-tile scatter is cheap on small tiles; the non-swap
+  buckets pay +10..+20% (bw1024 +19.7, bw8192 +16.9, pt16384 +15.9,
+  bw32768 +12.2).  Pinned to non-swap M64N256 CGA1x1 for every bucket:
+  ≤512 +0..5%, 1k–8k +9..13%, 16k–32k +5..6%.  The extra BF16 gate+up
+  write is 4x the fp8 fc1 output bytes and is issued as 32-bit (non-swap)
+  or 16-bit (swap) stores; SMEM staging + TMA or quad-transposed 128-bit
+  stores are the follow-up if the training forward needs it cheaper.
+  Off costs nothing: the store path is compiled out and the HEAD-vs-off
+  heuristic sweep is within noise (drop harness geomean −0.5% / +0.0%;
+  FlashInfer bench, 2 interleaved rounds, e2e geomean −0.1%, compute
+  −0.2%).  FlashInfer bench with `--generate-c` (same node, 2 rounds, e2e
+  median): swap-AB buckets 8–256 within ±1.5%, pt512/1024/8192 −2.5..−3%,
+  non-swap buckets −8..−16% (bw1024 −15.6, bw8192 −13.3, pt16384 −12.2);
+  geomean e2e −5.1%, compute −5.4%.  Test `test_..._generate_c` (both
+  layouts x both scale modes vs the multi-rank torch reference's
+  `return_fc1_gateup`).
 - `fold_producer_warps` (default True; requires `active_dispatch_warps == 1`)
   — folds the TMA-A / TMA-B / scheduler warps into the three idle
   dispatch-warpgroup slots and drops the separate producer warpgroup

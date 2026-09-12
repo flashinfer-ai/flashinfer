@@ -244,6 +244,14 @@ if [ "$USE_HEURISTIC" -eq 1 ]; then
 fi
 COMMON_KIND_ARGS="--kind fp8_e4m3"
 COMMON_PERF_ARGS="--perf_run --skip_ref_check"
+# generate_c (training forward): FP8_GENERATE_C=1 adds --generate_c to the
+# MegaMoE runner launches (P02/P03).  Non-swap layouts only; the lean fc12
+# runner (P01) has no raw-C store and is left unchanged.
+FP8_GENERATE_C="${FP8_GENERATE_C:-0}"
+MEGA_GENERATE_C_ARGS=""
+if [ "$FP8_GENERATE_C" = "1" ]; then
+    MEGA_GENERATE_C_ARGS="--generate_c"
+fi
 FP8_ACCUM_MODE="${FP8_ACCUM_MODE:-1xacc}"
 case "$FP8_ACCUM_MODE" in
     1xacc|2xacc)
@@ -412,9 +420,9 @@ run_fc12_case() {
 run_mega_single_case() {
     local args="$1"
     local scale_mode="$2"
-    echo "[CMD] timeout $TIMEOUT_SECONDS env MEGA_NO_DIST=1 $PYTHON $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $MEGA_COMBINE_ARGS"
+    echo "[CMD] timeout $TIMEOUT_SECONDS env MEGA_NO_DIST=1 $PYTHON $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $MEGA_COMBINE_ARGS $MEGA_GENERATE_C_ARGS"
     # shellcheck disable=SC2086
-    timeout "$TIMEOUT_SECONDS" env MEGA_NO_DIST=1 "$PYTHON" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $MEGA_COMBINE_ARGS
+    timeout "$TIMEOUT_SECONDS" env MEGA_NO_DIST=1 "$PYTHON" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $MEGA_COMBINE_ARGS $MEGA_GENERATE_C_ARGS
 }
 
 run_mega_multi_case() {
@@ -436,9 +444,9 @@ run_mega_multi_case() {
         fi
     fi
 
-    echo "[CMD] timeout $TIMEOUT_SECONDS torchrun --standalone --nproc_per_node=$nproc $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $MEGA_COMBINE_ARGS"
+    echo "[CMD] timeout $TIMEOUT_SECONDS torchrun --standalone --nproc_per_node=$nproc $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $MEGA_COMBINE_ARGS $MEGA_GENERATE_C_ARGS"
     # shellcheck disable=SC2086
-    timeout "$TIMEOUT_SECONDS" torchrun --standalone --nproc_per_node="$nproc" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $MEGA_COMBINE_ARGS
+    timeout "$TIMEOUT_SECONDS" torchrun --standalone --nproc_per_node="$nproc" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $MEGA_COMBINE_ARGS $MEGA_GENERATE_C_ARGS
 }
 
 if [ "$LIST_ONLY" -eq 1 ]; then

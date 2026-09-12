@@ -291,6 +291,13 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
     )
     p.add_argument(
+        "--generate-c",
+        action="store_true",
+        default=False,
+        help="training forward: also write the raw pre-SwiGLU fc1 gate+up "
+        "tensor (generate_c=True on every point, both layouts); default off",
+    )
+    p.add_argument(
         "--epi-mode",
         choices=["auto", "basic", "pingpong", "cooperative"],
         default="auto",
@@ -594,6 +601,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         fc1_store_offload=args.fc1_store_offload,
         fc1_early_done_publish=args.fc1_early_done_publish,
         fold_producer_warps=args.fold_producer_warps,
+        generate_c=args.generate_c,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )

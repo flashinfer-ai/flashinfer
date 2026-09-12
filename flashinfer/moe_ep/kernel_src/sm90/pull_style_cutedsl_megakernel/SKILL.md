@@ -80,6 +80,24 @@ not picked them up):
   `_tma_load_b_with_activation_sf_task_tile` in `kernel_fp8_glu_fc12.py`
   takes the sf box's own CTA coord / layout / mask.  n≥16 configs are
   byte-for-byte the same TMA traffic as before.  Not in the drop tree.
+- `generate_c` (2026-09-11, training forward; mirrors the Blackwell MXFP8
+  kernel's contract): `Sm90MegaMoE{,SwapAB}Fp8Kernel(generate_c=False)` and
+  `__call__(..., fc1_c, output_activation, ...)` write the raw pre-SwiGLU
+  fc1 gate+up accumulator (BF16, kernel gate/up-interleaved column order,
+  dequantized) to an expert-major pool tensor with 128-row expert segments;
+  non-swap stores BF16 pairs straight from the wgmma fragments
+  (`epilogue_fp8.py::_store_fc1_c_m64_half`), swap-AB scatters single
+  elements from its transposed tile (`epilogue_fp8_swapab.py::
+  _store_fc1_c_swapab`); both scale modes; compiled out when off.  Host:
+  `mega_runner.py --generate_c` + `_validate_c_output`, `ImplDesc.generate_c`
+  (works with any launch geometry, heuristic or explicit; no separate
+  training descriptor on Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
+  `run_mega_tests.sh` GC01-03, `run_perf_test.sh` `FP8_GENERATE_C=1`,
+  sweep `--generate-c` / `--training-geometry`.  FlashInfer side: shim
+  `MegaMoEHopperFp8Config.generate_c`, `symm_buffer.fc1_c` /
+  `frontend.fc1_c` read-back, backend config knob, bench `--generate-c`,
+  test `test_..._generate_c`.  Developed in the drop worktree first (branch
+  `hopper_fp8_generate_c`); the vendored `src/` copies match it.
 - `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
   (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
   barrier / pull / reuse token-back all follow it; barrier and grid-sync

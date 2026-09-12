@@ -8,6 +8,7 @@ Host driver for the MegaMoE FP8 GLU fused fc1+fc2 kernel.
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -75,8 +76,19 @@ from moe_hopper_fp8.hopper_moe_utils import (
 # =============================================================================
 
 
+@dataclass
 class ImplDesc(_BaseImplDesc):
-    """Hopper FP8 impl descriptor with the swap-AB short-N specializations."""
+    """Hopper FP8 impl descriptor with the swap-AB short-N specializations.
+
+    ``generate_c`` (training forward, default off) makes the kernel also write
+    the raw pre-SwiGLU fc1 gate+up activations to a BF16 ``fc1_c`` tensor --
+    the same contract as the Blackwell MXFP8 ``TrainingImplDesc``.  Works with
+    every launch geometry (both layouts, both scale modes, heuristic or
+    explicit tiles) -- there is no separate training descriptor on Hopper;
+    the runner pads expert pool segments to 128 rows when it is on.
+    """
+
+    generate_c: bool = False
 
     def _validate_mma_cta_mode(self, m: int) -> None:
         if self.use_2cta_instrs:

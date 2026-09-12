@@ -22,6 +22,7 @@ from src.ptx_helpers import red_add_relaxed_sys_v2_bf16x2
 from src.ptx_helpers import red_add_release_gpu_s32
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from common.megamoe_constants import (
+    Fp8GateUpInterleave,
     Fp8E4M3RcpLimit,
 )
 
@@ -33,6 +34,7 @@ from moe_hopper_fp8.epilogue_fp8_common import (
     consume_next_pingpong_work,
     clamp_and_swiglu_sm90,
     stg_fc1_block_scale_row,
+    stg_fc1_c_bf16,
     tma_store_fc1_output,
 )
 
@@ -85,6 +87,8 @@ class SwapABFp8GluEpilogue:
         fc1_store_offload: bool = False,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         pingpong: bool = False,
+        generate_c: bool = False,
+        c_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ) -> None:
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout
@@ -103,6 +107,11 @@ class SwapABFp8GluEpilogue:
         self._fc1_amax_sync_bar_id = fc1_amax_sync_bar_id
         self._epilogue_warp_ids = epilogue_warp_ids
         self._pingpong = pingpong
+        # generate_c (training forward): also write the raw pre-SwiGLU fc1
+        # gate+up accumulator to ``fc1_c`` (BF16, kernel column order); the
+        # swap-AB tile is transposed, so the store scatters per element.
+        self._generate_c = generate_c
+        self._c_dtype = c_dtype
         self._pingpong_order = pingpong
         self._use_2cta_instrs = use_2cta_instrs
         self._cluster_n = cluster_shape_mn[1]
@@ -277,6 +286,7 @@ class SwapABFp8GluEpilogue:
         fc2_act_dequant_scale,
         norm_const,
         storage_group_idx,
+        gmem_fc1_c,
     ) -> None:
         """Dispatch the FC1 epilogue for one completed WGMMA task tile."""
         if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
@@ -295,6 +305,7 @@ class SwapABFp8GluEpilogue:
                 tidx=tidx,
                 _iket_active=_iket_active,
                 storage_group_idx=storage_group_idx,
+                gmem_fc1_c=gmem_fc1_c,
             )
         else:
             self._run_fc1_epilogue_per_tensor(
@@ -314,6 +325,7 @@ class SwapABFp8GluEpilogue:
                 fc2_act_dequant_scale=fc2_act_dequant_scale,
                 norm_const=norm_const,
                 storage_group_idx=storage_group_idx,
+                gmem_fc1_c=gmem_fc1_c,
             )
 
 
@@ -421,6 +433,7 @@ class SwapABFp8GluEpilogue:
         fc2_act_dequant_scale,
         norm_const,
         storage_group_idx,
+        gmem_fc1_c,
     ) -> None:
         """Fold two M64 fragments into one WG-private Nx64 FP8 tile."""
         # Inner epilogue IKET range for swap-AB, FP8 per-tensor FC1. WGMMA has
@@ -442,6 +455,17 @@ class SwapABFp8GluEpilogue:
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
         )
+        if cutlass.const_expr(self._generate_c):
+            self._store_fc1_c_swapab(
+                work_tile_info=work_tile_info,
+                accumulators=accumulators,
+                n_half=n_half,
+                gmem_fc1_c=gmem_fc1_c,
+                token_tile_base=token_tile_base,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                c_scale=fc1_act_weight_dequant_scale,
+            )
 
         for token_group in cutlass.range_constexpr(self._token_group_count):
             self._run_fc1_token_group_swapab_per_tensor(
@@ -497,6 +521,75 @@ class SwapABFp8GluEpilogue:
                 self.glu_clamp,
                 Float32(1.0),
             )
+
+    @cute.jit
+    def _store_fc1_c_swapab(
+        self,
+        work_tile_info,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        gmem_fc1_c: cute.Tensor,
+        token_tile_base,
+        local_warp_idx: int,
+        tidx,
+        c_scale: Float32,
+    ) -> None:
+        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16.
+
+        Same contract as the non-swap kernel (pre-SwiGLU, pre-clamp,
+        pre-routing-weight, dequantized; ``fc1_c[pool_row, intermediate_gateup]``
+        in the kernel's gate/up-interleaved order) with the swap-AB register
+        layout: the CTA tile has intermediate along M and tokens along N.
+        Warpgroup ``n_half`` owns accumulator rows ``[n_half * 128, +128)``
+        of the CTA tile; within a warp's 16-row slab of an M64 fragment a
+        thread holds rows ``lane_group`` (gate) and ``lane_group + 8`` (up)
+        for the token pair ``token_group * 8 + 2 * lane_mod``.  Each value is
+        a separate BF16 element of ``fc1_c`` (the tile is transposed relative
+        to the output), so the store is a scalar STG per value; only valid
+        tokens are written and the expert offset comes straight from
+        ``cumulative_data_physical_row`` (no scheduler-extension slice).
+        ``c_scale``: per-tensor dequant scale, 1.0 for blockwise.
+        """
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
+        col_wg_base = (
+            (
+                work_tile_info.tile_m_idx
+                * cutlass.Int32(self._wgmma_fragment_count)
+                + cutlass.Int32(n_half)
+            )
+            * cutlass.Int32(128)
+            + cutlass.Int32(local_warp_idx * 16)
+            + lane_group
+        )
+        for token_group in cutlass.range_constexpr(self._token_group_count):
+            token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
+            token1 = token0 + cutlass.Int32(1)
+            token0_valid = token0 < valid_tokens
+            token1_valid = token1 < valid_tokens
+            row0 = row_base + token0
+            row1 = row_base + token1
+            for m_sub in cutlass.range_constexpr(2):
+                src = m_sub * self._accum_regs_per_m64 + token_group * 4
+                col_gate = col_wg_base + cutlass.Int32(m_sub * 64)
+                col_up = col_gate + cutlass.Int32(Fp8GateUpInterleave)
+                if token0_valid:
+                    stg_fc1_c_bf16(
+                        gmem_fc1_c, row0, col_gate, accumulators[src + 0] * c_scale
+                    )
+                    stg_fc1_c_bf16(
+                        gmem_fc1_c, row0, col_up, accumulators[src + 2] * c_scale
+                    )
+                if token1_valid:
+                    stg_fc1_c_bf16(
+                        gmem_fc1_c, row1, col_gate, accumulators[src + 1] * c_scale
+                    )
+                    stg_fc1_c_bf16(
+                        gmem_fc1_c, row1, col_up, accumulators[src + 3] * c_scale
+                    )
 
     @cute.jit
     def _apply_fc1_topk_swapab(
@@ -746,6 +839,7 @@ class SwapABFp8GluEpilogue:
         tidx,
         _iket_active,
         storage_group_idx,
+        gmem_fc1_c,
     ) -> None:
         """Process blockwise FC1 token groups in register-bounded chunks."""
         # Inner epilogue IKET range for swap-AB, DeepGEMM-style blockwise FC1.
@@ -783,6 +877,17 @@ class SwapABFp8GluEpilogue:
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
         )
+        if cutlass.const_expr(self._generate_c):
+            self._store_fc1_c_swapab(
+                work_tile_info=work_tile_info,
+                accumulators=accumulators,
+                n_half=n_half,
+                gmem_fc1_c=gmem_fc1_c,
+                token_tile_base=token_tile_base,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                c_scale=Float32(1.0),
+            )
 
         for chunk_idx in cutlass.range_constexpr(
             self._blockwise_fc1_group_chunks
@@ -1154,6 +1259,7 @@ class SwapABFp8GluEpilogue:
         math_wg_order_state,
         epi_wg_order_barrier,
         epi_wg_order_state,
+        gmem_fc1_c,
     ):
         if cutlass.const_expr(self._pingpong_order):
             if _iket_active:
@@ -1212,6 +1318,7 @@ class SwapABFp8GluEpilogue:
             fc2_act_dequant_scale=fc2_act_dequant_scale,
             norm_const=norm_const,
             storage_group_idx=storage_group_idx,
+            gmem_fc1_c=gmem_fc1_c,
         )
         return ab_consumer_state, math_wg_order_state, epi_wg_order_state
 
@@ -1413,6 +1520,7 @@ class SwapABFp8GluEpilogue:
         fc1_offload_empty_mbar_ptr=None,
         fc1_offload_mbox=None,
         token_comm_args=None,
+        gmem_fc1_c=None,
     ) -> None:
         """
         Run the full FP8 fc1+fc2 fused MMA+epilogue task-tile loop.
@@ -1560,6 +1668,7 @@ class SwapABFp8GluEpilogue:
                         math_wg_order_state=math_wg_order_state,
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1573,7 +1682,7 @@ class SwapABFp8GluEpilogue:
                             warpgroup_idx if self._pingpong else 0
                         ),
                         _iket_active=_iket_active,
-                    
+
                         gmem_fc1_done_counter=gmem_fc1_done_counter,
                         fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
                         fc1_offload_mbox=fc1_offload_mbox,
@@ -1619,6 +1728,7 @@ class SwapABFp8GluEpilogue:
                         math_wg_order_state=math_wg_order_state,
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1632,7 +1742,7 @@ class SwapABFp8GluEpilogue:
                             warpgroup_idx if self._pingpong else 0
                         ),
                         _iket_active=_iket_active,
-                    
+
                         gmem_fc1_done_counter=gmem_fc1_done_counter,
                         fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
                         fc1_offload_mbox=fc1_offload_mbox,
@@ -1678,6 +1788,7 @@ class SwapABFp8GluEpilogue:
                         math_wg_order_state=math_wg_order_state,
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1691,7 +1802,7 @@ class SwapABFp8GluEpilogue:
                             warpgroup_idx if self._pingpong else 1
                         ),
                         _iket_active=_iket_active,
-                    
+
                         gmem_fc1_done_counter=gmem_fc1_done_counter,
                         fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
                         fc1_offload_mbox=fc1_offload_mbox,

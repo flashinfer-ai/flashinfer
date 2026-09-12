@@ -188,6 +188,13 @@ class MegaMoEHopperFp8Config:
     # Frees 128 threads + their registers; forces fc1_early_done_publish
     # since the epi_aux store-server warp no longer exists.
     fold_producer_warps: bool = True
+    # Training forward: also write the raw pre-SwiGLU fc1 gate+up accumulator
+    # (BF16, kernel gate/up-interleaved column order) to an expert-major pool
+    # tensor with 128-row-aligned expert segments (``fc1_c`` on the frontend /
+    # symm buffer).  Same contract as the Blackwell MXFP8 kernel's generate_c;
+    # both layouts and both scale modes.  Off by default; the kernel store
+    # path is compiled out when off.
+    generate_c: bool = False
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -713,6 +720,10 @@ class MegaMoEHopperFp8Frontend:
         # Keep the dispatch pool and scheduler on the physical token tile: M
         # for the native layout and N after swapping A/B (driver recipe).
         token_padding_block = c.mma_tiler_mnk[1] if c.swap_ab else c.mma_tiler_mnk[0]
+        if c.generate_c:
+            # fc1_c consumers (weight-gradient GEMMs) want 128-aligned expert
+            # segments; the drop runner uses the same round-up.
+            token_padding_block = 128
 
         kernel_cls = Sm90MegaMoESwapABFp8Kernel if c.swap_ab else Sm90MegaMoEFp8Kernel
         kernel = kernel_cls(
@@ -750,6 +761,7 @@ class MegaMoEHopperFp8Frontend:
             fc1_store_offload=c.fc1_store_offload,
             fc1_early_done_publish=c.fc1_early_done_publish,
             fold_producer_warps=c.fold_producer_warps,
+            generate_c=c.generate_c,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -772,6 +784,14 @@ class MegaMoEHopperFp8Frontend:
             symmetric_base=symmetric_base,
             peer_offsets_list=peer_offsets_list,
         )
+        if c.generate_c:
+            # Expert-major pool rows (kernel.pool_token_capacity already counts
+            # the 128-row padding per local expert); zeroed so pad rows stay 0.
+            mega.fc1_c = torch.zeros(
+                (kernel.pool_token_capacity, c.fc1_out),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
         compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
         compile_kwargs["max_active_clusters"] = max_active_clusters
         if c.enable_iket:
@@ -781,6 +801,20 @@ class MegaMoEHopperFp8Frontend:
         self._mega_key = key
         self._mega = mega
         return self._mega
+
+    @property
+    def fc1_c(self) -> Optional[torch.Tensor]:
+        """generate_c output: raw pre-SwiGLU fc1 gate+up of the last launch.
+
+        ``(pool_rows, 2 * intermediate)`` BF16 in the kernel's gate/up-
+        interleaved column order.  Rows are this rank's expert-major dispatch
+        pool: local expert ``e`` owns rows ``[off[e], off[e] + count[e])`` with
+        ``off[e] = sum(round_up(count[i], 128) for i < e)`` (``count`` = tokens
+        routed to the expert from all ranks); pad rows stay zero.  Row order
+        inside a segment is the dispatch arrival order.  None unless
+        ``config.generate_c``; valid until the next launch.
+        """
+        return None if self._mega is None else self._mega.fc1_c
 
     def _invalidate_compile_cache(self) -> None:
         self._mega_key = None
@@ -1143,6 +1177,7 @@ class MegaMoEHopperFp8Frontend:
             fc2_weight_dequant_scale=self._to_cute(
                 inputs.fc2_weight_dequant_scale, assumed_align=4
             ),
+            fc1_c=(self._to_cute(mega.fc1_c) if mega.fc1_c is not None else None),
             output_activation=self._to_cute(inputs.output_activation),
             local_workspace=self._to_cute_ptr(mega.local_workspace),
             shared_workspace=self._to_cute_ptr(mega.shared_workspace),
@@ -1236,6 +1271,11 @@ class MegaMoEHopperFp8SymmBuffer:
     _unit_scales: Dict[Tuple[str, int], torch.Tensor] = field(default_factory=dict)
     _destroyed: bool = False
 
+    @property
+    def fc1_c(self) -> Optional[torch.Tensor]:
+        """generate_c output of the last launch (``MegaMoEHopperFp8Frontend.fc1_c``)."""
+        return self._frontend.fc1_c
+
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
         if self._destroyed:
@@ -1296,6 +1336,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
+    generate_c: bool = False,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1436,6 +1477,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
+        generate_c=generate_c,
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

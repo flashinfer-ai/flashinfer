@@ -215,7 +215,9 @@ def _preprocess_weights(problem: dict):
     )
 
 
-def _alloc_symm_buffer(problem: dict, rank: int, world_size: int):
+def _alloc_symm_buffer(
+    problem: dict, rank: int, world_size: int, *, generate_c: bool = False
+):
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         get_symm_buffer_for_hopper_fp8_mega_moe,
     )
@@ -232,6 +234,7 @@ def _alloc_symm_buffer(problem: dict, rank: int, world_size: int):
         fp8_scale_mode=problem["fp8_scale_mode"],
         swap_ab=problem["swap_ab"],
         gate_up_clamp=problem["gate_up_clamp"],
+        generate_c=generate_c,
     )
 
 
@@ -1097,7 +1100,46 @@ def _all_gather_stack(t):
     return stacked.view(tc.dtype) if byte_wire else stacked
 
 
-def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
+def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
+    """generate_c: compare the kernel's fc1_c pool with the reference gate+up.
+
+    Rows inside an expert segment follow the dispatch arrival order, so each
+    expert is compared as a sorted flat array (the drop runner's recipe); the
+    128-row segment offsets are rebuilt from the global routing, and the pad
+    rows must have stayed zero.
+    """
+    import torch
+
+    assert fc1_c is not None, "generate_c=True but fc1_c is None"
+    expert_start = rank * num_local_experts
+    counts = [
+        int((idx_g == expert_start + e).sum().item()) for e in range(num_local_experts)
+    ]
+    offsets = [0]
+    for v in counts:
+        offsets.append(offsets[-1] + ((v + 127) // 128) * 128)
+    assert offsets[-1] <= fc1_c.shape[0], (offsets[-1], fc1_c.shape)
+    checked = 0
+    for e in range(num_local_experts):
+        v = counts[e]
+        ref = ref_map.get(expert_start + e)
+        if v == 0 or ref is None:
+            continue
+        rows = fc1_c[offsets[e] : offsets[e] + v]
+        assert rows.shape == ref.shape, (e, tuple(rows.shape), tuple(ref.shape))
+        kernel_c = rows.float().flatten().sort().values
+        ref_c = ref.to(rows.device).float().flatten().sort().values
+        torch.testing.assert_close(kernel_c, ref_c, atol=1e-2, rtol=1e-2)
+        pad = fc1_c[offsets[e] + v : offsets[e + 1]]
+        assert pad.numel() == 0 or pad.abs().max().item() == 0.0, f"expert {e}: non-zero pad rows"
+        checked += 1
+    assert checked > 0, "no local expert received tokens"
+    return checked
+
+
+def _run_mega_torch_oracle(
+    rank, world_size, *, fp8_scale_mode, swap_ab=False, generate_c=False
+):
     """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
 
     Every rank stages its own bf16 shard, runs the fused kernel with real
@@ -1142,7 +1184,9 @@ def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
         n = problem["num_tokens"]
         hidden = problem["hidden"]
 
-        symm_buffer = _alloc_symm_buffer(problem, rank, world_size)
+        symm_buffer = _alloc_symm_buffer(
+            problem, rank, world_size, generate_c=generate_c
+        )
         try:
             stage_mega_moe_inputs(
                 problem["hidden_states"],
@@ -1203,6 +1247,7 @@ def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
                 fc2_output_dtype=torch.bfloat16,
                 gate_up_clamp=problem["gate_up_clamp"],
                 fp8_scale_mode=fp8_scale_mode,
+                return_fc1_gateup=generate_c,
             )
             if fp8_scale_mode == "blockwise":
                 sf_cols = hidden // Fp8BlockScaleK
@@ -1228,6 +1273,9 @@ def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
                 )
             # deepgemm graph folds topk weights before fc1-out quantization, so
             # the per-topk terms reduce with a plain sum; compare this rank's slice.
+            fc1_gateup_ref = None
+            if generate_c:
+                combine_ref, fc1_gateup_ref = combine_ref
             y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
 
             assert torch.isfinite(y_kernel).all()
@@ -1244,6 +1292,19 @@ def _run_mega_torch_oracle(rank, world_size, *, fp8_scale_mode, swap_ab=False):
             # + reference share the same gathered fp8 operands.
             torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
             assert rel_l2.item() < 0.02
+            if generate_c:
+                checked = _check_generate_c_output(
+                    symm_buffer.fc1_c,
+                    fc1_gateup_ref,
+                    idx_g,
+                    rank,
+                    problem["num_experts"] // world_size,
+                )
+                print(
+                    f"[sm90 fp8 generate_c rank {rank} {fp8_scale_mode} "
+                    f"swap_ab={swap_ab}] fc1_c matches the reference gate+up "
+                    f"for {checked} local experts"
+                )
             return rank
         finally:
             # A failing rank must still free its symmetric-heap slice;
@@ -1324,3 +1385,32 @@ def test_sm90_pull_fp8_mega_kernel_is_registered():
         Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     assert kernel.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab",
+    [
+        ("per_tensor", False),
+        ("per_tensor", True),
+        ("blockwise", False),
+        ("blockwise", True),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_multirank_generate_c(fp8_scale_mode, swap_ab):
+    """Training forward (generate_c=True): the raw pre-SwiGLU fc1 gate+up
+    pool written by the kernel matches the multi-rank torch reference for
+    every local expert, on both layouts and both scale modes, while the
+    combined output still matches the oracle."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_torch_oracle(
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        generate_c=True,
+    )

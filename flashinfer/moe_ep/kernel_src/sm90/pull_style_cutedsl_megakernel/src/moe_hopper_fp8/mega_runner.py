@@ -594,6 +594,30 @@ class MegaMoEFp8Tester(MegaMoETester):
                 device="cuda",
             )
 
+        # -- generate_c: raw fc1 gate+up output in the expert-major pool layout
+        # (128-aligned per-expert segments, zero-filled so pad rows stay 0);
+        # same host contract as the Blackwell MXFP8 runner.
+        self._c_output = None
+        self._c_valid_tokens_per_expert = None
+        self._c_data_physical_offsets = None
+        if self.impl.generate_c:
+            expert_start = self.rank * problem.num_experts_per_rank
+            valid_tokens = [
+                int((self._global_topk_idx == expert_start + e).sum().item())
+                for e in range(problem.num_experts_per_rank)
+            ]
+            doff = [0]
+            for v in valid_tokens:
+                doff.append(doff[-1] + round_up(v, 128))
+            intermediate_gateup = int(self._global_fc1_weight.shape[-1])
+            self._c_output = torch.zeros(
+                (max(1, doff[-1]), intermediate_gateup),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            self._c_valid_tokens_per_expert = valid_tokens
+            self._c_data_physical_offsets = doff[:-1]
+
         torch.cuda.synchronize()
         self._check_cuda_rng_consistency()
 
@@ -607,7 +631,7 @@ class MegaMoEFp8Tester(MegaMoETester):
         if self._global_activation is None:
             raise RuntimeError("compute_reference requires generate_inputs first.")
 
-        combine_ref_global, self._global_fc2_activation_dequant_scale = (
+        _ref_out = (
             compute_megamoe_reference_fp8(
                 input_activation=self._global_activation,
                 input_activation_sf=self._global_activation_sf,
@@ -629,8 +653,18 @@ class MegaMoEFp8Tester(MegaMoETester):
                 gate_up_clamp=self.problem.gate_up_clamp,
                 return_fc2_activation_dequant_scale=True,
                 fp8_scale_mode=self.fp8_scale_mode,
+                return_fc1_gateup=self.impl.generate_c,
             )
         )
+        if self.impl.generate_c:
+            (
+                combine_ref_global,
+                self._global_fc2_activation_dequant_scale,
+                self._ref_fc1_gateup_per_expert,
+            ) = _ref_out
+        else:
+            combine_ref_global, self._global_fc2_activation_dequant_scale = _ref_out
+            self._ref_fc1_gateup_per_expert = None
         if self.fp8_scale_mode == "blockwise":
             self.fc2_activation_dequant_scale = torch.ones(
                 (1,), dtype=torch.float32, device=self._global_activation.device
@@ -666,6 +700,7 @@ class MegaMoEFp8Tester(MegaMoETester):
         """Compare the public 2D output against the topk-reduced reference."""
         if self.misc.skip_ref_check:
             return
+        self._validate_c_output()
         if self.output_activation is None:
             raise RuntimeError("validate requires run_kernel first.")
         if self.combine_output_ref is None:
@@ -755,6 +790,61 @@ class MegaMoEFp8Tester(MegaMoETester):
     # Step 4: FP8 kernel launch
     # ------------------------------------------------------------------
 
+    def _validate_c_output(self) -> None:
+        """generate_c: compare ``fc1_c`` with the reference pre-SwiGLU gate+up.
+
+        Token order inside an expert's pool segment follows the multi-rank
+        dispatch order, so both sides are compared as sorted flat arrays per
+        expert (value-level check, robust to dispatch ordering) -- the same
+        recipe as the Blackwell MXFP8 runner.  Raises on mismatch so the test
+        harness fails the case.
+        """
+        if not self.impl.generate_c:
+            return
+        c = self._c_output
+        ref_map = self._ref_fc1_gateup_per_expert
+        if c is None or not ref_map:
+            raise RuntimeError("generate_c validation needs run_kernel + compute_reference first.")
+        valid = self._c_valid_tokens_per_expert
+        doff = self._c_data_physical_offsets
+        expert_start = self.rank * self.problem.num_experts_per_rank
+        print(f"\n{'=' * 60}")
+        print(f"[generate_c][rank{self.rank}] kernel fc1_c vs reference fc1 gate+up:")
+        any_checked = False
+        failures = []
+        for e in range(self.problem.num_experts_per_rank):
+            v_e = valid[e]
+            ref = ref_map.get(expert_start + e)
+            if v_e == 0 or ref is None:
+                continue
+            any_checked = True
+            kernel_rows = c[doff[e] : doff[e] + v_e]
+            if ref.shape != kernel_rows.shape:
+                failures.append(f"expert {e}: shape {tuple(kernel_rows.shape)} vs ref {tuple(ref.shape)}")
+                continue
+            kernel_c = kernel_rows.float().cpu().flatten().sort().values
+            ref_c = ref.float().cpu().flatten().sort().values
+            compare_and_report_mismatches(
+                kernel_c,
+                ref_c,
+                name=f"fc1_c[rank{self.rank}]expert{e}",
+                atol=1e-2,
+                rtol=1e-2,
+                max_mismatches=5,
+            )
+            if not torch.allclose(kernel_c, ref_c, atol=1e-2, rtol=1e-2):
+                max_err = (kernel_c - ref_c).abs().max().item()
+                failures.append(f"expert {e}: max |kernel - ref| = {max_err:.4g}")
+            # pad rows of this expert segment must have stayed zero
+            pad = c[doff[e] + v_e : (doff[e + 1] if e + 1 < len(doff) else c.shape[0])]
+            if pad.numel() and pad.abs().max().item() != 0.0:
+                failures.append(f"expert {e}: non-zero pad rows in fc1_c")
+        if not any_checked:
+            print("  (no valid tokens routed to any local expert)")
+        print("=" * 60)
+        if failures:
+            raise RuntimeError("[generate_c] fc1_c mismatch: " + "; ".join(failures))
+
     def run_kernel(self) -> None:
         """Compile + launch ``Sm90MegaMoEFp8Kernel`` on the current stream.
 
@@ -825,6 +915,11 @@ class MegaMoEFp8Tester(MegaMoETester):
             if self.swap_ab
             else self.impl.mma_tiler_mnk[0]
         )
+        if self.impl.generate_c:
+            # generate_c consumers (weight-gradient GEMMs) want 128-aligned
+            # expert segments; the fc1_c allocation below uses the same
+            # round-up, matching the Blackwell MXFP8 runner.
+            token_padding_block = 128
         self._kernel = Kernel(
             mma_tiler_mnk=self.impl.mma_tiler_mnk,
             cluster_shape_mnk=self.impl.cluster_shape_mnk,
@@ -832,6 +927,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             group_hint=group_hint,
             token_padding_block=token_padding_block,
             sf_padding_block=SfPaddingBlock,
+            generate_c=self.impl.generate_c,
             load_balance_mode=self.impl.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=self.impl.force_static_sched,
@@ -929,6 +1025,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             fc2_weight_sf=fc2_weight_sf_cute,
             fc2_activation_dequant_scale=fc2_activation_dequant_scale_cute,
             fc2_weight_dequant_scale=fc2_weight_dequant_scale_cute,
+            fc1_c=(_to_cute(self._c_output) if self.impl.generate_c else None),
             output_activation=output_activation_cute,
             local_workspace=local_workspace_cute,
             shared_workspace=shared_workspace_cute,
@@ -1098,6 +1195,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["transformers", "deepgemm"],
     )
     parser.add_argument("--enable_iket", action="store_true", default=False)
+    parser.add_argument(
+        "--generate_c", action="store_true", default=False,
+        help="Training forward: also write the raw pre-SwiGLU fc1 gate+up "
+        "accumulator (BF16, kernel column order) to a separate fc1_c tensor "
+        "and validate it against the reference (non-swap layouts only).",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--in_kernel_fc2_reduce", action="store_true", default=False,
@@ -1207,6 +1310,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         token_back_mode=token_back_mode,
         epi_flag_batch=(2, 4),
         flag_batch=1,
+        generate_c=args.generate_c,
     )
 
     misc = MiscDesc(

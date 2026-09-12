@@ -217,3 +217,58 @@ def stg_fc1_block_scale_row(
     rmem_sf = cute.make_rmem_tensor((1,), cutlass.Float32)
     rmem_sf[0] = scale
     cute.autovec_copy(rmem_sf, gmem_sf)
+
+
+@cute.jit
+def stg_fc1_c_bf16x2(
+    real_fc1_c: cute.Tensor,
+    token_idx,
+    col_idx,
+    v0: Float32,
+    v1: Float32,
+) -> None:
+    """generate_c: store two adjacent raw FC1 accumulator values as BF16.
+
+    ``real_fc1_c`` is the scheduler-sliced ``(tokens, intermediate_gateup, 1)``
+    view of the ``fc1_c`` tensor.  The wgmma accumulator layout hands every
+    thread column PAIRS, so ``col_idx`` is even and the pair is one aligned
+    32-bit store (no SMEM staging -- the AB pipeline budget is untouched).
+    """
+    c_base = cute.local_tile(
+        real_fc1_c,
+        (1, 2, 1),
+        (token_idx, col_idx // 2, cutlass.Int32(0)),
+    )
+    gmem_c = cute.make_tensor(c_base.iterator, cute.make_layout(2))
+    rmem_f32 = cute.make_rmem_tensor((2,), Float32)
+    rmem_f32[0] = v0
+    rmem_f32[1] = v1
+    rmem_c = cute.make_rmem_tensor((2,), cutlass.BFloat16)
+    rmem_c.store(rmem_f32.load().to(cutlass.BFloat16))
+    cute.autovec_copy(rmem_c, gmem_c)
+
+
+@cute.jit
+def stg_fc1_c_bf16(
+    real_fc1_c: cute.Tensor,
+    token_idx,
+    col_idx,
+    v: Float32,
+) -> None:
+    """generate_c (swap-AB): store one raw FC1 accumulator value as BF16.
+
+    The swap-AB accumulator is transposed (intermediate along M, tokens
+    along N), so a thread's values for one token are 8 columns apart in
+    ``fc1_c`` and are written one element at a time.
+    """
+    c_base = cute.local_tile(
+        real_fc1_c,
+        (1, 1, 1),
+        (token_idx, col_idx, cutlass.Int32(0)),
+    )
+    gmem_c = cute.make_tensor(c_base.iterator, cute.make_layout(1))
+    rmem_f32 = cute.make_rmem_tensor((1,), Float32)
+    rmem_f32[0] = v
+    rmem_c = cute.make_rmem_tensor((1,), cutlass.BFloat16)
+    rmem_c.store(rmem_f32.load().to(cutlass.BFloat16))
+    cute.autovec_copy(rmem_c, gmem_c)

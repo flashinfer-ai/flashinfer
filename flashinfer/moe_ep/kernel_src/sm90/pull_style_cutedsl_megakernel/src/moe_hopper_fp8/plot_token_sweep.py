@@ -23,7 +23,7 @@ CSV_NAME_RE = re.compile(
     r"(?P<order>swapab|nonswapab)_"
     r"(?P<schedule>legacy|pingpong)_"
     r"CGA(?P<cm>\d+)x(?P<cn>\d+)_"
-    r"TileM(?P<m>\d+)_TileN(?P<n>\d+)\.csv$"
+    r"TileM(?P<m>\d+)_TileN(?P<n>\d+)(?P<genc>_genc)?\.csv$"  # _genc: generate_c sweep
 )
 
 

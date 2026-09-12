@@ -137,6 +137,7 @@ class Sm90SwigluFp8Fc12Kernel:
         fc1_early_done_publish: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
+        generate_c: bool = False,
     ) -> None:
         # v1 only supports the static scheduler specialization. Dynamic CLC
         # scheduling remains future work.
@@ -236,6 +237,12 @@ class Sm90SwigluFp8Fc12Kernel:
         # that is active; also the automatic fallback when the offload's
         # register fit fails (fit_fc1_offload_registers).
         self.fc1_early_done_publish = fc1_early_done_publish
+        # generate_c (training forward): the FC1 epilogue also writes the raw
+        # pre-SwiGLU gate+up accumulator to the caller's ``fc1_c`` tensor
+        # (BF16, kernel column order) -- same contract as the Blackwell MXFP8
+        # kernel.  Off by default; the store path is compiled out when False.
+        self.generate_c = generate_c
+        self.c_dtype = cutlass.BFloat16
         self.epi_flag_batch = epi_flag_batch
         self.gate_up_clamp = (
             abs(gate_up_clamp) if gate_up_clamp is not None else None
@@ -502,6 +509,8 @@ class Sm90SwigluFp8Fc12Kernel:
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_output_rcp_limit=self.fp8_output_rcp_limit,
             pingpong=self.pingpong,
+            generate_c=self.generate_c,
+            c_dtype=self.c_dtype,
         )
         _epi_common["fc1_store_offload"] = self.fc1_store_offload
         _epi_common["fc1_early_done_publish"] = self.fc1_early_done_publish
@@ -2057,6 +2066,7 @@ class Sm90SwigluFp8Fc12Kernel:
         # ``cutlass.const_expr(token_comm_args is not None)`` so they vanish
         # at codegen time on the lean path.
         token_comm_args=None,
+        fc1_c: Optional[cute.Tensor] = None,  # generate_c: (tokens_sum_padded, intermediate_gateup) BF16
     ) -> None:
         """Launch the fused fc1+fc2 GLU FP8 kernel."""
 
@@ -2153,6 +2163,20 @@ class Sm90SwigluFp8Fc12Kernel:
                 stride=(fc1_output.stride[0], fc1_output.stride[1], 0),
             ),
         )
+        # generate_c: raw fc1 gate+up output as a (tokens_sum, intermediate_gateup,
+        # fake-L=1) GEMM-domain view so ``ext.get_gmem_tensor("c", ...)`` applies
+        # the per-expert token offset.  Without generate_c the fc1_output view
+        # stands in as a never-read placeholder (as the Blackwell MXFP8 kernel does).
+        if cutlass.const_expr(self.generate_c):
+            fc1_c_gemm = cute.make_tensor(
+                fc1_c.iterator,
+                cute.make_layout(
+                    (fc1_c.shape[0], fc1_c.shape[1], 1),
+                    stride=(fc1_c.stride[0], fc1_c.stride[1], 0),
+                ),
+            )
+        else:
+            fc1_c_gemm = fc1_output_gemm
 
         # ── GEMM-domain transform for fc2 phase ──
         #
@@ -2499,6 +2523,7 @@ class Sm90SwigluFp8Fc12Kernel:
             fc1_weight_dequant_scale,
             fc1_output_gemm,
             fc1_output_sf_gemm,
+            fc1_c_gemm,
             # GEMM-domain tensors (fc2)
             fc2_weight_gemm,
             fc2_weight_sf_gemm,
@@ -2558,6 +2583,7 @@ class Sm90SwigluFp8Fc12Kernel:
         fc1_weight_dequant_scale: cute.Tensor,
         fc1_output_gemm: cute.Tensor,
         fc1_output_sf_gemm: cute.Tensor,
+        fc1_c_gemm: cute.Tensor,
         # GEMM-domain tensors (fc2)
         fc2_weight_gemm: cute.Tensor,
         fc2_weight_sf_gemm: cute.Tensor,
@@ -3341,6 +3367,7 @@ class Sm90SwigluFp8Fc12Kernel:
                 tma_atom_fc2_output=tma_atom_fc2_output,
                 gmem_fc1_output=tma_tensor_fc1_output,
                 gmem_fc1_output_sf=fc1_output_sf_gemm,
+                gmem_fc1_c=fc1_c_gemm,
                 smem_activation_sf=sActivationSf,
                 smem_weight_sf=sWeightSf,
                 gmem_topk_scores=topk_scores,
