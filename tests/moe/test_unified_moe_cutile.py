@@ -234,7 +234,7 @@ def _cutile_device_is_supported() -> bool:
 
 cutile_bf16_required = pytest.mark.skipif(
     not _cutile_device_is_supported(),
-    reason="requires a working cuTile toolchain on SM89/SM90/SM120/SM121",
+    reason="requires a working cuTile toolchain on SM89/SM90/SM100/SM103/SM120/SM121",
 )
 
 
@@ -840,7 +840,7 @@ def _cutile_nvfp4_is_supported() -> bool:
 
 cutile_nvfp4_required = pytest.mark.skipif(
     not _cutile_nvfp4_is_supported(),
-    reason="requires a working cuTile toolchain on SM120/SM121",
+    reason="requires a working cuTile toolchain on SM100/SM103/SM120/SM121",
 )
 
 
