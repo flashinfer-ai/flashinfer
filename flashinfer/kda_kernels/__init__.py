@@ -26,7 +26,11 @@ Exported:
 - run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
 - run_fused_kda_decode: Fused Kimi K3 conv, recurrent KDA, and RMSNorm backend
 - run_packed_kda_decode: Packed Kimi K3 T=1 recurrent decode backend
-- run_kda_prefill_sm120: SM120a ordinary multi-token prefill backend
+
+The ``*_kda_prefill_sm120`` names below are the optional facade that
+``flashinfer.kda_prefill`` dispatches through; they are not part of this
+package's public surface. Reach that backend through ``flashinfer.kda_prefill``,
+or ``flashinfer.kda_kernels.sm120_prefill`` for its cache controls.
 """
 
 from typing import Optional
@@ -101,13 +105,10 @@ except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
     run_kda_prefill_sm120 = None  # type: ignore
 
 __all__ = [
-    "can_implement_kda_prefill_sm120",
-    "clear_kda_prefill_sm120_caches",
     "fused_kda_decode",
     "packed_kda_decode",
     "recurrent_kda",
     "run_fused_kda_decode",
-    "run_kda_prefill_sm120",
     "run_packed_kda_decode",
     "run_recurrent_kda",
 ]

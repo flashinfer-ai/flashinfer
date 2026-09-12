@@ -80,6 +80,17 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 constexpr int WARP_SIZE = 32;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
+__device__ __forceinline__ float computeSafeFP8QuantScale(float row_amax) {
+  if (!(row_amax > 0.0f)) {
+    return 1.0f;
+  }
+
+  constexpr float FP8_E4M3_MAX = 448.0f;
+  constexpr float MIN_AMAX_FOR_FINITE_SCALE = FP8_E4M3_MAX / FLT_MAX;
+  // A tiny nonzero amax can make FP8_E4M3_MAX / row_amax overflow to infinity.
+  return FP8_E4M3_MAX / fmaxf(row_amax, MIN_AMAX_FOR_FINITE_SCALE);
+}
+
 struct FloatMaxOp {
   __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
 };
@@ -1730,7 +1741,7 @@ __global__ void expandInputRowsKernel(
       float const row_amax =
           BlockReduce(reduce_storage).Reduce(AmaxOp::to_float(thread_amax), FloatMaxOp{});
       if (threadIdx.x == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+        float const quant = computeSafeFP8QuantScale(row_amax);
         float residual = 1.0f;
         if (fp8_expert_residual_scale) {
           int const expert = permuted_token_selected_experts[permuted_row];
@@ -2518,7 +2529,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
       __shared__ float shared_token_quant_scale;
       float const row_amax = BlockReduce(reduce_storage).Reduce(thread_amax, FloatMaxOp{});
       if (tid == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+        float const quant = computeSafeFP8QuantScale(row_amax);
         float residual = 1.0f;
         // The GEMM1 profiler passes no expert map and does not consume the generated FC2 scale.
         if (fp8_expert_residual_scale && permuted_token_selected_experts) {
