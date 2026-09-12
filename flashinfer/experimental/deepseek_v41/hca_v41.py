@@ -59,12 +59,9 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.arch import Arch
 from cutlass.cute.arch import nvvm_wrappers as _nvw
-from cutlass.cutlass_dsl import BaseDSL
 
 from ...cute_dsl.attention.dsa.hca_helpers import (
-    ceil_div,
     MAX_SPLITS,
     LOG2_E,
     HCAStaticTileScheduler,
@@ -172,15 +169,11 @@ class BlackwellV41MixedCacheDecode:
         self.compressed_is_fp4 = compressed_is_fp4
         # Upper bound on selected compressed keys per row; sizes the SMEM slot cache.
         self.max_topk = max_topk
-        self.use_2cta_instrs = mma_qk_tiler_mn[0] == 128
-        self.use_primitives = not self.use_2cta_instrs
         self.native_fp4 = native_fp4
-        self.cluster_shape_mnk = (2 if self.use_2cta_instrs else 1, 1, 1)
-        if not self.use_2cta_instrs:
-            assert mma_qk_tiler_mn == (64, 64)
-            assert mma_pv_tiler_mn == (64, 128)
-        # When using 2 CTAs with m=128: warps 0-1 handle accumulation for first half [0, n/2),
-        # while warps 2-3 handle accumulation for second half [n/2, n)
+        self.cluster_shape_mnk = (1, 1, 1)
+        assert mma_qk_tiler_mn == (64, 64)
+        assert mma_pv_tiler_mn == (64, 128)
+        # Both schedules split each head's scores across two warp pairs.
         self.warps_in_n = 2
         self.num_compute_warps = 4
         self.threads_per_warp = 32
@@ -213,8 +206,7 @@ class BlackwellV41MixedCacheDecode:
         # Dequant group: gathers raw FP8/FP4 rows with plain loads and writes
         # the BF16 K and V tiles that the UMMA warps consume.
         assert dequant_warps in (8, 16)
-        assert dequant_warps == 8 or not self.use_2cta_instrs
-        assert not use_ws or (dequant_warps == 16 and not self.use_2cta_instrs)
+        assert not use_ws or (dequant_warps == 16)
         self.dequant_warp_ids = tuple(
             range(7 if use_ws else 15, (7 if use_ws else 15) + dequant_warps)
         )
@@ -246,21 +238,18 @@ class BlackwellV41MixedCacheDecode:
         # The standard 24-warp schedule retains 96 for each softmax/correction
         # warp and 80 for dequant; its total is 1912 <= 24 * 80.
         self.softmax_reg_num = 192 if use_ws else 96
-        self.correction_reg_num = 136 if self.use_2cta_instrs else 96
-        self.other_reg_num = 40 if self.use_2cta_instrs else 32
+        self.correction_reg_num = 96
+        self.other_reg_num = 32
         self.idle_reg_num = 24
         self.dequant_reg_num = (
             (64 if dequant_warps == 16 else 96)
             if use_ws
-            else (56 if self.use_2cta_instrs else 48 if dequant_warps == 16 else 80)
+            else (48 if dequant_warps == 16 else 80)
         )
         # Raw 16-byte chunks each dequant thread keeps in flight per phase.
         self.dequant_phase_chunks = dequant_phase_chunks
         # The wrapper proves both complete cache pools fit before narrowing.
         self.offset_dtype = cutlass.Int32 if narrow_offsets else cutlass.Int64
-        # Timing-attribution switch (results are wrong when != 0): 1 = dequant
-        # warps only run the pipeline, 2 = loads only, 3 = convert+store only.
-        self.dbg_mode = 0
         # The V4.1 sliding window (128 keys) sits at the head of the key
         # sequence and spans window_tiles key tiles; window_indices has shape
         # [window_len, rows].
@@ -310,8 +299,7 @@ class BlackwellV41MixedCacheDecode:
             num_threads=self.threads_per_warp * len(self.dequant_warp_ids),
         )
         self.init_row_max = -float("inf")
-        self.tmem_corr_stage_cols = 4
-        self.tmem_s_offset = 0 if self.use_2cta_instrs else (16 << 16)
+        self.tmem_s_offset = 16 << 16
 
     def _setup_attributes(self):
         """Set up configurations and parameters for the HCA kernel operation.
@@ -338,14 +326,7 @@ class BlackwellV41MixedCacheDecode:
         # mbarrier ring grows, since all output slices already occupy TMEM.
         self.mma_o_stage = self.iterations_pv_n
 
-        self.tmem_o_offset = (
-            (self.mma_s_stage * self.mma_qk_tiler[1] // self.warps_in_n)
-            if self.use_2cta_instrs
-            else 0
-        )
-        self.correction_factor_offset = (
-            self.tmem_o_offset + self.latent_dim // self.warps_in_n
-        )
+        self.tmem_o_offset = 0
 
     @cute.jit
     def __call__(
@@ -367,7 +348,6 @@ class BlackwellV41MixedCacheDecode:
         output_scale: cutlass.Float32,
         attn_sink_unscaled: cute.Tensor,
         stream: cuda.CUstream,
-        debug_kv: Optional[cute.Tensor] = None,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
 
@@ -431,10 +411,12 @@ class BlackwellV41MixedCacheDecode:
         :raises TypeError: If tensor data types don't match or aren't supported
         """
 
-        # Prefetch the unsplit M64 route, where one CTA consumes many key
-        # tiles. Retain producer ordering for split and two-CTA routes. The
+        # Prefetch unsplit requests, where one CTA consumes many key tiles.
+        # Retain producer ordering for split requests. The
         # workspace optional type is static even with symbolic tensor shapes.
-        self.prefetch_raw = not self.use_2cta_instrs and workspace is None
+        self.prefetch_raw = workspace is None
+        if cutlass.const_expr(self.use_ws and workspace is not None):
+            raise ValueError("The WS schedule requires unsplit output")
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_latent.element_type
@@ -550,9 +532,7 @@ class BlackwellV41MixedCacheDecode:
 
         self._setup_attributes()
 
-        cta_group = (
-            tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        )
+        cta_group = tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from smem & k-major
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -680,13 +660,6 @@ class BlackwellV41MixedCacheDecode:
                 ],
                 1024,
             ]
-            smem_vc: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.v_dtype,
-                    cute.cosize(vc_smem_layout_staged) if self.use_2cta_instrs else 0,
-                ],
-                1024,
-            ]
             softmax_smem_exchange: cute.struct.MemRange[
                 self.acc_dtype, 2 * self.num_compute_warps * self.threads_per_warp
             ]
@@ -699,9 +672,7 @@ class BlackwellV41MixedCacheDecode:
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp
             ]
 
-            smem_metadata: cute.struct.MemRange[
-                self.acc_dtype, 0 if self.use_2cta_instrs else 1024
-            ]
+            smem_metadata: cute.struct.MemRange[self.acc_dtype, 1024]
 
             # Tmem dealloc cluster barrier
             tmem_dealloc_mbar: cutlass.Int64
@@ -742,7 +713,6 @@ class BlackwellV41MixedCacheDecode:
             softmax_scale_log2,
             output_scale,
             attn_sink_unscaled,
-            debug_kv,
             q_latent_smem_layout_staged,
             kc_latent_smem_layout_staged,
             p_smem_layout_staged,
@@ -823,7 +793,6 @@ class BlackwellV41MixedCacheDecode:
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         attn_sink_unscaled: cute.Tensor,
-        mDebugKV: Optional[cute.Tensor],
         q_latent_smem_layout_staged: cute.ComposedLayout,
         kc_latent_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
@@ -926,7 +895,7 @@ class BlackwellV41MixedCacheDecode:
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_pv_warp_id,
-            is_two_cta=self.use_2cta_instrs,
+            is_two_cta=False,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
             arch=self.arch_str,
         )
@@ -975,19 +944,12 @@ class BlackwellV41MixedCacheDecode:
         # SW128 tiles, addressed with explicit swizzle math).
         sKC_base = storage.smem_kc_latent.data_ptr()
         # (MMA, MMA_D, MMA_K, PIPE)
-        if cutlass.const_expr(self.use_2cta_instrs):
-            sVC = storage.smem_vc.get_tensor(
-                vc_smem_layout_staged.outer, swizzle=vc_smem_layout_staged.inner
-            )
-            sVC_base = storage.smem_vc.data_ptr()
-        else:
-            # M64 single CTA: QK's K-major (64 keys, 128 latent) tile and
-            # PV's MN-major (128 latent, 64 keys) tile use the same SW128
-            # bytes. Both consumers retain the stage until PV completes.
-            sVC = storage.smem_kc_latent.get_tensor(
-                vc_smem_layout_staged.outer, swizzle=vc_smem_layout_staged.inner
-            )
-            sVC_base = storage.smem_kc_latent.data_ptr()
+        # M64 single CTA: QK's K-major (64 keys, 128 latent) tile and
+        # PV's MN-major (128 latent, 64 keys) tile use the same SW128
+        # bytes. Both consumers retain the stage until PV completes.
+        sVC = storage.smem_kc_latent.get_tensor(
+            vc_smem_layout_staged.outer, swizzle=vc_smem_layout_staged.inner
+        )
         sSlots = storage.smem_slots.get_tensor(
             cute.make_layout(self.window_len + self.max_topk)
         )
@@ -1008,11 +970,9 @@ class BlackwellV41MixedCacheDecode:
         #
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk)
 
-        sMeta = None
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            sMeta = storage.smem_metadata.get_tensor(
-                cute.make_layout((128, 4, 2), stride=(1, 128, 512))
-            )
+        sMeta = storage.smem_metadata.get_tensor(
+            cute.make_layout((128, 4, 2), stride=(1, 128, 512))
+        )
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including window indices, compressed page table, and data
@@ -1134,8 +1094,6 @@ class BlackwellV41MixedCacheDecode:
                         mWindowIndices=mWindowIndices,
                         mCmpIndices=mCmpIndices,
                         sKC_base=sKC_base,
-                        sVC_base=sVC_base,
-                        mDebugKV=mDebugKV,
                         bidx=bidx,
                     )
                     while k_tile_count > 0:
@@ -1422,12 +1380,6 @@ class BlackwellV41MixedCacheDecode:
                         )
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
-
-            if cutlass.const_expr(self.use_2cta_instrs):
-                # A CTA must stay alive until its peer has finished all DSMEM
-                # V stores, including tiles whose query heads are padding.
-                prims.barrier_cluster_arrive()
-                prims.barrier_cluster_wait()
             return
 
         else:
@@ -1672,12 +1624,6 @@ class BlackwellV41MixedCacheDecode:
                         )
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
-
-            if cutlass.const_expr(self.use_2cta_instrs):
-                # A CTA must stay alive until its peer has finished all DSMEM
-                # V stores, including tiles whose query heads are padding.
-                prims.barrier_cluster_arrive()
-                prims.barrier_cluster_wait()
             return
 
     @cute.kernel
@@ -1858,36 +1804,6 @@ class BlackwellV41MixedCacheDecode:
                 element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
                 mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
         return
-
-    @staticmethod
-    def get_split_kv(
-        B: int, S: int, K: int, mma_qk_tiler_mn: tuple, max_active_blocks: int
-    ) -> int:
-        """Get the proper split_kv value for the HCA kernel based on parameters.
-
-        :param B: Batch size
-        :type B: int
-        :param S: Sequence length
-        :type S: int
-        :param K: Sequence length
-        :type K: int
-        :param mma_qk_tiler_mn: HCA QK tiling parameters
-        :type mma_qk_tiler_mn: tuple
-        :param max_active_blocks: Maximum number of active blocks
-        :type max_active_blocks: int
-        :return: Split_kv value
-        :rtype: int
-        """
-        max_splits = ceil_div(K, mma_qk_tiler_mn[1])
-        blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
-        split_heur = min(max_splits, blocks_per_batch)
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
-        k_waves = ceil_div(max_splits, split_heur)
-        split_wave_aware = ceil_div(max_splits, k_waves)
-        max_split_kv = 32
-        return min(split_wave_aware, max_split_kv)
 
     @cute.jit
     def get_effective_hca_k(
@@ -2094,29 +2010,16 @@ class BlackwellV41MixedCacheDecode:
         hw.store_bf16_fragment(frag, self._smem_dst(base_ptr, elem_off))
 
     @cute.jit
-    def _store_frag_dsmem(
-        self, frag, base_ptr, elem_off: cutlass.Int32, rank: cutlass.Int32
-    ) -> None:
-        """Same store into the tile of cluster CTA `rank` (may be this CTA)
-        through the shared::cluster window."""
-        if cutlass.const_expr(self.use_2cta_instrs):
-            dst = cute.arch.map_dsmem_ptr(self._smem_dst(base_ptr, elem_off), rank)
-            cute.autovec_copy(frag, cute.make_tensor(dst, cute.make_layout(8)))
-
-    @cute.jit
     def _store_fp4_chunk(
         self,
         chunk,
         sc_word: cutlass.Int32,
         k_base,
         e0k: cutlass.Int32,
-        v_base,
-        e0v: cutlass.Int32,
-        owner: cutlass.Int32,
     ) -> None:
         """32 E2M1 elements (two 16-groups; E4M3 scale bytes in sc_word[7:0],
         [15:8]) -> four 8-element BF16 fragments, each written to this CTA's K
-        tile and to the V tile of CTA `owner`."""
+        tile shared by QK and PV."""
         if cutlass.const_expr(self.native_fp4):
             # E2M1 times finite E4M3 needs at most six significant bits;
             # packed BF16 multiplication is exact and avoids FP32 expansion.
@@ -2134,7 +2037,6 @@ class BlackwellV41MixedCacheDecode:
                     cute.make_layout(8),
                 )
                 self._store_frag(bf16_frag, k_base, e0k + q * 8)
-                self._store_frag_dsmem(bf16_frag, v_base, e0v + q * 8, owner)
         else:
             # Preserve the same kernel on older bundled CUDA toolchains that
             # do not support PTX 9.2's native BF16 conversion instructions.
@@ -2147,7 +2049,6 @@ class BlackwellV41MixedCacheDecode:
                     sc = s1
                 frag = self._to_bf16_frag(self._fp4x8_to_f32x8(chunk[q]) * sc)
                 self._store_frag(frag, k_base, e0k + q * 8)
-                self._store_frag_dsmem(frag, v_base, e0v + q * 8, owner)
 
     @cute.jit
     def _store_fp8_chunk(
@@ -2156,9 +2057,6 @@ class BlackwellV41MixedCacheDecode:
         sc_byte: cutlass.Int32,
         k_base,
         e0k: cutlass.Int32,
-        v_base,
-        e0v: cutlass.Int32,
-        owner: cutlass.Int32,
     ) -> None:
         """16 E4M3 elements with one E8M0 scale -> two 8-element fragments."""
         sf = self._e8m0_to_f32(sc_byte)
@@ -2174,7 +2072,6 @@ class BlackwellV41MixedCacheDecode:
             )
             frag = self._to_bf16_frag(vals * sf)
             self._store_frag(frag, k_base, e0k + 8 * h)
-            self._store_frag_dsmem(frag, v_base, e0v + 8 * h, owner)
 
     @cute.jit
     def _lane_map(self, l: cutlass.Int32, rpi: cutlass.Constexpr):
@@ -2191,7 +2088,6 @@ class BlackwellV41MixedCacheDecode:
         self,
         slots: cute.Tensor,
         key: cutlass.Int32,
-        table_row: cutlass.Int32,
         page_bytes: cutlass.Int32,
         page_size: cutlass.Constexpr,
         row_bytes: cutlass.Constexpr,
@@ -2214,23 +2110,17 @@ class BlackwellV41MixedCacheDecode:
         slots: cute.Tensor,
         key_base: cutlass.Int32,
         k_base,
-        v_base,
         page_size: cutlass.Constexpr,
         is_fp4: cutlass.Constexpr,
         load_k_producer_state: pipeline.PipelineState,
         load_v_producer_state: pipeline.PipelineState,
     ) -> None:
-        """This CTA's n_cta keys x 512 latent of one key tile, gathered and
-        converted once, written twice: into this CTA's K tile (K-major B
-        operand of QK) and into the V tile of the CTA that owns the latent
-        range (MN-major B operand of PV), the peer's through the cluster
-        shared-memory window. So each element of the tile is converted once
-        per cluster instead of once for K and once for V.
+        """Gather and dequantize one 64-key tile into shared BF16 K/V storage.
 
-        V placement (verified element-wise against the TMA-written tile of the
-        original kernel): grouped by PV K-block of kpk keys, then output slice
-        j, then 64-latent block, then key row, then latent. All loads of a
-        phase are issued before the first conversion."""
+        QK and PV read different views of the same SW128 bytes. Each phase
+        issues its raw loads before conversion and waits for both consumers
+        to release the stage before storing new values.
+        """
         # This function is reached only by the dequant warp interval, so
         # tidx_g is nonnegative. Keep lane/row arithmetic unsigned to avoid
         # signed division/remainder fixups and their live address temporaries.
@@ -2239,7 +2129,6 @@ class BlackwellV41MixedCacheDecode:
         l = dequant_tid % self.threads_per_warp
         cta = dq.cta_in_cluster
         n_cta = self.mma_qk_tiler[1] // self.cluster_shape_mnk[0]
-        kpk = self.mma_pv_tiler[2]
         rows_per_warp = n_cta // len(self.dequant_warp_ids)
         # Four rows give eight lanes (128 contiguous bytes) per row.
         # M64 processes two row groups; stores stay SW128 conflict-free.
@@ -2248,8 +2137,6 @@ class BlackwellV41MixedCacheDecode:
         lpr = self.threads_per_warp // rpi
         chunk_elems = 32 if is_fp4 else 16
         cpb = 64 // chunk_elems  # chunks per 64-latent swizzle row
-        cpo = 128 // chunk_elems  # chunks per owner segment
-        cps = 256 // chunk_elems  # chunks per output slice
         row_bytes = self.latent_dim // (2 if is_fp4 else 1)
         scale_bytes = self.latent_dim // 16 if is_fp4 else self.latent_dim // 32
         groups = (row_bytes // 16) // lpr
@@ -2263,7 +2150,6 @@ class BlackwellV41MixedCacheDecode:
             d, sc = self._row_offsets(
                 slots,
                 key_base + cta * n_cta + n,
-                dq.table_row,
                 page_bytes,
                 page_size,
                 row_bytes,
@@ -2312,30 +2198,20 @@ class BlackwellV41MixedCacheDecode:
                     + n * 64
                     + within
                 )
-                nt = cta * n_cta + n  # key row within the tile
-                j = cq // cps
-                owner = (cq // cpo) & 1
-                e0v = (
-                    (nt // kpk) * (kpk * 256)
-                    + j * (kpk * 128)
-                    + (blk64 & 1) * (kpk * 64)
-                    + (nt & (kpk - 1)) * 64
-                    + within
-                )
                 chunk = cute.make_tensor(chunks.iterator + 4 * ii, cute.make_layout(4))
-                if cutlass.const_expr(self.dbg_mode == 2):
-                    sink = cute.make_tensor(
-                        cute.recast_ptr(k_base, dtype=cutlass.Int32) + dq.tidx_g,
-                        cute.make_layout(1),
-                    )
-                    sink[0] = chunk[0] ^ chunk[1] ^ chunk[2] ^ chunk[3] ^ scs[ii]
-                elif cutlass.const_expr(is_fp4):
+                if cutlass.const_expr(is_fp4):
                     self._store_fp4_chunk(
-                        chunk, scs[ii], k_base, e0k, v_base, e0v, owner
+                        chunk,
+                        scs[ii],
+                        k_base,
+                        e0k,
                     )
                 else:
                     self._store_fp8_chunk(
-                        chunk, scs[ii], k_base, e0k, v_base, e0v, owner
+                        chunk,
+                        scs[ii],
+                        k_base,
+                        e0k,
                     )
 
     @cute.jit
@@ -2348,24 +2224,17 @@ class BlackwellV41MixedCacheDecode:
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         """Produce this CTA's share of the BF16 K tile and V tile of one key
         tile (see _dequant_rows)."""
-        # Per-stage tile sizes: K = this CTA's keys x 512; V = all keys of the
-        # tile x this CTA's 256 latent columns.
+        # One BF16 tile is shared by QK's K operand and PV's V operand.
         k_stage_elems = (
             self.mma_qk_tiler[1] // self.cluster_shape_mnk[0]
         ) * self.latent_dim
-        v_stage_elems = self.mma_qk_tiler[1] * (
-            self.latent_dim // self.cluster_shape_mnk[0]
-        )
         n_tile = self.mma_qk_tiler[1]
         is_win = k_index < self.window_tiles
         key_base = k_index * n_tile  # absolute key: window keys, then compressed
 
-        # Both stages of a tile are freed by the same UMMA completions in both
-        # CTAs (tcgen05.commit multicasts to the pair), so once this CTA's
-        # stage is free the peer's is too and the remote V writes are safe.
-        # The selected M64 route acquires after its raw-load phase.
-        # Keep the peer-CTA lifetime protocol and no-load diagnostic unchanged.
-        if cutlass.const_expr(not self.prefetch_raw or self.dbg_mode == 1):
+        # Both QK and PV must finish reading before dequant may reuse a stage.
+        # Unsplit requests acquire after their raw-load prefetch phase.
+        if cutlass.const_expr(not self.prefetch_raw):
             dq.load_k_pipeline.producer_acquire(load_k_producer_state)
             dq.load_v_pipeline.producer_acquire(load_v_producer_state)
         # Rebuild the stage pointers with their alignment fact: a dynamic stage
@@ -2378,23 +2247,13 @@ class BlackwellV41MixedCacheDecode:
             cute.AddressSpace.smem,
             assumed_align=1024,
         )
-        v_base = cute.make_ptr(
-            self.v_dtype,
-            dq.sVC_base.toint()
-            + load_v_producer_state.index * (v_stage_elems * self.v_dtype.width // 8),
-            cute.AddressSpace.smem,
-            assumed_align=1024,
-        )
-        if cutlass.const_expr(self.dbg_mode == 1):
-            pass
-        elif is_win:
+        if is_win:
             self._dequant_rows(
                 dq,
                 dq.mWinPool,
                 dq.sSlots,
                 key_base,
                 k_base,
-                v_base,
                 self.window_page_size,
                 False,
                 load_k_producer_state,
@@ -2407,28 +2266,13 @@ class BlackwellV41MixedCacheDecode:
                 dq.sSlots,
                 key_base,
                 k_base,
-                v_base,
                 self.compressed_page_size,
                 self.compressed_is_fp4,
                 load_k_producer_state,
                 load_v_producer_state,
             )
-        # Publish local writes to UMMA. Only the two-CTA path also writes
-        # peer V tiles and needs the cluster-scope fence; M64 aliases K/V
-        # locally, so a second fence would unnecessarily drain its pipeline.
+        # Publish the shared K/V writes before either UMMA consumer proceeds.
         prims.fence_proxy("async_shared", space=prims.SharedSpace.shared_cta)
-        if cutlass.const_expr(self.use_2cta_instrs):
-            prims.fence_proxy("async_shared", space=prims.SharedSpace.shared_cluster)
-        if cutlass.const_expr(dq.mDebugKV is not None):
-            # Debug: dump this CTA's K and V stages of tile 0 (first cluster) as
-            # raw element order: mDebugKV[0/1 (K/V), cta*32768 + elem].
-            # (diagnostic only; intended for a single-tile, single-cluster run)
-            for i in cutlass.range_constexpr(256):
-                e = dq.tidx_g * 256 + i
-                kv = cute.make_tensor(k_base + e, cute.make_layout(1))
-                vv = cute.make_tensor(v_base + e, cute.make_layout(1))
-                dq.mDebugKV[0, dq.cta_in_cluster * 32768 + e] = kv[0]
-                dq.mDebugKV[1, dq.cta_in_cluster * 32768 + e] = vv[0]
         dq.load_k_pipeline.producer_commit(load_k_producer_state)
         load_k_producer_state.advance()
         dq.load_v_pipeline.producer_commit(load_v_producer_state)
@@ -2441,15 +2285,13 @@ class BlackwellV41MixedCacheDecode:
             cute.select(self.mma_qk_tiler, mode=[0, 1])
         )
         fragment = tiled_mma_qk.make_fragment_C(cute.append(shape, self.mma_s_stage))
-        layout = fragment.layout
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            # M64 SS fragments otherwise pack stages into the unused 16
-            # datapaths. Keep both score stages in the odd datapath groups;
-            # the even groups hold the live output accumulator.
-            layout = cute.make_layout(
-                fragment.shape,
-                stride=(*fragment.stride[:3], self.mma_qk_tiler[1]),
-            )
+        # M64 SS fragments otherwise pack stages into the unused 16
+        # datapaths. Keep both score stages in the odd datapath groups;
+        # the even groups hold the live output accumulator.
+        layout = cute.make_layout(
+            fragment.shape,
+            stride=(*fragment.stride[:3], self.mma_qk_tiler[1]),
+        )
         return layout
 
     @cute.jit
@@ -2543,8 +2385,7 @@ class BlackwellV41MixedCacheDecode:
             tOtO.layout,
             cute.make_layout(
                 common_params.L // self.mma_pv_tiler[1],
-                stride=self.mma_pv_tiler[1]
-                // (self.warps_in_n if self.use_2cta_instrs else 1),
+                stride=self.mma_pv_tiler[1],
             ),
         )
         tOtO_staged = cute.make_tensor(
@@ -2621,31 +2462,16 @@ class BlackwellV41MixedCacheDecode:
         if cutlass.const_expr(wait_q):
             load_q_pipeline.consumer_wait(load_q_consumer_state)
         load_k_pipeline.consumer_wait(load_k_consumer_state)
-        if cutlass.const_expr(self.use_primitives):
-            if cutlass.const_expr(self.use_ws):
-                hw.qk_mma_ws(qk_params.sKC, load_k_consumer_state.index)
-            else:
-                hw.qk_mma(
-                    qk_params.sQ,
-                    qk_params.sKC,
-                    tStS.iterator,
-                    load_k_consumer_state.index,
-                )
-            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+        if cutlass.const_expr(self.use_ws):
+            hw.qk_mma_ws(qk_params.sKC, load_k_consumer_state.index)
         else:
-            for q_stage in range(self.iterations_qk_latent):
-                kc_stage = load_k_consumer_state.index
-                for k_block in cutlass.range_constexpr(
-                    cute.size(qk_params.tSrQ.shape[2])
-                ):
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tStS,
-                        qk_params.tSrQ[None, None, k_block, (q_stage, 0)],
-                        qk_params.tSrKC[None, None, k_block, (q_stage, kc_stage)],
-                        tStS,
-                    )
-                    tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
+            hw.qk_mma(
+                qk_params.sQ,
+                qk_params.sKC,
+                tStS.iterator,
+                load_k_consumer_state.index,
+            )
+        tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
         load_k_pipeline.consumer_release(load_k_consumer_state)
         load_k_consumer_state.advance()
         if cutlass.const_expr(wait_q):
@@ -2727,40 +2553,17 @@ class BlackwellV41MixedCacheDecode:
             for acc_stage in range(self.iterations_pv_n):
                 mma_o_pipeline.producer_acquire(mma_o_producer_state)
                 tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
-                if cutlass.const_expr(self.use_primitives):
-                    tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-                    hw.pv_mma(
-                        pv_params.sP,
-                        pv_params.sVC,
-                        tOtO.iterator,
-                        p_mma_consumer_state.index,
-                        vc_stage,
-                        acc_stage,
-                        accumulate_flag,
-                    )
-                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
-                else:
-                    for p_stage in range(self.iterations_pv_k):
-                        tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-                        for k_block in cutlass.range_constexpr(pv_params.tOrP.shape[2]):
-                            cute.gemm(
-                                tiled_mma_pv,
-                                tOtO,
-                                pv_params.tOrP[
-                                    None,
-                                    None,
-                                    k_block,
-                                    (p_stage, p_mma_consumer_state.index),
-                                ],
-                                pv_params.tOrVC[
-                                    None,
-                                    None,
-                                    k_block,
-                                    ((acc_stage, p_stage), vc_stage),
-                                ],
-                                tOtO,
-                            )
-                            tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
+                hw.pv_mma(
+                    pv_params.sP,
+                    pv_params.sVC,
+                    tOtO.iterator,
+                    p_mma_consumer_state.index,
+                    vc_stage,
+                    acc_stage,
+                    accumulate_flag,
+                )
+                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
                 mma_o_pipeline.producer_commit(mma_o_producer_state)
                 mma_o_producer_state.advance()
         load_v_pipeline.consumer_release(load_v_consumer_state)
@@ -2848,69 +2651,20 @@ class BlackwellV41MixedCacheDecode:
         p_cor_producer_state: pipeline.PipelineState,
     ) -> tuple[pipeline.PipelineState, cutlass.Float32]:
         """Compute the correction factor for the last k tile."""
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            no_correction = cutlass.Int32(0)
-            if (
-                row_max_new - row_max
-            ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
-                no_correction = cutlass.Int32(1)
-                row_max_new = row_max
-            stage = p_cor_producer_state.index
-            common_params.sMeta[tidx, 0, stage] = row_sum
-            common_params.sMeta[tidx, 1, stage] = row_max_new
-            common_params.sMeta[tidx, 2, stage] = correction_factor
-            common_params.sMeta[tidx, 3, stage] = no_correction.to(cutlass.Float32)
-            common_params.p_cor_pipeline.producer_commit(p_cor_producer_state)
-            p_cor_producer_state.advance()
-            return p_cor_producer_state, row_max_new
-        else:
-            no_correction = 0
-            if (
-                row_max_new - row_max
-            ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
-                no_correction = 1
-                row_max_new = row_max
-
-            # pad for 4x32b
-            corr_layout = cute.make_layout(
-                (tAcc.shape[0], (4, tAcc.shape[1][1]), self.mma_s_stage),
-                stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
-            )
-            tCor = cute.make_tensor(
-                common_params.tmem_ptr + self.correction_factor_offset,
-                corr_layout,
-            )
-            cCor = cute.make_identity_tensor(tCor.shape)
-            corr_tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
-            )
-            corr_tmem_store_tiled_copy = tcgen05.make_tmem_copy(
-                corr_tmem_store_atom, tCor
-            )
-            corr_tmem_store_thr_copy = corr_tmem_store_tiled_copy.get_slice(tidx)
-            cCor_for_copy = corr_tmem_store_thr_copy.partition_S(cCor)
-            tCor_for_copy = corr_tmem_store_thr_copy.partition_D(tCor)
-            rCor = cute.make_fragment_like(
-                cCor_for_copy[None, None, None, 0], self.acc_dtype
-            )
-            rCor_int = cute.make_tensor(
-                cute.recast_ptr(rCor.iterator, dtype=cutlass.Int32), rCor.layout
-            )
-            rCor[0] = row_sum
-            rCor[1] = row_max_new
-            rCor[2] = correction_factor
-            rCor_int[3] = no_correction
-
-            cute.copy(
-                corr_tmem_store_tiled_copy,
-                rCor,
-                tCor_for_copy[None, None, None, p_cor_producer_state.index],
-            )
-            # fence between tmem store and correction warp
-            prims.tcgen05_wait("store")
-            common_params.p_cor_pipeline.producer_commit(p_cor_producer_state)
-            p_cor_producer_state.advance()
-            return p_cor_producer_state, row_max_new
+        no_correction = cutlass.Int32(0)
+        if (
+            row_max_new - row_max
+        ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+            no_correction = cutlass.Int32(1)
+            row_max_new = row_max
+        stage = p_cor_producer_state.index
+        common_params.sMeta[tidx, 0, stage] = row_sum
+        common_params.sMeta[tidx, 1, stage] = row_max_new
+        common_params.sMeta[tidx, 2, stage] = correction_factor
+        common_params.sMeta[tidx, 3, stage] = no_correction.to(cutlass.Float32)
+        common_params.p_cor_pipeline.producer_commit(p_cor_producer_state)
+        p_cor_producer_state.advance()
+        return p_cor_producer_state, row_max_new
 
     @cute.jit
     def softmax_advance_to_next_group(
@@ -3129,61 +2883,12 @@ class BlackwellV41MixedCacheDecode:
         init_row_max: cutlass.Float32,
         init_row_sum: cutlass.Float32,
     ) -> None:
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            tidx = common_params.tidx % 128
-            stage = p_cor_producer_state.index
-            common_params.sMeta[tidx, 0, stage] = init_row_sum
-            common_params.sMeta[tidx, 1, stage] = init_row_max
-            common_params.sMeta[tidx, 2, stage] = self.acc_dtype(1.0)
-            common_params.sMeta[tidx, 3, stage] = self.acc_dtype(1.0)
-        else:
-            init_tidx = common_params.tidx % (
-                self.num_compute_warps * self.threads_per_warp
-            )
-            init_tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
-                cute.select(self.mma_qk_tiler, mode=[0, 1])
-            )
-            init_tStS_layout = softmax_params.tiled_mma_qk.make_fragment_C(
-                cute.append(init_tStS_shape, self.mma_s_stage)
-            ).layout
-            init_tStS = cute.make_tensor(
-                common_params.tmem_ptr + self.tmem_s_offset, init_tStS_layout
-            )
-            init_tAcc = init_tStS[(None, None), 0, 0, 0]
-
-            init_corr_layout = cute.make_layout(
-                (init_tAcc.shape[0], 4, self.mma_s_stage),
-                stride=(init_tAcc.stride[0], 1, self.tmem_corr_stage_cols),
-            )
-            init_tCor = cute.make_tensor(
-                common_params.tmem_ptr + self.correction_factor_offset,
-                init_corr_layout,
-            )
-            init_cCor = cute.make_identity_tensor(init_tCor.shape)
-            init_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
-            )
-            init_tiled_copy = tcgen05.make_tmem_copy(init_store_atom, init_tCor)
-            init_thr_copy = init_tiled_copy.get_slice(init_tidx)
-            init_cCor_part = init_thr_copy.partition_S(init_cCor)
-            init_tCor_part = init_thr_copy.partition_D(init_tCor)
-            init_rCor = cute.make_fragment_like(
-                init_cCor_part[None, None, None, 0], self.acc_dtype
-            )
-            init_rCor_int = cute.make_tensor(
-                cute.recast_ptr(init_rCor.iterator, dtype=cutlass.Int32),
-                init_rCor.layout,
-            )
-            init_rCor[0] = init_row_sum
-            init_rCor[1] = init_row_max
-            init_rCor[2] = self.acc_dtype(1.0)
-            init_rCor_int[3] = cutlass.Int32(1)
-            cute.copy(
-                init_tiled_copy,
-                init_rCor,
-                init_tCor_part[None, None, None, p_cor_producer_state.index],
-            )
-            prims.tcgen05_wait("store")
+        tidx = common_params.tidx % 128
+        stage = p_cor_producer_state.index
+        common_params.sMeta[tidx, 0, stage] = init_row_sum
+        common_params.sMeta[tidx, 1, stage] = init_row_max
+        common_params.sMeta[tidx, 2, stage] = self.acc_dtype(1.0)
+        common_params.sMeta[tidx, 3, stage] = self.acc_dtype(1.0)
 
     @cute.jit
     def load_other_group_metadata(
@@ -3192,45 +2897,9 @@ class BlackwellV41MixedCacheDecode:
         softmax_params: SimpleNamespace,
         p_cor_producer_state: pipeline.PipelineState,
     ) -> tuple[cutlass.Float32, cutlass.Float32]:
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            tidx = common_params.tidx % 128
-            stage = (p_cor_producer_state.index + 1) % self.mma_s_stage
-            return common_params.sMeta[tidx, 1, stage], common_params.sMeta[
-                tidx, 0, stage
-            ]
-        else:
-            other_stage = (p_cor_producer_state.index + 1) % self.mma_s_stage
-            tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
-            tStS_shape = softmax_params.tiled_mma_qk.partition_shape_C(
-                cute.select(self.mma_qk_tiler, mode=[0, 1])
-            )
-            tStS_layout = softmax_params.tiled_mma_qk.make_fragment_C(
-                cute.append(tStS_shape, self.mma_s_stage)
-            ).layout
-            tStS = cute.make_tensor(
-                common_params.tmem_ptr + self.tmem_s_offset, tStS_layout
-            )
-            tAcc = tStS[(None, None), 0, 0, 0]
-            corr_layout = cute.make_layout(
-                (tAcc.shape[0], 4, self.mma_s_stage),
-                stride=(tAcc.stride[0], 1, self.tmem_corr_stage_cols),
-            )
-            tCor = cute.make_tensor(
-                common_params.tmem_ptr + self.correction_factor_offset, corr_layout
-            )
-            cCor = cute.make_identity_tensor(tCor.shape)
-            load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
-            )
-            load_tiled_copy = tcgen05.make_tmem_copy(load_atom, tCor)
-            load_thr_copy = load_tiled_copy.get_slice(tidx)
-            tCor_part = load_thr_copy.partition_S(tCor)
-            cCor_part = load_thr_copy.partition_D(cCor)
-            rCor = cute.make_fragment_like(
-                cCor_part[None, None, None, 0], self.acc_dtype
-            )
-            cute.copy(load_tiled_copy, tCor_part[None, None, None, other_stage], rCor)
-            return rCor[1], rCor[0]
+        tidx = common_params.tidx % 128
+        stage = (p_cor_producer_state.index + 1) % self.mma_s_stage
+        return common_params.sMeta[tidx, 1, stage], common_params.sMeta[tidx, 0, stage]
 
     @cute.jit
     def store_p_cor_row_sum(
@@ -3241,33 +2910,7 @@ class BlackwellV41MixedCacheDecode:
         tAcc: cute.Tensor,
         tidx: cutlass.Int32,
     ) -> None:
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            common_params.sMeta[tidx, 0, saved_stage_idx] = row_sum
-        else:
-            corr_layout_1 = cute.make_layout(
-                (tAcc.shape[0], 1, self.mma_s_stage),
-                stride=(tAcc.stride[0], 1, self.tmem_corr_stage_cols),
-            )
-            tCor = cute.make_tensor(
-                common_params.tmem_ptr + self.correction_factor_offset,
-                corr_layout_1,
-            )
-            cCor = cute.make_identity_tensor(tCor.shape)
-            store_atom = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), self.acc_dtype
-            )
-            tiled_copy = tcgen05.make_tmem_copy(store_atom, tCor)
-            thr_copy = tiled_copy.get_slice(tidx)
-            cCor_for_copy = thr_copy.partition_S(cCor)
-            tCor_for_copy = thr_copy.partition_D(tCor)
-            rCor = cute.make_fragment_like(
-                cCor_for_copy[None, None, None, 0], self.acc_dtype
-            )
-            rCor[0] = row_sum
-            cute.copy(
-                tiled_copy, rCor, tCor_for_copy[None, None, None, saved_stage_idx]
-            )
-            prims.tcgen05_wait("store")
+        common_params.sMeta[tidx, 0, saved_stage_idx] = row_sum
 
     @cute.jit
     def softmax(
@@ -3316,79 +2959,35 @@ class BlackwellV41MixedCacheDecode:
         cS = cute.make_identity_tensor(cute.select(cta_qk_tiler, mode=[0, 1]))
 
         tmem_load_atom = cute.make_copy_atom(
-            (
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
-                if self.use_2cta_instrs
-                else tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(32))
-            ),
+            (tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(32))),
             self.acc_dtype,
         )
         tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
 
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
-        tTR_tAcc = tmem_thr_copy.partition_S(tAcc)
         tTR_tS = tmem_thr_copy.partition_D(cS)
         tTR_rAcc = cute.make_fragment_like(tTR_tS, self.acc_dtype)
 
         row_max_new = row_max
-        arch = BaseDSL._get_dsl().get_arch_enum()
-        if cutlass.const_expr(
-            not self.use_2cta_instrs or (arch >= Arch.sm_100 and arch <= Arch.sm_100f)
-        ):
-            if cutlass.const_expr(self.use_primitives):
-                if cutlass.const_expr(self.use_ws):
-                    hw.load_ws_scores(
-                        tTR_rAcc,
-                        common_params.score_exchange,
-                        mma_s_consumer_state.index,
-                        self.softmax_exchange_sync_bar_1.barrier_id
-                        if is_second_compute_warp
-                        else self.softmax_exchange_sync_bar_0.barrier_id,
-                    )
-                else:
-                    hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
-            else:
-                cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                sparse_k_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                is_valid = (common_params.sSlots[sparse_k_idx] >= 0) & (
-                    cute.elem_less(sparse_k_idx, tile_valid_len)
-                )
-                tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
-            row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
-            tmem_load_red_atom = cute.make_copy_atom(
-                tcgen05.copy.LdRed32x32bOp(
-                    tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
-                ),
-                self.acc_dtype,
+        if cutlass.const_expr(self.use_ws):
+            hw.load_ws_scores(
+                tTR_rAcc,
+                common_params.score_exchange,
+                mma_s_consumer_state.index,
+                self.softmax_exchange_sync_bar_1.barrier_id
+                if is_second_compute_warp
+                else self.softmax_exchange_sync_bar_0.barrier_id,
             )
-            tmem_red_tiled_copy = tcgen05.make_tmem_copy(tmem_load_red_atom, tAcc)
-            tmem_red_thr_copy = tmem_red_tiled_copy.get_slice(tidx)
-            tTR_tAcc_red = tmem_red_thr_copy.partition_S(tAcc)
-            tTR_tS_red = tmem_red_thr_copy.partition_D(cS)
-            tTR_rAcc_red = cute.make_fragment_like(tTR_tS_red, self.acc_dtype)
-            tTR_rMax = cute.make_rmem_tensor(
-                cute.make_layout((1, tTR_tS_red.shape[1], tTR_tS_red.shape[2])),
-                self.acc_dtype,
+        else:
+            hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
+        for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            sparse_k_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
+            is_valid = (common_params.sSlots[sparse_k_idx] >= 0) & (
+                cute.elem_less(sparse_k_idx, tile_valid_len)
             )
-            cute.copy(tmem_red_tiled_copy, tTR_tAcc_red, (tTR_rAcc_red, tTR_rMax))
-            tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
-            if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    sparse_k_idx = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    is_valid = cute.elem_less(sparse_k_idx, tile_valid_len)
-                    tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
-                row_max_new = tTR_rAcc.load().reduce(
-                    cute.ReductionOp.MAX, row_max_new, 0
-                )
-            else:
-                row_max_new = cute.arch.fmax(row_max_new, tTR_rMax[0])
-
-        # The primitives helper already waits before returning its fragment.
-        if cutlass.const_expr(not self.use_primitives):
-            prims.tcgen05_wait("load")
+            tTR_rAcc[i] = tTR_rAcc[i] if is_valid else -self.acc_dtype.inf
+        row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
         softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
 
         group_offset = self.num_compute_warps * self.threads_per_warp
@@ -3404,9 +3003,7 @@ class BlackwellV41MixedCacheDecode:
             )
             row_max_new = cute.arch.fmax(
                 row_max_new,
-                common_params.smem_exchange[
-                    my_base + (tidx ^ (64 if self.use_2cta_instrs else 16))
-                ],
+                common_params.smem_exchange[my_base + (tidx ^ (16))],
             )
 
         if cutlass.const_expr(self.use_ws):
@@ -3623,8 +3220,7 @@ class BlackwellV41MixedCacheDecode:
             tOtO.layout,
             cute.make_layout(
                 common_params.L // self.mma_pv_tiler[1],
-                stride=self.mma_pv_tiler[1]
-                // (self.warps_in_n if self.use_2cta_instrs else 1),
+                stride=self.mma_pv_tiler[1],
             ),
         )
         tOtO = cute.make_tensor(
@@ -3640,11 +3236,7 @@ class BlackwellV41MixedCacheDecode:
         tAcc = tOtO[(None, None), 0, 0]
 
         tmem_load_atom = cute.make_copy_atom(
-            (
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
-                if self.use_2cta_instrs
-                else tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(32))
-            ),
+            (tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(32))),
             self.acc_dtype,
         )
         tmem_load_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
@@ -3722,18 +3314,9 @@ class BlackwellV41MixedCacheDecode:
                 + (iter_n // 2) * 256
                 + (iter_n % 2) * 64
             )
-            if cutlass.const_expr(common_params.mAccO is None):
-                row_view = common_params.mO[
-                    head, None, common_params.blk_coord[1], common_params.blk_coord[2]
-                ]
-            else:
-                row_view = common_params.mAccO[
-                    head,
-                    common_params.blk_coord[3],
-                    None,
-                    common_params.blk_coord[1],
-                    common_params.blk_coord[2],
-                ]
+            row_view = common_params.mO[
+                head, None, common_params.blk_coord[1], common_params.blk_coord[2]
+            ]
             tTR_gO = cute.make_tensor(
                 row_view.iterator + col, cute.make_layout(tTR_rAcc.shape)
             )
@@ -3762,77 +3345,27 @@ class BlackwellV41MixedCacheDecode:
         :return: The P correction consumer state, the row_sum, the row_max, and the correction factor
         :rtype: tuple[pipeline.PipelineState, cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Int32]
         """
-        if cutlass.const_expr(not self.use_2cta_instrs):
-            common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
-            tidx = common_params.tidx % 128
-            stage = p_cor_consumer_state.index
-            # Non-final tiles publish correction metadata before computing
-            # the updated sum for the next softmax group. That sum slot is
-            # still being written; correction only needs it for epilogue.
-            row_sum = self.acc_dtype(0.0)
-            if is_last_tile:
-                row_sum = common_params.sMeta[tidx, 0, stage]
-            row_max = common_params.sMeta[tidx, 1, stage]
-            correction_factor = common_params.sMeta[tidx, 2, stage]
-            no_correction = common_params.sMeta[tidx, 3, stage].to(cutlass.Int32)
-            common_params.p_cor_pipeline.consumer_release(p_cor_consumer_state)
-            p_cor_consumer_state.advance()
-            return (
-                p_cor_consumer_state,
-                row_sum,
-                row_max,
-                correction_factor,
-                no_correction,
-            )
-        else:
-            common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
-            tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
-            # load correction factor
-            _, tAcc, _, _, _, _ = self._tmem_load_partition(
-                common_params, common_params.tiled_mma_pv, 0
-            )
-            corr_layout = cute.make_layout(
-                (tAcc.shape[0], (4, tAcc.shape[1][1]), self.p_cor_stage),
-                stride=(tAcc.stride[0], (1, tAcc.stride[1][1]), 4),
-            )
-            tCor = cute.make_tensor(
-                common_params.tmem_ptr + self.correction_factor_offset, corr_layout
-            )
-            cCor = cute.make_identity_tensor(tCor.shape)
-            corr_tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(4)), self.acc_dtype
-            )
-            corr_tmem_load_tiled_copy = tcgen05.make_tmem_copy(
-                corr_tmem_load_atom, tCor
-            )
-            corr_tmem_load_thr_copy = corr_tmem_load_tiled_copy.get_slice(tidx)
-            tCor_for_copy = corr_tmem_load_thr_copy.partition_S(tCor)
-            cCor_for_copy = corr_tmem_load_thr_copy.partition_D(cCor)
-            rCor = cute.make_fragment_like(
-                cCor_for_copy[None, None, None, 0], self.acc_dtype
-            )
-            rCor_int = cute.make_tensor(
-                cute.recast_ptr(rCor.iterator, dtype=cutlass.Int32), rCor.layout
-            )
-            cute.copy(
-                corr_tmem_load_tiled_copy,
-                tCor_for_copy[None, None, None, p_cor_consumer_state.index],
-                rCor,
-            )
-            row_sum = rCor[0]
-            row_max = rCor[1]
-            correction_factor = rCor[2]
-            no_correction = rCor_int[3]
-
-            common_params.p_cor_pipeline.consumer_release(p_cor_consumer_state)
-            p_cor_consumer_state.advance()
-            return (
-                p_cor_consumer_state,
-                row_sum,
-                row_max,
-                correction_factor,
-                no_correction,
-            )
+        common_params.p_cor_pipeline.consumer_wait(p_cor_consumer_state)
+        tidx = common_params.tidx % 128
+        stage = p_cor_consumer_state.index
+        # Non-final tiles publish correction metadata before computing
+        # the updated sum for the next softmax group. That sum slot is
+        # still being written; correction only needs it for epilogue.
+        row_sum = self.acc_dtype(0.0)
+        if is_last_tile:
+            row_sum = common_params.sMeta[tidx, 0, stage]
+        row_max = common_params.sMeta[tidx, 1, stage]
+        correction_factor = common_params.sMeta[tidx, 2, stage]
+        no_correction = common_params.sMeta[tidx, 3, stage].to(cutlass.Int32)
+        common_params.p_cor_pipeline.consumer_release(p_cor_consumer_state)
+        p_cor_consumer_state.advance()
+        return (
+            p_cor_consumer_state,
+            row_sum,
+            row_max,
+            correction_factor,
+            no_correction,
+        )
 
     @cute.jit
     def rescale(
@@ -3867,25 +3400,11 @@ class BlackwellV41MixedCacheDecode:
                     )
                 )
 
-                # tmem store tiled copy
-                tmem_store_atom = cute.make_copy_atom(
-                    (
-                        tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32))
-                        if self.use_2cta_instrs
-                        else tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(32))
-                    ),
-                    self.acc_dtype,
-                )
-                tmem_store_tiled_copy = tcgen05.make_tmem_copy(tmem_store_atom, tAcc)
-
                 # load o
-                if cutlass.const_expr(self.use_primitives):
-                    if cutlass.const_expr(self.use_ws):
-                        hw.load_tmem_ws(tAcc.iterator, tTR_rAcc)
-                    else:
-                        hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
+                if cutlass.const_expr(self.use_ws):
+                    hw.load_tmem_ws(tAcc.iterator, tTR_rAcc)
                 else:
-                    cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+                    hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
                 # rescale, using `mul_packed_f32x2` to reduce the number of instructions
                 for i in cutlass.range(
                     cute.size(tTR_rAcc), vectorize=True, unroll_full=True
@@ -3893,13 +3412,10 @@ class BlackwellV41MixedCacheDecode:
                     tTR_rAcc[i] = tTR_rAcc[i] * correction_factor
 
                 # store o to tensor memory for next k tile
-                if cutlass.const_expr(self.use_primitives):
-                    if cutlass.const_expr(self.use_ws):
-                        hw.store_tmem_ws(tTR_rAcc, tAcc.iterator)
-                    else:
-                        hw.store_tmem_m64(tTR_rAcc, tAcc.iterator)
+                if cutlass.const_expr(self.use_ws):
+                    hw.store_tmem_ws(tTR_rAcc, tAcc.iterator)
                 else:
-                    cute.copy(tmem_store_tiled_copy, tTR_rAcc, tTR_tAcc)
+                    hw.store_tmem_m64(tTR_rAcc, tAcc.iterator)
 
             prims.tcgen05_wait("store")
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
@@ -3950,7 +3466,7 @@ class BlackwellV41MixedCacheDecode:
                 thread_count=self.epilogue_exchange_sync_bar.num_threads,
             )
             # (64, 2)
-            row_sum = row_sum + exchange[(tidx ^ (64 if self.use_2cta_instrs else 16))]
+            row_sum = row_sum + exchange[(tidx ^ (16))]
 
             # LSE is shared by every PV-N output tile. Store it once before
             # materializing the large O fragment so its global pointer and
@@ -4012,9 +3528,9 @@ class BlackwellV41MixedCacheDecode:
                 cute.math.log2(row_sum, fastmath=True)
                 + epilogue_params.softmax_scale_log2 * row_max
             )
-            lse_row = tidx if self.use_2cta_instrs else ((tidx // 32) * 16 + tidx % 16)
+            lse_row = (tidx // 32) * 16 + tidx % 16
             if cute.elem_less(cLSE[lse_row][0], common_params.H):
-                if self.use_2cta_instrs or tidx % 32 < 16:
+                if tidx % 32 < 16:
                     if cutlass.const_expr(epilogue_params.mAccLSE is None):
                         gLSE[lse_row] = lse / LOG2_E
                     else:
@@ -4050,13 +3566,10 @@ class BlackwellV41MixedCacheDecode:
             )
 
             # load o
-            if cutlass.const_expr(self.use_primitives):
-                if cutlass.const_expr(self.use_ws):
-                    hw.load_tmem_ws(tAcc.iterator, tTR_rAcc)
-                else:
-                    hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
+            if cutlass.const_expr(self.use_ws):
+                hw.load_tmem_ws(tAcc.iterator, tTR_rAcc)
             else:
-                cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+                hw.load_tmem_m64(tAcc.iterator, tTR_rAcc)
 
             # Keep the vectorized epilogue branch-free. An empty causal split
             # has a zero accumulator and selects a zero reciprocal, while its
@@ -4084,30 +3597,19 @@ class BlackwellV41MixedCacheDecode:
                 tR2G_rO_src = tTR_rAcc
 
             if cutlass.const_expr(self.use_ws):
-                if cutlass.const_expr(common_params.mAccO is None):
-                    hw.stage_ws_output_sw128(
-                        tR2G_rO_src, common_params.output_exchange, iter_n
+                hw.stage_ws_output_sw128(
+                    tR2G_rO_src, common_params.output_exchange, iter_n
+                )
+                hw.issue_ws_output(
+                    common_params.output_map,
+                    common_params.output_exchange,
+                    (
+                        common_params.blk_coord[2] * common_params.mO.shape[2]
+                        + common_params.blk_coord[1]
                     )
-                    hw.issue_ws_output(
-                        common_params.output_map,
-                        common_params.output_exchange,
-                        (
-                            common_params.blk_coord[2] * common_params.mO.shape[2]
-                            + common_params.blk_coord[1]
-                        )
-                        * common_params.H,
-                        iter_n,
-                    )
-                else:
-                    hw.store_ws_output(
-                        tR2G_rO_src,
-                        common_params.output_exchange,
-                        common_params.mO,
-                        common_params.mAccO,
-                        common_params.blk_coord,
-                        common_params.H,
-                        iter_n,
-                    )
+                    * common_params.H,
+                    iter_n,
+                )
 
             else:
                 if cute.elem_less(tTR_cO[0][0], common_params.H):
@@ -4116,23 +3618,11 @@ class BlackwellV41MixedCacheDecode:
                         tR2G_rO_dst,
                         l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                     )
-
-            # The primitives helper already completed this TMEM load.
-            if cutlass.const_expr(not self.use_primitives):
-                prims.tcgen05_wait("load")
             common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
             mma_o_consumer_state.advance()
 
-        if cutlass.const_expr(self.use_ws and common_params.mAccO is None):
-            hw.flush_ws_output(
-                common_params.output_map,
-                common_params.output_exchange,
-                (
-                    common_params.blk_coord[2] * common_params.mO.shape[2]
-                    + common_params.blk_coord[1]
-                )
-                * common_params.H,
-            )
+        if cutlass.const_expr(self.use_ws):
+            hw.flush_ws_output()
         return mma_o_consumer_state
 
     def make_and_init_load_qkv_pipeline(
@@ -4336,37 +3826,6 @@ class BlackwellV41MixedCacheDecode:
 
         return tile_sched_params, grid
 
-    @staticmethod
-    def get_workspace_size(
-        H: int,
-        S: int,
-        D: int,
-        B: int,
-        split_kv: int,
-        acc_dtype: Type[cutlass.Numeric],
-    ) -> int:
-        """Get the extra workspace(device memory) size for the HCA kernel when split_kv is not 1.
-
-        :param H: The height of the output tensor C
-        :type H: int
-        :param S: The sequence length of the output tensor C
-        :type S: int
-        :param D: The depth of the output tensor C
-        :type D: int
-        :param B: The batch size of the output tensor C
-        :type B: int
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: int
-        :param acc_dtype: The data type of the output tensor C
-        :type acc_dtype: Type[cutlass.Numeric]
-
-        :return: The workspace size for the HCA kernel
-        :rtype: int
-        """
-        if split_kv == 1:
-            return 0
-        return B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
-
     @cute.jit
     def initialize_workspace(
         self,
@@ -4424,124 +3883,3 @@ class BlackwellV41MixedCacheDecode:
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)
         return acc_o, acc_lse
-
-    @staticmethod
-    def can_implement(
-        B: int,
-        S: int,
-        K: int,
-        H: int,
-        L: int,
-        in_dtype: Type[cutlass.Numeric],
-        out_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
-        lse_dtype: Type[cutlass.Numeric],
-        mma_qk_tiler_mn: Tuple[int, int],
-        mma_pv_tiler_mn: Tuple[int, int],
-        split_kv: int,
-        is_persistent: bool,
-        is_var_seq: bool,
-        is_var_split_kv: bool,
-        page_size_cmp: int,
-    ) -> bool:
-        """Check if the HCA kernel can be implemented.
-
-        :param B: The batch size of the output tensor C
-        :type B: int
-        :param S: The sequence length of the output tensor C
-        :type S: int
-        :param K: The width of the output tensor KV
-        :type K: int
-        :param H: The number of heads of the output tensor C
-        :type H: int
-        :param L: The full per-head depth (head_dim) of the tensor KV
-            (last `qk_rope_head_dim` lanes assumed pre-rotated by caller)
-        :type L: int
-        :param in_dtype: The data type of the input tensor
-        :type in_dtype: Type[cutlass.Numeric]
-        :param out_dtype: The data type of the output tensor
-        :type out_dtype: Type[cutlass.Numeric]
-        :param acc_dtype: The data type of the accumulator
-        :type acc_dtype: Type[cutlass.Numeric]
-        :param lse_dtype: The data type of the log-sum-exp
-        :type lse_dtype: Type[cutlass.Numeric]
-        :param mma_qk_tiler_mn: The tile shape of the query-key matrix multiplication
-        :type mma_qk_tiler_mn: Tuple[int, int]
-        :param mma_pv_tiler_mn: The tile shape of the probability-value matrix multiplication
-        :type mma_pv_tiler_mn: Tuple[int, int]
-        :param split_kv: The split key-value of the output tensor C
-        :type split_kv: int
-        :param is_persistent: Whether to use persistent kernel optimization
-        :type is_persistent: bool
-        :param is_var_seq: Whether to use variable sequence length
-        :type is_var_seq: bool
-        :param is_var_split_kv: Whether to use variable split_kv
-        :type is_var_split_kv: bool
-        :param page_size_cmp: Page size for compressed-KV stream
-        :type page_size_cmp: int
-
-        :return: Whether the HCA kernel can be implemented
-        :rtype: bool
-        """
-        if L != 512:
-            return False
-        if in_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
-            return False
-        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
-            return False
-        if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
-            return False
-        if split_kv < 1 or split_kv > MAX_SPLITS:
-            return False
-        # The compressed stream remains paged and must satisfy the TMA 128B
-        # alignment requirement. Window gather4 splits the sequence tile across
-        # two CTAs, with each CTA issuing groups of four indices.
-        if page_size_cmp <= 1 or mma_qk_tiler_mn[1] % page_size_cmp != 0:
-            return False
-        if page_size_cmp & (page_size_cmp - 1) != 0:
-            return False
-        if mma_qk_tiler_mn[1] % 8 != 0:
-            return False
-        if mma_qk_tiler_mn[0] != mma_pv_tiler_mn[0]:
-            return False
-        if mma_qk_tiler_mn[0] == 64:
-            # The shared K/V and TMEM layouts below specialize H64 decode.
-            if (
-                mma_qk_tiler_mn != (64, 64)
-                or mma_pv_tiler_mn != (64, 128)
-                or H != 64
-                or S != 1
-                or is_persistent
-                or is_var_split_kv
-                or in_dtype != cutlass.BFloat16
-                or out_dtype != cutlass.BFloat16
-            ):
-                return False
-        elif mma_qk_tiler_mn[0] != 128:
-            return False
-        if is_var_split_kv and not is_var_seq:
-            return False
-        if H <= 0 or H > 128:
-            return False
-        if H < 128 and split_kv != 1:
-            # The H64 split epilogue predicates padded heads and the merge
-            # launches only real heads. Other partial-head shapes retain
-            # the original split restriction.
-            if (
-                H != 64
-                or S != 1
-                or is_persistent
-                or is_var_split_kv
-                or mma_qk_tiler_mn[1] != 64
-                or mma_pv_tiler_mn[1] != (128 if mma_qk_tiler_mn[0] == 64 else 256)
-                or in_dtype != cutlass.BFloat16
-                or out_dtype != cutlass.BFloat16
-            ):
-                return False
-        if S <= 0:
-            return False
-        if not is_persistent and B * S > 65535:
-            return False
-        if K <= 0:
-            return False
-        return True

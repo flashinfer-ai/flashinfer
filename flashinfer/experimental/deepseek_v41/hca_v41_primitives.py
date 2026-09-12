@@ -369,64 +369,6 @@ def store_p_inter(fragment, sp, stage):
 
 
 @cute.jit
-def store_ws_output(
-    fragment, exchange, output, accum, coord, heads, iter_n: cutlass.Constexpr
-):
-    # WS TMEM assigns each lane a head. Exchange to contiguous global vectors
-    # after the final softmax metadata hand-off makes Q scratch available.
-    dtype = fragment.element_type
-    width = 128 // dtype.width
-    tid, _, _ = cute.arch.thread_idx()
-    lane = tid % 128
-    base = cutlass.Int32(exchange.toint())
-    bits = cute.make_tensor(
-        cute.recast_ptr(fragment.iterator, dtype=cutlass.Int32),
-        cute.make_layout(64 * dtype.width // 32),
-    )
-    for block in cutlass.range_constexpr(64 // width):
-        values = cutlass.Vector.from_elements(
-            [bits[block * 4 + i] for i in range(4)], cutlass.Int32
-        )
-        addr = cutlass.Array(
-            base + (block * 128 + lane) * width * (dtype.width // 8),
-            dtype=cutlass.Int32,
-            shape=(4,),
-            addrspace=3,
-        )
-        prims.store_ext(values, addr)
-    prims.barrier_cta_sync(11, thread_count=128)
-    for block in cutlass.range_constexpr(64 // width):
-        linear = (block * 128 + lane) * width
-        head = linear // 128
-        col = linear % 128
-        source_lane = head + (col // 64) * 64
-        source_block = (col % 64) // width
-        addr = cutlass.Array(
-            base + (source_block * 128 + source_lane) * width * (dtype.width // 8),
-            dtype=cutlass.Int32,
-            shape=(4,),
-            addrspace=3,
-        )
-        values = prims.load_ext(addr, count=4)
-        global_col = (
-            (col // 64) * 128 + (iter_n // 2) * 256 + (iter_n % 2) * 64 + col % 64
-        )
-        if cutlass.const_expr(accum is None):
-            row = output[head, None, coord[1], coord[2]]
-        else:
-            row = accum[head, coord[3], None, coord[1], coord[2]]
-        if head < heads:
-            dst = cutlass.Array(
-                (row.iterator + global_col).toint(),
-                dtype=cutlass.Int32,
-                shape=(4,),
-                addrspace=1,
-            )
-            prims.store_ext(values, dst)
-    prims.barrier_cta_sync(11, thread_count=128)
-
-
-@cute.jit
 def stage_ws_output_sw128(fragment, scratch, iter_n: cutlass.Constexpr):
     tid, _, _ = cute.arch.thread_idx()
     head = tid % 64
@@ -463,7 +405,7 @@ def issue_ws_output(desc, scratch, row, iter_n: cutlass.Constexpr):
 
 
 @cute.jit
-def flush_ws_output(desc, scratch, row):
+def flush_ws_output():
     tid, _, _ = cute.arch.thread_idx()
     if tid < 64:
         if prims.elect_sync():

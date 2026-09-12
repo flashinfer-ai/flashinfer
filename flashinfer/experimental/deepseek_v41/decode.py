@@ -104,7 +104,6 @@ def _compile(
             cutlass.Float32(1.0),
             sink,
             stream,
-            None,
             options="--enable-tvm-ffi --opt-level 2",
         ),
         extra_key_files=(
@@ -290,6 +289,5 @@ def decode(q, swa_cache, global_cache, swa_indices, global_indices, sink, *, pla
             Float32(512**-0.5),
             Float32(1.0),
             sink,
-            None,
         )
     return plan.out, plan.lse, plan
