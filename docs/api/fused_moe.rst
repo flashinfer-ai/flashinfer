@@ -270,6 +270,19 @@ can be used (and tested) independently of quantization and GEMM configuration.
     trtllm_gen_routing
     TrtllmGenRoutingResult
 
+Standalone TRT-LLM Gen Activation Gather
+----------------------------------------
+
+The permuted -> expanded reorder of the TRT-LLM Gen MoE post-activation FC1
+output, exposed on its own so consumers of the ``gemm1_activation_output``
+returned by the routed MoE ops (for example a LoRA down-projection delta) can
+undo the kernels' permutation with a single copy kernel.
+
+.. autosummary::
+    :toctree: ../generated
+
+    trtllm_gen_moe_gather_activation
+
 CuteDSL Fused MoE
 -----------------
 
