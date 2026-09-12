@@ -147,6 +147,8 @@ class BlackwellV41MixedCacheDecode:
         # RoPE-rotated by the caller; the kernel does not see rope as a
         # separate path.
         self.use_ws = use_ws
+        self.slot_storage_dtype = cutlass.Int64 if is_persistent else cutlass.Int32
+        self.slot_storage_multiplier = 2 if is_persistent else 1
         self.latent_dim = 512
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
@@ -663,10 +665,13 @@ class BlackwellV41MixedCacheDecode:
             softmax_smem_exchange: cute.struct.MemRange[
                 self.acc_dtype, 2 * self.num_compute_warps * self.threads_per_warp
             ]
-            # Page-table slots of this row (window keys, then compressed keys),
-            # filled once per work tile by the dequant warps.
+            # Nonpersistent CTAs store Int32 page-table slots. Persistent CTAs
+            # share Int64 data offsets followed by Int64 scale offsets instead,
+            # avoiding repeated address arithmetic in the dequant warps. The
+            # first plane uses -1 for invalid keys in both representations.
             smem_slots: cute.struct.MemRange[
-                cutlass.Int32, self.window_len + self.max_topk
+                self.slot_storage_dtype,
+                (self.window_len + self.max_topk) * self.slot_storage_multiplier,
             ]
             epilogue_smem_exchange: cute.struct.MemRange[
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp
@@ -951,7 +956,9 @@ class BlackwellV41MixedCacheDecode:
             vc_smem_layout_staged.outer, swizzle=vc_smem_layout_staged.inner
         )
         sSlots = storage.smem_slots.get_tensor(
-            cute.make_layout(self.window_len + self.max_topk)
+            cute.make_layout(
+                (self.window_len + self.max_topk) * self.slot_storage_multiplier
+            )
         )
         # (MMA, MMA_H, MMA_K)
         sP = storage.smem_p.get_tensor(
@@ -1042,6 +1049,24 @@ class BlackwellV41MixedCacheDecode:
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
+            if cutlass.const_expr(self.is_persistent):
+                slots_per_thread = cute.ceil_div(
+                    self.window_len + self.max_topk,
+                    self.threads_per_warp * len(self.dequant_warp_ids),
+                )
+                next_offsets = cute.make_rmem_tensor(
+                    cute.make_layout(2 * slots_per_thread), cutlass.Int64
+                )
+                if work_tile.is_valid_tile:
+                    self.prefetch_request_offsets(
+                        mWindowIndices,
+                        mCmpIndices,
+                        mWinPool,
+                        mCmpPool,
+                        work_tile.tile_idx,
+                        tidx,
+                        next_offsets,
+                    )
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 k_index, k_tile_count, _ = self.get_k_tile_count(
@@ -1061,22 +1086,33 @@ class BlackwellV41MixedCacheDecode:
                         self.dequant_sync_bar.barrier_id,
                         thread_count=self.dequant_sync_bar.num_threads,
                     )
-                    for key in cutlass.range(
-                        k_index * n_tile + tidx_g,
-                        (k_index + k_tile_count) * n_tile,
-                        self.threads_per_warp * len(self.dequant_warp_ids),
-                    ):
-                        slot = cutlass.Int32(-1)
-                        bound = cutlass.Int32(0)
-                        if key < self.window_len:
-                            slot = mWindowIndices[key, table_row]
-                            bound = mWinPool.shape[0] * self.window_page_size
-                        else:
-                            slot = mCmpIndices[key - self.window_len, table_row]
-                            bound = mCmpPool.shape[0] * self.compressed_page_size
-                        sSlots[key] = cutlass.select_(
-                            (slot >= 0) & (slot < bound), slot, cutlass.Int32(-1)
-                        )
+                    if cutlass.const_expr(self.is_persistent):
+                        for i in cutlass.range_constexpr(slots_per_thread):
+                            key = tidx_g + i * self.threads_per_warp * len(
+                                self.dequant_warp_ids
+                            )
+                            if key < self.window_len + self.max_topk:
+                                sSlots[key] = next_offsets[i]
+                                sSlots[self.window_len + self.max_topk + key] = (
+                                    next_offsets[slots_per_thread + i]
+                                )
+                    else:
+                        for key in cutlass.range(
+                            k_index * n_tile + tidx_g,
+                            (k_index + k_tile_count) * n_tile,
+                            self.threads_per_warp * len(self.dequant_warp_ids),
+                        ):
+                            slot = cutlass.Int32(-1)
+                            bound = cutlass.Int32(0)
+                            if key < self.window_len:
+                                slot = mWindowIndices[key, table_row]
+                                bound = mWinPool.shape[0] * self.window_page_size
+                            else:
+                                slot = mCmpIndices[key - self.window_len, table_row]
+                                bound = mCmpPool.shape[0] * self.compressed_page_size
+                            sSlots[key] = cutlass.select_(
+                                (slot >= 0) & (slot < bound), slot, cutlass.Int32(-1)
+                            )
                     prims.barrier_cta_sync(
                         self.dequant_sync_bar.barrier_id,
                         thread_count=self.dequant_sync_bar.num_threads,
@@ -1107,13 +1143,24 @@ class BlackwellV41MixedCacheDecode:
                         )
                         k_index += 1
                         k_tile_count -= 1
-                if cutlass.const_expr(self.is_persistent):
-                    # Q scratch is reused for score exchange and TMA output;
-                    # all active roles finish the current request before the
-                    # producer may load the next Q or overwrite slot indices.
-                    prims.barrier_cta_sync(13, thread_count=self.threads_per_cta - 32)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+                if cutlass.const_expr(self.is_persistent):
+                    # Overlap next-request index loads and address calculation
+                    # with the current request's PV/epilogue tail. Only registers
+                    # are written here; Q scratch and shared slot metadata remain
+                    # owned by the current request until all active roles finish.
+                    if work_tile.is_valid_tile:
+                        self.prefetch_request_offsets(
+                            mWindowIndices,
+                            mCmpIndices,
+                            mWinPool,
+                            mCmpPool,
+                            work_tile.tile_idx,
+                            tidx,
+                            next_offsets,
+                        )
+                    prims.barrier_cta_sync(13, thread_count=self.threads_per_cta - 32)
             load_k_pipeline.producer_tail(load_k_producer_state)
             load_v_pipeline.producer_tail(load_v_producer_state)
 
@@ -1806,6 +1853,53 @@ class BlackwellV41MixedCacheDecode:
         return
 
     @cute.jit
+    def slot_offsets(self, key, slot):
+        # DS4.1's fixed D512 cache layout: 64 rows/page, MXFP8 window
+        # (512 data + 16 scale bytes/row), FP4 compressed (256 + 32).
+        # Widen before page-byte multiplication: pools can exceed 2 GiB.
+        width = cutlass.Int64(256)
+        scale_bytes = cutlass.Int64(32)
+        if key < self.window_len:
+            width = cutlass.Int64(512)
+            scale_bytes = cutlass.Int64(16)
+        page_base = cutlass.Int64(slot // 64) * 64 * (width + scale_bytes)
+        local = cutlass.Int64(slot % 64)
+        data = cutlass.select_(slot >= 0, page_base + local * width, cutlass.Int64(-1))
+        scale = page_base + 64 * width + local * scale_bytes
+        return data, scale
+
+    @cute.jit
+    def prefetch_request_offsets(
+        self,
+        mWindowIndices,
+        mCmpIndices,
+        mWinPool,
+        mCmpPool,
+        blk_coord,
+        tidx,
+        result,
+    ):
+        local_tid = tidx - self.dequant_warp_ids[0] * self.threads_per_warp
+        row = self.get_page_table_row(blk_coord)
+        count = cute.size(result) // 2
+        for i in cutlass.range_constexpr(count):
+            key = local_tid + i * self.threads_per_warp * len(self.dequant_warp_ids)
+            slot = cutlass.Int32(-1)
+            bound = cutlass.Int32(0)
+            if key < self.window_len:
+                slot = mWindowIndices[key, row]
+                bound = mWinPool.shape[0] * self.window_page_size
+            elif key < self.window_len + self.max_topk:
+                slot = mCmpIndices[key - self.window_len, row]
+                bound = mCmpPool.shape[0] * self.compressed_page_size
+            valid_slot = cutlass.select_(
+                (slot >= 0) & (slot < bound), slot, cutlass.Int32(-1)
+            )
+            data, scale = self.slot_offsets(key, valid_slot)
+            result[i] = data
+            result[count + i] = scale
+
+    @cute.jit
     def get_effective_hca_k(
         self,
         sparse_mla_topk_lens: cute.Tensor,
@@ -2093,6 +2187,8 @@ class BlackwellV41MixedCacheDecode:
         row_bytes: cutlass.Constexpr,
         scale_bytes: cutlass.Constexpr,
     ):
+        if cutlass.const_expr(self.is_persistent):
+            return slots[key], slots[self.window_len + self.max_topk + key]
         slot = slots[key]
         page = self.offset_dtype(slot // page_size)
         local = slot % page_size
