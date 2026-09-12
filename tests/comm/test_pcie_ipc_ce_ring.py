@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 
 from flashinfer import comm
+from flashinfer.comm.pcie_ipc_ar import get_pcie_ipc_comm_module
 from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig, IpcVariant
 from tests.comm.test_pcie_ipc_all_reduce import (
     _init_process_group,
@@ -48,6 +49,19 @@ def _skip_unless_runnable(world_size: int, variant: IpcVariant) -> None:
         pytest.skip(f"not enough GPUs: need {world_size}")
     if variant == IpcVariant.COPY_ENGINE_ISLAND and world_size != 8:
         pytest.skip("the island schedule is a 4+4 decomposition, world_size 8 only")
+    if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
+        if any(
+            torch.cuda.get_device_capability(rank) != (12, 0)
+            for rank in range(world_size)
+        ):
+            pytest.skip("the memop protocol requires SM120 on every participating GPU")
+        module = get_pcie_ipc_comm_module()
+        for rank in range(world_size):
+            with torch.cuda.device(rank):
+                if not module.memop_supported():
+                    pytest.skip(
+                        "the memop protocol requires stream memory operations on every GPU"
+                    )
 
 
 def _graph_replay_worker(
@@ -61,7 +75,11 @@ def _graph_replay_worker(
         ws = comm.PcieIpcAllReduceWorkspace(
             group=group, max_numel=_BATCH * _HIDDEN, dtype=torch.bfloat16
         )
-        config = _ce_config(variant=variant)
+        if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
+            assert ws.memop_supported, "the test must exercise the memop protocol"
+        config = _ce_config(
+            1 if variant == IpcVariant.COPY_ENGINE_RING_MEMOP else 2, variant
+        )
         inp = torch.randint(
             0, 16, (_BATCH, _HIDDEN), dtype=torch.int32, device=device
         ).to(torch.bfloat16)
@@ -136,7 +154,11 @@ def _skewed_ranks_worker(
         ws = comm.PcieIpcAllReduceWorkspace(
             group=group, max_numel=_BATCH * _HIDDEN, dtype=dtype
         )
-        config = _ce_config(variant=variant)
+        if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
+            assert ws.memop_supported, "the test must exercise the memop protocol"
+        config = _ce_config(
+            1 if variant == IpcVariant.COPY_ENGINE_RING_MEMOP else 2, variant
+        )
         out = torch.empty(_BATCH, _HIDDEN, dtype=dtype, device=device)
         for i in range(8 * world_size):
             # An iteration-dependent value, so staging left over from call i-1
@@ -187,6 +209,7 @@ def _mixed_memop_worker(world_size, rank, port, dtype):
         # At TP8 each one-MiB shard admits two half-MiB pieces.
         numel = 8 * 1024 * 1024 // 2
         ws = comm.PcieIpcAllReduceWorkspace(dist.group.WORLD, numel, dtype=dtype)
+        assert ws.memop_supported, "the mixed test must exercise the memop protocol"
         inp = torch.empty(numel, dtype=dtype, device=device)
         out = torch.empty_like(inp)
         configs = [
