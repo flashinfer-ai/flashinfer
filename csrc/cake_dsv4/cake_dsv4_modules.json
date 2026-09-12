@@ -1,0 +1,4124 @@
+{
+  "programs": {
+    "family_3426a50d18f048ba": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "Q"
+        ],
+        [
+          "buffer",
+          "SWA_cache"
+        ],
+        [
+          "buffer",
+          "compressed_KV_cache"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "stream",
+          "cuda_stream_ptr"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "dependencies": [
+        "bf16_h128_topk128x"
+      ],
+      "entry": "run_family_3426a50d18f048ba",
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "route_entry": "route_family_3426a50d18f048ba",
+      "routes": [
+        {
+          "index": 0,
+          "signature_to_stage": [
+            {
+              "bindings": [
+                {
+                  "argument": 0,
+                  "stage": 0
+                }
+              ],
+              "key": "Q",
+              "kind": "family_tensor",
+              "position": 0
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 1,
+                  "stage": 0
+                },
+                {
+                  "argument": 3,
+                  "stage": 0
+                }
+              ],
+              "key": "SWA_cache",
+              "kind": "family_tensor",
+              "position": 1
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 0
+                },
+                {
+                  "argument": 4,
+                  "stage": 0
+                }
+              ],
+              "key": "compressed_KV_cache",
+              "kind": "family_tensor",
+              "position": 2
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 6,
+                  "stage": 0
+                }
+              ],
+              "key": "partial_lse",
+              "kind": "family_tensor",
+              "position": 3
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 7,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_indices",
+              "kind": "family_tensor",
+              "position": 4
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 8,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk_lens",
+              "kind": "family_tensor",
+              "position": 5
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 9,
+                  "stage": 0
+                }
+              ],
+              "key": "sinks",
+              "kind": "family_tensor",
+              "position": 6
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 10,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm1_scale",
+              "kind": "family_tensor",
+              "position": 7
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 11,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm2_scale",
+              "kind": "family_tensor",
+              "position": 8
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 5,
+                  "stage": 0
+                }
+              ],
+              "key": "O",
+              "kind": "family_tensor",
+              "position": 9
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 12,
+                  "stage": 0
+                }
+              ],
+              "key": "num_heads",
+              "kind": "family_scalar",
+              "position": 10
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 13,
+                  "stage": 0
+                }
+              ],
+              "key": "num_query_tokens",
+              "kind": "family_scalar",
+              "position": 11
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 14,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk",
+              "kind": "family_scalar",
+              "position": 12
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 15,
+                  "stage": 0
+                }
+              ],
+              "key": "has_sinks",
+              "kind": "family_scalar",
+              "position": 13
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 16,
+                  "stage": 0
+                }
+              ],
+              "key": "total_work_items",
+              "kind": "family_scalar",
+              "position": 14
+            }
+          ],
+          "stage_bindings": [
+            [
+              {
+                "key": "Q",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_indices",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_topk_lens",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sinks",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm1_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm2_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "sparse_topk",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "has_sinks",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "total_work_items",
+                "kind": "family_scalar"
+              },
+              {
+                "a": {
+                  "key": "total_work_items",
+                  "kind": "family_scalar"
+                },
+                "b": {
+                  "kind": "constant",
+                  "value": 2
+                },
+                "kind": "expression",
+                "op": "Mul"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ]
+          ],
+          "stage_variants": [
+            "bf16_h128_topk128x"
+          ]
+        }
+      ],
+      "signature": {
+        "scalar_dtypes": {
+          "has_sinks": "int32",
+          "num_heads": "int32",
+          "num_query_tokens": "int32",
+          "sparse_topk": "int32",
+          "total_work_items": "int32"
+        },
+        "scalar_names": [
+          "num_heads",
+          "num_query_tokens",
+          "sparse_topk",
+          "has_sinks",
+          "total_work_items"
+        ],
+        "stream": "explicit",
+        "tensor_dtypes": {
+          "O": "bfloat16",
+          "Q": "bfloat16",
+          "SWA_cache": "bfloat16",
+          "bmm1_scale": "float32",
+          "bmm2_scale": "float32",
+          "compressed_KV_cache": "bfloat16",
+          "partial_lse": "float32",
+          "sinks": "float32",
+          "sparse_indices": "int32",
+          "sparse_topk_lens": "int32"
+        },
+        "tensor_keys": [
+          "Q",
+          "SWA_cache",
+          "compressed_KV_cache",
+          "partial_lse",
+          "sparse_indices",
+          "sparse_topk_lens",
+          "sinks",
+          "bmm1_scale",
+          "bmm2_scale",
+          "O"
+        ],
+        "workspace_dtypes": {},
+        "workspace_keys": []
+      },
+      "sources": [
+        "cake_dsv4_family_3426a50d18f048ba_binding.cu"
+      ]
+    },
+    "family_57680c1207711c04": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "Q"
+        ],
+        [
+          "buffer",
+          "SWA_cache"
+        ],
+        [
+          "buffer",
+          "compressed_KV_cache"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "parameter",
+          "num_split"
+        ],
+        [
+          "stream",
+          "cuda_stream_ptr"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "dependencies": [
+        "bf16_h128_topk4x_v52",
+        "split_reduce"
+      ],
+      "entry": "run_family_57680c1207711c04",
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "route_entry": "route_family_57680c1207711c04",
+      "routes": [
+        {
+          "index": 0,
+          "signature_to_stage": [
+            {
+              "bindings": [
+                {
+                  "argument": 0,
+                  "stage": 0
+                }
+              ],
+              "key": "Q",
+              "kind": "family_tensor",
+              "position": 0
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 1,
+                  "stage": 0
+                },
+                {
+                  "argument": 3,
+                  "stage": 0
+                }
+              ],
+              "key": "SWA_cache",
+              "kind": "family_tensor",
+              "position": 1
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 0
+                },
+                {
+                  "argument": 4,
+                  "stage": 0
+                }
+              ],
+              "key": "compressed_KV_cache",
+              "kind": "family_tensor",
+              "position": 2
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 5,
+                  "stage": 0
+                },
+                {
+                  "argument": 0,
+                  "stage": 1
+                }
+              ],
+              "key": "partial_O",
+              "kind": "family_tensor",
+              "position": 3
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 6,
+                  "stage": 0
+                },
+                {
+                  "argument": 1,
+                  "stage": 1
+                }
+              ],
+              "key": "partial_lse",
+              "kind": "family_tensor",
+              "position": 4
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 7,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_indices",
+              "kind": "family_tensor",
+              "position": 5
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 8,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk_lens",
+              "kind": "family_tensor",
+              "position": 6
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 9,
+                  "stage": 0
+                }
+              ],
+              "key": "sinks",
+              "kind": "family_tensor",
+              "position": 7
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 10,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm1_scale",
+              "kind": "family_tensor",
+              "position": 8
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 11,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm2_scale",
+              "kind": "family_tensor",
+              "position": 9
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 1
+                }
+              ],
+              "key": "O",
+              "kind": "family_tensor",
+              "position": 10
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 12,
+                  "stage": 0
+                },
+                {
+                  "argument": 3,
+                  "stage": 1
+                },
+                {
+                  "argument": 6,
+                  "stage": 1
+                }
+              ],
+              "key": "num_heads",
+              "kind": "family_scalar",
+              "position": 11
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 13,
+                  "stage": 0
+                },
+                {
+                  "argument": 5,
+                  "stage": 1
+                }
+              ],
+              "key": "num_query_tokens",
+              "kind": "family_scalar",
+              "position": 12
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 14,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk",
+              "kind": "family_scalar",
+              "position": 13
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 15,
+                  "stage": 0
+                }
+              ],
+              "key": "has_sinks",
+              "kind": "family_scalar",
+              "position": 14
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 16,
+                  "stage": 0
+                }
+              ],
+              "key": "total_work_items",
+              "kind": "family_scalar",
+              "position": 15
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 4,
+                  "stage": 1
+                }
+              ],
+              "key": "num_split",
+              "kind": "family_scalar",
+              "position": 16
+            }
+          ],
+          "stage_bindings": [
+            [
+              {
+                "key": "Q",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_indices",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_topk_lens",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sinks",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm1_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm2_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "sparse_topk",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "has_sinks",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "total_work_items",
+                "kind": "family_scalar"
+              },
+              {
+                "a": {
+                  "key": "total_work_items",
+                  "kind": "family_scalar"
+                },
+                "b": {
+                  "kind": "constant",
+                  "value": 2
+                },
+                "kind": "expression",
+                "op": "Mul"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ],
+            [
+              {
+                "key": "partial_O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_split",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ]
+          ],
+          "stage_variants": [
+            "bf16_h128_topk4x_v52",
+            "split_reduce"
+          ]
+        }
+      ],
+      "signature": {
+        "scalar_dtypes": {
+          "has_sinks": "int32",
+          "num_heads": "int32",
+          "num_query_tokens": "int32",
+          "num_split": "int32",
+          "sparse_topk": "int32",
+          "total_work_items": "int32"
+        },
+        "scalar_names": [
+          "num_heads",
+          "num_query_tokens",
+          "sparse_topk",
+          "has_sinks",
+          "total_work_items",
+          "num_split"
+        ],
+        "stream": "explicit",
+        "tensor_dtypes": {
+          "O": "bfloat16",
+          "Q": "bfloat16",
+          "SWA_cache": "bfloat16",
+          "bmm1_scale": "float32",
+          "bmm2_scale": "float32",
+          "compressed_KV_cache": "bfloat16",
+          "partial_O": "bfloat16",
+          "partial_lse": "float32",
+          "sinks": "float32",
+          "sparse_indices": "int32",
+          "sparse_topk_lens": "int32"
+        },
+        "tensor_keys": [
+          "Q",
+          "SWA_cache",
+          "compressed_KV_cache",
+          "partial_O",
+          "partial_lse",
+          "sparse_indices",
+          "sparse_topk_lens",
+          "sinks",
+          "bmm1_scale",
+          "bmm2_scale",
+          "O"
+        ],
+        "workspace_dtypes": {},
+        "workspace_keys": []
+      },
+      "sources": [
+        "cake_dsv4_family_57680c1207711c04_binding.cu"
+      ]
+    },
+    "family_5c2b5d825a9e1699": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "Q"
+        ],
+        [
+          "buffer",
+          "SWA_cache"
+        ],
+        [
+          "buffer",
+          "compressed_KV_cache"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "stream",
+          "cuda_stream_ptr"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "dependencies": [
+        "bf16_h128_prefill_v42"
+      ],
+      "entry": "run_family_5c2b5d825a9e1699",
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "route_entry": "route_family_5c2b5d825a9e1699",
+      "routes": [
+        {
+          "index": 0,
+          "signature_to_stage": [
+            {
+              "bindings": [
+                {
+                  "argument": 0,
+                  "stage": 0
+                }
+              ],
+              "key": "Q",
+              "kind": "family_tensor",
+              "position": 0
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 1,
+                  "stage": 0
+                },
+                {
+                  "argument": 3,
+                  "stage": 0
+                }
+              ],
+              "key": "SWA_cache",
+              "kind": "family_tensor",
+              "position": 1
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 0
+                },
+                {
+                  "argument": 4,
+                  "stage": 0
+                }
+              ],
+              "key": "compressed_KV_cache",
+              "kind": "family_tensor",
+              "position": 2
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 6,
+                  "stage": 0
+                }
+              ],
+              "key": "partial_lse",
+              "kind": "family_tensor",
+              "position": 3
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 7,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_indices",
+              "kind": "family_tensor",
+              "position": 4
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 8,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk_lens",
+              "kind": "family_tensor",
+              "position": 5
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 9,
+                  "stage": 0
+                }
+              ],
+              "key": "sinks",
+              "kind": "family_tensor",
+              "position": 6
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 10,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm1_scale",
+              "kind": "family_tensor",
+              "position": 7
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 11,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm2_scale",
+              "kind": "family_tensor",
+              "position": 8
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 5,
+                  "stage": 0
+                }
+              ],
+              "key": "O",
+              "kind": "family_tensor",
+              "position": 9
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 12,
+                  "stage": 0
+                }
+              ],
+              "key": "num_heads",
+              "kind": "family_scalar",
+              "position": 10
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 13,
+                  "stage": 0
+                }
+              ],
+              "key": "num_query_tokens",
+              "kind": "family_scalar",
+              "position": 11
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 14,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk",
+              "kind": "family_scalar",
+              "position": 12
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 15,
+                  "stage": 0
+                }
+              ],
+              "key": "has_sinks",
+              "kind": "family_scalar",
+              "position": 13
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 16,
+                  "stage": 0
+                }
+              ],
+              "key": "total_work_items",
+              "kind": "family_scalar",
+              "position": 14
+            }
+          ],
+          "stage_bindings": [
+            [
+              {
+                "key": "Q",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_indices",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_topk_lens",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sinks",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm1_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm2_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "sparse_topk",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "has_sinks",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "total_work_items",
+                "kind": "family_scalar"
+              },
+              {
+                "a": {
+                  "a": {
+                    "key": "total_work_items",
+                    "kind": "family_scalar"
+                  },
+                  "b": {
+                    "kind": "constant",
+                    "value": 2
+                  },
+                  "kind": "expression",
+                  "op": "Mul"
+                },
+                "b": {
+                  "a": {
+                    "kind": "constant",
+                    "value": 2
+                  },
+                  "b": {
+                    "a": {
+                      "a": {
+                        "attribute": "multi_processor_count",
+                        "key": "Q",
+                        "kind": "tensor_device_attribute"
+                      },
+                      "b": {
+                        "kind": "constant",
+                        "value": 2
+                      },
+                      "kind": "expression",
+                      "op": "FloorDiv"
+                    },
+                    "b": {
+                      "kind": "constant",
+                      "value": 1
+                    },
+                    "kind": "expression",
+                    "op": "Max"
+                  },
+                  "kind": "expression",
+                  "op": "Mul"
+                },
+                "kind": "expression",
+                "op": "Min"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ]
+          ],
+          "stage_variants": [
+            "bf16_h128_prefill_v42"
+          ]
+        }
+      ],
+      "signature": {
+        "scalar_dtypes": {
+          "has_sinks": "int32",
+          "num_heads": "int32",
+          "num_query_tokens": "int32",
+          "sparse_topk": "int32",
+          "total_work_items": "int32"
+        },
+        "scalar_names": [
+          "num_heads",
+          "num_query_tokens",
+          "sparse_topk",
+          "has_sinks",
+          "total_work_items"
+        ],
+        "stream": "explicit",
+        "tensor_dtypes": {
+          "O": "bfloat16",
+          "Q": "bfloat16",
+          "SWA_cache": "bfloat16",
+          "bmm1_scale": "float32",
+          "bmm2_scale": "float32",
+          "compressed_KV_cache": "bfloat16",
+          "partial_lse": "float32",
+          "sinks": "float32",
+          "sparse_indices": "int32",
+          "sparse_topk_lens": "int32"
+        },
+        "tensor_keys": [
+          "Q",
+          "SWA_cache",
+          "compressed_KV_cache",
+          "partial_lse",
+          "sparse_indices",
+          "sparse_topk_lens",
+          "sinks",
+          "bmm1_scale",
+          "bmm2_scale",
+          "O"
+        ],
+        "workspace_dtypes": {},
+        "workspace_keys": []
+      },
+      "sources": [
+        "cake_dsv4_family_5c2b5d825a9e1699_binding.cu"
+      ]
+    },
+    "family_d3bc3cf66f688933": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "Q"
+        ],
+        [
+          "buffer",
+          "SWA_cache"
+        ],
+        [
+          "buffer",
+          "compressed_KV_cache"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "parameter",
+          "num_split"
+        ],
+        [
+          "stream",
+          "cuda_stream_ptr"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "dependencies": [
+        "fp8_h128",
+        "split_reduce"
+      ],
+      "entry": "run_family_d3bc3cf66f688933",
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "route_entry": "route_family_d3bc3cf66f688933",
+      "routes": [
+        {
+          "index": 0,
+          "signature_to_stage": [
+            {
+              "bindings": [
+                {
+                  "argument": 0,
+                  "stage": 0
+                }
+              ],
+              "key": "Q",
+              "kind": "family_tensor",
+              "position": 0
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 1,
+                  "stage": 0
+                }
+              ],
+              "key": "SWA_cache",
+              "kind": "family_tensor",
+              "position": 1
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 0
+                }
+              ],
+              "key": "compressed_KV_cache",
+              "kind": "family_tensor",
+              "position": 2
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 3,
+                  "stage": 0
+                },
+                {
+                  "argument": 0,
+                  "stage": 1
+                }
+              ],
+              "key": "partial_O",
+              "kind": "family_tensor",
+              "position": 3
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 4,
+                  "stage": 0
+                },
+                {
+                  "argument": 1,
+                  "stage": 1
+                }
+              ],
+              "key": "partial_lse",
+              "kind": "family_tensor",
+              "position": 4
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 5,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_indices",
+              "kind": "family_tensor",
+              "position": 5
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 6,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk_lens",
+              "kind": "family_tensor",
+              "position": 6
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 7,
+                  "stage": 0
+                }
+              ],
+              "key": "sinks",
+              "kind": "family_tensor",
+              "position": 7
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 8,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm1_scale",
+              "kind": "family_tensor",
+              "position": 8
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 9,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm2_scale",
+              "kind": "family_tensor",
+              "position": 9
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 1
+                }
+              ],
+              "key": "O",
+              "kind": "family_tensor",
+              "position": 10
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 10,
+                  "stage": 0
+                },
+                {
+                  "argument": 3,
+                  "stage": 1
+                },
+                {
+                  "argument": 6,
+                  "stage": 1
+                }
+              ],
+              "key": "num_heads",
+              "kind": "family_scalar",
+              "position": 11
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 11,
+                  "stage": 0
+                },
+                {
+                  "argument": 5,
+                  "stage": 1
+                }
+              ],
+              "key": "num_query_tokens",
+              "kind": "family_scalar",
+              "position": 12
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 12,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk",
+              "kind": "family_scalar",
+              "position": 13
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 13,
+                  "stage": 0
+                }
+              ],
+              "key": "has_sinks",
+              "kind": "family_scalar",
+              "position": 14
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 14,
+                  "stage": 0
+                }
+              ],
+              "key": "total_work_items",
+              "kind": "family_scalar",
+              "position": 15
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 15,
+                  "stage": 0
+                },
+                {
+                  "argument": 4,
+                  "stage": 1
+                }
+              ],
+              "key": "num_split",
+              "kind": "family_scalar",
+              "position": 16
+            }
+          ],
+          "stage_bindings": [
+            [
+              {
+                "key": "Q",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_indices",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_topk_lens",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sinks",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm1_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm2_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "sparse_topk",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "has_sinks",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "total_work_items",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_split",
+                "kind": "family_scalar"
+              },
+              {
+                "a": {
+                  "key": "total_work_items",
+                  "kind": "family_scalar"
+                },
+                "b": {
+                  "kind": "constant",
+                  "value": 2
+                },
+                "kind": "expression",
+                "op": "Mul"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ],
+            [
+              {
+                "key": "partial_O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_split",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ]
+          ],
+          "stage_variants": [
+            "fp8_h128",
+            "split_reduce"
+          ]
+        },
+        {
+          "index": 1,
+          "signature_to_stage": [
+            {
+              "bindings": [
+                {
+                  "argument": 0,
+                  "stage": 0
+                }
+              ],
+              "key": "Q",
+              "kind": "family_tensor",
+              "position": 0
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 1,
+                  "stage": 0
+                }
+              ],
+              "key": "SWA_cache",
+              "kind": "family_tensor",
+              "position": 1
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 2,
+                  "stage": 0
+                }
+              ],
+              "key": "compressed_KV_cache",
+              "kind": "family_tensor",
+              "position": 2
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 3,
+                  "stage": 0
+                }
+              ],
+              "key": "partial_O",
+              "kind": "family_tensor",
+              "position": 3
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 4,
+                  "stage": 0
+                }
+              ],
+              "key": "partial_lse",
+              "kind": "family_tensor",
+              "position": 4
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 5,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_indices",
+              "kind": "family_tensor",
+              "position": 5
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 6,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk_lens",
+              "kind": "family_tensor",
+              "position": 6
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 7,
+                  "stage": 0
+                }
+              ],
+              "key": "sinks",
+              "kind": "family_tensor",
+              "position": 7
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 8,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm1_scale",
+              "kind": "family_tensor",
+              "position": 8
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 9,
+                  "stage": 0
+                }
+              ],
+              "key": "bmm2_scale",
+              "kind": "family_tensor",
+              "position": 9
+            },
+            {
+              "bindings": [],
+              "key": "O",
+              "kind": "family_tensor",
+              "position": 10
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 10,
+                  "stage": 0
+                }
+              ],
+              "key": "num_heads",
+              "kind": "family_scalar",
+              "position": 11
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 11,
+                  "stage": 0
+                }
+              ],
+              "key": "num_query_tokens",
+              "kind": "family_scalar",
+              "position": 12
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 12,
+                  "stage": 0
+                }
+              ],
+              "key": "sparse_topk",
+              "kind": "family_scalar",
+              "position": 13
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 13,
+                  "stage": 0
+                }
+              ],
+              "key": "has_sinks",
+              "kind": "family_scalar",
+              "position": 14
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 14,
+                  "stage": 0
+                }
+              ],
+              "key": "total_work_items",
+              "kind": "family_scalar",
+              "position": 15
+            },
+            {
+              "bindings": [
+                {
+                  "argument": 15,
+                  "stage": 0
+                }
+              ],
+              "key": "num_split",
+              "kind": "family_scalar",
+              "position": 16
+            }
+          ],
+          "stage_bindings": [
+            [
+              {
+                "key": "Q",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "SWA_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "compressed_KV_cache",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_O",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "partial_lse",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_indices",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sparse_topk_lens",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "sinks",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm1_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "bmm2_scale",
+                "kind": "family_tensor"
+              },
+              {
+                "key": "num_heads",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_query_tokens",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "sparse_topk",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "has_sinks",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "total_work_items",
+                "kind": "family_scalar"
+              },
+              {
+                "key": "num_split",
+                "kind": "family_scalar"
+              },
+              {
+                "a": {
+                  "key": "total_work_items",
+                  "kind": "family_scalar"
+                },
+                "b": {
+                  "kind": "constant",
+                  "value": 2
+                },
+                "kind": "expression",
+                "op": "Mul"
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              },
+              {
+                "kind": "constant",
+                "value": 1
+              }
+            ]
+          ],
+          "stage_variants": [
+            "fp8_h128"
+          ]
+        }
+      ],
+      "signature": {
+        "scalar_dtypes": {
+          "has_sinks": "int32",
+          "num_heads": "int32",
+          "num_query_tokens": "int32",
+          "num_split": "int32",
+          "sparse_topk": "int32",
+          "total_work_items": "int32"
+        },
+        "scalar_names": [
+          "num_heads",
+          "num_query_tokens",
+          "sparse_topk",
+          "has_sinks",
+          "total_work_items",
+          "num_split"
+        ],
+        "stream": "explicit",
+        "tensor_dtypes": {
+          "O": "bfloat16",
+          "Q": "uint8",
+          "SWA_cache": "uint8",
+          "bmm1_scale": "float32",
+          "bmm2_scale": "float32",
+          "compressed_KV_cache": "uint8",
+          "partial_O": "bfloat16",
+          "partial_lse": "float32",
+          "sinks": "float32",
+          "sparse_indices": "int32",
+          "sparse_topk_lens": "int32"
+        },
+        "tensor_keys": [
+          "Q",
+          "SWA_cache",
+          "compressed_KV_cache",
+          "partial_O",
+          "partial_lse",
+          "sparse_indices",
+          "sparse_topk_lens",
+          "sinks",
+          "bmm1_scale",
+          "bmm2_scale",
+          "O"
+        ],
+        "workspace_dtypes": {},
+        "workspace_keys": []
+      },
+      "sources": [
+        "cake_dsv4_family_d3bc3cf66f688933_binding.cu"
+      ]
+    }
+  },
+  "schema": "cake-dsv4-programs-v1",
+  "variants": {
+    "bf16_h128_prefill_v42": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_k"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_k"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_v"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_v"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h128_prefill_v42",
+      "sources": [
+        "cake_dsv4_bf16_h128_prefill_v42.cu",
+        "cake_dsv4_bf16_h128_prefill_v42_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "bf16_h128_swa128": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_head_tiles"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h128_swa128",
+      "sources": [
+        "cake_dsv4_bf16_h128_swa128.cu",
+        "cake_dsv4_bf16_h128_swa128_binding.cu"
+      ],
+      "tma_workspace_bytes": 256
+    },
+    "bf16_h128_topk128x": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_k"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_k"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_v"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_v"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h128_topk128x",
+      "sources": [
+        "cake_dsv4_bf16_h128_topk128x.cu",
+        "cake_dsv4_bf16_h128_topk128x_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "bf16_h128_topk4x_v52": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_k"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_k"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_v"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_v"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h128_topk4x_v52",
+      "sources": [
+        "cake_dsv4_bf16_h128_topk4x_v52.cu",
+        "cake_dsv4_bf16_h128_topk4x_v52_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "bf16_h16_h32_swa128_v44": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h16_h32_swa128_v44",
+      "sources": [
+        "cake_dsv4_bf16_h16_h32_swa128_v44.cu",
+        "cake_dsv4_bf16_h16_h32_swa128_v44_binding.cu"
+      ],
+      "tma_workspace_bytes": 256
+    },
+    "bf16_h32_topk128x_early_v47": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partition_arrivals"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "num_splits"
+        ],
+        [
+          "parameter",
+          "num_head_tiles"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "completion_base"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h32_topk128x_early_v47",
+      "sources": [
+        "cake_dsv4_bf16_h32_topk128x_early_v47.cu",
+        "cake_dsv4_bf16_h32_topk128x_early_v47_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h32_topk4x_v38": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partition_arrivals"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "num_splits"
+        ],
+        [
+          "parameter",
+          "num_head_tiles"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "completion_base"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h32_topk4x_v38",
+      "sources": [
+        "cake_dsv4_bf16_h32_topk4x_v38.cu",
+        "cake_dsv4_bf16_h32_topk4x_v38_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h64_compressed_q8_v38": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "num_splits"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h64_compressed_q8_v38",
+      "sources": [
+        "cake_dsv4_bf16_h64_compressed_q8_v38.cu",
+        "cake_dsv4_bf16_h64_compressed_q8_v38_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h64_compressed_reduce": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_splits"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h64_compressed_reduce",
+      "sources": [
+        "cake_dsv4_bf16_h64_compressed_reduce.cu",
+        "cake_dsv4_bf16_h64_compressed_reduce_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "bf16_h64_fixed_q": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "num_splits"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h64_fixed_q",
+      "sources": [
+        "cake_dsv4_bf16_h64_fixed_q.cu",
+        "cake_dsv4_bf16_h64_fixed_q_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h64_fixed_q_reduce": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_splits"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h64_fixed_q_reduce",
+      "sources": [
+        "cake_dsv4_bf16_h64_fixed_q_reduce.cu",
+        "cake_dsv4_bf16_h64_fixed_q_reduce_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "bf16_h64_guard_q_tma_batch_r25": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "seq_lens"
+        ],
+        [
+          "buffer",
+          "cum_seq_lens_q"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "parameter",
+          "max_q_len"
+        ],
+        [
+          "parameter",
+          "ragged_query"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h64_guard_q_tma_batch_r25",
+      "sources": [
+        "cake_dsv4_bf16_h64_guard_q_tma_batch_r25.cu",
+        "cake_dsv4_bf16_h64_guard_q_tma_batch_r25_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h64_prefill": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h64_prefill",
+      "sources": [
+        "cake_dsv4_bf16_h64_prefill.cu",
+        "cake_dsv4_bf16_h64_prefill_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h8_h16_source_exact": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "seq_lens"
+        ],
+        [
+          "buffer",
+          "cum_seq_lens_q"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "max_q_len"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h8_h16_source_exact",
+      "sources": [
+        "cake_dsv4_bf16_h8_h16_source_exact.cu",
+        "cake_dsv4_bf16_h8_h16_source_exact_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "bf16_h8_swa128_v43": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_h8_swa128_v43",
+      "sources": [
+        "cake_dsv4_bf16_h8_swa128_v43.cu",
+        "cake_dsv4_bf16_h8_swa128_v43_binding.cu"
+      ],
+      "tma_workspace_bytes": 256
+    },
+    "bf16_swa128_single_cta": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_bf16_swa128_single_cta",
+      "sources": [
+        "cake_dsv4_bf16_swa128_single_cta.cu",
+        "cake_dsv4_bf16_swa128_single_cta_binding.cu"
+      ],
+      "tma_workspace_bytes": 256
+    },
+    "fp8_h128": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "parameter",
+          "num_split"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_h128",
+      "sources": [
+        "cake_dsv4_fp8_h128.cu",
+        "cake_dsv4_fp8_h128_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "fp8_h128_prefill_source_persistent": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "seq_lens"
+        ],
+        [
+          "buffer",
+          "cum_seq_lens_q"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "parameter",
+          "max_q_len"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_h128_prefill_source_persistent",
+      "sources": [
+        "cake_dsv4_fp8_h128_prefill_source_persistent.cu",
+        "cake_dsv4_fp8_h128_prefill_source_persistent_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "fp8_h64_source_exact": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "cum_seq_lens_q"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_h64_source_exact",
+      "sources": [
+        "cake_dsv4_fp8_h64_source_exact.cu",
+        "cake_dsv4_fp8_h64_source_exact_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "fp8_lowhead_h64": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_lowhead_h64",
+      "sources": [
+        "cake_dsv4_fp8_lowhead_h64.cu",
+        "cake_dsv4_fp8_lowhead_h64_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "fp8_lowhead_one_partition": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_lowhead_one_partition",
+      "sources": [
+        "cake_dsv4_fp8_lowhead_one_partition.cu",
+        "cake_dsv4_fp8_lowhead_one_partition_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "fp8_lowhead_prefill": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_lowhead_prefill",
+      "sources": [
+        "cake_dsv4_fp8_lowhead_prefill.cu",
+        "cake_dsv4_fp8_lowhead_prefill_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "fp8_lowhead_split": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "tmap_q"
+        ],
+        [
+          "tma_buffer",
+          "tmap_swa_kv"
+        ],
+        [
+          "tma_buffer",
+          "tmap_compressed_kv"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "sparse_indices"
+        ],
+        [
+          "buffer",
+          "sparse_topk_lens"
+        ],
+        [
+          "buffer",
+          "sinks"
+        ],
+        [
+          "buffer",
+          "bmm1_scale"
+        ],
+        [
+          "buffer",
+          "bmm2_scale"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "num_query_tokens"
+        ],
+        [
+          "parameter",
+          "sparse_topk"
+        ],
+        [
+          "parameter",
+          "has_sinks"
+        ],
+        [
+          "parameter",
+          "total_work_items"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "-Xptxas=-uumn"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_fp8_lowhead_split",
+      "sources": [
+        "cake_dsv4_fp8_lowhead_split.cu",
+        "cake_dsv4_fp8_lowhead_split_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "split_reduce": {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_lse"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_split"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "-std=c++17",
+        "--use_fast_math",
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "host_linkage_flags": [
+        "--device-entity-has-hidden-visibility=false"
+      ],
+      "kernel_symbol": "kernel_cake_dsv4_split_reduce",
+      "sources": [
+        "cake_dsv4_split_reduce.cu",
+        "cake_dsv4_split_reduce_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    }
+  }
+}
