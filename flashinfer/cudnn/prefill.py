@@ -923,10 +923,21 @@ def cudnn_batch_prefill_with_kv_cache(
                 dtype=torch.float32,
             )
 
-    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
-        raise ValueError(
-            "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
-        )
+    if lse is not None:
+        padded = (num_sequences, max_token_per_sequence, h_qo)
+        # With a stats ragged offset cuDNN writes each request at its token
+        # offset, so a packed [num_tokens, h_qo] buffer (the wrapper contract)
+        # is a valid target too.
+        packed_ok = batch_offsets_stats is not None and lse.shape == (num_tokens, h_qo)
+        if lse.shape != padded and not packed_ok:
+            raise ValueError(
+                "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
+                + (
+                    " or, with batch_offsets_stats, (num_tokens, h_qo)"
+                    if batch_offsets_stats is not None
+                    else ""
+                )
+            )
 
     if o_data_type is None:
         o_data_type = q.dtype
