@@ -58,14 +58,13 @@ def _skip_unless_runnable(world_size: int, variant: IpcVariant) -> None:
         module = get_pcie_ipc_comm_module()
         for rank in range(world_size):
             with torch.cuda.device(rank):
-                if not module.memop_supported():
-                    pytest.skip(
-                        "the memop protocol requires stream memory operations on every GPU"
-                    )
+                assert module.memop_supported(), (
+                    "SM120 must admit the default-supported v2 32-bit stream writes"
+                )
 
 
 def _graph_replay_worker(
-    world_size: int, rank: int, port: int, variant: IpcVariant
+    world_size: int, rank: int, port: int, variant: IpcVariant, dtype: torch.dtype
 ) -> None:
     _init_process_group(world_size, rank, port)
     device = torch.device("cuda", rank)
@@ -73,7 +72,7 @@ def _graph_replay_worker(
     ws: Optional[comm.PcieIpcAllReduceWorkspace] = None
     try:
         ws = comm.PcieIpcAllReduceWorkspace(
-            group=group, max_numel=_BATCH * _HIDDEN, dtype=torch.bfloat16
+            group=group, max_numel=_BATCH * _HIDDEN, dtype=dtype
         )
         if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
             assert ws.memop_supported, "the test must exercise the memop protocol"
@@ -82,7 +81,7 @@ def _graph_replay_worker(
         )
         inp = torch.randint(
             0, 16, (_BATCH, _HIDDEN), dtype=torch.int32, device=device
-        ).to(torch.bfloat16)
+        ).to(dtype)
         out = torch.empty_like(inp)
         ref = inp.clone()
         dist.all_reduce(ref, group=group)
@@ -180,17 +179,17 @@ def _skewed_ranks_worker(
             dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("variant", _VARIANTS, ids=lambda v: v.name.lower())
 @pytest.mark.parametrize("world_size", [4, 8])
-def test_ce_ring_survives_graph_replay(world_size: int, variant: IpcVariant) -> None:
+def test_ce_ring_survives_graph_replay(
+    world_size: int, variant: IpcVariant, dtype: torch.dtype
+) -> None:
     _skip_unless_runnable(world_size, variant)
-    multi_process_parallel(world_size, _graph_replay_worker, args=(variant,))
+    multi_process_parallel(world_size, _graph_replay_worker, args=(variant, dtype))
 
 
-# Both 2-byte dtypes take the same path apart from the packed_add_u4
-# specialisation, which the ring shares with the SM kernels, so fp16 rides on
-# the correctness test alone; the replay test stays bf16 because the flag
-# kernels it exercises are not templated on dtype at all.
+# Both 2-byte dtypes share the flag protocol and specialize packed_add_u4.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("variant", _VARIANTS, ids=lambda v: v.name.lower())
 @pytest.mark.parametrize("world_size", [4, 8])

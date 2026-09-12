@@ -190,7 +190,7 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
 
 // Query before group agreement; a rank-local decision must never select a wire protocol.
 bool pcie_ipc_memop_supported() {
-  int ordinal = 0, major = 0, minor = 0, supported = 0;
+  int ordinal = 0, major = 0, minor = 0;
   CUdevice device;
   if (cudaGetDevice(&ordinal) != cudaSuccess || cuDeviceGet(&device, ordinal) != CUDA_SUCCESS) {
     return false;
@@ -198,12 +198,12 @@ bool pcie_ipc_memop_supported() {
   if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) !=
           CUDA_SUCCESS ||
       cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) !=
-          CUDA_SUCCESS ||
-      cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, device) !=
           CUDA_SUCCESS) {
     return false;
   }
-  return major == 12 && minor == 0 && supported != 0;
+  // cuStreamWriteValue32 uses the v2 API, whose 32-bit writes are available by
+  // default. The deprecated v1 capability can be disabled independently.
+  return major == 12 && minor == 0;
 }
 
 // Called once after communicator-wide capability agreement and before any launch.
