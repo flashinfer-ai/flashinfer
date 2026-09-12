@@ -52,8 +52,8 @@ constexpr int32_t kHiddenSize = 4096;
 constexpr int32_t kGridCTAsPerToken = 4;
 constexpr int32_t kRequiredAlignmentBytes = 128;
 
-static_assert(CAKE_MEGAMOE_TOPK_REDUCE_THREADS == 128,
-              "the frozen MegaMoE TopK reducer requires 128 threads");
+static_assert(CAKE_MEGAMOE_TOPK_REDUCE_THREADS == 256,
+              "the frozen MegaMoE TopK reducer requires 256 threads");
 static_assert(CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES == 0,
               "the frozen MegaMoE TopK reducer uses no dynamic shared memory");
 

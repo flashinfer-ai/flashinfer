@@ -191,7 +191,7 @@ def _make_vendored_cutedsl_runner(
             dtype=torch.bfloat16,
             device=partials.device,
         )
-        baseline_partials[: partials.shape[0]].copy_(partials)
+        baseline_partials[:num_tokens].copy_(partials[:num_tokens])
         baseline_out = torch.empty(
             (fixed_capacity, _HIDDEN_SIZE),
             dtype=torch.bfloat16,

@@ -549,8 +549,8 @@ def gen_jit_spec(
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
-    use_fast_math: bool = True,
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
+    use_fast_math: bool = True,
 ) -> JitSpec:
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)

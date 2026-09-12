@@ -30,7 +30,7 @@ _SOURCE_FILE = "cake_megamoe_topk_reduce_kernels.cu"
 _MANIFEST_FILE = "manifest.json"
 _BINDING_HEADER = "cake_megamoe_topk_reduce_binding.cuh"
 _KERNEL_SYMBOL = "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
-_SOURCE_SHA256 = "a0d7bab5d380023d9cc8983fb812ba551157d941e452c5f42da5ffca01e087dc"
+_SOURCE_SHA256 = "721e39685cc4f217b6e15a32dc0359cbcd0d2cee671da8fab3b6dd5aa536ee89"
 _MANIFEST_KEYS = {
     "arch",
     "compile_flags",
@@ -49,7 +49,7 @@ _CONSTRAINTS = {
     "top_k": 6,
 }
 _LAUNCH = {
-    "block_threads": 128,
+    "block_threads": 256,
     "dynamic_smem_bytes": 0,
     "grid_x": "4 * num_tokens",
 }
