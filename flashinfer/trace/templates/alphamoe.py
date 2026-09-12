@@ -17,7 +17,7 @@
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
-_WEIGHT_AXES = {
+_WEIGHT_AXES: dict[str, Var | Const] = {
     "num_experts": Const(description="Number of local experts."),
     "hidden_size": Const(description="Input and output hidden width."),
     "gated_size": Const(description="Combined gate and up width."),
@@ -25,7 +25,7 @@ _WEIGHT_AXES = {
     "gated_blocks": Const(description="128-row gate/up weight-scale blocks."),
 }
 
-_WEIGHT_INPUTS = {
+_WEIGHT_INPUTS: dict[str, Tensor | Scalar] = {
     "gemm1_weights": Tensor(["num_experts", "gated_size", "hidden_size"]),
     "gemm1_weights_scale": Tensor(["num_experts", "gated_blocks", "hidden_blocks"]),
 }
