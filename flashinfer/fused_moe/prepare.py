@@ -576,9 +576,7 @@ def prepare_trtllm_fp4_weights(
         QuantFormat.NVFP4,
         QuantFormat.NVFP4,
     ):
-        raise ValueError(
-            "Calibrated global scales are supported only for NVFP4×NVFP4."
-        )
+        raise ValueError("Calibrated global scales are supported only for NVFP4×NVFP4.")
     sf_vec_size = 32 if is_mxfp4 else 16
     required_alignment = 128 if is_mxfp4 else sf_vec_size
     if (
@@ -642,9 +640,9 @@ def prepare_trtllm_fp4_weights(
             sf_use_ue8m0=is_mxfp4,
             is_sf_swizzled_layout=False,
         )
-        g1_w = w1_q_flat.view(
-            num_local_experts, gemm1_rows, hidden_size // 2
-        ).view(torch.uint8)
+        g1_w = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2).view(
+            torch.uint8
+        )
         g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
             num_local_experts, gemm1_rows, hidden_size // sf_vec_size
         )
@@ -661,8 +659,10 @@ def prepare_trtllm_fp4_weights(
             w1_q.append(q)
             w1_sf.append(sf)
         g1_w = torch.stack(w1_q).view(torch.uint8)
-        g1_s = torch.stack(w1_sf).view(torch.float8_e4m3fn).reshape(
-            num_local_experts, gemm1_rows, hidden_size // sf_vec_size
+        g1_s = (
+            torch.stack(w1_sf)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_local_experts, gemm1_rows, hidden_size // sf_vec_size)
         )
 
     if gemm2_scales_global is None:
@@ -693,8 +693,10 @@ def prepare_trtllm_fp4_weights(
             w2_q.append(q)
             w2_sf.append(sf)
         g2_w = torch.stack(w2_q).view(torch.uint8)
-        g2_s = torch.stack(w2_sf).view(torch.float8_e4m3fn).reshape(
-            num_local_experts, hidden_size, intermediate_size // sf_vec_size
+        g2_s = (
+            torch.stack(w2_sf)
+            .view(torch.float8_e4m3fn)
+            .reshape(num_local_experts, hidden_size, intermediate_size // sf_vec_size)
         )
 
     g1_w_sh, g1_s_sh, g2_w_sh, g2_s_sh = [], [], [], []
@@ -2400,9 +2402,7 @@ def prepare_cute_dsl_weights(
         QuantFormat.NVFP4,
         QuantFormat.NVFP4,
     ):
-        raise ValueError(
-            "Calibrated global scales are supported only for NVFP4×NVFP4."
-        )
+        raise ValueError("Calibrated global scales are supported only for NVFP4×NVFP4.")
 
     if device is None:
         device = w1_bf16.device
@@ -2451,9 +2451,7 @@ def prepare_cute_dsl_weights(
             sf_use_ue8m0=is_mxfp4,
             is_sf_swizzled_layout=True,
         )
-        w1_weight = w1_q_flat.view(
-            num_local_experts, gemm1_rows, hidden_size // 2
-        )
+        w1_weight = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2)
     else:
         w1_q, w1_sf = [], []
         for expert in range(num_local_experts):
@@ -2510,7 +2508,6 @@ def prepare_cute_dsl_weights(
         sf_vec_size=sf_vec_size,
     )
 
-    ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
     view = {
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
