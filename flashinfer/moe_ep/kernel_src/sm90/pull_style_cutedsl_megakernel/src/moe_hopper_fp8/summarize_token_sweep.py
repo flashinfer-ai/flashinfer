@@ -8,6 +8,7 @@ import csv
 import math
 import re
 import shlex
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -30,6 +31,7 @@ HEURISTIC_FIELDS = (
     "rank_mode",
     "case",
     "scale_mode",
+    "generate_c",
     "tokens_per_rank",
     "routed_tokens_per_rank",
     "operand_order",
@@ -150,7 +152,12 @@ def _read_all_rows(date_dir: Path) -> list[SourceRow]:
     rows: list[SourceRow] = []
     for path in _raw_csv_files(date_dir):
         with path.open(newline="", encoding="utf-8") as handle:
-            rows.extend(SourceRow(path, row) for row in csv.DictReader(handle))
+            for row in csv.DictReader(handle):
+                # Older CSVs record this flag only in their filename.
+                row["generate_c"] = row.get("generate_c") or str(int("_genc.csv" in path.name))
+                rows.append(SourceRow(path, row))
+    if len({item.row["generate_c"] for item in rows}) > 1:
+        raise ValueError("Keep inference and generate_c sweeps in separate directories")
     return rows
 
 
@@ -418,17 +425,199 @@ def _date_dirs(input_dir: Path, run_date: str | None) -> list[Path]:
     return result
 
 
+COMPARISON_KEYS = ("rank_mode", "case", "scale_mode", "tokens_per_rank")
+COMPARISON_CONFIG_FIELDS = (
+    "operand_order",
+    "pingpong",
+    "accum_mode",
+    "cluster_m",
+    "cluster_n",
+    "cluster_k",
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "world_size",
+    "topk",
+    "total_experts",
+    "local_experts",
+    "hidden",
+    "intermediate_downproj",
+    "intermediate_gateup",
+    "warmup",
+    "iters",
+)
+COMPARISON_METRICS = (
+    "min_mega_us",
+    "max_mega_us",
+    "min_rank_tflops_per_rank",
+    "max_rank_tflops_per_rank",
+)
+
+
+def _heuristic_points(sweep_root: Path, run_date: str | None) -> dict[tuple, dict]:
+    date_dir = _date_dirs(sweep_root, run_date)[-1]
+    path = date_dir / f"{date_dir.name}_token_sweep_heuristic.csv"
+    points = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            key = tuple(row[field] for field in COMPARISON_KEYS)
+            if key in points:
+                raise ValueError(f"Duplicate comparison point {key} in {path}")
+            for metric in COMPARISON_METRICS:
+                value = float(row[metric])
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"Invalid {metric} for {key} in {path}")
+            points[key] = row
+    return points
+
+
+def compare_heuristic_sweeps(
+    dir_a: Path,
+    label_a: str,
+    dir_b: Path,
+    label_b: str,
+    out_prefix: Path,
+    run_date: str | None = None,
+) -> tuple[Path, Path]:
+    """Compare B/A-1 at each token and scale mode; positive latency = B slower.
+
+    The legacy min/max_mega_us fields include Mega plus separate TopkReduce.
+    Both rank extrema come from the same winning configuration, selected by
+    slowest-rank throughput. Missing points or different configs get no ratio.
+    """
+    if not label_a or not label_b or label_a == label_b:
+        raise ValueError("Comparison labels must be nonempty and distinct")
+    a_points = _heuristic_points(dir_a.resolve(), run_date)
+    b_points = _heuristic_points(dir_b.resolve(), run_date)
+    keys = sorted(
+        set(a_points) | set(b_points), key=lambda key: (*key[:3], int(key[3]))
+    )
+    if not keys:
+        raise ValueError("No successful points to compare")
+    value_fields = (
+        *COMPARISON_CONFIG_FIELDS,
+        "generate_c",
+        "git_commit",
+        "gpu_names",
+        "source_csv",
+        "log_file",
+        *COMPARISON_METRICS,
+    )
+    delta_fields = {
+        metric: f"{label_b}_vs_{label_a}_{metric}_pct" for metric in COMPARISON_METRICS
+    }
+    fields = (
+        *COMPARISON_KEYS,
+        "comparison_status",
+        "same_config",
+        *(f"{label}_{field}" for label in (label_a, label_b) for field in value_fields),
+        *delta_fields.values(),
+    )
+    rows = []
+    for key in keys:
+        a, b = a_points.get(key), b_points.get(key)
+        same_config = (
+            a is not None
+            and b is not None
+            and all(
+                a.get(field, "") == b.get(field, "")
+                for field in COMPARISON_CONFIG_FIELDS
+            )
+        )
+        row = dict(zip(COMPARISON_KEYS, key))
+        row["same_config"] = str(int(same_config))
+        row["comparison_status"] = (
+            "matched"
+            if same_config
+            else "different_config" if a and b else "missing_point"
+        )
+        for label, point in ((label_a, a), (label_b, b)):
+            for field in value_fields:
+                row[f"{label}_{field}"] = point.get(field, "") if point else ""
+        for metric, delta_field in delta_fields.items():
+            row[delta_field] = (
+                f"{(float(b[metric]) / float(a[metric]) - 1.0) * 100.0:.6f}"
+                if same_config
+                else ""
+            )
+        rows.append(row)
+    row_path = Path(f"{out_prefix}.csv")
+    _write_csv(row_path, fields, rows)
+
+    tokens = sorted({key[3] for key in keys}, key=int)
+    contexts = sorted({key[:3] for key in keys})
+    transposed = []
+    metrics = (
+        "comparison_status",
+        "same_config",
+        *(
+            f"{label}_{metric}"
+            for label in (label_a, label_b)
+            for metric in COMPARISON_METRICS
+        ),
+        *delta_fields.values(),
+    )
+    lookup = {tuple(row[field] for field in COMPARISON_KEYS): row for row in rows}
+    for context in contexts:
+        for metric in metrics:
+            row = dict(zip(COMPARISON_KEYS[:3], context))
+            row["metric"] = metric
+            row.update(
+                {
+                    token: lookup.get((*context, token), {}).get(metric, "")
+                    for token in tokens
+                }
+            )
+            transposed.append(row)
+        deltas = [
+            float(row[delta_fields["max_mega_us"]])
+            for row in rows
+            if tuple(row[field] for field in COMPARISON_KEYS[:3]) == context
+            and row[delta_fields["max_mega_us"]]
+        ]
+        if deltas:
+            print(
+                f"[COMPARE] {'/'.join(context)}: slowest-rank latency "
+                f"median {statistics.median(deltas):+.2f}%, "
+                f"range {min(deltas):+.2f}% .. {max(deltas):+.2f}% "
+                f"(positive = {label_b} slower), matched={len(deltas)}"
+            )
+    transposed_path = Path(f"{out_prefix}_transposed.csv")
+    _write_csv(transposed_path, (*COMPARISON_KEYS[:3], "metric", *tokens), transposed)
+    return row_path, transposed_path
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
     parser.add_argument("--date", default=None)
+    parser.add_argument(
+        "--compare",
+        nargs=4,
+        metavar=("DIR_A", "LABEL_A", "DIR_B", "LABEL_B"),
+        help="Compare two heuristic summaries (B/A-1); --date selects the run date.",
+    )
+    parser.add_argument(
+        "--compare-out",
+        type=Path,
+        help="Write <prefix>.csv and <prefix>_transposed.csv.",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     if args.date is not None and not DATE_DIR_RE.fullmatch(args.date):
         raise ValueError("--date must use YYYYMMDD")
+    if args.compare is not None:
+        if args.compare_out is None:
+            parser.error("--compare requires --compare-out")
+        dir_a, label_a, dir_b, label_b = args.compare
+        compare_heuristic_sweeps(
+            Path(dir_a), label_a, Path(dir_b), label_b, args.compare_out, args.date
+        )
+        return 0
     count = 0
     for date_dir in _date_dirs(args.input_dir.resolve(), args.date):
         summarize(date_dir)

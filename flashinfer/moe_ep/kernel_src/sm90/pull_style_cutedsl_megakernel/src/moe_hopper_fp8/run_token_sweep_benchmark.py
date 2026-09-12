@@ -8,6 +8,11 @@ through 32768 in powers of two. Each CSV owns one resolved configuration and
 contains one row per attempt so failed runs and forced reruns remain auditable.
 P02 remains available as an explicit compatibility mode, but the default and
 heuristic target are P03.
+
+The default ``--generate-c both`` runs inference and training forward into
+``<output-dir>/{inference,generate_c}/<date>`` and writes comparison CSVs under
+``<output-dir>/<date>``. Use ``--generate-c off`` for the original inference-only
+sweep. Positive latency changes mean that writing the raw FC1 output is slower.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -106,6 +111,7 @@ CSV_FIELDS = (
     "case",
     "rank_mode",
     "scale_mode",
+    "generate_c",
     "operand_order",
     "pingpong",
     "tile_m",
@@ -748,6 +754,7 @@ def _run_case(
         "case": case.perf_case,
         "rank_mode": case.rank_mode,
         "scale_mode": case.scale_mode,
+        "generate_c": int(case.generate_c),
         "operand_order": case.operand_order,
         "pingpong": int(case.pingpong),
         "tile_m": case.tile_m,
@@ -912,7 +919,8 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
         help=(
-            "Benchmark-data root; artifacts are stored under ROOT/YYYYMMDD "
+            "Benchmark-data root; both mode uses ROOT/{inference,generate_c}/YYYYMMDD, "
+            "off/on uses ROOT/YYYYMMDD "
             f"(default: {DEFAULT_OUTPUT_DIR})"
         ),
     )
@@ -1009,11 +1017,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--generate-c",
-        action="store_true",
-        help="Heuristic mode only: run the training forward (generate_c=True, the "
-        "raw fc1 gate+up tensor is written) on the table's launch configs "
-        "(combine with --training-geometry to pin M64N256); output stems get a "
-        "_genc suffix.",
+        nargs="?",
+        const="on",
+        choices=("off", "on", "both"),
+        default="both",
+        help="Default: both. Measure inference and raw FC1 gate/up output in "
+        "separate <output-dir>/{inference,generate_c}/<date> directories, then "
+        "write latency/TFLOPS comparisons under <output-dir>/<date>. "
+        "off/on runs only that path; bare --generate-c still means on.",
     )
     parser.add_argument(
         "--no-plot",
@@ -1048,10 +1059,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.reconfigure(line_buffering=True)
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if (args.generate_c or args.training_geometry) and not args.use_heuristic:
-        raise SystemExit(
-            "--generate-c / --training-geometry apply to the heuristic-mode token sweep only"
-        )
+    if args.training_geometry and not args.use_heuristic:
+        parser.error("--training-geometry requires heuristic mode")
+    if args.generate_c != "both":
+        return _run_sweep(parser, args)
+
+    root = args.output_dir.resolve()
+    rc = 0
+    for label, mode in (("inference", "off"), ("generate_c", "on")):
+        sub_args = argparse.Namespace(**vars(args))
+        sub_args.output_dir = root / label
+        sub_args.generate_c = mode
+        print(f"[GENERATE_C={mode}] sweep -> {sub_args.output_dir / args.date}")
+        rc |= _run_sweep(parser, sub_args)
+        if rc and args.fail_fast:
+            return rc
+    if args.list or args.dry_run or args.no_finalize or args.shard_count != 1:
+        return rc
+    compare_command = [
+        sys.executable,
+        str(SUMMARY_SCRIPT),
+        "--compare",
+        str(root / "inference"),
+        "inference",
+        str(root / "generate_c"),
+        "generate_c",
+        "--date",
+        args.date,
+        "--compare-out",
+        str(root / args.date / f"{args.date}_generate_c_vs_inference"),
+    ]
+    print(f"[COMPARE] {shlex.join(compare_command)}")
+    compare_rc = subprocess.run(
+        compare_command, cwd=SCRIPT_DIR.parent, check=False
+    ).returncode
+    return 1 if rc or compare_rc else 0
+
+
+def _run_sweep(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if not PERF_SCRIPT.is_file():
         raise FileNotFoundError(PERF_SCRIPT)
     if not PLOT_SCRIPT.is_file():
@@ -1077,7 +1122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.scale_mode,
             token_sizes,
             training_geometry=args.training_geometry,
-            generate_c=args.generate_c,
+            generate_c=args.generate_c == "on",
         )
         all_cases = tuple(dict.fromkeys(job.case for job in all_jobs))
         cases = tuple(
@@ -1095,6 +1140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.schedule,
             args.cluster_shape,
         )
+        cases = tuple(replace(case, generate_c=args.generate_c == "on") for case in cases)
         cases = tuple(
             case
             for index, case in enumerate(cases)

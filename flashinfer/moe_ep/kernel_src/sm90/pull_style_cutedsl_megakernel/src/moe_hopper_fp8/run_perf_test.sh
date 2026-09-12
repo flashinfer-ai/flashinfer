@@ -33,6 +33,7 @@
 #   FP8_CLUSTER_SHAPE=2,2,1 bash ... --scale-mode per-tensor P01 P02
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_perf_test.sh P01 P02
 #   FP8_SWAP_AB_M=256 FP8_SWAP_AB_N=32 bash .../run_perf_test.sh --swapab P01
+#   FP8_SWAP_AB_N accepts 8/16/32/64/128 (default 32).
 
 set -uo pipefail
 
@@ -195,10 +196,10 @@ if [ "$SWAP_AB" -eq 1 ]; then
     esac
     FP8_SWAP_AB_N="${FP8_SWAP_AB_N:-32}"
     case "$FP8_SWAP_AB_N" in
-        16|32|64|128)
+        8|16|32|64|128)
             ;;
         *)
-            echo "ERROR: FP8_SWAP_AB_N must be one of 16,32,64,128" >&2
+            echo "ERROR: FP8_SWAP_AB_N must be one of 8,16,32,64,128" >&2
             exit 2
             ;;
     esac
@@ -245,7 +246,7 @@ fi
 COMMON_KIND_ARGS="--kind fp8_e4m3"
 COMMON_PERF_ARGS="--perf_run --skip_ref_check"
 # generate_c (training forward): FP8_GENERATE_C=1 adds --generate_c to the
-# MegaMoE runner launches (P02/P03).  Non-swap layouts only; the lean fc12
+# MegaMoE runner launches (P02/P03), with either operand order. The lean fc12
 # runner (P01) has no raw-C store and is left unchanged.
 FP8_GENERATE_C="${FP8_GENERATE_C:-0}"
 MEGA_GENERATE_C_ARGS=""
