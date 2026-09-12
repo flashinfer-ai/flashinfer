@@ -24,6 +24,7 @@
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -827,6 +828,17 @@ __forceinline__ __device__ T find_max_elem_in_warp(T value) {
   return value;
 }
 
+// Form the reciprocal from a normal FP32 dequantization scale. Directly computing
+// 448 / amax overflows for tiny nonzero activation blocks (#2595).
+__forceinline__ __device__ float fp8_quantization_scale(float amax, float& dequant_scale) {
+  if (amax == 0.f) {
+    dequant_scale = 1.f;
+    return 1.f;
+  }
+  dequant_scale = fmaxf(amax / 448.f, std::numeric_limits<float>::min());
+  return 1.f / dequant_scale;
+}
+
 template <typename InputType, typename OutputType, typename ScaleType = float>
 __global__ void scale_1x128_kernel(OutputType* output, ScaleType* scales,
                                    InputType const* const input, int dim_x, int dim_y) {
@@ -868,10 +880,11 @@ __global__ void scale_1x128_kernel(OutputType* output, ScaleType* scales,
     }
 
     InputType amax = find_max_elem_in_warp(input_amax);
-    ScaleType scale = amax != InputType(0.f) ? 448.f / ScaleType(amax) : 1.f;
+    float dequant_scale;
+    ScaleType scale = ScaleType(fp8_quantization_scale(float(amax), dequant_scale));
 
     if (lane_id == 0) {
-      scales[(size_t)scales_idx_x * stride_scale_dim_y + scales_idx_y] = ScaleType(1.f / scale);
+      scales[(size_t)scales_idx_x * stride_scale_dim_y + scales_idx_y] = ScaleType(dequant_scale);
     }
 
     OutputType* output_line = output + (size_t)scales_idx_y * dim_x + scales_idx_x * 128;
@@ -985,10 +998,11 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
     //     __hmax(__hmax(__habs(input_frag[0]), __habs(input_frag[1])),
     //         __hmax(__habs(input_frag[2]), __habs(input_frag[3]))));
 
-    float scale = amax != InputType(0.f) ? 448.f / float(amax) : 1.f;
+    float dequant_scale;
+    float scale = fp8_quantization_scale(float(amax), dequant_scale);
 
     if (kernel_utils::elect_one_sync(lane_id)) {
-      scale_output = float(1.f / scale);
+      scale_output = dequant_scale;
     }
 
     for (int i = 0; i < 4; i++) {
@@ -1048,11 +1062,12 @@ __global__ void scale_1x128_reshape_kernel(OutputType* output, ScaleType* scales
     }
 
     InputType amax = find_max_elem_in_warp(input_amax);
-    ScaleType scale = amax != InputType(0.f) ? 448.f / ScaleType(amax) : 1.f;
+    float dequant_scale;
+    ScaleType scale = ScaleType(fp8_quantization_scale(float(amax), dequant_scale));
 
     if (lane_id == 0) {
       scales[(size_t)scales_idx_h * scales_along_dim_x * stride_scale_dim_y +
-             (size_t)scales_idx_x * stride_scale_dim_y + scales_idx_y] = ScaleType(1.f / scale);
+             (size_t)scales_idx_x * stride_scale_dim_y + scales_idx_y] = ScaleType(dequant_scale);
     }
 
     OutputType* output_line = output + (size_t)scales_idx_h * dim_y * dim_x +
@@ -1108,10 +1123,11 @@ __global__ void scale_128x128_kernel(OutputType* output, ScaleType* scales,
     }
 
     InputType amax = find_max_elem_in_warp(input_amax);
-    ScaleType scale = amax != InputType(0.f) ? 448.f / ScaleType(amax) : 1.f;
+    float dequant_scale;
+    ScaleType scale = ScaleType(fp8_quantization_scale(float(amax), dequant_scale));
 
     if (lane_id == 0) {
-      scales[scales_idx_y * scales_along_dim_x + scales_idx_x] = ScaleType(1.f / scale);
+      scales[scales_idx_y * scales_along_dim_x + scales_idx_x] = ScaleType(dequant_scale);
     }
 
     input_line = input + scales_idx_y * 128 * dim_x + scales_idx_x * 128;
