@@ -1,0 +1,95 @@
+{
+  "architectures": [
+    "sm_100a",
+    "sm_103a"
+  ],
+  "compile_flags": [
+    "--use_fast_math"
+  ],
+  "constraints": {
+    "dtypes": [
+      "float16",
+      "bfloat16"
+    ],
+    "hidden_dim": 7168,
+    "max_lamport_comm_size_bytes": 2145386496,
+    "quantization": false,
+    "world_sizes": [
+      2,
+      4,
+      8
+    ]
+  },
+  "kernel_symbols": [
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o0110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o1110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o0110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o1110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o0110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o1110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o0110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o1110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o0110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110"
+  ],
+  "launch": {
+    "block_threads": 224,
+    "cluster_dim": [
+      4,
+      1,
+      1
+    ],
+    "dynamic_smem_bytes": 256
+  },
+  "schema_version": 1,
+  "sm100_ws8_mid_kernel_symbols": [
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm100_ws8_mid",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o1110_sm100_ws8_mid",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm100_ws8_mid",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110_sm100_ws8_mid"
+  ],
+  "sm103_t1_kernel_symbols": [
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_float16_ws8_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm103_t1",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o1110_sm103_t1"
+  ],
+  "source_sha256": "b6ac2eaf7f4939250db5d5c16f51e7aff8717df54f25e013b78963e1c0b5dfa9",
+  "workspace_protocol": {
+    "flag_region_bytes_by_world_size": {
+      "2": 2048,
+      "4": 4288,
+      "8": 8576
+    },
+    "tp4_ack_tail": {
+      "bytes": 192,
+      "consumers": 4,
+      "empty_sentinel_u16": 32768,
+      "generation_stride_bytes": 64,
+      "generations": 3,
+      "offset_bytes": 4096,
+      "ready_u16": 0,
+      "slot_bytes": 16
+    },
+    "tp8_ack_tail": {
+      "bytes": 384,
+      "consumers": 8,
+      "empty_sentinel_u16": 32768,
+      "generation_stride_bytes": 128,
+      "generations": 3,
+      "offset_bytes": 8192,
+      "ready_u16": 0,
+      "slot_bytes": 16
+    }
+  }
+}
