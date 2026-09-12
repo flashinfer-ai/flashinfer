@@ -1,4 +1,4 @@
-# Experimental DeepSeek V4.1 components
+# Experimental DeepSeek V4.1 decode
 
 The mixed-cache and window-only decode APIs use one SM100 CuTe DSL backend,
 adapted from Mengyu Guo's CuTe DSL HCA ([#3943](https://github.com/flashinfer-ai/flashinfer/pull/3943),
@@ -12,8 +12,8 @@ the source.
 
 Run `python examples/deepseek_v41/decode.py` on SM100. The validated environment
 uses CUTLASS DSL 4.7, PyTorch 2.13+cu130 and CUDA toolkit 13.2. Decode is JIT-only
-and does not require the external `flash_mla` package. The cache examples use the
-separate experimental cache/quantization component. CuTe uses its bundled
+and does not require the external `flash_mla` package. The included optional
+cache writer makes the example self-contained. CuTe uses its bundled
 compiler (CUDA 13.3 in this validation), independently of `CUDA_HOME`. With
 bundled CUDA >= 13.2, compressed-cache decoding uses native FP4-to-BF16 and
 packed BF16 multiplication. Older bundled compilers retain the existing
@@ -33,11 +33,8 @@ of 64. Window-only decode uses the same kernel with no compressed stream.
 Physical slot `-1` and out-of-capacity slots are masked without reading cache
 storage. Every valid cache slot must be initialized and causally visible.
 
-Q/K/V and probabilities use BF16; accumulation and softmax use FP32. This is an
-explicit change from the earlier draft's FP32-probability Triton recipes:
-`deepseek_v41_decode_fp32`, `deepseek_v41_decode_bf16x3`, and the decode
-`backend`/`arithmetic` arguments have been removed. The numerical gate for this
-BF16-P path is independent FP64 relative-L2 < 0.005, max-scaled error < 0.01,
+Q/K/V and probabilities use BF16; accumulation and softmax use FP32.
+The numerical gate is independent FP64 relative-L2 < 0.005, max-scaled error < 0.01,
 and absolute LSE error < 1e-5. Checkpoint accuracy has not been established.
 
 `deepseek_v41_decode` returns `(out, lse, plan)`. Output is BF16 with Q's shape;
@@ -52,6 +49,28 @@ and addresses may change if shape, strides, dtype and device match. A plan
 must not run concurrently on multiple streams, and its buffers must not alias
 inputs. Training, speculative multi-token queries, SM103 and full-model E2E
 validation are outside this initial scope.
+
+`deepseek_v41_quantize_cache` is an optional Triton helper for producing these
+two cache formats from contiguous BF16/FP32 `[N,512]` rows. It fuses quantization
+and writing into page64 storage; `out` plus int32 `slots[N]` supports incremental
+updates without allocation. Slot `-1` skips a write; other slots must be unique
+and within the caller-owned cache. Unwritten slots remain unchanged. Apply
+model-required RoPE before quantization. This helper is provided for integration
+and reproducible examples, with no competitive-performance claim. Decode does
+not call it and accepts compatible cache bytes from any producer.
+
+Within each 64-token page, all data rows precede all scale rows. The opaque
+`[pages,64,1,width]` view does not mean data and scales are interleaved per token:
+
+| Cache | Data bytes/token | Scale bytes/token | Scale format |
+|---|---:|---:|---|
+| Main FP4, width 288 | 256 E2M1 | 32 | E4M3, group16, no global scale |
+| Window MXFP8, width 528 | 512 E4M3 | 16 | E8M0, group32 |
+
+The caller supplies physical slot IDs. For a logical token ID `t` in request
+`b`, the usual mapping is `block_table[b, t // 64] * 64 + t % 64`, with invalid
+entries mapped to `-1`. Slot mapping, RoPE, indexing and GEMM quantization remain
+outside this decode API.
 
 The reproducible GPU benchmark checks both outputs against FP64 before timing:
 

@@ -103,7 +103,12 @@ def main():
         raise FileExistsError(opts.output)
     if opts.context < 512 or opts.context % 64:
         raise ValueError("context must be a multiple of64 >=512")
-    from flashinfer.experimental.deepseek_v41 import hca_v41, hca_v41_primitives
+    from flashinfer.experimental.deepseek_v41 import (
+        cache,
+        decode,
+        hca_v41,
+        hca_v41_primitives,
+    )
 
     report = {
         "status": "running",
@@ -118,7 +123,7 @@ def main():
             Path(m.__file__).name: hashlib.sha256(
                 Path(m.__file__).read_bytes()
             ).hexdigest()
-            for m in (hca_v41, hca_v41_primitives)
+            for m in (cache, decode, hca_v41, hca_v41_primitives)
         },
         "rows": [],
     }
