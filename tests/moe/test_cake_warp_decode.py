@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -29,6 +31,7 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
     RoutingMethodType,
     SiLU,
+    SiTU,
     SwiGLU,
     TrtllmFp4Config,
 )
@@ -57,6 +60,7 @@ class _Module:
         self.prepare_calls = []
         self.release_calls = []
         self.run_calls = []
+        self.parameter_run_calls = []
         self.next_receipt = 1
         self.live_receipts = set()
         self.release_error: Exception | None = None
@@ -86,37 +90,131 @@ class _Module:
         if self.run_error is not None:
             raise self.run_error
 
+    def cake_fused_moe_warp_decode_with_activation_params(self, *args) -> None:
+        self.parameter_run_calls.append(args)
+        if self.run_error is not None:
+            raise self.run_error
 
-def test_jit_resolves_target_owned_shared_binding_paths(tmp_path):
-    csrc_dir = tmp_path / "csrc" / "fused_moe" / "warp_decode"
-    relative_paths = [
-        "csrc/fused_moe/warp_decode/cake_warp_decode_binding.cu",
-        "csrc/fused_moe/warp_decode/cake_warp_decode_contract.cuh",
-        "flashinfer/jit/cake_fused_moe_warp_decode.py",
+
+def _write_inventory(path, payload):
+    program = {key: payload[key] for key in ("modules", "sequences", "routes", "files")}
+    payload["program_hash"] = hashlib.sha256(
+        (
+            json.dumps(program, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode()
+    ).hexdigest()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _inventory_fixture(tmp_path):
+    prefix = "csrc/fused_moe/warp_decode/"
+    device = prefix + "generated/sm_100a/fc1_kernel.cu"
+    binding = prefix + "generated/sm_100a/fc1_binding.cu"
+    sequence_binding = prefix + "generated/sm_100a/sequence_binding.cu"
+    source_paths = [
+        device,
+        binding,
+        sequence_binding,
+        prefix + "generated/cake_warp_decode_generated_manifest.cuh",
+        prefix + "cake_warp_decode_binding.cu",
+        prefix + "cake_warp_decode_contract.cuh",
     ]
-    for relative in relative_paths:
-        path = tmp_path / relative
+    files = {}
+    for name in source_paths:
+        path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("// sealed target-owned source\n", encoding="utf-8")
-
-    receipt = {
-        "delivery": "target_owned_shared",
-        "paths": relative_paths,
-        "generated_source_witness": {"bytes": 1, "sha256": "0" * 64},
+        path.write_text("// source inventory witness: fc1_symbol\n", encoding="utf-8")
+        files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    payload = {
+        "schema": "flashinfer.warp_decode.inventory.v1",
+        "modules": [
+            {
+                "name": "fc1",
+                "role": "fc1",
+                "arch": "sm_100a",
+                "kernel_symbol": "fc1_symbol",
+                "ffi_entry": "fc1_run",
+                "compile_flags": [],
+                "device": device,
+                "binding": binding,
+            }
+        ],
+        "sequences": [
+            {
+                "name": "seq",
+                "role": "decode",
+                "arch": "sm_100a",
+                "ffi_entry": "sequence_run",
+                "binding": sequence_binding,
+                "devices": [device],
+                "modules": [{"name": "fc1", "role": "fc1"}],
+            }
+        ],
+        "routes": [
+            {
+                "shape": "T1",
+                "arch": "sm_100a",
+                "args": {"num_tokens": 1},
+                "stages": [
+                    {
+                        "name": "fc1",
+                        "template": "fc1_static",
+                        "module": {"name": "fc1", "role": "fc1"},
+                    }
+                ],
+                "sequence": {"name": "seq", "role": "decode"},
+            }
+        ],
+        "files": files,
     }
-    assert cake_warp_decode_jit._resolve_export_binding_paths(
-        csrc_dir, receipt, "modules[0].translation_units.binding"
-    ) == tuple((tmp_path / relative).resolve() for relative in relative_paths)
-    assert cake_warp_decode_jit._resolve_export_binding_paths(
-        csrc_dir, relative_paths[0], "modules[0].translation_units.binding"
-    ) == ((tmp_path / relative_paths[0]).resolve(),)
+    csrc_dir = tmp_path / prefix
+    manifest = csrc_dir / "generated" / "cake_warp_decode_inventory.json"
+    _write_inventory(manifest, payload)
+    return csrc_dir, manifest, payload, tmp_path / device
 
-    with pytest.raises(ValueError, match="paths must be a non-empty array"):
-        cake_warp_decode_jit._resolve_export_binding_paths(
-            csrc_dir,
-            {"delivery": "target_owned_shared", "paths": []},
-            "modules[0].translation_units.binding",
-        )
+
+def test_jit_validates_compact_inventory_source_and_route_closure(tmp_path):
+    csrc_dir, _, _, device = _inventory_fixture(tmp_path)
+    assert cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm100a") == (
+        [device],
+        False,
+        {device: []},
+    )
+    with pytest.raises(ValueError, match="no modules for exact target"):
+        cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm103a")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "source_hash",
+        "program_hash",
+        "route_module",
+        "sequence_device",
+        "architecture",
+        "compile_flags",
+    ],
+)
+def test_jit_rejects_inconsistent_compact_inventory(tmp_path, failure):
+    csrc_dir, manifest, payload, device = _inventory_fixture(tmp_path)
+    if failure == "source_hash":
+        device.write_text("// changed source\n", encoding="utf-8")
+    elif failure == "program_hash":
+        payload["program_hash"] = "0" * 64
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        if failure == "route_module":
+            payload["routes"][0]["stages"][0]["module"]["name"] = "missing"
+        elif failure == "sequence_device":
+            payload["sequences"][0]["devices"] = []
+        elif failure == "compile_flags":
+            del payload["modules"][0]["compile_flags"]
+        else:
+            payload["modules"][0]["arch"] = "sm_103a"
+        _write_inventory(manifest, payload)
+    with pytest.raises(ValueError):
+        cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm100a")
 
 
 def test_jit_prefers_checkout_sources_when_editable_data_is_staged(
@@ -230,6 +328,12 @@ def _weight_pack(
     }
     if activation.is_gated:
         view["gemm1_alpha"] = _TensorSpec((num_experts,), torch.float32)
+    if isinstance(activation, SiTU) or (
+        isinstance(activation, SwiGLU) and activation != SwiGLU()
+    ):
+        view["gemm1_beta"] = _TensorSpec((num_experts,), torch.float32)
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        view["gemm1_clamp_limit"] = _TensorSpec((num_experts,), torch.float32)
     if extra:
         view.update(extra)
     weights = MoEWeightPack()
@@ -282,6 +386,19 @@ def test_runner_build_passes_its_explicit_target_and_device(
         (None, SwiGLU(), 2560, 768, 384),
         (SwiGLU(), SwiGLU(), 2560, 768, 384),
         (SiLU(), SiLU(), 6144, 1536, 192),
+        (None, SwiGLU(), 2048, 768, 128),
+        (SwiGLU(), SwiGLU(), 4096, 1536, 128),
+        (SwiGLU(), SwiGLU(), 2048, 512, 256),
+        (SwiGLU(), SwiGLU(), 4096, 1024, 512),
+        (SwiGLU(), SwiGLU(), 3072, 1536, 256),
+        (
+            SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+            SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+            6144,
+            3072,
+            128,
+        ),
+        (SiTU(), SiTU(), 3584, 3072, 896),
     ],
 )
 def test_config_preparation_delegates_to_trtllm_physical_view(
@@ -331,6 +448,15 @@ def test_config_preparation_delegates_to_trtllm_physical_view(
         (SwiGLU(alpha=2.0), 2048, 1536, 60),
         (SiLU(), 2560, 768, 384),
         (SwiGLU(alpha=2.0), 2560, 768, 384),
+        (SiLU(), 2048, 768, 128),
+        (SwiGLU(alpha=2.0), 4096, 1536, 128),
+        (SiLU(), 2048, 512, 256),
+        (SiLU(), 4096, 1024, 512),
+        (SiLU(), 3072, 1536, 256),
+        (SwiGLU(), 6144, 3072, 128),
+        (SwiGLU(), 3584, 3072, 896),
+        (SwiGLU(alpha=1.702, beta=0.0, limit=7.0), 6144, 3072, 128),
+        (SiTU(gate_scale=1.0), 3584, 3072, 896),
     ],
 )
 def test_config_preparation_rejects_activation_geometry_cross_product(
@@ -411,12 +537,25 @@ def test_support_rejects_nonexact_architectures(device_arch):
 
 
 @pytest.mark.parametrize("device_arch", [100, 103])
-@pytest.mark.parametrize("intermediate_size,num_experts", [(1536, 60), (768, 384)])
+@pytest.mark.parametrize(
+    "intermediate_size,num_experts,top_k",
+    [
+        (1536, 60, 4),
+        (768, 384, 4),
+        (768, 128, 8),
+        (1536, 128, 8),
+        (512, 256, 8),
+        (1024, 512, 10),
+        (1536, 256, 8),
+    ],
+)
 def test_support_accepts_exact_architectures(
-    device_arch, intermediate_size, num_experts
+    device_arch, intermediate_size, num_experts, top_k
 ):
     runner, _ = _runner(
-        _config(intermediate_size=intermediate_size, num_experts=num_experts),
+        _config(
+            intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k
+        ),
         device_arch=device_arch,
     )
     runner._check_support()
@@ -424,17 +563,27 @@ def test_support_accepts_exact_architectures(
 
 @pytest.mark.parametrize("device_arch", [100, 103])
 @pytest.mark.parametrize(
-    "hidden_size,intermediate_size,num_experts",
-    [(2048, 1536, 60), (2560, 768, 384)],
+    "hidden_size,intermediate_size,num_experts,top_k",
+    [
+        (2048, 1536, 60, 4),
+        (2560, 768, 384, 4),
+        (2048, 768, 128, 8),
+        (4096, 1536, 128, 8),
+        (2048, 512, 256, 8),
+        (4096, 1024, 512, 10),
+        (3072, 1536, 256, 8),
+    ],
 )
 def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
-    device_arch, hidden_size, intermediate_size, num_experts
+    device_arch, hidden_size, intermediate_size, num_experts, top_k
 ):
     runner, module = _runner(
-        _config(intermediate_size=intermediate_size, num_experts=num_experts),
+        _config(
+            intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k
+        ),
         device_arch=device_arch,
     )
-    act = _activation_pack(hidden_size=hidden_size)
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
     weights, view = _weight_pack(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -444,7 +593,9 @@ def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
     first = runner.pack_inputs(act, weights)
     second = runner.pack_inputs(act, weights)
 
-    assert module.size_calls == [(7, hidden_size, intermediate_size, num_experts, 4)]
+    assert module.size_calls == [
+        (7, hidden_size, intermediate_size, num_experts, top_k)
+    ]
     assert len(module.prepare_calls) == 1
     assert first[1] is second[1]
     assert first[0] is not second[0]
@@ -469,6 +620,94 @@ def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
     assert len(module.prepare_calls) == 2
     assert runner.forward(first) is first[0]
     assert module.run_calls == [tuple([*first, 2, True])]
+
+
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "activation,hidden_size,num_experts,top_k",
+    [
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4),
+        (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 896, 16),
+    ],
+)
+def test_parameterized_pack_forwards_live_activation_tensors(
+    device_arch, activation, hidden_size, num_experts, top_k
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=3072,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        ),
+        device_arch=device_arch,
+    )
+    runner._check_support()
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        activation=activation,
+    )
+    inputs = runner.pack_inputs(act, weights)
+    assert len(inputs) == 16
+    assert inputs[13] is view["gemm1_alpha"]
+    assert inputs[14] is view["gemm1_beta"]
+    assert inputs[15] is view.get("gemm1_clamp_limit")
+    assert module.size_calls == [(7, hidden_size, 3072, num_experts, top_k)]
+    assert runner.forward(inputs) is inputs[0]
+    assert module.run_calls == []
+    assert module.parameter_run_calls == [tuple([*inputs, 1, True])]
+
+
+@pytest.mark.parametrize(
+    "activation,hidden_size,num_experts,top_k,missing_key",
+    [
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_alpha"),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_beta"),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_clamp_limit"),
+        (SiTU(), 3584, 896, 16, "gemm1_alpha"),
+        (SiTU(), 3584, 896, 16, "gemm1_beta"),
+    ],
+)
+def test_parameterized_pack_requires_prepared_activation_tensors(
+    activation, hidden_size, num_experts, top_k, missing_key
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=3072,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        )
+    )
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        activation=activation,
+    )
+    del view[missing_key]
+    with pytest.raises(KeyError, match=missing_key):
+        runner.pack_inputs(act, weights)
+    assert module.prepare_calls == []
+
+
+def test_situ_pack_rejects_unconsumed_clamp_override():
+    runner, _ = _runner(
+        _config(intermediate_size=3072, num_experts=896, top_k=16, activation=SiTU())
+    )
+    weights, _ = _weight_pack(
+        hidden_size=3584,
+        intermediate_size=3072,
+        num_experts=896,
+        activation=SiTU(),
+        extra={"gemm1_clamp_limit": _TensorSpec((896,), torch.float32)},
+    )
+    with pytest.raises(ValueError, match="gemm1_clamp_limit"):
+        runner.pack_inputs(_activation_pack(hidden_size=3584, top_k=16), weights)
 
 
 def test_silu_pack_uses_nongated_rows_and_preserves_ffi_order():

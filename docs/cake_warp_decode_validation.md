@@ -2,7 +2,7 @@
 
 `benchmarks/cake_warp_decode.py` is the standalone exact-SM100/SM103 validation
 and benchmark entry point. It prepares one public TRTLLM NVFP4 physical fixture
-per activation-qualified geometry. SwiGLU rows share the exact activation,
+per activation-qualified geometry. SwiGLU and SiTU rows share the exact activation,
 routing, weight, and scale tensors between Cake and
 `trtllm_fp4_block_scale_routed_moe`. The official runner does not support
 standalone SiLU, so that configuration uses Cake export repeatability and the
@@ -40,9 +40,16 @@ The mandatory dense matrix is:
 | SwiGLU | 2048 | 1536 | 60 | 4 | every value from 1 through 32 |
 | SwiGLU | 2560 | 768 | 384 | 4 | every value from 1 through 32 |
 | standalone SiLU | 6144 | 1536 | 192 | 4 | every value from 1 through 32 |
+| SwiGLU | 2048 | 768 | 128 | 8 | every value from 1 through 32 |
+| SwiGLU | 4096 | 1536 | 128 | 8 | every value from 1 through 32 |
+| SwiGLU | 2048 | 512 | 256 | 8 | every value from 1 through 32 |
+| SwiGLU | 4096 | 1024 | 512 | 10 | every value from 1 through 32 |
+| SwiGLU | 3072 | 1536 | 256 | 8 | every value from 1 through 32 |
+| SwiGLU(alpha=1.702, beta=1, limit=7) | 6144 | 3072 | 128 | 4 | every value from 1 through 32 |
+| SiTU(gate_scale=4, linear_scale=25) | 3584 | 3072 | 896 | 16 | every value from 1 through 32 |
 
 GEMM1 fixture construction is activation-aware. Its logical BF16 weight shape
-is `[E, 2 * I, H]` for gated SwiGLU and `[E, I, H]` for standalone SiLU; both
+is `[E, 2 * I, H]` for gated SwiGLU/SiTU and `[E, I, H]` for standalone SiLU; both
 are prepared into the production NVFP4 shuffled ABI expected by their
 activation-qualified generated schedules. The E2M1 weight tensor uses the
 production `MajorK` 32-row MMA layout: physical row `p` maps back to logical
@@ -51,7 +58,7 @@ block-scale tensor uses the production `R128c4` layout.
 
 Every row prepares the exported workspace on non-default stream A, launches on
 distinct non-default stream B, and launches twice into the same caller-owned
-output and workspace. SwiGLU compares finalized BF16 output against the official
+output and workspace. SwiGLU and SiTU compare finalized BF16 output against the official
 routed-MoE baseline with `atol=1e-2` and `rtol=1e-2`. Standalone SiLU records the
 official baseline as `N/A` and compares two independently prepared exported Cake
 calls; its source/export numeric parity comes from the release validation receipt
@@ -103,7 +110,7 @@ idempotent success, so a bookkeeping mistake cannot masquerade as proven GPU
 retirement. One retirement case per geometry launches on stream B, immediately
 re-prepares the same workspace on stream C without synchronizing B, launches the
 replacement generation, and releases it without synchronizing C. The
-replacement output must match the official baseline for SwiGLU or an
+replacement output must match the official baseline for SwiGLU/SiTU or an
 independently prepared exported Cake call for standalone SiLU. Source/export
 parity remains a separate release gate.
 
@@ -114,18 +121,21 @@ do not release or re-prepare that workspace and then replay the old graph.
 One deterministic receipt-generation case per geometry creates a distinct
 tensor view at the exact same workspace address, prepares it again to obtain
 receipt r2, verifies that stale receipt r1 is rejected before launch, then checks
-that r2 launches correctly on stream B. After releasing r2 through the fourth
-FFI entry point, the case verifies that r2 is rejected as well. This models the
+that r2 launches correctly on stream B. After releasing r2 through the receipt
+release FFI entry point, the case verifies that r2 is rejected as well. This models the
 same-address generation change caused by caching-allocator address reuse without
 depending on a nondeterministic allocator choice.
 
 CUDA Graph capture and post-capture mutation are additionally exercised at all
 selector transitions:
 
-- E512: T=1, 2, 22, 23, 32.
+- H2048/I512/E512/top-k 10: T=1, 2, 22, 23, 32.
 - E60: T=1, 7, 8, 10, 11, 12, 16, 17, 32.
 - standalone-SiLU E192: T=1, 2, 32.
 - SwiGLU E384: T=1, 2, 32.
+- The other five SwiGLU geometries: T=1, 2, 32.
+- Parameterized-SwiGLU H6144/I3072/E128/top-k 4: T=1, 2, 32.
+- SiTU H3584/I3072/E896/top-k 16: T=1, 2, 32 (static FC1 throughout).
 
 Workspace preparation occurs on stream A before capture on distinct stream B.
 The harness first replays the graph without mutation and checks the applicable
@@ -144,6 +154,13 @@ delay before replay makes the work deterministically in flight when release is
 called, and the replacement generation performs a full launch and correctness
 comparison rather than prepare-only reuse.
 
+Parameterized SwiGLU and SiTU additionally replay the captured graph after
+changing one routed expert's activation tensors, one parameter at a time.
+Each replay must match the official reference and change its output from the
+original case. These cases exercise SwiGLU alpha, beta, and clamp limit, and
+SiTU gate and linear scales. The tensor values are restored before the existing
+routing, weight, and workspace-retirement mutation cases.
+
 One public `MoELayer` case per geometry additionally clears the standalone
 tuner cache, enters actual autotune mode with the exact token bucket, and
 requires a positive successful-profile count from the real single-backend
@@ -155,10 +172,12 @@ routing-validation receipts.
 
 On SM103, the selector boundary labels in the JSON receipt distinguish E60
 `_e64_scan1` at T=11, `_e64_scan2` at T=12..16, and the general route packer at T=17..32.
-They distinguish E512 direct routing through T=22 from the general route packer
-at T=23..32.
-Standalone-SiLU E192 and SwiGLU E384 use the static direct route at T=1 and the
-persistent direct route at T=2..32 on both targets.
+They distinguish H2048/I512/E512/top-k 10 direct routing through T=22 from the
+general route packer at T=23..32. Standalone-SiLU E192, SwiGLU E384, and the five
+additional SwiGLU geometries use the static direct route at T=1 and the persistent
+direct route at T=2..32 on both targets, with the route-parallel K256 FC2 schedule.
+Parameterized SwiGLU uses the same direct static/persistent boundary. SiTU uses
+static FC1 at T=1..32 with direct K256 FC2 on both targets.
 
 ## CUPTI benchmark gate
 
@@ -186,7 +205,7 @@ stream B. The exported output and workspace must retain their caller-owned
 address/capacity through the measurement, after which the generation receipt is
 explicitly released.
 
-Each SwiGLU result row alternates exported Cake and the official FlashInfer
+Each SwiGLU/SiTU result row alternates exported Cake and the official FlashInfer
 routed-MoE baseline in ABBA and BAAB rounds. Every position is a separate
 repository `bench_gpu_time` CUPTI/cold-L2 session. The receipt records the exact
 order and measurement for every position, each arm's aggregate median,
@@ -214,7 +233,7 @@ python benchmarks/cake_warp_decode.py \
 
 Use `--benchmark-tokens 1 11 17 24 32` to request a smaller explicit
 performance slice; correctness mode always tests T=1..32 for every selected
-geometry. `--geometry all` includes all four configurations listed above.
+geometry. `--geometry all` includes all eleven configurations listed above.
 
 ## Compute Sanitizer entry point
 

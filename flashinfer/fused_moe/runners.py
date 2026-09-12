@@ -678,16 +678,16 @@ class CakeWarpDecodeRunner(MoERunner):
 
     The runner consumes the physical tensor view produced by
     :class:`TrtllmFp4Config`: packed E2M1 weights and activations, E4M3 block
-    scales, and per-expert FP32 epilogue scales. Supported SwiGLU geometries fix
-    ``alpha=1`` and ``beta=0``; the compatible ``gemm1_alpha`` field in the
-    TRTLLM view is therefore not a launch argument. Activation is identified by
-    the exact geometry and does not extend the tensor launch ABI.
+    scales, and per-expert FP32 epilogue scales. Default SwiGLU geometries fix
+    ``alpha=1`` and ``beta=0``. Parameterized SwiGLU and SiTU use an extended
+    launch entry point that consumes the prepared per-expert activation tensors.
+    Activation is identified by the exact geometry.
     """
 
     backend_key = "cake"
     supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
-    supported_activation_classes = (SwiGLU, SiLU)
+    supported_activation_classes = (SwiGLU, SiLU, SiTU)
     supports_expert_parallelism = False
 
     _SUPPORTED_CONFIGURATIONS: ClassVar[
@@ -698,6 +698,13 @@ class CakeWarpDecodeRunner(MoERunner):
         (SwiGLU(), 2048, 1536, 60, 4),
         (SwiGLU(), 2560, 768, 384, 4),
         (SiLU(), 6144, 1536, 192, 4),
+        (SwiGLU(), 2048, 768, 128, 8),
+        (SwiGLU(), 4096, 1536, 128, 8),
+        (SwiGLU(), 2048, 512, 256, 8),
+        (SwiGLU(), 4096, 1024, 512, 10),
+        (SwiGLU(), 3072, 1536, 256, 8),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 3072, 128, 4),
+        (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 3072, 896, 16),
     }
     _REQUIRED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = (
         "gemm1_weights",
@@ -709,6 +716,14 @@ class CakeWarpDecodeRunner(MoERunner):
         "output2_scale_scalar",
     )
     _GATED_WEIGHT_KEYS: ClassVar[tuple[str, ...]] = ("gemm1_alpha",)
+    _ACTIVATION_PARAMETER_KEYS: ClassVar[dict[ActivationConfig, tuple[str, ...]]] = {
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0): (
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+        ),
+        SiTU(gate_scale=4.0, linear_scale=25.0): ("gemm1_alpha", "gemm1_beta"),
+    }
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
     _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
@@ -797,8 +812,12 @@ class CakeWarpDecodeRunner(MoERunner):
             raise NotImplementedError(
                 "CakeWarpDecodeRunner supports only default SwiGLU() with "
                 "(intermediate_size, num_experts, top_k) = (512, 512, 10), "
-                "(1536, 60, 4), or (768, 384, 4), and SiLU() with "
-                "(1536, 192, 4); got "
+                "(1536, 60, 4), (768, 384, 4), (768, 128, 8), "
+                "(1536, 128, 8), (512, 256, 8), (1024, 512, 10), or "
+                "(1536, 256, 8), and SiLU() with "
+                "(1536, 192, 4), SwiGLU(alpha=1.702, beta=1.0, limit=7.0) "
+                "with (3072, 128, 4), or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3072, 896, 16); got "
                 f"{configuration_without_hidden}."
             )
 
@@ -1176,9 +1195,14 @@ class CakeWarpDecodeRunner(MoERunner):
             raise ValueError(
                 "CakeWarpDecodeRunner supports only default SwiGLU() with "
                 "(hidden_size, intermediate_size, num_experts, top_k) = "
-                "(2048, 512, 512, 10), (2048, 1536, 60, 4), or "
-                "(2560, 768, 384, 4), and SiLU() "
-                "with (6144, 1536, 192, 4); got "
+                "(2048, 512, 512, 10), (2048, 1536, 60, 4), "
+                "(2560, 768, 384, 4), (2048, 768, 128, 8), "
+                "(4096, 1536, 128, 8), (2048, 512, 256, 8), "
+                "(4096, 1024, 512, 10), or (3072, 1536, 256, 8), and SiLU() "
+                "with (6144, 1536, 192, 4), "
+                "SwiGLU(alpha=1.702, beta=1.0, limit=7.0) with (6144, 3072, 128, 4), "
+                "or SiTU(gate_scale=4.0, linear_scale=25.0) "
+                "with (3584, 3072, 896, 16); got "
                 f"{configuration}."
             )
 
@@ -1216,7 +1240,12 @@ class CakeWarpDecodeRunner(MoERunner):
 
         view = weights.get_view(self.backend_key)
         activation = self.config.activation
-        gated_weight_keys = self._GATED_WEIGHT_KEYS if activation.is_gated else ()
+        activation_parameter_keys = self._ACTIVATION_PARAMETER_KEYS.get(activation, ())
+        gated_weight_keys = (
+            activation_parameter_keys or self._GATED_WEIGHT_KEYS
+            if activation.is_gated
+            else ()
+        )
         required_weight_keys = self._REQUIRED_WEIGHT_KEYS + gated_weight_keys
         missing = [key for key in required_weight_keys if key not in view]
         if missing:
@@ -1252,10 +1281,10 @@ class CakeWarpDecodeRunner(MoERunner):
             shape=(num_experts, gemm1_rows, hidden_size // 16),
             device=device,
         )
-        if activation.is_gated:
+        for name in gated_weight_keys:
             self._require_tensor(
-                view["gemm1_alpha"],
-                name="gemm1_alpha",
+                view[name],
+                name=name,
                 dtype=torch.float32,
                 shape=(num_experts,),
                 device=device,
@@ -1312,7 +1341,7 @@ class CakeWarpDecodeRunner(MoERunner):
         output = torch.empty(
             (num_tokens, hidden_size), dtype=torch.bfloat16, device=device
         )
-        return [
+        inputs = [
             output,
             workspace,
             act.hidden_states_q,
@@ -1327,6 +1356,12 @@ class CakeWarpDecodeRunner(MoERunner):
             view["output1_scale_gate_scalar"],
             view["output2_scale_scalar"],
         ]
+        if activation_parameter_keys:
+            inputs.extend(
+                view.get(name)
+                for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+            )
+        return inputs
 
     def forward(
         self,
@@ -1338,9 +1373,11 @@ class CakeWarpDecodeRunner(MoERunner):
         self._require_built()
         if tactic != -1:
             raise ValueError("CakeWarpDecodeRunner supports only tactic -1.")
-        if len(inputs) != 13:
+        parameterized = self.config.activation in self._ACTIVATION_PARAMETER_KEYS
+        expected_inputs = 16 if parameterized else 13
+        if len(inputs) != expected_inputs:
             raise ValueError(
-                "CakeWarpDecodeRunner expects 13 flattened tensor inputs, "
+                f"CakeWarpDecodeRunner expects {expected_inputs} flattened tensor inputs, "
                 f"got {len(inputs)}."
             )
         geometry = self._geometry_from_inputs(inputs)
@@ -1370,7 +1407,14 @@ class CakeWarpDecodeRunner(MoERunner):
             self._stream_token(stream),
         )
         try:
-            self._module.cake_fused_moe_warp_decode(*launch_inputs, prepared[1], True)
+            if parameterized:
+                self._module.cake_fused_moe_warp_decode_with_activation_params(
+                    *launch_inputs, prepared[1], True
+                )
+            else:
+                self._module.cake_fused_moe_warp_decode(
+                    *launch_inputs, prepared[1], True
+                )
         except Exception:
             finalizer = self._workspace_receipt_finalizers.pop(identity, None)
             if finalizer is not None and finalizer.alive:
