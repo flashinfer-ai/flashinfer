@@ -151,7 +151,7 @@ def test_gemma4_fp8_kv_head_dim_512_chunked_prefill_matches_torch() -> None:
         q_len, num_pages
     )
 
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace, kv_layout="NHD", backend="fa2"
     )
@@ -186,7 +186,7 @@ def test_gemma4_fp8_kv_head_dim_512_tensor_core_decode_matches_torch() -> None:
     q, k_cache, v_cache, num_pages = _make_inputs(1)
     _, kv_indptr, kv_indices, kv_last_page_len = _paged_metadata(1, num_pages)
 
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace,
         kv_layout="NHD",
