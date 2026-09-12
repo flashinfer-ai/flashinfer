@@ -141,7 +141,7 @@ def main() -> None:
         intermediate_size=intermediate,
         top_k=top_k,
         kind="mxfp8_e4m3",
-        in_kernel_fc2_reduce=ikr,
+        enable_in_kernel_fc2_reduce=ikr,
     )
 
     log(rank, "constructing MoEEpMegaLayer...")

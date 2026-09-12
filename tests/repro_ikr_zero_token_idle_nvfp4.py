@@ -122,7 +122,7 @@ def main() -> None:
     megakernel_config = Nvfp4CutedslMegaMoeConfig(
         intermediate_size=intermediate,
         top_k=top_k,
-        in_kernel_fc2_reduce=ikr,
+        enable_in_kernel_fc2_reduce=ikr,
         gate_up_clamp=10.0,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,

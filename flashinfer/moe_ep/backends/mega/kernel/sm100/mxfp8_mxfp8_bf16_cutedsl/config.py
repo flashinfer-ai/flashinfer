@@ -26,8 +26,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
-    in_kernel_fc2_reduce: bool = False
-    token_back_by_dispatch: bool = False
+    # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
+    enable_in_kernel_fc2_reduce: bool = False
     # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
