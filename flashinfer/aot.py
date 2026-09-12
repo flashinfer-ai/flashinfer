@@ -171,6 +171,7 @@ from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
+from .jit.sparse_pre_indexer import gen_sparse_pre_indexer_module
 
 
 def gen_fa2(
@@ -854,6 +855,7 @@ def gen_all_modules(
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            gen_sparse_pre_indexer_module(),
             gen_topk_module(),
         ]
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
