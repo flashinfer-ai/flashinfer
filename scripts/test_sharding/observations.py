@@ -82,6 +82,18 @@ def adjust_first_case_warmup(
     return adjusted, dict(warmup)
 
 
+def _write_estimate_file(path: Path, content: str) -> None:
+    if path.suffix != ".gz":
+        atomic_write_text(path, content)
+        return
+    buffer = io.BytesIO()
+    with gzip.GzipFile(
+        filename="", mode="wb", fileobj=buffer, compresslevel=9, mtime=0
+    ) as compressed:
+        compressed.write(content.encode("utf-8"))
+    atomic_write_bytes(path, buffer.getvalue())
+
+
 def _write_duration_file(path: Path, rows: Iterable[DurationEstimate]) -> None:
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, lineterminator="\n")
@@ -97,12 +109,7 @@ def _write_duration_file(path: Path, rows: Iterable[DurationEstimate]) -> None:
                 row.sample_count,
             ]
         )
-    buffer = io.BytesIO()
-    with gzip.GzipFile(
-        filename="", mode="wb", fileobj=buffer, compresslevel=9, mtime=0
-    ) as compressed:
-        compressed.write(stream.getvalue().encode("utf-8"))
-    atomic_write_bytes(path, buffer.getvalue())
+    _write_estimate_file(path, stream.getvalue())
 
 
 def _write_overhead_file(path: Path, rows: Iterable[OverheadEstimate]) -> None:
@@ -129,7 +136,7 @@ def _write_overhead_file(path: Path, rows: Iterable[OverheadEstimate]) -> None:
                 row.sample_count,
             ]
         )
-    atomic_write_text(path, stream.getvalue())
+    _write_estimate_file(path, stream.getvalue())
 
 
 def _write_summary(path: Path, rows: Iterable[DurationEstimate]) -> None:
