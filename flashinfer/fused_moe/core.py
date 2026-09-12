@@ -6253,7 +6253,7 @@ def trtllm_fp8_per_channel_scale_moe(
     Args:
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
-        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        hidden_states: [seq_len, hidden_size] FP8 E4M3 tensor of input hidden states
         hidden_states_scale: [seq_len, 1] FP32 per-token dequantization multipliers
         gemm1_weights: [num_experts, M, hidden_size] FP8 first layer weights,
             where M is 2*intermediate_size for gated activations and
@@ -6366,7 +6366,7 @@ def trtllm_fp8_per_channel_scale_routed_moe(
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` tensor of routing bias. May be ``None``.
     hidden_states : torch.Tensor
-        ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``[seq_len, hidden_size]`` FP8 E4M3 tensor of input hidden states.
     hidden_states_scale : torch.Tensor
         ``[seq_len, 1]`` FP32 per-token dequantization multipliers.
     gemm1_weights : torch.Tensor

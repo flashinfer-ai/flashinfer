@@ -2304,15 +2304,11 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     args->mUseRoutingScalesOnInput = use_routing_scales_on_input;
 
     auto dtype = hidden_states.dtype();
-    if (dtype == dl_float16) {
-      mDtypeAct = btg::Dtype::Fp16;
-    } else if (dtype == dl_bfloat16) {
-      mDtypeAct = btg::Dtype::Bfloat16;
-    } else if (dtype == dl_float8_e4m3fn) {
+    if (dtype == dl_float8_e4m3fn) {
       mDtypeAct = btg::Dtype::E4m3;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "Unsupported input dtype for FP8 per-channel MoE.";
+          << "FP8 per-channel MoE requires float8_e4m3fn hidden_states.";
     }
     mDtypeWeights = btg::Dtype::E4m3;
 
@@ -2431,9 +2427,8 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     TVM_FFI_ICHECK_EQ(gemm2_per_channel_weight_scale_.size(1), args->hidden_size)
         << "gemm2_per_channel_weight_scale dim 1 must match hidden_size.";
 
-    TVM_FFI_ICHECK(hidden_states.dtype() == dl_float8_e4m3fn ||
-                   hidden_states.dtype() == dl_float16 || hidden_states.dtype() == dl_bfloat16)
-        << "FP8 per-channel MoE: hidden_states must be float8_e4m3fn, float16, or bfloat16.";
+    TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_float8_e4m3fn)
+        << "FP8 per-channel MoE: hidden_states must be float8_e4m3fn.";
     TVM_FFI_ICHECK_EQ(gemm1_weights.dtype(), dl_float8_e4m3fn)
         << "FP8 per-channel MoE: gemm1_weights must be float8_e4m3fn.";
     TVM_FFI_ICHECK_EQ(gemm2_weights.dtype(), dl_float8_e4m3fn)
@@ -4735,12 +4730,6 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
                                                  intermediate_size, num_local_experts, num_tokens,
                                                  act_type, use_shuffled_weight, weight_layout,
                                                  dtype_act, dtype_weights, use_per_token_scaling);
-  } else if (fp8_quantization_type == Fp8QuantizationType::PerChannelFp8 &&
-             dtype_weights == btg::Dtype::E4m3) {
-    // FP8 per-channel with bf16/fp16 activations (E4m3/E4m3 case handled above).
-    return Fp8PerChannelLauncher::getValidConfigs(
-        top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        act_type, use_shuffled_weight, weight_layout, dtype_act, dtype_weights);
   } else if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
     // FP4 block scale
     return FP4BlockScaleLauncher::getValidConfigs(
