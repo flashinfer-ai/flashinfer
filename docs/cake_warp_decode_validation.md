@@ -261,13 +261,12 @@ receipt is released only after stream B has completed.
 
 ## Public model comparison results
 
-The [448-row comparison report](cake_warp_decode_results/performance-448.public.md)
+The [complete 448-row comparison in PR #5134](https://github.com/flashinfer-ai/flashinfer/pull/5134)
 covers seven public model configurations, T1–32, on SM100 and SM103. All rows
-passed the source/export fidelity and correctness requirements. The report
-retains hardware/source cohorts and each official comparison’s independently
-paired export denominator; it includes favorable and unfavorable results.
-[JSON](cake_warp_decode_results/performance-448.public.json) and
-[CSV](cake_warp_decode_results/performance-448.public.csv) are available for analysis.
+passed the source/export fidelity and correctness requirements. The PR body
+contains the full result tables, hardware/source cohorts and each official
+comparison’s independently paired export denominator, including favorable and
+unfavorable results.
 
 These are CUPTI measurements with cold L2 and symmetric external CUDA Graph
 populations, not whole-model throughput. Reported native runtime totals marked
