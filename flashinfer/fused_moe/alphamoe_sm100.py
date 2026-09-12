@@ -55,16 +55,24 @@ def alphamoe_interleave_gated_weights(
     :func:`alphamoe_fp8_block_scale_aligned_moe` consumes gemm1 (gate+up)
     weights whose row axis alternates eight gate rows with eight up rows, so
     one 128-row TMA box carries matching gate and up features. This offline
-    helper converts the conventional ``[gate; up]``-stacked layout:
+    helper converts the conventional ``[gate; up]``-stacked layout. Run once
+    at weight-load time; the kernel must never see un-interleaved weights.
 
-    - ``gemm1_weights`` ``(num_experts, 2 * intermediate_size, hidden_size)``
-      FP8 with gate rows first: interleaved in eight-row chunks.
-    - ``gemm1_weights_scale`` ``(num_experts, 2 * intermediate_size / 128,
-      hidden_size / 128)`` float32 block scales: interleaved one row at a
-      time (each scale row covers 128 weight rows).
+    Parameters
+    ----------
+    gemm1_weights : torch.Tensor
+        FP8 weights shaped ``(num_experts, 2 * intermediate_size, hidden_size)``
+        with gate rows first, interleaved in eight-row chunks.
+    gemm1_weights_scale : torch.Tensor
+        Float32 block scales shaped ``(num_experts, 2 * intermediate_size / 128,
+        hidden_size / 128)``, interleaved one row at a time. Each scale row
+        covers 128 weight rows.
 
-    Returns the ``(weights, scales)`` pair in device layout. Run once at
-    weight-load time; the kernel must never see un-interleaved weights.
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        The ``(weights, scales)`` pair in device layout, retaining the input
+        shapes, dtypes, and devices.
     """
     return (
         _interleave_gated_rows(gemm1_weights, rep=8),
