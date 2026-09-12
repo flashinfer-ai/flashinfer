@@ -1579,8 +1579,8 @@ class CakeWarpDecodeRunner(MoERunner):
                 device=device,
             )
 
-        output1_scale, output1_gate_scale = (
-            _fold_trtllm_nvfp4_activation_scale(act, view)
+        output1_scale, output1_gate_scale = _fold_trtllm_nvfp4_activation_scale(
+            act, view
         )
 
         workspace_geometry = (
@@ -5866,9 +5866,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             raise ValueError(
                 "hidden_states_scale_global is supported only for NVFP4×NVFP4."
             )
-        output1_scale, output1_gate_scale = (
-            _fold_trtllm_nvfp4_activation_scale(act, v)
-        )
+        output1_scale, output1_gate_scale = _fold_trtllm_nvfp4_activation_scale(act, v)
 
         num_tokens = act.hidden_states_q.shape[0]
         hidden_size = (

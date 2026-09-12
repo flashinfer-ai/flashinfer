@@ -29,18 +29,14 @@ def _sm100_available() -> bool:
         (TrtllmFp4Config(), "trtllm_fp4_routed"),
     ],
 )
-def test_nvfp4_calibrated_global_scales_match_reference(
-    backend_config, backend_key
-):
+def test_nvfp4_calibrated_global_scales_match_reference(backend_config, backend_key):
     """Non-unit activation, weight, and intermediate scales reach the kernel."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, hidden_size = 32, 256
     intermediate_size, num_experts, top_k = 256, 8, 2
 
-    x = (torch.randn(num_tokens, hidden_size, device=device) * 0.5).to(
-        torch.bfloat16
-    )
+    x = (torch.randn(num_tokens, hidden_size, device=device) * 0.5).to(torch.bfloat16)
     w1 = (
         torch.randn(num_experts, 2 * intermediate_size, hidden_size, device=device)
         * 0.05
@@ -58,9 +54,10 @@ def test_nvfp4_calibrated_global_scales_match_reference(
     w1_gs = fp4_range / w1.float().abs().amax(dim=(1, 2))
     w2_gs = fp4_range / w2.float().abs().amax(dim=(1, 2))
     gemm1 = torch.einsum("th,eoh->teo", x.float(), w1.float())
-    intermediate = torch.nn.functional.silu(
-        gemm1[..., intermediate_size:]
-    ) * gemm1[..., :intermediate_size]
+    intermediate = (
+        torch.nn.functional.silu(gemm1[..., intermediate_size:])
+        * gemm1[..., :intermediate_size]
+    )
     a2_gs = (fp4_range / intermediate.abs().max()).reshape(1)
 
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
@@ -106,9 +103,10 @@ def test_nvfp4_calibrated_global_scales_match_reference(
         for slot in range(top_k):
             expert = int(topk_ids[token, slot])
             fc1 = torch.mv(w1[expert].float(), x[token].float())
-            activated = torch.nn.functional.silu(
-                fc1[intermediate_size:]
-            ) * fc1[:intermediate_size]
+            activated = (
+                torch.nn.functional.silu(fc1[intermediate_size:])
+                * fc1[:intermediate_size]
+            )
             reference[token] += topk_weights[token, slot] * torch.mv(
                 w2[expert].float(), activated
             )
