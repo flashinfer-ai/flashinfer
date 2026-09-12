@@ -258,5 +258,7 @@ def test_cudnn_prefill_lse_is_base2(num_kv_heads):
     scores = torch.einsum("qhd,khd->hqk", q.float(), kf) * scale  # [h_qo, s_q, s_kv]
     lse_ref = torch.logsumexp(scores, dim=-1) * log2e  # base-2, [h_qo, s_q]
 
-    lse_cudnn = lse[0, :s_q, :].transpose(0, 1)  # [h_qo, s_q]
-    torch.testing.assert_close(lse_cudnn, lse_ref, atol=1e-2, rtol=1e-2)
+    assert lse.shape == (s_q, num_qo_heads), (
+        "the LSE is packed, one row per query token"
+    )
+    torch.testing.assert_close(lse.transpose(0, 1), lse_ref, atol=1e-2, rtol=1e-2)
