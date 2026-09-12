@@ -26,6 +26,10 @@ from ._blackwell_sm100 import (
     blackwell_msa_sparse_attention,
     is_blackwell_msa_device,
 )
+from ._vibecuda_sm100 import (
+    require_vibecuda_device,
+    vibecuda_msa_sparse_attention,
+)
 from ._common import (
     _BLK_KV,
     _compile_cache,
@@ -57,6 +61,7 @@ def msa_sparse_attention(
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    backend: str = "auto",
 ):
     """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
 
@@ -142,6 +147,10 @@ def msa_sparse_attention(
         capability 10.0/10.3. Warm the workspace eagerly with the exact
         tensors, options, and capture stream before capture. It is not used by
         the SM120/SM121 backend.
+    backend : str, default="auto"
+        ``"auto"`` selects FlashInfer's canonical backend for the current
+        architecture. ``"vibecuda"`` explicitly selects the VibeCUDA
+        SM100/SM103 CUDA backend.
 
     Returns
     -------
@@ -153,6 +162,34 @@ def msa_sparse_attention(
         false, returns ``out``. Each returned LSE tensor has shape
         ``(total_q, num_qo_heads)`` and dtype float32.
     """
+    if backend not in ("auto", "vibecuda"):
+        raise ValueError(
+            f"msa_sparse_attention does not support backend {backend!r}; "
+            "expected 'auto' or 'vibecuda'"
+        )
+    if backend == "vibecuda":
+        require_vibecuda_device(q.device)
+        return vibecuda_msa_sparse_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
+            workspace=workspace,
+        )
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_attention(
             q,
