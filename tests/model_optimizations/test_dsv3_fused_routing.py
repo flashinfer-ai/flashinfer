@@ -446,6 +446,24 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
         raise
 
 
+def _is_supported_dsv3_config(num_experts, n_group, topk_group, topk):
+    """Mirror ``_check_dsv3_fused_routing_supported`` so parametrized cases the
+    public API would reject are reported as skips instead of errors.
+    """
+    if n_group <= 0 or num_experts % n_group != 0:
+        return False
+    if topk_group <= 0 or topk_group > n_group:
+        return False
+    if topk <= 0 or topk > 8:
+        return False
+    experts_per_group = num_experts // n_group
+    if topk > topk_group * experts_per_group:
+        return False
+    if n_group > 1:
+        return experts_per_group <= 32 and experts_per_group * topk_group <= 128
+    return num_experts <= 384
+
+
 @pytest.mark.parametrize("backend", ["default", "cake"])
 @pytest.mark.parametrize(
     "num_experts,n_group,topk_group,topk",
@@ -516,6 +534,67 @@ def test_dsv3_fused_routing_backend_correctness(
     )
 
 
+@pytest.mark.parametrize("num_experts", [256, 384])
+@pytest.mark.parametrize("topk", [2, 4, 8])
+def test_dsv3_fused_routing_ungrouped_read_mask(num_experts, topk):
+    """Regression: ``n_group == 1`` multi-warp shared-memory read mask.
+
+    Stage one fills only the first ``topk`` of each 8-slot block, so a ``topk=8``
+    warmup with zero bias followed by a query with bias ``-2`` leaves stale
+    positive slot values that must be masked out; ``topk=8`` is the control.
+    """
+    num_tokens = 7
+    routed_scaling_factor = 1.0
+    device = "cuda"
+
+    generator = torch.Generator(device=device).manual_seed(4867)
+    ramp = torch.linspace(0.0, -1.0, num_experts, device=device, dtype=torch.float32)
+    scores = torch.stack(
+        [
+            ramp[torch.randperm(num_experts, device=device, generator=generator)]
+            for _ in range(num_tokens)
+        ]
+    )
+    bias = torch.full((num_experts,), -2.0, device=device, dtype=torch.float32)
+
+    ground_truth = DSv3RoutingGroundTruth(
+        scores.clone(), bias.clone(), 1, 1, topk, routed_scaling_factor, torch.float32
+    )
+
+    # Warmup uses a zero bias, so every stale slot holds a positive value.
+    warm_values = torch.empty(num_tokens, 8, device=device, dtype=torch.float32)
+    warm_indices = torch.empty(num_tokens, 8, device=device, dtype=torch.int32)
+    fused_topk_deepseek(
+        scores,
+        torch.zeros_like(bias),
+        1,
+        1,
+        8,
+        routed_scaling_factor,
+        warm_values,
+        warm_indices,
+    )
+
+    topk_values = torch.empty(num_tokens, topk, device=device, dtype=torch.float32)
+    topk_indices = torch.empty(num_tokens, topk, device=device, dtype=torch.int32)
+    fused_topk_deepseek(
+        scores, bias, 1, 1, topk, routed_scaling_factor, topk_values, topk_indices
+    )
+
+    for token_idx in range(num_tokens):
+        kernel_experts = set(topk_indices[token_idx].tolist())
+        reference_experts = set(ground_truth.ref_expert_indices[token_idx].tolist())
+        assert kernel_experts == reference_experts, (
+            f"token {token_idx}: kernel {sorted(kernel_experts)} != "
+            f"reference {sorted(reference_experts)}"
+        )
+
+    sorted_values, _ = torch.sort(topk_values, dim=-1, descending=True)
+    torch.testing.assert_close(
+        sorted_values, ground_truth.ref_expert_values, rtol=2e-6, atol=2e-6
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 64])
 @pytest.mark.parametrize("num_experts", [256, 384])
 @pytest.mark.parametrize("topk", [1, 2, 4, 8])
@@ -535,20 +614,8 @@ def test_dsv3_fused_routing_op(
     """
 
     # Skip invalid configurations
-    if topk_group * n_group < topk or topk_group > n_group:
-        pytest.skip(
-            "Invalid configuration: topk_group * n_group < topk or topk_group > n_group"
-        )
-    if n_group > 1:
-        if (
-            topk > 8
-            or num_experts / n_group > 32
-            or num_experts / n_group * topk_group > 128
-        ):
-            pytest.skip("Invalid configuration: exceeds kernel limits for n_group > 1")
-    else:
-        if num_experts > 384 or topk > 8:
-            pytest.skip("Invalid configuration: exceeds kernel limits for n_group = 1")
+    if not _is_supported_dsv3_config(num_experts, n_group, topk_group, topk):
+        pytest.skip("Invalid configuration for fused_topk_deepseek")
 
     # Generate random inputs
     torch.manual_seed(42)
@@ -613,18 +680,8 @@ def test_routing_replay_out_extended(
 
     Extended parametrization covering larger token counts (8, 64).
     """
-    if topk_group * n_group < topk or topk_group > n_group:
-        pytest.skip("Invalid configuration")
-    if n_group > 1:
-        if (
-            topk > 8
-            or num_experts / n_group > 32
-            or num_experts / n_group * topk_group > 128
-        ):
-            pytest.skip("Exceeds kernel limits for n_group > 1")
-    else:
-        if num_experts > 384 or topk > 8:
-            pytest.skip("Exceeds kernel limits for n_group = 1")
+    if not _is_supported_dsv3_config(num_experts, n_group, topk_group, topk):
+        pytest.skip("Invalid configuration for fused_topk_deepseek")
 
     torch.manual_seed(42)
     device = "cuda"
@@ -702,18 +759,8 @@ def test_routing_replay_out(
     that routing_replay_out matches topk_indices (as sets per token), and that
     passing None produces identical routing results (no side effects).
     """
-    if topk_group * n_group < topk or topk_group > n_group:
-        pytest.skip("Invalid configuration")
-    if n_group > 1:
-        if (
-            topk > 8
-            or num_experts / n_group > 32
-            or num_experts / n_group * topk_group > 128
-        ):
-            pytest.skip("Exceeds kernel limits for n_group > 1")
-    else:
-        if num_experts > 384 or topk > 8:
-            pytest.skip("Exceeds kernel limits for n_group = 1")
+    if not _is_supported_dsv3_config(num_experts, n_group, topk_group, topk):
+        pytest.skip("Invalid configuration for fused_topk_deepseek")
 
     torch.manual_seed(42)
     device = "cuda"

@@ -182,7 +182,9 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
       int32_t intermidiateExpert[NumInterTopKPerThread];
       for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE) {
         int ii = i / WARP_SIZE;
-        if (i < NumInterTopK) {
+        // Stage one fills only the first ``topk`` of each ``MaxNumTopExperts``
+        // slot block, so the other slots are uninitialized reads; mask them out.
+        if (i < NumInterTopK && (i % MaxNumTopExperts) < topk) {
           intermidiateScore[ii] = smemInterTopScores[i];
           intermidiateExpert[ii] = smemInterTopExperts[i];
         } else {
@@ -239,17 +241,19 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
                    bool const launch_with_pdl, cudaStream_t const stream,
                    int16_t* routing_replay_out) {
 #ifdef FLASHINFER_CAKE_BACKEND
+  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
   bool const cake_common = num_tokens > 0 && num_experts > 0 && n_group > 0 &&
                            num_experts % n_group == 0 && topk > 0 && topk <= 8 &&
-                           topk <= num_experts && topk_group > 0 && topk_group <= n_group &&
-                           topk_group * n_group >= topk;
-  bool const cake_single_group = cake_common && (n_group == 1) && (num_experts <= NumKimiK2Experts);
-  int64_t const cake_experts_per_group = n_group > 0 ? num_experts / n_group : 0;
+                           topk <= num_experts && topk_group > 0 && topk_group <= n_group;
+  // The single-group Cake schedules write one winner per token: top-1 only.
+  bool const cake_single_group =
+      cake_common && (n_group == 1) && (topk == 1) && (num_experts <= NumKimiK2Experts);
   bool const cake_multi_group = cake_common && (n_group >= 2) && (n_group <= 8) &&
                                 (topk_group <= 4) && (num_experts <= NumDeepseekExperts) &&
                                 (cake_experts_per_group >= 2) &&
                                 (cake_experts_per_group <= WARP_SIZE) &&
-                                (cake_experts_per_group * topk_group <= MaxNumExpertsUnit);
+                                (cake_experts_per_group * topk_group <= MaxNumExpertsUnit) &&
+                                (topk <= cake_experts_per_group * topk_group);
   TLLM_CHECK_WITH_INFO(cake_single_group || cake_multi_group,
                        "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, "
                        "topk_group=%ld). Please use original pytorch implementation.",

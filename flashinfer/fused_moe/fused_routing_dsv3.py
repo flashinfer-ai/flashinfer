@@ -40,13 +40,20 @@ def _is_cake_dsv3_fused_routing_supported(
         return False
     if topk <= 0 or topk > 8 or topk > num_experts:
         return False
-    if topk_group <= 0 or topk_group > n_group or topk_group * n_group < topk:
+    if topk_group <= 0 or topk_group > n_group:
         return False
 
     if n_group == 1:
-        return num_experts <= 384
+        # The single-group Cake schedules write a single winner per token, so
+        # they only implement top-1 routing.
+        return topk == 1 and num_experts <= 384
 
     experts_per_group = num_experts // n_group
+    # The grouped Cake schedules select ``topk`` of the experts reachable from
+    # the ``topk_group`` selected groups.
+    if topk > topk_group * experts_per_group:
+        return False
+
     return (
         n_group <= 8
         and topk_group <= 4
@@ -141,11 +148,29 @@ def _check_dsv3_fused_routing_supported(
     # Extract number of experts from scores shape
     num_experts = scores.shape[1]
 
-    # Check basic configuration constraints
-    if topk_group * n_group < topk or topk_group > n_group:
+    # ``n_group`` must be positive and divide the expert count so that the
+    # per-group expert capacity is well defined.
+    if n_group <= 0:
+        raise ValueError(f"Invalid configuration: n_group ({n_group}) must be > 0")
+    if num_experts % n_group != 0:
         raise ValueError(
-            f"Invalid configuration: topk_group * n_group ({topk_group * n_group}) must be >= topk ({topk}) "
-            f"and topk_group ({topk_group}) must be <= n_group ({n_group})"
+            f"Invalid configuration: num_experts ({num_experts}) must be divisible by "
+            f"n_group ({n_group})"
+        )
+    if topk_group <= 0 or topk_group > n_group:
+        raise ValueError(
+            f"Invalid configuration: topk_group ({topk_group}) must be in [1, n_group "
+            f"({n_group})]"
+        )
+
+    # The selected groups expose ``topk_group * num_experts / n_group`` experts,
+    # and the kernel returns the top ``topk`` of exactly those candidates.
+    reachable_experts = topk_group * num_experts // n_group
+    if topk > reachable_experts:
+        raise ValueError(
+            f"Invalid configuration: topk ({topk}) must be <= the number of experts "
+            f"reachable from the topk_group ({topk_group}) selected groups "
+            f"({reachable_experts})"
         )
 
     # Check kernel limits based on number of groups
@@ -270,7 +295,8 @@ def fused_topk_deepseek(
         with 256 experts (32 experts per group).
     topk_group : int
         Number of top groups to select.  Must satisfy ``topk_group <=
-        n_group`` and ``topk_group * n_group >= topk``.  Typical value is 4.
+        n_group`` and ``topk <= (num_experts / n_group) * topk_group``.
+        Typical value is 4.
     topk : int
         Number of top experts to select per token.  Must be ``<= num_experts``.
         Hard cap ``topk <= 32``; in addition both branches of the kernel
