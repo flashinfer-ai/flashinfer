@@ -5976,6 +5976,14 @@ def _w4a16_fused_moe_launch_flat(
         # identical cache entry instead of silently recompiling with auto tiles.
         force_tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
     )
+    # Expert weight banks can exceed 2**31 elements. The implicit TensorAdapter
+    # conversion marks their layout dynamic, and the DSL runtime packs dynamic
+    # sizes 32-bit, so a >2 GiB flat bank overflows during host-side argument
+    # marshalling. The kernel is compiled against static-shape fakes for these
+    # parameters, so wrap the banks in a static-layout from_dlpack instead:
+    # identical MLIR type to the compiled signature, and sizes stay 64-bit.
+    w13_arg = cute.runtime.from_dlpack(w13_arg, assumed_align=16)
+    w2_arg = cute.runtime.from_dlpack(w2_arg, assumed_align=16)
     fused.compiled(
         make_ptr(
             _cutlass_element_dtype(element_dtype),
