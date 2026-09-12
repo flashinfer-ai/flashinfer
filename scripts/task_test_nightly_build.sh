@@ -31,12 +31,14 @@ echo ""
 echo "=== GPU Information ==="
 nvidia-smi
 
-# Install flashinfer packages
+# setup_test_env.sh has already verified the image's direct requirements. Keep
+# its validated CUDA stack intact instead of asking pip to resolve the packaged
+# requirements (which include torch's older exact cuDNN dependency).
 echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR}..."
-pip install ${DIST_CUBIN_DIR}/*.whl
+pip install --no-deps "${DIST_CUBIN_DIR}"/*.whl
 
 echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR}..."
-pip install ${DIST_JIT_CACHE_DIR}/*.whl
+pip install --no-deps "${DIST_JIT_CACHE_DIR}"/*.whl
 
 # Disable JIT to verify that jit-cache package contains all necessary
 # precompiled modules for the test suite to pass without compilation
@@ -44,7 +46,7 @@ echo "Disabling JIT compilation to test with precompiled cache only..."
 export FLASHINFER_DISABLE_JIT=1
 
 echo "Installing flashinfer-python from ${DIST_PYTHON_DIR}..."
-pip install ${DIST_PYTHON_DIR}/*.tar.gz
+pip install --no-deps "${DIST_PYTHON_DIR}"/*.tar.gz
 
 # Verify installation
 echo "Verifying installation..."

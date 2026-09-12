@@ -118,6 +118,9 @@ struct ActivationParams {
   float const* swiglu_alpha = nullptr;
   float const* swiglu_beta = nullptr;
   float const* swiglu_limit = nullptr;
+  // SiTU-GLU per-expert tanh scales; nullptr uses the SituAdaptor compile-time defaults.
+  float const* situ_beta = nullptr;
+  float const* situ_linear_beta = nullptr;
 
   explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
     TLLM_CHECK_WITH_INFO(
@@ -126,11 +129,14 @@ struct ActivationParams {
   }
 
   ActivationParams(ActivationType activation_type, float const* swiglu_alpha,
-                   float const* swiglu_beta, float const* swiglu_limit)
+                   float const* swiglu_beta, float const* swiglu_limit,
+                   float const* situ_beta = nullptr, float const* situ_linear_beta = nullptr)
       : activation_type(activation_type),
         swiglu_alpha(swiglu_alpha),
         swiglu_beta(swiglu_beta),
-        swiglu_limit(swiglu_limit) {}
+        swiglu_limit(swiglu_limit),
+        situ_beta(situ_beta),
+        situ_linear_beta(situ_linear_beta) {}
 
   // TODO Port everything properly and get rid of these implicit conversions
   operator ActivationType() const { return activation_type; }
@@ -1155,6 +1161,13 @@ struct GemmProfilerBackend {
  private:
   bool isNativeWfp4Afp8Family() const {
     return mSM >= 100 && mDType == nvinfer1::DataType::kFP8 &&
+           (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
+  }
+
+  // Native NVFP4: FP4 activations x FP4 weights. Shared by workspace
+  // allocation and consumption so the two never disagree (issue #4003).
+  bool isNativeWfp4Afp4Family() const {
+    return (mDType == nvinfer1::DataType::kFP4 || mDType == nvinfer1::DataType::kINT64) &&
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
   }
 

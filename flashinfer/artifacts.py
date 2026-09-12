@@ -135,25 +135,19 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "ce0795149bb2a183db22de04a3fec3aca65fff04/fmha/trtllm-gen/"
+    # The trtllm-gen packages below are single-package, multi-architecture: one
+    # publish carries the Blackwell (sm100f/sm103a) and Rubin (sm107a) cubins.
+    TRTLLM_GEN_FMHA: str = "2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
-        "14e0be19166763fb6a00cc6cb0e9bcf9b0231159/batched_gemm-fe08bc1-9f05022/"
+        "1d145b82ac60add55ea213863523f12d63005651/batched_gemm-09795a1-31ee4e5/"
     )
     TRTLLM_GEN_GEMM: str = (
-        "10f64528a1172dae8e29601a3b99ab9dc78d37be/gemm-91e0ba0-2710384/"
-    )
-    TRTLLM_GEN_BMM_RUBIN: str = (
-        "46d3f3561e3336c131a141191ee6aaa0690723bb/batched_gemm-17629de-61f1bc7/"
-    )
-    TRTLLM_GEN_GEMM_RUBIN: str = (
-        "46d3f3561e3336c131a141191ee6aaa0690723bb/gemm-17629de-25754e6/"
+        "7b1fc253cd6237950e76310873f4acf4d97a3904/gemm-b738138-25754e6/"
     )
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
-    # (and KernelMap.KERNEL_MAP_HASH_RUBIN for the Rubin variant below).
-    DEEPGEMM: str = "a72d85b019dc125b9f711300cb989430f762f5a6/deep-gemm/"
-    DEEPGEMM_RUBIN: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
-    DSL_FMHA: str = "5b34f84266cbc2135066ce96885b664992535670/fmha/cute-dsl/"
+    DEEPGEMM: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
+    DSL_FMHA: str = "6efb974aae4c012d9fb317c2ef360210b3f352e4/fmha/cute-dsl/"
     DSL_FMHA_ARCHS: tuple[str, ...] = (
         "sm_100a",
         "sm_103a",
@@ -170,52 +164,36 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "a8d5d3e86f5ee7dfecd36a8d6cf9a933ca0cb8225a2f954f0212c5db2d250f40"
+        "d79b5c51fc8597fac57dae0da4afa114fb2014575e4ec3df099ad856d97cabc3"
     )
     TRTLLM_GEN_BMM: str = (
-        "4bbb1fe8373c0f8f340b539a90e9ff69c223bdacdc9d5410f59c2706d40c415f"
+        "e071273ce357ee3e8d40ce905dac03d2a6078f6c5869ca3b7d1f1d146643f009"
     )
-    DEEPGEMM: str = "1a2a166839042dbd2a57f48051c82cd1ad032815927c753db269a4ed10d0ffbf"
-    DEEPGEMM_RUBIN: str = (
-        "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
-    )
+    DEEPGEMM: str = "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
     TRTLLM_GEN_GEMM: str = (
-        "f97f90f9ce1dab73eb3d7c90fca4bbd52687642dd87a79dd10b77d7802b25c33"
-    )
-    TRTLLM_GEN_BMM_RUBIN: str = (
-        "31c9f4cdd59299fc6a9a6f3a31b403b817a1fea63238eec2cbcd3009d2feb3f7"
-    )
-    TRTLLM_GEN_GEMM_RUBIN: str = (
-        "2174e60bc8248a8af41a3d0afdc4cac8f2b04893ac983f654065dd14c77ec139"
+        "ca9d4f956f3fb63bff3066db88fa7ccf08b00f4b0b2751cc14ba72454fd01638"
     )
     # SHA256 of the checksums.txt manifest file per cpu-arch/sm-arch,
     # NOT hashes of individual kernel .so files.
     DSL_FMHA_CHECKSUMS: dict[str, dict[str, str]] = {
         "x86_64": {
-            "sm_100a": "832c303bb9b386af590d3efc294681859829b91991975fd2e188a5d7dc30c461",
-            "sm_103a": "57322c10ddbbe9072c7ded41e2856fdf9d4276fbd79ac4bc825af0cd78844da6",
-            "sm_107a": "8480678539adf622f8395e875923471bce683be7158694556bd6c536eadeaa45",
-            "sm_110a": "4f6f0f3a868f0e9171c8ab217e6d2a87fde46b02a9417d8f55f1a779c53fa9fb",
+            "sm_100a": "7bb9eb497d295a6471ce85d0913e3b4955fd9a7d918ddd9b92882cba41af5365",
+            "sm_103a": "3c0dc183a6f73fe3f0705a4b6d6fe8de667cf1dd1908bfe27422327faa16e27b",
+            "sm_107a": "70be29547f3d9b2e7e22981865de20f35eef61fa3b6493443680b058e7523dd4",
+            "sm_110a": "817e55486f3c35fe1841dccafc9b7fe34e50aff99edc4a15da952ace123d9edd",
         },
         "aarch64": {
-            "sm_100a": "064cfcac21886c3e16b5007ca769f1b93111db7a63864db1e026a53e61fe20fe",
-            "sm_103a": "1631a884738d706f5bc39bf4032bcd54b25ba0a0d734c26f388dce4ae32093c9",
-            "sm_107a": "0348ef0b74dffa67c0c9662d3f567b26dccf46c356009f315860f31a9550e207",
-            "sm_110a": "8f16f510d159797432bda92d55d0d82d65d3e19080f9af1b751dec4146cdcbe6",
+            "sm_100a": "f1395b80f2c8917fd1f52dca0bf0a37efc6f74fc594c245284076c72bf7e8130",
+            "sm_103a": "c4a44f8be82d9544f18eb7e139712d9fe3b09b30d890b5d09e3cbc5a203a1544",
+            "sm_107a": "fe30ea44d746c630c0347ed357ce317de29968da3e1d848a1d6a6864cbd25b7e",
+            "sm_110a": "634636627af7a98f8e1ff8c8332baac91a2e2f4f3dddbf647b6da9d60a8085ca",
         },
     }
     map_checksums: dict[str, str] = {
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "checksums.txt"): TRTLLM_GEN_FMHA,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "checksums.txt"): TRTLLM_GEN_BMM,
         safe_urljoin(ArtifactPath.DEEPGEMM, "checksums.txt"): DEEPGEMM,
-        safe_urljoin(ArtifactPath.DEEPGEMM_RUBIN, "checksums.txt"): DEEPGEMM_RUBIN,
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "checksums.txt"): TRTLLM_GEN_GEMM,
-        safe_urljoin(
-            ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "checksums.txt"
-        ): TRTLLM_GEN_BMM_RUBIN,
-        safe_urljoin(
-            ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "checksums.txt"
-        ): TRTLLM_GEN_GEMM_RUBIN,
         **{
             safe_urljoin(
                 ArtifactPath.DSL_FMHA, f"{cpu_arch}/{sm_arch}/checksums.txt"
@@ -247,9 +225,8 @@ def get_checksums(subdirs):
                 sha256, filename = line.strip().split()
 
                 # Key every entry by its full path. Bare filenames are not
-                # unique across subdirs: the per-arch pins (e.g. TRTLLM_GEN_BMM
-                # and TRTLLM_GEN_BMM_RUBIN) ship the same sm100f/sm103a kernel
-                # names built from different sources, so a flat dict would let
+                # unique across subdirs: two pins built from different sources
+                # can ship identically named kernels, so a flat dict would let
                 # the subdir processed last silently overwrite the earlier
                 # one's hashes and fail verification for every shared name.
                 checksums[safe_urljoin(subdir, filename)] = sha256
@@ -274,10 +251,7 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         ArtifactPath.TRTLLM_GEN_FMHA,
         ArtifactPath.TRTLLM_GEN_BMM,
         ArtifactPath.TRTLLM_GEN_GEMM,
-        ArtifactPath.TRTLLM_GEN_BMM_RUBIN,
-        ArtifactPath.TRTLLM_GEN_GEMM_RUBIN,
         ArtifactPath.DEEPGEMM,
-        ArtifactPath.DEEPGEMM_RUBIN,
         # DSL FMHA: per cpu-arch and sm-arch subdirectories
         *(
             safe_urljoin(ArtifactPath.DSL_FMHA, f"{cpu_arch}/{arch}/")
@@ -305,24 +279,6 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h"),
         checksums[
             safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
-        ],
-    )
-    yield (
-        safe_urljoin(
-            ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
-        ),
-        checksums[
-            safe_urljoin(
-                ArtifactPath.TRTLLM_GEN_GEMM_RUBIN, "include/flashinferMetaInfo.h"
-            )
-        ],
-    )
-    yield (
-        safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(
-                ArtifactPath.TRTLLM_GEN_BMM_RUBIN, "include/flashinferMetaInfo.h"
-            )
         ],
     )
 
