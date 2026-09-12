@@ -1670,3 +1670,64 @@ if __name__ == "__main__":
     #     155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
     # )
     # test_batch_mla_page_attention(1, 1024, 128, 128, False, 1, "fa2", True, torch.half)
+
+
+def test_batch_mla_work_list_exceeding_plan_capacity():
+    """MLAPlan sizes its per-work arrays from an upper bound on the work list.
+    When that bound was a hardcoded 16384 with no check, a batch producing more
+    works than that scattered the tail of the plan past the end of those arrays:
+    silently wrong output just past the limit, illegal memory access further up.
+
+    Every request here is identical and shares the same pages, so all rows of
+    the output must be equal. Works are one per request for this shape, so the
+    batch size is what crosses the old limit."""
+    torch.manual_seed(0)
+    device = torch.device("cuda:0")
+    batch_size, qo_len, kv_len, page_size = 16600, 1, 4, 1
+    num_heads = 16
+    num_pages = kv_len // page_size
+
+    q_nope = torch.randn(
+        1, num_heads, HEAD_DIM_CKV, device=device, dtype=torch.bfloat16
+    ).expand(batch_size, num_heads, HEAD_DIM_CKV)
+    q_pe = torch.randn(
+        1, num_heads, HEAD_DIM_KPE, device=device, dtype=torch.bfloat16
+    ).expand(batch_size, num_heads, HEAD_DIM_KPE)
+    ckv = torch.randn(
+        num_pages, page_size, HEAD_DIM_CKV, device=device, dtype=torch.bfloat16
+    )
+    kpe = torch.randn(
+        num_pages, page_size, HEAD_DIM_KPE, device=device, dtype=torch.bfloat16
+    )
+
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * num_pages
+    )
+    kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32).repeat(
+        batch_size
+    )
+    kv_len_arr = torch.full((batch_size,), kv_len, device=device, dtype=torch.int32)
+
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_len_arr,
+        num_heads,
+        HEAD_DIM_CKV,
+        HEAD_DIM_KPE,
+        page_size,
+        causal=False,
+        sm_scale=1.0 / math.sqrt(HEAD_DIM_CKV + HEAD_DIM_KPE),
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    o = wrapper.run(q_nope.contiguous(), q_pe.contiguous(), ckv, kpe)
+
+    torch.testing.assert_close(o, o[0].unsqueeze(0).expand_as(o), rtol=0, atol=0)
+    clear_cuda_cache(device)
