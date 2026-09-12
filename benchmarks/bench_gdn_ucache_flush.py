@@ -72,13 +72,15 @@ ARMS = {
         torch.float16,
     ),
 }
-_FLUSH_PATH = str(
-    Path(__file__).resolve().parents[1]
-    / "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py"
-)
+_KDIR = Path(__file__).resolve().parents[1] / "flashinfer/gdn_kernels"
+_FLUSH_PATH = str(_KDIR / "gdn_decode_bf16_wy_ucache_flush.py")
+# STP (T=1) fold-absorb fork: flat 16-slot buffer, fm=15, single-row appends
+_STP_PATH = str(_KDIR / "gdn_decode_bf16_wy_ucache_stp.py")
+STP_RING = 16
+STP_FM = 15
 
 
-def load_flush(arm):
+def load_flush(arm, path=_FLUSH_PATH):
     io_env, state_env, ring_env, io_dtype, state_dtype, ring_dtype = ARMS[arm]
     old = {
         k: os.environ.pop(k, None)
@@ -95,7 +97,9 @@ def load_flush(arm):
     if ring_env:
         os.environ["GDN_UCACHE_RING_DTYPE"] = ring_env
     try:
-        spec = importlib.util.spec_from_file_location(f"uc_flush_{arm}", _FLUSH_PATH)
+        spec = importlib.util.spec_from_file_location(
+            f"uc_{Path(path).stem}_{arm}", path
+        )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     finally:
@@ -104,7 +108,12 @@ def load_flush(arm):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    return mod.gated_delta_rule_mtp_ucache_flush, io_dtype, state_dtype, ring_dtype
+    fn = (
+        mod.gated_delta_rule_stp_ucache_flush
+        if path == _STP_PATH
+        else mod.gated_delta_rule_mtp_ucache_flush
+    )
+    return fn, io_dtype, state_dtype, ring_dtype
 
 
 torch.manual_seed(0)
@@ -126,14 +135,20 @@ def make_case(
     io_dtype=torch.bfloat16,
     state_dtype=torch.bfloat16,
     ring_dtype=torch.bfloat16,
+    t_tokens=T,
+    ring_slots=RING,
 ):
     g = torch.Generator(device=DEV).manual_seed(seed)
 
     def rn(*s, sc=1.0):
         return (torch.randn(*s, generator=g, device=DEV) * sc).to(io_dtype)
 
-    q, k = rn(B, T, H, K), rn(B, T, H, K)
-    v, a, b = rn(B, T, HV, V, sc=0.5), rn(B, T, HV, sc=0.5), rn(B, T, HV)
+    q, k = rn(B, t_tokens, H, K), rn(B, t_tokens, H, K)
+    v, a, b = (
+        rn(B, t_tokens, HV, V, sc=0.5),
+        rn(B, t_tokens, HV, sc=0.5),
+        rn(B, t_tokens, HV),
+    )
     A_log = (
         torch.full((HV,), -3.0, device=DEV)
         + torch.rand(HV, generator=g, device=DEV) * 0.3
@@ -142,10 +157,12 @@ def make_case(
     pool = (torch.randn(B, HV, V, K, generator=g, device=DEV) * 0.5).to(state_dtype)
     # 32-deep physical rings, fully populated (rows outside the live window
     # are masked by the kernel; values just need to be finite).
-    kh = torch.randn(B, H, RING, K, generator=g, device=DEV)
+    kh = torch.randn(B, H, ring_slots, K, generator=g, device=DEV)
     kc = (kh / kh.norm(dim=-1, keepdim=True).clamp_min(1e-6)).to(ring_dtype)
-    uc = (torch.randn(B, HV, RING, V, generator=g, device=DEV) * 0.3).to(ring_dtype)
-    la = -(torch.rand(B, HV, RING, generator=g, device=DEV) * 0.3 + 0.003)
+    uc = (torch.randn(B, HV, ring_slots, V, generator=g, device=DEV) * 0.3).to(
+        ring_dtype
+    )
+    la = -(torch.rand(B, HV, ring_slots, generator=g, device=DEV) * 0.3 + 0.003)
     gc = torch.cumsum(la, dim=-1).float().contiguous()
     idx = torch.arange(B, dtype=torch.int32, device=DEV)
     return q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx
@@ -215,6 +232,89 @@ def bench_point(
     return float(np.median(times)) * 1000.0  # us
 
 
+def bench_point_stp(
+    uc_stp,
+    B,
+    rate_pct,
+    iters,
+    seed,
+    io_dtype,
+    state_dtype,
+    ring_dtype=torch.bfloat16,
+):
+    """One (batch, flush-rate) point for the STP (T=1) fold-absorb kernel.
+
+    Steady-state operating points: verify rows at hist_len = STP_FM - 1 (the
+    deepest replay), flush rows at STP_FM (fold absorbs the current token).
+    Inputs use the wrapper's zero-copy ``prepadded`` [B, 4, ...] contract
+    (row 0 real, rows 1..3 zero — the producer-writes-row-0 serving
+    pattern), so the graph carries no staging nodes. The wrapper always
+    self-commits cursors; the per-iter restore keeps every replay at the
+    same pre-call state, like bench_point's commit/restore.
+    """
+    q, k, v, a, b, A_log, dt_bias, pool, kc, uc, gc, idx = make_case(
+        B,
+        seed,
+        io_dtype,
+        state_dtype,
+        ring_dtype,
+        t_tokens=1,
+        ring_slots=STP_RING,
+    )
+
+    def pad4(t):
+        buf = torch.zeros(
+            (t.shape[0], 4) + tuple(t.shape[2:]), dtype=t.dtype, device=DEV
+        )
+        buf[:, 0] = t[:, 0]
+        return buf
+
+    q, k, v, a, b = pad4(q), pad4(k), pad4(v), pad4(a), pad4(b)
+    nf = 0 if rate_pct == 0 else max(1, round(B * rate_pct / 100))
+    mask = torch.zeros(B, dtype=torch.bool, device=DEV)
+    if nf:
+        g_cpu = torch.Generator().manual_seed(seed + 3)
+        mask[torch.randperm(B, generator=g_cpu)[:nf].to(DEV)] = True
+    hl_src = torch.where(
+        mask,
+        torch.tensor(STP_FM, dtype=torch.int32, device=DEV),
+        torch.tensor(STP_FM - 1, dtype=torch.int32, device=DEV),
+    )
+    hl = hl_src.clone()
+    cb = torch.zeros(B, dtype=torch.int32, device=DEV)
+
+    def fn():
+        uc_stp(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            prepadded=True,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=STP_FM,
+        )
+        hl.copy_(hl_src)
+
+    times = bench_gpu_time(
+        graphed(fn),
+        enable_cupti=True,
+        cold_l2_cache=True,
+        dry_run_iters=10,
+        repeat_iters=iters,
+    )
+    return float(np.median(times)) * 1000.0  # us
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=200)
@@ -225,6 +325,14 @@ def main():
         choices=list(ARMS),
         default="bf16",
         help="dtype config: bf16 | fp16_state | fp16_io",
+    )
+    ap.add_argument(
+        "--kernel",
+        choices=["mtp", "stp"],
+        default="mtp",
+        help="mtp = the T=4/8 verify+flush kernel (default, unchanged); "
+        "stp = the T=1 fold-absorb kernel "
+        "(gdn_decode_bf16_wy_ucache_stp.py; flat 16-slot buffer, fm=15)",
     )
     ap.add_argument(
         "--no-commit",
@@ -246,12 +354,21 @@ def main():
     )
     args = ap.parse_args()
 
-    uc_flush, io_dtype, state_dtype, ring_dtype = load_flush(args.arm)
+    stp = args.kernel == "stp"
+    uc_flush, io_dtype, state_dtype, ring_dtype = load_flush(
+        args.arm, _STP_PATH if stp else _FLUSH_PATH
+    )
+    geom = (
+        f"T=1 ring={STP_RING} (flat) fm={STP_FM}"
+        if stp
+        else f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN}"
+    )
     print(
-        f"GPU: {torch.cuda.get_device_name(0)} | fused verify+flush, "
+        f"GPU: {torch.cuda.get_device_name(0)} | "
+        f"{'STP fold-absorb' if stp else 'fused verify+flush'}, "
         f"arm={args.arm} (io={io_dtype}, state={state_dtype}, "
         f"ring={ring_dtype}), "
-        f"T={T} W={W} ring={RING} base={args.base} fm={FLUSH_MIN} "
+        f"{geom} "
         f"H={H} HV={HV} K=V={K} | "
         f"CUDA-graph replay, CUPTI cold-L2, median of {args.iters}",
         flush=True,
@@ -260,21 +377,36 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for B in args.batches:
-        row = [
-            bench_point(
-                uc_flush,
-                B,
-                r,
-                args.iters,
-                1000 + B + r,
-                io_dtype,
-                state_dtype,
-                ring_dtype,
-                base=args.base,
-                no_commit=args.no_commit,
-            )
-            for r in args.rates
-        ]
+        if stp:
+            row = [
+                bench_point_stp(
+                    uc_flush,
+                    B,
+                    r,
+                    args.iters,
+                    1000 + B + r,
+                    io_dtype,
+                    state_dtype,
+                    ring_dtype,
+                )
+                for r in args.rates
+            ]
+        else:
+            row = [
+                bench_point(
+                    uc_flush,
+                    B,
+                    r,
+                    args.iters,
+                    1000 + B + r,
+                    io_dtype,
+                    state_dtype,
+                    ring_dtype,
+                    base=args.base,
+                    no_commit=args.no_commit,
+                )
+                for r in args.rates
+            ]
         print(f"{B:4d} | " + " | ".join(f"{t:9.2f}" for t in row), flush=True)
 
 
