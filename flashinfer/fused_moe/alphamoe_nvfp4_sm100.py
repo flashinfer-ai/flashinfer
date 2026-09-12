@@ -458,7 +458,8 @@ def alphamoe_nvfp4_aligned_moe(
     Logical ``K`` is derived as ``2 * hidden_states.shape[1]`` and must be at
     least 256 and divisible by 256. This function mutates ``out`` and returns
     ``None``. The FP32 bulk reduction is order-dependent and flushes subnormal
-    inputs and results to signed zero, as specified by PTX ``cp.reduce.add.f32``.
+    inputs and results to signed zero, as specified by PTX
+    ``cp.reduce.async.bulk.add.f32``.
     """
 
     _alphamoe_nvfp4_aligned_moe_impl(
