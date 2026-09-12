@@ -5440,7 +5440,7 @@ def trtllm_fp8_per_channel_scale_moe(
     Args:
         routing_logits: [seq_len, num_experts] tensor of routing logits
         routing_bias: [num_experts] tensor of routing bias
-        hidden_states: [seq_len, hidden_size] tensor of input hidden states
+        hidden_states: [seq_len, hidden_size] FP8 E4M3 tensor of input hidden states
         hidden_states_scale: [seq_len, 1] FP32 per-token dequantization multipliers
         gemm1_weights: [num_experts, M, hidden_size] FP8 first layer weights,
             where M is 2*intermediate_size for gated activations and
@@ -5475,6 +5475,12 @@ def trtllm_fp8_per_channel_scale_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, expert_weights, expanded_idx_to_permuted_idx).
     """
+    if hidden_states.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "FP8 per-channel MoE hidden_states must have dtype "
+            f"torch.float8_e4m3fn, got {hidden_states.dtype}."
+        )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         routing_logits,
         None,
@@ -5553,7 +5559,7 @@ def trtllm_fp8_per_channel_scale_routed_moe(
     routing_bias : Optional[torch.Tensor]
         ``[num_experts]`` tensor of routing bias. May be ``None``.
     hidden_states : torch.Tensor
-        ``[seq_len, hidden_size]`` tensor of input hidden states.
+        ``[seq_len, hidden_size]`` FP8 E4M3 tensor of input hidden states.
     hidden_states_scale : torch.Tensor
         ``[seq_len, 1]`` FP32 per-token dequantization multipliers.
     gemm1_weights : torch.Tensor
@@ -5611,6 +5617,12 @@ def trtllm_fp8_per_channel_scale_routed_moe(
         Final MoE output when ``do_finalize`` is ``True``; otherwise
         ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``.
     """
+    if hidden_states.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "FP8 per-channel MoE hidden_states must have dtype "
+            f"torch.float8_e4m3fn, got {hidden_states.dtype}."
+        )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_per_channel_scale_moe(
         None,  # routing_logits
         topk_ids,
