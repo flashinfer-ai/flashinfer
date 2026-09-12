@@ -14,6 +14,4 @@
  * limitations under the License.
  */
 
-#define FLASHINFER_ROUTING_CUSTOM_ENTRY
-#include "trtllm_fused_moe_routing_custom.cuh"
 #include "trtllm_fused_moe_routing_custom_entry_launchers.cuh"
