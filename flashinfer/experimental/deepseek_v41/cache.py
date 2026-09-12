@@ -19,13 +19,16 @@ def _power2(amax):
 
 
 @tr.jit
-def _quantize_cache(X, OUT, SLOTS, N, FP4: tl.constexpr, HAS_SLOTS: tl.constexpr):
+def _quantize_cache(
+    X, OUT, SLOTS, N, CAPACITY, FP4: tl.constexpr, HAS_SLOTS: tl.constexpr
+):
     rows = tl.program_id(0) * 4 + tl.arange(0, 4)
     valid = rows < N
     slot = tl.load(SLOTS + rows, valid, -1) if HAS_SLOTS else rows
-    valid = valid & (slot >= 0)
     # A physical slot can fit int32 while its byte address exceeds 2 GiB.
     slot = slot.to(tl.int64)
+    if HAS_SLOTS:
+        valid = valid & (slot >= 0) & (slot < CAPACITY)
     rows = rows.to(tl.int64)
     WIDTH: tl.constexpr = 256 if FP4 else 512
     GROUP: tl.constexpr = 16 if FP4 else 32
@@ -133,6 +136,7 @@ def quantize_cache(x, *, format, page_size=64, out=None, slots=None):
                 out,
                 slots,
                 n,
+                out.shape[0] * 64,
                 format == "main_kv_fp4",
                 slots is not None,
                 num_warps=4,

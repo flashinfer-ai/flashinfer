@@ -117,6 +117,39 @@ def test_scatter_changed_slots_and_untouched_bytes(fmt, width, sf):
         torch.testing.assert_close(out.flatten(), expected.flatten(), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "fmt,width,sf", [("main_kv_fp4", 256, 32), ("swa_mxfp8", 512, 16)]
+)
+def test_invalid_slots_are_masked_under_graph_replay(fmt, width, sf):
+    gate()
+    x = torch.randn(7, 512, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor(
+        [0, 127, -1, -2, 128, 2**31 - 1, 64], device="cuda", dtype=torch.int32
+    )
+    out = torch.full((2, 64, 1, width + sf), 173, device="cuda", dtype=torch.uint8)
+    deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        deepseek_v41_quantize_cache(x, format=fmt, out=out, slots=slots)
+    for step in range(2):
+        if step:
+            slots.fill_(-2)
+        x.copy_(torch.randn_like(x))
+        out.fill_(173)
+        expected = torch.full_like(out, 173).view(2, -1)
+        graph.replay()
+        data, scales = reference(x, fmt)
+        for row, slot in enumerate(slots.tolist()):
+            if not 0 <= slot < 128:
+                continue
+            page, local = divmod(slot, 64)
+            expected[page, local * width : (local + 1) * width] = data[row]
+            expected[page, 64 * width + local * sf : 64 * width + (local + 1) * sf] = (
+                scales[row]
+            )
+        torch.testing.assert_close(out.flatten(), expected.flatten(), rtol=0, atol=0)
+
+
 def test_fp4_halfway_even_and_signed_zero():
     gate()
     values = [

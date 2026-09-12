@@ -1,13 +1,13 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""Quantized-cache FP64 gate and paired CUDA Graph timing of DS4.1 decode.
+"""Quantized-cache FP64 gate and paired CUDA Graph timing of Frost DS4.1 decode.
 
 python benchmarks/bench_deepseek_v41_decode.py --batches 1,4,16,32,64,128,256 \
     --context 32768 --flashmla --output results.json
 
 FlashMLA is an optional external benchmark dependency, not a shipped decode
 backend. Quantization, allocation, JIT and host overhead are excluded from GPU
-timing. The timed CuTe invocation includes the public plan replay and merge.
+timing. The timed Frost invocation includes the public plan replay and merge.
 """
 
 import argparse
@@ -112,6 +112,7 @@ def main():
 
     report = {
         "status": "running",
+        "implementation": "frost",
         "device": str(torch.cuda.get_device_properties(0)),
         "torch": torch.__version__,
         "context_per_request": opts.context,
@@ -133,13 +134,16 @@ def main():
                 args, expected, expected_lse = fixture(batch, opts.context, opts.seed)
                 out, lse, plan = deepseek_v41_decode(*args)
                 fns = {
-                    "cute": lambda args=args, plan=plan: deepseek_v41_decode(
+                    "frost": lambda args=args, plan=plan: deepseek_v41_decode(
                         *args, plan=plan
                     )[:2]
                 }
                 if opts.flashmla:
                     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
+                    # FlashMLASchedMeta is initialized from this fixture by
+                    # the eager correctness call below, before graph capture.
+                    # The second return value is a None compatibility placeholder.
                     meta, _ = get_mla_metadata()
 
                     def flashmla(args=args, meta=meta):

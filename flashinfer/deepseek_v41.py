@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
 
-"""Experimental SM100 DS4.1 decode and optional cache preparation."""
+"""Experimental Frost DS4.1 decode and optional cache preparation on SM100."""
 
 from .api_logging import flashinfer_experimental_api
 
@@ -10,7 +10,7 @@ from .api_logging import flashinfer_experimental_api
 def deepseek_v41_decode(
     q, swa_cache, global_cache, swa_indices, global_indices, sink, *, plan=None
 ):
-    """SM100 CuTe DSL mixed MXFP8/FP4 decode with BF16 probabilities.
+    """Frost mixed MXFP8/FP4 decode using CuTe DSL primitives on SM100.
 
     Q is contiguous BF16[B,1,64,512]. Caches are opaque uint8 page pools
     [pages,64,1,528] (SWA) and [pages,64,1,288] (global). SWA indices are
@@ -25,7 +25,10 @@ def deepseek_v41_decode(
     Multiplications use BF16 Q/K/V/P; accumulation and softmax use FP32.
     Prepare once before capture, then reuse plan with identical declarations
     on its device. Replay overwrites plan-owned output/LSE/workspace; the
-    same plan must not execute concurrently on different streams. Single
+    captured graph keeps fixed input addresses: update values in place, or
+    recapture/update the graph when addresses change. Ordinary plan calls
+    may use new addresses with matching declarations. The same plan must
+    not execute concurrently on different streams. Single
     token decode only; MTP and SM103 are not part of this initial scope.
     """
     from .experimental.deepseek_v41.decode import decode
@@ -37,7 +40,7 @@ def deepseek_v41_decode(
 
 @flashinfer_experimental_api
 def deepseek_v41_window_decode(q, cache, indices, sink, *, plan=None):
-    """Window-only variant of deepseek_v41_decode, using the same CuTe kernel.
+    """Window-only variant of deepseek_v41_decode, using the same Frost kernel.
 
     Accepts BF16[B,1,64,512] Q, uint8[pages,64,1,528] cache and
     int32[B,1,128] physical slot IDs. See deepseek_v41_decode for the plan,
@@ -50,7 +53,7 @@ def deepseek_v41_window_decode(q, cache, indices, sink, *, plan=None):
 
 @flashinfer_experimental_api
 def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None):
-    """Quantize and write the two cache formats consumed by DS4.1 decode.
+    """Quantize and write the two cache formats consumed by Frost DS4.1 decode.
 
     Optional Triton preparation helper; decode accepts compatible caches from
     any producer. Contiguous finite BF16/FP32 x[N,512] must already include
@@ -63,9 +66,10 @@ def deepseek_v41_quantize_cache(x, *, format, page_size=64, out=None, slots=None
     followed by all scale rows; these are not interleaved token records.
 
     Without slots, input row i writes physical slot i. For incremental
-    updates, provide caller-owned out and CUDA int32 slots[N]: -1 skips a
-    row; other slots must be unique and within output capacity. Unwritten
-    slots remain untouched and must not be attended to before initialization.
+    updates, provide caller-owned out and CUDA int32 slots[N]. Negative or
+    out-of-capacity slots skip publication. Valid slots must be unique;
+    uniqueness is a caller precondition and is not checked. Unwritten slots
+    remain untouched and must not be attended to before initialization.
     Inputs and output must not overlap. Reusing out permits allocation-free
     CUDA Graph replay. No implicit QAT derivative.
     """
