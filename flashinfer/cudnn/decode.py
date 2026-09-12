@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -63,21 +63,44 @@ def _sdpa_decode_key_fn(
     block_tables: Optional[torch.Tensor] = None,
     batch_offsets_q: Optional[torch.Tensor] = None,
     batch_offsets_o: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
 ):
     return (
         "decode",
         max_sequence_kv,
         tuple(q.shape),
+        # K/V shapes and strides are baked into the built graph via
+        # tensor_like (v_cache also supplies d_vo for the O dims), so both
+        # caches key on their full layout, not just k_cache's shape.
         tuple(k_cache.shape),
+        tuple(v_cache.shape),
+        tuple(k_cache.stride()),
+        tuple(v_cache.stride()),
+        # I/O data types are baked into the built graph; same-shape calls that
+        # differ only in dtype must not share a graph (a replayed graph would
+        # silently reinterpret the buffers as the first caller's dtype).
+        q.dtype,
+        k_cache.dtype,
+        v_cache.dtype,
         # attn_scale is baked into the built graph as a compile-time constant;
         # omitting it silently replays a stale-scale graph on same-shape calls.
         scale,
         # These presence flags change the built graph's structure (padding
-        # mask, paged tables) the same way: same-shape calls that differ only
-        # in them must not share a graph.
+        # mask, paged tables, Stats output) the same way: same-shape calls
+        # that differ only in them must not share a graph.
         actual_seq_lens_q is not None,
         actual_seq_lens_kv is not None,
-        block_tables is not None,
+        # The block table's dims/strides/dtype are baked via tensor_like: a
+        # same-batch table with a different pages-per-seq width must not share
+        # a graph (the replay would walk rows with the stale row stride).
+        tuple(block_tables.shape) if block_tables is not None else None,
+        block_tables.dtype if block_tables is not None else None,
+        # The seq-len tensors are bound via tensor_like, which bakes their
+        # dtypes (an int64 buffer bound to a graph built for int32 would be
+        # silently read as int32).
+        actual_seq_lens_q.dtype if actual_seq_lens_q is not None else None,
+        actual_seq_lens_kv.dtype if actual_seq_lens_kv is not None else None,
+        return_lse,
     )
 
 
@@ -98,12 +121,19 @@ if CUDNN_AVAILABLE:
         block_tables: Optional[torch.Tensor] = None,
         batch_offsets_q: Optional[torch.Tensor] = None,
         batch_offsets_o: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream())
 
         # WAR: override batch offsets for now, as it leads to a poor performance
         batch_offsets_q = None
         batch_offsets_o = None
+
+        # Q and O carry explicit data types (K/V inherit theirs from the torch
+        # tensors via tensor_like below); derive them from q.dtype instead of
+        # hardcoding, so fp16 callers are not silently reinterpreted as bf16.
+        cudnn_q_data_type = cudnn.datatypes._torch_to_cudnn_data_type(q.dtype)
+        cudnn_o_data_type = cudnn_q_data_type
 
         with cudnn.graph(handle) as (g, _):
             if q.dim() == 3:
@@ -128,7 +158,7 @@ if CUDNN_AVAILABLE:
                 name="q",
                 dim=(b, h_qo, s_qo, d_qk),
                 stride=(h_qo * d_qk, d_qk, d_qk * h_qo, 1),
-                data_type=cudnn.data_type.BFLOAT16,
+                data_type=cudnn_q_data_type,
             )
             if batch_offsets_q is not None:
                 ragged_q = g.tensor_like(batch_offsets_q)
@@ -163,7 +193,7 @@ if CUDNN_AVAILABLE:
 
             padding_mask = actual_seq_lens_kv is not None
 
-            O, _ = g.sdpa(
+            O, Stats = g.sdpa(
                 name="sdpa",
                 q=cudnn_q,
                 k=cudnn_k_cache,
@@ -175,7 +205,7 @@ if CUDNN_AVAILABLE:
                     cudnn_actual_seq_lens_kv if actual_seq_lens_kv is not None else None
                 ),
                 use_padding_mask=padding_mask,
-                is_inference=True,
+                generate_stats=return_lse,
                 attn_scale=scale,
                 paged_attention_k_table=cudnn_k_block_tables,
                 paged_attention_v_table=cudnn_v_block_tables,
@@ -191,10 +221,20 @@ if CUDNN_AVAILABLE:
             O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
                 [b, h_qo, s_qo, d_vo]
             ).set_stride([d_vo * h_qo, d_vo, d_vo * h_qo, 1]).set_data_type(
-                cudnn.data_type.BFLOAT16
+                cudnn_o_data_type
             )
 
+            if return_lse:
+                # Same layout as prefill's Stats with s_qo == 1: fp32,
+                # (b, h_qo, 1, 1) with token-major strides, which is exactly a
+                # contiguous (batch, num_heads_qo) fp32 buffer.
+                Stats.set_uid(UIDs.STATS_UID.value).set_output(True).set_data_type(
+                    cudnn.data_type.FLOAT
+                ).set_dim([b, h_qo, s_qo, 1]).set_stride([s_qo * h_qo, 1, h_qo, 1])
+
         tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
+        if return_lse:
+            tensors_to_return.append(Stats)
 
         if actual_seq_lens_q is not None:
             tensors_to_return.append(cudnn_actual_seq_lens_q)
@@ -221,6 +261,8 @@ def _batch_decode_with_kv_cache(
     batch_offsets_k: Optional[torch.Tensor] = None,
     batch_offsets_v: Optional[torch.Tensor] = None,
     out: torch.Tensor,
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     graph, tensors = _build_decode_graph(
         q=q,
@@ -234,6 +276,7 @@ def _batch_decode_with_kv_cache(
         block_size=block_size,
         batch_offsets_q=batch_offsets_q if batch_offsets_q is not None else None,
         batch_offsets_o=batch_offsets_q if batch_offsets_q is not None else None,
+        return_lse=return_lse,
     )
 
     handle_ = _create_cudnn_handle(torch.cuda.current_stream())
@@ -244,6 +287,8 @@ def _batch_decode_with_kv_cache(
         UIDs.V_UID.value: v_cache,
         UIDs.O_UID.value: out,
     }
+    if return_lse:
+        var_map[UIDs.STATS_UID.value] = lse
     if actual_seq_lens_q is not None:
         var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
     if actual_seq_lens_kv is not None:
@@ -280,13 +325,18 @@ def cudnn_batch_decode_with_kv_cache(
     batch_offsets_k: Optional[torch.Tensor] = None,
     batch_offsets_v: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    lse: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     r"""Batched decode attention with paged KV cache, backed by cuDNN SDPA.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query tensor of shape ``(batch_size, num_heads_qo, head_dim)``.
+        Query tensor of shape ``(batch_size, num_heads_qo, head_dim)``,
+        ``torch.float16`` or ``torch.bfloat16`` (the output uses ``q.dtype``).
+        ``torch.float16`` requires the cuDNN graph backend; the fallback
+        (cubin) path is bf16-only and raises ``NotImplementedError``.
     k_cache : torch.Tensor
         Key cache, shape ``(total_num_pages, num_heads_kv, page_size, head_dim)``.
     v_cache : torch.Tensor
@@ -317,29 +367,84 @@ def cudnn_batch_decode_with_kv_cache(
     batch_offsets_v : Optional[torch.Tensor]
         Per-request offsets into the value tensor, shape ``(batch_size,)`` on GPU.
     out : Optional[torch.Tensor]
-        Pre-allocated output tensor, shape ``(batch_size, num_heads_qo, head_dim)``;
-        allocated internally when ``None``.
+        Pre-allocated output tensor, shape ``(batch_size, num_heads_qo, head_dim)``
+        with dtype ``q.dtype``; allocated internally when ``None``.
+    return_lse : bool
+        Whether to also return the log-sum-exp of the attention scores
+        (cuDNN's SDPA ``Stats`` output).  Requires the cuDNN graph backend;
+        raises ``NotImplementedError`` on the fallback (cubin) path.
+    lse : Optional[torch.Tensor]
+        Pre-allocated LSE tensor, shape ``(batch_size, num_heads_qo)``,
+        ``torch.float32``, contiguous, on the same device as ``q``; allocated
+        internally when ``None`` and ``return_lse`` is ``True``.
 
     Returns
     -------
-    torch.Tensor
-        Output tensor of shape ``(batch_size, num_heads_qo, head_dim)``.
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        Output tensor of shape ``(batch_size, num_heads_qo, head_dim)`` when
+        ``return_lse=False``; otherwise ``(output, lse)`` where ``lse`` has
+        shape ``(batch_size, num_heads_qo)`` and dtype ``torch.float32``.
 
     Note
     ----
     Currently only supports causal attention; all tensors must be contiguous and
     on the same CUDA device.  Query and KV heads may differ
     (``num_heads_qo >= num_heads_kv``, multi-query / grouped-query attention).
+
+    LSE convention: ``lse[b, h]`` is the natural-log log-sum-exp of the
+    pre-softmax attention row with ``scale`` folded in, i.e.
+    ``log(sum_j(exp(scale * q[b, h] . k[b, h // (num_heads_qo // num_heads_kv), j])))``
+    summed over the valid KV positions ``j < actual_seq_lens_kv[b]`` (matching
+    ``torch.logsumexp`` on the masked, scaled scores).
     """
 
     bs = q.shape[0]
     h_qo = q.shape[1]
     d_vo = v_cache.shape[3]
 
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
+        if t.dtype not in supported_dtypes:
+            raise ValueError(
+                f"cudnn_batch_decode_with_kv_cache only supports torch.float16 "
+                f"and torch.bfloat16, got {name}.dtype={t.dtype}"
+            )
+    if out is not None and out.dtype != q.dtype:
+        raise ValueError(
+            f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}); the "
+            "output is produced in the query's data type"
+        )
+
+    if return_lse:
+        if not CUDNN_AVAILABLE:
+            raise NotImplementedError(
+                "return_lse=True requires the cuDNN graph backend; it is not "
+                "supported by the fallback cubin decode path"
+            )
+        if lse is None:
+            lse = torch.empty(bs, h_qo, device=q.device, dtype=torch.float32)
+        elif (
+            lse.shape != (bs, h_qo)
+            or lse.dtype != torch.float32
+            or not lse.is_contiguous()
+        ):
+            raise ValueError(
+                "lse must be a contiguous float32 tensor of shape "
+                f"(batch_size, num_heads_qo) = ({bs}, {h_qo}), got shape "
+                f"{tuple(lse.shape)} with dtype {lse.dtype}"
+            )
+
     if out is None:
         out = torch.empty(bs, h_qo, d_vo, device=q.device, dtype=q.dtype)
 
     if not CUDNN_AVAILABLE:
+        if q.dtype != torch.bfloat16:
+            # The fallback cubins are compiled for bf16 only; passing fp16
+            # buffers through would silently reinterpret them as bf16.
+            raise NotImplementedError(
+                f"q.dtype={q.dtype} requires the cuDNN graph backend; the "
+                "fallback cubin decode path only supports torch.bfloat16"
+            )
         actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device, non_blocking=True)
 
         run_func = get_cudnn_fmha_gen_module().decode
@@ -378,6 +483,10 @@ def cudnn_batch_decode_with_kv_cache(
             batch_offsets_o=batch_offsets_o,
             block_size=block_size,
             out=out,
+            return_lse=return_lse,
+            lse=lse,
         )
 
+    if return_lse:
+        return out, lse
     return out
