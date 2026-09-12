@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import time
+from pathlib import PureWindowsPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
 import requests  # type: ignore[import-untyped]
@@ -62,8 +63,10 @@ def get_available_cubin_files(
         try:
             response = requests.get(source, timeout=timeout)
             response.raise_for_status()
-            hrefs = re.findall(r'\<a href=".*\.cubin">', response.text)
-            return tuple((h[9:-8] + ".cubin") for h in hrefs)
+            # Kernel binaries are shipped as .cubin (trtllm-gen, deepgemm)
+            # or .so (cute-dsl, exported via TVM-FFI).
+            hrefs = re.findall(r'<a href="([^"]+\.(?:cubin|so))">', response.text)
+            return tuple(hrefs)
 
         except requests.exceptions.RequestException as e:
             logger.warning(
@@ -220,9 +223,39 @@ def get_checksums(subdirs):
                 f"from {uri}. Check that the pin exists in "
                 f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
             )
+        # Verify the manifest against its pinned SHA-256 *before* parsing it:
+        # its entries become download paths and per-file checksums, so a
+        # tampered manifest must be rejected up front, not discovered after
+        # files derived from it have already been written.
+        pinned_sha = CheckSumHash.map_checksums.get(
+            safe_urljoin(subdir, "checksums.txt")
+        )
+        if pinned_sha is not None and not verify_cubin(str(checksum_path), pinned_sha):
+            raise RuntimeError(
+                f"Checksum manifest for artifact pin '{subdir}' does not match "
+                f"its pinned SHA-256; refusing to parse it. Delete "
+                f"'{checksum_path}' and retry."
+            )
         with open(checksum_path, "r") as f:
             for line in f:
                 sha256, filename = line.strip().split()
+
+                # Manifest entries are joined onto FLASHINFER_CUBIN_DIR and
+                # downloaded to; never accept a name that could escape it
+                # (absolute, parent-relative, backslash-separated, or
+                # drive-qualified like ``C:/x.so``, which would replace the
+                # cache root when joined on Windows).
+                if (
+                    "\\" in filename
+                    or filename.startswith("/")
+                    or ".." in filename.split("/")
+                    or PureWindowsPath(filename).drive
+                ):
+                    raise RuntimeError(
+                        f"Unsafe filename {filename!r} in checksum manifest for "
+                        f"artifact pin '{subdir}'; refusing to use it as a "
+                        f"download path."
+                    )
 
                 # Key every entry by its full path. Bare filenames are not
                 # unique across subdirs: two pins built from different sources
@@ -244,7 +277,6 @@ def _get_host_cpu_arch() -> str:
 
 
 def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
-    base = FLASHINFER_CUBINS_REPOSITORY
     cpu_arch = _get_host_cpu_arch()
 
     cubin_dirs = [
@@ -263,35 +295,35 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
     checksums = get_checksums(cubin_dirs)
 
     # The meta info header files first.
-    yield (
+    meta_info_headers = (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_FMHA, "include/flashInferMetaInfo.h")
-        ],
-    )
-    yield (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_GEMM, "include/flashinferMetaInfo.h")
-        ],
-    )
-    yield (
         safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h"),
-        checksums[
-            safe_urljoin(ArtifactPath.TRTLLM_GEN_BMM, "include/flashinferMetaInfo.h")
-        ],
     )
+    for header_path in meta_info_headers:
+        yield (header_path, checksums[header_path])
 
-    # All the actual kernel cubin's.
+    # The checksum manifests themselves, pinned by CheckSumHash.
     for cubin_dir in cubin_dirs:
         checksum_path = safe_urljoin(cubin_dir, "checksums.txt")
         yield (checksum_path, CheckSumHash.map_checksums[checksum_path])
-        for name in get_available_cubin_files(safe_urljoin(base, cubin_dir)):
-            full_path = safe_urljoin(cubin_dir, name)
-            yield (full_path, checksums[full_path])
-        for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
-            full_path = safe_urljoin(cubin_dir, name)
-            yield (full_path, checksums[full_path])
+
+    # Everything else each directory's checksums.txt manifest lists.
+    #
+    # The manifest is authoritative for a directory's contents: it is generated
+    # by the cubin publishing pipeline, already fetched by get_checksums(), and
+    # pinned by SHA-256 via CheckSumHash.map_checksums. Enumerating downloads
+    # from it (instead of scraping the artifactory HTML index for hard-coded
+    # extensions) guarantees every published artifact is downloaded and
+    # checksum-verified by download_artifacts(). Scraping silently dropped any
+    # file the regex did not anticipate -- the cute-dsl FMHA kernels ship as
+    # .so, so none of them were ever pre-fetched and each was lazily fetched
+    # over HTTP inside the first forward pass that needed it (#4432). It also
+    # made a failed/unparseable index listing indistinguishable from an empty
+    # directory, silently skipping the whole directory.
+    for file_path, checksum in checksums.items():
+        if file_path not in meta_info_headers:
+            yield (file_path, checksum)
 
 
 def download_artifacts() -> None:
