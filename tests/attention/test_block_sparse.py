@@ -33,7 +33,11 @@ from tests.test_helpers.jit_utils import (
 
 import flashinfer
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
-from flashinfer.utils import has_flashinfer_jit_cache, is_sm100a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    has_flashinfer_jit_cache,
+    is_sm100a_supported,
+)
 
 
 @pytest.fixture(
@@ -41,6 +45,11 @@ from flashinfer.utils import has_flashinfer_jit_cache, is_sm100a_supported
     scope="module",
 )
 def warmup_jit():
+    if torch.cuda.is_available() and get_compute_capability(torch.device(0)) == (10, 7):
+        # SM107 does not run the vsa_blackwell backend. Let any supported
+        # backend compile lazily instead of building unrelated modules here.
+        yield
+        return
     flashinfer.jit.build_jit_specs(
         gen_decode_attention_modules(
             [torch.float16],  # q_dtypes
@@ -124,6 +133,8 @@ def _run_block_sparse_attention_case(
         pytest.skip("BSR test dimensions require M % R == 0 and N % C == 0")
 
     if backend == "vsa_blackwell":
+        if get_compute_capability(torch.device(0)) == (10, 7):
+            pytest.skip("vsa_blackwell supports SM100 and SM103, not SM107")
         if not is_sm100a_supported(torch.device(0)):
             pytest.skip("vsa_blackwell requires sm100a (Blackwell GPU)")
         if R != 128 or C != 128:

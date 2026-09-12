@@ -4,6 +4,19 @@ import types
 from pathlib import Path
 from typing import Any, Dict, Set
 
+
+def _configure_cute_dsl_cache_dir():
+    if "CUTE_DSL_CACHE_DIR" not in os.environ:
+        workspace_base = Path(
+            os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home().as_posix())
+        ).expanduser()
+        os.environ["CUTE_DSL_CACHE_DIR"] = str(
+            workspace_base / ".cache" / "flashinfer" / "cute_dsl"
+        )
+
+
+_configure_cute_dsl_cache_dir()
+
 import pytest
 import torch
 from torch.torch_version import TorchVersion
