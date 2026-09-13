@@ -850,7 +850,7 @@ template <typename DTP, typename ST, bool VLEN, bool GS, bool SV>
 __global__ void __launch_bounds__(256)
     ssd_k3_kernel(const bf16* __restrict__ x, const bf16* __restrict__ bmat,
                   const bf16* __restrict__ cmat, const bf16* __restrict__ zz,
-                  const void* __restrict__ dvec, int has_d, int d_is32, int d_hdim,
+                  const void* __restrict__ dvec, int has_d, int d_is32, int d_layout,
                   const DTP* __restrict__ dt, const float* __restrict__ a,
                   const DTP* __restrict__ dtb, const ST* __restrict__ initial,
                   const float* __restrict__ chunk_state, const float* __restrict__ da_last,
@@ -1769,7 +1769,7 @@ __global__ void __launch_bounds__(256)
       float xv[4] = {cvt_bf2(xu.x).x, cvt_bf2(xu.x).y, cvt_bf2(xu.y).x, cvt_bf2(xu.y).y};
       float dv[4] = {0.f, 0.f, 0.f, 0.f};
       if (has_d) {
-        if (d_hdim) {
+        if (d_layout == 1) {
           const long di = (long)h * PD + p0y;
           if (d_is32) {
             const float4 d4 =
@@ -1787,8 +1787,9 @@ __global__ void __launch_bounds__(256)
             dv[3] = cvt_bf2(du.y).y;
           }
         } else {
-          const float ds = d_is32 ? reinterpret_cast<const float*>(dvec)[h]
-                                  : VT<bf16>::to(reinterpret_cast<const bf16*>(dvec)[h]);
+          const long di = (long)h * (d_layout == 2 ? PD : 1);
+          const float ds = d_is32 ? reinterpret_cast<const float*>(dvec)[di]
+                                  : VT<bf16>::to(reinterpret_cast<const bf16*>(dvec)[di]);
           dv[0] = dv[1] = dv[2] = dv[3] = ds;
         }
       }
@@ -1863,7 +1864,7 @@ template <typename DTP, typename ST, int SPLIT, bool SV>
 __global__ void __launch_bounds__(256)
     ssd_k3l_kernel(const bf16* __restrict__ x, const bf16* __restrict__ bmat,
                    const bf16* __restrict__ cmat, const bf16* __restrict__ zz,
-                   const void* __restrict__ dvec, int has_d, int d_is32, int d_hdim,
+                   const void* __restrict__ dvec, int has_d, int d_is32, int d_layout,
                    const DTP* __restrict__ dt, const float* __restrict__ a,
                    const DTP* __restrict__ dtb, const ST* __restrict__ initial,
                    bf16* __restrict__ y, ST* __restrict__ final_states, int L, int heads,
@@ -2227,7 +2228,7 @@ __global__ void __launch_bounds__(256)
         float xv[4] = {cvt_bf2(xu.x).x, cvt_bf2(xu.x).y, cvt_bf2(xu.y).x, cvt_bf2(xu.y).y};
         float dv[4] = {0.f, 0.f, 0.f, 0.f};
         if (has_d) {
-          if (d_hdim) {
+          if (d_layout == 1) {
             const long di = (long)h * PD + p0y;
             if (d_is32) {
               const float4 d4 =
@@ -2245,8 +2246,9 @@ __global__ void __launch_bounds__(256)
               dv[3] = cvt_bf2(du.y).y;
             }
           } else {
-            const float ds = d_is32 ? reinterpret_cast<const float*>(dvec)[h]
-                                    : VT<bf16>::to(reinterpret_cast<const bf16*>(dvec)[h]);
+            const long di = (long)h * (d_layout == 2 ? PD : 1);
+            const float ds = d_is32 ? reinterpret_cast<const float*>(dvec)[di]
+                                    : VT<bf16>::to(reinterpret_cast<const bf16*>(dvec)[di]);
             dv[0] = dv[1] = dv[2] = dv[3] = ds;
           }
         }
@@ -2323,7 +2325,7 @@ struct VibeCudaSsdArgs {
   int dt_is32;    // dt/dt_bias fp32 (else bf16)
   int st_is_f16;  // state dtype fp16 (else bf16)
   int si_is64;    // seq_idx int64 (else int32)
-  int d_mode;     // 0 none, 1 per-head scalar, 2 per-(head,hdim)
+  int d_mode;     // 0 none, 1 scalar, 2 per-(head,hdim), 3 first column of 2D D
   int d_is32;     // d fp32 (else bf16)
   int Bsz;        // x.shape[0]
   int L;          // x.shape[1] (batched seqlen / packed varlen tokens)
@@ -2394,11 +2396,14 @@ inline void vibecuda_launch_dt_st(const VibeCudaSsdArgs& p, cudaError_t* err) {
     kern<<<grid, 256, k3_smem, p.stream>>>(
         reinterpret_cast<const bf16*>(p.x), reinterpret_cast<const bf16*>(p.b),
         reinterpret_cast<const bf16*>(p.c), zp, p.d, p.d_mode > 0 ? 1 : 0, p.d_is32,
-        p.d_mode == 2 ? 1 : 0, reinterpret_cast<const DTP*>(p.dt), p.a, dtb, init, chunk_state,
-        da_last, reinterpret_cast<bf16*>(p.y), reinterpret_cast<ST*>(p.final_states), sqi_ptr,
-        p.meta_ci, p.meta_co, p.nmeta, reinterpret_cast<ST*>(p.ck_states), p.ck_tokens, p.ck_slots,
-        si_is64, p.Tseq, cps, p.L, p.heads, p.groups, p.has_z, p.do_softplus, p.unbounded, p.dt_lo,
-        p.dt_hi, p.y_chunk_major);
+        p.d_mode == 2   ? 1
+        : p.d_mode == 3 ? 2
+                        : 0,
+        reinterpret_cast<const DTP*>(p.dt), p.a, dtb, init, chunk_state, da_last,
+        reinterpret_cast<bf16*>(p.y), reinterpret_cast<ST*>(p.final_states), sqi_ptr, p.meta_ci,
+        p.meta_co, p.nmeta, reinterpret_cast<ST*>(p.ck_states), p.ck_tokens, p.ck_slots, si_is64,
+        p.Tseq, cps, p.L, p.heads, p.groups, p.has_z, p.do_softplus, p.unbounded, p.dt_lo, p.dt_hi,
+        p.y_chunk_major);
     return cudaGetLastError();
   };
 
@@ -2427,9 +2432,12 @@ inline void vibecuda_launch_dt_st(const VibeCudaSsdArgs& p, cudaError_t* err) {
       kern<<<lgrid, 256, k3_smem, p.stream>>>(
           reinterpret_cast<const bf16*>(p.x), reinterpret_cast<const bf16*>(p.b),
           reinterpret_cast<const bf16*>(p.c), zp, p.d, p.d_mode > 0 ? 1 : 0, p.d_is32,
-          p.d_mode == 2 ? 1 : 0, reinterpret_cast<const DTP*>(p.dt), p.a, dtb, init,
-          reinterpret_cast<bf16*>(p.y), reinterpret_cast<ST*>(p.final_states), p.L, p.heads,
-          p.groups, p.has_z, p.do_softplus, p.unbounded, p.dt_lo, p.dt_hi, p.y_chunk_major);
+          p.d_mode == 2   ? 1
+          : p.d_mode == 3 ? 2
+                          : 0,
+          reinterpret_cast<const DTP*>(p.dt), p.a, dtb, init, reinterpret_cast<bf16*>(p.y),
+          reinterpret_cast<ST*>(p.final_states), p.L, p.heads, p.groups, p.has_z, p.do_softplus,
+          p.unbounded, p.dt_lo, p.dt_hi, p.y_chunk_major);
       return cudaGetLastError();
     };
     *err = (lean_split == 4) ? launch_k3l(std::integral_constant<int, 4>{})

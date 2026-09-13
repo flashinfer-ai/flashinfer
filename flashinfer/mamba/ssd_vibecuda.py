@@ -126,8 +126,9 @@ class VibeCUDASSDCombined:
         self._seq_idx_dtype = seq_idx_dtype
 
         self._module = _get_vibecuda_module()
-        self._zero_dt_bias_cache = {}
-        self._d_head_cache = {}
+        self._zero_dt_bias_cache: dict[
+            tuple[int | None, torch.dtype], torch.Tensor
+        ] = {}
 
     # -- helpers --------------------------------------------------------------
 
@@ -145,16 +146,18 @@ class VibeCUDASSDCombined:
             self._zero_dt_bias_cache[key] = value
         return value
 
-    def _d_head(self, d: torch.Tensor) -> torch.Tensor:
-        # Match the public runner's D-shape coercion: a 2D D passed to a
-        # per-head constructor consumes its first column.
-        key = (d.device.index,)
-        value = self._d_head_cache.get(key)
-        if value is None or value.shape != (self.nheads,):
-            value = torch.empty(self.nheads, dtype=d.dtype, device=d.device)
-            self._d_head_cache[key] = value
-        value.copy_(d[:, 0])
-        return value
+    @staticmethod
+    def _require_same_device(
+        reference: torch.Tensor,
+        **tensors: Optional[torch.Tensor],
+    ) -> None:
+        if reference.device.type != "cuda":
+            raise ValueError("VibeCUDA SSDCombined inputs must be CUDA tensors")
+        for name, tensor in tensors.items():
+            if tensor is not None and tensor.device != reference.device:
+                raise ValueError(
+                    f"{name} must be on {reference.device}, got {tensor.device}"
+                )
 
     # -- main entry point ------------------------------------------------------
 
@@ -183,6 +186,8 @@ class VibeCUDASSDCombined:
         return_final_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass; see ``SSDCombined.run``."""
+        if x.ndim != 4:
+            raise ValueError("x must be a 4D [batch, seqlen, nheads, headdim] tensor")
         batch, seqlen, nheads, headdim = x.shape
         if seqlen % _CHUNK:
             raise ValueError("seqlen must be divisible by chunk_size=128")
@@ -207,6 +212,26 @@ class VibeCUDASSDCombined:
                 "runtime initial_states presence must match the constructor"
             )
 
+        self._require_same_device(
+            x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            seq_chunk_cumsum=seq_chunk_cumsum,
+            checkpoint_token_indices=checkpoint_token_indices,
+            checkpoint_state_slots=checkpoint_state_slots,
+            checkpoint_states=checkpoint_states,
+            out=out,
+        )
+
         has_varlen = seq_idx is not None
         if has_varlen and not self._has_varlen:
             raise ValueError(
@@ -217,6 +242,20 @@ class VibeCUDASSDCombined:
             raise ValueError(
                 "VibeCUDASSDCombined was constructed with has_varlen=True but no "
                 "seq_idx was provided"
+            )
+        metadata_pair = (chunk_indices, chunk_offsets)
+        if any(value is not None for value in metadata_pair) and not all(
+            value is not None for value in metadata_pair
+        ):
+            raise ValueError(
+                "chunk_indices and chunk_offsets must be supplied together"
+            )
+        if not has_varlen and (
+            any(value is not None for value in metadata_pair)
+            or seq_chunk_cumsum is not None
+        ):
+            raise ValueError(
+                "batched mode does not accept chunk metadata or seq_chunk_cumsum"
             )
         if has_varlen:
             if batch != 1:
@@ -236,7 +275,16 @@ class VibeCUDASSDCombined:
                     "seq_idx must have one entry per packed token "
                     f"({batch * seqlen}), got {seq_idx.numel()}"
                 )
-        num_seqs = initial_states.shape[0] if initial_states is not None else batch
+            if tuple(seq_idx.shape) != (batch, seqlen):
+                raise ValueError(
+                    f"seq_idx must have shape [{batch}, {seqlen}], got "
+                    f"{tuple(seq_idx.shape)}"
+                )
+        num_seqs = (
+            initial_states.shape[0]
+            if has_varlen and initial_states is not None
+            else batch
+        )
         if initial_states is not None:
             expected_states = (num_seqs, self.nheads, _HEADDIM, _DSTATE)
             if tuple(initial_states.shape) != expected_states:
@@ -253,17 +301,24 @@ class VibeCUDASSDCombined:
         # Safe upper bound on the total logical-chunk count: batch * nchunks for
         # the uniform layout; every varlen sequence wastes at most one partial
         # chunk, so seqlen/CS + num_seqs bounds the packed count.
-        nchunk_bound = (
-            nchunks + num_seqs if has_varlen else batch * nchunks
-        )
+        nchunk_bound = nchunks + num_seqs if has_varlen else batch * nchunks
         meta_ci = None
         meta_co = None
         nmeta = 0
         if has_varlen and chunk_indices is not None and chunk_offsets is not None:
-            if chunk_indices.numel() != chunk_offsets.numel():
-                raise ValueError("chunk_indices/chunk_offsets length mismatch")
+            if (
+                chunk_indices.ndim != 1
+                or chunk_offsets.ndim != 1
+                or chunk_indices.shape != chunk_offsets.shape
+            ):
+                raise ValueError(
+                    "chunk_indices/chunk_offsets must be matching 1D vectors"
+                )
             if chunk_indices.numel() > 0:
-                if chunk_indices.dtype != torch.int32 or chunk_offsets.dtype != torch.int32:
+                if (
+                    chunk_indices.dtype != torch.int32
+                    or chunk_offsets.dtype != torch.int32
+                ):
                     raise ValueError("chunk_indices/chunk_offsets must be int32")
                 meta_ci = self._contiguous(chunk_indices)
                 meta_co = self._contiguous(chunk_offsets)
@@ -315,14 +370,13 @@ class VibeCUDASSDCombined:
                 raise ValueError("checkpoint_states dtype must match state_dtype")
             if not checkpoint_states.is_contiguous():
                 raise ValueError("checkpoint_states must be contiguous")
+            if checkpoint_token_indices.ndim != 1 or checkpoint_state_slots.ndim != 1:
+                raise ValueError("checkpoint_token_indices/slots must be 1D vectors")
             checkpoint_token_indices = self._contiguous(checkpoint_token_indices)
             checkpoint_state_slots = self._contiguous(checkpoint_state_slots)
 
         if dt_bias is not None:
-            if (
-                tuple(dt_bias.shape) != (self.nheads,)
-                or dt_bias.dtype != dt.dtype
-            ):
+            if tuple(dt_bias.shape) != (self.nheads,) or dt_bias.dtype != dt.dtype:
                 raise ValueError(
                     f"dt_bias must have shape [{self.nheads}] and dtype "
                     f"matching dt ({dt.dtype})"
@@ -341,13 +395,16 @@ class VibeCUDASSDCombined:
                     f"D must have shape [{self.nheads}] or "
                     f"[{self.nheads}, 64] and dtype bfloat16"
                 )
+            if not D.is_contiguous():
+                raise ValueError("D must be contiguous")
             d_c = D
             if self._d_has_hdim and D.dim() == 2:
                 d_mode = 2
             else:
-                d_mode = 1
-                if D.dim() == 2:
-                    d_c = self._d_head(D)
+                # Mode 3 reads the first column with the source tensor's fixed
+                # row stride. This avoids both shared cross-stream scratch and
+                # a per-call allocation/copy in the timed execution path.
+                d_mode = 3 if D.dim() == 2 else 1
         if z is not None and (z.shape != x.shape or z.dtype != torch.bfloat16):
             raise ValueError("z must have the same shape and dtype as x")
 
@@ -361,9 +418,14 @@ class VibeCUDASSDCombined:
             else self._zero_dt_bias(x.device, dt_c.dtype)
         )
         z_c = self._contiguous(z) if z is not None else None
-        d_c = self._contiguous(d_c) if d_mode != 0 else None
         initial_c = self._contiguous(initial_states)
         seq_idx_c = self._contiguous(seq_idx) if has_varlen else None
+
+        if seq_chunk_cumsum is not None and (
+            tuple(seq_chunk_cumsum.shape) != (num_seqs + 1,)
+            or seq_chunk_cumsum.dtype != torch.int32
+        ):
+            raise ValueError("seq_chunk_cumsum shape or dtype is invalid")
 
         # dt_limit (0.0, inf) is the "unbounded" mode: when softplus is on the
         # clamp is an identity on the (non-negative) softplus output, so the

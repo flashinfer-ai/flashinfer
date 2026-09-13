@@ -472,6 +472,18 @@ def run_workload(args) -> dict:
         report["vibecuda_truth_final_states"] = _diagnostic(
             outputs["vibecuda"][1], fs_ref, atol=6e-2, rtol=6e-2
         )
+        # Diagnostic only: public correctness is VibeCUDA-vs-CuTe at 0.01.
+        # This records whether each candidate maximum error is no larger than
+        # CAKE's against the independent sequential recurrence without turning
+        # two different floating-point evaluation orders into an acceptance
+        # requirement.
+        report["candidate_no_worse_than_cake"] = {
+            "reference": "fp64_sequential_recurrence",
+            "out": report["vibecuda_truth_out"]["max_abs"]
+            <= report["cake_truth_out"]["max_abs"],
+            "final_states": report["vibecuda_truth_final_states"]["max_abs"]
+            <= report["cake_truth_final_states"]["max_abs"],
+        }
     return report
 
 

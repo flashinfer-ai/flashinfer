@@ -55,7 +55,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROW_BENCH = REPO_ROOT / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "vibecuda_ssd_combined"
-CONTRACT_VERSION = "pr4576-route-matrix-12-seed7-v1"
+CONTRACT_VERSION = "pr4576-route-matrix-12-seed7-v2"
 
 # Exact rows from PR-4576's
 # tests/mamba/test_cake_ssd_combined.py::test_cake_ssd_combined_route_matrix.

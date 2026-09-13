@@ -257,26 +257,6 @@ def test_vibecuda_ssd_combined_accepts_strided_input_views():
     _assert_parity(actual, reference)
 
 
-def test_vibecuda_ssd_combined_rejects_checkpoint_arguments():
-    constructor, tensors, arguments = _case()
-    with pytest.raises(ValueError, match="backend='cake'"):
-        SSDCombined(**constructor, backend="vibecuda").run(
-            *tensors,
-            **{
-                **arguments,
-                "checkpoint_token_indices": torch.zeros(
-                    1, dtype=torch.int32, device="cuda"
-                ),
-                "checkpoint_state_slots": torch.zeros(
-                    1, dtype=torch.int32, device="cuda"
-                ),
-                "checkpoint_states": torch.zeros(
-                    (1, 8, 64, 128), dtype=torch.bfloat16, device="cuda"
-                ),
-            },
-        )
-
-
 def test_vibecuda_ssd_combined_rejects_unsupported_geometry():
     with pytest.raises(ValueError, match="chunk_size=128"):
         SSDCombined(

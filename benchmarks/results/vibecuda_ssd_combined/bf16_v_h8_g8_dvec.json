@@ -23,11 +23,11 @@
     "final_states_tolerance_passed": true,
     "out_tolerance_passed": true
   },
-  "contract_version": "pr4576-route-matrix-12-seed7-v1",
+  "contract_version": "pr4576-route-matrix-12-seed7-v2",
   "execution_error": null,
-  "mode": "subprocess-per-row",
+  "mode": "in-process",
   "report": {
-    "cake_ms": 0.074177,
+    "cake_ms": 0.0745775,
     "cake_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -49,10 +49,9 @@
       "tolerance_passed": true
     },
     "candidate_no_worse_than_cake": {
-      "baseline_contract": "allclose:6e-2,6e-2",
-      "candidate_contract": "allclose:5.9e-2,5.9e-2",
       "final_states": true,
-      "out": true
+      "out": true,
+      "reference": "fp64_sequential_recurrence"
     },
     "final_states": {
       "atol": 0.01,
@@ -64,7 +63,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "flashinfer_ms": 0.072865,
+    "flashinfer_ms": 0.073761,
     "full_write": {
       "fully_written": true,
       "out_numel": 131072,
@@ -109,53 +108,53 @@
       ],
       "state_dtype": "bfloat16"
     },
-    "speedup": 0.9823125766747104,
+    "speedup": 0.9890516576715496,
     "timing_backend": "cupti",
     "truth_reference": "fp64_sequential_recurrence",
     "vibecuda_final_states": {
       "atol": 0.01,
       "bitwise_equal": false,
-      "max_abs": 0.00390625,
-      "max_rel": 132.89564514160156,
-      "mismatch_count": 69753,
+      "max_abs": 0.001953125,
+      "max_rel": 0.3072625696659088,
+      "mismatch_count": 414,
       "numel": 131072,
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "vibecuda_ms": 0.026784,
+    "vibecuda_ms": 0.0373125,
     "vibecuda_out": {
       "atol": 0.01,
       "bitwise_equal": false,
-      "max_abs": 0.125,
-      "max_rel": 166.01205444335938,
-      "mismatch_count": 51300,
+      "max_abs": 0.00048828125,
+      "max_rel": 0.01807228848338127,
+      "mismatch_count": 5,
       "numel": 131072,
       "rtol": 0.01,
-      "tolerance_passed": false
+      "tolerance_passed": true
     },
-    "vibecuda_speedup_vs_cake": 2.769451911589009,
+    "vibecuda_speedup_vs_cake": 1.9987269681742046,
     "vibecuda_truth_final_states": {
-      "atol": 0.059,
+      "atol": 0.06,
       "bitwise_equal": false,
-      "max_abs": 0.003818511962890625,
-      "max_rel": 85.51799011230469,
+      "max_abs": 0.004437685012817383,
+      "max_rel": 44.2075080871582,
       "mismatch_count": 131072,
       "numel": 131072,
-      "rtol": 0.059,
+      "rtol": 0.06,
       "tolerance_passed": true
     },
     "vibecuda_truth_out": {
-      "atol": 0.059,
+      "atol": 0.06,
       "bitwise_equal": false,
       "max_abs": 0.12060165405273438,
-      "max_rel": 71.13301849365234,
+      "max_rel": 2670.078369140625,
       "mismatch_count": 131072,
       "numel": 131072,
-      "rtol": 0.059,
+      "rtol": 0.06,
       "tolerance_passed": true
     }
   },
   "row": "bf16_v_h8_g8_dvec",
   "validation_failures": [],
-  "wall_s": 68.09
+  "wall_s": 3.606
 }
