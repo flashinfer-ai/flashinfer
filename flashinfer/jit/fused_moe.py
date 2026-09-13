@@ -455,3 +455,33 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
     )
+
+
+def gen_alphamoe_sm100_module() -> JitSpec:
+    """Generate the JIT spec for the alphamoe_sm100 fused W8A8 MoE kernel.
+
+    ``csrc/alphamoe_sm100.cu`` is a single translation unit holding the
+    generated schedule with a zero-activation guard and its TVM-FFI binding,
+    mirroring the ``csrc/tinygemm2_sm100.cu`` layout.
+    """
+    targets = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS & {(10, "0a"), (10, "3a")}
+    )
+    if not targets:
+        raise RuntimeError(
+            "AlphaMoE W8A8 requires an SM100a or SM103a compilation target"
+        )
+    if not is_cuda_version_at_least("12.8"):
+        raise RuntimeError("AlphaMoE W8A8 on SM100a requires CUDA 12.8 or newer")
+    if (10, "3a") in targets and not is_cuda_version_at_least("12.9"):
+        raise RuntimeError("AlphaMoE W8A8 on SM103a requires CUDA 12.9 or newer")
+    nvcc_flags = [
+        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        for major, minor in targets
+    ] + current_compilation_context.COMMON_NVCC_FLAGS
+    return gen_jit_spec(
+        "alphamoe_sm100",
+        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_sm100.cu"],
+        extra_cuda_cflags=nvcc_flags,
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )
