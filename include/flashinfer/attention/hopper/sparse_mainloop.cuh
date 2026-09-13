@@ -35,6 +35,11 @@ using namespace cute;
 
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
 struct SparseCollectiveMainloop {
+  // The paged mainloop implements the MIS-aware K/V tile skip optimization
+  // (kv_tile_idx_decrement). The kernel reads this flag to decide whether
+  // to compute real skip-window args and call the 13-arg load() overload.
+  static constexpr bool kSupportsMISAwareLoad = true;
+
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
