@@ -55,21 +55,16 @@ HEAD_DIM = 128
 #: Elementwise tolerance against the reference below, as
 #: ``abs(got - ref) <= ATOL + RTOL * abs(ref)``.
 #:
-#: Output and final state get their own numbers on purpose, and the state's are
-#: looser for a reason that is worth writing down rather than discovering
-#: again. The reference here is *contract*-shaped: it walks tokens one at a
-#: time and rounds to bfloat16 where the public ABI does. The kernels are
-#: chunk-shaped: they accumulate a chunk in float32 and round at the chunk
-#: boundary. Both are correct implementations of the same contract and they do
-#: not associate identically, so a state element that has absorbed 128 tokens
-#: can land one or two bfloat16 ULP apart -- measured at 3.9e-3 on ~5 of
-#: 196608 elements at magnitude 0.26, which is exactly 2 ULP there.
-#:
-#: The numbers below admit about three times that and nothing more. They are
-#: not a way to make a failure go away: the same kernels agree *bitwise* with
-#: the standalone implementation used during validation, and their float64
-#: error is identical to that implementation's, so anything this would newly
-#: catch is a change in the kernel rather than in the rounding.
+#: Output and final state get their own numbers, and the state's are looser.
+#: The reference is token-serial: one rank-1 update per token. The kernels are
+#: chunk-parallel: each 16-token chunk's update is formed at once, in the WY/UT
+#: reordering with a blockwise inverse. Both hold the state in bfloat16 between
+#: steps and do a step's arithmetic in float32, but a step is one token for the
+#: reference and one chunk for the kernels, so the same contract is associated
+#: and rounded differently and a state element that has absorbed many tokens
+#: can land a few bfloat16 ULP from the reference. The numbers below admit a
+#: small multiple of that and nothing more: a miss here is a change in the
+#: kernel, not in the rounding.
 OUTPUT_RTOL, OUTPUT_ATOL = 1.0e-2, 1.0e-3
 STATE_RTOL, STATE_ATOL = 2.0e-2, 6.0e-3
 
@@ -295,7 +290,7 @@ def _call(inputs, **overrides):
 
 @pytest.fixture
 def as_sm120_host(monkeypatch):
-    """Make CPU tensors look like SM120 CUDA tensors to the predicate.
+    """Make ``_eligibility_kwargs`` tensors look like SM120 CUDA tensors.
 
     Everything the rejection reason checks after the device is structural and
     device-independent, but the device check runs first -- so without this the
@@ -314,8 +309,26 @@ def as_sm120_host(monkeypatch):
             and tensor.is_contiguous()
         ),
     )
-    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setitem(globals(), "_HOST_AS_CUDA", True)
     return kda_prefill
+
+
+class _HostAsCudaTensor(torch.Tensor):
+    """A CPU tensor that reports ``is_cuda``, for the host-only predicate tests.
+
+    Scoped to the tensors it wraps: the alternative, patching
+    ``torch.Tensor.is_cuda`` for the duration of a test, lies to every tensor
+    in the process.
+    """
+
+    @property
+    def is_cuda(self):  # type: ignore[override]
+        return True
+
+
+#: Set by the ``as_sm120_host`` fixture so ``_eligibility_kwargs`` hands out
+#: ``_HostAsCudaTensor`` instances instead of plain CPU tensors.
+_HOST_AS_CUDA = False
 
 
 def _eligibility_kwargs(**overrides):
@@ -355,6 +368,15 @@ def _eligibility_kwargs(**overrides):
         checkpoint_every_n_tokens=0,
     )
     kwargs.update(overrides)
+    if _HOST_AS_CUDA:
+        kwargs = {
+            key: (
+                value.as_subclass(_HostAsCudaTensor)
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for key, value in kwargs.items()
+        }
     return kwargs
 
 
@@ -583,14 +605,18 @@ def test_sm120_facade_imports_without_device_code():
     module-level ``from . import decomp`` would undo it and nothing else in the
     suite would notice.
     """
+    import subprocess
     import sys
 
-    from flashinfer import kda_kernels
-
-    assert hasattr(kda_kernels, "can_implement_kda_prefill_sm120")
-    loaded = {name for name in sys.modules if "sm120_prefill" in name}
-    assert "flashinfer.kda_kernels.sm120_prefill.decomp" not in loaded
-    assert "flashinfer.kda_kernels.sm120_prefill.fused" not in loaded
+    # A fresh interpreter, so an earlier test in this process that imported a
+    # device module cannot make this one fail or pass by accident.
+    probe = (
+        "import sys, flashinfer.kda_kernels as k;"
+        "assert hasattr(k, 'can_implement_kda_prefill_sm120');"
+        "loaded = [m for m in sys.modules if 'sm120_prefill' in m];"
+        "assert not any(m.endswith(('.decomp', '.fused')) for m in loaded), loaded"
+    )
+    subprocess.run([sys.executable, "-c", probe], check=True)
 
 
 def test_sm120_can_implement_is_fail_closed_on_cpu():
@@ -612,6 +638,9 @@ def test_sm120_variant_policy_reports_tuned_or_fallback():
 
     tuned = sm120_prefill.describe_variant_policy(156)
     assert "measured on this device" in tuned
+    assert "equal lengths and CTA>=96" in tuned
+    assert "T<=8192" in tuned
+    assert "CTA>=128" in tuned
 
     fallback = sm120_prefill.describe_variant_policy(999)
     assert "FALLBACK" in fallback
@@ -622,24 +651,37 @@ def test_sm120_variant_choice_is_a_pure_function_of_shape():
     sm120_prefill = _sm120_prefill()
     choose = sm120_prefill.choose_variant
 
-    # Every measured row, at the CTA value on each side of its own threshold.
-    # Written as a table rather than as prose assertions because the previous
-    # version described `H >= 96 or T <= 48 or CTA >= 512` -- thresholds two
-    # re-fits out of date -- and still passed, since none of its cases sat near
-    # a boundary that had moved.
+    # Every row, at the CTA value on each side of its own threshold. Written
+    # as a table of boundary cases rather than prose assertions: cases far
+    # from the lines keep passing after the lines move.
     #
-    # (sm_count, cta_threshold): the profile's own CTA line.
-    for sm_count, threshold in ((110, 128), (156, 144), (188, 144)):
+    # (sm_count, uniform, cta_threshold, tokens_threshold).
+    for sm_count, uniform, threshold, tokens in (
+        (110, True, 96, 130),
+        (110, False, 96, 130),
+        (156, True, 96, 130),
+        (156, False, 128, 130),
+        (188, True, 96, 130),
+        (188, False, 128, 130),
+    ):
         # CTA = 2 * batch * heads, so batch = threshold // (2 * heads) puts the
         # shape exactly on the line, and one less batch puts it just under.
         heads = 8
         on = threshold // (2 * heads)
-        assert choose(on, heads, 1024, sm_count=sm_count) == "fused", sm_count
-        assert choose(on - 1, heads, 1024, sm_count=sm_count) == "decomp", sm_count
+        assert choose(on, heads, 1024, sm_count=sm_count, uniform=uniform) == "fused", (
+            sm_count
+        )
+        assert (
+            choose(on - 1, heads, 1024, sm_count=sm_count, uniform=uniform) == "decomp"
+        ), sm_count
 
-        # The tokens term is 32 on every row, and it fires independently of CTA.
-        assert choose(1, 1, 32, sm_count=sm_count) == "fused", sm_count
-        assert choose(1, 1, 33, sm_count=sm_count) == "decomp", sm_count
+        # The tokens term fires independently of CTA.
+        assert choose(1, 1, tokens, sm_count=sm_count, uniform=uniform) == "fused", (
+            sm_count
+        )
+        assert (
+            choose(1, 1, tokens + 1, sm_count=sm_count, uniform=uniform) == "decomp"
+        ), sm_count
 
         # No row has a heads term, and it cannot be tested through `choose`:
         # CTA is 2 * batch * heads, so the smallest CTA any H >= 96 shape can
@@ -647,20 +689,69 @@ def test_sm120_variant_choice_is_a_pure_function_of_shape():
         # the term is None -- it could never fire -- so assert the field.
         assert sm120_prefill.AUTO_PROFILES[sm_count].heads is None, sm_count
 
-    # The two larger parts sit at 144 and the 110-SM part at 128, so CTA 128
-    # separates them.  This is the case the re-fit turned on, and the one a
-    # single shared row would get wrong.
-    assert choose(8, 8, 1024, sm_count=110) == "fused"  # CTA 128 >= 128
-    assert choose(8, 8, 1024, sm_count=156) == "decomp"  # CTA 128 < 144
-    assert choose(8, 8, 1024, sm_count=188) == "decomp"
+    # CTA 128 goes to fused on every row. Ragged CTA 112 is where rows differ:
+    # fused on the 110-SM row, decomp on the other two, which is what keeps
+    # the table at three rows rather than one.
+    for sm_count in (110, 156, 188):
+        assert choose(8, 8, 1024, sm_count=sm_count) == "fused", sm_count  # CTA 128
+    assert choose(7, 8, 1024, sm_count=110, uniform=False) == "fused"
+    assert choose(7, 8, 1024, sm_count=156, uniform=False) == "decomp"
+    assert choose(7, 8, 1024, sm_count=188, uniform=False) == "decomp"
 
-    # CTA 144 is the shape FlashInfer benchmarks (six sequences, H=12) and the
-    # reason the threshold moved off 192.  All three rows must take it now.
+    # CTA 144 (six sequences, H=12) is over every row's line.
     for sm_count in (110, 156, 188):
         assert choose(6, 12, 8192, sm_count=sm_count) == "fused", sm_count
 
     # An unmeasured SM count falls back rather than extrapolating.
     assert choose(1, 96, 1024, sm_count=999) == choose(1, 96, 1024, sm_count=156)
+
+
+@pytest.mark.parametrize("sm_count", [110, 156, 188, 999])
+def test_sm120_uniform_cta_length_boundary(sm_count):
+    """The 156-SM line reverts only the newly admitted grids above 8K."""
+    choose = _sm120_prefill().choose_variant
+    for tokens in (8191, 8192, 8193, 16384, 32768):
+        expected = "decomp" if sm_count in (156, 999) and tokens > 8192 else "fused"
+        assert choose(1, 48, tokens, sm_count=sm_count) == expected
+        assert choose(4, 12, tokens, sm_count=sm_count) == expected
+        # The original wide-grid threshold remains independent of length.
+        assert choose(1, 64, tokens, sm_count=sm_count) == "fused"
+        # Ragged grids never use the lower line.
+        expected_ragged = "fused" if sm_count == 110 else "decomp"
+        assert (
+            choose(4, 12, tokens, sm_count=sm_count, uniform=False) == expected_ragged
+        )
+
+
+@pytest.mark.parametrize("sm_count", [110, 156, 188, 999])
+@pytest.mark.parametrize(
+    "lengths,expected",
+    [
+        ((4096,) * 4, "fused"),
+        ((4096, 1024, 65, 17), "decomp"),
+        ((4096, 4096, 4096, 0), "decomp"),
+        ((130, 1, 0, 0), "fused"),
+    ],
+)
+def test_sm120_variant_uses_uniform_length_metadata(
+    monkeypatch, sm_count, lengths, expected
+):
+    """Equal packed batches use the new line, but long tails keep the old one."""
+    sm120_prefill = _sm120_prefill()
+    monkeypatch.setattr(sm120_prefill, "_sm_count", lambda index: sm_count)
+    offsets = SimpleNamespace(
+        lengths=lengths,
+        sequences=len(lengths),
+        total_tokens=sum(lengths),
+        longest_sequence=max(lengths),
+    )
+    info = SimpleNamespace(batch=1, heads=12, tokens_per_sequence=sum(lengths))
+    if sm_count == 110:
+        expected = "fused"  # Both layouts use the 110-SM row's 96-CTA threshold.
+    assert (
+        sm120_prefill._resolve_variant("auto", info, offsets, True, None, device=0)
+        == expected
+    )
 
 
 def test_sm120_bound_workspace_rejects_an_explicit_variant_change():
@@ -756,15 +847,13 @@ def test_sm120_resolved_fast_path_rejects_rebound_inference_storage(monkeypatch)
 def test_sm120_flat_output_range_is_checked_on_the_host():
     """The flat output is bounded before a launch, not after it.
 
-    Two limits meet one element apart. The tail store writes a partial chunk
-    element-wise through ``(token * H + head) * DV + d``, which the device
-    builds and consumes as INT32, so it needs the largest *index* -- ``T_total *
-    H * DV - 1`` -- to fit. The DSL packs the flat view's extent as INT32 when
-    it crosses into the compiled entry, so it needs the *count*. The count is
-    therefore the bound, and it is the one asserted here: on hardware the shape
-    one element inside the index limit does not launch, it raises
-    ``OverflowError: Value overflow: 2147483648 exceeds range of l`` out of
-    ``build_memref_desc``, which names neither the tensor nor the shape.
+    Two limits meet one element apart. The tail store indexes the flat output
+    as ``(token * H + head) * DV + d`` in INT32, so the largest *index* must
+    fit; the DSL packs the flat view's extent as INT32 at the compiled entry,
+    so the *count* must fit. The count is the tighter bound and the one
+    asserted here: the shape one element inside the index limit does not
+    launch, it fails inside ``build_memref_desc`` with an overflow error that
+    names neither the tensor nor the shape.
     """
     from flashinfer.kda_kernels.sm120_prefill import runtime
 
@@ -787,10 +876,10 @@ def test_sm120_flat_output_range_is_checked_on_the_host():
 def test_sm120_variant_policy_reads_the_input_device(monkeypatch):
     """A host holding two CC 12.0 parts must not drive both from one row.
 
-    The measured rows disagree at CTA 128: the 110-SM part takes the fused
-    kernel there and the 188-SM part takes the decomposed one. Reading device 0
-    would apply the wrong row to every call on the other card, and the only
-    symptom is a time nobody can attribute.
+    The rows differ at ragged CTA 112: the 110-SM row takes the fused kernel there
+    and the 188-SM row takes the decomposed one. Reading device 0 would apply
+    the wrong row to every call on the other card, and the only symptom is a
+    time nobody can attribute.
     """
     sm120_prefill = _sm120_prefill()
 
@@ -806,12 +895,17 @@ def test_sm120_variant_policy_reads_the_input_device(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     try:
         choose = sm120_prefill.choose_variant
-        # CTA = 2 * batch * heads = 128: on the 110-SM row's threshold and
+        # CTA = 2 * batch * heads = 112: over the 110-SM row's threshold and
         # under the 188-SM row's.
-        assert choose(8, 8, 1024, device=torch.device("cuda", 0)) == "fused"
-        assert choose(8, 8, 1024, device=torch.device("cuda", 1)) == "decomp"
+        assert (
+            choose(7, 8, 1024, device=torch.device("cuda", 0), uniform=False) == "fused"
+        )
+        assert (
+            choose(7, 8, 1024, device=torch.device("cuda", 1), uniform=False)
+            == "decomp"
+        )
         # No device named still means the current one.
-        assert choose(8, 8, 1024) == "fused"
+        assert choose(7, 8, 1024, uniform=False) == "fused"
         # And the policy line names the card it actually read.
         assert "188 SMs" in sm120_prefill.describe_variant_policy(
             device=torch.device("cuda", 1)
@@ -824,16 +918,14 @@ def test_sm120_pinned_staging_carries_the_event_it_reuses_against():
     """A descriptor build may not refill a buffer whose transfer is pending.
 
     ``upload_bytes`` copies out of one pinned buffer per size with
-    ``non_blocking=True``, so the transfer is queued rather than finished when
-    it returns. Two cold builds of one size are ordinary rather than a corner --
-    the size is a function of the descriptor count, so any two cold calls of a
-    shape collide -- and without the event the second one's host-side refill
-    overwrites bytes the first one's DMA has not read yet, which reaches the
-    device as a descriptor made of two.
+    ``non_blocking=True``, so the transfer is still queued when it returns, and
+    two cold builds of one size are ordinary: the size is a function of the
+    descriptor count. Without the event the second refill overwrites bytes the
+    first DMA has not read yet, which reaches the device as a descriptor made
+    of two.
 
-    The event is what that costs, so the event is what is asserted: the byte
-    comparison below would pass on the racing version too, most of the time,
-    which is exactly why it cannot be the guard.
+    The event is what is asserted: the byte comparison below would pass on the
+    racing version too, most of the time, which is why it cannot be the guard.
     """
     _skip_if_not_sm120()
     from flashinfer.kda_kernels.sm120_prefill import runtime
@@ -896,16 +988,13 @@ def test_sm120_call_memos_hold_weak_references():
     """The three per-call memos may not be what keeps a caller's buffers alive.
 
     Each is keyed on tensor identity, and the obvious way to re-check that
-    identity on the next call is to hold the tensors. Holding them puts one
-    whole activation set -- q, k, v, g and out -- into steady-state device
-    memory and keeps those blocks away from the caching allocator until the
-    next call replaces them. The LRU behind each memo already used weak
-    references; the fast paths in the facade and in both variants did not.
+    identity on the next call is to hold the tensors -- which would pin one
+    whole activation set (q, k, v, g and out) in device memory until the next
+    call replaces it.
 
-    Structural rather than an allocator measurement, and deliberately so: a
-    live plan legitimately retains the buffers its descriptors and views
-    address, at the C level where ``gc`` cannot see it, so a byte count here
-    would be measuring the plan cache instead of these memos.
+    Checked structurally rather than by allocator measurement: a live plan
+    legitimately retains the buffers its descriptors and views address, so a
+    byte count here would be measuring the plan cache instead of these memos.
     """
     _skip_if_not_sm120()
     sm120_prefill = _sm120_prefill()
@@ -915,16 +1004,81 @@ def test_sm120_call_memos_hold_weak_references():
 
     memos = {"facade": sm120_prefill._RESOLVED_LAST}
     for name, module in sm120_prefill._MODULES.items():
-        memos[name] = module._LAST
+        memos[name] = module._MEMO.last
     assert any(memo is not None for memo in memos.values()), "no memo was written"
 
     for name, memo in memos.items():
         if memo is None:
             continue
         for held in memo[0]:
-            assert held is None or isinstance(held, weakref.ref), (
-                f"the {name} memo holds a strong reference: {type(held).__name__}"
-            )
+            assert (
+                held is None
+                or held is sm120_prefill._BY_ADDRESS
+                or isinstance(held, weakref.ref)
+            ), f"the {name} memo holds a strong reference: {type(held).__name__}"
+
+    # ``_BY_ADDRESS`` is the one permitted non-weakref, and it stands for a
+    # buffer this call allocated for itself -- verified by address, so it is not
+    # a strong reference either. It may only appear in the facade's memo, which
+    # is the only one told which slots the call owns.
+    for name, memo in memos.items():
+        if memo is None or name == "facade":
+            continue
+        assert sm120_prefill._BY_ADDRESS not in memo[0], (
+            f"the {name} memo claims a private slot it was never told about"
+        )
+
+
+@torch.inference_mode()
+def test_sm120_private_final_state_keeps_the_call_memo_warm(monkeypatch):
+    """A state buffer allocated per call must not cost a plan rebuild per call.
+
+    Without an ``initial_state`` the adapter allocates the final state itself,
+    so it is a new Python object on every call even when the caching allocator
+    hands back the same block. Verifying that slot by object identity -- right
+    for a caller-supplied tensor, where a recycled address could otherwise
+    become a stale plan hit -- would turn every warm call into a cold one, and
+    the fresh object's weakref callback would purge the LRU entry as it died.
+    The rebuild is invisible next to a long kernel and most of the call at the
+    short shapes this backend is fastest on.
+
+    ``output`` is supplied because the same exemption cannot apply to it: a
+    live plan retains the buffer its descriptors address, so a backend-allocated
+    output is still alive when the next call asks for one and never gets the
+    same block back. That is why the out slot is not marked private.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+
+    inputs = _make_inputs_sm120(seq_lens=[64], num_heads=4, packed=False, seed=SEED)
+    overrides = {
+        "output_final_state": True,
+        "output": torch.empty_like(inputs["v"]),
+    }
+
+    # The first call may compile and upload descriptors, and those allocations
+    # can move where the caching allocator places the next private state.  The
+    # memo's promise is about the calls after it.
+    _call(inputs, **overrides)
+    torch.cuda.synchronize()
+    gc.collect()
+
+    rebuilds = []
+    original = sm120_prefill._remember_call
+
+    def spy(*args, **kwargs):
+        rebuilds.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sm120_prefill, "_remember_call", spy)
+    for _ in range(4):
+        _call(inputs, **overrides)
+
+    assert len(rebuilds) == 0, (
+        "the call memo rebuilt its plan on a warm call: "
+        f"{len(rebuilds)} rebuilds across four identical warm calls"
+    )
 
 
 def test_sm120_cache_clear_iterates_a_module_snapshot(monkeypatch):
@@ -1083,6 +1237,46 @@ def test_sm120_cute_dsl_request_names_the_reason_this_backend_refused():
 # ===========================================================================
 # Correctness through the public API.
 # ===========================================================================
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "seq_lens,packed", [([256] * 4, False), ([256] * 4, True), ([256, 65, 17, 0], True)]
+)
+@pytest.mark.parametrize("has_initial_state", [False, True])
+def test_recurrent_kda_prefill_sm120_uniform_dispatch_matches_reference(
+    seq_lens, packed, has_initial_state, monkeypatch
+):
+    """Exercise the re-fitted CTA line and ragged guard through public auto."""
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    resolved = []
+    resolve = sm120_prefill._resolve_variant
+
+    def record_variant(*args, **kwargs):
+        chosen = resolve(*args, **kwargs)
+        resolved.append(chosen)
+        return chosen
+
+    monkeypatch.setattr(sm120_prefill, "_resolve_variant", record_variant)
+    inputs = _make_inputs_sm120(
+        seq_lens=seq_lens,
+        num_heads=12,
+        packed=packed,
+        initial_state=has_initial_state,
+        seed=SEED,
+    )
+    expected_out, expected_state = _reference_kda_prefill(inputs)
+    out, state = _call(inputs, output_final_state=True, backend="auto")
+    key, _ = sm120_prefill.auto_profile(device=inputs["q"].device)
+    expected_variant = "fused" if key == 110 or len(set(seq_lens)) == 1 else "decomp"
+    assert resolved and set(resolved) == {expected_variant}
+    _assert_elementwise(out, expected_out, "output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+    assert state is not None
+    _assert_elementwise(
+        state, expected_state, "final_state", rtol=STATE_RTOL, atol=STATE_ATOL
+    )
 
 
 @torch.inference_mode()
@@ -1597,6 +1791,164 @@ def test_recurrent_kda_prefill_sm120_graph_replay_matches_eager(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("mode", ["serial", "dual"])
+@pytest.mark.parametrize("max_grid_y", [15, 16])
+def test_recurrent_kda_prefill_sm120_pipe_prepare_grid_limit(
+    mode, max_grid_y, monkeypatch
+):
+    """PIPE must not move a valid grid.x beyond grid.y's smaller limit.
+
+    This shape has 16 prepare chunk groups. Lower the reported limit to test
+    both sides of the boundary without allocating millions of input tokens.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill import decomp
+
+    sm120_prefill = _sm120_prefill()
+    device = torch.device("cuda", torch.cuda.current_device())
+    if (
+        mode == "dual"
+        and decomp.pipe_decisions(
+            mode,
+            heads=12,
+            total_chunks=32,
+            rec_ctas=24,
+            sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+        )[0]
+        != "dual"
+    ):
+        pytest.skip("this shape does not admit the overlap on this device")
+
+    monkeypatch.setattr(decomp, "_PIPE_MODE", mode)
+    monkeypatch.setattr(decomp, "max_grid_dims", lambda device: (2**31 - 1, max_grid_y))
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    try:
+        inputs = _make_inputs_sm120(
+            seq_lens=[512], num_heads=12, packed=False, initial_state=True, seed=SEED
+        )
+        expected_out, expected_state = _reference_kda_prefill(inputs)
+        state = inputs["initial_state"]
+        out = torch.empty_like(inputs["v"])
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            initial_state=state,
+            final_state=state,
+            cu_seqlens=inputs["cu_seqlens"],
+            output=out,
+            variant="decomp",
+        )
+        torch.cuda.synchronize()
+        plan = decomp._MEMO.last[-1]
+        assert (plan.gen_ref is not None) == (max_grid_y == 16)
+        assert (plan.dual_ctx is not None) == (mode == "dual" and max_grid_y == 16)
+        _assert_elementwise(
+            out, expected_out, "grid-limit output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        _assert_elementwise(
+            state,
+            expected_state,
+            "grid-limit final_state",
+            rtol=STATE_RTOL,
+            atol=STATE_ATOL,
+        )
+    finally:
+        sm120_prefill.clear_kda_prefill_sm120_caches()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "seq_lens,heads", [([512] * 4, 4), ([4096], 4), ([1024], 12), ([4096], 12)]
+)
+def test_recurrent_kda_prefill_sm120_dual_overlap_graph_replays_fresh_inputs(
+    seq_lens, heads, monkeypatch
+):
+    """An overlapped decomp plan must re-order its kernels on every replay.
+
+    The captured generation is a constant, so without a reset of the flag
+    buffer ahead of both kernels the second replay's recurrence would find
+    every flag already at that value and consume factor slabs prepare had not
+    rewritten yet.  Replaying with fresh inputs at the same addresses exposes
+    that: the stale slabs belong to the previous inputs.  The H=12 cases
+    exercise the relaxed lookahead's acquire fence with both the TMA-only
+    input path (T=1024) and the cp.async split (T=4096).
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill import decomp
+    from flashinfer.kda_kernels.sm120_prefill.runtime import SM120PrefillResources
+
+    sm120_prefill = _sm120_prefill()
+    device = torch.device("cuda", torch.cuda.current_device())
+    shape = dict(
+        heads=heads,
+        total_chunks=sum(length // 16 for length in seq_lens),
+        rec_ctas=2 * len(seq_lens) * heads,
+        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+    )
+    if decomp.pipe_decisions("dual", **shape)[0] != "dual":
+        pytest.skip("this shape does not admit the overlap on this device")
+
+    monkeypatch.setattr(decomp, "_PIPE_MODE", "dual")
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    try:
+        inputs = _make_inputs_sm120(
+            seq_lens=seq_lens,
+            num_heads=heads,
+            packed=False,
+            initial_state=True,
+            seed=SEED,
+        )
+        workspace = SM120PrefillResources(device=inputs["q"].device)
+        graph_out = torch.empty_like(inputs["v"])
+        graph = _warm_and_capture(
+            inputs,
+            workspace=workspace,
+            output=graph_out,
+            state=inputs["initial_state"],
+            variant="decomp",
+        )
+        for replay in range(3):
+            fresh = _make_inputs_sm120(
+                seq_lens=seq_lens,
+                num_heads=heads,
+                packed=False,
+                initial_state=True,
+                seed=SEED + 1 + replay,
+            )
+            # The graph reads these buffers at their captured addresses; the
+            # per-head parameters stay what the warmup derived its tables from.
+            for name in ("q", "k", "v", "g", "beta", "initial_state"):
+                inputs[name].copy_(fresh[name])
+            fresh["A_log"] = inputs["A_log"]
+            fresh["dt_bias"] = inputs["dt_bias"]
+            expected_out, expected_state = _reference_kda_prefill(fresh)
+            graph.replay()
+            torch.cuda.synchronize()
+            _assert_elementwise(
+                graph_out,
+                expected_out,
+                f"replay {replay} output",
+                rtol=OUTPUT_RTOL,
+                atol=OUTPUT_ATOL,
+            )
+            _assert_elementwise(
+                inputs["initial_state"],
+                expected_state,
+                f"replay {replay} final_state",
+                rtol=STATE_RTOL,
+                atol=STATE_ATOL,
+            )
+    finally:
+        sm120_prefill.clear_kda_prefill_sm120_caches()
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("variant", ["decomp", "fused"])
 def test_recurrent_kda_prefill_sm120_plan_is_isolated_per_workspace(variant):
     """A plan built for one workspace must never populate another one.
@@ -1897,22 +2249,58 @@ def test_sm120_runtime_bounded_cache_evicts_from_the_lru_tail():
     assert cache.stats(device).evictions == 1
 
 
-def test_sm120_runtime_refuses_a_mismatched_persistent_cache_target(monkeypatch):
-    """An artifact must not be named for a target it was not built for.
+def test_sm120_runtime_labels_the_persistent_cache_with_its_target(monkeypatch):
+    """The artifact is named for the target it was built for, not for the DSL's guess.
 
-    This is the failure mode the explicit compile option exists to prevent:
-    ``JitSpecCuteDsl`` names its module directory from ``CUTE_DSL_ARCH`` or the
-    device, while the kernel is compiled for whatever option we passed. If
-    those disagree, the on-disk artifact claims one target and contains
-    another, and the next process loads it believing the name.
+    ``build_kernel`` compiles for ``sm_120a`` explicitly, so it hands that
+    target to the persistent cache rather than letting ``CUTE_DSL_ARCH`` or the
+    current device name the module directory and its ``meta.json``.
     """
+    pytest.importorskip("cutlass")
+    from flashinfer.jit import cute_dsl_core
     from flashinfer.kda_kernels.sm120_prefill import runtime
 
+    class DeviceGuard:
+        def __init__(self, device):
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+    monkeypatch.setattr(runtime.torch.cuda, "device", DeviceGuard)
+    monkeypatch.setattr(cute_dsl_core, "_get_compile_arch", lambda: "sm100a")
+    seen = {}
+
+    def fake_build_and_load(module, kernel, compile_fn, extra_key_files=(), arch=None):
+        seen.update(module=module, kernel=kernel, arch=arch)
+        return compile_fn()
+
     monkeypatch.setattr(
-        "flashinfer.jit.cute_dsl_core._get_compile_arch", lambda: "sm100a"
+        cute_dsl_core, "build_and_load_cute_dsl_kernel", fake_build_and_load
     )
-    with pytest.raises(runtime.UnsupportedArchitectureError, match="sm120a"):
-        runtime._assert_cache_target_matches()
+    compiled = object()
+    assert (
+        runtime.build_kernel(
+            "target-test", lambda: compiled, device=torch.device("cuda", 0)
+        )
+        is compiled
+    )
+    assert seen["arch"] == runtime.SM120_CODE_TARGET
+    assert seen["module"] == runtime.JIT_MODULE_NAME
+
+    # With the explicit target the spec ignores what the DSL would have picked.
+    spec = cute_dsl_core.JitSpecCuteDsl(
+        runtime.JIT_MODULE_NAME,
+        "k",
+        lambda: None,
+        "sha",
+        arch=runtime.SM120_CODE_TARGET,
+    )
+    assert spec.module_dir_name == f"{runtime.JIT_MODULE_NAME}_sm120a_cute_dsl"
+    assert spec.expected_meta["arch"] == "sm120a"
 
 
 def test_sm120_runtime_build_kernel_uses_the_input_device(monkeypatch):
@@ -1937,13 +2325,10 @@ def test_sm120_runtime_build_kernel_uses_the_input_device(monkeypatch):
     monkeypatch.setattr(runtime.torch.cuda, "device", DeviceGuard)
     monkeypatch.setattr(
         cute_dsl_core,
-        "_get_compile_arch",
-        lambda: "sm120a" if active_devices else "sm100a",
-    )
-    monkeypatch.setattr(
-        cute_dsl_core,
         "build_and_load_cute_dsl_kernel",
-        lambda _module, _kernel, compile_fn, extra_key_files=(): compile_fn(),
+        lambda _module, _kernel, compile_fn, extra_key_files=(), arch=None: (
+            compile_fn()
+        ),
     )
 
     compiled = object()
@@ -2029,3 +2414,133 @@ def test_sm120_runtime_packed_offsets_eviction_releases_the_source():
         assert sources[0]() is None
     finally:
         runtime.clear_offsets_caches()
+
+
+# ---------------------------------------------------------------------------
+# The decomp overlap's predicate family.
+#
+# ``pipe_decisions`` is a pure function of the shape and the SM count, so its
+# boundaries are pinned here as data; a re-tune has to update this table
+# alongside the predicate.  Host-only apart from importing the CuTe DSL.
+# ---------------------------------------------------------------------------
+
+_PIPE_SM = 110
+
+
+def _pipe_shape(B, H, T):
+    total_chunks = B * (T // 16)
+    rec_ctas = 2 * B * H
+    return dict(
+        heads=H, total_chunks=total_chunks, rec_ctas=rec_ctas, sm_count=_PIPE_SM
+    )
+
+
+def _pipe_decide(B, H, T, mode="dual", guard=True):
+    pytest.importorskip("cutlass")
+    from flashinfer.kda_kernels.sm120_prefill.decomp import pipe_decisions
+
+    return pipe_decisions(mode, guard=guard, **_pipe_shape(B, H, T))
+
+
+def test_sm120_pipe_liveness_oversubscription_falls_back():
+    # Liveness floor: rec 128 exceeds sm_count - 8 on the 110-SM part, so the
+    # spinning recurrence would leave prepare no SM to finish on.
+    assert _pipe_decide(1, 64, 8192) == ("", False, False)
+
+
+def test_sm120_pipe_chase_regime_long_chains():
+    # Chase regime (cps >= 256, 4 <= rec <= 64) at rec 64 on the 110-SM part:
+    # acquire flavour and deferred publication.
+    assert _pipe_decide(1, 32, 8192) == ("dual", True, True)
+    assert _pipe_decide(1, 32, 4096) == ("dual", True, True)
+
+
+def test_sm120_pipe_notch_is_carved_out():
+    # The notch: cps 128 lies between the resident-slab regime (cps <= 64) and
+    # the chase regime (cps >= 256), and neither term admits it.
+    assert _pipe_decide(1, 32, 2048) == ("", False, False)
+
+
+def test_sm120_pipe_resident_slab_regime_short_chains():
+    # Resident-slab regime (32 <= cps <= 64, 24 <= rec <= 64): relaxed
+    # flavour, same-chunk publication.
+    assert _pipe_decide(1, 32, 1024) == ("dual", False, False)
+    assert _pipe_decide(2, 16, 512) == ("dual", False, False)  # cps 32, the floor
+    assert _pipe_decide(1, 12, 1024) == ("dual", False, False)  # rec 24, the floor
+
+
+def test_sm120_pipe_thin_prepare_and_microshapes_fall_back():
+    assert _pipe_decide(1, 1, 8192)[0] == ""  # heads==1: too little prepare to hide
+    assert _pipe_decide(1, 4, 256)[0] == ""  # cps 16: under both regimes
+    assert _pipe_decide(4, 4, 256)[0] == ""  # cps 16 at rec 32: still under
+    assert _pipe_decide(1, 4, 1024)[0] == ""  # rec 8 at cps 64: under the rec floor
+
+
+def test_sm120_pipe_deep_chain_small_grid_still_pays():
+    # Chase regime at rec 8: dual, relaxed flavour (rec < 64), deferred
+    # publication (cps >= 256).
+    assert _pipe_decide(1, 4, 8192) == ("dual", False, True)
+
+
+def test_sm120_pipe_chase_caps_at_the_measured_rec_ceiling():
+    # rec 128 and 144 pass the 156-SM liveness floor (148) but sit above the
+    # chase regime's rec <= 64 cap: a grid that wide leaves prepare too few
+    # SMs even where it stays live, the liveness deadlock in its milder form.
+    pytest.importorskip("cutlass")
+    from flashinfer.kda_kernels.sm120_prefill.decomp import pipe_decisions
+
+    # Two shapes the liveness floor alone would admit.
+    for B, H in ((1, 64), (6, 12)):  # rec 128, 144
+        got = pipe_decisions(
+            "dual",
+            heads=H,
+            total_chunks=B * 512,
+            rec_ctas=2 * B * H,
+            sm_count=156,
+        )
+        assert got == ("", False, False), (B, H)
+
+
+def test_sm120_pipe_acquire_flavour_is_110sm_only():
+    # The acquire flavour is keyed to the 110-SM part (rec >= 64, cps >= 256,
+    # sm_count == 110); the same chase shape on the other parts runs relaxed.
+    # Deferred publication follows cps alone.
+    pytest.importorskip("cutlass")
+    from flashinfer.kda_kernels.sm120_prefill.decomp import pipe_decisions
+
+    args = dict(heads=32, total_chunks=512, rec_ctas=64)
+    assert pipe_decisions("dual", sm_count=110, **args) == ("dual", True, True)
+    assert pipe_decisions("dual", sm_count=156, **args) == ("dual", False, True)
+    assert pipe_decisions("dual", sm_count=188, **args) == ("dual", False, True)
+
+
+def test_sm120_pipe_mid_grid_long_chains_take_relaxed():
+    # Chase regime at rec 24-48: under the acquire flavour's rec >= 64 floor,
+    # so dual runs relaxed, with deferred publication.
+    assert _pipe_decide(1, 12, 8192) == ("dual", False, True)
+    assert _pipe_decide(1, 24, 8192) == ("dual", False, True)
+    assert _pipe_decide(2, 12, 8192) == ("dual", False, True)
+
+
+def test_sm120_pipe_serial_mode_bypasses_the_guard():
+    # serial is a measurement mode: machinery on, one stream, any shape.
+    assert _pipe_decide(1, 4, 256, mode="serial") == ("serial", False, False)
+    assert _pipe_decide(1, 32, 8192, mode="serial") == ("serial", True, True)
+    # The flavour terms are the same under serial: off the 110-SM part the
+    # chase runs relaxed, and deferred publication still follows cps.
+    pytest.importorskip("cutlass")
+    from flashinfer.kda_kernels.sm120_prefill.decomp import pipe_decisions
+
+    shape = _pipe_shape(1, 32, 8192)
+    shape["sm_count"] = 156
+    got = pipe_decisions("serial", guard=True, **shape)
+    assert got == ("serial", False, True)
+
+
+def test_sm120_pipe_noguard_only_lifts_eligibility_not_liveness():
+    assert _pipe_decide(1, 32, 2048, guard=False)[0] == "dual"
+    assert _pipe_decide(1, 64, 8192, guard=False)[0] == ""
+
+
+def test_sm120_pipe_off_stays_off():
+    assert _pipe_decide(1, 32, 8192, mode="") == ("", False, False)

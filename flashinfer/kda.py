@@ -389,11 +389,10 @@ def recurrent_kda(
             and q.is_cuda
             and get_compute_capability(q.device) == (12, 0)
         ):
-            # Recorded, not raised: a decode or any other call this backend does
-            # not take must keep falling through exactly as before.  It is used
-            # only where the CC 10.0/10.3 block already refuses an explicit
-            # request, which on this architecture can only answer with the
-            # contract when the reason is known right here.
+            # Recorded, not raised: a call this backend does not take must keep
+            # falling through to the other backends.  The reason only enriches
+            # the error the block below raises when an explicit ``cute-dsl``
+            # request is refused on a CC 12.0 device.
             sm120_rejection = _kda_prefill._sm120_kda_prefill_rejection_reason(
                 **sm120_prefill_kwargs
             )
