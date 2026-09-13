@@ -38,29 +38,35 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     if (
         world_size == 8
         and dtype == torch.bfloat16
-        and get_compute_capability(device) == (10, 3)
+        and get_compute_capability(device) in ((10, 0), (10, 3))
     ):
+        packed_rows = 512
         packed_weight = torch.randn(8192, 1280, dtype=dtype, device=device)
-        active_inp = symm_mem.empty(rows, 8192, dtype=dtype, device=device).normal_()
+        active_inp = symm_mem.empty(
+            packed_rows, 8192, dtype=dtype, device=device
+        ).normal_()
         packed_gathered = torch.empty(
-            world_size * rows, 8192, dtype=dtype, device=device
+            world_size * packed_rows, 8192, dtype=dtype, device=device
         )
         dist.all_gather_into_tensor(packed_gathered, active_inp, group=group)
         packed_expected = packed_gathered @ packed_weight
         packed_launcher = prepare_all_gather_matmul(
-            inp, packed_weight, group, backend="cake"
+            active_inp, packed_weight, group, backend="cake"
         )
         packed_stream = torch.cuda.Stream(device=device)
         packed_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(packed_stream):
             packed_first = packed_launcher(active_inp)
             packed_first_snapshot = packed_first.clone()
+            active_inp.neg_()
             packed_second = packed_launcher(active_inp)
         torch.cuda.current_stream(device).wait_stream(packed_stream)
         assert packed_first.data_ptr() != packed_second.data_ptr()
         torch.testing.assert_close(packed_first, packed_first_snapshot, atol=0, rtol=0)
         torch.testing.assert_close(packed_first, packed_expected, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(packed_second, packed_expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            packed_second, -packed_expected, atol=1e-2, rtol=1e-2
+        )
         del (
             active_inp,
             packed_expected,

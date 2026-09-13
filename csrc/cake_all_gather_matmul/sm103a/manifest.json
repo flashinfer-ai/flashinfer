@@ -40,7 +40,7 @@
       8
     ]
   },
-  "kernel_count": 12,
+  "kernel_count": 13,
   "kernel_symbols": [
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0",
     "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1",
@@ -53,7 +53,8 @@
     "kernel_cake_blackwell_all_gather_matmul_float16_ws4",
     "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4",
     "kernel_cake_blackwell_all_gather_matmul_float16_ws8",
-    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8"
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8",
+    "kernel_cake_blackwell_all_gather_matmul_fused_peer_copy"
   ],
   "launch": {
     "barrier": {
@@ -65,10 +66,22 @@
         1
       ]
     },
+    "fused_peer_copy": {
+      "block_threads": 128,
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        7,
+        1
+      ],
+      "ordering": "start_barrier -> fused_peer_copy -> comm_join -> completion_barrier -> main",
+      "when": "sm_103a, bfloat16, world_size=8, M=512, N=1280"
+    },
     "main": {
       "block_threads": 192,
       "dynamic_smem_bytes": 197632,
-      "grid_x": "(min(M, 2432) / 128) * (N / 256)"
+      "grid_x": "(min(M, 2432) / 128) * (N / 256)",
+      "grid_y": "4 if world_size == 8 and M == 512 and N == 1280 else 1"
     }
   },
   "route_coverage": {
@@ -104,6 +117,6 @@
     }
   },
   "schema_version": 1,
-  "source_sha256": "6ba37efcba102135f0155ef5e162143ad71bc27e52699c9aae05b9d9ace99433",
+  "source_sha256": "ef39c0d6ddfa1e038fc50bdf6137e8df872142faaadfe31a3a1fbe271e11d94d",
   "tma_abi": "pointer"
 }
