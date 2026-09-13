@@ -13,22 +13,26 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-VibeCUDA SSDCombined backend
-============================
+VibeCUDA backend
+================
 
 Hand-written CUDA implementation of the Mamba2 SSD combined forward pass
-(mma.sync m16n8k16 bf16/fp16 with fp32 accumulation, no cuBLAS and no
-CuTe-DSL).  At most two kernels per call:
+(cp.async staging + mma.sync m16n8k16 bf16/fp16 with fp32 accumulation, no
+cuBLAS and no CuTe-DSL).  At most two kernel launches per call:
 
-* ``k_segstate`` — fused chunk-state accumulation and inter-chunk state
-  passing for multi-chunk segments (skipped when the layout is host-known
-  single-chunk);
-* ``k_out`` — masked-decay intra-chunk matmuls, inter-chunk state
-  contribution, D-skip, optional SiLU z gate, output store, and the fused
-  final-state MMA for single-chunk segments.
+* ``ssd_k1_kernel`` — chunk-state builder, only for the uniform (non-varlen)
+  multi-chunk layout;
+* ``ssd_k3_kernel`` — fused output kernel: masked-decay intra-chunk matmuls,
+  inter-chunk state contribution (inline chain for varlen, global chunk-state
+  chain for the uniform multi-chunk layout), D-skip, optional SiLU z gate,
+  per-token output store, and inline final-state accumulation;
+* ``ssd_k3l_kernel`` — lean row-split variant of the fused kernel, selected
+  by shape metadata for the tiny uniform single-chunk family.
 
 Compiled through the regular FlashInfer nvcc JIT path; see
-``flashinfer/jit/mamba/vibecuda_ssd.py``.
+``flashinfer/jit/mamba/vibecuda_ssd.py``.  Device code lives in
+``include/flashinfer/mamba/vibecuda_ssd_combined.cuh`` with the TVM-FFI
+launcher in ``csrc/vibecuda_mamba_ssd_combined.cu``.
 """
 
 import functools
@@ -42,6 +46,10 @@ from ..jit.mamba.vibecuda_ssd import gen_vibecuda_ssd_combined_module
 _CHUNK = 128
 _HEADDIM = 64
 _DSTATE = 128
+# Device-side table bounds (shared by the kernel header); the wrapper fails
+# loudly instead of silently overflowing the varlen decode table.
+_MAX_CHUNKS = 384
+_MAX_SEQS = 128
 
 
 @functools.cache
@@ -85,6 +93,10 @@ class VibeCUDASSDCombined:
                 f"dstate=128; got chunk_size={chunk_size}, headdim={headdim}, "
                 f"dstate={dstate}"
             )
+        if nheads <= 0 or ngroups <= 0 or nheads % ngroups:
+            raise ValueError(
+                "VibeCUDA SSDCombined requires positive nheads divisible by ngroups"
+            )
         if io_dtype != torch.bfloat16:
             raise ValueError(
                 f"VibeCUDA SSDCombined requires io_dtype=bfloat16, got {io_dtype}"
@@ -94,12 +106,11 @@ class VibeCUDASSDCombined:
                 "VibeCUDA SSDCombined requires state_dtype bfloat16 or float16, "
                 f"got {state_dtype}"
             )
-        if nheads <= 0 or ngroups <= 0 or nheads % ngroups:
-            raise ValueError(
-                "nheads and ngroups must be positive and nheads divisible by ngroups"
-            )
         if seq_idx_dtype not in (torch.int32, torch.int64):
-            raise ValueError("seq_idx_dtype must be int32 or int64")
+            raise ValueError(
+                "VibeCUDA SSDCombined seq_idx dtype must be int32 or int64, "
+                f"got {seq_idx_dtype}"
+            )
         self.chunk_size = chunk_size
         self.nheads = nheads
         self.headdim = headdim
@@ -115,6 +126,8 @@ class VibeCUDASSDCombined:
         self._seq_idx_dtype = seq_idx_dtype
 
         self._module = _get_vibecuda_module()
+        self._zero_dt_bias_cache = {}
+        self._d_head_cache = {}
 
     # -- helpers --------------------------------------------------------------
 
@@ -123,6 +136,25 @@ class VibeCUDASSDCombined:
         if t is not None and not t.is_contiguous():
             return t.contiguous()
         return t
+
+    def _zero_dt_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device.index, dtype)
+        value = self._zero_dt_bias_cache.get(key)
+        if value is None:
+            value = torch.zeros(self.nheads, dtype=dtype, device=device)
+            self._zero_dt_bias_cache[key] = value
+        return value
+
+    def _d_head(self, d: torch.Tensor) -> torch.Tensor:
+        # Match the public runner's D-shape coercion: a 2D D passed to a
+        # per-head constructor consumes its first column.
+        key = (d.device.index,)
+        value = self._d_head_cache.get(key)
+        if value is None or value.shape != (self.nheads,):
+            value = torch.empty(self.nheads, dtype=d.dtype, device=d.device)
+            self._d_head_cache[key] = value
+        value.copy_(d[:, 0])
+        return value
 
     # -- main entry point ------------------------------------------------------
 
@@ -151,62 +183,29 @@ class VibeCUDASSDCombined:
         return_final_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass; see ``SSDCombined.run``."""
-        if x.ndim != 4 or not x.is_cuda:
-            raise ValueError("x must be a four-dimensional CUDA tensor")
         batch, seqlen, nheads, headdim = x.shape
-        if batch <= 0 or seqlen <= 0 or seqlen % _CHUNK:
+        if seqlen % _CHUNK:
+            raise ValueError("seqlen must be divisible by chunk_size=128")
+        if (nheads, headdim) != (self.nheads, _HEADDIM):
+            raise ValueError(f"x must have shape [batch, seqlen, {self.nheads}, 64]")
+        if tuple(B.shape) != (batch, seqlen, self.ngroups, _DSTATE):
+            raise ValueError(f"B must have shape [batch, seqlen, {self.ngroups}, 128]")
+        if C.shape != B.shape:
+            raise ValueError("C must have the same shape as B")
+        if x.dtype != torch.bfloat16 or B.dtype != x.dtype or C.dtype != x.dtype:
+            raise ValueError("x, B, and C must be bfloat16")
+        if tuple(dt.shape) != (batch, seqlen, self.nheads):
+            raise ValueError(f"dt must have shape [batch, seqlen, {self.nheads}]")
+        if dt.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("dt must be bfloat16 or float32")
+        if tuple(A.shape) != (self.nheads,) or A.dtype != torch.float32:
+            raise ValueError(f"A must have shape [{self.nheads}] and dtype float32")
+        if (D is not None) != self._has_d or (z is not None) != self._has_z:
+            raise ValueError("runtime D/z presence must match the constructor")
+        if (initial_states is not None) != self._has_init_states:
             raise ValueError(
-                "batch must be positive and seqlen a positive multiple of 128"
+                "runtime initial_states presence must match the constructor"
             )
-        if (nheads, headdim) != (self.nheads, self.headdim):
-            raise ValueError("x geometry must match the runner specialization")
-        properties = torch.cuda.get_device_properties(x.device)
-        if properties.major < 8 or properties.shared_memory_per_block_optin < 159824:
-            raise ValueError(
-                "VibeCUDA SSDCombined requires SM80+ and 159824 bytes of opt-in shared memory"
-            )
-
-        def check(name, tensor, shape, dtypes, *, contiguous=False):
-            if tensor is None:
-                return
-            if tensor.device != x.device or tuple(tensor.shape) != tuple(shape):
-                raise ValueError(f"{name} must have shape {shape} on {x.device}")
-            if tensor.dtype not in dtypes:
-                raise ValueError(f"{name} has unsupported dtype {tensor.dtype}")
-            if contiguous and not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous")
-
-        check("x", x, x.shape, (torch.bfloat16,))
-        check(
-            "dt",
-            dt,
-            (batch, seqlen, nheads),
-            (torch.float32, torch.float16, torch.bfloat16),
-        )
-        check("A", A, (nheads,), (torch.float32,), contiguous=True)
-        check("B", B, (batch, seqlen, self.ngroups, _DSTATE), (torch.bfloat16,))
-        check("C", C, B.shape, (torch.bfloat16,))
-        check("z", z, x.shape, (torch.bfloat16,))
-        check("dt_bias", dt_bias, (nheads,), (dt.dtype,))
-        if D is not None:
-            if tuple(D.shape) not in ((nheads,), (nheads, _HEADDIM)):
-                raise ValueError("D must have shape (nheads,) or (nheads, headdim)")
-            check("D", D, D.shape, (torch.bfloat16,))
-        check("seq_idx", seq_idx, (batch, seqlen), (torch.int32, torch.int64))
-        if seq_idx is not None and batch != 1:
-            raise ValueError("packed varlen requires batch=1")
-        if any(
-            t is not None
-            for t in (
-                checkpoint_token_indices,
-                checkpoint_state_slots,
-                checkpoint_states,
-            )
-        ):
-            raise ValueError(
-                "selective checkpoint outputs are not supported by the vibecuda backend"
-            )
-        nchunks = seqlen // _CHUNK
 
         has_varlen = seq_idx is not None
         if has_varlen and not self._has_varlen:
@@ -214,111 +213,206 @@ class VibeCUDASSDCombined:
                 "seq_idx provided but VibeCUDASSDCombined was constructed with "
                 "has_varlen=False"
             )
-        if self._has_init_states and initial_states is None:
+        if not has_varlen and self._has_varlen:
             raise ValueError(
-                "initial_states must be provided when has_initial_states=True"
+                "VibeCUDASSDCombined was constructed with has_varlen=True but no "
+                "seq_idx was provided"
             )
-        if initial_states is not None and not self._has_init_states:
-            raise ValueError(
-                "initial_states provided but VibeCUDASSDCombined was constructed "
-                "with has_initial_states=False"
-            )
-        if has_varlen and initial_states is None:
-            raise ValueError(
-                "initial_states must be provided in varlen mode to determine num_seqs"
-            )
+        if has_varlen:
+            if batch != 1:
+                raise ValueError("varlen mode requires packed x with batch == 1")
+            if initial_states is None:
+                raise ValueError(
+                    "initial_states must be provided in varlen mode to determine "
+                    "num_seqs"
+                )
+            if seq_idx.dtype != self._seq_idx_dtype:
+                raise ValueError(
+                    f"seq_idx dtype {seq_idx.dtype} does not match the constructor "
+                    f"dtype {self._seq_idx_dtype}"
+                )
+            if seq_idx.numel() != batch * seqlen:
+                raise ValueError(
+                    "seq_idx must have one entry per packed token "
+                    f"({batch * seqlen}), got {seq_idx.numel()}"
+                )
         num_seqs = initial_states.shape[0] if initial_states is not None else batch
-        if num_seqs <= 0 or (not has_varlen and num_seqs != batch):
-            raise ValueError("initial_states sequence count must match the batch")
-        check(
-            "initial_states",
-            initial_states,
-            (num_seqs, nheads, _HEADDIM, _DSTATE),
-            (self._state_torch_dtype,),
-        )
-        check(
-            "out",
-            out,
-            (batch, nheads, _HEADDIM, nchunks, _CHUNK),
-            (torch.bfloat16,),
-            contiguous=True,
-        )
-        for name, tensor in (
-            ("chunk_indices", chunk_indices),
-            ("chunk_offsets", chunk_offsets),
-        ):
-            if tensor is not None:
-                if tensor.ndim != 1:
-                    raise ValueError(f"{name} must be one-dimensional")
-                check(name, tensor, tensor.shape, (torch.int32,), contiguous=True)
-        if (chunk_indices is None) != (chunk_offsets is None):
+        if initial_states is not None:
+            expected_states = (num_seqs, self.nheads, _HEADDIM, _DSTATE)
+            if tuple(initial_states.shape) != expected_states:
+                raise ValueError(f"initial_states must have shape {expected_states}")
+            if initial_states.dtype != self._state_torch_dtype:
+                raise ValueError("initial_states dtype must match state_dtype")
+        if num_seqs > _MAX_SEQS:
             raise ValueError(
-                "chunk_indices and chunk_offsets must be supplied together"
+                f"VibeCUDA SSDCombined supports at most {_MAX_SEQS} sequences, "
+                f"got {num_seqs}"
             )
-        if chunk_indices is not None and chunk_indices.shape != chunk_offsets.shape:
+
+        nchunks = seqlen // _CHUNK
+        # Safe upper bound on the total logical-chunk count: batch * nchunks for
+        # the uniform layout; every varlen sequence wastes at most one partial
+        # chunk, so seqlen/CS + num_seqs bounds the packed count.
+        nchunk_bound = (
+            nchunks + num_seqs if has_varlen else batch * nchunks
+        )
+        meta_ci = None
+        meta_co = None
+        nmeta = 0
+        if has_varlen and chunk_indices is not None and chunk_offsets is not None:
+            if chunk_indices.numel() != chunk_offsets.numel():
+                raise ValueError("chunk_indices/chunk_offsets length mismatch")
+            if chunk_indices.numel() > 0:
+                if chunk_indices.dtype != torch.int32 or chunk_offsets.dtype != torch.int32:
+                    raise ValueError("chunk_indices/chunk_offsets must be int32")
+                meta_ci = self._contiguous(chunk_indices)
+                meta_co = self._contiguous(chunk_offsets)
+                nmeta = meta_ci.numel()
+                # Metadata defines the tiling exactly; the grid (and bound) is nmeta.
+                nchunk_bound = nmeta
+        if nchunk_bound > _MAX_CHUNKS:
             raise ValueError(
-                "chunk_indices and chunk_offsets must have matching shapes"
+                f"VibeCUDA SSDCombined supports at most {_MAX_CHUNKS} chunk "
+                f"segments, bound is {nchunk_bound}"
             )
-        check(
-            "seq_chunk_cumsum",
-            seq_chunk_cumsum,
-            (num_seqs + 1,),
-            (torch.int32,),
-            contiguous=True,
-        )
 
-        state_dtype = self._state_torch_dtype
-        final_states = torch.empty(
-            num_seqs,
-            nheads,
-            _HEADDIM,
-            _DSTATE,
-            dtype=state_dtype,
-            device=x.device,
-        )
+        # Selective checkpoint capture (same contract as the Cake backend):
+        # one exclusive token boundary per sequence — absolute in the packed
+        # token axis for varlen, sequence-relative for the batched layout.
+        # Negative token or slot disables capture for that sequence. The kernel
+        # writes the part-start state at the boundary in place into the
+        # caller-owned checkpoint_states rows.
+        ck_args = (checkpoint_token_indices, checkpoint_state_slots, checkpoint_states)
+        if any(value is not None for value in ck_args):
+            if not all(value is not None for value in ck_args):
+                raise ValueError(
+                    "checkpoint_token_indices, checkpoint_state_slots, and "
+                    "checkpoint_states must be supplied together"
+                )
+            if (
+                checkpoint_token_indices.dtype != torch.int32
+                or checkpoint_state_slots.dtype != torch.int32
+            ):
+                raise ValueError("checkpoint_token_indices/slots must be int32")
+            if (
+                checkpoint_token_indices.numel() != num_seqs
+                or checkpoint_state_slots.numel() != num_seqs
+            ):
+                raise ValueError(
+                    "checkpoint_token_indices/slots must have one entry per "
+                    f"sequence ({num_seqs})"
+                )
+            if checkpoint_states.dim() != 4 or tuple(checkpoint_states.shape[1:]) != (
+                self.nheads,
+                _HEADDIM,
+                _DSTATE,
+            ):
+                raise ValueError(
+                    "checkpoint_states must have shape "
+                    f"[num_checkpoints, {self.nheads}, {_HEADDIM}, {_DSTATE}]"
+                )
+            if checkpoint_states.dtype != self._state_torch_dtype:
+                raise ValueError("checkpoint_states dtype must match state_dtype")
+            if not checkpoint_states.is_contiguous():
+                raise ValueError("checkpoint_states must be contiguous")
+            checkpoint_token_indices = self._contiguous(checkpoint_token_indices)
+            checkpoint_state_slots = self._contiguous(checkpoint_state_slots)
 
-        # The host can only rule out multi-chunk segments without scanning
-        # seq_idx; multi-chunk layouts need the state_in scratch.
-        all_single_host = (not has_varlen) and seqlen <= _CHUNK
-        if all_single_host:
-            state_in = torch.empty(0, dtype=torch.bfloat16, device=x.device)
-        else:
-            n_lc_max = nchunks + num_seqs
-            state_in = torch.empty(
-                n_lc_max * nheads * _HEADDIM * _DSTATE,
-                dtype=torch.bfloat16,
-                device=x.device,
-            )
+        if dt_bias is not None:
+            if (
+                tuple(dt_bias.shape) != (self.nheads,)
+                or dt_bias.dtype != dt.dtype
+            ):
+                raise ValueError(
+                    f"dt_bias must have shape [{self.nheads}] and dtype "
+                    f"matching dt ({dt.dtype})"
+                )
+        # Match the CAKE contract exactly: a provided D is (nheads,) or
+        # (nheads, headdim) bfloat16. A 2D D with a per-head constructor
+        # reduces to its first column (same coercion as the CAKE public runner);
+        # a 1D D with a d_has_hdim constructor stays a per-head scalar because
+        # no headdim dimension exists to broadcast from.
+        d_c: Optional[torch.Tensor] = None
+        d_mode = 0
+        if D is not None:
+            valid_d_shapes = ((self.nheads,), (self.nheads, _HEADDIM))
+            if tuple(D.shape) not in valid_d_shapes or D.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"D must have shape [{self.nheads}] or "
+                    f"[{self.nheads}, 64] and dtype bfloat16"
+                )
+            d_c = D
+            if self._d_has_hdim and D.dim() == 2:
+                d_mode = 2
+            else:
+                d_mode = 1
+                if D.dim() == 2:
+                    d_c = self._d_head(D)
+        if z is not None and (z.shape != x.shape or z.dtype != torch.bfloat16):
+            raise ValueError("z must have the same shape and dtype as x")
 
         x_c = self._contiguous(x)
         dt_c = self._contiguous(dt)
         B_c = self._contiguous(B)
         C_c = self._contiguous(C)
+        dt_bias_c = (
+            self._contiguous(dt_bias)
+            if dt_bias is not None
+            else self._zero_dt_bias(x.device, dt_c.dtype)
+        )
         z_c = self._contiguous(z) if z is not None else None
-        d_c = self._contiguous(D)
-        dt_bias_c = self._contiguous(dt_bias)
-        initial_c = self._contiguous(initial_states) if self._has_init_states else None
-        seq_idx_c = self._contiguous(seq_idx)
+        d_c = self._contiguous(d_c) if d_mode != 0 else None
+        initial_c = self._contiguous(initial_states)
+        seq_idx_c = self._contiguous(seq_idx) if has_varlen else None
 
-        # Match the CuTe backend's public-API D-shape coercion: a 1D D with
-        # d_has_hdim broadcasts to (nheads, headdim); a 2D D with a scalar
-        # parameter reduces to its first column.
-        if d_c is not None:
-            if self._d_has_hdim and d_c.dim() == 1:
-                d_c = d_c.unsqueeze(1).expand(-1, _HEADDIM).contiguous()
-            elif not self._d_has_hdim and d_c.dim() == 2:
-                d_c = d_c[:, 0].contiguous()
+        # dt_limit (0.0, inf) is the "unbounded" mode: when softplus is on the
+        # clamp is an identity on the (non-negative) softplus output, so the
+        # kernel may skip it; with softplus off the clamp to [0, inf) is kept so
+        # the semantics still match clamp(dt, dt_lo, dt_hi) exactly.
+        dt_lo, dt_hi = (float(v) for v in dt_limit)
+        if dt_lo == 0.0 and dt_hi == float("inf") and dt_softplus:
+            unbounded = 1
+        else:
+            unbounded = 0
 
-        if out is None:
+        # fp32 scratch for the uniform multi-chunk chunk-state pre-pass
+        # (chunk_state then da_last, padded to at least 64 floats so the tensor
+        # always has valid storage).
+        need_gs = (not has_varlen) and nchunks > 1
+        cs_floats = nchunk_bound * nheads * _HEADDIM * _DSTATE if need_gs else 0
+        dal_floats = nchunk_bound * nheads if need_gs else 0
+        workspace = torch.empty(
+            cs_floats + dal_floats + 64, dtype=torch.float32, device=x.device
+        )
+
+        # y buffer: a caller-provided ``out`` uses the public SSDCombined
+        # chunk-major layout (batch, nheads, headdim, nchunks, chunk); an
+        # internal allocation is packed token-major (batch, seqlen, nheads,
+        # headdim) and returned directly (the single kernel store covers every
+        # element in both layouts).
+        if out is not None:
+            expected_out = (batch, self.nheads, _HEADDIM, nchunks, _CHUNK)
+            if tuple(out.shape) != expected_out or out.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"out must have shape {expected_out} and dtype bfloat16"
+                )
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous")
+            y_chunk_major = 1
+        else:
             out = torch.empty(
-                batch,
-                nheads,
-                _HEADDIM,
-                nchunks,
-                _CHUNK,
-                dtype=x.dtype,
-                device=x.device,
+                batch, seqlen, nheads, _HEADDIM, dtype=torch.bfloat16, device=x.device
             )
+            y_chunk_major = 0
+
+        final_states = torch.empty(
+            num_seqs,
+            nheads,
+            _HEADDIM,
+            _DSTATE,
+            dtype=self._state_torch_dtype,
+            device=x.device,
+        )
 
         self._module.vibecuda_ssd_combined_fwd(
             x_c,
@@ -331,15 +425,22 @@ class VibeCUDASSDCombined:
             z_c,
             initial_c,
             seq_idx_c if has_varlen else None,
-            state_in,
+            meta_ci,
+            meta_co,
+            checkpoint_states,
+            checkpoint_token_indices,
+            checkpoint_state_slots,
+            workspace,
             out,
             final_states,
+            nchunk_bound,
             1 if dt_softplus else 0,
-            float(dt_limit[0]),
-            float(dt_limit[1]),
-            1 if self._d_has_hdim else 0,
+            float(dt_lo),
+            float(dt_hi),
+            unbounded,
+            d_mode,
             1 if has_varlen else 0,
-            1 if all_single_host else 0,
+            y_chunk_major,
         )
 
         if (
@@ -352,6 +453,11 @@ class VibeCUDASSDCombined:
                 seq_chunk_cumsum = torch.zeros(
                     num_seqs + 1, dtype=torch.int32, device=x.device
                 )
+            if (
+                tuple(seq_chunk_cumsum.shape) != (num_seqs + 1,)
+                or seq_chunk_cumsum.dtype != torch.int32
+            ):
+                raise ValueError("seq_chunk_cumsum shape or dtype is invalid")
             module = _get_seq_chunk_cumsum_module()
             tile_state_bytes = module.seq_chunk_cumsum_tile_state_size(num_seqs)
             tile_state = (
@@ -370,5 +476,6 @@ class VibeCUDASSDCombined:
                 num_seqs,
             )
 
-        out_view = out.permute(0, 3, 4, 1, 2).reshape(batch, seqlen, nheads, headdim)
-        return out_view, final_states if return_final_states else None
+        if y_chunk_major:
+            out = out.permute(0, 3, 4, 1, 2).reshape(batch, seqlen, nheads, _HEADDIM)
+        return out, final_states if return_final_states else None

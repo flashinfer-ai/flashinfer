@@ -1,0 +1,154 @@
+{
+  "argv": [
+    "--vibecuda",
+    "--batch",
+    "2",
+    "--nheads",
+    "1",
+    "--ngroups",
+    "1",
+    "--state-dtype",
+    "bfloat16",
+    "--seq-idx-dtype",
+    "int32",
+    "--preprocess-dtype",
+    "float32",
+    "--has-z"
+  ],
+  "cake_cute_parity": {
+    "final_states_tolerance_passed": true,
+    "out_tolerance_passed": true
+  },
+  "contract_version": "pr4576-route-matrix-12-seed7-v1",
+  "execution_error": null,
+  "mode": "subprocess-per-row",
+  "report": {
+    "cake_ms": 0.0324805,
+    "cake_truth_final_states": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.0029810070991516113,
+      "max_rel": 45.01449203491211,
+      "mismatch_count": 16384,
+      "numel": 16384,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "cake_truth_out": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.08552169799804688,
+      "max_rel": 30.423471450805664,
+      "mismatch_count": 16384,
+      "numel": 16384,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "candidate_no_worse_than_cake": {
+      "baseline_contract": "allclose:6e-2,6e-2",
+      "candidate_contract": "allclose:5.9e-2,5.9e-2",
+      "final_states": true,
+      "out": true
+    },
+    "final_states": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.001953125,
+      "max_rel": 0.04433497413992882,
+      "mismatch_count": 34,
+      "numel": 16384,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "flashinfer_ms": 0.056208999999999995,
+    "full_write": {
+      "fully_written": true,
+      "out_numel": 16384,
+      "sentinel": "NaN",
+      "unwritten_elements": 0
+    },
+    "out": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 1.9073486328125e-06,
+      "max_rel": 0.006849315017461777,
+      "mismatch_count": 1,
+      "numel": 16384,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "shape": {
+      "batch": 2,
+      "chunk_size": 128,
+      "chunks_per_sequence": 1,
+      "d_has_hdim": false,
+      "dstate": 128,
+      "dt_limit": [
+        0.001,
+        0.1
+      ],
+      "has_z": true,
+      "headdim": 64,
+      "initial_states": "random",
+      "input_layout": "contiguous",
+      "mode": "batched",
+      "ngroups": 1,
+      "nheads": 1,
+      "num_sequences": 2,
+      "preprocess_dtype": "float32",
+      "seed": 7,
+      "seq_idx_dtype": "int32",
+      "seqlen": 128,
+      "sequence_lengths": null,
+      "state_dtype": "bfloat16"
+    },
+    "speedup": 1.7305460199196439,
+    "timing_backend": "cupti",
+    "truth_reference": "fp64_sequential_recurrence",
+    "vibecuda_final_states": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.00390625,
+      "max_rel": 53.5528450012207,
+      "mismatch_count": 8808,
+      "numel": 16384,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "vibecuda_ms": 0.0169605,
+    "vibecuda_out": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.125,
+      "max_rel": 5.474885940551758,
+      "mismatch_count": 5360,
+      "numel": 16384,
+      "rtol": 0.01,
+      "tolerance_passed": false
+    },
+    "vibecuda_speedup_vs_cake": 1.9150673624008727,
+    "vibecuda_truth_final_states": {
+      "atol": 0.059,
+      "bitwise_equal": false,
+      "max_abs": 0.0030161142349243164,
+      "max_rel": 98.7349624633789,
+      "mismatch_count": 16384,
+      "numel": 16384,
+      "rtol": 0.059,
+      "tolerance_passed": true
+    },
+    "vibecuda_truth_out": {
+      "atol": 0.059,
+      "bitwise_equal": false,
+      "max_abs": 0.08552169799804688,
+      "max_rel": 2.294396162033081,
+      "mismatch_count": 16384,
+      "numel": 16384,
+      "rtol": 0.059,
+      "tolerance_passed": true
+    }
+  },
+  "row": "b_h1_g1",
+  "validation_failures": [],
+  "wall_s": 10.073
+}

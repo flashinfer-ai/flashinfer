@@ -1,0 +1,161 @@
+{
+  "argv": [
+    "--vibecuda",
+    "--mode",
+    "varlen",
+    "--sequence-lengths",
+    "96",
+    "160",
+    "--nheads",
+    "8",
+    "--ngroups",
+    "8",
+    "--state-dtype",
+    "bfloat16",
+    "--seq-idx-dtype",
+    "int32",
+    "--preprocess-dtype",
+    "float32",
+    "--d-has-hdim",
+    "--has-z"
+  ],
+  "cake_cute_parity": {
+    "final_states_tolerance_passed": true,
+    "out_tolerance_passed": true
+  },
+  "contract_version": "pr4576-route-matrix-12-seed7-v1",
+  "execution_error": null,
+  "mode": "subprocess-per-row",
+  "report": {
+    "cake_ms": 0.074177,
+    "cake_truth_final_states": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.004437685012817383,
+      "max_rel": 44.2075080871582,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "cake_truth_out": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.12060165405273438,
+      "max_rel": 2670.078369140625,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "candidate_no_worse_than_cake": {
+      "baseline_contract": "allclose:6e-2,6e-2",
+      "candidate_contract": "allclose:5.9e-2,5.9e-2",
+      "final_states": true,
+      "out": true
+    },
+    "final_states": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.001953125,
+      "max_rel": 0.16972477734088898,
+      "mismatch_count": 63,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "flashinfer_ms": 0.072865,
+    "full_write": {
+      "fully_written": true,
+      "out_numel": 131072,
+      "sentinel": "NaN",
+      "unwritten_elements": 0
+    },
+    "out": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.015625,
+      "max_rel": 0.1419753134250641,
+      "mismatch_count": 99,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "shape": {
+      "batch": 1,
+      "chunk_size": 128,
+      "chunks_per_sequence": 1,
+      "d_has_hdim": true,
+      "dstate": 128,
+      "dt_limit": [
+        0.001,
+        0.1
+      ],
+      "has_z": true,
+      "headdim": 64,
+      "initial_states": "random",
+      "input_layout": "contiguous",
+      "mode": "varlen",
+      "ngroups": 8,
+      "nheads": 8,
+      "num_sequences": 2,
+      "preprocess_dtype": "float32",
+      "seed": 7,
+      "seq_idx_dtype": "int32",
+      "seqlen": 256,
+      "sequence_lengths": [
+        96,
+        160
+      ],
+      "state_dtype": "bfloat16"
+    },
+    "speedup": 0.9823125766747104,
+    "timing_backend": "cupti",
+    "truth_reference": "fp64_sequential_recurrence",
+    "vibecuda_final_states": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.00390625,
+      "max_rel": 132.89564514160156,
+      "mismatch_count": 69753,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "vibecuda_ms": 0.026784,
+    "vibecuda_out": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.125,
+      "max_rel": 166.01205444335938,
+      "mismatch_count": 51300,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": false
+    },
+    "vibecuda_speedup_vs_cake": 2.769451911589009,
+    "vibecuda_truth_final_states": {
+      "atol": 0.059,
+      "bitwise_equal": false,
+      "max_abs": 0.003818511962890625,
+      "max_rel": 85.51799011230469,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.059,
+      "tolerance_passed": true
+    },
+    "vibecuda_truth_out": {
+      "atol": 0.059,
+      "bitwise_equal": false,
+      "max_abs": 0.12060165405273438,
+      "max_rel": 71.13301849365234,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.059,
+      "tolerance_passed": true
+    }
+  },
+  "row": "bf16_v_h8_g8_dvec",
+  "validation_failures": [],
+  "wall_s": 68.09
+}

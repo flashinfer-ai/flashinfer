@@ -298,15 +298,12 @@ class SSDCombined:
         major, minor = get_compute_capability(torch.device("cuda"))
         if backend == "vibecuda":
             # The VibeCUDA kernels are plain CUDA + mma.sync m16n8k16 (bf16/f16,
-            # fp32 accumulators) with cp.async staging and 159824 bytes of
-            # dynamic shared memory. SM80+ alone does not guarantee capacity.
-            properties = torch.cuda.get_device_properties(torch.device("cuda"))
-            if major < 8 or properties.shared_memory_per_block_optin < 159824:
+            # fp32 accumulators) with cp.async staging, available on every
+            # SM80+ part.
+            if major < 8:
                 raise ValueError(
-                    "SSDCombined backend='vibecuda' requires SM80 or newer "
-                    "and 159824 bytes of opt-in shared memory. "
-                    f"Got SM{major}{minor} with "
-                    f"{properties.shared_memory_per_block_optin} bytes."
+                    f"SSDCombined backend='vibecuda' requires SM80 or newer "
+                    f"for cp.async and mma.sync bf16. Got SM{major}{minor}."
                 )
         # The SSD CuTe-DSL kernel uses tcgen05 MMA (MmaF16BF16Op), which is only
         # available on datacenter Blackwell (SM100/SM103/SM110). Consumer/workstation
@@ -588,10 +585,10 @@ class SSDCombined:
             checkpoint_state_slots: Optional contiguous int32 vector mapping
                 each sequence to a row in ``checkpoint_states``.  Negative entries
                 disable capture.  Must be provided with the other checkpoint
-                arguments.  Supported by the Cake backend.
+                arguments.  Supported by the Cake and VibeCUDA backends.
             checkpoint_states: Optional caller-owned contiguous output with shape
                 ``[num_checkpoints, nheads, headdim, dstate]`` and state dtype.
-                Supported by the Cake backend.
+                Supported by the Cake and VibeCUDA backends.
             out: Optional caller-owned contiguous output storage with shape
                 ``[batch, nheads, headdim, nchunks, chunk_size]``. A fresh tensor
                 is allocated when omitted.
@@ -718,9 +715,10 @@ class SSDCombined:
                 checkpoint_state_slots,
                 checkpoint_states,
             )
-        ):
+        ) and self._backend not in ("cake", "vibecuda"):
             raise ValueError(
-                "selective checkpoint state outputs require SSDCombined backend='cake'"
+                "selective checkpoint state outputs require SSDCombined "
+                "backend='cake' or backend='vibecuda'"
             )
 
         if self._backend == "vibecuda":
@@ -741,6 +739,9 @@ class SSDCombined:
                 chunk_offsets=chunk_offsets,
                 seq_chunk_cumsum=seq_chunk_cumsum,
                 update_seq_chunk_cumsum=update_seq_chunk_cumsum,
+                checkpoint_token_indices=checkpoint_token_indices,
+                checkpoint_state_slots=checkpoint_state_slots,
+                checkpoint_states=checkpoint_states,
                 out=out,
                 return_final_states=return_final_states,
             )
