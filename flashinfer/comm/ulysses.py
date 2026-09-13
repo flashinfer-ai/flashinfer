@@ -46,6 +46,97 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _OPEN, _CLOSING, _CLOSED = "open", "closing", "closed"
 
 
+def _storage_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Conservatively test whether two positive-strided tensors share bytes."""
+    if left.device != right.device or left.numel() == 0 or right.numel() == 0:
+        return False
+
+    def storage_end(tensor: torch.Tensor) -> int:
+        max_element_offset = sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            if size > 0
+        )
+        return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
+
+    return left.data_ptr() < storage_end(right) and right.data_ptr() < storage_end(left)
+
+
+class UlyssesWorkspace:
+    r"""Reusable staging storage for NCCL Ulysses collectives.
+
+    A workspace owns two flat CUDA buffers: one for the packed all-to-all
+    input and one for the receive result. Passing it to
+    :meth:`UlyssesCommunicator.scatter_heads` or
+    :meth:`UlyssesCommunicator.gather_heads` removes the per-call NCCL staging
+    allocations. The NVLink backend already owns IPC staging storage, so it
+    validates but otherwise does not use this object.
+
+    Workspaces are local allocations: they own no process group and create no
+    streams. A workspace may be shared by serialized scatter/gather calls, but
+    must not be used by concurrent collectives.
+
+    Parameters
+    ----------
+    max_elems : int
+        Capacity of each staging buffer in elements.
+    dtype : torch.dtype
+        Element dtype; float16, bfloat16, or float32.
+    device : torch.device or str or int, optional
+        CUDA device. ``None`` uses the current CUDA device.
+    """
+
+    @flashinfer_api
+    def __init__(
+        self,
+        *,
+        max_elems: int,
+        dtype: torch.dtype,
+        device: Optional[Union[torch.device, str, int]] = None,
+    ):
+        r"""Initialize reusable NCCL send and receive staging buffers.
+
+        Parameters
+        ----------
+        max_elems : int
+            Capacity of each staging buffer in elements.
+        dtype : torch.dtype
+            Element dtype; float16, bfloat16, or float32.
+        device : torch.device or str or int, optional
+            CUDA device. ``None`` uses the current CUDA device.
+        """
+        if type(max_elems) is not int or max_elems <= 0:
+            raise ValueError(f"max_elems must be a positive int, got {max_elems!r}")
+        if max_elems > _INT32_MAX:
+            raise ValueError(
+                f"max_elems must be at most {_INT32_MAX} (int32 index range), "
+                f"got {max_elems}"
+            )
+        if dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(f"dtype must be one of {_SUPPORTED_DTYPES}, got {dtype!r}")
+        ordinal, error = UlyssesCommunicator._parse_cuda_ordinal(device)
+        if error is not None:
+            raise ValueError(f"invalid workspace device: {error}")
+        if ordinal is None:
+            ordinal = torch.cuda.current_device()
+        self.max_elems = max_elems
+        self.dtype = dtype
+        self.device = torch.device("cuda", ordinal)
+        with torch.cuda.device(self.device):
+            self._send_buffer = torch.empty(max_elems, dtype=dtype, device=self.device)
+            self._recv_buffer = torch.empty(max_elems, dtype=dtype, device=self.device)
+
+    @property
+    def send_buffer(self) -> torch.Tensor:
+        """Flat send staging buffer (advanced/debugging use)."""
+        return self._send_buffer
+
+    @property
+    def recv_buffer(self) -> torch.Tensor:
+        """Flat receive staging buffer (advanced/debugging use)."""
+        return self._recv_buffer
+
+
 class UlyssesCommunicator:
     r"""Ulysses context-parallelism all-to-all communicator.
 
@@ -662,10 +753,53 @@ class UlyssesCommunicator:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
+    @flashinfer_api
+    def create_workspace(self, *, max_elems: Optional[int] = None) -> UlyssesWorkspace:
+        r"""Allocate reusable NCCL send/receive staging buffers.
+
+        This operation is rank-local and non-collective. ``max_elems``
+        defaults to the communicator capacity and may be smaller when a
+        caller knows the maximum chunk size it will communicate.
+
+        Parameters
+        ----------
+        max_elems : int, optional
+            Capacity of each send and receive staging buffer in elements.
+            ``None`` uses the communicator's ``max_elems`` capacity.
+
+        Returns
+        -------
+        UlyssesWorkspace
+            A workspace on the communicator's device with its dtype.
+        """
+        if self._state != _OPEN:
+            raise RuntimeError(
+                "create_workspace called on a "
+                f"{self._state} UlyssesCommunicator (use-after-close)"
+            )
+        if max_elems is None:
+            max_elems = self.max_elems
+        if type(max_elems) is not int or max_elems <= 0:
+            raise ValueError(f"max_elems must be a positive int, got {max_elems!r}")
+        if max_elems > self.max_elems:
+            raise ValueError(
+                f"workspace max_elems={max_elems} exceeds communicator "
+                f"capacity max_elems={self.max_elems}"
+            )
+        return UlyssesWorkspace(
+            max_elems=max_elems, dtype=self.dtype, device=self.device
+        )
+
     # ---- collectives -----------------------------------------------------------
 
     @flashinfer_api
-    def scatter_heads(self, x: torch.Tensor) -> torch.Tensor:
+    def scatter_heads(
+        self,
+        x: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        workspace: Optional[UlyssesWorkspace] = None,
+    ) -> torch.Tensor:
         r"""``[B, S_local, H, D] -> [B, S_global, H_local, D]``.
 
         Scatter the global heads across ranks and gather the full sequence:
@@ -678,6 +812,15 @@ class UlyssesCommunicator:
         ----------
         x : torch.Tensor
             Contiguous 4-D CUDA tensor with shape ``[B, S_local, H, D]``.
+        out : torch.Tensor, optional
+            Preallocated contiguous output with shape
+            ``[B, S_local * world_size, H // world_size, D]``. Supplying it
+            removes the public output allocation. It must not alias ``x``
+            when ``world_size > 1``.
+        workspace : UlyssesWorkspace, optional
+            Reusable NCCL pack/receive storage. Supplying it removes the two
+            NCCL staging allocations. It is validated but unused by the
+            NVLink backend, which owns IPC staging internally.
 
         Returns
         -------
@@ -693,23 +836,220 @@ class UlyssesCommunicator:
                 f"divisible by world size {self.world_size}, got shape "
                 f"{tuple(x.shape)}"
             )
+        output_shape = (
+            B,
+            S_local * self.world_size,
+            H // self.world_size,
+            D,
+        )
+        out = self._prepare_out(x, out, output_shape, "scatter_heads")
+        self._validate_workspace(workspace, x.numel(), "scatter_heads")
+        self._validate_workspace_out_alias(out, workspace, "scatter_heads")
         if self.world_size == 1:
-            return x
+            if out is None or out is x:
+                return x
+            out.copy_(x)
+            return out
         if self.backend == "nvlink":
-            out = torch.empty(
-                B,
-                S_local * self.world_size,
-                H // self.world_size,
-                D,
-                dtype=x.dtype,
-                device=x.device,
-            )
+            if out is None:
+                out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
             ulysses_a2a(self._fa, x, out, B, S_local, H, D, 0)
             return out
-        return self._nccl_scatter_heads(x)
+        return self._nccl_scatter_heads(x, out=out, workspace=workspace)
 
     @flashinfer_api
-    def gather_heads(self, x: torch.Tensor) -> torch.Tensor:
+    def scatter_qkv_head_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        head_offset: int,
+        head_count: int,
+        out: Optional[torch.Tensor] = None,
+        workspace: Optional[UlyssesWorkspace] = None,
+    ) -> torch.Tensor:
+        r"""Pack and scatter one Q/K/V head band with one collective.
+
+        ``query``, ``key`` and ``value`` have shape
+        ``[B, S_local, H, D]`` and may be independent positive-strided views.
+        The output is a fused ``[B, S_global, head_count, 3 * D]`` payload;
+        slicing its final dimension produces the three attention operands.
+
+        The method is a transport primitive, not a pipeline scheduler. A
+        caller that overlaps input and output communication must use separate
+        communicators and workspaces. Runs on the current CUDA stream.
+
+        When the NCCL backend, ``B == 1``, ``out is None`` and a workspace is
+        supplied, the returned tensor aliases the workspace receive buffer and
+        remains valid only until that workspace is reused. Pass ``out`` for an
+        explicit lifetime.
+
+        Parameters
+        ----------
+        query : torch.Tensor
+            Positive-strided CUDA tensor with shape ``[B, S_local, H, D]``.
+        key : torch.Tensor
+            Positive-strided CUDA tensor with the same shape, dtype, and
+            device as ``query``.
+        value : torch.Tensor
+            Positive-strided CUDA tensor with the same shape, dtype, and
+            device as ``query``.
+        head_offset : int
+            Start of the selected band within each destination rank's
+            ``H // world_size`` local heads.
+        head_count : int
+            Number of consecutive local heads in the selected band.
+        out : torch.Tensor, optional
+            Preallocated contiguous result with shape
+            ``[B, S_local * world_size, head_count, 3 * D]``. It must not
+            alias ``query``, ``key``, or ``value``.
+        workspace : UlyssesWorkspace, optional
+            Reusable staging storage large enough for the fused Q/K/V
+            payload. A workspace cannot service concurrent collectives.
+
+        Returns
+        -------
+        torch.Tensor
+            Fused Q/K/V payload with shape
+            ``[B, S_global, head_count, 3 * D]``.
+        """
+        from .ulysses_head_chunk import (
+            _launch_pack_qkv,
+            _validate_qkv_geometry,
+        )
+
+        self._require_open("scatter_qkv_head_chunk")
+        B, S_local, local_heads, D, payload_elems = _validate_qkv_geometry(
+            query,
+            key,
+            value,
+            world_size=self.world_size,
+            head_offset=head_offset,
+            head_count=head_count,
+        )
+        for name, tensor in (("query", query), ("key", key), ("value", value)):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"scatter_qkv_head_chunk {name} is on {tensor.device}, but "
+                    f"this communicator is bound to {self.device}"
+                )
+            if tensor.dtype != self.dtype:
+                raise ValueError(
+                    f"scatter_qkv_head_chunk {name} dtype {tensor.dtype} does "
+                    f"not match communicator dtype {self.dtype}"
+                )
+        self._validate_capacity(payload_elems, "scatter_qkv_head_chunk")
+        self._validate_workspace(workspace, payload_elems, "scatter_qkv_head_chunk")
+        output_shape = (
+            B,
+            S_local * self.world_size,
+            head_count,
+            3 * D,
+        )
+        out = self._prepare_out(query, out, output_shape, "scatter_qkv_head_chunk")
+        self._validate_workspace_out_alias(
+            out,
+            workspace,
+            "scatter_qkv_head_chunk",
+            allow_recv_alias=(self.backend == "nccl" and B == 1),
+        )
+        if out is not None and any(
+            _storage_ranges_overlap(out, tensor) for tensor in (query, key, value)
+        ):
+            raise ValueError(
+                "scatter_qkv_head_chunk out must not alias query, key, or value"
+            )
+
+        if self.world_size == 1:
+            if out is None:
+                out = torch.empty(output_shape, dtype=query.dtype, device=query.device)
+            _launch_pack_qkv(
+                out,
+                query,
+                key,
+                value,
+                world_size=1,
+                local_heads=local_heads,
+                head_offset=head_offset,
+                head_count=head_count,
+                nccl_layout=False,
+            )
+            return out
+
+        if workspace is None:
+            send_storage = torch.empty(
+                payload_elems, dtype=self.dtype, device=self.device
+            )
+            recv_storage = None
+        else:
+            send_storage = workspace._send_buffer[:payload_elems]
+            recv_storage = workspace._recv_buffer[:payload_elems]
+
+        if self.backend == "nvlink":
+            packed = send_storage.view(B, S_local, self.world_size * head_count, 3 * D)
+            _launch_pack_qkv(
+                packed,
+                query,
+                key,
+                value,
+                world_size=self.world_size,
+                local_heads=local_heads,
+                head_offset=head_offset,
+                head_count=head_count,
+                nccl_layout=False,
+            )
+            if out is None:
+                out = torch.empty(output_shape, dtype=self.dtype, device=self.device)
+            ulysses_a2a(
+                self._fa,
+                packed,
+                out,
+                B,
+                S_local,
+                self.world_size * head_count,
+                3 * D,
+                0,
+            )
+            return out
+
+        send = send_storage.view(self.world_size, B, S_local, head_count, 3 * D)
+        if recv_storage is None:
+            recv = torch.empty_like(send)
+        else:
+            recv = recv_storage.view_as(send)
+        _launch_pack_qkv(
+            send,
+            query,
+            key,
+            value,
+            world_size=self.world_size,
+            local_heads=local_heads,
+            head_offset=head_offset,
+            head_count=head_count,
+            nccl_layout=True,
+        )
+        dist.all_to_all_single(recv, send, group=self.group)
+        recv_as_output = recv.view(output_shape) if B == 1 else None
+        if out is None and recv_as_output is not None:
+            return recv_as_output
+        if out is None:
+            out = torch.empty(output_shape, dtype=self.dtype, device=self.device)
+        if recv_as_output is not None and out.data_ptr() == recv.data_ptr():
+            return out
+        out.view(B, self.world_size, S_local, head_count, 3 * D).copy_(
+            recv.permute(1, 0, 2, 3, 4)
+        )
+        return out
+
+    @flashinfer_api
+    def gather_heads(
+        self,
+        x: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        workspace: Optional[UlyssesWorkspace] = None,
+    ) -> torch.Tensor:
         r"""``[B, S_global, H_local, D] -> [B, S_local, H, D]``.
 
         Inverse of :meth:`scatter_heads`: gather all head slices for this
@@ -720,6 +1060,15 @@ class UlyssesCommunicator:
         ----------
         x : torch.Tensor
             Contiguous 4-D CUDA tensor with shape ``[B, S_global, H_local, D]``.
+        out : torch.Tensor, optional
+            Preallocated contiguous output with shape
+            ``[B, S_global // world_size, H_local * world_size, D]``.
+            Supplying it removes the public output allocation. It must not
+            alias ``x`` when ``world_size > 1``.
+        workspace : UlyssesWorkspace, optional
+            Reusable NCCL pack/receive storage. Supplying it removes the two
+            NCCL staging allocations. It is validated but unused by the
+            NVLink backend.
 
         Returns
         -------
@@ -735,50 +1084,283 @@ class UlyssesCommunicator:
                 f"be divisible by world size {self.world_size}, got shape "
                 f"{tuple(x.shape)}"
             )
-        if self.world_size == 1:
-            return x
         S_local = S_global // self.world_size
         H = H_local * self.world_size
+        output_shape = (B, S_local, H, D)
+        out = self._prepare_out(x, out, output_shape, "gather_heads")
+        self._validate_workspace(workspace, x.numel(), "gather_heads")
+        self._validate_workspace_out_alias(out, workspace, "gather_heads")
+        if self.world_size == 1:
+            if out is None or out is x:
+                return x
+            out.copy_(x)
+            return out
         if self.backend == "nvlink":
-            out = torch.empty(B, S_local, H, D, dtype=x.dtype, device=x.device)
+            if out is None:
+                out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
             ulysses_a2a(self._fa, x, out, B, S_local, H, D, 1)
             return out
-        return self._nccl_gather_heads(x)
+        return self._nccl_gather_heads(x, out=out, workspace=workspace)
+
+    @flashinfer_api
+    def gather_output_head_chunk(
+        self,
+        x: torch.Tensor,
+        *,
+        local_heads: int,
+        head_offset: int,
+        out: torch.Tensor,
+        workspace: Optional[UlyssesWorkspace] = None,
+    ) -> torch.Tensor:
+        r"""Gather one attention-output head band into a full destination.
+
+        ``x`` has shape ``[B, S_global, head_count, D]``. ``out`` is the
+        preallocated full output ``[B, S_local, world_size * local_heads, D]``.
+        Only the selected head band is written; calling this method for every
+        non-overlapping band in a complete schedule reconstructs ordinary
+        whole-head Ulysses output communication.
+
+        The NCCL path packs the sequence split directly into reusable staging
+        and merges the received head band directly into ``out``. The NVLink
+        path uses its fused-transpose collective followed by the same merge
+        primitive. Runs on the current CUDA stream.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Positive-strided CUDA tensor with shape
+            ``[B, S_global, head_count, D]``.
+        local_heads : int
+            Total number of attention-output heads owned by this rank before
+            the output all-to-all.
+        head_offset : int
+            Start of this band within the rank's ``local_heads``.
+        out : torch.Tensor
+            Preallocated contiguous destination with shape
+            ``[B, S_global // world_size, world_size * local_heads, D]``.
+            Only this head band is modified.
+        workspace : UlyssesWorkspace, optional
+            Reusable staging storage large enough for ``x``. A workspace
+            cannot service concurrent collectives.
+
+        Returns
+        -------
+        torch.Tensor
+            ``out`` after merging the gathered head band.
+        """
+        from .ulysses_head_chunk import (
+            _launch_merge_rank_major,
+            _launch_pack_output_sequence,
+            _positive_int,
+            _nonnegative_int,
+            _validate_cuda_tensor,
+        )
+
+        self._require_open("gather_output_head_chunk")
+        local_heads = _positive_int(local_heads, "local_heads")
+        head_offset = _nonnegative_int(head_offset, "head_offset")
+        x = _validate_cuda_tensor(
+            x, "gather_output_head_chunk input", ndim=4, contiguous=False
+        )
+        B, S_global, head_count, D = x.shape
+        if x.device != self.device or x.dtype != self.dtype:
+            raise ValueError(
+                f"gather_output_head_chunk input device/dtype "
+                f"({x.device}, {x.dtype}) must match communicator "
+                f"({self.device}, {self.dtype})"
+            )
+        if S_global % self.world_size != 0:
+            raise ValueError(
+                f"global sequence length {S_global} must be divisible by "
+                f"world size {self.world_size}"
+            )
+        if head_offset + head_count > local_heads:
+            raise ValueError(
+                f"head band [{head_offset}, {head_offset + head_count}) "
+                f"exceeds local_heads={local_heads}"
+            )
+        S_local = S_global // self.world_size
+        output_shape = (B, S_local, self.world_size * local_heads, D)
+        out = self._prepare_out(x, out, output_shape, "gather_output_head_chunk")
+        if out is None:  # ``out`` is required by the public signature.
+            raise TypeError("gather_output_head_chunk requires out")
+        if _storage_ranges_overlap(out, x):
+            raise ValueError("gather_output_head_chunk out must not alias the input")
+        payload_elems = x.numel()
+        self._validate_capacity(payload_elems, "gather_output_head_chunk")
+        self._validate_workspace(workspace, payload_elems, "gather_output_head_chunk")
+        self._validate_workspace_out_alias(out, workspace, "gather_output_head_chunk")
+
+        if self.world_size == 1:
+            _launch_merge_rank_major(
+                x.unsqueeze(0),
+                out,
+                world_size=1,
+                local_heads=local_heads,
+                head_offset=head_offset,
+            )
+            return out
+
+        if workspace is None:
+            send_storage = torch.empty(
+                payload_elems, dtype=self.dtype, device=self.device
+            )
+            recv_storage = torch.empty_like(send_storage)
+        else:
+            send_storage = workspace._send_buffer[:payload_elems]
+            recv_storage = workspace._recv_buffer[:payload_elems]
+
+        if self.backend == "nvlink":
+            if x.is_contiguous():
+                contiguous_input = x
+            else:
+                contiguous_input = send_storage.view_as(x)
+                contiguous_input.copy_(x)
+            compact = recv_storage.view(B, S_local, self.world_size * head_count, D)
+            ulysses_a2a(
+                self._fa,
+                contiguous_input,
+                compact,
+                B,
+                S_local,
+                self.world_size * head_count,
+                D,
+                1,
+            )
+            rank_major = compact.view(
+                B, S_local, self.world_size, head_count, D
+            ).permute(2, 0, 1, 3, 4)
+        else:
+            send = send_storage.view(self.world_size, B, S_local, head_count, D)
+            recv = recv_storage.view_as(send)
+            _launch_pack_output_sequence(
+                send,
+                x,
+                world_size=self.world_size,
+            )
+            dist.all_to_all_single(recv, send, group=self.group)
+            rank_major = recv
+
+        _launch_merge_rank_major(
+            rank_major,
+            out,
+            world_size=self.world_size,
+            local_heads=local_heads,
+            head_offset=head_offset,
+        )
+        return out
 
     # ---- NCCL fallback ---------------------------------------------------------
     # The conventional all_to_all_single path with explicit permute/contiguous
     # glue before and after (exactly the data movement the fused NVLink kernel
     # folds into its cross-GPU writes). Bit-identical to the NVLink backend.
 
-    def _nccl_scatter_heads(self, x: torch.Tensor) -> torch.Tensor:
+    def _nccl_scatter_heads(
+        self,
+        x: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor],
+        workspace: Optional[UlyssesWorkspace],
+    ) -> torch.Tensor:
         B, S_local, H, D = x.shape
         W = self.world_size
         H_local = H // W
-        xt = x.reshape(B, S_local, W, H_local, D).permute(2, 0, 1, 3, 4).contiguous()
-        recv = torch.empty_like(xt)
-        dist.all_to_all_single(recv, xt, group=self.group)
-        # chunk j == rank j's contribution to sequence block j
-        return recv.permute(1, 0, 2, 3, 4).reshape(B, W * S_local, H_local, D)
+        # Preserve the pre-existing allocation/layout path byte-for-byte when
+        # destination passing is not requested. This keeps the default API's
+        # behavior and performance independent of the new opt-in feature.
+        if out is None and workspace is None:
+            xt = (
+                x.reshape(B, S_local, W, H_local, D).permute(2, 0, 1, 3, 4).contiguous()
+            )
+            recv = torch.empty_like(xt)
+            dist.all_to_all_single(recv, xt, group=self.group)
+            # chunk j == rank j's contribution to sequence block j
+            return recv.permute(1, 0, 2, 3, 4).reshape(B, W * S_local, H_local, D)
 
-    def _nccl_gather_heads(self, x: torch.Tensor) -> torch.Tensor:
+        if out is None:
+            out = torch.empty(
+                B,
+                W * S_local,
+                H_local,
+                D,
+                dtype=x.dtype,
+                device=x.device,
+            )
+        if workspace is None:
+            send = torch.empty(
+                W, B, S_local, H_local, D, dtype=x.dtype, device=x.device
+            )
+            recv = torch.empty_like(send)
+        else:
+            send = workspace._send_buffer[: x.numel()].view(W, B, S_local, H_local, D)
+            recv = workspace._recv_buffer[: x.numel()].view(W, B, S_local, H_local, D)
+        send.copy_(x.reshape(B, S_local, W, H_local, D).permute(2, 0, 1, 3, 4))
+        dist.all_to_all_single(recv, send, group=self.group)
+        out.view(B, W, S_local, H_local, D).copy_(recv.permute(1, 0, 2, 3, 4))
+        return out
+
+    def _nccl_gather_heads(
+        self,
+        x: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor],
+        workspace: Optional[UlyssesWorkspace],
+    ) -> torch.Tensor:
         B, S_global, H_local, D = x.shape
         W = self.world_size
         S_local = S_global // W
-        xt = x.reshape(B, W, S_local, H_local, D).permute(1, 0, 2, 3, 4).contiguous()
-        recv = torch.empty_like(xt)
-        dist.all_to_all_single(recv, xt, group=self.group)
-        # chunk p == this rank's sequence block, head slice p
-        return (
-            recv.permute(1, 2, 0, 3, 4).reshape(B, S_local, W * H_local, D).contiguous()
-        )
+        if out is None and workspace is None:
+            xt = (
+                x.reshape(B, W, S_local, H_local, D).permute(1, 0, 2, 3, 4).contiguous()
+            )
+            recv = torch.empty_like(xt)
+            dist.all_to_all_single(recv, xt, group=self.group)
+            # chunk p == this rank's sequence block, head slice p
+            return (
+                recv.permute(1, 2, 0, 3, 4)
+                .reshape(B, S_local, W * H_local, D)
+                .contiguous()
+            )
+
+        if out is None:
+            out = torch.empty(
+                B,
+                S_local,
+                W * H_local,
+                D,
+                dtype=x.dtype,
+                device=x.device,
+            )
+        if workspace is None:
+            send = torch.empty(
+                W, B, S_local, H_local, D, dtype=x.dtype, device=x.device
+            )
+            recv = torch.empty_like(send)
+        else:
+            send = workspace._send_buffer[: x.numel()].view(W, B, S_local, H_local, D)
+            recv = workspace._recv_buffer[: x.numel()].view(W, B, S_local, H_local, D)
+        send.copy_(x.reshape(B, W, S_local, H_local, D).permute(1, 0, 2, 3, 4))
+        dist.all_to_all_single(recv, send, group=self.group)
+        out.view(B, S_local, W, H_local, D).copy_(recv.permute(1, 2, 0, 3, 4))
+        return out
 
     # ---- validation ------------------------------------------------------------
 
-    def _validate(self, x, op: str) -> None:
+    def _require_open(self, op: str) -> None:
         if self._state != _OPEN:
             raise RuntimeError(
                 f"{op} called on a {self._state} UlyssesCommunicator (use-after-close)"
             )
+
+    def _validate_capacity(self, required_elems: int, op: str) -> None:
+        if required_elems > self.max_elems:
+            raise ValueError(
+                f"{op} payload has {required_elems} elements, exceeding the "
+                f"communicator capacity max_elems={self.max_elems}"
+            )
+
+    def _validate(self, x, op: str) -> None:
+        self._require_open(op)
         if not isinstance(x, torch.Tensor):
             raise TypeError(f"{op} expects a torch.Tensor, got {type(x).__name__}")
         if x.dim() != 4:
@@ -808,6 +1390,95 @@ class UlyssesCommunicator:
                 f"communicator capacity max_elems={self.max_elems} "
                 f"(which is capped at the int32 index range {_INT32_MAX})"
             )
+
+    def _prepare_out(
+        self,
+        x: torch.Tensor,
+        out: Optional[torch.Tensor],
+        expected_shape: Tuple[int, ...],
+        op: str,
+    ) -> Optional[torch.Tensor]:
+        if out is None:
+            return None
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(
+                f"{op} out expects a torch.Tensor, got {type(out).__name__}"
+            )
+        if tuple(out.shape) != expected_shape:
+            raise ValueError(
+                f"{op} out has shape {tuple(out.shape)}, expected {expected_shape}"
+            )
+        if out.device != x.device:
+            raise ValueError(f"{op} out is on {out.device}, but input is on {x.device}")
+        if out.dtype != x.dtype:
+            raise ValueError(
+                f"{op} out dtype {out.dtype} does not match input dtype {x.dtype}"
+            )
+        if not out.is_contiguous():
+            raise ValueError(f"{op} out must be contiguous")
+        if _storage_ranges_overlap(out, x):
+            if self.world_size > 1 or out.data_ptr() != x.data_ptr():
+                raise ValueError(f"{op} out must not alias the input")
+        return out
+
+    def _validate_workspace(
+        self,
+        workspace: Optional[UlyssesWorkspace],
+        required_elems: int,
+        op: str,
+    ) -> None:
+        if workspace is None:
+            return
+        if not isinstance(workspace, UlyssesWorkspace):
+            raise TypeError(
+                f"{op} workspace expects UlyssesWorkspace, got "
+                f"{type(workspace).__name__}"
+            )
+        if workspace.device != self.device:
+            raise ValueError(
+                f"{op} workspace is on {workspace.device}, but communicator "
+                f"is bound to {self.device}"
+            )
+        if workspace.dtype != self.dtype:
+            raise ValueError(
+                f"{op} workspace dtype {workspace.dtype} does not match "
+                f"communicator dtype {self.dtype}"
+            )
+        if workspace.max_elems < required_elems:
+            raise ValueError(
+                f"{op} requires {required_elems} workspace elements, but "
+                f"workspace capacity is {workspace.max_elems}"
+            )
+        for name, buffer in (
+            ("send", workspace._send_buffer),
+            ("recv", workspace._recv_buffer),
+        ):
+            if (
+                buffer.device != self.device
+                or buffer.dtype != self.dtype
+                or not buffer.is_contiguous()
+                or buffer.numel() < workspace.max_elems
+            ):
+                raise ValueError(f"{op} workspace {name} buffer was modified")
+
+    @staticmethod
+    def _validate_workspace_out_alias(
+        out: Optional[torch.Tensor],
+        workspace: Optional[UlyssesWorkspace],
+        op: str,
+        *,
+        allow_recv_alias: bool = False,
+    ) -> None:
+        if out is None or workspace is None:
+            return
+        if _storage_ranges_overlap(out, workspace._send_buffer):
+            raise ValueError(f"{op} out must not alias the workspace send buffer")
+        if _storage_ranges_overlap(out, workspace._recv_buffer):
+            exact_recv_alias = out.data_ptr() == workspace._recv_buffer.data_ptr()
+            if not (allow_recv_alias and exact_recv_alias):
+                raise ValueError(
+                    f"{op} out must not alias the workspace receive buffer"
+                )
 
 
 # =============================================================================

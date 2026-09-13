@@ -57,11 +57,18 @@ from .pcie_ipc_topology import (
     resolve_pcie_ipc_profile as resolve_pcie_ipc_profile,
 )
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
+from .ulysses import UlyssesWorkspace as UlyssesWorkspace
 from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
 from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
 from .ulysses import get_ulysses_a2a_module as get_ulysses_a2a_module
 from .ulysses import init_ulysses_a2a as init_ulysses_a2a
 from .ulysses import ulysses_a2a as ulysses_a2a
+from .ulysses_head_chunk import (
+    merge_ulysses_output_head_chunk as merge_ulysses_output_head_chunk,
+)
+from .ulysses_head_chunk import (
+    pack_ulysses_qkv_head_chunk as pack_ulysses_qkv_head_chunk,
+)
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
