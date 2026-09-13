@@ -27,9 +27,9 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from dataclasses import dataclass, field
+from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Optional, Tuple, Union
+from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -60,32 +60,32 @@ MAX_SUPPORTED_TOTAL_EXPERTS = 512
 # Typed ActivationConfig values retain an accessible shared ``ActivationType``
 # for the kernel ABI while also carrying activation-specific scalar semantics.
 #
-# ``QuantVariant`` below is the one genuinely API-level enum: it has no single
-# kernel counterpart (the quant path is selected by dtype/scale wiring in the
-# runners, not one enum), so it is defined here as a plain ``Enum``.
+# ``QuantFormat`` is the per-operand MMA numeric format. Axes describe the
+# format consumed by the MMA, not the dtype of the tensor that crosses the
+# Python API. A CUTLASS NVFP4 runner that takes BF16 activations and
+# quantizes in-kernel is still ``(NVFP4, NVFP4)``.
 
 
-class QuantVariant(Enum):
-    """Quantization variant — single knob for dtype + granularity + scale convention."""
+class QuantFormat(Enum):
+    """Numeric format of one MMA operand or of the MoE layer output.
+
+    Axes describe the format consumed by the MMA, not the dtype of the tensor
+    that crosses the Python API. A CUTLASS NVFP4 runner that takes BF16
+    activations and quantizes in-kernel is still ``(NVFP4, NVFP4)``.
+    """
 
     BF16 = 0
-    FP8PerTensor = 1
-    DeepSeekFp8 = 2
-    MxFp8 = 3
-    NVFP4 = 4  # day-1 MVP target
-    MXFP4 = 5  # MXFP4 weights x MXFP8 activations (TRTLLM W4A8)
-    MxInt4 = 6
-    W4A16 = 7  # backend-specific 4-bit weights x BF16 activations
-    W4A8 = 8  # INT4 weights x FP8 activations (CUTLASS SM90 packed mixed-input)
-    Humming = 9  # MXFP4 weights x FP8 activations with Humming pre-MMA fusion
+    FP16 = 1
+    FP8PerTensor = 2
+    DeepSeekFp8 = 3  # e4m3 + fp32 block scales (128x128 weight, 1x128 activation)
+    MXFP8 = 4
+    NVFP4 = 5
+    MXFP4 = 6
+    MXINT4 = 7
+    INT4 = 8
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
-
-
-# ---------------------------------------------------------------------------
-# Component configs — each owns one concern
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -130,12 +130,22 @@ class RoutingConfig:
 
 @dataclass(frozen=True)
 class QuantConfig:
-    """Quantization scheme.
+    """Quantization scheme: MMA weight/activation formats plus the result format.
+
+    ``QuantConfig`` only checks that each axis is a :class:`QuantFormat`. Legal
+    combinations are runner capabilities (``supported_quant_variants`` and
+    ``supported_output_formats``), not an allow-list in this dataclass.
 
     Parameters
     ----------
-    variant : QuantVariant
-        Single knob for dtype + granularity + scale convention.
+    weight, activation : QuantFormat
+        MMA weight and activation formats. An omitted axis is BF16, i.e.
+        unquantized: ``QuantConfig()`` is BF16×BF16 and ``QuantConfig(weight=MXFP4)``
+        is MXFP4 weights with BF16 activations (W4A16). MXFP4×MXFP8 must be
+        spelled with both axes.
+    output : QuantFormat
+        Layer output format. Default BF16. Pass ``QuantFormat.FP16``, not
+        ``torch.float16``.
     swizzled_scale_factors : bool or None
         Whether block scale factors use the swizzled (vs linear) layout.
         ``None`` → backend default.  Mirrors core's ``swizzled_input_sf``.  Finer
@@ -148,9 +158,39 @@ class QuantConfig:
         ``None`` → backend default.
     """
 
-    variant: QuantVariant = QuantVariant.BF16
+    weight: QuantFormat = QuantFormat.BF16
+    activation: QuantFormat = QuantFormat.BF16
+    output: QuantFormat = QuantFormat.BF16
+    # The three axes stay positional; the remaining knobs are keyword-only.
+    _: KW_ONLY
     swizzled_scale_factors: Optional[bool] = None
     per_token_scale: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        for name in ("weight", "activation", "output"):
+            value = getattr(self, name)
+            if not isinstance(value, QuantFormat):
+                raise TypeError(
+                    f"QuantConfig.{name} must be a QuantFormat, got {value!r}. "
+                    "Pass QuantFormat.FP16 rather than torch.float16."
+                )
+
+    @property
+    def pair(self) -> Tuple[QuantFormat, QuantFormat]:
+        """MMA ``(weight, activation)`` pair used for runner matching."""
+        return (self.weight, self.activation)
+
+    def __repr__(self) -> str:
+        parts = [
+            f"weight={self.weight!r}",
+            f"activation={self.activation!r}",
+            f"output={self.output!r}",
+        ]
+        if self.swizzled_scale_factors is not None:
+            parts.append(f"swizzled_scale_factors={self.swizzled_scale_factors!r}")
+        if self.per_token_scale is not None:
+            parts.append(f"per_token_scale={self.per_token_scale!r}")
+        return f"QuantConfig({', '.join(parts)})"
 
 
 @dataclass(frozen=True)
@@ -404,6 +444,21 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
 
+_CUTILE_BF16_ARCHS = (89, 90, 120, 121)
+_CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_SUPPORTED_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.SwigluStep,
+    ActivationType.Geglu,
+    ActivationType.GegluTanh,
+    ActivationType.Situ,
+    ActivationType.Relu2,
+    ActivationType.Identity,
+    ActivationType.Gelu,
+    ActivationType.Relu,
+    ActivationType.Silu,
+)
+
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
 # Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
 _CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
@@ -428,6 +483,11 @@ _CUTLASS_W4A8_ARCHS = (90,)
 _CUTLASS_HUMMING_ARCHS = (90,)
 
 
+# Default MMA pair shared by the FP4 ``prepare_*`` helpers
+# (TrtllmFp4Config, CakeWarpDecodeConfig, CuteDslConfig).
+_NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+
+
 @dataclass(frozen=True)
 class TrtllmFp4Config:
     """TensorRT-LLM FP4 backend for NVFP4 and MXFP4 mixed-precision modes.
@@ -447,7 +507,7 @@ class TrtllmFp4Config:
         w1_bf16,
         w2_bf16,
         *,
-        variant: QuantVariant = QuantVariant.NVFP4,
+        quant: QuantConfig = _NVFP4_NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
@@ -458,8 +518,8 @@ class TrtllmFp4Config:
         """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("trtllm_fp4_routed", ...)``.
-        ``variant`` selects NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``
-        (MXFP4 weights x BF16 activations).
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16 (TRTLLM W4A16).
+        Defaults to NVFP4×NVFP4.
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
 
         .. warning::
@@ -472,7 +532,7 @@ class TrtllmFp4Config:
         return prepare_trtllm_fp4_weights(
             w1_bf16,
             w2_bf16,
-            variant=variant,
+            quant=quant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -485,21 +545,124 @@ class TrtllmFp4Config:
     def prepare_activations(
         hidden_states_bf16,
         *,
-        variant: QuantVariant = QuantVariant.NVFP4,
+        quant: QuantConfig = _NVFP4_NVFP4,
     ):
-        """Prepare activations for NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``.
+        """Prepare activations for NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16.
 
-        W4A16 returns raw BF16 activations without an activation scale.
+        MXFP4×BF16 (TRTLLM W4A16) returns raw BF16 activations without an
+        activation scale. Defaults to NVFP4×NVFP4.
         """
         from .prepare import prepare_trtllm_fp4_activations
 
         return prepare_trtllm_fp4_activations(
             hidden_states_bf16,
-            variant=variant,
+            quant=quant,
         )
 
     def __repr__(self) -> str:
         return "TrtllmFp4Config()"
+
+
+@dataclass(frozen=True)
+class CakeWarpDecodeConfig:
+    """Explicit Cake NVFP4 warp-decode backend for exact SM100 and SM103.
+
+    This backend is intentionally narrow: it accepts only the
+    activation-qualified expert geometries documented by
+    :class:`CakeWarpDecodeRunner`, 1--32 tokens, and unpacked precomputed routing.
+    It is never part of the default backend list; users opt in with
+    ``CakeWarpDecodeConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
+    representation usable by both runners.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                f"CakeWarpDecodeConfig backend must be 'cake', got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the shared TRTLLM NVFP4 physical weight view.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("cake", view)``. The same dictionary may
+        also be registered for ``"trtllm_fp4_routed"`` without copying.
+        """
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake warp decode weight preparation requires "
+                f"NVFP4×NVFP4, got {quant!r}."
+            )
+        activation = SwiGLU() if activation is None else activation
+        geometry = (hidden_size, intermediate_size, num_local_experts)
+        supported = (
+            (SwiGLU(), (2048, 512, 512)),
+            (SwiGLU(), (2048, 1536, 60)),
+            (SiLU(), (6144, 1536, 192)),
+        )
+        if not any(
+            activation == supported_activation and geometry == supported_geometry
+            for supported_activation, supported_geometry in supported
+        ):
+            raise ValueError(
+                "Cake warp decode weight preparation supports only default "
+                "SwiGLU() with (hidden_size, intermediate_size, num_local_experts) "
+                "= (2048, 512, 512) or (2048, 1536, 60), and SiLU() with "
+                "(6144, 1536, 192); got "
+                f"activation={activation!r}, geometry={geometry}."
+            )
+        return TrtllmFp4Config.prepare_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+            permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        quant: QuantConfig = _NVFP4_NVFP4,
+    ):
+        """Build the shared TRTLLM NVFP4 packed activation view."""
+        if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            raise ValueError(
+                "Cake warp decode activation preparation requires "
+                f"NVFP4×NVFP4, got {quant!r}."
+            )
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            quant=quant,
+        )
+
+    def __repr__(self) -> str:
+        return "CakeWarpDecodeConfig(backend='cake')"
 
 
 @dataclass(frozen=True)
@@ -515,7 +678,7 @@ class TrtllmFp8BlockConfig:
         w1_bf16,
         w2_bf16,
         *,
-        variant: QuantVariant,
+        quant: QuantConfig,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
@@ -524,9 +687,9 @@ class TrtllmFp8BlockConfig:
     ):
         """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
 
-        ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
-        :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
-        prepared by separate paths. The shuffled MXFP8 view requires both
+        ``quant`` must be DeepSeekFp8×DeepSeekFp8 or MXFP8×MXFP8; their scale
+        formats are intentionally prepared by separate paths. The shuffled MXFP8
+        view requires both
         ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
         scale tensors fit TRTLLM's unpadded 128x4 physical layout.
 
@@ -541,7 +704,7 @@ class TrtllmFp8BlockConfig:
         return prepare_trtllm_fp8_block_weights(
             w1_bf16,
             w2_bf16,
-            variant=variant,
+            quant=quant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -550,11 +713,11 @@ class TrtllmFp8BlockConfig:
         )
 
     @staticmethod
-    def prepare_activations(hidden_states_bf16, *, variant: QuantVariant):
+    def prepare_activations(hidden_states_bf16, *, quant: QuantConfig):
         """Quantize BF16 activations for the selected block-FP8 convention."""
         from .prepare import prepare_trtllm_fp8_block_activations
 
-        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, variant=variant)
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "TrtllmFp8BlockConfig()"
@@ -739,6 +902,94 @@ class CutlassBf16Config:
 
     def __repr__(self) -> str:
         return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileBf16Config:
+    """cuTile BF16 backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``cutile_bf16`` weight view from canonical BF16 weights."""
+        from .prepare import prepare_cutile_bf16_weights
+
+        return prepare_cutile_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Config:
+    """cuTile NVFP4-weight x NVFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        from .prepare import prepare_cutile_nvfp4_weights
+
+        return prepare_cutile_nvfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Config()"
 
 
 @dataclass(frozen=True)
@@ -1113,7 +1364,7 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL NVFP4 backend — SM100 family only (Blackwell SM100, SM103).
+    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     """
@@ -1128,22 +1379,25 @@ class CuteDslConfig:
         w1_bf16,
         w2_bf16,
         *,
+        quant: QuantConfig = _NVFP4_NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
     ):
-        """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
+        """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
-        Register the result with ``MoEWeightPack.prepare_for("cute_dsl_nvfp4", ...)``.
-        See :func:`flashinfer.fused_moe.prepare.prepare_cute_dsl_nvfp4_weights`.
+        Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
+        Defaults to NVFP4×NVFP4.
         """
-        from .prepare import prepare_cute_dsl_nvfp4_weights
+        from .prepare import prepare_cute_dsl_weights
 
-        return prepare_cute_dsl_nvfp4_weights(
+        return prepare_cute_dsl_weights(
             w1_bf16,
             w2_bf16,
+            quant=quant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -1241,12 +1495,15 @@ class B12xW4A16Config:
 
 # Union type for backend config
 BackendConfigType = Union[
+    CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
@@ -1261,12 +1518,15 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
@@ -1348,7 +1608,7 @@ class MoEConfig:
     >>> config = MoEConfig(
     ...     routing=RoutingConfig(num_experts=64, top_k=8,
     ...                           method=RoutingMethodType.DeepSeekV3),
-    ...     quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+    ...     quant=QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
     ...     experts=ExpertConfig(intermediate_size=2048),
     ... )
     >>> output = fused_moe(tensors, **config)
@@ -1460,15 +1720,19 @@ class MoEConfig:
 class MoEActivationPack:
     """Per-call backend-native activations plus routing inputs.
 
-    Activation encoding depends on ``QuantConfig.variant``:
+    Activation encoding depends on the MMA pair on ``QuantConfig``:
 
-    * NVFP4: packed ``uint8 [M, H/2]`` values with
-      ``float8_e4m3fn [M, H/16]`` block scales.
-    * MXFP4 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
+    * NVFP4×NVFP4 with ``TrtllmFp4Config`` or ``CuteDslConfig``: packed
+      ``uint8 [M, H/2]`` values with ``float8_e4m3fn [M, H/16]`` block scales.
+    * NVFP4×NVFP4 with ``CutlassNvfp4Config``: raw ``bfloat16 [M, H]`` values
+      without an activation scale.
+    * MXFP4×MXFP8 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
       ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale bytes, matching
       the TRTLLM FP4 launcher ABI.
-    * W4A16 with ``TrtllmFp4Config``: raw ``bfloat16 [M, H]`` values with no
+    * MXFP4×BF16 (TRTLLM W4A16): raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the MXFP4 preparation contract.
+    * NVFP4×BF16 (CuTe-DSL / b12x W4A16): raw ``bfloat16 [M, H]`` values with no
+      activation scale; weights use the NVFP4 preparation contract.
     * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
     * MxInt4: raw ``bfloat16 [M, H]`` values with no scale tensor; weights are
       packed signed INT4 with BF16 block scales.
@@ -1476,8 +1740,13 @@ class MoEActivationPack:
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
       ``uint8 [M, H/32]`` UE8M0 scales.
-    * FP8 per-tensor: ``float8_e4m3fn [M, H]`` values with no scale tensor;
-      the calibrated scalar is folded into the backend's epilogue scales.
+    * FP8 per-tensor with ``TrtllmFp8PerTensorConfig``: ``float8_e4m3fn
+      [M, H]`` values with no activation scale; the calibrated scalar is
+      folded into the TRT-LLM weight view.
+    * FP8 per-tensor with ``CutlassFp8PerTensorConfig``: ``float8_e4m3fn
+      [M, H]`` values with a scalar ``float32`` dequantization scale. Obtain
+      both tensors from ``CutlassFp8PerTensorConfig.prepare_activations``.
+      This pack cannot be shared with the TRT-LLM per-tensor backend.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -1506,7 +1775,7 @@ class MoEActivationPack:
 
     # Backend-native activation payload; layouts documented above.
     hidden_states_q: Tensor
-    # Variant-specific scales documented above; None for BF16/per-tensor FP8.
+    # Pair-specific scales documented above; None for BF16 and TRT-LLM FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)

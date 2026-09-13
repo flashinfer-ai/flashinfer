@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,8 +18,10 @@ from benchmarks.bench_trtllm_moe_da import (
     _temporary_environment,
 )
 from flashinfer.autotuner import autotune
+from flashinfer.fused_moe import core as fused_moe_core
 from flashinfer.fused_moe import (
-    QuantVariant,
+    QuantConfig,
+    QuantFormat,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8PerTensorConfig,
@@ -47,6 +50,64 @@ from tests.moe.da_acceptance_utils import (
 
 
 # Shared-plan capture ownership
+
+
+@pytest.mark.parametrize("needs_lora_mapping", [False, True])
+@pytest.mark.parametrize("tile_ns", [(32,), (64, 32)])
+def test_routing_metadata_allocation_preserves_lora_mapping(
+    monkeypatch, needs_lora_mapping, tile_ns
+):
+    flat = [torch.tensor([index]) for index in range(10 * len(tile_ns))]
+    calls = []
+
+    def allocate(*args):
+        calls.append(args)
+        return flat
+
+    monkeypatch.setattr(
+        fused_moe_core,
+        "get_trtllm_moe_sm100_module",
+        lambda: SimpleNamespace(allocate_routing_metadata_multi_tile=allocate),
+    )
+    kwargs = dict(
+        num_experts=8,
+        top_k=2,
+        local_expert_offset=0,
+        num_local_experts=8,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        needs_permuted_idx_to_expanded_idx=needs_lora_mapping,
+    )
+    ids = torch.zeros((2, 2), dtype=torch.int32)
+    if len(tile_ns) == 1:
+        slots = (
+            fused_moe_core.trtllm_moe_allocate_routing_metadata(
+                ids, tile_n=tile_ns[0], **kwargs
+            ),
+        )
+    else:
+        slots = fused_moe_core.trtllm_moe_allocate_routing_metadata_multi_tile(
+            ids, tile_ns=tile_ns, **kwargs
+        ).slots
+
+    assert len(calls) == 1
+    assert calls[0][-1] is needs_lora_mapping
+    assert calls[0][5] == sorted(tile_ns)
+    for index, slot in enumerate(slots):
+        assert slot.tile_n == sorted(tile_ns)[index]
+        assert slot.permuted_idx_to_expanded_idx is flat[index * 10 + 2]
+        assert all(
+            actual is expected
+            for actual, expected in zip(
+                slot.tensors(), flat[index * 10 : (index + 1) * 10], strict=True
+            )
+        )
+
+
+def test_routing_metadata_rejects_truncated_native_slots():
+    with pytest.raises(RuntimeError, match="expected 10"):
+        fused_moe_core._routing_metadata_slots_from_flat_tensors(
+            (32,), [torch.empty(0) for _ in range(9)]
+        )
 
 
 def _bf16_weights(shape):
@@ -624,12 +685,13 @@ def test_fp32_unpacked_routing_weights_remain_live_during_da_replay() -> None:
     assert metadata.expert_weights.data_ptr() == routing_weights.data_ptr()
     assert metadata.expert_weights.dtype == torch.float32
     hidden_quantized, hidden_scale = TrtllmFp4Config.prepare_activations(
-        hidden, variant=QuantVariant.NVFP4
+        hidden,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
     view = TrtllmFp4Config.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         num_local_experts=shape.local_num_experts,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,
