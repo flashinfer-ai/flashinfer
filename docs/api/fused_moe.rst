@@ -67,6 +67,22 @@ The E8M0 range-clamping, residual-scale factorization, and FP4 payload-rewrite
 scheme used by ``preprocess_moe_weights_for_sm90_mixed_gemm_humming`` is adapted
 from `Humming <https://github.com/inclusionAI/humming>`_.
 
+AlphaMoE Router (SM100/SM103)
+-----------------------------
+
+The standalone AlphaMoE frontend converts FP32 logits into top-k weights and an
+expert-grouped, block-aligned route plan. Selection and ordering among exactly
+equal routed logits are unspecified. The resulting plan can feed either the
+AlphaMoE W8A8 or NVFP4 compute path and can be reused across launches to avoid
+steady-state allocation.
+
+.. autosummary::
+    :toctree: ../generated
+
+    AlphaMoERoutePlan
+    allocate_alphamoe_route_plan
+    alphamoe_fused_router
+
 Multi-LoRA MoE (BGMV)
 ---------------------
 

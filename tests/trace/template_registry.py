@@ -57,6 +57,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.backends.prims_ts.bf16_op",
     "flashinfer.fused_moe.backends.prims_ts.fp4_op",
     "flashinfer.fused_moe.backends.prims_ts.fp8_op",
+    "flashinfer.fused_moe.alphamoe_fused_router",
     "flashinfer.fused_moe.core",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",
