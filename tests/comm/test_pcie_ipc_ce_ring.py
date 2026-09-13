@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 
 from flashinfer import comm
+from flashinfer.comm.pcie_ipc_ar import get_pcie_ipc_comm_module
 from flashinfer.comm.pcie_ipc_policy import IpcLaunchConfig, IpcVariant
 from tests.comm.test_pcie_ipc_all_reduce import (
     _init_process_group,
@@ -30,7 +31,11 @@ _BATCH = 64
 # -- an explicit `config=` is documented to reach a kernel the tuner would not
 # choose. Reaching it matters here: it stages into two peers' scratch rather
 # than one, which is the part the end-of-call handshake has to cover.
-_VARIANTS = [IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND]
+_VARIANTS = [
+    IpcVariant.COPY_ENGINE_RING,
+    IpcVariant.COPY_ENGINE_ISLAND,
+    IpcVariant.COPY_ENGINE_RING_MEMOP,
+]
 
 
 def _ce_config(
@@ -44,10 +49,22 @@ def _skip_unless_runnable(world_size: int, variant: IpcVariant) -> None:
         pytest.skip(f"not enough GPUs: need {world_size}")
     if variant == IpcVariant.COPY_ENGINE_ISLAND and world_size != 8:
         pytest.skip("the island schedule is a 4+4 decomposition, world_size 8 only")
+    if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
+        if any(
+            torch.cuda.get_device_capability(rank) != (12, 0)
+            for rank in range(world_size)
+        ):
+            pytest.skip("the memop protocol requires SM120 on every participating GPU")
+        module = get_pcie_ipc_comm_module()
+        for rank in range(world_size):
+            with torch.cuda.device(rank):
+                assert module.memop_supported(), (
+                    "SM120 must admit the default-supported v2 32-bit stream writes"
+                )
 
 
 def _graph_replay_worker(
-    world_size: int, rank: int, port: int, variant: IpcVariant
+    world_size: int, rank: int, port: int, variant: IpcVariant, dtype: torch.dtype
 ) -> None:
     _init_process_group(world_size, rank, port)
     device = torch.device("cuda", rank)
@@ -55,12 +72,16 @@ def _graph_replay_worker(
     ws: Optional[comm.PcieIpcAllReduceWorkspace] = None
     try:
         ws = comm.PcieIpcAllReduceWorkspace(
-            group=group, max_numel=_BATCH * _HIDDEN, dtype=torch.bfloat16
+            group=group, max_numel=_BATCH * _HIDDEN, dtype=dtype
         )
-        config = _ce_config(variant=variant)
+        if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
+            assert ws.memop_supported, "the test must exercise the memop protocol"
+        config = _ce_config(
+            1 if variant == IpcVariant.COPY_ENGINE_RING_MEMOP else 2, variant
+        )
         inp = torch.randint(
             0, 16, (_BATCH, _HIDDEN), dtype=torch.int32, device=device
-        ).to(torch.bfloat16)
+        ).to(dtype)
         out = torch.empty_like(inp)
         ref = inp.clone()
         dist.all_reduce(ref, group=group)
@@ -83,6 +104,8 @@ def _graph_replay_worker(
             # on every call; only calls that advance the counters outside the
             # graph tell the two apart.
             for i in range(8):
+                inp.fill_(float((rank + i) % 16))
+                ref.fill_(float(sum((peer + i) % 16 for peer in range(world_size))))
                 graph.replay()
                 torch.cuda.synchronize(device)
                 torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -130,7 +153,11 @@ def _skewed_ranks_worker(
         ws = comm.PcieIpcAllReduceWorkspace(
             group=group, max_numel=_BATCH * _HIDDEN, dtype=dtype
         )
-        config = _ce_config(variant=variant)
+        if variant == IpcVariant.COPY_ENGINE_RING_MEMOP:
+            assert ws.memop_supported, "the test must exercise the memop protocol"
+        config = _ce_config(
+            1 if variant == IpcVariant.COPY_ENGINE_RING_MEMOP else 2, variant
+        )
         out = torch.empty(_BATCH, _HIDDEN, dtype=dtype, device=device)
         for i in range(8 * world_size):
             # An iteration-dependent value, so staging left over from call i-1
@@ -152,17 +179,17 @@ def _skewed_ranks_worker(
             dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("variant", _VARIANTS, ids=lambda v: v.name.lower())
 @pytest.mark.parametrize("world_size", [4, 8])
-def test_ce_ring_survives_graph_replay(world_size: int, variant: IpcVariant) -> None:
+def test_ce_ring_survives_graph_replay(
+    world_size: int, variant: IpcVariant, dtype: torch.dtype
+) -> None:
     _skip_unless_runnable(world_size, variant)
-    multi_process_parallel(world_size, _graph_replay_worker, args=(variant,))
+    multi_process_parallel(world_size, _graph_replay_worker, args=(variant, dtype))
 
 
-# Both 2-byte dtypes take the same path apart from the packed_add_u4
-# specialisation, which the ring shares with the SM kernels, so fp16 rides on
-# the correctness test alone; the replay test stays bf16 because the flag
-# kernels it exercises are not templated on dtype at all.
+# Both 2-byte dtypes share the flag protocol and specialize packed_add_u4.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("variant", _VARIANTS, ids=lambda v: v.name.lower())
 @pytest.mark.parametrize("world_size", [4, 8])
@@ -171,3 +198,52 @@ def test_ce_ring_is_correct_with_skewed_ranks(
 ) -> None:
     _skip_unless_runnable(world_size, variant)
     multi_process_parallel(world_size, _skewed_ranks_worker, args=(variant, dtype))
+
+
+def _mixed_memop_worker(world_size, rank, port, dtype):
+    _init_process_group(world_size, rank, port)
+    device = torch.device("cuda", rank)
+    ws = None
+    try:
+        # At TP8 each one-MiB shard admits two half-MiB pieces.
+        numel = 8 * 1024 * 1024 // 2
+        ws = comm.PcieIpcAllReduceWorkspace(dist.group.WORLD, numel, dtype=dtype)
+        assert ws.memop_supported, "the mixed test must exercise the memop protocol"
+        inp = torch.empty(numel, dtype=dtype, device=device)
+        out = torch.empty_like(inp)
+        configs = [
+            _ce_config(1, IpcVariant.COPY_ENGINE_RING_MEMOP),
+            _ce_config(2, IpcVariant.COPY_ENGINE_RING),
+            _ce_config(2, IpcVariant.COPY_ENGINE_RING_MEMOP),
+        ]
+        if world_size == 8:
+            configs.append(_ce_config(1, IpcVariant.COPY_ENGINE_ISLAND))
+        configs.append(_ce_config(1, IpcVariant.COPY_ENGINE_RING_MEMOP))
+        for iteration in range(3):
+            for step, config in enumerate(configs):
+                value = (iteration * len(configs) + step + rank) % 16
+                inp.fill_(float(value))
+                if rank == step % world_size:
+                    torch.cuda._sleep(2_000_000)
+                ws.all_reduce(inp, out=out, config=config)
+                torch.cuda.synchronize(device)
+                expected = sum(
+                    (iteration * len(configs) + step + peer) % 16
+                    for peer in range(world_size)
+                )
+                torch.testing.assert_close(
+                    out, torch.full_like(out, expected), rtol=0, atol=0
+                )
+        dist.barrier()
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_ce_memop_preserves_mixed_protocol_reuse(world_size, dtype):
+    _skip_unless_runnable(world_size, IpcVariant.COPY_ENGINE_RING_MEMOP)
+    multi_process_parallel(world_size, _mixed_memop_worker, args=(dtype,))
