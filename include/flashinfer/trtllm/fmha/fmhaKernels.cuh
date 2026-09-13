@@ -1139,6 +1139,14 @@ class TllmGenFmhaKernel {
     FmhaKernelType& kernelType = selectKernelParams.mKernelType;
     // The tile size for Q.
     int& tileSizeQ = selectKernelParams.mTileSizeQ;
+    // CTA configuration can upgrade the selected GQA tile to cluster reduction. Keep that
+    // tile when reselecting its reduction variant: restarting the heuristic from the largest
+    // query tile can request a nonexistent KeepsMmaAb/CGA kernel.
+    if (selectKernelParams.mGroupsTokensHeadsQ &&
+        isSwapsMmaAbForGenerationKernel(kernelType) &&
+        isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode)) {
+      return;
+    }
     selectKernelParams.mGroupsTokensHeadsQ = false;
 
     // Generic mixed precision kernels don't work with groupsTokensHeadsQ = true. BF16Q+FP8KV
