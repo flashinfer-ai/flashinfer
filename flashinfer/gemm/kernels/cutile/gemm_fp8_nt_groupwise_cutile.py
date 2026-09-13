@@ -42,6 +42,7 @@ import torch
 from cuda.tile.tune import exhaustive_search
 
 from ....cutile.cutile_common import cached_replace_hints
+from ._tune_select import rank_measurements
 
 
 # Module-level tune cache:
@@ -333,6 +334,16 @@ def _w8a8_autotune_configs(block_n_quant, block_k_quant):
                 )
 
 
+def _w8a8_config_sort_key(cfg):
+    """Tie-break order among statistically tied configs."""
+    return (
+        cfg.occupancy,
+        cfg.num_ctas,
+        cfg.BLOCK_SIZE_M,
+        int(cfg.swap_ab),
+    )
+
+
 def _w8a8_early_config_prune(configs, M):
     """Drop configs whose BLOCK_SIZE_M exceeds the M dimension."""
     pruned = [cfg for cfg in configs if cfg.BLOCK_SIZE_M <= M]
@@ -427,7 +438,7 @@ def _w8a8_autotune_and_launch(
             build_args,
             hints_fn,
         )
-        best_cfg = result.best.config
+        best_cfg = rank_measurements(result.successes, _w8a8_config_sort_key)[0].config
         tuned_kernel = ct.kernel(
             kernel._pyfunc,
             num_ctas=best_cfg.num_ctas,
