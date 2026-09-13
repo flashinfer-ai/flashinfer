@@ -3327,15 +3327,28 @@ def test_cub_topk_physical_width(api, algo, num_rows, dtype, width, k, set_topk_
             assert torch.all(indices[row, valid:] == -1)
 
 
-@pytest.mark.parametrize("api", ["top_k", "page_table", "ragged"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
-    "width,k",
-    [(65, 4096), (8192, 2048), (32768, 2048)],
-    ids=["physical_short", "logical_cross_k", "cluster_logical_cross_k"],
+    "api,width,k,capture_length",
+    [
+        pytest.param("top_k", 65, 4096, "full", id="top_k-physical_short"),
+        pytest.param("top_k", 8192, 2048, "full", id="top_k-physical_long"),
+        pytest.param("top_k", 32768, 2048, "full", id="top_k-cluster_physical_long"),
+    ]
+    + [
+        pytest.param(api, width, k, capture_length, id=f"{api}-{name}")
+        for api in ("page_table", "ragged")
+        for width, k, capture_length, name in [
+            (65, 4096, "short", "physical_short"),
+            (8192, 2048, "short", "capture_short_replay_long"),
+            (8192, 2048, "long", "capture_long_replay_short"),
+            (32768, 2048, "short", "cluster_capture_short_replay_long"),
+            (32768, 2048, "long", "cluster_capture_long_replay_short"),
+        ]
+    ],
 )
-def test_cub_topk_graph_replay(api, dtype, width, k, set_topk_algo):
-    """One fixed-shape graph consumes changing logical lengths on either side of k."""
+def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_algo):
+    """Replay fixed-capacity graphs; fused API lengths cross k in both directions."""
     _require_cub_tie_break_support()
     set_topk_algo("cub")
     num_rows, page_size = 4, 64
@@ -3344,10 +3357,18 @@ def test_cub_topk_graph_replay(api, dtype, width, k, set_topk_algo):
     scores.copy_((torch.arange(width, device="cuda") % 7).to(dtype))
     assert not scores.is_contiguous()
     assert scores.data_ptr() % 16 != 0
-    row_starts = torch.tensor([0, 3, 9, width], device="cuda", dtype=torch.int32)
-    lengths = torch.tensor(
-        [width, width - 3, width - 9, 0], device="cuda", dtype=torch.int32
+    short_state = (
+        [0, 3, 9, 0],
+        [min(width, 64), min(width - 3, 17), min(width - 9, 1), 0],
     )
+    long_state = ([0, 3, 9, 0], [width, width - 3, width - 9, width])
+    capture_state = short_state if capture_length == "short" else long_state
+    if capture_length == "short":
+        assert max(capture_state[1]) < k
+    elif capture_length == "long":
+        assert min(capture_state[1]) > k
+    row_starts = torch.tensor(capture_state[0], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor(capture_state[1], device="cuda", dtype=torch.int32)
     offsets = torch.tensor([100, 500, 1000, 2000], device="cuda", dtype=torch.int32)
     row_to_batch = torch.tensor([1, 0, 1, 0], device="cuda", dtype=torch.int32)
     page_starts = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32)
@@ -3362,7 +3383,7 @@ def test_cub_topk_graph_replay(api, dtype, width, k, set_topk_algo):
         kwargs = dict(tie_break=flashinfer.TopKTieBreak.LARGE, dsa_graph_safe=True)
         if api == "top_k":
             return flashinfer.top_k(scores, k, **kwargs)
-        if api == "page_table":
+        elif api == "page_table":
             return flashinfer.top_k_page_table_transform(
                 scores,
                 pages,
@@ -3376,9 +3397,11 @@ def test_cub_topk_graph_replay(api, dtype, width, k, set_topk_algo):
                 out_raw_indices=raw,
                 **kwargs,
             )
-        return flashinfer.top_k_ragged_transform(
-            scores, offsets, lengths, k, row_starts=row_starts, **kwargs
-        )
+        elif api == "ragged":
+            return flashinfer.top_k_ragged_transform(
+                scores, offsets, lengths, k, row_starts=row_starts, **kwargs
+            )
+        raise AssertionError(f"Unexpected API: {api}")
 
     def expected_indices(row, length, start=0):
         valid = min(max(length, 0), k)
@@ -3425,8 +3448,10 @@ def test_cub_topk_graph_replay(api, dtype, width, k, set_topk_algo):
                     * page_size
                     + expected % page_size
                 )
-            else:
+            elif api == "ragged":
                 expected = expected + offsets[row]
+            else:
+                raise AssertionError(f"Unexpected API: {api}")
             _assert_unordered_indices_match(result[row, :valid], expected)
             assert torch.all(result[row, valid:] == -1)
 
@@ -3437,16 +3462,26 @@ def test_cub_topk_graph_replay(api, dtype, width, k, set_topk_algo):
         result = run()
     outputs = result if api == "top_k" else (result,)
     output_ptrs = tuple(output.data_ptr() for output in outputs)
-    # Width and batch size never change. The wide shape crosses from >k to
-    # exactly k, shorter/empty rows, and back to >k without recapturing.
-    for new_starts, new_lengths in [
-        ([width, 1, width - 5, 0], [0, min(width - 1, k), 5, -1]),
-        ([0, width - 1, 0, 7], [width, 1, min(width, k - 1), width - 7]),
-        (
-            [0, 3, 9, 0],
-            [min(width, k + 1), min(width - 3, k - 1), min(width - 9, k), width],
-        ),
-    ]:
+    # Physical capacity and batch size stay fixed. Plain top_k has no logical
+    # lengths input; its cases replay changed scores at that fixed width.
+    replay_states = [capture_state]
+    if api in ("page_table", "ragged") and width > k:
+        assert max(short_state[1]) < k < min(long_state[1])
+        opposite_state = long_state if capture_length == "short" else short_state
+        # Check the captured lengths, cross k for every row, then return to the
+        # original lengths using the same graph and the same device buffers.
+        replay_states.extend([opposite_state, capture_state])
+    replay_states.extend(
+        [
+            ([width, 1, width - 5, 0], [0, min(width - 1, k), 5, -1]),
+            ([0, width - 1, 0, 7], [width, 1, min(width, k - 1), width - 7]),
+            (
+                [0, 3, 9, 0],
+                [min(width, k + 1), min(width - 3, k - 1), min(width - 9, k), width],
+            ),
+        ]
+    )
+    for new_starts, new_lengths in replay_states:
         row_starts.copy_(torch.tensor(new_starts, device="cuda", dtype=torch.int32))
         lengths.copy_(torch.tensor(new_lengths, device="cuda", dtype=torch.int32))
         row_to_batch.copy_(1 - row_to_batch)
