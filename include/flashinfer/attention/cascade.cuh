@@ -369,6 +369,26 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
+/*!
+ * \brief Load one vector asynchronously using cp.async-supported transfer widths.
+ * \tparam vec_size The number of elements in the vector.
+ * \tparam DType The vector element type.
+ * \param dst The destination address in shared memory.
+ * \param src The source address in global memory.
+ * \param pred Whether the source data should be loaded.
+ */
+template <uint32_t vec_size, typename DType>
+__device__ __forceinline__ void LoadVectorAsync(DType* dst, const DType* src, bool pred) {
+  constexpr uint32_t chunk_size = std::min(vec_size, 32U / static_cast<uint32_t>(sizeof(DType)));
+  constexpr uint32_t chunk_bits = chunk_size * sizeof(DType) * 8;
+  static_assert(vec_size % chunk_size == 0);
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size / chunk_size; ++i) {
+    cp_async::pred_load<chunk_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+        dst + i * chunk_size, src + i * chunk_size, pred);
+  }
+}
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeO, typename IdType>
 __global__ void PersistentVariableLengthMergeStatesKernel(
@@ -422,7 +442,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
 
 #pragma unroll
     for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      LoadVectorAsync<vec_size>(
           v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
           V + ((indptr[pos] + (iter * bdy + ty)) * num_heads + head_idx) * head_dim + tx * vec_size,
           (iter * bdy + ty) < num_index_sets);
@@ -446,7 +466,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
         st.merge(v, s, 1);
       }
       __syncthreads();
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      LoadVectorAsync<vec_size>(
           v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
           V +
               ((indptr[pos] + ((iter + num_smem_stages) * bdy + ty)) * num_heads + head_idx) *
@@ -518,7 +538,7 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
 
 #pragma unroll
     for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      LoadVectorAsync<vec_size>(
           v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
           V + ((indptr[pos] + (iter * bdy + ty)) * num_heads + head_idx) * head_dim + tx * vec_size,
           (iter * bdy + ty) < num_index_sets);
@@ -537,7 +557,7 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
         }
       }
       __syncthreads();
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      LoadVectorAsync<vec_size>(
           v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
           V +
               ((indptr[pos] + ((iter + num_smem_stages) * bdy + ty)) * num_heads + head_idx) *
