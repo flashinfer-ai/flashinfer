@@ -3515,7 +3515,18 @@ def trtllm_batch_decode_with_kv_cache(
         order, only the final selected page of a row may be partially filled.
 
     max_seq_len : int
-        max sequence length for kv_cache
+        Host-side upper bound on the sequence lengths in ``kv_cache``. It must be at
+        least ``max(seq_lens)``.
+
+        On devices supported by the ``trtllm-gen`` backend (compute capability major
+        10), this value participates in kernel selection, including tile size, the KV
+        split, and reduction strategy. Different valid upper bounds can therefore
+        introduce extra work and change the floating-point accumulation order. Their
+        outputs are not guaranteed to be bitwise identical, but remain numerically
+        equivalent within the tolerances exercised by the supported SM10x test
+        matrix. Because CUDA Graph capture freezes this host value, use the same
+        ``max_seq_len`` in eager execution and graph capture when bitwise
+        reproducibility between them is required.
 
     bmm1_scale : Union[float, torch.Tensor]
         fused scale for bmm1 input.
