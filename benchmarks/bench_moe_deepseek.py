@@ -1221,7 +1221,7 @@ def run_benchmark(
         gc.collect()
         torch.cuda.empty_cache()
 
-    if verbose and backends is not None:
+    if verbose and (backends is not None or CFG.situ_beta is not None):
         print("backend,tokens,latency_ms,tflops")
         for row, _ in rows_and_histograms:
             for result in row:
