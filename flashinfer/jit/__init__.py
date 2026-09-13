@@ -34,6 +34,7 @@ from .attention import (
 )
 from .attention import (
     gen_customize_batch_prefill_module as gen_customize_batch_prefill_module,
+    with_fa2_route_scalars as with_fa2_route_scalars,
 )
 from .attention import (
     gen_customize_single_decode_module as gen_customize_single_decode_module,

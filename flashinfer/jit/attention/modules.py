@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import jinja2
 import torch
@@ -39,7 +39,7 @@ from ..utils import (
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import _is_nvfp4_kv_dtype, generate_additional_params
+from .utils import generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
@@ -1254,21 +1254,20 @@ def _fa2_head_dim_nvcc_flags(
     head_dim_vo: int,
     dtype_kv: torch.dtype,
     *,
-    allow_nvfp4_sm8_large_head: bool = False,
+    allow_quantized_sm8_large_head: bool = False,
 ) -> Optional[List[str]]:
     """Return arch flags for FA2 large-head modules.
 
-    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
-    can opt into the same arch set only for validated FA2 prefill read paths.
-    Other one-byte large-head modules remain restricted to SM100+ until those
-    variants are validated separately.
+    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. A one-byte
+    KV cache is read as raw bytes and rebuilt before the dots, which that path
+    does just as well, so the read paths validated for it opt into the same arch
+    set. The rest stay on SM100+ until they are validated too.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
-        if dtype_kv.itemsize == 1:
-            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
-                return current_compilation_context.get_nvcc_flags_list(
-                    supported_major_versions=[10, 11, 12]
-                )
+        if dtype_kv.itemsize == 1 and not allow_quantized_sm8_large_head:
+            return current_compilation_context.get_nvcc_flags_list(
+                supported_major_versions=[10, 11, 12]
+            )
         return current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[8, 9, 10, 11, 12]
         )
@@ -1282,7 +1281,7 @@ def _fa2_prefill_head_dim_nvcc_flags(
         head_dim_qk,
         head_dim_vo,
         dtype_kv,
-        allow_nvfp4_sm8_large_head=True,
+        allow_quantized_sm8_large_head=True,
     )
 
 
@@ -1659,6 +1658,31 @@ def gen_customize_batch_decode_module(
     )
 
 
+def with_fa2_route_scalars(
+    backend: str,
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+) -> Tuple[List[str], List[str]]:
+    """The extra scalar every FA2 prefill module takes, added once.
+
+    How a route element is read: a page id when it matches the cache's own page
+    size, a flat KV slot when it is smaller. The host derives the page size from
+    the tensor, so the logical block has to arrive separately. Addressing is
+    independent of the KV dtype, so every FA2 module carries it; 0 keeps the two
+    equal, which is the plain paged contract.
+
+    The module is generated from these names and the wrapper passes its
+    arguments by them, so both sides call this rather than one of them
+    appending and the other not.
+    """
+    if backend != "fa2" or "kv_logical_block_size" in additional_scalar_names:
+        return list(additional_scalar_names), list(additional_scalar_dtypes)
+    return (
+        [*additional_scalar_names, "kv_logical_block_size"],
+        [*additional_scalar_dtypes, "int64_t"],
+    )
+
+
 def gen_customize_batch_prefill_module(
     backend: str,
     uri: str,
@@ -1681,6 +1705,9 @@ def gen_customize_batch_prefill_module(
     fp8_enabled: bool = False,
 ) -> JitSpec:
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    additional_scalar_names, additional_scalar_dtypes = with_fa2_route_scalars(
+        backend, additional_scalar_names, additional_scalar_dtypes
+    )
     if require_fp4_kv_cache:
         missing_sf_tensors = [
             name

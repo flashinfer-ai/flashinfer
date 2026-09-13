@@ -16,6 +16,8 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
+#include <type_traits>
+#include <utility>
 
 #include "batch_prefill_config.inc"
 #include "tvm/ffi/container/array.h"
@@ -40,6 +42,40 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 }  // namespace flashinfer
 
 using namespace flashinfer;
+
+// A block-sparse route may address one KV entry per index while the cache still
+// stores whole pages. Only the modules that declare the scalar carry the field,
+// so detect it here rather than in the shared attention headers -- the generated
+// translation unit does not include them.
+namespace {
+template <typename T, typename = void>
+struct has_kv_logical_block_size : std::false_type {};
+template <typename T>
+struct has_kv_logical_block_size<T, std::void_t<decltype(std::declval<T>().kv_logical_block_size)>>
+    : std::true_type {};
+template <typename T>
+inline constexpr bool has_kv_logical_block_size_v = has_kv_logical_block_size<T>::value;
+
+// A block-sparse route may name a logical block smaller than the cache page it
+// lives in, in which case its indices are flat slots. `page_size` here is the
+// physical page derived from the tensor; the scalar carries the logical block.
+//
+// This has to be a template: `if constexpr` only discards an uninstantiated
+// branch inside one, and the dispatch lambda below is not itself templated.
+template <typename Params>
+void set_kv_logical_block_size(Params& params, uint32_t page_size) {
+  if constexpr (has_kv_logical_block_size_v<Params>) {
+    const int64_t logical_block = params.kv_logical_block_size;
+    if (logical_block > 0 && logical_block != static_cast<int64_t>(page_size)) {
+      TVM_FFI_ICHECK_EQ(logical_block, 1)
+          << "only a logical block size of 1 is supported for physical-slot routes, got "
+          << logical_block;
+      params.paged_kv.page_size = flashinfer::uint_fastdiv(static_cast<uint32_t>(logical_block));
+      params.paged_kv.storage_page_size = flashinfer::uint_fastdiv(page_size);
+    }
+  }
+}
+}  // namespace
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
@@ -327,6 +363,12 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.v_sf_stride_h = 0;
 
         ADDITIONAL_PARAMS_SETTER
+
+        // A block-sparse route addresses one KV entry per index while the cache
+        // still stores whole pages, so the logical block size and the page size
+        // come apart. When the caller asks for that, the route elements are
+        // physical slots and paged_kv resolves each one back into (page, entry).
+        set_kv_logical_block_size(params, static_cast<uint32_t>(page_size));
 
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
