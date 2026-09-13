@@ -113,6 +113,7 @@ def get_single_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_inline_sf: bool = False,
 ) -> str:
     return (
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -123,6 +124,7 @@ def get_single_decode_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
+        + ("_inline_sf" if use_inline_sf else "")
     )
 
 
@@ -136,6 +138,7 @@ def get_batch_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_inline_sf: bool = False,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -147,6 +150,7 @@ def get_batch_decode_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
+        + ("_inline_sf" if use_inline_sf else "")
     )
 
 
@@ -389,6 +393,7 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_inline_sf: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -399,7 +404,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_inline_sf" if use_inline_sf else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -445,6 +452,7 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_inline_sf: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -456,7 +464,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_inline_sf" if use_inline_sf else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -515,6 +525,7 @@ def gen_single_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     uri = get_single_decode_uri(
         dtype_q,
@@ -525,6 +536,7 @@ def gen_single_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        use_inline_sf,
     )
     return gen_customize_single_decode_module(
         uri,
@@ -547,6 +559,7 @@ def gen_single_decode_module(
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
+        use_inline_sf=use_inline_sf,
     )
 
 
@@ -561,6 +574,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -573,6 +587,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_inline_sf,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -642,6 +657,7 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_inline_sf=use_inline_sf,
     )
 
 
@@ -985,6 +1001,7 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
@@ -996,6 +1013,7 @@ def gen_batch_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        use_inline_sf,
     )
     return gen_customize_batch_decode_module(
         uri,
@@ -1019,6 +1037,7 @@ def gen_batch_decode_module(
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
+        use_inline_sf=use_inline_sf,
     )
 
 
@@ -1034,6 +1053,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -1047,6 +1067,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_inline_sf,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1148,6 +1169,7 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_inline_sf=use_inline_sf,
     )
 
 
@@ -1331,6 +1353,7 @@ def gen_customize_single_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
@@ -1367,6 +1390,7 @@ def gen_customize_single_decode_module(
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_inline_sf": str(use_inline_sf).lower(),
     }
 
     generated_inc_str = config_templ.render(
@@ -1424,6 +1448,7 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1437,6 +1462,7 @@ def gen_customize_single_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_inline_sf": str(use_inline_sf).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1592,6 +1618,7 @@ def gen_customize_batch_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
@@ -1618,6 +1645,7 @@ def gen_customize_batch_decode_module(
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_inline_sf": str(use_inline_sf).lower(),
     }
 
     with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja") as f:
@@ -1679,6 +1707,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_inline_sf: bool = False,
 ) -> JitSpec:
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
     if require_fp4_kv_cache:
@@ -1708,6 +1737,7 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_inline_sf": str(use_inline_sf).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")

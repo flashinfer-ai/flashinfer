@@ -196,6 +196,7 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_inline_sf: bool = False,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -217,6 +218,7 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        use_inline_sf,
     ).build_and_load()
 
 
@@ -1152,6 +1154,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_inline_sf: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1180,6 +1183,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_inline_sf: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1208,6 +1212,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_inline_sf: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1292,6 +1297,13 @@ def single_prefill_with_kv_cache(
         The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[Union[float, torch.Tensor]]
         The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+    use_inline_sf : bool
+        Whether the FP8 KV cache uses the per-(token, head) *inline* scale layout: each
+        ``(token, head)`` vector stores a ``float32`` scale at its tail, padded to a 16-byte
+        slot. When enabled, ``k``/``v`` are FP8 (``e4m3``/``e5m2``) tensors whose last dim is
+        ``head_dim + 16`` (the slot size, e.g. ``144`` for ``head_dim=128``), and ``q`` must be
+        ``fp16`` (or ``bf16`` on SM80+). The scale is dequantized inside the kernel and the
+        ``fa2`` backend is forced. Defaults to ``False``.
 
     Returns
     -------
@@ -1343,6 +1355,44 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    if use_inline_sf:
+        # Inline per-(token, head) FP8 scale: the KV tensor's last dim is the slot size
+        # (head_dim + 16, the float32 scale stored inline at byte offset head_dim, padded to
+        # 16B). Recover the actual head dims from the slot size and validate the layout.
+        assert k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2), (
+            f"use_inline_sf requires an fp8 (e4m3/e5m2) KV cache, got {k.dtype}"
+        )
+        assert v.dtype == k.dtype, "k and v must have the same dtype"
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            f"use_inline_sf requires an fp16/bf16 query, got {q.dtype}"
+        )
+        if get_compute_capability(q.device)[0] < 8:
+            assert q.dtype == torch.float16, (
+                "bf16 query is not supported with use_inline_sf on this "
+                "architecture (only fp16 is supported on SM75)"
+            )
+        # head_dim_qk = Q head_dim = K slot - 16; head_dim_vo = V slot - 16. K and V may
+        # have different head dims (asymmetric QK/VO plans), matching the non-inline path.
+        assert q.shape[-1] % 16 == 0, (
+            "use_inline_sf requires the query head_dim to be a multiple of 16, "
+            f"got {q.shape[-1]}"
+        )
+        assert k.shape[-1] == q.shape[-1] + 16, (
+            "use_inline_sf expects the K slot size to be the query head_dim + 16 "
+            f"(got K slot {k.shape[-1]}, query head_dim {q.shape[-1]})"
+        )
+        assert v.shape[-1] > 16 and (v.shape[-1] - 16) % 16 == 0, (
+            "use_inline_sf expects the V slot size to be head_dim + 16 with "
+            f"head_dim a multiple of 16 (got V slot {v.shape[-1]})"
+        )
+        # The inline-scale path is only implemented in the FA2 kernels.
+        if backend == "auto":
+            backend = "fa2"
+        elif backend != "fa2":
+            raise ValueError(
+                "use_inline_sf is only supported with backend='fa2', "
+                f"got backend={backend!r}"
+            )
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1392,6 +1442,8 @@ def single_prefill_with_kv_cache(
     out_head_dim = (
         v.shape[-1] * 2
         if kv_cache_sf is not None and v.dtype == torch.uint8
+        else v.shape[-1] - 16
+        if use_inline_sf
         else v.shape[-1]
     )
 
@@ -1431,6 +1483,7 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        use_inline_sf,
     )
 
     module.run(
@@ -1813,10 +1866,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
             self._jit_additional_scalar_names = list(jit_args[9])
+            self._jit_use_inline_sf = bool(jit_kwargs.get("use_inline_sf", False))
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
             self._jit_additional_scalar_names = []
+            self._jit_use_inline_sf = False
 
         if variant_owns_mask and self._jit_module is None:
             raise ValueError(
@@ -2247,6 +2302,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_inline_sf: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2359,6 +2415,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        use_inline_sf : bool
+            Whether the KV cache uses the inline per-(token, head) FP8 scale layout,
+            where each head vector is followed by a ``float32`` scale padded to a
+            16-byte slot (``slot_size = head_dim + 16``). When enabled, the KV cache
+            must be an FP8 (e4m3/e5m2) tensor whose last dim is the slot size, the
+            query must be fp16/bf16, and the backend is forced to ``fa2``. Defaults
+            to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2391,6 +2454,48 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+        self._head_dim_qk = head_dim_qk
+        self._head_dim_vo = head_dim_vo
+
+        if use_inline_sf:
+            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
+                "use_inline_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                f"{kv_data_type}"
+            )
+            assert q_data_type in (torch.float16, torch.bfloat16), (
+                f"use_inline_sf requires an fp16/bf16 query, got {q_data_type}"
+            )
+            if get_compute_capability(self.device)[0] < 8:
+                assert q_data_type == torch.float16, (
+                    "bf16 query is not supported with use_inline_sf on this "
+                    "device (SM75 only supports fp16)"
+                )
+            # The KV cache last dim is the slot size (head_dim + 16), not head_dim.
+            # head_dim_qk/head_dim_vo are the actual head dims (the slot size is derived
+            # from them); any 16-multiple is supported, and QK/VO may differ.
+            assert head_dim_qk % 16 == 0, (
+                "use_inline_sf requires head_dim_qk to be a multiple of 16, "
+                f"got {head_dim_qk}"
+            )
+            assert head_dim_vo % 16 == 0, (
+                "use_inline_sf requires head_dim_vo to be a multiple of 16, "
+                f"got {head_dim_vo}"
+            )
+            # The inline-scale path is only implemented for the fa2 backend.
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise ValueError(
+                    "use_inline_sf is only supported with backend='fa2', "
+                    f"got backend={self._backend!r}"
+                )
+        self._use_inline_sf = use_inline_sf
+        if self._jit_module is not None and self._jit_use_inline_sf != use_inline_sf:
+            raise ValueError(
+                "use_inline_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_inline_sf="
+                f"{self._jit_use_inline_sf}, plan() passed use_inline_sf={use_inline_sf}"
+            )
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -2673,6 +2778,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    use_inline_sf,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -3110,6 +3216,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
                 )
 
+        if getattr(self, "_use_inline_sf", False):
+            # Inline FP8 KV scale stores each slot as [head_dim fp8][4B f32
+            # scale][pad to 16B], so the cache last dim is head_dim + 16.
+            if k_cache.shape[-1] != self._head_dim_qk + 16:
+                raise ValueError(
+                    f"use_inline_sf requires K cache last dim = head_dim_qk + 16 "
+                    f"({self._head_dim_qk + 16}), got {k_cache.shape[-1]}"
+                )
+            if v_cache.shape[-1] != self._head_dim_vo + 16:
+                raise ValueError(
+                    f"use_inline_sf requires V cache last dim = head_dim_vo + 16 "
+                    f"({self._head_dim_vo + 16}), got {v_cache.shape[-1]}"
+                )
+            if v_cache.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v_cache {v_cache.dtype} does not match the "
+                    f"kv_data_type {self._cached_kv_data_type} specified in plan function."
+                )
+
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
         # For NVFP4 KV (uint8 packed), v_cache last dim is packed bytes
@@ -3121,6 +3246,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out_head_dim = (
             v_cache.shape[-1] * 2
             if kv_cache_sf is not None and v_cache.dtype == torch.uint8
+            else v_cache.shape[-1] - 16
+            if getattr(self, "_use_inline_sf", False)
             else v_cache.shape[-1]
         )
         if out is None:
@@ -3578,9 +3705,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_use_inline_sf = bool(jit_kwargs.get("use_inline_sf", False))
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_use_inline_sf = False
 
         if variant_owns_mask and self._jit_module is None:
             raise ValueError(
@@ -3715,6 +3844,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        use_inline_sf: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -3826,6 +3956,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Required for cudnn backend. This is the indptr of the value tensor.
         o_indptr: Optional[torch.Tensor]
             Required for cudnn backend. This is the indptr of the output tensor.
+        use_inline_sf : bool
+            Whether the KV cache uses the inline per-(token, head) FP8 scale layout,
+            where each head vector is followed by a ``float32`` scale padded to a
+            16-byte slot (``slot_size = head_dim + 16``). When enabled, the KV cache
+            must be an FP8 (e4m3/e5m2) tensor whose last dim is the slot size, the
+            query must be fp16/bf16, and the backend is forced to ``fa2``. Defaults
+            to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3851,6 +3988,48 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        self._head_dim_qk = head_dim_qk
+        self._head_dim_vo = head_dim_vo
+
+        if use_inline_sf:
+            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
+                "use_inline_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                f"{kv_data_type}"
+            )
+            assert q_data_type in (torch.float16, torch.bfloat16), (
+                f"use_inline_sf requires an fp16/bf16 query, got {q_data_type}"
+            )
+            if get_compute_capability(self.device)[0] < 8:
+                assert q_data_type == torch.float16, (
+                    "bf16 query is not supported with use_inline_sf on this "
+                    "device (SM75 only supports fp16)"
+                )
+            # The KV cache last dim is the slot size (head_dim + 16), not head_dim.
+            # head_dim_qk/head_dim_vo are the actual head dims (the slot size is derived
+            # from them); any 16-multiple is supported, and QK/VO may differ.
+            assert head_dim_qk % 16 == 0, (
+                "use_inline_sf requires head_dim_qk to be a multiple of 16, "
+                f"got {head_dim_qk}"
+            )
+            assert head_dim_vo % 16 == 0, (
+                "use_inline_sf requires head_dim_vo to be a multiple of 16, "
+                f"got {head_dim_vo}"
+            )
+            # The inline-scale path is only implemented for the fa2 backend.
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise ValueError(
+                    "use_inline_sf is only supported with backend='fa2', "
+                    f"got backend={self._backend!r}"
+                )
+        self._use_inline_sf = use_inline_sf
+        if self._jit_module is not None and self._jit_use_inline_sf != use_inline_sf:
+            raise ValueError(
+                "use_inline_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_inline_sf="
+                f"{self._jit_use_inline_sf}, plan() passed use_inline_sf={use_inline_sf}"
+            )
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
@@ -4205,6 +4384,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
+                use_inline_sf,
             )
             if self._backend == "fmha_v2":
                 # Cache plan data for run() — avoid GPU-CPU sync in hot path
@@ -4469,6 +4649,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 k_sf, v_sf = kv_cache_sf.unbind(dim=1)
 
+        if getattr(self, "_use_inline_sf", False):
+            # Inline FP8 KV scale stores each slot as [head_dim fp8][4B f32
+            # scale][pad to 16B], so the cache last dim is head_dim + 16.
+            if k.shape[-1] != self._head_dim_qk + 16:
+                raise ValueError(
+                    f"use_inline_sf requires K last dim = head_dim_qk + 16 "
+                    f"({self._head_dim_qk + 16}), got {k.shape[-1]}"
+                )
+            if v.shape[-1] != self._head_dim_vo + 16:
+                raise ValueError(
+                    f"use_inline_sf requires V last dim = head_dim_vo + 16 "
+                    f"({self._head_dim_vo + 16}), got {v.shape[-1]}"
+                )
+            if v.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v {v.dtype} does not match the "
+                    f"kv_data_type {self._cached_kv_data_type} specified in plan function."
+                )
+
         # NVFP4 packed: unpacked VO width is packed bytes * 2 (supports
         # asymmetric QK/VO; q.shape[-1] assumed QK == VO). Gate on the packed
         # (uint8) storage so a stray scale-factor tensor on a non-uint8 cache
@@ -4476,6 +4675,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out_head_dim = (
             v.shape[-1] * 2
             if kv_cache_sf is not None and v.dtype == torch.uint8
+            else v.shape[-1] - 16
+            if getattr(self, "_use_inline_sf", False)
             else v.shape[-1]
         )
         # Effective output dtype for allocation and validation; an 8-bit cached
