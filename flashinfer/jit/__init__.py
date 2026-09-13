@@ -113,6 +113,7 @@ from .cake_megamoe_topk_reduce import (
 from .cake_megamoe_topk_reduce import (
     run_cake_megamoe_topk_reduce as run_cake_megamoe_topk_reduce,
 )
+from .fused_moe import gen_alphamoe_sm100_module as gen_alphamoe_sm100_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
