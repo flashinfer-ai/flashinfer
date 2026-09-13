@@ -7,7 +7,7 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import ClassVar, Optional, cast
+from typing import ClassVar, Optional, Union, cast
 
 import torch
 
@@ -16,7 +16,7 @@ from ....attention.prims_ts._tensor_aliasing import (
 )
 from ....utils import get_compute_capability
 from .._contracts import _are_adjacent_last_dim_views
-from .._planning import _MLAPlanArguments
+from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
 
 
@@ -31,7 +31,7 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1)
 def get_cutile_mla_decode():
     """Load the cuda.tile kernel only after the cuTile plan is validated."""
 
@@ -169,6 +169,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         self.device = float_workspace_buffer.device
 
     @classmethod
+    @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionCutileBackend":
@@ -335,6 +336,10 @@ class _BatchMLAPagedAttentionCutileBackend:
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[Union[float, torch.Tensor]] = None,
+        bmm2_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # -----------------------------------------------------------------------
         # Validate the run contract and resolve planned metadata
@@ -356,6 +361,15 @@ class _BatchMLAPagedAttentionCutileBackend:
                 "ckv_scale / ckv_scale_arr / kpe_scale are not supported with "
                 "cutile backend."
             )
+        if sinks is not None:
+            raise ValueError("sinks are not supported with cutile backend.")
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is not supported with "
+                "cutile backend."
+            )
+        if bmm1_scale is not None or bmm2_scale is not None:
+            raise ValueError("BMM scales are not supported with cutile backend.")
         if (kv_len is None) != (page_table is None):
             raise ValueError(
                 "run-time kv_len and page_table must both be omitted or both be provided."
@@ -449,7 +463,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         )
 
         # -----------------------------------------------------------------------
-        # Launch the lazily loaded cuTile backend
+        # Launch the cuTile kernel acquired during planning
         # -----------------------------------------------------------------------
         launch_args = (
             q_nope,
