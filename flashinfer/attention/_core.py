@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import math
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -791,6 +791,51 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             disable_split_kv=disable_split_kv,
         )
 
+    # Deliberately narrower than the parent: the range tensor and the two
+    # windows are positional here, and the parent's `*args` plus the options
+    # this variant cannot honour are not accepted at all. Widening the
+    # signature back to be Liskov-substitutable would reintroduce exactly the
+    # silently-ignored arguments this wrapper exists to reject.
+    @overload  # type: ignore[override]
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        bidirectional_ranges: torch.Tensor,
+        causal_window_left: int = -1,
+        range_window_left: int = -1,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: Literal[False] = False,
+        enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        bidirectional_ranges: torch.Tensor,
+        causal_window_left: int = -1,
+        range_window_left: int = -1,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: Literal[True] = True,
+        enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
     def run(
         self,
         q: torch.Tensor,
@@ -914,6 +959,25 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         # 0 rather than -1.
         causal_n = float(max(causal_window_left, 0))
         range_n = float(max(range_window_left, 0))
+        # The parent's overloads key on a literal ``return_lse``, so branch
+        # here rather than forwarding the bool: that is what makes each call
+        # resolve to one of them and keeps the return type exact.
+        if return_lse:
+            return super().run(
+                q,
+                paged_kv_cache,
+                ranges_flat,
+                causal_n,
+                range_n,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                out=out,
+                lse=lse,
+                return_lse=True,
+                enable_pdl=enable_pdl,
+                kv_cache_sf=kv_cache_sf,
+            )
         return super().run(
             q,
             paged_kv_cache,
@@ -925,7 +989,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             v_scale=v_scale,
             out=out,
             lse=lse,
-            return_lse=return_lse,
+            return_lse=False,
             enable_pdl=enable_pdl,
             kv_cache_sf=kv_cache_sf,
         )
