@@ -59,15 +59,8 @@ def _source_root(num_q_heads: int = 8, num_kv_heads: int = 1) -> Path:
     suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
     directory = "request_ordered_paged_decode" + suffix
     manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
-    installed = (
-        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
-    )
-    checkout = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "cake_fmha"
-        / directory
-    )
+    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory
     for candidate in (installed, checkout):
         if (candidate / manifest_name).is_file():
             return candidate
@@ -119,7 +112,9 @@ def get_cake_fmha_request_ordered_manifest(
     _require(payload.get("target") == "sm_103a", "target")
     _require(payload.get("shape_count") == 43, "shape_count")
     _require(payload.get("module_count") == 13, "module_count")
-    expected_contract = dict(_CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)
+    expected_contract = dict(
+        _CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+    )
     if suffix:
         expected_contract.update(q_groups_per_kv=2, query_heads_per_work_group=8)
     _require(payload.get("contract") == expected_contract, "contract")
@@ -194,7 +189,8 @@ def get_cake_fmha_request_ordered_manifest(
         _require(plan.get("q_len") in (1, 6), f"routes[{index}].build_plan.q_len")
         if suffix:
             _require(
-                plan.get("num_q_heads") == 32 and plan.get("num_kv_heads") == 2
+                plan.get("num_q_heads") == 32
+                and plan.get("num_kv_heads") == 2
                 and plan.get("q_groups_per_kv") == 2,
                 f"routes[{index}].build_plan.head_geometry",
             )
@@ -210,7 +206,11 @@ def get_cake_fmha_request_ordered_manifest(
 def get_cake_fmha_request_ordered_module_spec(
     name: str,
 ) -> CakeFmhaRequestOrderedModuleSpec:
-    geometry = (32, 2) if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_") else (8, 1)
+    geometry = (
+        (32, 2)
+        if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_")
+        else (8, 1)
+    )
     root = _source_root(*geometry)
     manifest = get_cake_fmha_request_ordered_manifest(*geometry)
     matches = [module for module in manifest["modules"] if module["name"] == name]

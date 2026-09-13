@@ -3728,7 +3728,9 @@ def trtllm_batch_decode_with_kv_cache(
     if request_order_capture is not None and (
         request_order is None or request_order_plan is None
     ):
-        raise ValueError("request_order_capture requires device order and an explicit plan")
+        raise ValueError(
+            "request_order_capture requires device order and an explicit plan"
+        )
     if request_order is not None and causal_seqlens_kv_global is not None:
         raise ValueError("request_order is not supported by DCP speculative decode")
     if causal_seqlens_kv_global is not None and enable_pdl is True:
@@ -4163,7 +4165,9 @@ def trtllm_batch_decode_with_kv_cache(
             if request_order_capture is not None and not isinstance(
                 request_order_capture, CakeFmhaRequestOrderedCapture
             ):
-                raise TypeError("request_order_capture must be CakeFmhaRequestOrderedCapture")
+                raise TypeError(
+                    "request_order_capture must be CakeFmhaRequestOrderedCapture"
+                )
             if (
                 request_order_plan.batch_size != batch_size
                 or request_order_plan.q_len != q_len_per_req

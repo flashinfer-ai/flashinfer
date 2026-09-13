@@ -74,8 +74,12 @@ def _request_ordered_plan_from_route(
 
 
 def _fallback_cake_fmha_request_ordered_plan(
-    *, batch_size: int, q_len: int, write_lse: bool,
-    num_q_heads: int = 8, num_kv_heads: int = 1,
+    *,
+    batch_size: int,
+    q_len: int,
+    write_lse: bool,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 1,
 ) -> CakeFmhaRequestOrderedDecodePlan:
     if batch_size <= 0 or q_len not in (1, 6):
         raise ValueError(
@@ -85,7 +89,9 @@ def _fallback_cake_fmha_request_ordered_plan(
         f"fallback_q{q_len}_ordered_s1_lse" if write_lse else f"fallback_q{q_len}"
     )
     matches = []
-    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)["routes"]:
+    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
+        "routes"
+    ]:
         plan = route["build_plan"]
         if (
             plan["route_slug"] == route_slug
@@ -145,7 +151,9 @@ def plan_cake_fmha_request_ordered_paged_decode(
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
 
     exact = []
-    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)["routes"]:
+    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
+        "routes"
+    ]:
         args = route["args"]
         plan = route["build_plan"]
         if (
@@ -189,7 +197,9 @@ def _is_authenticated_request_ordered_plan(
     )
     if plan == fallback:
         return True
-    for route in get_cake_fmha_request_ordered_manifest(plan.num_q_heads, plan.num_kv_heads)["routes"]:
+    for route in get_cake_fmha_request_ordered_manifest(
+        plan.num_q_heads, plan.num_kv_heads
+    )["routes"]:
         build_plan = route["build_plan"]
         if (
             build_plan["ordered"] is True
@@ -220,9 +230,13 @@ class CakeFmhaRequestOrderedCapture:
 
     def __init__(self, plans: Sequence[CakeFmhaRequestOrderedDecodePlan]) -> None:
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("create request-order capture preparation outside capture")
+            raise RuntimeError(
+                "create request-order capture preparation outside capture"
+            )
         if not plans:
-            raise ValueError("request-order capture preparation requires selected plans")
+            raise ValueError(
+                "request-order capture preparation requires selected plans"
+            )
         self._plans = frozenset(plans)
         self._tokens: dict[str, tuple[Any, int]] = {}
         self._workspaces: dict[int, torch.Tensor] = {}
@@ -230,10 +244,15 @@ class CakeFmhaRequestOrderedCapture:
         try:
             for plan in plans:
                 if not _is_authenticated_request_ordered_plan(plan):
-                    raise ValueError("request-order capture plan is not an exported route")
+                    raise ValueError(
+                        "request-order capture plan is not an exported route"
+                    )
                 if plan.module_name not in self._tokens:
                     module = load_cake_fmha_request_ordered_module(plan.module_name)
-                    self._tokens[plan.module_name] = (module, module.begin_tma_capture())
+                    self._tokens[plan.module_name] = (
+                        module,
+                        module.begin_tma_capture(),
+                    )
         except BaseException:
             self.discard()
             raise
@@ -249,9 +268,13 @@ class CakeFmhaRequestOrderedCapture:
         arguments: tuple[Any, ...],
     ) -> None:
         if self._state != "recording" or plan not in self._plans:
-            raise ValueError("request-order capture is not recording this selected plan")
+            raise ValueError(
+                "request-order capture is not recording this selected plan"
+            )
         if not torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("request_order_capture is only used inside CUDA Graph capture")
+            raise RuntimeError(
+                "request_order_capture is only used inside CUDA Graph capture"
+            )
         module, token = self._tokens[plan.module_name]
         module.run_tma_capture(token, *arguments)
         self._workspaces[workspace.data_ptr()] = workspace
@@ -270,7 +293,9 @@ class CakeFmhaRequestOrderedCapture:
     def discard(self) -> None:
         """Release unfinished host records; the associated graph must be discarded."""
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("discard request-order descriptor records after capture ends")
+            raise RuntimeError(
+                "discard request-order descriptor records after capture ends"
+            )
         for name, (module, token) in tuple(self._tokens.items()):
             module.discard_tma_capture(token)
             del self._tokens[name]

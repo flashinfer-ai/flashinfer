@@ -132,7 +132,9 @@ def test_decode_api_exposes_order_pointer_and_host_plan_at_the_end() -> None:
         ).parameters
     )
     assert parameters[-3:] == [
-        "request_order", "request_order_plan", "request_order_capture"
+        "request_order",
+        "request_order_plan",
+        "request_order_capture",
     ]
 
 
@@ -191,13 +193,22 @@ def test_request_ordered_capture_prepares_actual_producer_q(
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(48320 + q_len)
     base = torch.randn(
-        batch * q_len, num_q_heads, 256, dtype=torch.bfloat16, device=device,
+        batch * q_len,
+        num_q_heads,
+        256,
+        dtype=torch.bfloat16,
+        device=device,
         generator=generator,
     )
     key, value = (
         torch.randn(
-            batch * page_slots, num_kv_heads, 64, 256, dtype=torch.float32,
-            device=device, generator=generator,
+            batch * page_slots,
+            num_kv_heads,
+            64,
+            256,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
         ).to(torch.float8_e4m3fn)
         for _ in range(2)
     )
@@ -215,11 +226,20 @@ def test_request_ordered_capture_prepares_actual_producer_q(
 
     def invoke(query, workspace, output, preparation=None):
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=query, kv_cache=(key, value), workspace_buffer=workspace,
-            out=output, block_tables=tables, seq_lens=seq_lens,
-            max_seq_len=max(lengths), bmm1_scale_log2=qk, bmm2_scale=pv,
-            backend="cake", enable_pdl=True, q_len_per_req=q_len,
-            request_order=order, request_order_plan=plan,
+            query=query,
+            kv_cache=(key, value),
+            workspace_buffer=workspace,
+            out=output,
+            block_tables=tables,
+            seq_lens=seq_lens,
+            max_seq_len=max(lengths),
+            bmm1_scale_log2=qk,
+            bmm2_scale=pv,
+            backend="cake",
+            enable_pdl=True,
+            q_len_per_req=q_len,
+            request_order=order,
+            request_order_plan=plan,
             request_order_capture=preparation,
         )
 
@@ -238,7 +258,9 @@ def test_request_ordered_capture_prepares_actual_producer_q(
             scores = torch.einsum("qhd,khd->hqk", q, k) / 16
             visible = length - q_len + torch.arange(q_len, device=device) + 1
             mask = torch.arange(length, device=device)[None, :] < visible[:, None]
-            probabilities = scores.masked_fill(~mask[None, :, :], -torch.inf).softmax(-1)
+            probabilities = scores.masked_fill(~mask[None, :, :], -torch.inf).softmax(
+                -1
+            )
             rows.append(torch.einsum("hqk,khd->qhd", probabilities, v))
         return torch.cat(rows).to(torch.bfloat16)
 
@@ -261,9 +283,16 @@ def test_request_ordered_capture_prepares_actual_producer_q(
         with torch.cuda.graph(rejected_graph):
             first_query = base * 3.0
             second_query = base * 4.0
-            invoke(first_query, rejected_workspace, rejected_output, rejected_preparation)
+            invoke(
+                first_query, rejected_workspace, rejected_output, rejected_preparation
+            )
             with pytest.raises(RuntimeError, match="different tensor bindings"):
-                invoke(second_query, rejected_workspace, rejected_output, rejected_preparation)
+                invoke(
+                    second_query,
+                    rejected_workspace,
+                    rejected_output,
+                    rejected_preparation,
+                )
     finally:
         rejected_preparation.discard()
     assert not rejected_preparation.finalized
@@ -272,7 +301,9 @@ def test_request_ordered_capture_prepares_actual_producer_q(
     del rejected_graph, first_query, second_query
     invoke(warm_query, rejected_workspace, rejected_output)
     torch.cuda.synchronize()
-    torch.testing.assert_close(rejected_output, reference(warm_query), atol=0.1, rtol=0.1)
+    torch.testing.assert_close(
+        rejected_output, reference(warm_query), atol=0.1, rtol=0.1
+    )
     del rejected_workspace, rejected_output, rejected_preparation
 
     graphs = []
@@ -313,7 +344,9 @@ def test_request_ordered_capture_prepares_actual_producer_q(
             output.fill_(float("nan"))
             graph.replay()
             torch.cuda.synchronize()
-            torch.testing.assert_close(output, reference(base * factor), atol=0.1, rtol=0.1)
+            torch.testing.assert_close(
+                output, reference(base * factor), atol=0.1, rtol=0.1
+            )
 
 
 @pytest.mark.parametrize(
