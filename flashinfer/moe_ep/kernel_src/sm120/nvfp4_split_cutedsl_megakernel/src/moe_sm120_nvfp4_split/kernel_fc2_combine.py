@@ -34,6 +34,7 @@ from .sm120_mma import (
     get_layout_sfa_tv,
     get_layout_sfb_tv,
     issue_m64n8k64_nvfp4,
+    issue_m64n8k64_nvfp4_packed_sfb,
     make_sm120_ldmatrix_atom,
     partition_fragment_sfa_for_sm120_mma,
     partition_fragment_sfb_for_sm120_mma,
@@ -75,6 +76,7 @@ from .split_timestamp import (
     read_globaltimer,
     trace_word,
 )
+from .sm120_ptx_helpers import lds_b32_raw
 from src.ptx_helpers import ldg_f32_raw
 from src.token_comm import TokenSrcMetadata
 
@@ -580,6 +582,13 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             n_groups = self.mma_tiler[1] // MMA_N
             rFc2Store = cute.make_rmem_tensor((8,), self.fc2_output_dtype)
             rFc2StoreI32 = cute.recast_tensor(rFc2Store, cutlass.Int32)
+            if cutlass.const_expr(self.mma_tiler[1] < 128):
+                rSFBCompact = cute.make_rmem_tensor(
+                    (n_groups * 8,), self.sf_dtype
+                )
+                rSFBCompactI32 = cute.recast_tensor(
+                    rSFBCompact, cutlass.Int32
+                )
             mma_tidx = tidx
             compute_tiled_mma = tiled_mma
             thr_mma = compute_tiled_mma.get_slice(mma_tidx)
@@ -834,9 +843,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(self.mma_tiler_sfa[0] // self.mma_tiler[0])
                     tCsSFA_selected = cute.make_tensor(tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8), tCsSFA_p.layout)
                     tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
-                    tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
                     tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
-                    tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
                     tile_compute_start = cutlass.Int64(0)
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
@@ -847,12 +854,48 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     cute.copy(smem_tiled_copy_A, tCsA_p[None, None, 0], tCrA_copy_view[None, None, 0])
                     cute.copy(smem_tiled_copy_B, tCsB_p[None, None, 0], tCrB_copy_view[None, None, 0])
                     cute.copy(smem_tiled_copy_SFA, tCsSFA_p_filtered[None, None, 0], tCrSFA_copy_view_filtered[None, None, 0])
-                    cute.copy(smem_tiled_copy_SFB, tCsSFB_p_filtered[None, None, 0], tCrSFB_copy_view_filtered[None, 0, None, 0])
-                    sfb_tiles_per_tma = 1
-                    sfb_tile_slot = cutlass.Int32(0)
                     if cutlass.const_expr(self.mma_tiler[1] < 128):
                         sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_slot = work_tile_info.tile_n_idx % cutlass.Int32(sfb_tiles_per_tma)
+                        sfb_tile_slot = (
+                            work_tile_info.tile_n_idx
+                            % cutlass.Int32(sfb_tiles_per_tma)
+                        )
+                        sfb_stage_byte_offset = (
+                            handle_b.index
+                            * cutlass.Int32(cute.cosize(sfb_smem_layout))
+                        )
+                        for ng in cutlass.range_constexpr(0, n_groups):
+                            lane_scale_row = (
+                                sfb_tile_slot
+                                * cutlass.Int32(self.mma_tiler[1])
+                                + cutlass.Int32(ng * MMA_N)
+                                + lane_idx // cutlass.Int32(4)
+                            )
+                            sfb_lane_byte_base = (
+                                (lane_scale_row % cutlass.Int32(32))
+                                * cutlass.Int32(16)
+                                + (lane_scale_row // cutlass.Int32(32))
+                                * cutlass.Int32(4)
+                                + sfb_stage_byte_offset
+                            )
+                            rSFBCompactI32[ng * 2] = lds_b32_raw(
+                                sSFB.iterator + sfb_lane_byte_base
+                            )
+                            rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
+                                sSFB.iterator
+                                + sfb_lane_byte_base
+                                + cutlass.Int32(512)
+                            )
+                    else:
+                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                        tCrSFB_copy_view_filtered = cute.filter_zeros(
+                            tCrSFB_copy_view
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 0],
+                            tCrSFB_copy_view_filtered[None, 0, None, 0],
+                        )
                     if trace_k_detail != cutlass.Int32(0):
                         iket.range_push('sm120_fc2_k128_compute')
                     for k_inner_mma in cutlass.range_constexpr(0, 2):
@@ -861,11 +904,49 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             cute.copy(smem_tiled_copy_A, tCsA_p[None, None, k_inner_next], tCrA_copy_view[None, None, k_inner_next])
                             cute.copy(smem_tiled_copy_B, tCsB_p[None, None, k_inner_next], tCrB_copy_view[None, None, k_inner_next])
                             cute.copy(smem_tiled_copy_SFA, tCsSFA_p_filtered[None, None, k_inner_next], tCrSFA_copy_view_filtered[None, None, k_inner_next])
-                            cute.copy(smem_tiled_copy_SFB, tCsSFB_p_filtered[None, None, k_inner_next], tCrSFB_copy_view_filtered[None, 0, None, k_inner_next])
+                            if cutlass.const_expr(self.mma_tiler[1] == 128):
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[
+                                        None, None, k_inner_next
+                                    ],
+                                    tCrSFB_copy_view_filtered[
+                                        None, 0, None, k_inner_next
+                                    ],
+                                )
                         for ng in cutlass.range_constexpr(0, n_groups):
-                            for sfb_slot in cutlass.range_constexpr(0, sfb_tiles_per_tma):
-                                if sfb_tile_slot == cutlass.Int32(sfb_slot):
-                                    issue_m64n8k64_nvfp4(compute_tiled_mma, accumulators[None, None, ng], tCrA, tCrB, tCrSFA, tCrSFB, n_group=ng, active_n_groups=n_groups, sfa_m_group=0, sfb_n_group=sfb_slot * n_groups + ng, k_inner=k_inner_mma, a_dtype=self.a_dtype, b_dtype=self.b_dtype, sf_dtype=self.sf_dtype)
+                            if cutlass.const_expr(self.mma_tiler[1] < 128):
+                                issue_m64n8k64_nvfp4_packed_sfb(
+                                    compute_tiled_mma,
+                                    accumulators[None, None, ng],
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA,
+                                    rSFBCompactI32,
+                                    n_group=ng,
+                                    active_n_groups=n_groups,
+                                    sfa_m_group=0,
+                                    k_inner=k_inner_mma,
+                                    a_dtype=self.a_dtype,
+                                    b_dtype=self.b_dtype,
+                                    sf_dtype=self.sf_dtype,
+                                )
+                            else:
+                                issue_m64n8k64_nvfp4(
+                                    compute_tiled_mma,
+                                    accumulators[None, None, ng],
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA,
+                                    tCrSFB,
+                                    n_group=ng,
+                                    active_n_groups=n_groups,
+                                    sfa_m_group=0,
+                                    k_inner=k_inner_mma,
+                                    a_dtype=self.a_dtype,
+                                    b_dtype=self.b_dtype,
+                                    sf_dtype=self.sf_dtype,
+                                )
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
                     ):

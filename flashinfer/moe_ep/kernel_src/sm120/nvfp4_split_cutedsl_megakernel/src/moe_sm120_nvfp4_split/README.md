@@ -59,6 +59,7 @@ compatibility guard rejects an unknown NVSHMEM device ABI.
 ## Run
 
 From the repository root, run the validated DSV4-flash EP4 correctness case:
+DSV4-flash requires `--gate_up_clamp 10.0`; omitting it disables the clamp.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -73,6 +74,7 @@ torchrun --standalone --nproc_per_node=4 \
   --num_total_experts 256 \
   --hidden 4096 \
   --intermediate 4096 \
+  --gate_up_clamp 10.0 \
   --data_parallel_size 1 \
   --tensor_parallel_size 1 \
   --route_distribution balanced \
@@ -91,6 +93,7 @@ torchrun --standalone --nproc_per_node=4 \
   --num_total_experts 256 \
   --hidden 4096 \
   --intermediate 4096 \
+  --gate_up_clamp 10.0 \
   --data_parallel_size 1 \
   --tensor_parallel_size 1 \
   --route_distribution balanced \

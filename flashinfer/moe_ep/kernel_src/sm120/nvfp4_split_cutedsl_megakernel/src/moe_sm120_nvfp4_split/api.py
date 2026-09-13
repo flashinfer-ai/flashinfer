@@ -27,7 +27,9 @@ from .jit_config import Sm120JitConfig
 # ownership cover the complete N128 SFB TMA slab. Version 7 adds the shared
 # K2 main/drain queue and graph-ordered tail finalizer contract. Version 8
 # publishes K2 work only after every FC1 K bundle in the ready block completes.
-KERNEL_CACHE_ABI = 15
+# Version 16 narrows rank-local queue/handoff publication to GPU scope and
+# removes reset/finalizer graph nodes from the ordinary tail-reclaim-off path.
+KERNEL_CACHE_ABI = 16
 
 
 @dataclass(frozen=True)

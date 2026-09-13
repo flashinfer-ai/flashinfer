@@ -334,12 +334,12 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         queue_desc[desc_base + Int32(4)] = cumulative_sf
         queue_desc[desc_base + Int32(5)] = cumulative_token_block
         queue_desc[desc_base + Int32(6)] = valid_tokens
-        cute.arch.fence_acq_rel_sys()
+        cute.arch.fence_acq_rel_gpu()
         cute.arch.store(
             queue_ready.iterator + queue_pos,
             Int32(1),
             sem="release",
-            scope="sys",
+            scope="gpu",
         )
 
     @cute.jit
@@ -401,7 +401,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 queue_desc[desc_base + Int32(5)] = cumulative_token_block
                 queue_desc[desc_base + Int32(6)] = valid_tokens
         cute.arch.sync_warp()
-        cute.arch.fence_acq_rel_sys()
+        cute.arch.fence_acq_rel_gpu()
         for work_batch in cutlass.range_constexpr(
             0, (self.k1_ready_queue_m_tiles + 31) // 32
         ):
@@ -414,7 +414,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     + tile_m_idx,
                     Int32(1),
                     sem="release",
-                    scope="sys",
+                    scope="gpu",
                 )
 
     @cute.jit
@@ -961,7 +961,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 # GPU's HBM.  K1 is the only consumer, so a GPU-scope release
                 # is sufficient; system scope needlessly drains each token's
                 # local stores toward peers before publishing the ready tile.
-                cute.arch.fence_acq_rel_sys()
+                cute.arch.fence_acq_rel_gpu()
 
                 # Accumulate this token's release target into the rotating-lane
                 # batch tracker.  task_tile_idx is warp-uniform (token_idx /
@@ -993,7 +993,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                             # for this tile.  Acquire the preceding producers'
                             # release sequence before exposing the descriptor.
                             sem="acq_rel",
-                            scope="sys",
+                            scope="gpu",
                         )
                         if old_count + Int32(1) == valid_tokens_in_tile:
                             publish_tile = Int32(1)

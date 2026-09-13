@@ -591,11 +591,12 @@ def issue_m64n8k64_nvfp4_packed_sfb(
     b_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
 ) -> None:
-    """Issue one K64 QMMA from a fixed four-byte SFB fragment.
+    """Issue one K64 QMMA from fixed four-byte SFB fragments.
 
     The caller folds the dynamic N128 slot into the shared-memory address and
-    loads two packed words for K128. Each K64 issue consumes one word, so the
-    register-fragment layout is independent of the routed tile index.
+    loads two packed words per N8 group for K128. Each K64 issue consumes one
+    word, so the register-fragment layout is independent of the routed tile
+    index.
     """
 
     if cutlass.const_expr(n_group >= active_n_groups):
@@ -608,7 +609,7 @@ def issue_m64n8k64_nvfp4_packed_sfb(
             sfa_frag[None, sfa_m_group, k_inner].iterator,
             cute.make_layout(4),
         ),
-        sfb_packed[k_inner],
+        sfb_packed[n_group * 2 + k_inner],
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         acc_dtype=cutlass.Float32,

@@ -1,7 +1,8 @@
 # SM120 NVFP4 Split Kernel Drop
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
-`hanyueh/sm120-nvfp4-split`, commit `0047b7a`.
+`hanyueh/sm120-nvfp4-split`, commit
+`0f5e3a094aa0c66a5290170fe40fa452729718d2`.
 
 The raw package is named `moe_sm120_nvfp4_split`. Its weight and activation
 contract is packed E2M1 NVFP4 x NVFP4 with one E4M3 scale per 16 K elements,

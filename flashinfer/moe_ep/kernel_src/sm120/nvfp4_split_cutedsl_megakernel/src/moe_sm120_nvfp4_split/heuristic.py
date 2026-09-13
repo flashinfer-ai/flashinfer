@@ -436,9 +436,25 @@ def select_megamoe_config(
         k1_token_n = 128
 
     cross_numa = shape.ep_cross_numa_peer_count > 0
+    # The measured DSV4 EP4 128-token point is 10% faster with N32 K2 and
+    # the balanced 72/38 partition than with the generic local-decode N16
+    # preset. Keep this narrow until neighboring wide-hidden buckets have
+    # their own controlled sweep.
+    dsv4_ep4_t128_n32 = (
+        not cross_numa
+        and shape.tokens_per_rank == 128
+        and shape.hidden == 7168
+        and shape.intermediate == 6144
+        and shape.num_topk == 6
+        and shape.num_total_experts == 384
+        and shape.data_parallel_size == 1
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size == 4
+    )
     local_decode = (
         not cross_numa
         and rows <= _LOCAL_DECODE_MAX_ROWS_PER_EXPERT
+        and not dsv4_ep4_t128_n32
     )
     # The dual-N8 path is enabled only for the exact four-rank DSV4-flash
     # envelope covered by balanced, power-law, concentrated and empty-rank
