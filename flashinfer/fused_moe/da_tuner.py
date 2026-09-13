@@ -379,6 +379,8 @@ class DAPlanCompiler:
         self,
         selections: Sequence[DAProfileSelection],
         baseline_tactic: Any,
+        *,
+        eager_selections: Sequence[DAProfileSelection] | None = None,
     ) -> DACompiledPlan:
         """Deduplicate bodies and publish singleton, switch, or guarded NoDA."""
         # Validate the complete selector catalog before graph-body reduction so classifier
@@ -415,7 +417,9 @@ class DAPlanCompiler:
         )
         admitted, reason = self._guard_admits(candidate_policy, selections)
         policy = candidate_policy if admitted else DAPlanMode.DA_FALLBACK
-        eager_tactic, eager_distribution = self._select_eager_tactic(selections)
+        eager_tactic, eager_distribution = self._select_eager_tactic(
+            selections if eager_selections is None else eager_selections
+        )
         return DACompiledPlan(
             candidate_policy=candidate_policy,
             policy=policy,

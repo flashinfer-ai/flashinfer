@@ -46,6 +46,7 @@ _ResultT = TypeVar("_ResultT")
 
 # Generic AutoTuner namespace for backend-explicit DA plan records.
 DA_MOE_CACHE_NAMESPACE = "moe_da"
+_DA_MOE_CACHE_SCHEMA = 2
 
 
 class DaMoeBackend(str, Enum):
@@ -819,8 +820,13 @@ class DaMoeOperationState:
 
             # Measure each retained body against every exemplar only when a guarded multi-body
             # plan could profitably collapse to one body and remove control overhead.
+            # Host dispatch keeps the original distribution winners; only capture may prune them.
+            eager_selections = tuple(selections)
+            capture_selections = eager_selections
             candidate_bodies = tuple(
-                dict.fromkeys(selection.selected_tactic for selection in selections)
+                dict.fromkeys(
+                    selection.selected_tactic for selection in capture_selections
+                )
             )
             candidate_latencies: dict[tuple[RoutingRealizationKey, Any], float] = {}
             if config.baseline_guard_enabled and len(candidate_bodies) > 1:
@@ -848,16 +854,18 @@ class DaMoeOperationState:
                             (selection.realization_key, "da", identity),
                             profile_candidate,
                         )
-                selections = list(
-                    compiler.prefer_control_aware_singleton(
-                        selections, candidate_latencies
-                    )
+                capture_selections = compiler.prefer_control_aware_singleton(
+                    capture_selections, candidate_latencies
                 )
         finally:
             routing_adapter.restore(inputs, original_routing)
 
         # Publish only after routing restoration and complete host-side compilation succeed.
-        compiled = compiler.compile(selections, normalized_baseline)
+        compiled = compiler.compile(
+            capture_selections,
+            normalized_baseline,
+            eager_selections=eager_selections,
+        )
         publish_compiled_plan(self.dispatcher, compiled)
         self._published_policy = compiled.policy.value
         self._eager_body = (
@@ -1021,7 +1029,7 @@ class DaMoeOperationState:
         eager_record = self._serialize_eager_body()
         if plan is None:
             return {
-                "schema": 1,
+                "schema": _DA_MOE_CACHE_SCHEMA,
                 "backend": self.key.backend.value,
                 "policy": DAPlanMode.DA_FALLBACK.value,
                 "fallback_reason": self._policy_fallback_reason,
@@ -1030,7 +1038,7 @@ class DaMoeOperationState:
         # Serialize only populated exemplar rows and deduplicated bodies; fixed-capacity device
         # padding is reconstructed during restore.
         return {
-            "schema": 1,
+            "schema": _DA_MOE_CACHE_SCHEMA,
             "backend": self.key.backend.value,
             "policy": self._published_policy,
             **eager_record,
@@ -1055,7 +1063,7 @@ class DaMoeOperationState:
         with self._lock:
             if self._tuned:
                 return
-            if record.get("schema") != 1:
+            if record.get("schema") != _DA_MOE_CACHE_SCHEMA:
                 raise ValueError("Unsupported current DA tuning-cache schema")
             if record.get("backend") != self.key.backend.value:
                 raise ValueError(
