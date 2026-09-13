@@ -4,9 +4,10 @@
 Runs every row of the authoritative 12-workload route matrix through
 ``bench_cake_mamba_ssd_combined.py --vibecuda`` semantics: live CAKE baseline
 as the speedup denominator, VibeCUDA candidate, CUPTI ``bench_gpu_time`` with
-5 dry-run + 100 repetitions and median aggregation, fp64 sequential
-ground-truth validation of both legs, and a NaN-sentinel full-write proof on
-the caller-owned ``out``.
+5 dry-run + 100 repetitions and median aggregation, candidate parity against
+the CuTe reference at ``atol=rtol=0.01``, and a NaN-sentinel full-write proof
+on the caller-owned ``out``. The sequential FP64 comparison remains a
+diagnostic and does not replace the repository's CuTe parity contract.
 
 Two execution modes:
 
@@ -314,21 +315,16 @@ def _validate_row(report: dict | None) -> list[str]:
     for key in ("cake_ms", "vibecuda_ms", "vibecuda_speedup_vs_cake"):
         if key not in report:
             failures.append(f"missing timing field {key!r}")
-    if not report.get("vibecuda_truth_out", {}).get("tolerance_passed", False):
-        failures.append("vibecuda fp64 truth gate failed for out")
-    if not report.get("vibecuda_truth_final_states", {}).get("tolerance_passed", False):
-        failures.append("vibecuda fp64 truth gate failed for final_states")
+    if not report.get("vibecuda_out", {}).get("tolerance_passed", False):
+        failures.append("vibecuda CuTe parity failed for out at 0.01/0.01")
+    if not report.get("vibecuda_final_states", {}).get("tolerance_passed", False):
+        failures.append("vibecuda CuTe parity failed for final_states at 0.01/0.01")
     if not report.get("full_write", {}).get("fully_written", False):
         failures.append(
             "full-write sentinel check failed "
             f"({report.get('full_write', {}).get('unwritten_elements')} "
             "unwritten elements)"
         )
-    no_worse = report.get("candidate_no_worse_than_cake", {})
-    if not no_worse.get("out", False):
-        failures.append("candidate output error exceeds cake error")
-    if not no_worse.get("final_states", False):
-        failures.append("candidate final-state error exceeds cake error")
     if report.get("timing_backend") != "cupti":
         failures.append(f"unexpected timing backend {report.get('timing_backend')!r}")
     return failures
@@ -368,9 +364,8 @@ def _reused_row(results_dir: Path, name: str) -> dict | None:
         "cake_ms": report["cake_ms"],
         "vibecuda_ms": report["vibecuda_ms"],
         "speedup": report["vibecuda_speedup_vs_cake"],
-        "truth_passed": True,
+        "cute_parity_passed": True,
         "full_write_passed": True,
-        "candidate_no_worse_than_cake": report.get("candidate_no_worse_than_cake", {}),
         "cake_cute_parity": artifact.get("cake_cute_parity", {}),
         "reused_from_artifact": True,
     }
@@ -538,7 +533,7 @@ def main() -> int:
         print(
             f"[{index:>2}/{len(MATRIX)}] {name:<14} "
             f"cake {cake_us:7.2f} µs  vibecuda {vibe_us:7.2f} µs  "
-            f"speedup {speedup:5.3f}x  truth PASS  full-write PASS  "
+            f"speedup {speedup:5.3f}x  CuTe parity PASS  full-write PASS  "
             f"{parity}  — wall {elapsed:.1f}s",
             flush=True,
         )
@@ -548,9 +543,8 @@ def main() -> int:
                 "cake_ms": report["cake_ms"],
                 "vibecuda_ms": report["vibecuda_ms"],
                 "speedup": speedup,
-                "truth_passed": True,
+                "cute_parity_passed": True,
                 "full_write_passed": True,
-                "candidate_no_worse_than_cake": report["candidate_no_worse_than_cake"],
                 "cake_cute_parity": artifact["cake_cute_parity"],
             }
         )

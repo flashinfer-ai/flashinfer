@@ -240,9 +240,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run_workload(args) -> dict:
     """Run one workload row and return the report dict.
 
-    Candidate-side gates (vibecuda fp64 truth, NaN-sentinel full write) raise
-    ``AssertionError`` here; the cake-vs-cute self-gate stays in :func:`main`
-    so an in-process matrix driver can treat it as informational.
+    Candidate-side gates (CuTe parity at 0.01/0.01 and NaN-sentinel full
+    write) raise ``AssertionError`` here. The sequential FP64 comparison and
+    Cake-versus-CuTe comparison are diagnostics rather than acceptance gates.
     """
     torch.manual_seed(args.seed)
     state_dtype = getattr(torch, args.state_dtype)
