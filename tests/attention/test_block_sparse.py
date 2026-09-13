@@ -137,6 +137,8 @@ def _run_block_sparse_attention_case(
             pytest.skip("vsa_blackwell supports SM100 and SM103, not SM107")
         if not is_sm100a_supported(torch.device(0)):
             pytest.skip("vsa_blackwell requires sm100a (Blackwell GPU)")
+        if torch.cuda.get_device_capability(0) == (10, 7):
+            pytest.skip("vsa_blackwell supports SM100/SM103, not SM107")
         if R != 128 or C != 128:
             pytest.skip("vsa_blackwell requires R == C == 128")
         if M % 128 != 0 or N % 128 != 0:
