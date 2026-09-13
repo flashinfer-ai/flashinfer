@@ -4,15 +4,17 @@ The frozen device TU in ``csrc/alphamoe_sm100.cu`` is a generated Loom
 schedule of the Alpha-MoE up+SwiGLU+down megakernel. The torch reference
 reproduced below rounds each routed per-128-block down contribution to BF16
 before accumulating, exactly like the kernel's
-``cp.reduce.async.bulk .add.noftz.bf16`` output path. The candidate also
-reassociates FP32 scale multiplication. For BF16 accumulation, the reference
-adds in a fixed (expert, intermediate-block) order while the kernel's reduce-adds
+``cp.reduce.async.bulk .add.noftz.bf16`` output path. The down reference applies
+FP32 block and route scales after the FP8-code dot product, preserving the
+kernel's scale association. The up/activation reference remains independent
+Torch math. For BF16 accumulation, the reference adds in a fixed
+(expert, intermediate-block) order while the kernel's reduce-adds
 land in hardware scheduling order, which is nondeterministic run to run.
 BF16 addition is commutative but not associative, so:
 
-- cases where every output element receives at most TWO contributions into a
-  zero accumulator are order-insensitive and are asserted with
-  ``torch.equal`` (any hardware order gives the same bits);
+- the fixed cases with at most TWO contributions into a zero accumulator
+  retain ``torch.equal``. Two identical BF16 contributions are order-insensitive;
+  this does not guarantee equality of all preceding FP32 intermediates;
 - all other cases are asserted at the FP8-tier contract tolerance
   (``atol=0.1, rtol=0.1``) widened per element by an accumulation-order
   bound of 2 ulp of the accumulated |contribution| mass (see
@@ -238,10 +240,10 @@ def _make_case(
 
 
 def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
-    """Torch reference with per-active-expert weight dequantization.
+    """Torch reference with dequantized up and post-dot-scaled down projections.
 
-    Dequantized routed expert math with the kernel's source-visible rounding:
-    the intermediate is requantized to FP8 per token in groups of 128, each
+    The intermediate is requantized to FP8 per token in groups of 128. Down
+    dot products use FP8 codes, followed by explicit FP32 scale operations; each
     128-wide intermediate block's down contribution rounds to BF16 before the
     accumulator add, and every accumulator update rounds to BF16.
     """
@@ -278,18 +280,24 @@ def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
         if pair_indices.numel() == 0:
             continue
         w1 = case["w1"][expert].float() * _expand_block_scales(case["w1_scale"][expert])
-        w2 = case["w2"][expert].float() * _expand_block_scales(case["w2_scale"][expert])
+        w2 = case["w2"][expert].float()
         token_indices = torch.div(pair_indices, top_k, rounding_mode="floor")
         gate_up = x[token_indices] @ w1.transpose(0, 1)
         gate, up = gate_up[:, :intermediate], gate_up[:, intermediate:]
         activated = torch.nn.functional.silu(gate) * up
         act_q, act_scale = _quantize_per_row_group(activated)
-        activated_dequant = act_q.float() * act_scale.repeat_interleave(_GROUP, dim=1)
         for base in range(0, intermediate, _GROUP):
-            down = activated_dequant[:, base : base + _GROUP] @ w2[
+            down = act_q[:, base : base + _GROUP].float() @ w2[
                 :, base : base + _GROUP
             ].transpose(0, 1)
-            down *= flat_weights[pair_indices, None] * case["scaling_factor"]
+            # Keep scales after the FP8-code dot product. Dequantizing operands
+            # before matmul can move a BF16 midpoint by one FP32 ulp.
+            group = base // _GROUP
+            token_scale = act_scale[:, group] * flat_weights[pair_indices]
+            token_scale = token_scale * case["scaling_factor"]
+            w2_scale = case["w2_scale"][expert, :, group].repeat_interleave(_GROUP)
+            out_scale = token_scale[:, None] * w2_scale[None, :]
+            down *= out_scale
             routed_bf16 = down.to(torch.bfloat16)
             output[token_indices] = (
                 output[token_indices].float() + routed_bf16.float()
@@ -301,7 +309,7 @@ def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
 def _assert_order_tolerant(out, expected, abs_sum, label):
     """Contract tolerance widened by an accumulation-order bound near zero.
 
-    In addition to FP32 scale reassociation, BF16 accumulation order can move a
+    BF16 accumulation order can move a
     near-zero output element (catastrophic cancellation of O(abs_sum)
     partials) by a few ulp of the PARTIAL-SUM magnitude —
     which can exceed ``atol + rtol*|ref|`` when |ref| is tiny. Bound each
@@ -382,7 +390,8 @@ def test_alphamoe_sm100_matches_reference(
     expected, abs_sum = _reference(case, return_abs_sum=True)
     contributions_per_element = top_k * (n // 256)
     if contributions_per_element <= 2:
-        # Two BF16 addends into a zero accumulator are order-insensitive.
+        # Keep the exact gate for these fixed two-contribution cases; the
+        # contribution count alone does not guarantee FP32-stage parity.
         assert torch.equal(out, expected), (
             f"mismatch vs torch reference at {label}: "
             f"{(out != expected).sum().item()} differing elements, "
@@ -390,7 +399,7 @@ def test_alphamoe_sm100_matches_reference(
         )
     else:
         # 3+ addends: retain the contract tolerance and near-zero order bound.
-        # FP32 scale reassociation remains subject to these existing assertions.
+        # Independent up/activation rounding remains subject to these assertions.
         _assert_order_tolerant(out, expected, abs_sum, label)
 
 
