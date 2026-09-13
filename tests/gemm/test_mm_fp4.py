@@ -259,6 +259,119 @@ def _nvfp4_operands(m, n, k):
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
+def _cutlass_scheduler_operands(m, n=1152, k=256):
+    # Integer-valued FP4 inputs make both the dot product and scaled reference exact.
+    values = torch.tensor([0, 1, -1, 2, -2], device="cuda", dtype=torch.float32)
+    codes = torch.tensor([0, 2, 10, 4, 12], device="cuda", dtype=torch.uint8)
+    column = torch.arange(k, device="cuda")
+    a_index = (torch.arange(m, device="cuda")[:, None] + column * 3) % 5
+    b_index = (torch.arange(n, device="cuda")[:, None] * 2 + column) % 5
+    a_codes, b_codes = codes[a_index], codes[b_index]
+    a = a_codes[:, ::2] | (a_codes[:, 1::2] << 4)
+    b = b_codes[:, ::2] | (b_codes[:, 1::2] << 4)
+    # Uniform E4M3 scale 1 has the same bytes in every 128x4 block-scale layout.
+    a_scale = torch.full(
+        ((m + 127) // 128 * 128, k // 16), 0x38, device="cuda", dtype=torch.uint8
+    )
+    b_scale = torch.full((n, k // 16), 0x38, device="cuda", dtype=torch.uint8)
+    reference = values[a_index] @ values[b_index].T
+    alpha = torch.tensor([1.25], device="cuda", dtype=torch.float32)
+    return a, b, a_scale, b_scale, alpha, reference
+
+
+@pytest.mark.parametrize("m", [4, 257, 1025])
+@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+def test_mm_fp4_cutlass_scheduler_tactics(m, out_dtype):
+    """All legacy and appended schedules preserve spatial output and live GPU alpha."""
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("CUTLASS scheduler variants require SM120/SM121.")
+    from flashinfer.jit.gemm import gen_gemm_sm120_module_cutlass_fp4
+
+    module = gen_gemm_sm120_module_cutlass_fp4().build_and_load()
+    assert module.fp4_gemm_tactic_num() == 64
+    a, b, sa, sb, alpha, reference = _cutlass_scheduler_operands(m)
+    out = torch.empty(reference.shape, device="cuda", dtype=out_dtype)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    saved_inputs = [t.clone() for t in (a, b, sa, sb)]
+
+    for tactic in [-1, *range(64)]:
+        # The first 32 integer IDs remain valid, and each added schedule is explicit.
+        module.fp4_gemm(a, b, sa, sb, alpha, out, workspace, tactic)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            module.fp4_gemm(a, b, sa, sb, alpha, out, workspace, tactic)
+        for scale in (1.25, -0.75):
+            alpha.fill_(scale)
+            out.fill_(float("nan"))
+            graph.replay()
+            expected = (reference * scale).to(out_dtype)
+            assert torch.isfinite(out).all()
+            assert torch.equal(out.view(torch.int16), expected.view(torch.int16)), (
+                tactic
+            )
+        for actual, saved in zip((a, b, sa, sb), saved_inputs, strict=True):
+            assert torch.equal(actual, saved)
+
+
+@pytest.mark.parametrize("managed_cache", [False, True])
+def test_mm_fp4_cutlass_scheduler_autotune_cache(monkeypatch, tmp_path, managed_cache):
+    """Public tuning selects an appended integer tactic and replays it after reload."""
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("CUTLASS scheduler variants require SM120/SM121.")
+    from flashinfer import autotune_v2
+    from flashinfer.autotuner import AutoTuner
+
+    monkeypatch.setattr(AutoTuner, "_instance", None)
+    a, b, sa, sb, alpha, reference = _cutlass_scheduler_operands(4)
+    profiled = []
+
+    def profile(self, runner, inputs, tactic, tuning_config=None, **kwargs):
+        profiled.append(tactic)
+        runner(inputs, tactic=tactic)
+        # Deterministic selection tests cache plumbing, not hardware performance.
+        return 1.0 if tactic == 54 else 2.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    context = (
+        autotune_v2(cache_root=tmp_path / "managed", tuning_buckets=(4,))
+        if managed_cache
+        else autotune(True, tuning_buckets=(4,))
+    )
+    with context:
+        out = mm_fp4(a, b.T, sa, sb.T, alpha, backend="cutlass")
+    assert set(profiled) == (set(range(64)) | ({-1} if managed_cache else set()))
+    expected = (reference * 1.25).to(torch.bfloat16)
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+    cache = tmp_path / "tactics.json"
+    if not managed_cache:
+        AutoTuner.get().save_configs(cache)
+    monkeypatch.setattr(AutoTuner, "_instance", None)
+    if not managed_cache:
+        AutoTuner.get().load_configs(cache)
+    calls = []
+    original_choose = AutoTuner.choose_one
+
+    def choose(self, *args, **kwargs):
+        runner, tactic = original_choose(self, *args, **kwargs)
+        calls.append(tactic)
+        return runner, tactic
+
+    monkeypatch.setattr(AutoTuner, "choose_one", choose)
+    alpha.fill_(-0.75)
+    replay = (
+        autotune_v2(cache_root=tmp_path / "managed", mode="replay", tuning_buckets=(4,))
+        if managed_cache
+        else autotune(True, tuning_buckets=(4,))
+    )
+    with replay:
+        out = mm_fp4(a, b.T, sa, sb.T, alpha, backend="cutlass")
+    assert calls == [54]
+    assert len(profiled) == (65 if managed_cache else 64)
+    expected = (reference * -0.75).to(torch.bfloat16)
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
 def test_mm_fp4_b12x_short_k_multi_wave():
     # One K tile and more work tiles than SMs stress the epilogue smem
     # handoff between a persistent CTA's work tiles, a regime the
