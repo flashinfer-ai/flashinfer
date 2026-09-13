@@ -324,7 +324,7 @@ def test_flat_page_pitch_preserved(prefill, glm, sm12x):
 
     expected = run(packed)
     actual = run(pitched)
-    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
 
 
 @pytest.mark.parametrize("append,issue", [(False, "row_gap"), (True, "page_overlap")])

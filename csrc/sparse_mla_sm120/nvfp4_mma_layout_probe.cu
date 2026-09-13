@@ -23,7 +23,6 @@
 #include <flashinfer/attention/sparse_mla_sm120/arch/matrix_memory.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/arch/mma_sm120_nvfp4.cuh>
 
-
 #include "../tvm_ffi_utils.h"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
@@ -31,9 +30,9 @@ namespace flashinfer::sparse_mla_sm120::nvfp4 {
 namespace {
 
 template <int KV_STRIDE>
-__device__ __forceinline__ void load_candidate_major_e2m1_b_n8(
-    uint32_t& b0, uint32_t& b1, const uint8_t* __restrict__ kv_smem,
-    int entry_base, int dim, int lane) {
+__device__ __forceinline__ void load_candidate_major_e2m1_b_n8(uint32_t& b0, uint32_t& b1,
+                                                               const uint8_t* __restrict__ kv_smem,
+                                                               int entry_base, int dim, int lane) {
   const int gid = lane >> 2;
   const int tid = lane & 3;
   const int byte_column = dim >> 1;

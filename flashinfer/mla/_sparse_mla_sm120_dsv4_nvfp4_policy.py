@@ -114,7 +114,7 @@ class NVFP4CalibrationReport:
 _plan_memo: dict[tuple, NVFP4KernelVariant] = {}
 _plan_epoch = -1
 _calibration_lock = threading.RLock()
-_calibrating: set[tuple[str, str, int, int]] = set()
+_calibrating: set[tuple[str | None, str, str, int, int]] = set()
 
 
 def _token_bucket(num_tokens: int) -> int:

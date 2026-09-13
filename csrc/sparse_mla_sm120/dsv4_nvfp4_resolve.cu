@@ -13,9 +13,9 @@
 namespace flashinfer::sparse_mla_sm120::execution {
 
 ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk, int page_size,
-                             int extra_page_size, size_t page_stride_bytes,
-                             size_t extra_page_stride_bytes, int cpb, int sm_count,
-                             size_t max_shared_bytes, bool prefill, bool stage1_only) {
+                                 int extra_page_size, size_t page_stride_bytes,
+                                 size_t extra_page_stride_bytes, int cpb, int sm_count,
+                                 size_t max_shared_bytes, bool prefill, bool stage1_only) {
   using namespace nvfp4;
   TVM_FFI_ICHECK(tokens > 0 && has_instance(heads, topk)) << "unsupported NVFP4 tokens/heads/topk";
   TVM_FFI_ICHECK(page_size == FixedPageSize &&
@@ -34,19 +34,19 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
   const int chunks = (topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW +
                      (extra_topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW;
   const int grouped_blocks = (heads + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
-  const bool grouped =
-      prefill || (heads >= STREAMING_HEADS_PER_CTA && chunks >= 8 && tokens * grouped_blocks >= 8);
+  const bool grouped = prefill || (heads >= STREAMING_HEADS_PER_CTA && chunks >= 8 &&
+                                   int64_t{tokens} * grouped_blocks >= 8);
   const int h_blocks = grouped ? grouped_blocks : (heads + HPB - 1) / HPB;
   if (prefill) cpb = chunks;
   if (cpb < 1 || cpb > chunks) {
-    const int per_token_head = tokens * h_blocks;
-    const int target_waves = (per_token_head + sm_count - 1) / sm_count;
+    const int64_t per_token_head = int64_t{tokens} * h_blocks;
+    const int64_t target_waves = (per_token_head + sm_count - 1) / sm_count;
     cpb = 1;
     float best_gap = static_cast<float>(target_waves) + 1.f;
     for (int candidate = 1; candidate <= chunks; ++candidate) {
       const int splits = (chunks + candidate - 1) / candidate;
-      const int active = per_token_head * splits;
-      const int waves = (active + sm_count - 1) / sm_count;
+      const int64_t active = per_token_head * splits;
+      const int64_t waves = (active + sm_count - 1) / sm_count;
       if (waves != target_waves) continue;
       const float gap = static_cast<float>(waves) - static_cast<float>(active) / sm_count;
       if (gap < best_gap - 1e-6f || (gap < best_gap + 1e-6f && candidate > cpb)) {
@@ -88,8 +88,8 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
 }
 
 ffi::Module resolve_dsv4_nvfp4_descriptor(ffi::Array<int64_t> values, int64_t numeric, int64_t cpb,
-                                      int64_t sm_count, int64_t max_shared_bytes,
-                                      bool stage1_only) {
+                                          int64_t sm_count, int64_t max_shared_bytes,
+                                          bool stage1_only) {
   const auto m = unpack_metadata(values, 0);
   TVM_FFI_ICHECK(numeric == int64_t(NumericRoute::NVFP4) && cpb >= 0 && cpb <= INT_MAX &&
                  sm_count > 0 && sm_count <= INT_MAX && max_shared_bytes > 0)
@@ -100,18 +100,18 @@ ffi::Module resolve_dsv4_nvfp4_descriptor(ffi::Array<int64_t> values, int64_t nu
                  (!m.has_extra_lengths || m.extra_topk > 0) && m.indices_stride == size_t(m.topk) &&
                  m.extra_indices_stride == size_t(m.extra_topk) && m.lse_stride == size_t(m.heads))
       << "DSV4 NVFP4 attention metadata mismatch";
-  auto p = resolve_dsv4_nvfp4(m.tokens, m.heads, m.topk, m.extra_topk, m.page_size, m.extra_page_size,
-                          m.page_stride_bytes, m.extra_page_stride_bytes, cpb, sm_count,
-                          max_shared_bytes, m.variant == 1, stage1_only);
+  auto p = resolve_dsv4_nvfp4(m.tokens, m.heads, m.topk, m.extra_topk, m.page_size,
+                              m.extra_page_size, m.page_stride_bytes, m.extra_page_stride_bytes,
+                              cpb, sm_count, max_shared_bytes, m.variant == 1, stage1_only);
   p.metadata = m;
   return pack_plan(p);
 }
 
-ffi::Module resolve_dsv4_nvfp4_query(int64_t tokens, int64_t heads, int64_t topk, int64_t extra_topk,
-                                 int64_t page_size, int64_t extra_page_size, int64_t page_stride,
-                                 int64_t extra_page_stride, int64_t cpb, int64_t sm_count,
-                                 int64_t shared, bool prefill, bool stage1, bool lengths,
-                                 bool extra_lengths, bool sink) {
+ffi::Module resolve_dsv4_nvfp4_query(int64_t tokens, int64_t heads, int64_t topk,
+                                     int64_t extra_topk, int64_t page_size, int64_t extra_page_size,
+                                     int64_t page_stride, int64_t extra_page_stride, int64_t cpb,
+                                     int64_t sm_count, int64_t shared, bool prefill, bool stage1,
+                                     bool lengths, bool extra_lengths, bool sink) {
   return resolve_dsv4_nvfp4_descriptor(
       {int(ModelType::DSV4), tokens, heads, topk, extra_topk, page_size, extra_page_size,
        page_stride, extra_page_stride, Dsv4Nvfp4Layout::BYTES_PER_TOKEN, topk, extra_topk, heads,
@@ -127,11 +127,11 @@ bool supports_attention(int64_t heads, int64_t topk, int64_t page, int64_t extra
     return false;
   try {
     resolve_dsv4_nvfp4(1, heads, topk, extra_topk, page, extra_page,
-                   size_t(page) * Dsv4Nvfp4Layout::BYTES_PER_TOKEN,
-                   size_t(extra_page) * Dsv4Nvfp4Layout::BYTES_PER_TOKEN, 1, 1, SIZE_MAX, false,
-                   false);
+                       size_t(page) * Dsv4Nvfp4Layout::BYTES_PER_TOKEN,
+                       size_t(extra_page) * Dsv4Nvfp4Layout::BYTES_PER_TOKEN, 1, 1, SIZE_MAX, false,
+                       false);
     return true;
-  } catch (const ffi::Error &) {
+  } catch (const ffi::Error&) {
     return false;
   }
 }
@@ -164,5 +164,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(supports_attention,
                               flashinfer::sparse_mla_sm120::execution::supports_attention);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(resolve_dsv4_nvfp4,
                               flashinfer::sparse_mla_sm120::execution::resolve_dsv4_nvfp4_query);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_nvfp4_resolve_attention,
-                              flashinfer::sparse_mla_sm120::execution::resolve_dsv4_nvfp4_descriptor);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    dsv4_nvfp4_resolve_attention,
+    flashinfer::sparse_mla_sm120::execution::resolve_dsv4_nvfp4_descriptor);

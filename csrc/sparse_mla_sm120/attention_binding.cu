@@ -5,11 +5,11 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h>
+#include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 #include <tvm/ffi/container/array.h>
 
-#include <flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/dsv41_layout.cuh>
-#include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 
 #include "attention_descriptor.h"
 #include "attention_dispatch.h"
@@ -207,33 +207,33 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       metadata, BF16 ? execution::NumericRoute::FullBF16 : execution::NumericRoute::FP8,
       chunks_per_block_override, {sm_count, size_t(max_shared)});
   const execution::AttentionParams params{num_heads,
-                                       topk,
-                                       static_cast<const bf16*>(q.data_ptr()),
-                                       static_cast<const uint8_t*>(kv_cache.data_ptr()),
-                                       static_cast<const int32_t*>(indices.data_ptr()),
-                                       static_cast<bf16*>(mid_out.data_ptr()),
-                                       static_cast<float*>(mid_lse.data_ptr()),
-                                       topk_len_ptr,
-                                       static_cast<bf16*>(output.data_ptr()),
-                                       static_cast<float*>(out_lse.data_ptr()),
-                                       attn_sink_ptr,
-                                       extra_kv_ptr,
-                                       extra_indices_ptr,
-                                       extra_topk_len_ptr,
-                                       extra_topk_arg,
-                                       pbs_extra_arg,
-                                       stride_extra_kv_block,
-                                       num_tokens,
-                                       int(num_splits),
-                                       plan.cpb,
-                                       float(sm_scale),
-                                       kv_layout.stride_kv_block,
-                                       stride_indices_token,
-                                       stride_extra_indices_token,
-                                       stride_out_lse,
-                                       page_block_size,
-                                       extra_fp4,
-                                       BF16};
+                                          topk,
+                                          static_cast<const bf16*>(q.data_ptr()),
+                                          static_cast<const uint8_t*>(kv_cache.data_ptr()),
+                                          static_cast<const int32_t*>(indices.data_ptr()),
+                                          static_cast<bf16*>(mid_out.data_ptr()),
+                                          static_cast<float*>(mid_lse.data_ptr()),
+                                          topk_len_ptr,
+                                          static_cast<bf16*>(output.data_ptr()),
+                                          static_cast<float*>(out_lse.data_ptr()),
+                                          attn_sink_ptr,
+                                          extra_kv_ptr,
+                                          extra_indices_ptr,
+                                          extra_topk_len_ptr,
+                                          extra_topk_arg,
+                                          pbs_extra_arg,
+                                          stride_extra_kv_block,
+                                          num_tokens,
+                                          int(num_splits),
+                                          plan.cpb,
+                                          float(sm_scale),
+                                          kv_layout.stride_kv_block,
+                                          stride_indices_token,
+                                          stride_extra_indices_token,
+                                          stride_out_lse,
+                                          page_block_size,
+                                          extra_fp4,
+                                          BF16};
   const auto status = dispatch_decode(params, plan, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "decode-dsv4: " << cudaGetErrorString(status);
 }
@@ -351,7 +351,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   const auto& m = plan.metadata;
   const auto format = cache_format_info(static_cast<ModelType>(m.model));
   const bool inline_scale = format.inline_scale;
-  const size_t q_alignment = plan.numeric == execution::NumericRoute::QkBF16PvFP8            ? 2
+  const size_t q_alignment = plan.numeric == execution::NumericRoute::QkBF16PvFP8       ? 2
                              : plan.implementation == execution::Implementation::SwapAB ? 8
                                                                                         : 16;
   check_decode_tensors(q, cache, indices, mid, mlse, output, lse, plan.chunk_capacity, q_alignment);

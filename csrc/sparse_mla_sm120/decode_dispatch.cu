@@ -18,9 +18,10 @@ cudaError_t dispatch_decode(const execution::AttentionParams& params,
                                       execution::FixedPageSize>(params, plan, stream);          \
     });
   MODEL(DSV4)
-  MODEL(DOTS3_SWA) MODEL(DSV4_1)
+  MODEL(DOTS3_SWA)
+  MODEL(DSV4_1)
 #undef MODEL
-      return cudaErrorInvalidValue;
+  return cudaErrorInvalidValue;
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

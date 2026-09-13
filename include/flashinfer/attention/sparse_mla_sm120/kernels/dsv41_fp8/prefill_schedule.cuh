@@ -76,7 +76,8 @@ struct Dsv41MixedCachePrefillSchedule
           Transaction::wait(ready + buf, Cursor::phase(extra_tile++));
           if (Cursor::reuses(tile)) KvFree::acquire(buf);
           kernels::dsv41_fp8::convert_raw<Plan>(Plan::raw(scratch, buf), sm.kv_bufs[buf],
-              sm.kv_scale_bufs[buf], role_tid, [&](int row) { return sec.index(row, BI) >= 0; });
+                                                sm.kv_scale_bufs[buf], role_tid,
+                                                [&](int row) { return sec.index(row, BI) >= 0; });
         }
         RawFree::release(buf);
         KvReady::publish(buf);

@@ -1215,7 +1215,9 @@ def _materialize_store(state: dict) -> None:
         _apply_unit(devices, *unit)
     parsed = _parse_payload_devices(devices)
     state["profiles"] = {dev: data.get("profiles", {}) for dev, data in devices.items()}
-    for name, values in zip(("constants", "crossover", "overrides"), parsed):
+    for name, values in zip(
+        ("constants", "crossover", "overrides"), parsed, strict=True
+    ):
         state[name].clear()
         state[name].update(values)
     _constants_version += 1
@@ -1276,9 +1278,15 @@ def publish_calibration(
     crossover: dict[str, int] | None = None,
     overrides: dict[str, int] | None = None,
     replace_family: bool = False,
+    replace_family_if_absent: bool = False,
     profiles: dict | None = None,
 ) -> bool:
-    """Publish one measured unit; write failures retain a scope-local overlay."""
+    """Publish one measured unit; write failures retain a scope-local overlay.
+
+    ``replace_family`` discards the family's stale crossover/override entries
+    unconditionally (force re-measurement). ``replace_family_if_absent`` does
+    so only when the family is still absent under the publish lock; when a
+    concurrent publisher landed in between, entries merge instead."""
     with _store_lock:
         refresh_store()
         path, state = _activate_store()
@@ -1286,8 +1294,9 @@ def publish_calibration(
         aliases = (
             ("dsv3_2", "glm_nsa") if family in ("dsv3_2", "glm_nsa") else (family,)
         )
-        prefixes = tuple(f + "|" for f in aliases) if replace_family else ()
-        if replace_family and family.startswith("dsv4_nvfp4"):
+        replace = replace_family or replace_family_if_absent
+        prefixes = tuple(f + "|" for f in aliases) if replace else ()
+        if replace and family.startswith("dsv4_nvfp4"):
             prefixes += (family + "_t",)
         unit = (
             dev_key,
@@ -1297,7 +1306,7 @@ def publish_calibration(
             prefixes,
             profiles,
         )
-        candidate = {}
+        candidate: dict = {}
         _apply_unit(candidate, *unit)
         _parse_payload_devices(candidate)
         persisted = False
@@ -1309,7 +1318,14 @@ def publish_calibration(
                 devices = payload.setdefault("devices", {})
                 for pending in state["overlay"]:
                     _apply_unit(devices, *pending)
-                _apply_unit(devices, *unit)
+                effective = unit
+                if (
+                    replace_family_if_absent
+                    and not replace_family
+                    and any(f in devices.get(dev_key, {}) for f in aliases)
+                ):
+                    effective = unit[:4] + ((),) + unit[5:]
+                _apply_unit(devices, *effective)
                 _parse_payload_devices(devices)
                 with tempfile.NamedTemporaryFile(
                     mode="w", dir=path.parent, delete=False
@@ -1322,9 +1338,7 @@ def publish_calibration(
                 state["token"] = _file_token(path)
                 persisted = True
         except OSError as error:
-            logger.warning(
-                "SM120 calibration not persisted to %s (%s)", path, error
-            )
+            logger.warning("SM120 calibration not persisted to %s (%s)", path, error)
         finally:
             if tmp is not None:
                 with contextlib.suppress(FileNotFoundError):
@@ -2081,7 +2095,8 @@ def calibrate_sparse_mla_sm120(
                     cpb_family,
                     constants=c if existing is None else None,
                     crossover=table,
-                    replace_family=existing is None,
+                    replace_family=force,
+                    replace_family_if_absent=existing is None and not force,
                 )
                 and persisted
             )

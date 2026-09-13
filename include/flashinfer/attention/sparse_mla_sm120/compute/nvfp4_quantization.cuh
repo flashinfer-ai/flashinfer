@@ -16,12 +16,11 @@
 
 #pragma once
 
-#include <cstdint>
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <cstdint>
 #include <flashinfer/math.cuh>
 
 #include "../model/kv_storage.cuh"

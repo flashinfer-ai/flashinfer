@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+
 #include <cstdint>
 
 namespace flashinfer::sparse_mla_sm120::pipeline {

@@ -24,7 +24,6 @@
 #include "../../compute/nvfp4_vt.cuh"
 #include "../../compute/warp_tiles.cuh"
 #include "../../pipeline/staged_pipeline.cuh"
-
 #include "gather.cuh"
 #include "q_stage.cuh"
 #include "resources.cuh"
@@ -40,8 +39,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const float* __restrict__ attn_sink, const int* __restrict__ topk_length_ptr,
         const uint8_t* __restrict__ extra_kv_cache, const int32_t* __restrict__ extra_indices,
         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
-        size_t extra_page_stride_bytes, int num_tokens, int scratch_split_stride, int chunks_per_block,
-        float sm_scale, size_t page_stride_bytes, bool write_direct) {
+        size_t extra_page_stride_bytes, int num_tokens, int scratch_split_stride,
+        int chunks_per_block, float sm_scale, size_t page_stride_bytes, bool write_direct) {
   static_assert(NUM_HEADS <= STREAMING_HEADS_PER_CTA || NUM_HEADS % STREAMING_HEADS_PER_CTA == 0);
   constexpr int VALID_HEAD_GROUPS =
       NUM_HEADS < STREAMING_HEADS_PER_CTA ? (NUM_HEADS + HPB - 1) / HPB : STREAMING_HEAD_GROUPS;
@@ -103,7 +102,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
           output[((size_t)token_idx * NUM_HEADS + h_start + head) * D_V + dim] =
               __float2bfloat16(0.f);
         } else {
-          mid_out[(((size_t)token_idx * NUM_HEADS + h_start + head) * scratch_split_stride + split_idx) *
+          mid_out[(((size_t)token_idx * NUM_HEADS + h_start + head) * scratch_split_stride +
+                   split_idx) *
                       D_V +
                   dim] = __float2bfloat16(0.f);
         }
@@ -287,7 +287,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       float block_max = -1e30f;
 #pragma unroll
       for (int w = 0; w < STREAMING_N_WARPS; ++w)
-        block_max = fmaxf(block_max, sm.reduce_scratch()[(group * STREAMING_N_WARPS + w) * HPB + head]);
+        block_max =
+            fmaxf(block_max, sm.reduce_scratch()[(group * STREAMING_N_WARPS + w) * HPB + head]);
       const int group_base = group * REDUCE_GROUP_STRIDE;
       sm.reduce_scratch()[group_base + head] = block_max;
     }
@@ -513,8 +514,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     bf16* destination =
         write_direct
             ? output + ((size_t)token_idx * NUM_HEADS + group_h_start) * D_V
-            : mid_out +
-                  (((size_t)token_idx * NUM_HEADS + group_h_start) * scratch_split_stride + split_idx) * D_V;
+            : mid_out + (((size_t)token_idx * NUM_HEADS + group_h_start) * scratch_split_stride +
+                         split_idx) *
+                            D_V;
     const size_t head_stride = write_direct ? D_V : (size_t)scratch_split_stride * D_V;
 #pragma unroll
     for (int slot = 0; slot < PV_GROUPS_PER_WARP; ++slot) {

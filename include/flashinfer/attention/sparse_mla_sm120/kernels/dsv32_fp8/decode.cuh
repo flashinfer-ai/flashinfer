@@ -126,8 +126,8 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
     return;
   }
 
-  constexpr int V_CHUNK = QUANT_TILE;                           // 128
-  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                  // 4
+  constexpr int V_CHUNK = QUANT_TILE;                          // 128
+  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                 // 4
   constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / DSV32_N_WARPS;  // 2
   constexpr int XV_KSTEPS = DSV32_BI / 32;                     // 2
   constexpr int W_FP8_STRIDE = DSV32_BI + 16;                  // 80
@@ -268,10 +268,12 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
         uint8_t sfa = fp32_exponent_byte(sm.q_sc()[(gid + (lane & 1) * 8) * NUM_SCALES + blk]);
         float acc0, acc1, acc2, acc3;
         init_qk_acc<KV::SCALE_FORMAT>(qk[0], acc0, acc1, acc2, acc3);
-        const uint8_t* k_scale_base = sm_kv_fp8 + (size_t)(warp_first_cand + gid) * KV_SMEM_STRIDE + D_NOPE;
+        const uint8_t* k_scale_base =
+            sm_kv_fp8 + (size_t)(warp_first_cand + gid) * KV_SMEM_STRIDE + D_NOPE;
         uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
         qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_fp8(),
-            sm_kv_fp8 + (size_t)warp_first_cand * KV_SMEM_STRIDE, blk, sfa, sfb, lane);
+                                    sm_kv_fp8 + (size_t)warp_first_cand * KV_SMEM_STRIDE, blk, sfa,
+                                    sfb, lane);
         const int c0 = warp_first_cand + tid * 2;
         const int c1 = c0 + 1;
         commit_qk_acc<KV>(qk[0], acc0, acc1, acc2, acc3,
@@ -516,8 +518,8 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
 #pragma unroll
         for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
           const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
-          pv_fp8_d2_16x8<KV_SMEM_STRIDE, W_FP8_STRIDE, XV_KSTEPS>(
-              xv_acc[nt], sm_w_fp8, sm_kv_fp8, dim, lane);
+          pv_fp8_d2_16x8<KV_SMEM_STRIDE, W_FP8_STRIDE, XV_KSTEPS>(xv_acc[nt], sm_w_fp8, sm_kv_fp8,
+                                                                  dim, lane);
         }
       }
 #pragma unroll

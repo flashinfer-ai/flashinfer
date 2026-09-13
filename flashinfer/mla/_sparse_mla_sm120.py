@@ -95,6 +95,7 @@ from ._sparse_mla_sm120_policy import (
     _DECODE_GLM53_NOPE_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_GLM53_NOPE_TOPK,
     _D_V_BY_MODEL_TYPE,
+    _SUPPORTED_D_V,
     _decode_chunk_width,
     _decode_scratch_heads,
     _MODEL_TYPE_TO_FAMILY,
@@ -306,16 +307,16 @@ def supported_sparse_mla_sm120_configs(
     )
     result = {}
     for model, family in _MODEL_TYPE_TO_FAMILY.items():
-        facts = format_info(model)
+        info = format_info(model)
         result[family] = SparseMLASm120DecodeConfig(
-            d_qk=facts["query_dim"],
-            page_block_size=facts["page_size"],
+            d_qk=info["query_dim"],
+            page_block_size=info["page_size"],
             max_num_tokens=_DECODE_MAX_TOKENS,
             topks=probes[model],
-            min_topk=facts["min_topk"],
-            max_num_heads=facts["max_heads"],
-            bytes_per_token=facts["bytes_per_token"],
-            page_block_size_is_runtime=bool(facts["runtime_page"]),
+            min_topk=info["min_topk"],
+            max_num_heads=info["max_heads"],
+            bytes_per_token=info["bytes_per_token"],
+            page_block_size_is_runtime=bool(info["runtime_page"]),
         )
     result["glm_nsa"] = result["dsv3_2"]
     return result
@@ -401,15 +402,15 @@ def _require_d_v(d_v: int, model_type: Optional[int] = None) -> None:
 
 
 def _require_supported_d_v(d_v: int) -> None:
-    """Check ``d_v`` against every supported model type.
+    """Check ``d_v`` against the supported set without loading the JIT module.
 
-    Used where the model type is not yet known -- the runner is constructed
-    before it sees a ``q`` to read ``d_qk`` from. Each call still goes through
-    the strict :func:`_require_d_v` once ``d_qk`` has resolved the model type.
+    The strict per-model check runs again at plan/run time through
+    :func:`_require_d_v` once ``d_qk`` has resolved the model type.
     """
-    supported = sorted(set(_D_V_BY_MODEL_TYPE.values()))
-    if int(d_v) not in supported:
-        raise ValueError(f"SM120 sparse-MLA requires d_v in {supported}, got {d_v}")
+    if int(d_v) not in _SUPPORTED_D_V:
+        raise ValueError(
+            f"SM120 sparse-MLA requires d_v in {sorted(_SUPPORTED_D_V)}, got {d_v}"
+        )
 
 
 def _check_last_dim(

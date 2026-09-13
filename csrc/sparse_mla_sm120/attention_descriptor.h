@@ -2,21 +2,20 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include <climits>
-#include <utility>
-
 #include <cuda_bf16.h>
+#include <flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/map.h>
 #include <tvm/ffi/extra/module.h>
 
-#include <flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h>
+#include <climits>
+#include <utility>
 
 #include "../tvm_ffi_utils.h"
 
 namespace flashinfer::sparse_mla_sm120::execution {
 
-inline AttentionMetadata unpack_metadata(const ffi::Array<int64_t> &d, size_t i = 0) {
+inline AttentionMetadata unpack_metadata(const ffi::Array<int64_t>& d, size_t i = 0) {
   TVM_FFI_ICHECK_EQ(d.size() - i, 18) << "attention metadata ABI mismatch";
   for (size_t j = i; j < d.size(); ++j) {
     TVM_FFI_ICHECK_GE(d[j], 0) << "negative attention metadata";
@@ -32,7 +31,7 @@ inline AttentionMetadata unpack_metadata(const ffi::Array<int64_t> &d, size_t i 
           bool(d[i + 16]),   int(d[i + 17])};
 }
 
-inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata &m) {
+inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata& m) {
   return {m.model,
           m.tokens,
           m.heads,
@@ -56,13 +55,13 @@ inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata &m) {
 class AttentionPlanObj : public ffi::ModuleObj {
  public:
   explicit AttentionPlanObj(ExecutionPlan value) : plan(std::move(value)) {}
-  const char *kind() const final { return "sparse_mla_execution_plan"; }
+  const char* kind() const final { return "sparse_mla_execution_plan"; }
   const ExecutionPlan plan;
 
-  ffi::Optional<ffi::Function> GetFunction(const ffi::String &name) final {
+  ffi::Optional<ffi::Function> GetFunction(const ffi::String& name) final {
     if (name == "workspace")
       return ffi::Function::FromTyped([this]() {
-        auto requirement = [](ffi::Array<int64_t> shape, const char *dtype, size_t bytes,
+        auto requirement = [](ffi::Array<int64_t> shape, const char* dtype, size_t bytes,
                               int alignment) -> ffi::Array<ffi::Any> {
           return {shape, ffi::String(dtype), int64_t(bytes), alignment};
         };
@@ -77,11 +76,18 @@ class AttentionPlanObj : public ffi::ModuleObj {
       });
     if (name == "inspect")
       return ffi::Function::FromTyped([this]() {
-        const char *numeric[] = {"fp8", "hybrid", "bf16", "nvfp4"};
-        const char *implementation[] = {
-            "ordinary", "mixed", "full_bf16", "dsv4_nvfp4_decode", "dsv4_nvfp4_grouped_decode",
-            "sg",       "mg",    "fulltile",  "swapab",             "dsv4_nvfp4_prefill"};
-        const char *merge[] = {"direct", "merge2", "general", "stage1"};
+        const char* numeric[] = {"fp8", "hybrid", "bf16", "nvfp4"};
+        const char* implementation[] = {"ordinary",
+                                        "mixed",
+                                        "full_bf16",
+                                        "dsv4_nvfp4_decode",
+                                        "dsv4_nvfp4_grouped_decode",
+                                        "sg",
+                                        "mg",
+                                        "fulltile",
+                                        "swapab",
+                                        "dsv4_nvfp4_prefill"};
+        const char* merge[] = {"direct", "merge2", "general", "stage1"};
         return ffi::Map<ffi::String, ffi::Any>{
             {"numeric_route", ffi::String(numeric[int(plan.numeric)])},
             {"implementation", ffi::String(implementation[int(plan.implementation)])},
@@ -106,8 +112,8 @@ inline ffi::Module pack_plan(ExecutionPlan plan) {
   return ffi::Module(ffi::make_object<AttentionPlanObj>(std::move(plan)));
 }
 
-inline const ExecutionPlan &unpack_plan(const ffi::Module &carrier, bool is_dsv4_nvfp4) {
-  const auto *object = dynamic_cast<const AttentionPlanObj *>(carrier.get());
+inline const ExecutionPlan& unpack_plan(const ffi::Module& carrier, bool is_dsv4_nvfp4) {
+  const auto* object = dynamic_cast<const AttentionPlanObj*>(carrier.get());
   TVM_FFI_ICHECK(object != nullptr) << "execution plan module mismatch";
   TVM_FFI_ICHECK((object->plan.numeric == NumericRoute::NVFP4) == is_dsv4_nvfp4)
       << "execution plan route/module mismatch";

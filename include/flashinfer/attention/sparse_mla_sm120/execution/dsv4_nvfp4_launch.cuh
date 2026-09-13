@@ -4,15 +4,15 @@
 
 #include "../kernels/dsv4_nvfp4/decode.cuh"
 #include "../kernels/dsv4_nvfp4/grouped_attention.cuh"
-#include "merge.cuh"
-#include "attention_plan.h"
 #include "attention_params.cuh"
+#include "attention_plan.h"
+#include "merge.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 template <int NUM_HEADS, int TOPK, int PAGE_SIZE, bool DUAL_CACHE>
-cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params, const execution::ExecutionPlan& plan,
-                          cudaStream_t stream) {
+cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
+                          const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
                extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes] = params;
@@ -72,8 +72,8 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params, const executio
 }
 
 template <int NUM_HEADS, int TOPK, int PAGE_SIZE, bool DUAL_CACHE>
-cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params, const execution::ExecutionPlan& plan,
-                           cudaStream_t stream) {
+cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params,
+                           const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
                extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes] = params;
@@ -85,8 +85,8 @@ cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params, const executi
   if (status != cudaSuccess) return status;
   kernel<<<dim3(num_tokens, HEAD_BLOCKS), dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
       q, cache, indices, output, out_lse, nullptr, nullptr, attn_sink, topk_length, extra_cache,
-      extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes, num_tokens,
-      plan.scratch_split_stride, plan.cpb, sm_scale, page_stride_bytes,
+      extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
+      num_tokens, plan.scratch_split_stride, plan.cpb, sm_scale, page_stride_bytes,
       plan.merge == execution::Merge::Direct);
   return cudaGetLastError();
 }

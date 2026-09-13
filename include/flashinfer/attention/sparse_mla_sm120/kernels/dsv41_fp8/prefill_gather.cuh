@@ -36,7 +36,9 @@ struct Dsv41PrefillGatherSchedule {
           __ldg(reinterpret_cast<const uint4*>(scales));
     __threadfence_block();
     flashinfer::sparse_mla_sm120::pipeline::RoleSync<GATHER_BARRIER, Cfg::IO_THREADS>::wait();
-    if (tid == 0) flashinfer::sparse_mla_sm120::pipeline::BulkReady::expect(sm.mbar_kv + buf, Cfg::BI * KV::D_NOPE);
+    if (tid == 0)
+      flashinfer::sparse_mla_sm120::pipeline::BulkReady::expect(sm.mbar_kv + buf,
+                                                                Cfg::BI * KV::D_NOPE);
     if (tid < Cfg::BI)
       cp_async_bulk_g2s_l2hint(sm.kv_bufs[buf] + tid * KV::KV_SMEM_STRIDE, data, KV::D_NOPE,
                                sm.mbar_kv + buf, policy);

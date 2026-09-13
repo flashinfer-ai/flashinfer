@@ -35,7 +35,6 @@
 #include "../../compute/scale_mma.cuh"
 #include "../../model/scale_convert.cuh"
 #include "../../pipeline/staged_pipeline.cuh"
-
 #include "prefill_common.cuh"
 #include "resources.cuh"
 #include "smem_layout.cuh"
@@ -235,8 +234,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 #pragma unroll
         for (int mi = 0; mi < CT::MPASS; mi++)
           ldmatrix_load_a_packed_16x32_bytes(a[0][mi][0], a[0][mi][1], a[0][mi][2], a[0][mi][3],
-                              kv_smem + (size_t)((m0 + mi) * 16) * L::KV_STRIDE, L::KV_STRIDE,
-                              lane);
+                                             kv_smem + (size_t)((m0 + mi) * 16) * L::KV_STRIDE,
+                                             L::KV_STRIDE, lane);
 
 #pragma unroll
         for (int g = 0; g < KV::NUM_SCALES; g++) {
@@ -400,9 +399,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
           for (int mt = 0; mt < CT::XV_MTILES; mt++)
 #pragma unroll
             for (int kt = 0; kt < CT::XV_KSTEPS; kt++)
-              ldmatrix_load_a_packed_16x32_bytes_trans<L::KV_STRIDE>(v[mt][kt][0], v[mt][kt][1], v[mt][kt][2],
-                                                      v[mt][kt][3], kv_smem, kt * 32,
-                                                      vc * CT::V_CHUNK + mt * 16, lane);
+              ldmatrix_load_a_packed_16x32_bytes_trans<L::KV_STRIDE>(
+                  v[mt][kt][0], v[mt][kt][1], v[mt][kt][2], v[mt][kt][3], kv_smem, kt * 32,
+                  vc * CT::V_CHUNK + mt * 16, lane);
 
           float xv[CT::XV_MTILES][4] = {};
 #pragma unroll

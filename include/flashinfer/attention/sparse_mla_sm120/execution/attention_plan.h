@@ -157,8 +157,8 @@ ExecutionPlan resolve_attention(const AttentionMetadata& metadata, NumericRoute 
                                 int requested_cpb, DeviceCaps caps);
 
 ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk, int page_size,
-                             int extra_page_size, size_t page_stride_bytes,
-                             size_t extra_page_stride_bytes, int cpb, int sm_count,
-                             size_t max_shared_bytes, bool prefill, bool stage1_only);
+                                 int extra_page_size, size_t page_stride_bytes,
+                                 size_t extra_page_stride_bytes, int cpb, int sm_count,
+                                 size_t max_shared_bytes, bool prefill, bool stage1_only);
 
 }  // namespace flashinfer::sparse_mla_sm120::execution

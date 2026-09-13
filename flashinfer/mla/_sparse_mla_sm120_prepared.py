@@ -96,7 +96,7 @@ def resolve_execution(
             NVFP4KernelVariant,
         )
 
-        selected = plan_nvfp4_sparse_mla_sm120(
+        nvfp4_selected = plan_nvfp4_sparse_mla_sm120(
             m.tokens,
             m.heads,
             m.topk,
@@ -108,15 +108,17 @@ def resolve_execution(
             has_extra_topk_length=m.has_extra_lengths,
             has_attn_sink=m.has_sink,
         )
-        if selected is None:
+        if nvfp4_selected is None:
             raise ValueError("no NVFP4 attention route serves this metadata")
         sm, shared = device_caps(device)
         return get_sparse_mla_sm120_module().dsv4_nvfp4_resolve_attention(
             m._replace(
-                variant=int(selected.variant is NVFP4KernelVariant.PREFILL_STREAMING)
+                variant=int(
+                    nvfp4_selected.variant is NVFP4KernelVariant.PREFILL_STREAMING
+                )
             ),
             3,
-            max(0, selected.cpb),
+            max(0, nvfp4_selected.cpb),
             sm,
             shared,
             False,
@@ -248,7 +250,7 @@ def prepare(
 
 
 def prefix_scratch(prepared, mid, mlse):
-    for tensor, (_, _, need, _) in zip((mid, mlse), prepared.workspace):
+    for tensor, (_, _, need, _) in zip((mid, mlse), prepared.workspace, strict=False):
         if tensor is not None and tensor.numel() * tensor.element_size() < need:
             raise ValueError(f"scratch capacity is too small: need {need} bytes")
     return mid, mlse

@@ -4,8 +4,8 @@
 
 #include <type_traits>
 
-#include "tile_config.cuh"
 #include "smem_layout.cuh"
+#include "tile_config.cuh"
 
 template <ModelType MT, QkComputeMode QkMode, typename Schedule>
 struct Fp8PrefillResources {

@@ -20,7 +20,7 @@ cudaError_t dispatch_decode(const execution::AttentionParams& params,
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 #define SPARSE_MLA_DSV4_NVFP4_INSTANCES(F) \
-  F(16, 128)                           \
+  F(16, 128)                               \
   F(16, 512) F(32, 128) F(32, 512) F(64, 128) F(64, 512) F(128, 128) F(128, 512)
 
 inline bool has_instance(int heads, int topk) {

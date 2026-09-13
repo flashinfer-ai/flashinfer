@@ -362,7 +362,7 @@ def _nvfp4_sparse_mla_workspace(
         prefill=use_prefill,
     )
     offset = 0
-    views = []
+    views: list = []
     for shape, dtype, size, alignment in plan.workspace():
         if not size:
             views.append(None)
@@ -1756,8 +1756,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         SM120/SM121 accepts BF16.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
-        packed uint8 record with last dimension 584 (FP8) or 384 (NVFP4).
-        Layout follows ``kv_layout``.
+        packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
+        384 (NVFP4). The ``fp8_dsv41_fp4_ca`` format additionally carries a
+        288-byte compressed V41_FP4 record. Layout follows ``kv_layout``.
     workspace_buffer : torch.Tensor
         Byte workspace used by TRTLLM-GEN or HCA split-K reduction. The
         TRTLLM-GEN multi-CTA KV counters are managed in a separate internal

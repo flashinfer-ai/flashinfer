@@ -23,7 +23,7 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-#define DSV32_CUDA_CHECK(call)                                                             \
+#define DSV32_CUDA_CHECK(call)                                                              \
   do {                                                                                      \
     cudaError_t e = (call);                                                                 \
     TVM_FFI_ICHECK_EQ(e, cudaSuccess) << "sparse-MLA " #call ": " << cudaGetErrorString(e); \

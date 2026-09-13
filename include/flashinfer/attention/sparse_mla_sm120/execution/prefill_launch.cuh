@@ -51,10 +51,10 @@
 #include <flashinfer/attention/sparse_mla_sm120/arch/common.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/prefill.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_schedule.cuh>
-#include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_sg.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_mg.cuh>
-#include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/smem_layout.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_sg.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_swapab.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/smem_layout.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
 
 #include "attention_plan.h"
@@ -86,7 +86,7 @@ PrefillLaunchResult configure_dynamic_smem_per_device(Kernel kernel, size_t smem
 
 template <int Heads, bool ExtraFp4>
 PrefillLaunchResult launch_dsv41_bf16_prefill(const execution::AttentionParams& params,
-                                            cudaStream_t stream) {
+                                              cudaStream_t stream) {
   using namespace kernels::dsv41_bf16;
   auto kernel = sparse_mla_prefill_dsv41_bf16_kernel<Heads, ExtraFp4>;
   constexpr size_t bytes = sizeof(Dsv41Bf16Smem);
@@ -94,7 +94,8 @@ PrefillLaunchResult launch_dsv41_bf16_prefill(const execution::AttentionParams& 
   const auto result = configure_dynamic_smem_per_device(kernel, bytes, configured);
   if (result.error != cudaSuccess) return result;
   dim3 grid(params.num_tokens * ((params.num_heads + 15) / 16));
-  cudaLaunchConfig_t config{grid, dim3(Dsv41Bf16Resources::BLOCK_THREADS), bytes, stream, nullptr, 0};
+  cudaLaunchConfig_t config{grid, dim3(Dsv41Bf16Resources::BLOCK_THREADS), bytes, stream, nullptr,
+                            0};
   void* args[] = {(void*)&params};
   return {cudaLaunchKernelExC(&config, (const void*)kernel, args), "cudaLaunchKernelExC"};
 }

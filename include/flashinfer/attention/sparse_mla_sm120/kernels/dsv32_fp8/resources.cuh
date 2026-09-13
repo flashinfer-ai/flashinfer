@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "../../model/kv_cache_traits.cuh"
 #include "../../compute/tile_traits.cuh"
+#include "../../model/kv_cache_traits.cuh"
 
 namespace flashinfer::sparse_mla_sm120 {
 
@@ -11,14 +11,14 @@ constexpr int DSV32_MATH_BARRIER = 3;
 constexpr int DSV32_N_WARPS = 8;  // math warps
 constexpr int DSV32_IO_WARPS = 1;
 constexpr int DSV32_N_TOTAL_WARPS = DSV32_N_WARPS + DSV32_IO_WARPS;  // 9
-constexpr int DSV32_BLOCK_THREADS = DSV32_N_TOTAL_WARPS * 32;         // 288
-constexpr int DSV32_MATH_THREADS = DSV32_N_WARPS * 32;                // 256
-constexpr int DSV32_IO_THREADS = DSV32_IO_WARPS * 32;                 // 32
+constexpr int DSV32_BLOCK_THREADS = DSV32_N_TOTAL_WARPS * 32;        // 288
+constexpr int DSV32_MATH_THREADS = DSV32_N_WARPS * 32;               // 256
+constexpr int DSV32_IO_THREADS = DSV32_IO_WARPS * 32;                // 32
 constexpr int DSV32_CAND_WINDOW = 64;
 constexpr int DSV32_BI = DSV32_CAND_WINDOW;
 constexpr int DSV32_KV_BUF_COUNT = 2;
 constexpr int DSV32_ENTRIES_PER_WARP = DSV32_BI / DSV32_N_WARPS;  // 8
-constexpr int DSV32_QK_N_TILES = DSV32_ENTRIES_PER_WARP / 8;       // 1
+constexpr int DSV32_QK_N_TILES = DSV32_ENTRIES_PER_WARP / 8;      // 1
 
 template <ModelType MT>
 struct Dsv32DecodeSmem {
@@ -48,7 +48,7 @@ struct Dsv32DecodeSmem {
   static constexpr size_t OFF_W_HEAD_SC = OFF_REDUCE + SMEM_REDUCE;
   static constexpr size_t OFF_W_FP8 = OFF_W_HEAD_SC + SMEM_W_HEAD_SC;
   static constexpr size_t LAUNCH_BYTES = OFF_MBAR_FULL_UNALIGNED + 16 + 2 * SMEM_MBAR_PAIR +
-      SMEM_REDUCE + SMEM_W_HEAD_SC + 2 * SMEM_W_FP8_BUF;
+                                         SMEM_REDUCE + SMEM_W_HEAD_SC + 2 * SMEM_W_FP8_BUF;
 
   char* base;
 

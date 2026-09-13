@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include <cuda_bf16.h>
+
 #include <cstddef>
 #include <cstdint>
-#include <cuda_bf16.h>
 
 using bf16 = __nv_bfloat16;
 

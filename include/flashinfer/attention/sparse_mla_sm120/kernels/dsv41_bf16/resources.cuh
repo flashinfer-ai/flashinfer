@@ -32,4 +32,4 @@ struct Dsv41Bf16Smem {
 };
 static_assert(sizeof(Dsv41Bf16Smem) == 86784);
 
-} // namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16
+}  // namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16

@@ -177,7 +177,8 @@ ffi::Array<int64_t> inspect_attention_metadata(
     TVM_FFI_ICHECK((ix.ndim() == 2 || (ix.ndim() == 3 && ix.size(1) == 1)) && ix.size(0) == t &&
                    ix.size(-1) > 0 && ix.stride(-1) == 1 && ix.stride(0) >= ix.size(-1))
         << "indices shape/stride mismatch";
-    if constexpr (IsDsv4Nvfp4) TVM_FFI_ICHECK(ix.IsContiguous()) << "NVFP4 indices must be contiguous";
+    if constexpr (IsDsv4Nvfp4)
+      TVM_FFI_ICHECK(ix.IsContiguous()) << "NVFP4 indices must be contiguous";
   };
   index_check(indices);
   size_t lse_stride = h;
@@ -200,7 +201,7 @@ ffi::Array<int64_t> inspect_attention_metadata(
   }
   auto parse = [&](TensorView value, bool compressed) {
     check_attention_device(q, value, "kv_cache");
-    const int bpt = IsDsv4Nvfp4       ? Dsv4Nvfp4Layout::BYTES_PER_TOKEN
+    const int bpt = IsDsv4Nvfp4  ? Dsv4Nvfp4Layout::BYTES_PER_TOKEN
                     : compressed ? Dsv41Fp4Layout::BYTES_PER_TOKEN
                                  : format.bytes_per_token;
     if constexpr (IsDsv4Nvfp4) {
@@ -214,7 +215,8 @@ ffi::Array<int64_t> inspect_attention_metadata(
     index_check(extra_indices.value());
     ex = parse(extra.value(), extra_fp4);
   }
-  if constexpr (IsDsv4Nvfp4) TVM_FFI_ICHECK(lse_stride == size_t(h)) << "NVFP4 LSE must be contiguous";
+  if constexpr (IsDsv4Nvfp4)
+    TVM_FFI_ICHECK(lse_stride == size_t(h)) << "NVFP4 LSE must be contiguous";
   return execution::pack_metadata(
       {int(model), t, h, int(indices.size(-1)),
        extra_indices.has_value() ? int(extra_indices.value().size(-1)) : 0, layout.page_block_size,

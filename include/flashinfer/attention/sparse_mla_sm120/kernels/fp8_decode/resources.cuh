@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
-#include "../../model/kv_cache_traits.cuh"
 #include "../../compute/tile_traits.cuh"
+#include "../../model/kv_cache_traits.cuh"
 #include "../dsv41_fp8/resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120 {
@@ -61,13 +61,13 @@ struct DecodeTileCfg {
   static constexpr int XV_FOLD = (N_WARPS * 8 + KV::QUANT_TILE - 1) / KV::QUANT_TILE;
   static constexpr int XV_WARPS = N_WARPS / XV_FOLD;
 
-  static constexpr int N_TOTAL_WARPS = N_WARPS + IO_WARPS;  // DSV4 9,   DOTS3_SWA 5
+  static constexpr int N_TOTAL_WARPS = N_WARPS + IO_WARPS;       // DSV4 9,   DOTS3_SWA 5
   static constexpr int BASE_BLOCK_THREADS = N_TOTAL_WARPS * 32;  // DSV4 288, DOTS3_SWA 160
-  static constexpr int MATH_THREADS = N_WARPS * 32;         // DSV4 256, DOTS3_SWA 128
-  static constexpr int IO_THREADS = IO_WARPS * 32;          // 32
-  static constexpr int BI = CAND_WINDOW;                    // DSV4 64,  DOTS3_SWA 32
-  static constexpr int ENTRIES_PER_WARP = BI / N_WARPS;     // 8 for both
-  static constexpr int QK_N_TILES = ENTRIES_PER_WARP / 8;   // 1 for both
+  static constexpr int MATH_THREADS = N_WARPS * 32;              // DSV4 256, DOTS3_SWA 128
+  static constexpr int IO_THREADS = IO_WARPS * 32;               // 32
+  static constexpr int BI = CAND_WINDOW;                         // DSV4 64,  DOTS3_SWA 32
+  static constexpr int ENTRIES_PER_WARP = BI / N_WARPS;          // 8 for both
+  static constexpr int QK_N_TILES = ENTRIES_PER_WARP / 8;        // 1 for both
 
   static constexpr int WINDOW = P::WINDOW;
   static constexpr bool HAS_WINDOW = WINDOW > 0;
@@ -135,7 +135,8 @@ struct Fp8DecodeSharedLayout {
   static constexpr size_t OFF_W_FP8 = OFF_W_HEAD_SC + SMEM_W_HEAD_SC;
   static constexpr size_t BASE_BYTES = OFF_W_FP8 + W_FP8_SLOTS * SMEM_W_FP8_BUF;
   static constexpr size_t TOTAL_BYTES =
-      BASE_BYTES + (MIXED_PIPELINE ? kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources::EXTRA_SMEM : 0);
+      BASE_BYTES +
+      (MIXED_PIPELINE ? kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources::EXTRA_SMEM : 0);
 
   char* base;
 

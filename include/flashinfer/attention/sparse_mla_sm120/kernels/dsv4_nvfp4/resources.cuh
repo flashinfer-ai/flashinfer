@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "../../model/dsv4_nvfp4_layout.cuh"
 #include "../../compute/nvfp4_vt_layout.cuh"
 #include "../../compute/tile_traits.cuh"
+#include "../../model/dsv4_nvfp4_layout.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
@@ -121,7 +121,9 @@ struct DecodeNVFP4Smem {
   __device__ __forceinline__ float* reduce_scratch() const {
     return reinterpret_cast<float*>(base + OFF_REDUCE);
   }
-  __device__ __forceinline__ float* reduce_scratch_second() const { return reduce_scratch() + DECODE_N_WARPS * HPB; }
+  __device__ __forceinline__ float* reduce_scratch_second() const {
+    return reduce_scratch() + DECODE_N_WARPS * HPB;
+  }
   __device__ __forceinline__ uint8_t* w_sc() const {
     return reinterpret_cast<uint8_t*>(base + OFF_W_SC);
   }

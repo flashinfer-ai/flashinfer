@@ -32,8 +32,8 @@
 
 #include "dsv41_layout.cuh"
 #include "dsv4_geometry.cuh"
-#include "model_type.h"
 #include "kv_storage.cuh"
+#include "model_type.h"
 
 using bf16 = __nv_bfloat16;
 
@@ -265,9 +265,16 @@ struct CacheFormatInfo {
 template <ModelType MT>
 constexpr CacheFormatInfo cache_format_info() {
   using KV = KVCacheTraits<MT>;
-  return {KV::D_QK, KV::D_V, KV::BYTES_PER_TOKEN, KV::SCALE_INLINE,
-          KV::D_NOPE, KV::D_ROPE, KV::NUM_SCALES, KV::SCALE_BYTES_PER_TOKEN,
-          KV::SCALE_DATA_PREFIX_BYTES, KV::KV_ROPE_GMEM_OFFSET};
+  return {KV::D_QK,
+          KV::D_V,
+          KV::BYTES_PER_TOKEN,
+          KV::SCALE_INLINE,
+          KV::D_NOPE,
+          KV::D_ROPE,
+          KV::NUM_SCALES,
+          KV::SCALE_BYTES_PER_TOKEN,
+          KV::SCALE_DATA_PREFIX_BYTES,
+          KV::KV_ROPE_GMEM_OFFSET};
 }
 
 constexpr CacheFormatInfo cache_format_info(ModelType mt) {

@@ -4,9 +4,10 @@
 
 #include <cstdint>
 #include <flashinfer/math.cuh>
+
 #include "../../compute/nvfp4_quantization.cuh"
-#include "resources.cuh"
 #include "../../pipeline/staged_pipeline.cuh"
+#include "resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_fp8 {
 
@@ -81,8 +82,8 @@ __device__ __forceinline__ void requantize_e2m1_e4m3_g16_to_e4m3_ue8m0_g32(uint4
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_fp8 {
 
 template <typename Resources, typename Valid>
-__device__ void convert_raw(const uint8_t* raw, uint8_t* values, uint8_t* scales,
-                            int tid, Valid valid) {
+__device__ void convert_raw(const uint8_t* raw, uint8_t* values, uint8_t* scales, int tid,
+                            Valid valid) {
   using Raw = typename Resources::Raw;
   using KV = typename Resources::KV;
   constexpr int Groups = Resources::CONVERSION_GROUPS_PER_ROW;
@@ -98,7 +99,7 @@ __device__ void convert_raw(const uint8_t* raw, uint8_t* values, uint8_t* scales
       requantize_e2m1_e4m3_g16_to_e4m3_ue8m0_g32(
           *reinterpret_cast<const uint4*>(raw + row * Raw::DATA_BYTES + group * sizeof(uint4)),
           *reinterpret_cast<const uint16_t*>(raw + Resources::RAW_SCALE_OFFSET +
-                                              row * Raw::SCALE_BYTES + group * sizeof(uint16_t)),
+                                             row * Raw::SCALE_BYTES + group * sizeof(uint16_t)),
           dst, sc);
     }
   }

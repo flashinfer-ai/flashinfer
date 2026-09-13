@@ -16,10 +16,10 @@
 
 #pragma once
 
+#include <cuda_fp16.h>
+
 #include <cstddef>
 #include <cstdint>
-
-#include <cuda_fp16.h>
 
 #include "nvfp4_quantization.cuh"
 #include "nvfp4_vt_layout.cuh"

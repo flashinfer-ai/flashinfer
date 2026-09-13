@@ -65,9 +65,10 @@ __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t& r0, uint32_t& r1, ui
 }
 
 // Packed 16-row x 32-byte A tile: E4M3 bytes or E2M1 nibble pairs, unchanged.
-__device__ __forceinline__ void ldmatrix_load_a_packed_16x32_bytes(
-    uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3, const uint8_t* smem_base,
-    int stride_bytes, int lane) {
+__device__ __forceinline__ void ldmatrix_load_a_packed_16x32_bytes(uint32_t& a0, uint32_t& a1,
+                                                                   uint32_t& a2, uint32_t& a3,
+                                                                   const uint8_t* smem_base,
+                                                                   int stride_bytes, int lane) {
   int row = (lane & 7) + ((lane >> 3) & 1) * 8;
   int col = (lane >> 4) * 16;
   ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride_bytes + col);
@@ -87,8 +88,8 @@ __device__ __forceinline__ void ldmatrix_load_a_packed_16x32_bytes_layout(
 
 // Packed 8-row x 32-byte B tile, without numerical conversion.
 __device__ __forceinline__ void ldmatrix_load_b_packed_8x32_bytes(uint32_t& b0, uint32_t& b1,
-                                                    const uint8_t* smem_base, int stride_bytes,
-                                                    int lane) {
+                                                                  const uint8_t* smem_base,
+                                                                  int stride_bytes, int lane) {
   int row = lane & 7;
   int col = ((lane >> 3) & 1) * 16;
   ldmatrix_x2(b0, b1, smem_base + row * stride_bytes + col);
@@ -114,10 +115,13 @@ __device__ __forceinline__ void ldmatrix_x2_trans_b8(uint32_t& d0, uint32_t& d1,
 
 // FP8 A operand [16×32] transposed, straight out of a [candidate, dim] tile
 template <int KV_STRIDE_BYTES>
-__device__ __forceinline__ void ldmatrix_load_a_packed_16x32_bytes_trans(uint32_t& a0, uint32_t& a1, uint32_t& a2,
-                                                          uint32_t& a3, const uint8_t* smem_base,
-                                                          int k_start, int dim, int lane) {
-  ldmatrix_x2_trans_b8(a0, a1, a2, a3, smem_base + (size_t)(k_start + lane) * KV_STRIDE_BYTES + dim);
+__device__ __forceinline__ void ldmatrix_load_a_packed_16x32_bytes_trans(uint32_t& a0, uint32_t& a1,
+                                                                         uint32_t& a2, uint32_t& a3,
+                                                                         const uint8_t* smem_base,
+                                                                         int k_start, int dim,
+                                                                         int lane) {
+  ldmatrix_x2_trans_b8(a0, a1, a2, a3,
+                       smem_base + (size_t)(k_start + lane) * KV_STRIDE_BYTES + dim);
 }
 
 __device__ __forceinline__ void stmatrix_x4_trans_b8(void* smem_ptr, uint32_t r0, uint32_t r1,

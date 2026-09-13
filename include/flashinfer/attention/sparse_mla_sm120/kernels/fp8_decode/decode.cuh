@@ -51,11 +51,11 @@ __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
     sparse_mla_decode_dsv4_kernel(
-        const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk] bf16
-        const uint8_t* __restrict__ KV_cache,     // FP8 paged (DSV4 footer layout)
-        const int32_t* __restrict__ indices,      // [num_tokens, topk] int32
-        bf16* __restrict__ mid_out,               // [num_tokens, num_heads, scratch_split_stride, d_v] bf16
-        float* __restrict__ mid_lse,              // [num_tokens, num_heads, scratch_split_stride] f32
+        const bf16* __restrict__ Q,            // [num_tokens, num_heads, d_qk] bf16
+        const uint8_t* __restrict__ KV_cache,  // FP8 paged (DSV4 footer layout)
+        const int32_t* __restrict__ indices,   // [num_tokens, topk] int32
+        bf16* __restrict__ mid_out,   // [num_tokens, num_heads, scratch_split_stride, d_v] bf16
+        float* __restrict__ mid_lse,  // [num_tokens, num_heads, scratch_split_stride] f32
         const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
         // Optional secondary KV cache (DSv4 C4A / C128A). When non-null, the extra
         // candidate window is concatenated after the main one; per-chunk dispatch
@@ -65,8 +65,8 @@ __global__ void __launch_bounds__(
         const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
         int extra_topk,                                 // 0 = no extra cache
         int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
-        size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk, int scratch_split_stride,
-        int chunks_per_block, float sm_scale, size_t page_stride_bytes,
+        size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk,
+        int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
         // Row strides of (extra_)indices; either may exceed the row width when the
         // caller views a wider persistent buffer (last dim must stay contiguous).
         size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
@@ -133,8 +133,9 @@ __global__ void __launch_bounds__(
   // Chunk range this block owns. Total chunks = main + extra (extra layout
   // is concatenated immediately after main; per-chunk dispatch in IO + math
   // routes to the right source).
-  constexpr int SUBTILES =
-      GatherSchedule::RAW_PIPELINE ? kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources::SUBTILES : 1;
+  constexpr int SUBTILES = GatherSchedule::RAW_PIPELINE
+                               ? kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources::SUBTILES
+                               : 1;
   constexpr int LOGICAL_WINDOW = Cfg::CAND_WINDOW * SUBTILES;
   const int num_orig_chunks = (topk_len + LOGICAL_WINDOW - 1) / LOGICAL_WINDOW * SUBTILES;
   const int num_extra_chunks = (extra_topk_len + LOGICAL_WINDOW - 1) / LOGICAL_WINDOW * SUBTILES;
@@ -150,8 +151,8 @@ __global__ void __launch_bounds__(
   if (chunk_lo >= num_chunks_total) {
     if (!is_io && threadIdx.x < valid_h) {
       const int h = h_start + threadIdx.x;
-      const size_t lse_off =
-          (size_t)t_idx * mid_heads * scratch_split_stride + (size_t)h * scratch_split_stride + split_idx;
+      const size_t lse_off = (size_t)t_idx * mid_heads * scratch_split_stride +
+                             (size_t)h * scratch_split_stride + split_idx;
       mid_lse[lse_off] = -1e30f;
     }
     return;
@@ -637,8 +638,10 @@ __global__ void __launch_bounds__(
         const int cand_e1 = cand_e0 + 1;
 #pragma unroll
         for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-          const float vsc0 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc0 =
+              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc1 =
+              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid]),
                     __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
@@ -672,8 +675,10 @@ __global__ void __launch_bounds__(
         for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
           const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
           const int cand_e1 = cand_e0 + 1;
-          const float vsc0 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc0 =
+              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc1 =
+              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
           __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][0] * vsc0 * si0)));
           __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][1] * vsc1 * si0)));
           __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][2] * vsc0 * si1)));
@@ -758,8 +763,9 @@ __global__ void __launch_bounds__(
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base = ((size_t)t_idx * mid_heads + h_start) * (size_t)scratch_split_stride * D_V_C +
-                            (size_t)split_idx * D_V_C;
+  const size_t mid_o_base =
+      ((size_t)t_idx * mid_heads + h_start) * (size_t)scratch_split_stride * D_V_C +
+      (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 so the compiler
   // emits STG.E.64 instead of two STG.E.U16 — halves the global-store
@@ -811,7 +817,8 @@ __global__ void __launch_bounds__(
   if (warp_id == 0 && tid == 0) {
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base = (size_t)t_idx * mid_heads * scratch_split_stride + (size_t)h_start * scratch_split_stride;
+    const size_t lse_base =
+        (size_t)t_idx * mid_heads * scratch_split_stride + (size_t)h_start * scratch_split_stride;
     mid_lse[lse_base + (size_t)gid * scratch_split_stride + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * scratch_split_stride + split_idx] = lse1;
