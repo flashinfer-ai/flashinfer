@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""DeepSeek-V3 MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM.
+"""MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM.
 
-Compares NVFP4 and BF16 MoE backends on DeepSeek-V3 configuration:
+Compares NVFP4 and BF16 MoE backends on DeepSeek-V3, GLM-5, and Kimi K3 shapes:
 - CuteDSL W4A4: NVFP4 activations and weights
 - CuteDSL W4A16: BF16 activations with NVFP4 weights decoded online
 - CUTLASS: NVIDIA CUTLASS-based implementation
@@ -9,6 +9,14 @@ Compares NVFP4 and BF16 MoE backends on DeepSeek-V3 configuration:
 - TRTLLM BF16: unquantized BF16 activations and weights
 
 Usage:
+    # Model presets (Kimi K3 uses its routed latent width and SiTU activation)
+    python bench_moe_deepseek.py --model glm5 --ep 8
+    python bench_moe_deepseek.py --model kimi-k3 --ep 8
+    # Kimi K3 compares NVFP4 experiments, not its native MXFP4 checkpoint.
+    # TRTLLM BF16 is omitted because its kernels do not support SiTU.
+    # TRTLLM NVFP4 is also omitted with --use-per-token-activation: its SiTU
+    # kernels do not support per-token scaling.
+
     # Throughput benchmark (large batches: 128-4096 tokens)
     python bench_moe_deepseek.py
 
@@ -66,13 +74,14 @@ import argparse
 import contextlib
 import gc
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
 
 @dataclass
-class DeepSeekConfig:
+class MoEConfig:
+    name: str = "DeepSeek-V3"
     hidden_size: int = 7168
     intermediate_size: int = 2048
     num_experts: int = 256
@@ -80,26 +89,120 @@ class DeepSeekConfig:
     topk_group: int = 4
     top_k: int = 8
     routed_scaling_factor: float = 2.5
+    situ_beta: float | None = None
+    situ_linear_beta: float | None = None
 
 
-CFG = DeepSeekConfig()
+MODEL_CONFIGS = {
+    "deepseek-v3": MoEConfig(),
+    # https://huggingface.co/zai-org/GLM-5/blob/c183ef8c61faee82855eca1ed9bb3a9a7ce3b0b2/config.json
+    "glm5": MoEConfig(name="GLM-5", hidden_size=6144, n_group=1, topk_group=1),
+    # https://huggingface.co/moonshotai/Kimi-K3/blob/f831ab66814297da540d832a5235f8e904f29d06/config.json
+    "kimi-k3": MoEConfig(
+        name="Kimi K3",
+        hidden_size=3584,
+        intermediate_size=3072,
+        num_experts=896,
+        n_group=1,
+        topk_group=1,
+        top_k=16,
+        routed_scaling_factor=1.0,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    ),
+}
+CFG = replace(MODEL_CONFIGS["deepseek-v3"])
 BASE_INTERMEDIATE_SIZE = CFG.intermediate_size
 TOKEN_COUNTS = [128, 256, 512, 1024, 2048, 4096]
 
 # Generation phase token counts (small batches typical in decode)
 GEN_PHASE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 
-# Expert Parallelism configurations
-# EP=1: all 256 experts on single GPU
-# EP=8: 32 experts per GPU (256/8)
-# EP=16: 16 experts per GPU (256/16)
-EP_CONFIGS = {
-    1: {"num_local_experts": 256, "local_expert_offset": 0},
-    2: {"num_local_experts": 128, "local_expert_offset": 0},
-    4: {"num_local_experts": 64, "local_expert_offset": 0},
-    8: {"num_local_experts": 32, "local_expert_offset": 0},
-    16: {"num_local_experts": 16, "local_expert_offset": 0},
-}
+
+def set_model_config(model, num_experts=None):
+    """Select a fresh preset before applying EP/TP simulation."""
+    global CFG, BASE_INTERMEDIATE_SIZE
+    CFG = replace(MODEL_CONFIGS[model])
+    if num_experts is not None:
+        CFG.num_experts = num_experts
+    BASE_INTERMEDIATE_SIZE = CFG.intermediate_size
+
+
+def _make_routing(inputs):
+    """Prepare graph-stable routing; the returned call stays inside timing."""
+    if CFG.n_group == 1:
+        from flashinfer.fused_moe import RoutingMethodType
+        from flashinfer.fused_moe.core import (
+            allocate_trtllm_moe_canonical_routing,
+            canonicalize_trtllm_moe_routing_,
+        )
+
+        # The standalone DeepSeek top-k kernel cannot express these presets.
+        # Reuse TRTLLM's native router and replay outputs without reconstructing
+        # expert IDs from its permutation. The full expert range keeps every
+        # route valid; each MoE backend applies its own EP partition afterward.
+        canonical = allocate_trtllm_moe_canonical_routing(
+            inputs["router_logits"], top_k=CFG.top_k, tile_n=8
+        )
+
+        def route(router_logits, routing_bias, topk_values, topk_indices):
+            canonicalize_trtllm_moe_routing_(
+                canonical,
+                router_logits,
+                routing_bias,
+                inputs["hidden_bf16"],
+                top_k=CFG.top_k,
+                n_group=CFG.n_group,
+                topk_group=CFG.topk_group,
+                local_expert_offset=0,
+                local_num_experts=CFG.num_experts,
+                routed_scaling_factor=CFG.routed_scaling_factor,
+                routing_method_type=RoutingMethodType.DeepSeekV3,
+                use_routing_scales_on_input=False,
+                use_deep_seek_fp8=False,
+                norm_topk_prob=True,
+                enable_pdl=True,
+            )
+            # Native route weights are BF16; widen them for CuTe/CUTLASS.
+            topk_values.copy_(canonical.expert_weights)
+            topk_indices.copy_(canonical.routing_replay_ids)
+
+    else:
+        from flashinfer.fused_moe import fused_topk_deepseek
+
+        def route(router_logits, routing_bias, topk_values, topk_indices):
+            fused_topk_deepseek(
+                scores=router_logits,
+                bias=routing_bias,
+                n_group=CFG.n_group,
+                topk_group=CFG.topk_group,
+                topk=CFG.top_k,
+                routed_scaling_factor=CFG.routed_scaling_factor,
+                topk_values=topk_values,
+                topk_indices=topk_indices,
+            )
+
+    return route
+
+
+def _select_backends(backends, use_per_token_activation=False):
+    selected = (
+        set(backends)
+        if backends is not None
+        else {"cutedsl", "cutlass", "trtllm-nvfp4"}
+    )
+    if backends is None and CFG.situ_beta is None:
+        selected.add("trtllm-bf16")
+    if "trtllm-bf16" in selected and CFG.situ_beta is not None:
+        raise ValueError("TRTLLM BF16 does not support the Kimi K3 SiTU activation")
+    if CFG.situ_beta is not None and use_per_token_activation:
+        if backends is None:
+            selected.discard("trtllm-nvfp4")
+        elif "trtllm-nvfp4" in selected:
+            raise ValueError(
+                "TRTLLM NVFP4 does not support SiTU with per-token activation scaling"
+            )
+    return selected
 
 
 def _autotune_context(do_autotune, cache):
@@ -373,7 +476,6 @@ def bench_cute_dsl(
         profile_iters: Number of cold-L2 graph replays to capture.
     """
     from flashinfer import SfLayout, nvfp4_quantize
-    from flashinfer.fused_moe import fused_topk_deepseek
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.quantization.nvfp4_quantization_utils import (
@@ -469,6 +571,7 @@ def bench_cute_dsl(
 
     # Pre-convert routing bias to float32
     routing_bias_f32 = inputs["routing_bias"].float()
+    route_tokens = _make_routing(inputs)
 
     if use_wrapper:
         # Use CuteDslMoEWrapper (recommended for CUDA graph)
@@ -485,20 +588,13 @@ def bench_cute_dsl(
             local_expert_offset=local_expert_offset,
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
+            situ_beta=CFG.situ_beta,
+            situ_linear_beta=CFG.situ_linear_beta,
         )
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
             x, x_sf, per_token_scale = prepare_activation(x, x_sf)
-            fused_topk_deepseek(
-                scores=router_logits,
-                bias=routing_bias,
-                n_group=CFG.n_group,
-                topk_group=CFG.topk_group,
-                topk=CFG.top_k,
-                routed_scaling_factor=CFG.routed_scaling_factor,
-                topk_values=topk_values,
-                topk_indices=topk_indices,
-            )
+            route_tokens(router_logits, routing_bias, topk_values, topk_indices)
             return moe.run(
                 x=x,
                 x_sf=x_sf,
@@ -519,16 +615,7 @@ def bench_cute_dsl(
 
         def run(x, x_sf, router_logits, routing_bias, topk_values, topk_indices):
             x, x_sf, per_token_scale = prepare_activation(x, x_sf)
-            fused_topk_deepseek(
-                scores=router_logits,
-                bias=routing_bias,
-                n_group=CFG.n_group,
-                topk_group=CFG.topk_group,
-                topk=CFG.top_k,
-                routed_scaling_factor=CFG.routed_scaling_factor,
-                topk_values=topk_values,
-                topk_indices=topk_indices,
-            )
+            route_tokens(router_logits, routing_bias, topk_values, topk_indices)
             return cute_dsl_fused_moe(
                 x=x,
                 x_sf=x_sf,
@@ -548,6 +635,8 @@ def bench_cute_dsl(
                 quant_mode=quant_mode,
                 per_token_scale=per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                situ_beta=CFG.situ_beta,
+                situ_linear_beta=CFG.situ_linear_beta,
             )
 
     # Pass input tensors via input_kwargs for cold L2 cache rotation
@@ -604,7 +693,8 @@ def bench_cutlass(
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
     """
-    from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
+    from flashinfer.fused_moe import cutlass_fused_moe
+    from flashinfer.tllm_enums import ActivationType
     from flashinfer.fp4_quantization import fp4_quantize
 
     if num_local_experts is None:
@@ -645,6 +735,7 @@ def bench_cutlass(
 
     # Pre-convert routing bias to float32
     routing_bias_f32 = inputs["routing_bias"].float()
+    route_tokens = _make_routing(inputs)
 
     # Pre-compute values that need conversion
     w1_fp4_view = w1_fp4_local.contiguous().view(torch.long)
@@ -653,20 +744,26 @@ def bench_cutlass(
     # Compute EP size from config
     ep_size = CFG.num_experts // num_local_experts
 
+    activation_kwargs = {}
+    if CFG.situ_beta is not None:
+        activation_kwargs = dict(
+            activation_type=ActivationType.Situ,
+            situ_beta=torch.full(
+                (num_local_experts,), CFG.situ_beta, dtype=torch.float32, device=dev
+            ),
+            situ_linear_beta=torch.full(
+                (num_local_experts,),
+                CFG.situ_linear_beta,
+                dtype=torch.float32,
+                device=dev,
+            ),
+        )
+
     def run(hidden, sf, router_logits, routing_bias, topk_values, topk_indices):
         if include_activation_quant:
             hidden, sf = fp4_quantize(hidden, a1_gs, sv, False, True)
         # Routing (included in timing for fair comparison with TRTLLM)
-        fused_topk_deepseek(
-            scores=router_logits,
-            bias=routing_bias,
-            n_group=CFG.n_group,
-            topk_group=CFG.topk_group,
-            topk=CFG.top_k,
-            routed_scaling_factor=CFG.routed_scaling_factor,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
-        )
+        route_tokens(router_logits, routing_bias, topk_values, topk_indices)
         cutlass_fused_moe(
             hidden,
             topk_indices.to(torch.int),
@@ -679,6 +776,7 @@ def bench_cutlass(
             output=output,
             ep_size=ep_size,
             ep_rank=0,  # Simulating rank 0 of EP
+            **activation_kwargs,
         )
         return output
 
@@ -735,7 +833,9 @@ def bench_trtllm(
             and weights without quantization; FP4 activation flags do not
             affect it.
     """
+    _select_backends([f"trtllm-{precision}"], use_per_token_activation)
     from flashinfer.fused_moe import RoutingMethodType
+    from flashinfer.tllm_enums import ActivationType
     from flashinfer.fused_moe.da_tuner import (
         RoutingRealizationFactory,
         RoutingRealizationKey,
@@ -900,6 +1000,19 @@ def bench_trtllm(
         )
         logits_moe = trtllm_fp4_block_scale_moe
         routed_moe = trtllm_fp4_block_scale_routed_moe
+        if CFG.situ_beta is not None:
+            moe_kwargs.update(
+                activation_type=ActivationType.Situ,
+                gemm1_alpha=torch.full(
+                    (num_local_experts,), CFG.situ_beta, dtype=torch.float32, device=dev
+                ),
+                gemm1_beta=torch.full(
+                    (num_local_experts,),
+                    CFG.situ_linear_beta,
+                    dtype=torch.float32,
+                    device=dev,
+                ),
+            )
     else:
         raise ValueError(f"Unsupported TRTLLM precision: {precision}")
 
@@ -1027,7 +1140,7 @@ def run_benchmark(
     autotune_cache=None,
 ):
     """
-    Unified benchmark for DeepSeek-V3 MoE backends.
+    Unified benchmark for the selected MoE shape and activation preset.
 
     Autotuning runs in each backend's pre-warm step (under ``autotune(True)``)
     so the autotuner profiles all tactics on the default stream before
@@ -1067,6 +1180,9 @@ def run_benchmark(
     Returns:
         List of BenchResult objects
     """
+    _select_backends(backends, use_per_token_activation)
+    if profile_backend is not None:
+        _select_backends([profile_backend], use_per_token_activation)
     if tp_config < 1 or BASE_INTERMEDIATE_SIZE % tp_config != 0:
         raise ValueError(
             f"tp_config must be a positive divisor of {BASE_INTERMEDIATE_SIZE}"
@@ -1113,7 +1229,7 @@ def run_benchmark(
         gc.collect()
         torch.cuda.empty_cache()
 
-    if verbose and backends is not None:
+    if verbose and (backends is not None or CFG.situ_beta is not None):
         print("backend,tokens,latency_ms,tflops")
         for row, _ in rows_and_histograms:
             for result in row:
@@ -1171,7 +1287,7 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    selected = set(backends or ("cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"))
+    selected = _select_backends(backends, use_per_token_activation)
     run_cute_dsl_w4a4 = "cutedsl" in selected and profile_backend in (
         None,
         "cute-dsl",
@@ -1299,12 +1415,12 @@ def _print_header(
     print("\n" + "=" * table_width)
     if use_per_token_activation:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4 / TRTLLM BF16 "
+            f"{CFG.name} MoE Benchmark: CuteDSL W4A4/W4A16 vs TRTLLM NVFP4 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     else:
         print(
-            "DeepSeek-V3 MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM BF16 "
+            f"{CFG.name} MoE Benchmark: CuteDSL W4A4/W4A16 vs CUTLASS vs TRTLLM NVFP4 / TRTLLM BF16 "
             f"(EP={ep_config}, TP={tp_config})"
         )
     print("=" * table_width)
@@ -1484,22 +1600,16 @@ def _print_footer(use_per_token_activation):
 
 
 def _collect_expert_histogram(inputs, num_local, local_offset):
-    from flashinfer.fused_moe import fused_topk_deepseek
-
     num_tokens = inputs["router_logits"].shape[0]
     dev = inputs["router_logits"].device
     topk_values = torch.empty(num_tokens, CFG.top_k, dtype=torch.float32, device=dev)
     topk_indices = torch.empty(num_tokens, CFG.top_k, dtype=torch.int32, device=dev)
 
-    fused_topk_deepseek(
-        scores=inputs["router_logits"],
-        bias=inputs["routing_bias"].float(),
-        n_group=CFG.n_group,
-        topk_group=CFG.topk_group,
-        topk=CFG.top_k,
-        routed_scaling_factor=CFG.routed_scaling_factor,
-        topk_values=topk_values,
-        topk_indices=topk_indices,
+    _make_routing(inputs)(
+        inputs["router_logits"],
+        inputs["routing_bias"].float(),
+        topk_values,
+        topk_indices,
     )
 
     expert_hist = torch.bincount(
@@ -1527,7 +1637,13 @@ def _collect_expert_histogram(inputs, num_local, local_offset):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DeepSeek-V3 MoE Performance Benchmark"
+        description="DeepSeek-V3, GLM-5, and Kimi K3 MoE Performance Benchmark"
+    )
+    parser.add_argument(
+        "--model",
+        choices=tuple(MODEL_CONFIGS),
+        default="deepseek-v3",
+        help="MoE shape and activation preset (Kimi K3 excludes TRTLLM BF16: SiTU unsupported)",
     )
     parser.add_argument(
         "--num-tokens",
@@ -1554,13 +1670,13 @@ def main():
     parser.add_argument(
         "--num-experts",
         type=int,
-        default=CFG.num_experts,
-        help="Number of global routing experts",
+        default=None,
+        help="Override the preset number of global routing experts",
     )
     parser.add_argument(
         "--backends",
         type=str,
-        help="Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,trtllm-bf16 (default: all)",
+        help="Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,trtllm-bf16 (default: all supported by the model)",
     )
     parser.add_argument(
         "--distributions",
@@ -1652,12 +1768,13 @@ def main():
         help="Scale for random routing bias. Larger values tend to create expert imbalance.",
     )
     args = parser.parse_args()
+    set_model_config(args.model, args.num_experts)
 
     if args.tp < 1:
         parser.error("--tp must be positive")
-    if args.num_experts < 1:
+    if CFG.num_experts < 1:
         parser.error("--num-experts must be positive")
-    if args.num_experts % args.ep != 0:
+    if CFG.num_experts % args.ep != 0:
         parser.error("--ep must divide --num-experts")
     backends = None
     if args.backends:
@@ -1696,11 +1813,16 @@ def main():
             )
     if args.profile_backend == "cutlass" and args.use_per_token_activation:
         parser.error("CUTLASS does not consume the per-token activation scale")
+    try:
+        selected = _select_backends(backends, args.use_per_token_activation)
+        if args.profile_backend is not None:
+            _select_backends([args.profile_backend], args.use_per_token_activation)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
 
-    CFG.num_experts = args.num_experts
     if args.routing_input_mode == "routed" and not args.no_cuda_graph:
         os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "1"
         os.environ["FLASHINFER_DA_DISTRIBUTIONS"] = ",".join(distributions)
@@ -1716,12 +1838,62 @@ def main():
         tokens = TOKEN_COUNTS  # [128, 256, 512, 1024, 2048, 4096]
     if args.profile_cuda and len(tokens) != 1:
         parser.error("--profile-cuda requires exactly one token count")
-    print("\nDeepSeek-V3 MoE Performance Benchmark")
+    print(f"\n{CFG.name} MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(
+        f"Shape: hidden={CFG.hidden_size}, intermediate={BASE_INTERMEDIATE_SIZE}, "
+        f"experts={CFG.num_experts}, top_k={CFG.top_k}; "
+        f"EP={args.ep} ({CFG.num_experts // args.ep} local experts), "
+        f"TP={args.tp} (local intermediate={BASE_INTERMEDIATE_SIZE // args.tp})"
+    )
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
-    print("CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4 and TRTLLM BF16")
+    backend_names = {
+        "cutedsl": "CuteDSL W4A4 and CuteDSL W4A16",
+        "cutlass": "CUTLASS",
+        "trtllm-nvfp4": "TRTLLM NVFP4",
+        "trtllm-bf16": "TRTLLM BF16",
+    }
+    print(
+        "Backends: "
+        + ", ".join(
+            name
+            for backend, name in backend_names.items()
+            if backend in selected
+            and not (backend == "cutlass" and args.use_per_token_activation)
+        )
+    )
+    if CFG.situ_beta is not None:
+        print(
+            f"Activation: SiTU (gate beta={CFG.situ_beta:g}, "
+            f"linear beta={CFG.situ_linear_beta:g})"
+        )
+        print("TRTLLM BF16 omitted: its kernels do not support SiTU.")
+        if args.use_per_token_activation:
+            print(
+                "TRTLLM NVFP4 omitted: its SiTU kernels do not support per-token activation scaling."
+            )
+        print(
+            "Kimi K3 scope: routed latent experts only; NVFP4 experiments, not native MXFP4."
+        )
+    else:
+        print("Activation: SwiGLU")
+    print(
+        f"Routing: groups={CFG.n_group}, top groups={CFG.topk_group}, "
+        f"scale={CFG.routed_scaling_factor}; "
+        + (
+            "native TRTLLM routing; CuTe DSL/CUTLASS also include permutation and replay casts"
+            if CFG.n_group == 1
+            else "fused DeepSeek routing"
+        )
+        + " (included in timing)"
+    )
+    if CFG.n_group == 1:
+        print(
+            "CuTe DSL/CUTLASS routing: native BF16 weights widened to FP32; "
+            "full-range router permutation and two replay copies are timed."
+        )
     print(f"Tensor parallelism simulation: TP={args.tp}")
     print(f"CUDA profiler capture: {args.profile_cuda}")
     print(
@@ -1729,9 +1901,15 @@ def main():
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
     )
 
-    print(
-        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
-    )
+    trtllm_names = [
+        name
+        for backend, name in backend_names.items()
+        if backend in selected and backend.startswith("trtllm-")
+    ]
+    if trtllm_names:
+        print(
+            f"{' / '.join(trtllm_names)} finalize: native (unaffected by --no-fused-finalize)."
+        )
 
     run_benchmark(
         token_counts=tokens,
