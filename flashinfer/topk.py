@@ -921,8 +921,6 @@ def top_k(
       better performance. Set ``sorted=True`` if you need sorted output.
     - The radix-based algorithm is O(n) in vocabulary size, compared to O(n log k)
       for heap-based methods, making it faster for large vocabularies.
-    - The CUB backend supports ``k > d``: all input entries are returned, followed
-      by padding with index ``-1`` and value ``0``.
     - For small vocabularies (< 1000), ``torch.topk`` may be faster.
 
     Examples
@@ -1162,8 +1160,7 @@ def top_k_page_table_transform(
     - ``input`` may have padding between rows, but its last dimension must be
       contiguous.
     - If ``lengths[i] <= k``, raw indices are ``0..lengths[i]-1`` and remaining
-      positions are set to -1. The CUB backend also supports ``k`` larger than
-      the physical score width.
+      positions are set to -1.
 
     Examples
     --------
@@ -1373,8 +1370,7 @@ def top_k_ragged_transform(
     - This is specifically designed for sparse attention's second stage with
       ragged KV cache layout.
     - If lengths[i] <= k, the output contains [offsets[i], offsets[i]+1, ..., offsets[i]+lengths[i]-1]
-      with remaining positions set to -1. The CUB backend also supports ``k``
-      larger than the physical score width.
+      with remaining positions set to -1.
 
     Examples
     --------
