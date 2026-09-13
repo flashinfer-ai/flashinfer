@@ -86,6 +86,13 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
     Workspace construction compiles the selected kernels and must finish before
     the first invocation. Calls using the same workspace must not overlap.
     Feature-disabled tensor slots use internal placeholders that are not read.
+
+    ``apply_rms_norm=False`` compiles the collective without its normalisation:
+    the chain stops after finalize, shared-expert add, all-reduce and the
+    optional residual add, and writes that value to ``residual_out``. It then
+    requires ``write_residual_output=True`` -- otherwise nothing would be
+    written -- and ``rms_gamma`` and ``norm_out`` must be ``None``. The
+    high-throughput protocol fuses the norm into a warp group and rejects it.
     """
 
     _destroyed: bool
@@ -106,6 +113,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         include_shared_expert: bool = True,
         add_residual: bool = True,
         write_residual_output: bool = True,
+        apply_rms_norm: bool = True,
         config: MNNVLCuteDSLConfig = DEFAULT_CONFIG,
     ) -> None:
         if tp_size not in (2, 4, 8, 16):
@@ -114,6 +122,11 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
             raise ValueError("tp_rank must be in [0, tp_size)")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
+        if not apply_rms_norm and not write_residual_output:
+            raise ValueError(
+                "write_residual_output must be True when apply_rms_norm is False; "
+                "otherwise the fusion produces no output"
+            )
         if dtype != torch.bfloat16:
             raise ValueError("MNNVL CuTe DSL kernels only support torch.bfloat16")
         if not torch.cuda.is_available():
@@ -147,6 +160,17 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.apply_rms_norm = apply_rms_norm
+        # The compiled kernels still take gamma and norm_output arguments when
+        # the norm is guarded out, but never read or write them. A small owned
+        # placeholder keeps the signature satisfied without allocating another
+        # (capacity_m, hidden_dim) buffer -- residual_out stands in for
+        # norm_output at the call site.
+        self._gamma_placeholder = (
+            None
+            if apply_rms_norm
+            else torch.empty(hidden_dim, dtype=dtype, device=device)
+        )
         self.config = config
         self.profile = config.resolve(
             tp_size=tp_size,
@@ -180,6 +204,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 include_shared_expert=include_shared_expert,
                 add_residual=add_residual,
                 write_residual_output=write_residual_output,
+                apply_rms_norm=apply_rms_norm,
                 group=group,
             )
             instance: LLProtocol | BTProtocol | HTProtocol
@@ -394,8 +419,12 @@ def _mnnvl_cutedsl_allreduce_fusion(
         raise ValueError("rms_eps does not match the compiled workspace")
     if weight_bias != workspace.weight_bias:
         raise ValueError("weight_bias does not match the compiled workspace")
-    if rms_gamma is None:
+    if workspace.apply_rms_norm and rms_gamma is None:
         raise ValueError("rms_gamma is required")
+    if not workspace.apply_rms_norm and rms_gamma is not None:
+        raise ValueError("rms_gamma must be None for this compiled workspace")
+    if not workspace.apply_rms_norm and norm_out is not None:
+        raise ValueError("norm_out must be None for this compiled workspace")
     if workspace.add_residual and residual_in is None:
         raise ValueError("residual_in is required by the compiled workspace")
     if not workspace.add_residual and residual_in is not None:
@@ -405,14 +434,17 @@ def _mnnvl_cutedsl_allreduce_fusion(
 
     device = torch.device("cuda", torch.cuda.current_device())
     hidden = workspace.hidden_dim
-    _check_tensor(
-        rms_gamma,
-        "rms_gamma",
-        shape=(hidden,),
-        dtype=torch.bfloat16,
-        device=device,
-        alignment=16,
-    )
+    if workspace.apply_rms_norm:
+        _check_tensor(
+            rms_gamma,
+            "rms_gamma",
+            shape=(hidden,),
+            dtype=torch.bfloat16,
+            device=device,
+            alignment=16,
+        )
+    else:
+        rms_gamma = workspace._gamma_placeholder
 
     if pattern == AllReduceFusionPattern.kARResidualRMSNorm:
         if any(
@@ -463,12 +495,16 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 device=device,
                 alignment=16,
             )
+        # With the norm compiled out the kernel writes only
+        # residual_output; passing it as norm_output too satisfies the
+        # signature and is never written through.
+        norm_target = norm_out if workspace.apply_rms_norm else residual_out
         norm_out, _ = workspace._all_reduce_rms_norm(
             input,
             residual_in,
             rms_gamma,
             input.shape[0],
-            norm_output=norm_out,
+            norm_output=norm_target,
             residual_output=residual_out,
         )
         return norm_out
@@ -550,6 +586,10 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 device=device,
                 alignment=16,
             )
+        # With the norm compiled out the kernel writes only
+        # residual_output; passing it as norm_output too satisfies the
+        # signature and is never written through.
+        norm_target = norm_out if workspace.apply_rms_norm else residual_out
         norm_out, _ = workspace._finalize_all_reduce_rms_norm(
             input,
             expert_scale_factor,
@@ -558,7 +598,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
             residual_in,
             rms_gamma,
             m,
-            norm_output=norm_out,
+            norm_output=norm_target,
             residual_output=residual_out,
         )
         return norm_out
