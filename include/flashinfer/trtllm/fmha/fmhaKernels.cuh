@@ -1142,8 +1142,7 @@ class TllmGenFmhaKernel {
     // CTA configuration can upgrade the selected GQA tile to cluster reduction. Keep that
     // tile when reselecting its reduction variant: restarting the heuristic from the largest
     // query tile can request a nonexistent KeepsMmaAb/CGA kernel.
-    if (selectKernelParams.mGroupsTokensHeadsQ &&
-        isSwapsMmaAbForGenerationKernel(kernelType) &&
+    if (selectKernelParams.mGroupsTokensHeadsQ && isSwapsMmaAbForGenerationKernel(kernelType) &&
         isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode)) {
       return;
     }
