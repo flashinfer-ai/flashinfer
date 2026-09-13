@@ -125,6 +125,8 @@ def _get_compiled_kernel(
 ):
     mma_tiler_m, route_tile, mma_tiler_k = mma_tiler_mnk
     use_2cta_instrs = mma_tiler_m == 256
+    cta_tile_m = mma_tiler_m // (2 if use_2cta_instrs else 1)
+    m_cluster_aligned = m > 0 and m % (cta_tile_m * cluster_shape_mn[0]) == 0
     transform_fragment_size = (
         128 if activation_type is not None or k == mma_tiler_k else 32
     )
@@ -146,6 +148,7 @@ def _get_compiled_kernel(
         cluster_shape_mn,
         raster_along_m,
         transform_fragment_size,
+        m_cluster_aligned,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -168,6 +171,7 @@ def _get_compiled_kernel(
             use_clc_scheduler=use_clc_scheduler,
             raster_along_m=raster_along_m,
             transform_fragment_size=transform_fragment_size,
+            m_cluster_aligned=m_cluster_aligned,
         )
         compiled = cute.compile(
             kernel.wrapper,
