@@ -25,6 +25,7 @@ from ..jit import gen_batch_attention_module
 from ..trace.templates.attention import batch_attention_run_trace
 from ..utils import (
     MaskMode,
+    canonicalize_torch_dtype,
     PosEncodingMode,
     TensorLayout,
     _check_kv_layout,
@@ -33,6 +34,10 @@ from ..utils import (
 )
 from ..prefill import BatchPrefillWithPagedKVCacheWrapper
 from ..jit.attention.variants import attention_sink_decl
+from ..jit.attention.modules import (
+    batch_prefill_bidirectional_ranges_jit_args,
+    get_batch_prefill_bidirectional_ranges_spec,
+)
 from ..jit.utils import filename_safe_dtype_map
 
 
@@ -405,4 +410,522 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
             backend=backend,
             jit_args=jit_args,
             jit_kwargs=jit_kwargs,
+        )
+
+
+class BatchPrefillWithCausalBidirectionalRangesWrapper(
+    BatchPrefillWithPagedKVCacheWrapper
+):
+    r"""Paged batch prefill with a causal mask plus per-query bidirectional ranges.
+
+    The mask this wrapper applies is
+
+    .. code-block:: text
+
+        (causal AND causal_window) OR (in_range AND range_window)
+
+    where ``in_range`` is decided per query token from an inclusive
+    ``[start, end]`` key span supplied by the caller. Tokens inside their own
+    span see each other in both directions; everything else stays causal. This
+    is the shape a prefix-style batch produces, but the wrapper knows nothing
+    about what the spans mean.
+
+    The mask is never materialized. A custom fa2 attention variant owns the
+    whole expression and evaluates it on every KV tile from the compact range
+    tensor, so nothing here grows with ``qo_len * kv_len``.
+
+    Ranges are passed to :meth:`run` as a contiguous ``int32`` tensor of shape
+    ``[total_q, 2]`` on the query device, one row per scheduled query token in
+    the same order as the query tensor. Row ``i`` is the inclusive
+    ``[start, end]`` span of query ``i`` in absolute key positions within its
+    request; ``(-1, -1)`` marks a query with no span, which then keeps the
+    plain causal mask.
+
+    The wrapper is fa2 only, because fa2 is the only backend whose kernels
+    evaluate a custom ``LogitsMask`` per KV tile. It is not related to, and
+    cannot be combined with, ``prefix_len_ptr`` (multi-item scoring), which
+    selects a different mask mode and owns the mask itself.
+
+    The JIT module is specialized in the constructor on the query, KV and
+    output dtypes, both head dimensions and the positional-encoding mode.
+    :meth:`plan` and :meth:`workspace_size` reject any value that differs from
+    what was compiled, and reject the inherited options that would otherwise be
+    accepted and silently ignored.
+
+    Example
+    -------
+    >>> import torch, flashinfer
+    >>> workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> wrapper = flashinfer.BatchPrefillWithCausalBidirectionalRangesWrapper(
+    ...     workspace, q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16,
+    ...     head_dim_qk=128, head_dim_vo=128,
+    ... )  # doctest: +SKIP
+    """
+
+    # No @flashinfer_api on the overrides here: the parent class already
+    # decorates __init__, plan, workspace_size and run.
+    def __init__(
+        self,
+        float_workspace_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+        use_cuda_graph: bool = False,
+        qo_indptr_buf: Optional[torch.Tensor] = None,
+        paged_kv_indptr_buf: Optional[torch.Tensor] = None,
+        paged_kv_indices_buf: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        pos_encoding_mode: str = "NONE",
+        q_data_type: torch.dtype = torch.bfloat16,
+        kv_data_type: torch.dtype = torch.bfloat16,
+        o_data_type: Optional[torch.dtype] = None,
+        head_dim_qk: int = 128,
+        head_dim_vo: int = 128,
+    ) -> None:
+        if pos_encoding_mode != "NONE":
+            # POS_ENCODING_MODE is a compile-time constant of the customize
+            # config, and a rotary mode makes the kernel read rope parameters
+            # that this variant does not declare as additional scalars.
+            raise NotImplementedError(
+                "pos_encoding_mode must be 'NONE' for this wrapper: the variant "
+                "declares no rope scalars, so any other mode would not compile. "
+                f"Got {pos_encoding_mode!r}."
+            )
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        o_data_type = (
+            q_data_type
+            if o_data_type is None
+            else canonicalize_torch_dtype(o_data_type)
+        )
+
+        self._spec = get_batch_prefill_bidirectional_ranges_spec(
+            q_data_type,
+            kv_data_type,
+            o_data_type,
+            torch.int32,
+            head_dim_qk,
+            head_dim_vo,
+        )
+
+        super().__init__(
+            float_workspace_buffer=float_workspace_buffer,
+            kv_layout=kv_layout,
+            use_cuda_graph=use_cuda_graph,
+            qo_indptr_buf=qo_indptr_buf,
+            paged_kv_indptr_buf=paged_kv_indptr_buf,
+            paged_kv_indices_buf=paged_kv_indices_buf,
+            paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
+            backend=self._spec["backend"],
+            jit_args=batch_prefill_bidirectional_ranges_jit_args(self._spec),
+            jit_kwargs=self._spec["jit_kwargs"],
+            variant_owns_mask=True,
+        )
+
+    def _check_specialization(
+        self,
+        head_dim_qk: int,
+        head_dim_vo: Optional[int],
+        pos_encoding_mode: str,
+        q_data_type: Optional[Union[str, torch.dtype]],
+        kv_data_type: Optional[Union[str, torch.dtype]],
+        o_data_type: Optional[Union[str, torch.dtype]],
+        custom_mask: Optional[torch.Tensor],
+        packed_custom_mask: Optional[torch.Tensor],
+        causal: bool,
+        use_fp16_qk_reduction: bool,
+        window_left: int,
+        logits_soft_cap: Optional[float],
+        prefix_len_ptr: Optional[torch.Tensor],
+        token_pos_in_items_ptr: Optional[torch.Tensor],
+        token_pos_in_items_len: int,
+        max_item_len_ptr: Optional[torch.Tensor],
+    ) -> Tuple[torch.dtype, torch.dtype, torch.dtype, int]:
+        """Validate one ``plan``/``workspace_size`` call against the built module.
+
+        An omitted dtype or ``head_dim_vo`` is taken from the specialization the
+        constructor compiled, not from a generic default, so a caller never has
+        to restate what it already said once. Only a value that was actually
+        passed is compared, and a mismatch is refused rather than quietly
+        planned for a kernel that was never built.
+
+        Returns the ``(q, kv, o)`` dtypes and ``head_dim_vo`` of the built
+        module, so both callers hand the parent exactly what it was compiled
+        for.
+        """
+        spec = self._spec
+        for name, value, key in (
+            ("q_data_type", q_data_type, "dtype_q"),
+            ("kv_data_type", kv_data_type, "dtype_kv"),
+            ("o_data_type", o_data_type, "dtype_o"),
+            ("head_dim_qk", head_dim_qk, "head_dim_qk"),
+            ("head_dim_vo", head_dim_vo, "head_dim_vo"),
+        ):
+            if value is None:
+                continue
+            got = (
+                value if key.startswith("head_dim") else canonicalize_torch_dtype(value)
+            )
+            if got != spec[key]:
+                raise ValueError(
+                    f"{name}={got} does not match the value this wrapper was "
+                    f"constructed with ({spec[key]}). The JIT module is "
+                    "specialized in the constructor; build a second wrapper for "
+                    "a second configuration."
+                )
+        q_data_type = spec["dtype_q"]
+        kv_data_type = spec["dtype_kv"]
+        o_data_type = spec["dtype_o"]
+        head_dim_vo = spec["head_dim_vo"]
+        if (
+            PosEncodingMode[pos_encoding_mode].value
+            != spec["jit_kwargs"]["pos_encoding_mode"]
+        ):
+            raise ValueError(
+                f"pos_encoding_mode={pos_encoding_mode!r} does not match the "
+                "value this wrapper was constructed with."
+            )
+
+        # Inherited options that this wrapper would otherwise accept and then
+        # ignore, because the variant owns the mask or because the module was
+        # not compiled for them.
+        for name, value in (
+            ("custom_mask", custom_mask),
+            ("packed_custom_mask", packed_custom_mask),
+            ("prefix_len_ptr", prefix_len_ptr),
+            ("token_pos_in_items_ptr", token_pos_in_items_ptr),
+            ("max_item_len_ptr", max_item_len_ptr),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"{name} is not supported: the attention variant owns the "
+                    "whole mask, so a caller-supplied mask would be ignored. "
+                    "Pass the spans through run(bidirectional_ranges=...)."
+                )
+        if token_pos_in_items_len != 0:
+            raise ValueError(
+                "token_pos_in_items_len is not supported: multi-item scoring "
+                "owns the mask itself and cannot be combined with this variant."
+            )
+        if causal:
+            raise ValueError(
+                "causal=True is not supported: causality is already part of "
+                "this variant's mask and the flag would be ignored. Use "
+                "run(causal_window_left=...) to bound the causal part."
+            )
+        if use_fp16_qk_reduction:
+            raise ValueError(
+                "use_fp16_qk_reduction=True is not supported: the module was "
+                "compiled with fp16 QK reduction off."
+            )
+        if window_left != -1:
+            raise ValueError(
+                "window_left is not supported here: the variant applies its own "
+                "windows. Use run(causal_window_left=..., range_window_left=...), "
+                "which bound the causal and bidirectional parts separately."
+            )
+        if logits_soft_cap:
+            raise ValueError(
+                "logits_soft_cap is not supported: the module was compiled with "
+                "the soft-cap path off."
+            )
+        return q_data_type, kv_data_type, o_data_type, head_dim_vo
+
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        page_size: int,
+        head_dim_vo: Optional[int] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = None,
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        non_blocking: bool = True,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: int = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+    ) -> None:
+        r"""Plan a batch whose mask this variant owns.
+
+        The signature mirrors the parent wrapper so that a caller can swap the
+        two, but every argument that the variant makes meaningless is rejected
+        instead of ignored, and the dtypes and head dimensions must match what
+        the constructor compiled. Backend-specific planning arguments of the
+        parent (``seq_lens``, ``block_tables``, ``rope_scale``, ...) are absent
+        here: this wrapper is fa2 only and applies no positional encoding.
+        """
+        q_data_type, kv_data_type, o_data_type, head_dim_vo = (
+            self._check_specialization(
+                head_dim_qk,
+                head_dim_vo,
+                pos_encoding_mode,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                custom_mask,
+                packed_custom_mask,
+                causal,
+                use_fp16_qk_reduction,
+                window_left,
+                logits_soft_cap,
+                prefix_len_ptr,
+                token_pos_in_items_ptr,
+                token_pos_in_items_len,
+                max_item_len_ptr,
+            )
+        )
+        return super().plan(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            page_size,
+            head_dim_vo=head_dim_vo,
+            causal=False,
+            pos_encoding_mode=pos_encoding_mode,
+            sm_scale=sm_scale,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            non_blocking=non_blocking,
+            max_token_per_sequence=max_token_per_sequence,
+            max_sequence_kv=max_sequence_kv,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+        )
+
+    def workspace_size(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        page_size: int,
+        head_dim_vo: Optional[int] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        packed_custom_mask: Optional[torch.Tensor] = None,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = None,
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        prefix_len_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_ptr: Optional[torch.Tensor] = None,
+        token_pos_in_items_len: int = 0,
+        max_item_len_ptr: Optional[torch.Tensor] = None,
+        max_token_per_sequence: Optional[int] = None,
+        max_sequence_kv: Optional[int] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+    ) -> Tuple[int, int]:
+        r"""Caller-owned workspace size for a :meth:`plan` with these arguments.
+
+        Validates exactly what :meth:`plan` validates, so a caller cannot size a
+        workspace for a configuration that :meth:`plan` would then reject.
+        """
+        q_data_type, kv_data_type, o_data_type, head_dim_vo = (
+            self._check_specialization(
+                head_dim_qk,
+                head_dim_vo,
+                pos_encoding_mode,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                custom_mask,
+                packed_custom_mask,
+                causal,
+                use_fp16_qk_reduction,
+                window_left,
+                logits_soft_cap,
+                prefix_len_ptr,
+                token_pos_in_items_ptr,
+                token_pos_in_items_len,
+                max_item_len_ptr,
+            )
+        )
+        return super().workspace_size(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim_qk,
+            page_size,
+            head_dim_vo=head_dim_vo,
+            causal=False,
+            pos_encoding_mode=pos_encoding_mode,
+            sm_scale=sm_scale,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            max_token_per_sequence=max_token_per_sequence,
+            max_sequence_kv=max_sequence_kv,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        bidirectional_ranges: torch.Tensor,
+        causal_window_left: int = -1,
+        range_window_left: int = -1,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        r"""Run causal + bidirectional-ranges attention.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Query tensor, shape ``[total_q, num_qo_heads, head_dim_qk]``.
+        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            The paged KV cache, as accepted by the parent wrapper.
+        bidirectional_ranges : torch.Tensor
+            Contiguous ``int32`` tensor of shape ``[total_q, 2]`` on the query
+            device. Row ``i`` is the inclusive ``[start, end]`` key span that
+            query ``i`` attends bidirectionally, or ``(-1, -1)`` for none. A
+            contiguous row slice of a larger ``[N, 2]`` buffer is accepted; a
+            non-contiguous tensor is rejected rather than copied, so the kernel
+            argument stays a stable pointer under CUDA graph capture.
+        causal_window_left : int
+            Sliding window on the causal part. A key is kept when
+            ``q_abs - kv < causal_window_left``. ``-1`` (or ``0``) disables the
+            window, leaving the causal part unbounded.
+        range_window_left : int
+            Sliding window on the bidirectional part. ``-1`` (or ``0``) leaves
+            the spans unclamped, which is what a span normally wants; set it to
+            bound how far back a span may reach.
+        q_scale, k_scale : Optional[float]
+            Scalar calibration scales folded into ``sm_scale``. Per-head scale
+            tensors are rejected: this variant declares a single ``double``
+            ``sm_scale``, so a tensor could not be folded into it.
+        v_scale : Optional[float]
+            Scalar calibration scale of the value cache. It never reaches the
+            variant: the parent rescales the output once the kernel has
+            returned. Only a scalar is exposed here, so the public contract of
+            this wrapper stays a single output rescaling; per-head tensors are
+            rejected.
+        out : Optional[torch.Tensor]
+            Output tensor; allocated internally when omitted. Its dtype must be
+            the ``o_data_type`` this wrapper was constructed with.
+        lse : Optional[torch.Tensor]
+            Log-sum-exp tensor, allocated internally when omitted.
+        return_lse : bool
+            Whether to return the log-sum-exp alongside the output.
+        enable_pdl : Optional[bool]
+            Programmatic dependent launch, as in the parent wrapper.
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Scale factors for a packed NVFP4 KV cache. Required when the
+            wrapper was constructed with a packed fp4 ``kv_data_type``, and
+            meaningless otherwise.
+
+        Notes
+        -----
+        ``window_left``, ``sinks`` and the parent's remaining keyword arguments
+        are deliberately absent. Each of them either contradicts the mask this
+        variant owns or falls outside the contract this specialized wrapper
+        offers, so it is not exposed rather than accepted and then ignored.
+        """
+        if bidirectional_ranges.dtype != torch.int32:
+            raise ValueError(
+                f"bidirectional_ranges must be int32, got {bidirectional_ranges.dtype}"
+            )
+        if bidirectional_ranges.dim() != 2 or bidirectional_ranges.size(-1) != 2:
+            raise ValueError(
+                "bidirectional_ranges must have shape [total_q, 2], got "
+                f"{tuple(bidirectional_ranges.shape)}"
+            )
+        if bidirectional_ranges.size(0) != q.size(0):
+            raise ValueError(
+                "bidirectional_ranges must have one row per query token: got "
+                f"{bidirectional_ranges.size(0)} rows for {q.size(0)} queries"
+            )
+        if bidirectional_ranges.device != q.device:
+            raise ValueError(
+                "bidirectional_ranges must live on the query device, got "
+                f"{bidirectional_ranges.device} and {q.device}"
+            )
+        if not bidirectional_ranges.is_contiguous():
+            raise ValueError(
+                "bidirectional_ranges must be contiguous. Copying it here would "
+                "hand the kernel a fresh pointer on every call, which a captured "
+                "CUDA graph would then replay against freed memory; call "
+                ".contiguous() at the call site if that is what you want."
+            )
+        for name, value in (("q_scale", q_scale), ("k_scale", k_scale)):
+            if isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"{name} must be a scalar for this wrapper: the variant "
+                    "declares a single sm_scale double, so a per-head tensor "
+                    "cannot be folded into it."
+                )
+        if isinstance(v_scale, torch.Tensor):
+            raise ValueError(
+                "v_scale must be a scalar for this wrapper: its public contract "
+                "is a single scalar rescaling of the output, not a per-head one."
+            )
+        if q.dtype != self._spec["dtype_q"]:
+            raise ValueError(
+                f"q has dtype {q.dtype}, but this wrapper was built for "
+                f"{self._spec['dtype_q']}."
+            )
+
+        # The kernel indexes the rows flat; the 2-D shape is the public
+        # contract, and this view keeps the caller's pointer.
+        ranges_flat = bidirectional_ranges.view(-1)
+        # Window semantics are "keep when distance < N", so a disabled window is
+        # 0 rather than -1.
+        causal_n = float(max(causal_window_left, 0))
+        range_n = float(max(range_window_left, 0))
+        return super().run(
+            q,
+            paged_kv_cache,
+            ranges_flat,
+            causal_n,
+            range_n,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out=out,
+            lse=lse,
+            return_lse=return_lse,
+            enable_pdl=enable_pdl,
+            kv_cache_sf=kv_cache_sf,
         )

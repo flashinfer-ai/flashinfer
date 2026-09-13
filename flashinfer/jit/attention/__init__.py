@@ -50,5 +50,6 @@ from .modules import gen_trtllm_fmha_v2_sm120_module as gen_trtllm_fmha_v2_sm120
 from .modules import gen_fmha_v2_module as gen_fmha_v2_module
 from .modules import (
     gen_batch_prefill_attention_sink_module as gen_batch_prefill_attention_sink_module,
+    gen_batch_prefill_bidirectional_ranges_module as gen_batch_prefill_bidirectional_ranges_module,
     get_batch_prefill_attention_sink_uri as get_batch_prefill_attention_sink_uri,
 )

@@ -1151,6 +1151,135 @@ def gen_batch_prefill_module(
     )
 
 
+def get_batch_prefill_bidirectional_ranges_spec(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> dict:
+    """The single source of truth for this variant's JIT contract.
+
+    Both the public generator and the wrapper build their module from this, so
+    the URI, the additional tensor/scalar names and their dtypes cannot drift
+    apart between the two entry points.
+
+    There is no positional-encoding parameter: ``POS_ENCODING_MODE`` is a
+    compile-time constant of the customize config, and any rotary mode makes
+    the kernel read rope parameters that this variant does not declare as
+    additional scalars. The mode is fixed to ``NONE`` here rather than accepted
+    and then failing at nvcc time.
+    """
+    from flashinfer.jit.attention.variants import bidirectional_ranges_decl
+
+    uri = (
+        f"batch_prefill_with_bidirectional_ranges_"
+        f"dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}"
+    )
+
+    tensor_names: List[str] = ["bidirectional_ranges"]
+    tensor_dtypes: List[str] = ["int32_t"]
+    if dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1":
+        # The generator emits the scale-factor stride setters that the packed
+        # fp4 KV load path reads only for these exact names.
+        tensor_names += ["maybe_k_cache_sf", "maybe_v_cache_sf"]
+        tensor_dtypes += ["uint8_t", "uint8_t"]
+
+    return {
+        "uri": uri,
+        "backend": "fa2",
+        "dtype_q": dtype_q,
+        "dtype_kv": dtype_kv,
+        "dtype_o": dtype_o,
+        "dtype_idx": dtype_idx,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
+        "tensor_names": tensor_names,
+        "tensor_dtypes": tensor_dtypes,
+        "scalar_names": ["causal_window_left", "range_window_left", "sm_scale"],
+        "scalar_dtypes": ["double", "double", "double"],
+        "variant_name": "CausalBidirectionalRangesAttention",
+        "variant_decl": bidirectional_ranges_decl["fa2"],
+        "jit_kwargs": {
+            # The variant owns the window, so the kernel-side sliding-window
+            # and soft-cap paths stay off.
+            "pos_encoding_mode": 0,  # PosEncodingMode.NONE
+            "use_sliding_window": False,
+            "use_logits_soft_cap": False,
+            "use_fp16_qk_reduction": False,
+        },
+    }
+
+
+def batch_prefill_bidirectional_ranges_jit_args(spec: dict) -> List[Any]:
+    """Positional ``jit_args`` for ``BatchPrefillWithPagedKVCacheWrapper``."""
+    return [
+        spec["uri"],
+        spec["dtype_q"],
+        spec["dtype_kv"],
+        spec["dtype_o"],
+        spec["dtype_idx"],
+        spec["head_dim_qk"],
+        spec["head_dim_vo"],
+        spec["tensor_names"],
+        spec["tensor_dtypes"],
+        spec["scalar_names"],
+        spec["scalar_dtypes"],
+        spec["variant_name"],
+        spec["variant_decl"],
+    ]
+
+
+def gen_batch_prefill_bidirectional_ranges_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> JitSpec:
+    """Build the causal + bidirectional-ranges batch-prefill module.
+
+    fa2 only: it is the only backend whose kernels evaluate a custom
+    ``LogitsMask`` on every KV tile, which is what lets the variant own the
+    whole mask instead of reading a materialized one. The positional-encoding
+    mode is fixed to ``NONE``; see
+    :func:`get_batch_prefill_bidirectional_ranges_spec`.
+    """
+    spec = get_batch_prefill_bidirectional_ranges_spec(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+    )
+    return gen_customize_batch_prefill_module(
+        spec["backend"],
+        spec["uri"],
+        spec["dtype_q"],
+        spec["dtype_kv"],
+        spec["dtype_o"],
+        spec["dtype_idx"],
+        spec["head_dim_qk"],
+        spec["head_dim_vo"],
+        spec["tensor_names"],
+        spec["tensor_dtypes"],
+        spec["scalar_names"],
+        spec["scalar_dtypes"],
+        spec["variant_name"],
+        spec["variant_decl"],
+        fp8_enabled=False,
+        **spec["jit_kwargs"],
+    )
+
+
 def gen_batch_prefill_attention_sink_module(
     backend: str,
     dtype_q: torch.dtype,

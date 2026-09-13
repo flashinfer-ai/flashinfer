@@ -216,6 +216,25 @@ Batch Prefill/Append Attention
     .. automethod:: __init__
 
 
+Causal + Bidirectional Ranges Prefill
+-------------------------------------
+
+.. currentmodule:: flashinfer.attention
+
+A batch-prefill wrapper whose fa2 attention variant owns the whole mask:
+causal, plus an inclusive per-query key span attended in both directions. The
+spans are handed to :meth:`BatchPrefillWithCausalBidirectionalRangesWrapper.run`
+as a compact ``int32 [total_q, 2]`` tensor and no mask is materialized, so
+nothing scales with ``qo_len * kv_len``. The JIT module is specialized in the
+constructor, and the inherited options the variant makes meaningless are
+rejected rather than ignored.
+
+.. autoclass:: BatchPrefillWithCausalBidirectionalRangesWrapper
+    :members:
+
+    .. automethod:: __init__
+
+
 Unified BatchAttention
 ----------------------
 
