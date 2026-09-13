@@ -137,6 +137,7 @@ def _get_compiled_kernel(
         situ_beta,
         situ_linear_beta,
         use_fused_finalize,
+        top_k,
         enable_pdl,
         use_clc_scheduler,
         mma_tiler_m,
@@ -350,7 +351,6 @@ def _run_grouped_gemm(
         n,
         k,
         num_tokens,
-        top_k,
         stream=stream,
     )
 
