@@ -178,6 +178,9 @@ class _CompiledMega:
     shared_workspace: torch.Tensor
     symmetric_base: int
     peer_offsets_list: Tuple[int, ...]
+    # generate_c (training forward): raw pre-SwiGLU fc1 gate+up output,
+    # (pool_token_capacity, 2 * intermediate) BF16, rank-local; None when off.
+    fc1_c: Optional[torch.Tensor] = None
     # Launch-kwargs cache: rebuilding the cute tensor views (13x from_dlpack +
     # SymBufferHost) and re-validating inputs costs real host time per launch,
     # and the launch inputs are stable session buffers in steady state.  Keyed

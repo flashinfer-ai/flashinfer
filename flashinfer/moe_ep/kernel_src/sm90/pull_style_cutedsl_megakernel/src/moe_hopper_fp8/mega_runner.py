@@ -17,7 +17,8 @@ overridden:
 Topk weighting follows the NVFP4/MXFP8 compute graphs. ``deepgemm`` folds each
 routing weight into the SwiGLU output before FC1-output quantization;
 ``transformers`` keeps the staged FC2 terms unweighted and applies routing
-weights in the standalone ``TopkReduce`` kernel. Form B requires ``deepgemm``.
+weights in the standalone ``TopkReduce`` kernel. In-kernel reduce
+(``--in_kernel_fc2_reduce``) requires ``deepgemm``.
 
 Launcher::
 
@@ -89,6 +90,7 @@ from moe_hopper_fp8.hopper_moe_utils import (
     quantize_fp8_per_token_block,
     quantize_fp8_weight_block_nk,
 )
+from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
 
 
 _KIND_TO_TORCH_DTYPE = {
@@ -156,9 +158,11 @@ class MegaMoEFp8Tester(MegaMoETester):
         fp8_scale_mode: str = "per_tensor",
         fp8_accum_mode: str = "1xacc",
         swap_ab: bool = False,
+        pingpong: bool = False,
         use_cuda_profiler_api: bool = False,
     ) -> None:
         self.swap_ab = swap_ab
+        self.pingpong = pingpong
         self._use_cuda_profiler_api = use_cuda_profiler_api
         super().__init__(problem, impl, misc, rank=rank)
         if kind not in _KIND_TO_TORCH_DTYPE:
@@ -187,10 +191,6 @@ class MegaMoEFp8Tester(MegaMoETester):
         self._global_fc1_weight_dequant_scale: Optional[torch.Tensor] = None
         self._global_fc2_activation_dequant_scale: Optional[torch.Tensor] = None
         self._global_fc2_weight_dequant_scale: Optional[torch.Tensor] = None
-        if impl.in_kernel_fc2_reduce and impl.token_back_by_dispatch:
-            raise ValueError(
-                "in_kernel_fc2_reduce and token_back_by_dispatch cannot both be True."
-            )
 
     # ------------------------------------------------------------------
     # Step 1: deterministic FP8 input + weight generation
@@ -575,22 +575,48 @@ class MegaMoEFp8Tester(MegaMoETester):
 
         # ---- Public final output. The per-topk (T, K, H) combine plane is an
         # internal shared-workspace region in separate-reduce mode.
+        if problem.fc2_output_dtype != torch.bfloat16:
+            raise ValueError(
+                "the Hopper FP8 combine (REDG / cp.reduce push / separate "
+                f"TopkReduce) is BF16-only, got {problem.fc2_output_dtype}."
+            )
         if self.impl.in_kernel_fc2_reduce:
-            # Form B REDG writes across ranks and accumulates from zero.
+            # In-kernel reduce (epi_warps REDG or dispatch cp.reduce push)
+            # accumulates across ranks from zero, so the output must live on
+            # the symmetric heap.
             self.output_activation = _sym_zeros(
                 (num_tokens_per_rank, hidden), problem.fc2_output_dtype,
             )
         else:
-            if problem.fc2_output_dtype != torch.bfloat16:
-                raise ValueError(
-                    "separate TopkReduce currently expects BF16 output, "
-                    f"got {problem.fc2_output_dtype}."
-                )
             self.output_activation = torch.empty(
                 (num_tokens_per_rank, hidden),
                 dtype=problem.fc2_output_dtype,
                 device="cuda",
             )
+
+        # -- generate_c: raw fc1 gate+up output in the expert-major pool layout
+        # (128-aligned per-expert segments, zero-filled so pad rows stay 0);
+        # same host contract as the Blackwell MXFP8 runner.
+        self._c_output = None
+        self._c_valid_tokens_per_expert = None
+        self._c_data_physical_offsets = None
+        if self.impl.generate_c:
+            expert_start = self.rank * problem.num_experts_per_rank
+            valid_tokens = [
+                int((self._global_topk_idx == expert_start + e).sum().item())
+                for e in range(problem.num_experts_per_rank)
+            ]
+            doff = [0]
+            for v in valid_tokens:
+                doff.append(doff[-1] + round_up(v, 128))
+            intermediate_gateup = int(self._global_fc1_weight.shape[-1])
+            self._c_output = torch.zeros(
+                (max(1, doff[-1]), intermediate_gateup),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            self._c_valid_tokens_per_expert = valid_tokens
+            self._c_data_physical_offsets = doff[:-1]
 
         torch.cuda.synchronize()
         self._check_cuda_rng_consistency()
@@ -605,7 +631,7 @@ class MegaMoEFp8Tester(MegaMoETester):
         if self._global_activation is None:
             raise RuntimeError("compute_reference requires generate_inputs first.")
 
-        combine_ref_global, self._global_fc2_activation_dequant_scale = (
+        _ref_out = (
             compute_megamoe_reference_fp8(
                 input_activation=self._global_activation,
                 input_activation_sf=self._global_activation_sf,
@@ -627,8 +653,18 @@ class MegaMoEFp8Tester(MegaMoETester):
                 gate_up_clamp=self.problem.gate_up_clamp,
                 return_fc2_activation_dequant_scale=True,
                 fp8_scale_mode=self.fp8_scale_mode,
+                return_fc1_gateup=self.impl.generate_c,
             )
         )
+        if self.impl.generate_c:
+            (
+                combine_ref_global,
+                self._global_fc2_activation_dequant_scale,
+                self._ref_fc1_gateup_per_expert,
+            ) = _ref_out
+        else:
+            combine_ref_global, self._global_fc2_activation_dequant_scale = _ref_out
+            self._ref_fc1_gateup_per_expert = None
         if self.fp8_scale_mode == "blockwise":
             self.fc2_activation_dequant_scale = torch.ones(
                 (1,), dtype=torch.float32, device=self._global_activation.device
@@ -664,6 +700,7 @@ class MegaMoEFp8Tester(MegaMoETester):
         """Compare the public 2D output against the topk-reduced reference."""
         if self.misc.skip_ref_check:
             return
+        self._validate_c_output()
         if self.output_activation is None:
             raise RuntimeError("validate requires run_kernel first.")
         if self.combine_output_ref is None:
@@ -692,8 +729,9 @@ class MegaMoEFp8Tester(MegaMoETester):
                 if bool(match_mask.all().item()):
                     if self.rank == 0:
                         print(
-                            "Validation PASSED: Form B output matches a legal "
-                            f"BF16 atomic-add ordering ({num_orderings} orderings)."
+                            "Validation PASSED: in-kernel reduce output "
+                            "matches a legal BF16 atomic-add ordering "
+                            f"({num_orderings} orderings)."
                         )
                     return
             else:
@@ -707,8 +745,8 @@ class MegaMoEFp8Tester(MegaMoETester):
                 if not bool(((actual_reduced - exact).abs() > bound).any().item()):
                     if self.rank == 0:
                         print(
-                            "Validation PASSED: Form B output is within the "
-                            "BF16 atomic-add roundoff envelope."
+                            "Validation PASSED: in-kernel reduce output is "
+                            "within the BF16 atomic-add roundoff envelope."
                         )
                     return
         if (
@@ -751,6 +789,61 @@ class MegaMoEFp8Tester(MegaMoETester):
     # ------------------------------------------------------------------
     # Step 4: FP8 kernel launch
     # ------------------------------------------------------------------
+
+    def _validate_c_output(self) -> None:
+        """generate_c: compare ``fc1_c`` with the reference pre-SwiGLU gate+up.
+
+        Token order inside an expert's pool segment follows the multi-rank
+        dispatch order, so both sides are compared as sorted flat arrays per
+        expert (value-level check, robust to dispatch ordering) -- the same
+        recipe as the Blackwell MXFP8 runner.  Raises on mismatch so the test
+        harness fails the case.
+        """
+        if not self.impl.generate_c:
+            return
+        c = self._c_output
+        ref_map = self._ref_fc1_gateup_per_expert
+        if c is None or not ref_map:
+            raise RuntimeError("generate_c validation needs run_kernel + compute_reference first.")
+        valid = self._c_valid_tokens_per_expert
+        doff = self._c_data_physical_offsets
+        expert_start = self.rank * self.problem.num_experts_per_rank
+        print(f"\n{'=' * 60}")
+        print(f"[generate_c][rank{self.rank}] kernel fc1_c vs reference fc1 gate+up:")
+        any_checked = False
+        failures = []
+        for e in range(self.problem.num_experts_per_rank):
+            v_e = valid[e]
+            ref = ref_map.get(expert_start + e)
+            if v_e == 0 or ref is None:
+                continue
+            any_checked = True
+            kernel_rows = c[doff[e] : doff[e] + v_e]
+            if ref.shape != kernel_rows.shape:
+                failures.append(f"expert {e}: shape {tuple(kernel_rows.shape)} vs ref {tuple(ref.shape)}")
+                continue
+            kernel_c = kernel_rows.float().cpu().flatten().sort().values
+            ref_c = ref.float().cpu().flatten().sort().values
+            compare_and_report_mismatches(
+                kernel_c,
+                ref_c,
+                name=f"fc1_c[rank{self.rank}]expert{e}",
+                atol=1e-2,
+                rtol=1e-2,
+                max_mismatches=5,
+            )
+            if not torch.allclose(kernel_c, ref_c, atol=1e-2, rtol=1e-2):
+                max_err = (kernel_c - ref_c).abs().max().item()
+                failures.append(f"expert {e}: max |kernel - ref| = {max_err:.4g}")
+            # pad rows of this expert segment must have stayed zero
+            pad = c[doff[e] + v_e : (doff[e + 1] if e + 1 < len(doff) else c.shape[0])]
+            if pad.numel() and pad.abs().max().item() != 0.0:
+                failures.append(f"expert {e}: non-zero pad rows in fc1_c")
+        if not any_checked:
+            print("  (no valid tokens routed to any local expert)")
+        print("=" * 60)
+        if failures:
+            raise RuntimeError("[generate_c] fc1_c mismatch: " + "; ".join(failures))
 
     def run_kernel(self) -> None:
         """Compile + launch ``Sm90MegaMoEFp8Kernel`` on the current stream.
@@ -822,6 +915,11 @@ class MegaMoEFp8Tester(MegaMoETester):
             if self.swap_ab
             else self.impl.mma_tiler_mnk[0]
         )
+        if self.impl.generate_c:
+            # generate_c consumers (weight-gradient GEMMs) want 128-aligned
+            # expert segments; the fc1_c allocation below uses the same
+            # round-up, matching the Blackwell MXFP8 runner.
+            token_padding_block = 128
         self._kernel = Kernel(
             mma_tiler_mnk=self.impl.mma_tiler_mnk,
             cluster_shape_mnk=self.impl.cluster_shape_mnk,
@@ -829,6 +927,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             group_hint=group_hint,
             token_padding_block=token_padding_block,
             sf_padding_block=SfPaddingBlock,
+            generate_c=self.impl.generate_c,
             load_balance_mode=self.impl.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=self.impl.force_static_sched,
@@ -838,6 +937,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             sf_vec_size=Fp8E8M0SfVecSize,
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_accum_mode=self.fp8_accum_mode,
+            pingpong=self.pingpong,
             world_size=self.world_size,
             local_rank=self.rank,
             num_topk=self.problem.num_topk,
@@ -845,7 +945,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             hidden=self.problem.hidden,
             fc2_in_kernel_topk_reduce=self.impl.in_kernel_fc2_reduce,
             apply_topk_in_fc1=self.misc.ref_compute_graph == "deepgemm",
-            token_back_by_dispatch=self.impl.token_back_by_dispatch,
+            token_back_mode=self.impl.token_back_mode,
             epi_flag_batch=self.impl.epi_flag_batch,
             flag_batch=self.impl.flag_batch,
             gate_up_clamp=self.problem.gate_up_clamp,
@@ -925,6 +1025,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             fc2_weight_sf=fc2_weight_sf_cute,
             fc2_activation_dequant_scale=fc2_activation_dequant_scale_cute,
             fc2_weight_dequant_scale=fc2_weight_dequant_scale_cute,
+            fc1_c=(_to_cute(self._c_output) if self.impl.generate_c else None),
             output_activation=output_activation_cute,
             local_workspace=local_workspace_cute,
             shared_workspace=shared_workspace_cute,
@@ -1027,18 +1128,45 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="FP8 scale interpretation: scalar per-tensor or DeepGEMM-style blockwise.",
     )
     parser.add_argument(
-        "--fp8_accum_mode", type=str, default="1xacc",
+        "--fp8_accum_mode", type=str, default=None,
         choices=list(FP8_ACCUM_MODE_CHOICES),
-        help="Per-tensor WGMMA accumulation mode; ignored by blockwise scaling.",
+        help=(
+            "Per-tensor WGMMA accumulation mode; ignored by blockwise scaling. "
+            "Defaults to the token heuristic selection."
+        ),
     )
-    parser.add_argument(
-        "--swap_ab", action="store_true",
+    swap_group = parser.add_mutually_exclusive_group()
+    swap_group.add_argument(
+        "--swap_ab", dest="swap_ab", action="store_true",
         help="Use the Hopper weight-as-A M128/M256xN swap-AB kernel.",
     )
+    swap_group.add_argument(
+        "--no_swap_ab", dest="swap_ab", action="store_false",
+        help="Force the non-swap Hopper kernel and disable token heuristics.",
+    )
+    pingpong_group = parser.add_mutually_exclusive_group()
+    pingpong_group.add_argument(
+        "--pingpong", dest="pingpong", action="store_true",
+        help="Alternate complete task tiles across two WGMMA+epilogue warpgroups.",
+    )
+    pingpong_group.add_argument(
+        "--no_pingpong", dest="pingpong", action="store_false",
+        help="Force legacy scheduling and disable token heuristics.",
+    )
+    parser.set_defaults(swap_ab=None, pingpong=None)
 
-    # Hopper FP8 fused fc12 defaults to the 1CTA (M=64, N=128) tile.
-    parser.add_argument("--mma_tiler_mnk", type=str, default="64,128,128")
-    parser.add_argument("--cluster_shape_mnk", type=str, default="1,1,1")
+    parser.add_argument(
+        "--mma_tiler_mnk",
+        type=str,
+        default=None,
+        help="Manual M,N,K tile; setting it disables token heuristics.",
+    )
+    parser.add_argument(
+        "--cluster_shape_mnk",
+        type=str,
+        default=None,
+        help="Manual M,N,K cluster shape; setting it disables token heuristics.",
+    )
     parser.add_argument("--use_2cta_instrs", action="store_true", default=False)
     parser.add_argument("--enable_static_expert_shape", action="store_true", default=False)
     parser.add_argument("--dynamic_sched", action="store_true", default=False)
@@ -1067,10 +1195,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["transformers", "deepgemm"],
     )
     parser.add_argument("--enable_iket", action="store_true", default=False)
+    parser.add_argument(
+        "--generate_c", action="store_true", default=False,
+        help="Training forward: also write the raw pre-SwiGLU fc1 gate+up "
+        "accumulator (BF16, kernel column order) to a separate fc1_c tensor "
+        "and validate it against the reference (non-swap layouts only).",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--in_kernel_fc2_reduce", action="store_true", default=False,
-        help="Form B: REDG in-kernel topk-reduce to output_activation[t, :]",
+        help="Collapse topk in kernel: epi_warps issues REDG into "
+             "output_activation[t, :]; the dispatch token-back modes push "
+             "with cp.reduce.async.bulk (token_back_reduce_topk).",
+    )
+    parser.add_argument(
+        "--token_back_mode",
+        type=str,
+        default=None,
+        choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
+        help="Where the cross-rank fc2 write-back runs: epi_warps (epilogue "
+             "STG/REDG straight to the source rank), standalone_warps (four "
+             "dedicated token-back warps), or reuse_dispatch_warps (dispatch "
+             "warps push after pull).  Default: the token-bucket heuristic "
+             "table's per-bucket winner (heuristic_config.py).",
     )
     return parser
 
@@ -1105,13 +1252,52 @@ def main(argv: Optional[List[str]] = None) -> int:
         gate_up_clamp=args.gate_up_clamp,
     )
 
-    mma_tiler_mnk = _parse_tuple(args.mma_tiler_mnk)
-    if args.swap_ab and mma_tiler_mnk == (64, 128, 128):
-        mma_tiler_mnk = (256, 32, 128)
+    config_selection = resolve_hopper_fp8_config(
+        args.fp8_scale_mode,
+        args.num_tokens_per_rank,
+        swap_ab=args.swap_ab,
+        pingpong=args.pingpong,
+        mma_tiler_mnk=(
+            _parse_tuple(args.mma_tiler_mnk)
+            if args.mma_tiler_mnk is not None
+            else None
+        ),
+        cluster_shape_mnk=(
+            _parse_tuple(args.cluster_shape_mnk)
+            if args.cluster_shape_mnk is not None
+            else None
+        ),
+        accum_mode=args.fp8_accum_mode,
+    )
+    launch_config = config_selection.config
+    # Explicit CLI choice wins; else the table's per-bucket winner.
+    token_back_mode = (
+        args.token_back_mode
+        if args.token_back_mode is not None
+        else launch_config.token_back_mode
+    )
+    if rank == 0:
+        bucket = (
+            str(config_selection.token_bucket)
+            if config_selection.token_bucket is not None
+            else "n/a"
+        )
+        print(
+            "[mega_runner_fp8] "
+            f"config_source={config_selection.source} token_bucket={bucket} "
+            f"scale_mode={args.fp8_scale_mode} "
+            f"swap_ab={launch_config.swap_ab} "
+            f"pingpong={launch_config.pingpong} "
+            f"mma_tiler_mnk={launch_config.mma_tiler_mnk} "
+            f"cluster_shape_mnk={launch_config.cluster_shape_mnk} "
+            f"accum_mode={launch_config.accum_mode} "
+            f"token_back_mode={token_back_mode}",
+            flush=True,
+        )
 
     impl = ImplDesc(
-        mma_tiler_mnk=mma_tiler_mnk,
-        cluster_shape_mnk=_parse_tuple(args.cluster_shape_mnk),
+        mma_tiler_mnk=launch_config.mma_tiler_mnk,
+        cluster_shape_mnk=launch_config.cluster_shape_mnk,
         use_2cta_instrs=args.use_2cta_instrs,
         enable_static_expert_shape=args.enable_static_expert_shape,
         force_static_sched=not args.dynamic_sched,
@@ -1121,11 +1307,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         group_hint=args.group_hint,
         non_ubulk_fc2_store=True,
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
-        token_back_mode=(
-            "epi_warps" if args.in_kernel_fc2_reduce else "reuse_dispatch_warps"
-        ),
+        token_back_mode=token_back_mode,
         epi_flag_batch=(2, 4),
         flag_batch=1,
+        generate_c=args.generate_c,
     )
 
     misc = MiscDesc(
@@ -1145,8 +1330,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         rank=rank,
         kind=args.kind,
         fp8_scale_mode=args.fp8_scale_mode,
-        fp8_accum_mode=args.fp8_accum_mode,
-        swap_ab=args.swap_ab,
+        fp8_accum_mode=launch_config.accum_mode,
+        swap_ab=launch_config.swap_ab,
+        pingpong=launch_config.pingpong,
         use_cuda_profiler_api=args.use_cuda_profiler_api,
     )
     tester.set_torch_profiler_enabled(args.use_torch_profiler)

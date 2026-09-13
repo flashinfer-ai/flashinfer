@@ -8,6 +8,7 @@ Host driver for the MegaMoE FP8 GLU fused fc1+fc2 kernel.
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -75,8 +76,19 @@ from moe_hopper_fp8.hopper_moe_utils import (
 # =============================================================================
 
 
+@dataclass
 class ImplDesc(_BaseImplDesc):
-    """Hopper FP8 impl descriptor with the swap-AB short-N specializations."""
+    """Hopper FP8 impl descriptor with the swap-AB short-N specializations.
+
+    ``generate_c`` (training forward, default off) makes the kernel also write
+    the raw pre-SwiGLU fc1 gate+up activations to a BF16 ``fc1_c`` tensor --
+    the same contract as the Blackwell MXFP8 ``TrainingImplDesc``.  Works with
+    every launch geometry (both layouts, both scale modes, heuristic or
+    explicit tiles) -- there is no separate training descriptor on Hopper;
+    the runner pads expert pool segments to 128 rows when it is on.
+    """
+
+    generate_c: bool = False
 
     def _validate_mma_cta_mode(self, m: int) -> None:
         if self.use_2cta_instrs:
@@ -87,6 +99,12 @@ class ImplDesc(_BaseImplDesc):
 
     def __post_init__(self) -> None:
         m, n, k = self.mma_tiler_mnk
+        supported_clusters = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
+        if self.cluster_shape_mnk not in supported_clusters:
+            raise ValueError(
+                "Hopper FP8 cluster_shape_mnk must be one of "
+                f"{supported_clusters}, got {self.cluster_shape_mnk}."
+            )
         non_swap_geometry = (
             m in NonSwapTileMChoices and n in NonSwapTileNChoices
         )
@@ -103,12 +121,17 @@ class ImplDesc(_BaseImplDesc):
         # supported N, then restore this Hopper-only compile-time N. This
         # temporary value never becomes the physical token padding.
         original_tiler = self.mma_tiler_mnk
+        original_cluster = self.cluster_shape_mnk
         if n < 64:
             self.mma_tiler_mnk = (m, 64, k)
+        # The shared v1 descriptor keeps cluster-N fixed at one. Hopper owns
+        # the wider cluster matrix above and validates it independently.
+        self.cluster_shape_mnk = (original_cluster[0], 1, 1)
         try:
             super().__post_init__()
         finally:
             self.mma_tiler_mnk = original_tiler
+            self.cluster_shape_mnk = original_cluster
 
 
 class SwigluFp8Fc12Tester(Fc12TesterBase):
@@ -123,8 +146,10 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
         fp8_scale_mode: str = "per_tensor",
         fp8_accum_mode: str = "1xacc",
         swap_ab: bool = False,
+        pingpong: bool = False,
     ) -> None:
         self.swap_ab = swap_ab
+        self.pingpong = pingpong
         super().__init__(problem, impl, misc)
         if fp8_scale_mode not in FP8_SCALE_MODE_CHOICES:
             raise ValueError(
@@ -191,6 +216,13 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             or self.fc2_weight_block_scale is None
         ):
             raise RuntimeError("blockwise generate_inputs did not create block scales.")
+        # Activation scales are TMA-loaded: each FP32 row needs a 16-byte stride.
+        scale = self.fc1_activation_block_scale
+        if scale.stride(0) * scale.element_size() % 16:
+            cols = scale.shape[1]
+            storage = scale.new_zeros((scale.shape[0], (cols + 3) // 4 * 4))
+            storage[:, :cols].copy_(scale)
+            self.fc1_activation_block_scale = storage[:, :cols]
         self.activation_sf = self.fc1_activation_block_scale
         self.fc1_weight_sf = self.fc1_weight_block_scale
         self.fc2_weight_sf = self.fc2_weight_block_scale
@@ -663,6 +695,7 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             ab_dtype=fp8_kind_to_cutlass_dtype(self.problem.kind),
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_accum_mode=self.fp8_accum_mode,
+            pingpong=self.pingpong,
             gate_up_clamp=self.problem.gate_up_clamp,
         )
 
@@ -703,8 +736,13 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
         }
 
     def _partition_workspace(self, counter_token_tile: int):
-        if self.swap_ab:
-            counter_token_tile = self.impl.mma_tiler_mnk[1]
+        # Hopper cluster peers execute independent WGMMA tiles, so FC1-done
+        # counters are indexed at physical CTA token-tile granularity.
+        counter_token_tile = (
+            self.impl.mma_tiler_mnk[1]
+            if self.swap_ab
+            else self.impl.mma_tiler_mnk[0]
+        )
         if self.fp8_scale_mode != "blockwise":
             return super()._partition_workspace(counter_token_tile)
 
@@ -716,7 +754,9 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
 
         fc1_output_byte_count = data_total_rows * intermediate_downproj
         fc1_output_sf_cols = intermediate_downproj // Fp8Fc2ActivationScaleK
-        fc1_output_sf_byte_count = data_total_rows * fc1_output_sf_cols * 4
+        # TMA requires a 16-byte row stride, including a single FC2 K tile.
+        fc1_output_sf_row_stride = (fc1_output_sf_cols + 3) // 4 * 4
+        fc1_output_sf_byte_count = data_total_rows * fc1_output_sf_row_stride * 4
         counter_slots_upper = (
             (data_total_rows + counter_token_tile - 1) // counter_token_tile
             + experts
@@ -738,7 +778,7 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             ws[offset : offset + fc1_output_sf_byte_count]
             .view(torch.uint8)
             .view(torch.float32)
-            .reshape(data_total_rows, fc1_output_sf_cols)
+            .reshape(data_total_rows, fc1_output_sf_row_stride)[:, :fc1_output_sf_cols]
         )
         offset += fc1_output_sf_byte_count
 
@@ -799,7 +839,6 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             kq = self._ws_fc1_output_torch[doff[e] : doff[e] + v_e]
             if self.fp8_scale_mode == "blockwise":
                 ref_sf = self._ref_fc1_raw_sf_per_expert[e]
-                ref_raw = self._ref_fc1_raw_fp32_per_expert[e]
                 if ref_sf is None:
                     continue
                 ksf = self._ws_fc1_output_sf_torch[doff[e] : doff[e] + v_e]
@@ -808,14 +847,14 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
                     ksf,
                     block_k=Fp8Fc2ActivationScaleK,
                 )
-                if ref_raw is None:
-                    ref_fp32 = dequantize_fp8_per_token_block(
-                        ref_q,
-                        ref_sf,
-                        block_k=Fp8Fc2ActivationScaleK,
-                    )
-                else:
-                    ref_fp32 = ref_raw
+                # Compare the same quantized hand-off on both sides. Comparing
+                # to pre-quantization SwiGLU also rejects a correct reference's
+                # normal E4M3 rounding error (up to about 6%).
+                ref_fp32 = dequantize_fp8_per_token_block(
+                    ref_q,
+                    ref_sf,
+                    block_k=Fp8Fc2ActivationScaleK,
+                )
             else:
                 fc2_activation_scale = self.fc2_activation_dequant_scale[0]
                 kfp32 = kq.to(torch.float32) * fc2_activation_scale
@@ -880,6 +919,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--swap_ab", action="store_true",
         help="Use the Hopper weight-as-A M128/M256xN swap-AB kernel.",
     )
+    parser.add_argument(
+        "--pingpong", action="store_true",
+        help="Alternate complete task tiles across two WGMMA+epilogue warpgroups.",
+    )
 
     return parser
 
@@ -902,7 +945,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     mma_tiler_mnk = parse_tuple(args.mma_tiler_mnk)
     if args.swap_ab and mma_tiler_mnk == (64, 128, 128):
-        mma_tiler_mnk = (256, 32, 128)
+        mma_tiler_mnk = (128, 32, 128) if args.pingpong else (256, 32, 128)
 
     impl = ImplDesc(
         mma_tiler_mnk=mma_tiler_mnk,
@@ -937,6 +980,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         fp8_scale_mode=args.fp8_scale_mode,
         fp8_accum_mode=args.fp8_accum_mode,
         swap_ab=args.swap_ab,
+        pingpong=args.pingpong,
     )
     tester.run()
 
