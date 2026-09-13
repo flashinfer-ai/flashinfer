@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import List
+import os
+from typing import List, Optional
 
 from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
@@ -38,6 +39,22 @@ from .trtllm_gen_metainfo import (
     RUBIN_CUBIN_ARCHS,
     write_filtered_metainfo,
 )
+
+
+def _should_enable_sm90_moe_prebuilt_d_descriptor() -> bool:
+    """Return whether to use the H20-specific prebuilt-D JIT variant."""
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        return False
+
+    try:
+        import torch
+
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # H20 and H20-3e expose 78 SMs, unlike H100 and H200.
+        return properties.multi_processor_count == 78
+    except Exception:  # noqa: BLE001 - an unknown device must use the generic path
+        return False
+
 
 BMM_EXPORT_HEADERS = [
     "BatchedGemmEnums.h",
@@ -127,7 +144,13 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
-    return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
+    module_name = None
+    if _should_enable_sm90_moe_prebuilt_d_descriptor():
+        nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
+        module_name = "fused_moe_90_h20_prebuilt_d"
+    return gen_cutlass_fused_moe_module(
+        nvcc_flags, "90", use_fast_build, module_name=module_name
+    )
 
 
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
@@ -141,7 +164,10 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_cutlass_fused_moe_module(
-    nvcc_flags: List[str], device_arch: str, use_fast_build: bool = False
+    nvcc_flags: List[str],
+    device_arch: str,
+    use_fast_build: bool = False,
+    module_name: Optional[str] = None,
 ) -> JitSpec:
     """
     Generate a JitSpec for the cutlass fused moe module.
@@ -218,7 +244,7 @@ def gen_cutlass_fused_moe_module(
     ]
 
     return gen_jit_spec(
-        f"fused_moe_{device_arch}",
+        module_name or f"fused_moe_{device_arch}",
         sources,
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],

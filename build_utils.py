@@ -31,6 +31,14 @@ _DEPENDENCY_SCOPE_FIELDS = {
     "ci_image": "ci_image_specifier",
 }
 
+CUDA_TILE_COMPILE_DEPENDENCY_REQUIREMENTS = (
+    "nvidia-cuda-nvcc<13.4,>=13.2",
+    "nvidia-cuda-tileiras<13.4,>=13.2",
+    "nvidia-nvvm<13.4,>=13.2",
+    "nvidia-nvjitlink<14,>=13.3",
+    "nvidia-cuda-crt<13.4,>=13.2",
+)
+
 
 def get_dependency_requirements(
     scope: str,
@@ -77,6 +85,11 @@ def get_ci_image_dependency_requirements(
 ) -> list[str]:
     """Return exact dependency selections for reproducible CI images."""
     return get_dependency_requirements("ci_image", cuda_major)
+
+
+def get_cuda_tile_compile_dependency_requirements() -> list[str]:
+    """Return the compiler-only dependency chain needed by cuda-tile."""
+    return list(CUDA_TILE_COMPILE_DEPENDENCY_REQUIREMENTS)
 
 
 def get_git_version(cwd: Optional[Path] = None) -> str:

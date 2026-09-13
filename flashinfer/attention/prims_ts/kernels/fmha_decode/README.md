@@ -23,24 +23,66 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchDecodePagedTSWrapper` | Reusable `plan()`/`run()` interface; owns compiled callables and scratch. |
+| `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
-carry the wrapper's plan-owned query mode and output dtype.
+carry the wrapper's plan-owned query mode, output dtype, and length ownership.
+Pass the same length argument as `run()`: a CUDA tensor for a run-owned plan or
+`None` for a plan-owned vector. Trace names and tags distinguish the two
+lifecycles even when both compiled K/V modes are dynamic.
 
-Prefer the reusable wrapper when a cache geometry is used repeatedly. Planning
-always snapshots and host-validates the derived K/V lengths once; `run()`
-performs no device-to-host metadata read. An explicit `max_kv_len` is a bound
-that must cover every planned row. Fixed-length scheduling is selected
-automatically only when every row equals that bound and the resolved K-tile
-domain consists of complete instruction groups. Sliding-window plans retain
-runtime K/V lengths because leading-tile skips change the effective domain;
-persistent Q-dependent causal plans do the same while recycling the task
-graph. This is not a public knob.
+Prefer the reusable wrapper when static attention geometry and capacity are
+used repeatedly.
+`plan()` receives the device, exact batch and head geometry, page size, static
+Q and K/V bounds, dtypes, mask, and window. It compiles the specialization and
+either binds an optional caller-owned workspace or allocates private scratch;
+it also copies optional host `seq_lens` into plan-owned CUDA storage. Every
+`run()` supplies the current query, cache, and a fixed row-strided page table,
+plus query offsets for packed Q. Exactly one lifecycle owns K/V lengths:
+
+- If `plan()` receives a host list or CPU tensor, every `run()` must pass
+  `seq_lens=None` and uses the plan-owned CUDA copy.
+- If `plan()` receives `seq_lens=None`, every `run()` must pass a CUDA
+  `seq_lens` tensor. The compiled K/V-prefix and K/V-length modes are dynamic.
+
+Supplying lengths to both calls or neither call is rejected regardless of
+`validate`. Plan-owned lengths may prove that every row is exactly
+`max_kv_len` or that the full configured split-CTA fanout is active for every
+batch/Q group. They are frozen until the next successful `plan()` call; omit
+plan-time `seq_lens` when lengths must change between runs or graph replays.
+Validation is enabled by default. `validate=False` skips explicit wrapper
+checks and host metadata reads for a previously validated steady state or CUDA
+Graph launch; the caller then owns every remaining value, bounds, aliasing, and
+lifetime precondition.
+Sliding-window plans retain dynamic K/V-length handling because leading-tile
+skips change the effective domain; persistent Q-dependent causal plans do the
+same while recycling the task graph. This kernel mode is independent of
+whether the plan or run owns the length vector.
+
+## Shared decode wrapper
+
+`flashinfer.BatchDecodeWithPagedKVCacheWrapper(..., backend="prims-ts")`
+adapts the shared CSR planning API to the native fixed-table interface.
+Optional `seq_lens` accepts `uint32`, `int32`, or `int64` CPU/CUDA tensors;
+planning copies validated lengths into owned int32 CUDA storage. Call `plan()`
+again to change these lengths. An explicit `block_tables` must be an int32 or
+uint32 CUDA tensor on the wrapper device, with unit inner stride and
+non-overlapping rows. The adapter retains int32 tables directly and uses an
+int32 view of uint32 tables, preserving storage and subsequent caller updates.
+Active page IDs must fit in signed int32 and index the physical cache;
+inactive entries are ignored. When omitted, the table is derived from the CSR
+inputs during planning.
+
+This backend requires `kv_layout="HND"` and does not support the shared
+wrapper's `use_cuda_graph=True` replanning flow. Manual capture of `run()` is
+supported after planning, but binds to that completed plan. Keep the wrapper
+and captured tensors alive, and recapture after re-planning. Page IDs may
+change between completed replays while the captured storage and layout stay
+fixed; plan-owned sequence lengths may not.
 
 ## Supported contract
 
@@ -50,7 +92,7 @@ graph. This is not a public knob.
 | Head dimension | 64, 128, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` and `1 <= Hq/Hkv <= 32` |
+| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
 | Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
@@ -68,11 +110,17 @@ The public paths require compact, 16-byte-aligned Q and output storage. K/V
 pages must have compact HND inner strides; a padded outer page stride is
 allowed when pages do not overlap and both the tensor base and outer stride
 are 16-byte aligned. All query, cache, metadata, output, and workspace tensors
-must be on one CUDA device. Metadata is contiguous CUDA `torch.int32` with
-4-byte alignment. A caller-provided `out` must not overlap Q, K/V page
-storage, retained metadata, or caller-owned workspace. The launch
+must be on one CUDA device. Metadata uses 4-byte-aligned CUDA `torch.int32`;
+the page table is contiguous within each row but may have padding between
+rows. A caller-provided `out` must not overlap Q, K/V page
+storage, run-time metadata, or caller-owned workspace. The launch
 conservatively rejects overlapping storage spans. The API returns O only; LSE
 and split-KV statistics are internal scratch.
+
+The fixed table controls logical-to-physical lookup only. Native TMA tensor
+maps still span the complete physical page pool and use each cache tensor's
+runtime outer page stride, so page IDs may be arbitrary and physical pages may
+have padded storage.
 
 ## Tensor and metadata layouts
 
@@ -86,18 +134,21 @@ and split-KV statistics are internal scratch.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
   `[num_pages, Hkv, page_size, D]`.
-- Wrapper/one-shot page metadata uses FlashInfer CSR:
-  `paged_kv_indptr[B + 1]`, `paged_kv_indices[num_used_pages]`, and
-  `paged_kv_last_page_len[B]`, all contiguous CUDA `int32` tensors.
-- The standalone launch uses the same indptr/indices plus explicit
-  `seq_lens[B]` and a static `max_seq_len` upper bound.
+- Wrapper, standalone, and one-shot metadata use contiguous logical K/V
+  lengths plus `block_tables[B, C]`. Wrapper lengths are either copied into
+  plan-owned CUDA storage or supplied to each run; the other APIs always take
+  them at launch. The table has unit inner stride and a
+  non-overlapping row stride of at least `C`; padding between rows is
+  supported. Packed runs additionally supply contiguous `qo_indptr[B + 1]`.
+  The one-shot argument is named `seq_lens_kv`; wrapper and standalone entry
+  points use `seq_lens`. The standalone launch also takes a static
+  `max_seq_len` upper bound. The one-shot helper reads request metadata to
+  derive its plan bounds and therefore is not CUDA-graph-capturable; reusable
+  graph paths plan the wrapper before capture.
 
-Valid CSR metadata starts `paged_kv_indptr` at zero, increases it strictly,
-and ends it at the number of used page-index entries. Every request owns at
-least one page, every page ID indexes the physical cache, and wrapper last-page
-lengths are in `[1, page_size]`. For every standalone request `b`, the live
-metadata must also satisfy
-`ceil(seq_lens[b] / page_size) <= paged_kv_indptr[b + 1] - paged_kv_indptr[b]`.
+For every request `b`, the fixed table must satisfy
+`ceil(seq_lens[b] / page_size) <= C`. Only that active row prefix must contain
+valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
 and have every delta no larger than the planned `max_seq_len_q`. Causal
 attention additionally requires each fixed or packed per-request Q length to
@@ -125,9 +176,12 @@ the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
 and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
 it uses CLC above one resident wave and the direct static path otherwise.
 
-Page IDs are loaded from the live CSR metadata on every run and graph replay.
-The `paged_kv_indices` storage and entry count are part of the plan, but valid
-IDs may be remapped in-place without recompiling.
+Fixed-table page IDs and packed-Q offsets are per-run bindings and are loaded
+on every run and graph replay. K/V lengths come from exactly one source. A
+plan-owned vector has stable storage and values until replan and may enable
+full-prefix or uniform-maximum specialization. A run-owned vector may change
+between completed launches without recompiling; CUDA Graph replay additionally
+requires its captured address and shape to remain stable.
 
 | Source | Responsibility |
 | --- | --- |
@@ -159,32 +213,34 @@ kv = torch.randn(
     device=device,
     dtype=torch.float16,
 )
-paged_kv_indptr = torch.arange(
-    0, num_pages + 1, pages_per_request, device=device, dtype=torch.int32
+block_tables = torch.arange(num_pages, device=device, dtype=torch.int32).view(
+    B, pages_per_request
 )
-paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
-last_page_len = torch.full(
-    (B,), page_size, device=device, dtype=torch.int32
-)
+max_seq_len = pages_per_request * page_size
+seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
 
 wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
 wrapper.plan(
-    paged_kv_indptr,
-    paged_kv_indices,
-    last_page_len,
+    q.device,
+    B,
     Hq,
     Hkv,
     D,
     page_size,
+    max_seq_len,
+    max_seq_len_q=1,
+    packed_query=False,
     q_data_type=q.dtype,
+    kv_data_type=kv.dtype,
+    o_data_type=q.dtype,
     mask_type="causal",
-    max_kv_len=pages_per_request * page_size,
+    # Optional fixed lengths enable a plan-owned specialization.
+    seq_lens=[max_seq_len] * B,
 )
-out = wrapper.run(q, kv)
+out = wrapper.run(q, kv, None, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
-max_seq_len = pages_per_request * page_size
 workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     B,
     Hq,
@@ -197,13 +253,11 @@ workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
-seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
 standalone_out = prims_ts_batch_decode_with_kv_cache(
     q,
     kv,
     workspace,
-    paged_kv_indptr,
-    paged_kv_indices,
+    block_tables,
     seq_lens,
     max_seq_len,
     mask_type="causal",
@@ -211,42 +265,46 @@ standalone_out = prims_ts_batch_decode_with_kv_cache(
 assert standalone_out.shape == q.shape
 ```
 
-The wrapper snapshots K/V lengths derived from `paged_kv_indptr` and
-`paged_kv_last_page_len`. Both tensors' values must remain unchanged until the
-next successful plan. The `paged_kv_indices` storage and entry count must stay
-fixed, but valid page IDs may be remapped in-place between completed runs or
-graph replays because each execution reloads them. Packed `qo_indptr` storage
-also stays fixed; interior offsets may change between completed executions only
-while preserving positive deltas within the planned bound and the same final
-packed extent. Do not mutate any retained metadata concurrently with a run or
-graph replay that reads it. The hot path does not synchronize live device
-metadata to the host or fully value- and bounds-check it. Invalid live page IDs
-or packed offsets violate the contract and may cause incorrect results or
-out-of-bounds access. A wrapper owns mutable scratch and supports only one
-in-flight run or captured-graph replay; use separate wrapper instances for
-concurrent execution.
+The wrapper owns its compiled specialization, plan-bound workspace, and any
+sequence lengths supplied to `plan()`. If no `workspace_buffer` is passed to
+`plan()`, the wrapper allocates private scratch. A workspace is mutable and
+supports only one in-flight run or captured-graph replay; use separate wrappers
+and workspaces for concurrent execution. Caller-owned scratch must remain alive
+and must not overlap Q, K/V cache, metadata, or output storage.
+
+With default `validate=True`, each wrapper run checks the fixed table, effective
+K/V lengths, packed offsets when present, tensors, and output. Plan-owned
+lengths and their specialization predicates were validated by `plan()` and are
+not revalidated against a second length vector. Once the caller has established
+the remaining conditions, `validate=False` avoids explicit checks and host
+metadata reads. Invalid run-owned lengths, page IDs, offsets, or aliases in that
+mode may cause incorrect results or out-of-bounds access. Do not mutate
+run-owned metadata concurrently with a launch or replay that reads it.
 
 For the standalone workflow, call
 `get_prims_ts_batch_decode_workspace_size()` with the same shape, dtype, mask,
 window, and Q-layout arguments as the launch. Allocate at least that many
 bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
-tensor. Zero it before first use and re-zero it whenever an argument that
-contributes to the semantic JIT key changes, because the internal workspace
-section offsets can change with that key. Do not share it between concurrent
-launches or captured graphs. It must not overlap Q, K/V cache, metadata, or
-output storage. The standalone hot path trusts CSR, `seq_lens`, and packed-Q
-values: keep lengths positive and within their static bounds, keep enough page
-entries in every CSR row for its live length, and keep all page IDs valid. CSR
-offsets, sequence lengths, page IDs, and packed-Q offsets may change between
+tensor. Zero it before first use and re-zero it whenever any workspace-layout
+input, including batch size, changes because the internal workspace section
+offsets can move even when the compiled callable is reused. Do not share it
+between concurrent launches or captured graphs. It must not overlap Q, K/V
+cache, metadata, or output storage. The standalone hot path trusts
+`block_tables`, `seq_lens`, and
+packed-Q values: keep lengths positive and within their static bounds, keep
+enough table columns for every request, and keep all active page IDs valid.
+Sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution
 that reads them. These live values are not host-synchronized or fully
 value-checked at launch; invalid lengths or IDs may cause incorrect results or
 out-of-bounds access.
 
-For CUDA graph capture, compile and warm the planned configuration first,
-retain all metadata and workspace storage at stable addresses, and pass a
-preallocated compact, 16-byte-aligned `out` tensor.
+For CUDA graph capture, call `plan()` and perform one default-validating
+`run()` first. Capture subsequent calls with `validate=False`, retain all
+run-owned metadata and workspace storage at stable addresses, and pass a
+preallocated compact, 16-byte-aligned `out` tensor. A successful replan changes
+plan-owned length storage and requires graph recapture.
 
 ## Limitations
 
@@ -254,10 +312,12 @@ preallocated compact, 16-byte-aligned `out` tensor.
   this API.
 - Attention sinks and custom masks are not exposed.
 - Q, K, and V cannot use mixed dtypes.
-- Runtime K lengths must be positive and no greater than the static plan bound.
-- Packed offsets are validated during wrapper planning. The standalone hot
-  path intentionally trusts their values to preserve synchronization-free
-  launch behavior. Live causal metadata must preserve `q_len[b] <= kv_len[b]`.
+- Effective K/V lengths must be positive and no greater than the static plan
+  bound.
+- Packed offsets are run-time wrapper inputs. Default wrapper validation checks
+  them; `validate=False` and the standalone hot path trust them to preserve a
+  synchronization-free launch. Live causal metadata must preserve
+  `q_len[b] <= kv_len[b]`.
 
 ## Validation
 

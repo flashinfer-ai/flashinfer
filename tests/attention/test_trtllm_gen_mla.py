@@ -1145,6 +1145,22 @@ def test_trtllm_batch_decode_sparse_mla_power_of_two_heads(
     )
 
 
+@pytest.mark.parametrize("num_heads", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("topk", [128, 2048])
+def test_trtllm_batch_decode_sparse_mla_small_power_of_two_heads(
+    num_heads: int,
+    dtype: torch.dtype,
+    topk: int,
+) -> None:
+    _run_trtllm_batch_decode_sparse_mla_head_case(
+        num_heads,
+        1,
+        dtype,
+        topk,
+    )
+
+
 @pytest.mark.parametrize(
     "layer_dimensions",
     supported_mla_layer_dimensions,

@@ -53,15 +53,21 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.cute_dsl.attention.wrappers.batch_prefill",
     "flashinfer.cute_dsl.rmsnorm_fp4quant",
     "flashinfer.decode",
+    "flashinfer.diffusion_ops.minimax_h3",
+    "flashinfer.fused_moe.backends.prims_ts.bf16_op",
+    "flashinfer.fused_moe.backends.prims_ts.fp4_op",
+    "flashinfer.fused_moe.backends.prims_ts.fp8_op",
     "flashinfer.fused_moe.core",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",
-    "flashinfer.fused_moe.cute_dsl.fused_moe_mxfp8_mxfp4",
+    "flashinfer.fused_moe.cute_dsl.sm90_fused_moe",
     "flashinfer.fused_moe.fused_routing_dsv3",
     "flashinfer.fused_moe.hash_topk",
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",
     "flashinfer.fused_moe.trtllm_gen_routing",
+    "flashinfer.gdn2_prefill",
+    "flashinfer.gdp_prefill",
     "flashinfer.gdn_decode",
     "flashinfer.gdn_kernels.experimental.gdn_fused_decode",
     "flashinfer.gdn_prefill",
@@ -78,6 +84,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.mhc",
     "flashinfer.mla._batch_mla._wrapper",
     "flashinfer.mla._core",
+    "flashinfer.cake_minimax_h3",
     "flashinfer.msa_ops.proxy_score",
     "flashinfer.msa_ops.sparse_decode",
     "flashinfer.msa_ops.sparse_prefill",
@@ -122,8 +129,14 @@ def collect_registered_trace_templates() -> list[TraceRegistryEntry]:
 
     from flashinfer.api_logging import _TRACE_REGISTRY
 
+    # Experimental APIs live in core modules, so filter them by the flag that
+    # @flashinfer_experimental_api sets on the registered function; they are
+    # exercised by the experimental lane, not the stable trace tests.
     entries = [
-        entry for entry in _TRACE_REGISTRY if entry[0].__module__ in available_modules
+        entry
+        for entry in _TRACE_REGISTRY
+        if entry[0].__module__ in available_modules
+        and not getattr(entry[0], "is_experimental", False)
     ]
     keys = [trace_registry_entry_key(entry) for entry in entries]
     if len(keys) != len(set(keys)):

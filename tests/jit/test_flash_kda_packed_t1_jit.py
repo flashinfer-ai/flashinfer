@@ -181,7 +181,7 @@ def test_flash_kda_packed_t1_binding_contract():
     assert "kHeadDim = 128" in binding
     assert "kTargetFamily = 100" in binding
     assert "kTargetSM100a = 1000" in binding
-    assert "minor == 0 || minor == 3" in binding
+    assert "minor == 0 || minor == 3 || minor == 7" in binding
     assert "CHECK_LAST_DIM_CONTIGUOUS(mixed_qkv)" in binding
     assert "CHECK_INPUT_TYPE(mixed_qkv, dl_bfloat16)" in binding
     assert "mixed_qkv must have shape [B," in binding

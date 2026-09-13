@@ -95,6 +95,24 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
+from .cake_megamoe_topk_reduce import (
+    gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_uri as get_cake_megamoe_topk_reduce_uri,
+)
+from .cake_megamoe_topk_reduce import (
+    load_cake_megamoe_topk_reduce_module as load_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    is_cake_megamoe_topk_reduce_module_loaded as is_cake_megamoe_topk_reduce_module_loaded,
+)
+from .cake_megamoe_topk_reduce import (
+    run_cake_megamoe_topk_reduce as run_cake_megamoe_topk_reduce,
+)
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
@@ -120,6 +138,21 @@ from .cake_kda import (
 )
 from .cake_kda import (
     load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_fused_moe_warp_decode import (
+    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
+)
+from .cake_fused_moe_warp_decode import (
+    gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
+)
+from .cake_fused_moe_warp_decode import (
+    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
 )
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,

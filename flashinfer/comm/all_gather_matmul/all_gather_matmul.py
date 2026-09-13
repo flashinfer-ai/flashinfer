@@ -105,16 +105,17 @@ def prepare_all_gather_matmul(
     The returned callable binds ``w`` and ``group`` and accepts a new input
     tensor with the same shape, dtype, and device as ``inp``. Both
     ``backend="auto"`` and ``backend="cake"`` select the source-built
-    prepared launcher. Unsupported inputs raise during preparation instead of
-    falling back to another implementation.
+    prepared SM103/BF16 launcher for the exact TP4/N=2560 or TP8/N=1280
+    profile. Unsupported inputs raise during preparation instead of falling
+    back to another implementation.
     """
     if backend not in {"auto", "cake"}:
         raise ValueError("backend must be exactly 'auto' or 'cake'")
 
     from .cake_all_gather_matmul import (
-        _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4,
+        _prepare_all_gather_matmul_cake_packed_qkv_sm103,
     )
 
-    return _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
+    return _prepare_all_gather_matmul_cake_packed_qkv_sm103(
         inp, w, group, verbose=verbose
     )

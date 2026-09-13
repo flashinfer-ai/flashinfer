@@ -79,12 +79,11 @@ struct KernelParams {
   int64_t const* ptrCustomMaskOffsets;
   // The debug output matrix O
   float* ptrDebugO;
-  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor, only for epilogue
-  // fusion. Unused by FlashInfer but part of the kernel-side KernelParams ABI; the field order
-  // must stay in sync with the kernels or every later field is misread by the cubins.
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor. The field order must
+  // stay in sync with the kernels or every later field is misread by the cubins.
   float const* ptrDsv4InvRopeCosSinCache;
-  // Dsv4 output block-scaled tensor, only for epilogue fusion
-  float* ptrDsv4OScaleFp32;
+  // DSv4 output scales. RopeQuant cubins interpret this as packed UE8M0 bytes in INT32 storage.
+  float* ptrDsv4OScale;
   // The first sparseMask offsets in the Kv sequence dimension.
   int32_t const* ptrFirstSparseMaskOffsetsKv;
   // The counter for the multiCtasKv mode.
@@ -136,8 +135,7 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
-  // Padded token dimension for the DSv4 fused FP32 scale layout. Unused by FlashInfer; kept for
-  // the KernelParams ABI (see the DSv4 pointer fields above).
+  // Padded token dimension for the DSv4 fused packed UE8M0 scale layout.
   int64_t mDsv4ScaleBufM;
   // The factor to add to the maximum value to increase the probability
   //   of skip correction during next iterations.
@@ -845,6 +843,8 @@ struct KernelParams {
     params.ptrO = options.oPtr;
     // The output scaling factor buffer.
     params.ptrSfO = options.oSfPtr;
+    params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
+    params.ptrDsv4OScale = options.dsv4OScalePtr;
 
     // TRT-LLM restrictions: the quantization scales must be on the device.
     params.ptrOutputScale = options.outputScalePtr;
@@ -907,6 +907,7 @@ struct KernelParams {
     params.mNumHiddenEltsO = options.mNumHeadsQ * options.mHeadDimQk;
     params.mNumTokensPerCtaQ = numTokensPerCtaQ;
     params.mOutputScale = options.outputScale;
+    params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
     params.mScaleSoftmaxLog2 = options.scaleSoftmaxLog2;
     params.mSkipSoftmaxThresholdScaleFactor = options.mSkipSoftmaxThresholdScaleFactor;
     params.mStartTokenIdxSfO = options.mSfStartTokenIdx;

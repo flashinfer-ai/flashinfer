@@ -48,6 +48,46 @@ namespace pcie_ipc {
 constexpr int kMaxWorldSize = 8;
 constexpr int kSignalPhases = 8;
 
+// Number of ScratchRegion enumerators. The enum's integer value indexes
+// scratch_state_offset(), which reads a {epoch, arrival} pair per region, so
+// the slot count and the enum must move together. Spelled out here rather than
+// as a literal 2 inside compute_workspace_layout() because getting them out of
+// step lands scratch_state_offset() past signal_slots and inside the pack
+// scratch: silent corruption of the sentinel protocol, not a crash.
+constexpr int kScratchRegionCount = 2;
+
+// Copy-engine ring staging. It lives outside ScratchRegion on purpose: it has
+// no epoch and no arrival counter -- its scratch reuse is guarded by an
+// end-of-call neighbour handshake rather than by a double buffer -- so a
+// ScratchRegion enumerator for it would be state that exists only to be
+// miscalled.
+//
+// Flags are strided a full sector apart because a peer writes them over PCIe;
+// two sharing a sector turn a store into a read-modify-write on the root
+// complex. phase_offset() packs int32 contiguously and so could not host them.
+constexpr int kCeFlagStride = 128;
+constexpr int kCeMaxPieces = 4;
+// Block size of the ring's add kernel. Fixed, not tuned: the ring is bound by
+// the fabric rather than by the SM, so the one tunable integer is spent on the
+// sub-chunk depth instead.
+constexpr int kCeAddThreads = 256;
+
+// Ring slots for the deepest sub-chunking, plus two fixed handshake slots. The
+// handshake indices are fixed rather than derived as steps*pieces, which
+// aliases a ring slot whenever `pieces` varies between calls.
+//
+// Two, not one, because a rank must rendezvous with every rank whose staging it
+// writes and the two schedules write different sets: the flat ring only writes
+// `next`, while the island schedule writes `island_next` in phases A and C and
+// `partner` in phase B. A single global slot leaves at least one consumer
+// uncovered on every rank -- ranks 3 and 7, the two that wrap within their
+// island, cover neither.
+inline int ce_flag_slots(int world_size) { return 2 * (world_size - 1) * kCeMaxPieces + 2; }
+inline int ce_handshake_slot(int world_size) { return 2 * (world_size - 1) * kCeMaxPieces; }
+inline int ce_partner_handshake_slot(int world_size) {
+  return 2 * (world_size - 1) * kCeMaxPieces + 1;
+}
+
 // Which kernel all_reduce() launches, together with world_size. Values are
 // part of the FFI signature, so they are explicit and append-only.
 //
@@ -58,9 +98,13 @@ enum class Variant : int {
   kStaged = 1,      // staged pushes; island-decomposed at world_size 8
   kStagedRing = 2,  // staged pushes in neighbour order; world_size 4 and 8
   kFlatStaged = 3,  // staged pushes without the island decomposition
+  // Copy-engine ring. Dispatched one level up, in csrc, not by all_reduce()
+  // below -- see the guard at the top of that function.
+  kCopyEngineRing = 4,
+  kCopyEngineIsland = 5,  // 4+4 decomposition; world_size 8 and rootcplx only
 };
 
-constexpr int kVariantCount = 4;
+constexpr int kVariantCount = 6;
 
 // Which staging area a kernel uses. The kernels come in two protocol families
 // and a region may hold only one of them.
@@ -2033,7 +2077,12 @@ __global__ __launch_bounds__(1024, 1) void push_oneshot_param_kernel(
 // Byte layout of one rank's workspace slab.
 //
 //   [ epoch slots | barrier phase slots | barrier flags
-//     | block-scratch epoch + arrival | pack scratch | block scratch ]
+//     | block-scratch epoch + arrival | pack scratch | block scratch
+//     | ce flags | ce counters | ce scratch ]
+//
+// The copy-engine block is strictly at the tail so every offset make_peer_views
+// hands out for signal/pack/block is byte-identical with and without it, and a
+// tune cache measured before it stays valid.
 //
 // Both scratch regions are sized for world_size ranks x a double-buffered
 // epoch, so a rank may start collective N+1 before its peer has drained N.
@@ -2045,6 +2094,9 @@ struct WorkspaceLayout {
   size_t signal_bytes;
   size_t max_payload_bytes;
   size_t scratch_bytes;  // per scratch region
+  size_t ce_flag_bytes;
+  size_t ce_counter_bytes;
+  size_t ce_scratch_bytes;  // total, across every ring step
   size_t total_bytes;
 };
 
@@ -2057,7 +2109,7 @@ inline WorkspaceLayout compute_workspace_layout(int world_size, int64_t max_nume
   // {epoch, arrival} per scratch region, in ScratchRegion order. Appended at
   // the tail so phase_offset() and flag_offset(), both anchored at the front,
   // are unchanged. See scratch_state_offset().
-  const size_t scratch_state_slots = 2 * 2;
+  const size_t scratch_state_slots = 2 * static_cast<size_t>(kScratchRegionCount);
   const size_t signal_slots = epoch_slots + barrier_slots + flag_slots + scratch_state_slots;
   auto align128 = [](size_t n) { return (n + 127u) & ~static_cast<size_t>(127u); };
   WorkspaceLayout layout{};
@@ -2065,7 +2117,27 @@ inline WorkspaceLayout compute_workspace_layout(int world_size, int64_t max_nume
   layout.max_payload_bytes =
       align128(static_cast<size_t>(max_numel) * static_cast<size_t>(elem_size));
   layout.scratch_bytes = align128(2 * static_cast<size_t>(world_size) * layout.max_payload_bytes);
-  layout.total_bytes = layout.signal_bytes + 2 * layout.scratch_bytes;
+
+  // One landing buffer per ring step, sized by the shard that step carries.
+  // The flat ring runs 2*(N-1) steps of max_payload/N; at world_size 8 the
+  // island schedule runs 7 steps of max_payload/4, which is why it is zero
+  // below at any other size. There the two agree to within rounding at ~2x the
+  // payload, against the 2*2*N*payload the SM regions above take; take the
+  // larger so either schedule fits and neither needs its own allocation.
+  const size_t ce_slots = static_cast<size_t>(ce_flag_slots(world_size));
+  layout.ce_flag_bytes = align128(ce_slots * static_cast<size_t>(kCeFlagStride));
+  // Send and wait counters, rank-local. In the slab rather than in a torch
+  // tensor so pcie_ipc_init's memset initialises them and teardown needs no
+  // extra step.
+  layout.ce_counter_bytes = align128(2 * ce_slots * sizeof(int32_t));
+  const size_t flat_total = static_cast<size_t>(2 * (world_size - 1)) *
+                            align128(layout.max_payload_bytes / static_cast<size_t>(world_size));
+  const size_t island_total =
+      world_size == 8 ? static_cast<size_t>(7) * align128(layout.max_payload_bytes / 4) : 0;
+  layout.ce_scratch_bytes = flat_total > island_total ? flat_total : island_total;
+
+  layout.total_bytes = layout.signal_bytes + 2 * layout.scratch_bytes + layout.ce_flag_bytes +
+                       layout.ce_counter_bytes + layout.ce_scratch_bytes;
   return layout;
 }
 
@@ -2080,6 +2152,12 @@ struct PeerViews {
   uint64_t signal[kMaxWorldSize];
   uint64_t pack[kMaxWorldSize];
   uint64_t block[kMaxWorldSize];
+  // Copy-engine ring. flags and scratch are written by peers; the counters are
+  // rank-local and only ever touched by this rank's single-thread flag kernels.
+  uint64_t ce_flags[kMaxWorldSize];
+  uint64_t ce_scratch[kMaxWorldSize];
+  int32_t* ce_send_counters;
+  int32_t* ce_wait_counters;
   int32_t* self_signal;
 };
 
@@ -2093,8 +2171,17 @@ inline PeerViews make_peer_views(const int64_t* ipc_ptrs, int world_size, int ra
     auto* scratch = base + static_cast<ptrdiff_t>(layout.signal_bytes);
     views.pack[peer] = reinterpret_cast<uint64_t>(scratch);
     views.block[peer] = reinterpret_cast<uint64_t>(scratch + layout.scratch_bytes);
+    auto* ce = scratch + 2 * static_cast<ptrdiff_t>(layout.scratch_bytes);
+    views.ce_flags[peer] = reinterpret_cast<uint64_t>(ce);
+    views.ce_scratch[peer] = reinterpret_cast<uint64_t>(
+        ce + static_cast<ptrdiff_t>(layout.ce_flag_bytes + layout.ce_counter_bytes));
   }
   views.self_signal = reinterpret_cast<int32_t*>(ipc_ptrs[rank]);
+  auto* self_ce =
+      reinterpret_cast<char*>(ipc_ptrs[rank]) +
+      static_cast<ptrdiff_t>(layout.signal_bytes + 2 * layout.scratch_bytes + layout.ce_flag_bytes);
+  views.ce_send_counters = reinterpret_cast<int32_t*>(self_ce);
+  views.ce_wait_counters = views.ce_send_counters + ce_flag_slots(world_size);
   return views;
 }
 
@@ -2146,6 +2233,14 @@ template <typename T>
 cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews& views, int rank,
                        int world_size, int max_blocks, int64_t max_numel, int blocks, int threads,
                        Variant variant, bool use_pdl, cudaStream_t stream) {
+  // The copy-engine ring is a different protocol with its own launcher; csrc
+  // routes it before reaching here. Refused explicitly because the
+  // world_size == 2 branch below selects on `variant == kStaged` and would
+  // otherwise silently run the TP2 SM kernel for any variant it does not know.
+  if (variant == Variant::kCopyEngineRing || variant == Variant::kCopyEngineIsland) {
+    return cudaErrorInvalidValue;
+  }
+
   using Traits = PackTraits<T>;
   const int num_packs = static_cast<int>(numel / Traits::kPackElems);
   const int rank_stride_packs = static_cast<int>(max_numel / Traits::kPackElems);

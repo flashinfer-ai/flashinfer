@@ -6,6 +6,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
+from ..utils import log2e
 from .utils import get_cudnn_fmha_gen_module
 
 try:
@@ -715,6 +716,11 @@ def _batch_prefill_with_kv_cache(
     graph.execute(var_map, workspace=workspace_buffer, handle=handle)
 
     if return_lse:
+        # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
+        # backend returns base-2 LSE (they fold log2e into the softmax scale, so
+        # their kernels emit base-2 directly). Convert here so the cuDNN backend
+        # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
+        lse.mul_(log2e)
         return out, lse
     else:
         return out, None
