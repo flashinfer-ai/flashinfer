@@ -29,6 +29,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstring>
 
@@ -81,7 +82,9 @@ template <ScaleFormat F>
 struct ScaleConvert {
   static_assert(F == ScaleFormat::POW2_FP32 || F == ScaleFormat::ARBITRARY_FP32,
                 "add a ScaleConvert specialization for this scale format");
-  __device__ static __forceinline__ uint8_t to_ue8m0(float scale) { return fp32_exponent_byte(scale); }
+  __device__ static __forceinline__ uint8_t to_ue8m0(float scale) {
+    return fp32_exponent_byte(scale);
+  }
 };
 
 template <>
@@ -93,11 +96,13 @@ __device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DSV3_2>::scale_to_ue
   return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
 }
 
-__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::GLM53_NOPE>::scale_to_ue8m0(float scale) {
+__device__ __forceinline__ uint8_t
+KVCacheTraits<ModelType::GLM53_NOPE>::scale_to_ue8m0(float scale) {
   return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
 }
 
-__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DOTS3_SWA>::scale_to_ue8m0(uint8_t scale) {
+__device__ __forceinline__ uint8_t
+KVCacheTraits<ModelType::DOTS3_SWA>::scale_to_ue8m0(uint8_t scale) {
   return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
 }
 

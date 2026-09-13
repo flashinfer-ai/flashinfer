@@ -211,7 +211,10 @@ def test_dual_resolved_execution_and_optional_mismatch(model, variant, extra_fp4
     import torch
     from flashinfer.utils import is_sm12x_supported
     from flashinfer.jit.mla import gen_sparse_mla_sm120_module
-    from tests.attention.sparse_mla_test_utils import quantize_kv_dsv4, quantize_kv_dsv4_1
+    from tests.attention.sparse_mla_test_utils import (
+        quantize_kv_dsv4,
+        quantize_kv_dsv4_1,
+    )
     from flashinfer.mla import dsv41_fp4_quantize_pack_sparse_mla_cache
 
     if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
@@ -407,13 +410,13 @@ def test_dsv4_nvfp4_execute_plan_graph(cpb, prefill, stage1):
         )
 
     call()
-    assert all(torch.equal(x, y) for x, y in zip(actual, expected))
+    assert all(torch.equal(x, y) for x, y in zip(actual, expected, strict=True))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         call()
     graph.replay()
     torch.cuda.synchronize()
-    assert all(torch.equal(x, y) for x, y in zip(actual, expected))
+    assert all(torch.equal(x, y) for x, y in zip(actual, expected, strict=True))
     with pytest.raises(RuntimeError, match="module mismatch"):
         call(_resolve())
     wrong_optional = resolve_dsv4_nvfp4(
@@ -612,9 +615,11 @@ def test_capture_rejects_insufficient_workspace():
         )
 
     run()
-    with pytest.raises(ValueError, match="workspace"):
-        with torch.cuda.graph(torch.cuda.CUDAGraph()):
-            run(workspace[:0])
+    with (
+        pytest.raises(ValueError, match="workspace"),
+        torch.cuda.graph(torch.cuda.CUDAGraph()),
+    ):
+        run(workspace[:0])
 
 
 def test_prepared_profile_update_and_invalid_extra_order(monkeypatch):
@@ -731,9 +736,11 @@ def test_prepared_rejects_offset_vector_operand_before_launch(
     bad_q, bad_output = (offset, output) if operand == "q" else (q, offset)
     graph = torch.cuda.CUDAGraph(keep_graph=True)
     graph.enable_debug_mode()
-    with torch.cuda.graph(graph):
-        with pytest.raises(RuntimeError, match=f"{operand}.*aligned"):
-            wrapper.run(bad_q, cache, indices, bad_output, 512**-0.5)
+    with (
+        torch.cuda.graph(graph),
+        pytest.raises(RuntimeError, match=f"{operand}.*aligned"),
+    ):
+        wrapper.run(bad_q, cache, indices, bad_output, 512**-0.5)
     graph.instantiate()
     dot = tmp_path / "rejected.dot"
     graph.debug_dump(str(dot))
@@ -792,12 +799,12 @@ def test_functional_capture_rejects_copying_normalization(operand):
         run()
     assert copies
     copies.clear()
-    with torch.cuda.graph(torch.cuda.CUDAGraph()):
-        with (
-            WatchCopies(),
-            pytest.raises(ValueError, match="capture.*view|view.*capture"),
-        ):
-            run()
+    with (
+        torch.cuda.graph(torch.cuda.CUDAGraph()),
+        WatchCopies(),
+        pytest.raises(ValueError, match="capture.*view|view.*capture"),
+    ):
+        run()
     assert not copies
 
 

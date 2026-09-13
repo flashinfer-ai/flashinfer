@@ -87,9 +87,11 @@ struct Fp8PrefillSync {
   static constexpr int NORMALIZER = 4;
   static constexpr int OUTPUT = 10;
   template <int QkThreads, int XvThreads>
-  using WeightsReady = flashinfer::sparse_mla_sm120::pipeline::StoreHandoff<6, 7, QkThreads, XvThreads>;
+  using WeightsReady =
+      flashinfer::sparse_mla_sm120::pipeline::StoreHandoff<6, 7, QkThreads, XvThreads>;
   template <int QkThreads, int XvThreads>
-  using WeightsFree = flashinfer::sparse_mla_sm120::pipeline::SlotRelease<8, 9, QkThreads, XvThreads>;
+  using WeightsFree =
+      flashinfer::sparse_mla_sm120::pipeline::SlotRelease<8, 9, QkThreads, XvThreads>;
   template <int IoThreads, int MathThreads>
   using KvFree = flashinfer::sparse_mla_sm120::pipeline::SlotRelease<1, 5, IoThreads, MathThreads>;
 };

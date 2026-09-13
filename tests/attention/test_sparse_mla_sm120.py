@@ -3296,6 +3296,13 @@ def test_sparse_mla_sm120_runner_rejects_unknown_d_v() -> None:
         _SparseMLAPagedAttentionRunner(d_v=d_v, device=device)
     with pytest.raises(ValueError, match="d_v"):
         _SparseMLAPagedAttentionRunner(d_v=768, device=device)
+    # The static construction-time set must mirror the compiled format table.
+    from flashinfer.mla._sparse_mla_sm120_policy import (
+        _SUPPORTED_D_V,
+        _D_V_BY_MODEL_TYPE,
+    )
+
+    assert frozenset(_D_V_BY_MODEL_TYPE.values()) == _SUPPORTED_D_V
 
 
 def test_sparse_mla_sm120_runner_wide_lse_buffer() -> None:

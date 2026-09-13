@@ -29,8 +29,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <flashinfer/attention/sparse_mla_sm120/model/dsv41_layout.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/compute/nvfp4_quantization.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/model/dsv41_layout.cuh>
 
 #include "../tvm_ffi_utils.h"
 
@@ -59,8 +59,7 @@ PagedCacheInfo parse_dsv41_fp4_paged_layout(const TensorView& cache) {
   TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(cache.data_ptr()) % VECTOR_ALIGNMENT, 0)
       << "V41_FP4 kv_cache base pointer must be " << VECTOR_ALIGNMENT << "-byte aligned";
   TVM_FFI_ICHECK_EQ(static_cast<size_t>(cache.stride(0)) % VECTOR_ALIGNMENT, 0)
-      << "V41_FP4 kv_cache page stride must be a multiple of " << VECTOR_ALIGNMENT
-      << " bytes";
+      << "V41_FP4 kv_cache page stride must be a multiple of " << VECTOR_ALIGNMENT << " bytes";
   if (cache.ndim() == 2) {
     const size_t page_bytes = static_cast<size_t>(cache.size(1));
     TVM_FFI_ICHECK_EQ(page_bytes % BPT, 0);
@@ -110,7 +109,7 @@ void check_latent(const TensorView& input, int64_t expected_tokens) {
 // One thread writes a 16-wide E2M1 group and its clamped E4M3 scale.
 template <typename T>
 __device__ __forceinline__ void quantize_dsv41_group16(const T* input, uint8_t* data_output,
-                                               uint8_t* scale_output) {
+                                                       uint8_t* scale_output) {
   float values[nvfp4::SF_VEC_SIZE];
   bool poisoned = false;
   float amax = 0.f;
@@ -130,20 +129,18 @@ __device__ __forceinline__ void quantize_dsv41_group16(const T* input, uint8_t* 
   // The stored (E4M3-rounded) scale is what the values are divided by.
   // __fdiv_rn: the module builds with -use_fast_math, and an approximate
   // division flips exact-tie roundings against the FlashMLA reference.
-  const uint8_t scale_byte = float_to_e4m3_byte(
-      fminf(fmaxf(__fdiv_rn(amax, 6.f), 0.001953125f /* 2^-9 */), 448.f));
+  const uint8_t scale_byte =
+      float_to_e4m3_byte(fminf(fmaxf(__fdiv_rn(amax, 6.f), 0.001953125f /* 2^-9 */), 448.f));
   const float scale = e4m3_byte_to_float(scale_byte);
   float normalized[nvfp4::SF_VEC_SIZE];
 #pragma unroll
   for (int i = 0; i < nvfp4::SF_VEC_SIZE; ++i) normalized[i] = __fdiv_rn(values[i], scale);
   *scale_output = scale_byte;
-  *reinterpret_cast<uint2*>(data_output) =
-      make_uint2(math::fp32_vec_to_e2m1(normalized[0], normalized[1], normalized[2],
-                                        normalized[3], normalized[4], normalized[5],
-                                        normalized[6], normalized[7]),
-                 math::fp32_vec_to_e2m1(normalized[8], normalized[9], normalized[10],
-                                        normalized[11], normalized[12], normalized[13],
-                                        normalized[14], normalized[15]));
+  *reinterpret_cast<uint2*>(data_output) = make_uint2(
+      math::fp32_vec_to_e2m1(normalized[0], normalized[1], normalized[2], normalized[3],
+                             normalized[4], normalized[5], normalized[6], normalized[7]),
+      math::fp32_vec_to_e2m1(normalized[8], normalized[9], normalized[10], normalized[11],
+                             normalized[12], normalized[13], normalized[14], normalized[15]));
 }
 
 template <typename T>
@@ -151,7 +148,7 @@ __device__ __forceinline__ void quantize_token(const T* input, uint8_t* data_out
                                                uint8_t* scale_output) {
   const int tid = threadIdx.x;
   quantize_dsv41_group16(input + tid * nvfp4::SF_VEC_SIZE,
-                 data_output + tid * nvfp4::FP4_PACKED_PER_GROUP, scale_output + tid);
+                         data_output + tid * nvfp4::FP4_PACKED_PER_GROUP, scale_output + tid);
 }
 
 __device__ __forceinline__ uint8_t* data_row(uint8_t* cache, size_t slot, int page_size,
@@ -224,9 +221,8 @@ void SparseMlaSm120Dsv41Fp4QuantizePack(TensorView latent_kv, TensorView cache) 
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(latent_kv.dtype(), c_type, [&] {
     QuantizePackKernel<c_type><<<grid, block, 0, stream>>>(
-        static_cast<const c_type*>(latent_kv.data_ptr()),
-        static_cast<uint8_t*>(cache.data_ptr()), shape.num_pages, shape.page_size,
-        shape.page_stride_bytes);
+        static_cast<const c_type*>(latent_kv.data_ptr()), static_cast<uint8_t*>(cache.data_ptr()),
+        shape.num_pages, shape.page_size, shape.page_stride_bytes);
     return true;
   });
   const cudaError_t status = cudaGetLastError();
@@ -235,7 +231,7 @@ void SparseMlaSm120Dsv41Fp4QuantizePack(TensorView latent_kv, TensorView cache) 
 }
 
 void SparseMlaSm120Dsv41Fp4QuantizeAppend(TensorView latent_kv, TensorView slot_mapping,
-                                        TensorView cache) {
+                                          TensorView cache) {
   CHECK_CUDA(latent_kv);
   CHECK_CUDA(slot_mapping);
   CHECK_CUDA(cache);
@@ -260,17 +256,17 @@ void SparseMlaSm120Dsv41Fp4QuantizeAppend(TensorView latent_kv, TensorView slot_
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(latent_kv.dtype(), c_type, [&] {
     if (slot_mapping.dtype() == dl_int32) {
-      QuantizeAppendKernel<c_type, int32_t><<<grid, block, 0, stream>>>(
-          static_cast<const c_type*>(latent_kv.data_ptr()),
-          static_cast<const int32_t*>(slot_mapping.data_ptr()), num_tokens,
-          static_cast<uint8_t*>(cache.data_ptr()), shape.num_pages, shape.page_size,
-          shape.page_stride_bytes);
+      QuantizeAppendKernel<c_type, int32_t>
+          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
+                                       static_cast<const int32_t*>(slot_mapping.data_ptr()),
+                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()),
+                                       shape.num_pages, shape.page_size, shape.page_stride_bytes);
     } else {
-      QuantizeAppendKernel<c_type, int64_t><<<grid, block, 0, stream>>>(
-          static_cast<const c_type*>(latent_kv.data_ptr()),
-          static_cast<const int64_t*>(slot_mapping.data_ptr()), num_tokens,
-          static_cast<uint8_t*>(cache.data_ptr()), shape.num_pages, shape.page_size,
-          shape.page_stride_bytes);
+      QuantizeAppendKernel<c_type, int64_t>
+          <<<grid, block, 0, stream>>>(static_cast<const c_type*>(latent_kv.data_ptr()),
+                                       static_cast<const int64_t*>(slot_mapping.data_ptr()),
+                                       num_tokens, static_cast<uint8_t*>(cache.data_ptr()),
+                                       shape.num_pages, shape.page_size, shape.page_stride_bytes);
     }
     return true;
   });

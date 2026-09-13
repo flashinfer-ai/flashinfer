@@ -1,7 +1,6 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 #include <flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h>
-
 #include <tvm/ffi/container/array.h>
 
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv32_fp8/resources.cuh>
@@ -23,11 +22,11 @@ int resolve_wave_cpb(int tokens, int head_blocks, int chunks, int requested_cpb,
   TVM_FFI_ICHECK_GT(sm_count, 0) << "SM count must be positive";
   int cpb = 1;
   float best_gap = 2.0f;
-  const int per_token_head = tokens * head_blocks;
+  const int64_t per_token_head = int64_t{tokens} * head_blocks;
   for (int candidate = 1; candidate <= chunks; ++candidate) {
     const int eff = (chunks + candidate - 1) / candidate;
-    const int active = per_token_head * eff;
-    const int ceil_w = (active + sm_count - 1) / sm_count;
+    const int64_t active = per_token_head * eff;
+    const int64_t ceil_w = (active + sm_count - 1) / sm_count;
     if (ceil_w > 3) continue;
     const float waves = (float)active / (float)sm_count;
     const float gap = (float)ceil_w - waves;
@@ -76,8 +75,9 @@ void prefill_resources(ExecutionPlan& p) {
     p.shared_bytes = Resources::SHARED_BYTES;
     if constexpr (MT == ModelType::DSV4_1) {
       if (p.metadata.extra_fp4) {
-        using MixedResources = Fp8PrefillResources<
-            MT, QkComputeMode::FP8, kernels::dsv41_fp8::Dsv41MixedCachePrefillResources>;
+        using MixedResources =
+            Fp8PrefillResources<MT, QkComputeMode::FP8,
+                                kernels::dsv41_fp8::Dsv41MixedCachePrefillResources>;
         p.block_threads = MixedResources::BLOCK_THREADS;
         p.shared_bytes = MixedResources::SHARED_BYTES;
       }
@@ -132,9 +132,9 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
                  m.topk >= DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW)
       << "sparse-MLA DOTS3 requires topk >= 513";
   TVM_FFI_ICHECK(requested != NumericRoute::NVFP4) << "wrong module for NVFP4";
-  TVM_FFI_ICHECK(requested != NumericRoute::FullBF16 ||
-                 (mt == ModelType::DSV4_1 &&
-                  ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)))
+  TVM_FFI_ICHECK(
+      requested != NumericRoute::FullBF16 ||
+      (mt == ModelType::DSV4_1 && ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)))
       << "full BF16 requires DSV41 decode or SG prefill";
   ExecutionPlan p{};
   p.metadata = m;
@@ -178,7 +178,8 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
     p.chunk_capacity = (m.topk + 63) / 64 + (m.extra_topk + 63) / 64;
     p.active_splits = 1;
     p.merge = Merge::Direct;
-    p.specialized_heads = visit_decode_heads<ModelType::DSV4_1>(m.heads, [](auto h) { return int(h); });
+    p.specialized_heads =
+        visit_decode_heads<ModelType::DSV4_1>(m.heads, [](auto h) { return int(h); });
     p.block_threads = Dsv41Bf16Resources::BLOCK_THREADS;
     p.shared_bytes = sizeof(Dsv41Bf16Smem);
   } else {

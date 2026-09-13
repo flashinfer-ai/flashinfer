@@ -1131,8 +1131,8 @@ def test_native_index_sets_preserve_global_rng(monkeypatch):
     first = native._make_index_sets(**arguments)
     second = native._make_index_sets(**arguments)
     torch.testing.assert_close(torch.random.get_rng_state(), before)
-    for actual, repeated in zip(first, second):
-        for tensor, other in zip(actual, repeated):
+    for actual, repeated in zip(first, second, strict=True):
+        for tensor, other in zip(actual, repeated, strict=True):
             torch.testing.assert_close(tensor, other)
     assert not torch.equal(first[0][0], first[1][0])
 
@@ -1219,6 +1219,37 @@ def test_scope_switch_same_mtime_delete_and_entry_remove(store, monkeypatch, tmp
     assert cpb_mod.get_constants(store, "dsv4") is None
 
 
+def test_publish_if_absent_replaces_when_still_absent(store) -> None:
+    cpb_mod.save_crossover(store, {"dsv4|16|128": 8})  # stale, no constants
+    assert cpb_mod.publish_calibration(
+        store,
+        "dsv4",
+        constants=_C,
+        crossover={"dsv4|32|256": 4},
+        replace_family_if_absent=True,
+    )
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 16, 128) is None
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 32, 256) == 4
+
+
+def test_publish_if_absent_merges_concurrent_family(store) -> None:
+    """A family published between the caller's absence check and publish must
+    survive: replace_family_if_absent degrades to a merge."""
+    cpb_mod.save_constants(store, "dsv4", _C)
+    cpb_mod.save_crossover(store, {"dsv4|16|128": 8})
+    fresh = replace(_C, c0=2e-6)
+    assert cpb_mod.publish_calibration(
+        store,
+        "dsv4",
+        constants=fresh,
+        crossover={"dsv4|32|256": 4},
+        replace_family_if_absent=True,
+    )
+    assert cpb_mod.get_constants(store, "dsv4") == fresh
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 16, 128) == 8
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 32, 256) == 4
+
+
 def test_atomic_alias_invalidation_and_writer_merge(store):
     cpb_mod.save_constants(store, "dsv3_2", _C)
     cpb_mod.save_crossover(
@@ -1240,7 +1271,9 @@ def test_atomic_alias_invalidation_and_writer_merge(store):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(
             pool.map(
-                lambda index: cpb_mod.save_constants(torch.device(f"cpu:{index}"), "dsv4", _C),
+                lambda index: cpb_mod.save_constants(
+                    torch.device(f"cpu:{index}"), "dsv4", _C
+                ),
                 (1, 2),
             )
         )
@@ -1266,7 +1299,9 @@ def test_write_failure_overlay_does_not_cross_path(store, monkeypatch, tmp_path)
 def test_public_force_keeps_old_unit_on_measurement_failure(store, monkeypatch):
     from flashinfer.mla import _sparse_mla_sm120_execution as execution
 
-    cpb_mod.publish_calibration(store, "dsv4", constants=_C, crossover={"dsv4|16|128": 8})
+    cpb_mod.publish_calibration(
+        store, "dsv4", constants=_C, crossover={"dsv4|16|128": 8}
+    )
     before = cpb_mod.default_cache_path().read_bytes()
     monkeypatch.setattr(cpb_mod, "_family_specs", lambda: {"dsv4": ((16,), (128,), 1)})
     monkeypatch.setattr(execution, "get_sparse_mla_sm120_module", lambda: object())
@@ -1570,7 +1605,9 @@ def test_public_preflight_and_default_six_families(store, monkeypatch):
             store, families=("dsv4",), compute_precision="bf16"
         )
     with pytest.raises(ValueError, match="extra"):
-        cpb_mod.calibrate_sparse_mla_sm120(store, families=("dsv4_1",), extra_kv_fp4=True)
+        cpb_mod.calibrate_sparse_mla_sm120(
+            store, families=("dsv4_1",), extra_kv_fp4=True
+        )
     requested = set()
     monkeypatch.setattr(execution, "get_sparse_mla_sm120_module", lambda: object())
 
@@ -1657,7 +1694,9 @@ def test_runtime_exact_lookup_unknown_persistence_and_precision(store, monkeypat
         )
         is None
     )
-    assert cpb_mod._profile_bucket(cpb_mod.get_dsv41_profile(request, store), 65) is None
+    assert (
+        cpb_mod._profile_bucket(cpb_mod.get_dsv41_profile(request, store), 65) is None
+    )
     assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
     assert policy.profile_selection(m._replace(tokens=4), store, "fp8").variant == 1
 
@@ -1675,5 +1714,7 @@ def test_dsv41_fallback_does_not_start_legacy_measurement(store, monkeypatch):
     )
     monkeypatch.setattr(cpb_mod, "_target_capturing", lambda device: False)
     monkeypatch.setattr(cpb_mod, "get_constants", lambda *args: None)
-    monkeypatch.setattr(cpb_mod, "calibrate", lambda *args: pytest.fail("legacy measurement"))
+    monkeypatch.setattr(
+        cpb_mod, "calibrate", lambda *args: pytest.fail("legacy measurement")
+    )
     assert policy._resolve_cpb(store, "dsv4_1", 5, 16, 128, 0) == -1

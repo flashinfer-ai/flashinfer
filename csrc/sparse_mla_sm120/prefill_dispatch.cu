@@ -1,8 +1,8 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
-#include "attention_dispatch.h"
-
 #include <flashinfer/attention/sparse_mla_sm120/execution/prefill_launch.cuh>
+
+#include "attention_dispatch.h"
 
 namespace flashinfer::sparse_mla_sm120 {
 
@@ -14,7 +14,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     return execution::visit_decode_heads<ModelType::DSV4_1>(m.heads, [&](auto head) {
       constexpr int H = decltype(head)::value;
       return m.extra_fp4 ? launch_dsv41_bf16_prefill<H, true>(p, stream)
-                        : launch_dsv41_bf16_prefill<H, false>(p, stream);
+                         : launch_dsv41_bf16_prefill<H, false>(p, stream);
     });
   }
   PrefillColdParams cold{p.sm_scale,          m.tokens,

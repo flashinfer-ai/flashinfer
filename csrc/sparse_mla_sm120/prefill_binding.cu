@@ -84,7 +84,7 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
       attn_sink.has_value() ? static_cast<const float*>(attn_sink.value().data_ptr()) : nullptr;
   params.sm_scale = sm_scale;
   check_attention_alignment(q,
-                            plan.numeric == execution::NumericRoute::QkBF16PvFP8            ? 2
+                            plan.numeric == execution::NumericRoute::QkBF16PvFP8       ? 2
                             : plan.implementation == execution::Implementation::SwapAB ? 8
                                                                                        : 16,
                             "q");

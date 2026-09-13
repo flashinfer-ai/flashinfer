@@ -20,7 +20,6 @@
 
 #include "../../arch/barrier.cuh"
 #include "../../compute/nvfp4_quantization.cuh"
-
 #include "resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {

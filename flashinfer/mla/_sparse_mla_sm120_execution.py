@@ -55,6 +55,15 @@ def query(name: str, *args, is_dsv4_nvfp4: bool = False):
 
 KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32", "ue8m0_g32"})
 
+_PRECISION_CODES = {"fp8": 0, "default": 1, "bf16": 2}
+
+
+def _precision_code(precision: str) -> int:
+    try:
+        return _PRECISION_CODES[precision]
+    except KeyError:
+        raise ValueError(f"unsupported compute precision {precision!r}") from None
+
 
 def normalize_kv_scale_format(kv_scale_format: str) -> str:
     fmt = str(kv_scale_format).lower().replace("-", "_")
@@ -131,9 +140,7 @@ def metadata_candidates(
     metadata: AttentionMetadata, precision: str, sm_count: int, max_shared_bytes: int
 ) -> Mapping[int, int]:
     """Legal variants and resolver-owned chunk capacities for actual metadata."""
-    if precision not in ("default", "fp8", "bf16"):
-        raise ValueError(f"unsupported compute precision {precision!r}")
-    numeric = {"fp8": 0, "default": 1, "bf16": 2}[precision]
+    numeric = _precision_code(precision)
     return dict(
         query("metadata_candidates", metadata, numeric, sm_count, max_shared_bytes)
     )
@@ -224,7 +231,7 @@ def resolve_attention(
         int(extra_fp4),
         variant,
     )
-    requested = {"fp8": 0, "default": 1, "bf16": 2}[precision]
+    requested = _precision_code(precision)
     return get_sparse_mla_sm120_module().resolve_attention(
         metadata, requested, cpb, sm_count, max_shared_bytes
     )

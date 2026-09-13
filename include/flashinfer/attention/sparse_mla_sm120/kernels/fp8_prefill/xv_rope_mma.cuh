@@ -31,8 +31,8 @@
 #include "../../arch/common.cuh"
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
-#include "../../model/kv_cache_traits.cuh"
 #include "../../common/kv_cache_io.cuh"
+#include "../../model/kv_cache_traits.cuh"
 #include "tile_config.cuh"
 
 // XV rope via BF16 MMA m16n8k16 (DSV4 only).

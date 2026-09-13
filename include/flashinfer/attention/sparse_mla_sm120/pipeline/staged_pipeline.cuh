@@ -8,7 +8,8 @@
 namespace flashinfer::sparse_mla_sm120::pipeline {
 
 template <int Even, int Odd, int ProducerThreads, int ConsumerThreads>
-__device__ inline void StoreHandoff<Even, Odd, ProducerThreads, ConsumerThreads>::publish(int slot) {
+__device__ inline void StoreHandoff<Even, Odd, ProducerThreads, ConsumerThreads>::publish(
+    int slot) {
   bar_arrive_alt<Even, Odd, PARTICIPANTS>(slot);
 }
 template <int Even, int Odd, int ProducerThreads, int ConsumerThreads>
@@ -50,11 +51,16 @@ __device__ inline void BulkReady::expect(uint64_t* barrier, uint32_t bytes) {
 
 template <int Slots, int ReadyArrivals, int FreeArrivals>
 template <typename Phase>
-__device__ inline void AsyncRing<Slots, ReadyArrivals, FreeArrivals>::advance(int& slot, Phase& phase) {
-  if (++slot == Slots) { slot = 0; phase ^= 1; }
+__device__ inline void AsyncRing<Slots, ReadyArrivals, FreeArrivals>::advance(int& slot,
+                                                                              Phase& phase) {
+  if (++slot == Slots) {
+    slot = 0;
+    phase ^= 1;
+  }
 }
 template <int Slots, int ReadyArrivals, int FreeArrivals>
-__device__ inline void AsyncRing<Slots, ReadyArrivals, FreeArrivals>::init(uint64_t* ready, uint64_t* free) {
+__device__ inline void AsyncRing<Slots, ReadyArrivals, FreeArrivals>::init(uint64_t* ready,
+                                                                           uint64_t* free) {
 #pragma unroll
   for (int slot = 0; slot < Slots; ++slot) {
     Ready::init(ready + slot);

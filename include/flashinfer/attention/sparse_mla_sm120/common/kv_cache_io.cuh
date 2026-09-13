@@ -28,9 +28,9 @@
 
 #pragma once
 
-#include "../pipeline/staged_pipeline.cuh"
 #include "../arch/cp_async.cuh"
 #include "../model/kv_cache_traits.cuh"
+#include "../pipeline/staged_pipeline.cuh"
 #include "zero_row.cuh"
 
 // KV cache IO: gather BI entries from global KV pool to smem.
@@ -90,8 +90,7 @@ __device__ __forceinline__ int mask_idx_past_len(int idx, int pos, int len) {
 // one tile ahead of use so the LDG latency does not sit on the TMA issue chain.
 // TILE_BI <= TILE_IO_THREADS gives each IO thread at most one candidate, so the
 // thread's slot in the smem tile is io_tid.
-template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT, int TILE_BI,
-          int TILE_IO_THREADS>
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT, int TILE_BI, int TILE_IO_THREADS>
 __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
                                                     const uint8_t* __restrict__ kv_ptr,
                                                     uint64_t* mbar, int io_tid,
@@ -104,7 +103,8 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
   static_assert(TILE_BI <= TILE_IO_THREADS,
                 "per-thread index staging assumes at most one candidate per IO thread");
 
-  if (io_tid == 0) flashinfer::sparse_mla_sm120::pipeline::BulkReady::expect(mbar, TILE_BI * COPY_BYTES);
+  if (io_tid == 0)
+    flashinfer::sparse_mla_sm120::pipeline::BulkReady::expect(mbar, TILE_BI * COPY_BYTES);
   if (io_tid >= TILE_BI) return;
 
   static_assert(COPY_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
@@ -129,8 +129,7 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
 // on the release handshake. Pure hint: padding indices are skipped, not
 // clamped. Addressing mirrors io_bulk_gather_tile; footer models also warm the
 // scale line, whose synchronous LDG sits on the gather issue path.
-template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT, int TILE_BI,
-          int TILE_IO_THREADS>
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT, int TILE_BI, int TILE_IO_THREADS>
 __device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __restrict__ kv_ptr,
                                                     int io_tid, size_t stride_kv_block,
                                                     uint64_t cache_policy = 0) {

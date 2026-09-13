@@ -27,8 +27,8 @@
 #include <flashinfer/attention/sparse_mla_sm120/compute/nvfp4_quantization.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/model/dsv4_nvfp4_layout.cuh>
 
-#include "dsv4_nvfp4_validation.h"
 #include "../tvm_ffi_utils.h"
+#include "dsv4_nvfp4_validation.h"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 

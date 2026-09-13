@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+
 #include <cstddef>
 
 #include "model_type.h"

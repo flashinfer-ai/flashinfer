@@ -17,10 +17,10 @@
 #include "smem_layout.cuh"
 #include "xv_rope_mma.cuh"
 
-using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
-using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8_pair;
+using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
+using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
 using flashinfer::sparse_mla_sm120::pipeline::BulkReady;
 using flashinfer::sparse_mla_sm120::pipeline::RoleSync;
 using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
@@ -158,8 +158,8 @@ __device__ __forceinline__ void prefill_mg_impl(
     auto issue_tile = [&](int logical_ti, int buf, int staged) {
       if constexpr (DUAL_CACHE) {
         if (logical_ti >= main_ni) {
-          io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache_extra,
-                                                      io_tid, extra_page_stride_bytes);
+          io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA, BI, IO_THREADS>(
+              sm.kv_scale_buf(buf), staged, KV_cache_extra, io_tid, extra_page_stride_bytes);
           __threadfence_block();
           io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true, BI, IO_THREADS>(
               sm.kv_buf(buf), staged, KV_cache_extra, sm.mbar_kv(buf), io_tid,
@@ -167,12 +167,12 @@ __device__ __forceinline__ void prefill_mg_impl(
           return;
         }
       }
-      io_gather_scales<MT, PAGE_BLOCK_SIZE, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache, io_tid,
-                                            page_stride_bytes);
+      io_gather_scales<MT, PAGE_BLOCK_SIZE, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
+                                                            io_tid, page_stride_bytes);
       __threadfence_block();
-      io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true, BI, IO_THREADS>(sm.kv_buf(buf), staged, KV_cache,
-                                                     sm.mbar_kv(buf), io_tid, page_stride_bytes,
-                                                     kv_l2_policy);
+      io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true, BI, IO_THREADS>(
+          sm.kv_buf(buf), staged, KV_cache, sm.mbar_kv(buf), io_tid, page_stride_bytes,
+          kv_l2_policy);
     };
 
     int staged = load_idx(0);
@@ -276,7 +276,8 @@ __device__ __forceinline__ void prefill_mg_impl(
         // Position and runtime length are cache-section-relative under dual cache.
         const int section_tile = (DUAL_CACHE && !is_main) ? (ti - main_ni) : ti;
         const int len_now = (DUAL_CACHE && !is_main) ? topk_len_extra : topk_len;
-        const int idx = mask_idx_past_len(ib[qk_nb + gid], section_tile * BI + qk_nb + gid, len_now);
+        const int idx =
+            mask_idx_past_len(ib[qk_nb + gid], section_tile * BI + qk_nb + gid, len_now);
         if constexpr (DUAL_CACHE) {
           if (is_main) {
             entry_base_gid =
@@ -304,11 +305,12 @@ __device__ __forceinline__ void prefill_mg_impl(
         const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
         float qk_grp[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
 
-        const uint8_t* k_sc = KV::SCALE_IN_KV_SMEM
-                                  ? kv_gid_base + KV::D_NOPE
-                                  : sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
+        const uint8_t* k_sc = KV::SCALE_IN_KV_SMEM ? kv_gid_base + KV::D_NOPE
+                                                   : sm.kv_scale_buf(ti & 1) +
+                                                         (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
         qk_bf16_from_fp8_nope_16x8<KV>(qk_grp, sm.q_nope_bf16(0),
-                                int(sm.q_nope_bf16(1) - sm.q_nope_bf16(0)), kv_gid_base, k_sc, lane);
+                                       int(sm.q_nope_bf16(1) - sm.q_nope_bf16(0)), kv_gid_base,
+                                       k_sc, lane);
 
 #pragma unroll
         for (int g = 0; g < 2; g++) {
@@ -387,14 +389,17 @@ __device__ __forceinline__ void prefill_mg_impl(
           float qk_storage[1][4] = {};
           auto& qk = qk_storage[0];
           if constexpr (QkMode == QkComputeMode::BF16) {
-            const uint8_t* k_sc = KV::SCALE_IN_KV_SMEM
-                                      ? kv_gid_base + KV::D_NOPE
-                                      : sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
-            qk_bf16_from_fp8_nope_16x8<KV>(qk_storage, sm.q_nope_bf16(g), 0, kv_gid_base, k_sc, lane);
+            const uint8_t* k_sc =
+                KV::SCALE_IN_KV_SMEM
+                    ? kv_gid_base + KV::D_NOPE
+                    : sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
+            qk_bf16_from_fp8_nope_16x8<KV>(qk_storage, sm.q_nope_bf16(g), 0, kv_gid_base, k_sc,
+                                           lane);
           } else {
 #pragma unroll
             for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
-              uint8_t sfa = fp32_exponent_byte(sm.q_nope_sc(g)[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
+              uint8_t sfa = fp32_exponent_byte(
+                  sm.q_nope_sc(g)[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
               float acc0, acc1, acc2, acc3;
               init_qk_acc<KV::SCALE_FORMAT>(qk, acc0, acc1, acc2, acc3);
               const uint8_t* k_scale_base;
@@ -405,10 +410,11 @@ __device__ __forceinline__ void prefill_mg_impl(
               }
               uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
               qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8(g), kv_warp_base,
-                                         blk, sfa, sfb, lane);
+                                          blk, sfa, sfb, lane);
               const uint8_t* e0_base = kv_warp_base + (size_t)(tid * 2) * KV::KV_SMEM_STRIDE;
               const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
-              commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE, e1_base + KV::D_NOPE, blk);
+              commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE,
+                                e1_base + KV::D_NOPE, blk);
             }
           }
 
@@ -513,10 +519,10 @@ __device__ __forceinline__ void prefill_mg_impl(
           vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
           vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
         } else {
-          vsc_cache[vc][0] =
-              fp32_from_exponent_byte(sm.kv_scale_buf(ti & 1)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-          vsc_cache[vc][1] =
-              fp32_from_exponent_byte(sm.kv_scale_buf(ti & 1)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+          vsc_cache[vc][0] = fp32_from_exponent_byte(
+              sm.kv_scale_buf(ti & 1)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+          vsc_cache[vc][1] = fp32_from_exponent_byte(
+              sm.kv_scale_buf(ti & 1)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
         }
       }
 
@@ -746,8 +752,8 @@ __device__ __forceinline__ void prefill_mg_impl(
                 reinterpret_cast<bf16*>(sm.w_fp8()));
           }
         } else {
-          xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, p, ib, valid_len, kv_global,
-                                                       mwarp, lane, page_stride_bytes_now,
+          xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, p, ib, valid_len, kv_global, mwarp,
+                                                       lane, page_stride_bytes_now,
                                                        reinterpret_cast<bf16*>(sm.w_fp8()));
         }
       }
@@ -904,9 +910,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
                                       bf16* __restrict__ output, float* __restrict__ out_lse,
                                       const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
                                       __grid_constant__ const PrefillColdParams cold) {
-  prefill_mg_impl<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true, PAGE_BLOCK_SIZE_EXTRA,
-                  MG_N_HG_T>(Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse,
-                             attn_sink, cold);
+  prefill_mg_impl<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, /*DUAL_CACHE=*/true,
+                  PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>(
+      Q, KV_cache, indices, KV_cache_extra, indices_extra, output, out_lse, attn_sink, cold);
 }
 
 // Dual-cache full-tile wrapper for fixed-length inputs.

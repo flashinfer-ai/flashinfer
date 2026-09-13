@@ -28,9 +28,9 @@
 
 #pragma once
 
-#include "tile_config.cuh"
-#include "../../model/kv_cache_traits.cuh"
 #include "../../compute/tile_traits.cuh"
+#include "../../model/kv_cache_traits.cuh"
+#include "tile_config.cuh"
 
 // Smem layout: constexpr offset computation for each buffer.
 // Parameterized by ModelType and QkComputeMode.

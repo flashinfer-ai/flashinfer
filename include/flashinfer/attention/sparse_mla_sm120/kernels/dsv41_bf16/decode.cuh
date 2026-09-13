@@ -13,13 +13,14 @@ namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 template <int NUM_HEADS, bool EXTRA_FP4>
 __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     sparse_mla_decode_dsv41_bf16_kernel(
-    const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
-    const int32_t* __restrict__ indices, bf16* __restrict__ mid_out, float* __restrict__ mid_lse,
-    const int* __restrict__ topk_length_ptr, const uint8_t* __restrict__ extra_KV_cache,
-    const int32_t* __restrict__ extra_indices, const int* __restrict__ extra_topk_length_ptr,
-    int extra_topk, int pbs_extra, size_t extra_page_stride_bytes, int num_tokens, int num_heads,
-    int topk, int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
-    size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
+        const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
+        const int32_t* __restrict__ indices, bf16* __restrict__ mid_out,
+        float* __restrict__ mid_lse, const int* __restrict__ topk_length_ptr,
+        const uint8_t* __restrict__ extra_KV_cache, const int32_t* __restrict__ extra_indices,
+        const int* __restrict__ extra_topk_length_ptr, int extra_topk, int pbs_extra,
+        size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk,
+        int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
+        size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
   using R = Dsv41Bf16Resources;
   using Geometry = R::Geometry;
   const int t = blockIdx.x, hs = blockIdx.y * R::HEADS_PER_CTA, split = blockIdx.z;
@@ -44,8 +45,9 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
   auto& sm = *reinterpret_cast<Dsv41Bf16Smem*>(storage);
   for (int i = tidx; i < R::HEADS_PER_CTA * R::QK_VECTORS; i += R::BLOCK_THREADS) {
     const int h = i / R::QK_VECTORS, d = i % R::QK_VECTORS * R::VECTOR_ELEMS;
-    uint4 data = h < vh ? *reinterpret_cast<const uint4*>(Q + ((size_t)t * qh + hs + h) * Geometry::D_QK + d)
-                        : make_uint4(0, 0, 0, 0);
+    uint4 data =
+        h < vh ? *reinterpret_cast<const uint4*>(Q + ((size_t)t * qh + hs + h) * Geometry::D_QK + d)
+               : make_uint4(0, 0, 0, 0);
     *reinterpret_cast<uint4*>(&sm.q[h][d]) = data;
   }
   float acc[R::PV_TILES_PER_WARP][4] = {};
@@ -90,8 +92,10 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
       }
     };
-    if ((pbs & (pbs - 1)) == 0) gather(true);
-    else gather(false);
+    if ((pbs & (pbs - 1)) == 0)
+      gather(true);
+    else
+      gather(false);
     __syncthreads();
     float qk[4] = {};
 #pragma unroll
@@ -164,8 +168,8 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
 #pragma unroll
       for (int v = 0; v < R::PV_TILES_PER_WARP; ++v) {
         uint32_t b0, b1;
-        const uint32_t addr =
-            uint32_t(__cvta_generic_to_shared(&sm.kv[k + (lane & 15)][v * (R::WARPS * R::MMA_N) + warp * R::MMA_N]));
+        const uint32_t addr = uint32_t(__cvta_generic_to_shared(
+            &sm.kv[k + (lane & 15)][v * (R::WARPS * R::MMA_N) + warp * R::MMA_N]));
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1},[%2];"
                      : "=r"(b0), "=r"(b1)
                      : "r"(addr));
@@ -184,7 +188,8 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     const int head = hs + gid + h * 8;
     if (head < qh) {
       const float inv = sum[h] > 0.f ? 1.f / sum[h] : 0.f;
-      const size_t base = ((size_t)t * mh + head) * scratch_split_stride * Geometry::D_V + split * Geometry::D_V;
+      const size_t base =
+          ((size_t)t * mh + head) * scratch_split_stride * Geometry::D_V + split * Geometry::D_V;
 #pragma unroll
       for (int v = 0; v < R::PV_TILES_PER_WARP; ++v) {
         const int d = v * (R::WARPS * R::MMA_N) + warp * R::MMA_N + tid * 2;

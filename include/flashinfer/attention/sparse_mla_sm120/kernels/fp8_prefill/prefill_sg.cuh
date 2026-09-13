@@ -31,7 +31,6 @@
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
 #include "../../common/d2_load_b.cuh"
-#include "xv_rope_mma.cuh"
 #include "../../compute/online_softmax.cuh"
 #include "../../compute/q_rope.cuh"
 #include "../../compute/q_stage.cuh"
@@ -41,15 +40,15 @@
 #include "../../pipeline/staged_pipeline.cuh"
 #include "../dsv41_fp8/prefill_gather.cuh"
 #include "../dsv41_fp8/resources.cuh"
-
 #include "prefill_common.cuh"
 #include "resources.cuh"
 #include "smem_layout.cuh"
+#include "xv_rope_mma.cuh"
 
-using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
-using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8_pair;
+using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
+using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
 using flashinfer::sparse_mla_sm120::pipeline::BulkReady;
 using flashinfer::sparse_mla_sm120::pipeline::RoleSync;
 using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
@@ -95,7 +94,8 @@ using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
 // internals use barrier id 2 with QK_THREADS, the consumer's staging
 // readback uses id 10 with XV_THREADS — distinct ids because the two groups
 // sync independently.
-template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE, typename GatherSchedule>
+template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE,
+          typename GatherSchedule>
 __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     SmemPtrs<MT, QkMode, PrefillTileCfg<MT>::BI, PrefillTileCfg<MT>::MATH_WARPS> sm,
     const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
@@ -247,7 +247,8 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
       } else {
 #pragma unroll
         for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
-          uint8_t sfa = fp32_exponent_byte(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
+          uint8_t sfa =
+              fp32_exponent_byte(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
           float acc0, acc1, acc2, acc3;
           init_qk_acc<KV::SCALE_FORMAT>(qk, acc0, acc1, acc2, acc3);
           const uint8_t* k_scale_base;
@@ -257,11 +258,12 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
             k_scale_base = sm.kv_scale_bufs[buf] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
           }
           uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
-          qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8, kv_warp_base,
-                                     blk, sfa, sfb, lane);
+          qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8, kv_warp_base, blk, sfa,
+                                      sfb, lane);
           const uint8_t* e0_base = kv_warp_base + (size_t)(tid * 2) * KV::KV_SMEM_STRIDE;
           const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
-          commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE, e1_base + KV::D_NOPE, blk);
+          commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE, e1_base + KV::D_NOPE,
+                            blk);
         }
       }
 
@@ -431,8 +433,8 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
           int ti_acc = vc * CT_XV::NT_PER_WARP_XV + nt;
           int dim = vc * CT::V_CHUNK + xw * (CT_XV::NT_PER_WARP_XV * 8) + nt * 8;
           float xv[4] = {0.f, 0.f, 0.f, 0.f};
-          pv_fp8_d2_16x8<KV::KV_SMEM_STRIDE, CT::W_FP8_STRIDE, CT_XV::XV_KSTEPS>(
-              xv, wfp8, kv_smem, dim, lane);
+          pv_fp8_d2_16x8<KV::KV_SMEM_STRIDE, CT::W_FP8_STRIDE, CT_XV::XV_KSTEPS>(xv, wfp8, kv_smem,
+                                                                                 dim, lane);
           float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
           acc_o[ti_acc][0] += xv[0] * sc0;
           acc_o[ti_acc][1] += xv[1] * sc0;
@@ -503,7 +505,8 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 
 template <ModelType MT, QkComputeMode QkMode, int NUM_HEADS, int PAGE_BLOCK_SIZE,
           typename GatherSchedule = Dsv41PrefillGatherSchedule>
-__global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS), 1)
+__global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS),
+                                  1)
     sparse_mla_prefill_kernel(const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
                               const int32_t* __restrict__ indices,
                               const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable
@@ -560,7 +563,8 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       flashinfer::sparse_mla_sm120::pipeline::BulkReady::init_slots<2>(
           GatherSchedule::ready(smem_raw + L::TOTAL));
   }
-  bar_sync_t<Fp8PrefillSync::CTA_INIT, Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS>();
+  bar_sync_t<Fp8PrefillSync::CTA_INIT,
+             Fp8PrefillResources<MT, QkMode, GatherSchedule>::BLOCK_THREADS>();
 
   if constexpr (GatherSchedule::RAW_PIPELINE) {
     if (threadIdx.x >= Cfg::MATH_THREADS) {
@@ -733,14 +737,16 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         auto& qk = qk_storage[0];
         const uint8_t* kv_gid_base = kv_warp_base + gid * KV::KV_SMEM_STRIDE;
         if constexpr (QkMode == QkComputeMode::BF16) {
-          const uint8_t* k_sc = KV::SCALE_IN_KV_SMEM
-                                    ? kv_gid_base + KV::D_NOPE
-                                    : sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
+          const uint8_t* k_sc =
+              KV::SCALE_IN_KV_SMEM
+                  ? kv_gid_base + KV::D_NOPE
+                  : sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
           qk_bf16_from_fp8_nope_16x8<KV>(qk_storage, sm.q_nope_bf16, 0, kv_gid_base, k_sc, lane);
         } else {
 #pragma unroll
           for (int blk = 0; blk < KV::NUM_SCALES; blk++) {
-            uint8_t sfa = fp32_exponent_byte(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
+            uint8_t sfa =
+                fp32_exponent_byte(sm.q_nope_sc[(gid + (lane & 1) * 8) * KV::NUM_SCALES + blk]);
             float acc0, acc1, acc2, acc3;
             init_qk_acc<KV::SCALE_FORMAT>(qk, acc0, acc1, acc2, acc3);
             const uint8_t* k_scale_base;
@@ -750,11 +756,12 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
               k_scale_base = sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
             }
             uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
-            qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8, kv_warp_base,
-                                       blk, sfa, sfb, lane);
+            qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8, kv_warp_base, blk,
+                                        sfa, sfb, lane);
             const uint8_t* e0_base = kv_warp_base + (size_t)(tid * 2) * KV::KV_SMEM_STRIDE;
             const uint8_t* e1_base = e0_base + KV::KV_SMEM_STRIDE;
-            commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE, e1_base + KV::D_NOPE, blk);
+            commit_qk_acc<KV>(qk, acc0, acc1, acc2, acc3, e0_base + KV::D_NOPE,
+                              e1_base + KV::D_NOPE, blk);
           }
         }  // closes the FP8/BF16 QK branch
 
@@ -863,10 +870,10 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
             vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
             vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
           } else {
-            vsc_cache[vc][0] =
-                fp32_from_exponent_byte(sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
-            vsc_cache[vc][1] =
-                fp32_from_exponent_byte(sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+            vsc_cache[vc][0] = fp32_from_exponent_byte(
+                sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+            vsc_cache[vc][1] = fp32_from_exponent_byte(
+                sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
           }
           float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
           float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
@@ -966,8 +973,8 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
               int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
               int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
               float xv[4] = {0.f, 0.f, 0.f, 0.f};
-              pv_fp8_d2_16x8<KV::KV_SMEM_STRIDE, CT::W_FP8_STRIDE, CT::XV_KSTEPS>(
-                  xv, wfp8, kv_smem, dim, lane);
+              pv_fp8_d2_16x8<KV::KV_SMEM_STRIDE, CT::W_FP8_STRIDE, CT::XV_KSTEPS>(xv, wfp8, kv_smem,
+                                                                                  dim, lane);
               float sc0 = vc_sc[gid], sc1 = vc_sc[gid + 8];
               acc_o[ti_acc][0] += xv[0] * sc0;
               acc_o[ti_acc][1] += xv[1] * sc0;
@@ -989,9 +996,9 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         static_assert(Cfg::BI == BI && Cfg::MATH_WARPS == N_MATH_WARPS,
                       "xv_rope_mma is hardcoded to the 64/8 tile; parameterize it before running a "
                       "V_HAS_ROPE model at a different BI");
-        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib,
-                                         min(Cfg::BI, topk_len - ti * Cfg::BI), KV_cache, mwarp,
-                                         lane, page_stride_bytes, reinterpret_cast<bf16*>(sm.w_fp8));
+        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
+            acc_rope, w0, w1, w2, w3, ib, min(Cfg::BI, topk_len - ti * Cfg::BI), KV_cache, mwarp,
+            lane, page_stride_bytes, reinterpret_cast<bf16*>(sm.w_fp8));
       }
 
       Fp8PrefillSync::KvFree<Cfg::IO_THREADS, Cfg::MATH_THREADS>::release(ti & 1);

@@ -24,7 +24,6 @@
 #include "../../compute/nvfp4_vt.cuh"
 #include "../../compute/warp_tiles.cuh"
 #include "../../pipeline/staged_pipeline.cuh"
-
 #include "gather.cuh"
 #include "q_stage.cuh"
 #include "resources.cuh"
@@ -89,8 +88,8 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
         }
       } else if (threadIdx.x < VALID_HPB) {
         const int h = h_start + threadIdx.x;
-        mid_lse[(size_t)token_idx * NUM_HEADS * scratch_split_stride + (size_t)h * scratch_split_stride + split_idx] =
-            -1e30f;
+        mid_lse[(size_t)token_idx * NUM_HEADS * scratch_split_stride +
+                (size_t)h * scratch_split_stride + split_idx] = -1e30f;
       }
     }
     return;
@@ -250,7 +249,8 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       float block_sum = 0.f;
 #pragma unroll
       for (int w = 0; w < DECODE_N_WARPS; ++w)
-        block_sum += sm.reduce_scratch_second()[w * HPB + h] * exp2f(sm.reduce_scratch()[w * HPB + h] - block_max);
+        block_sum += sm.reduce_scratch_second()[w * HPB + h] *
+                     exp2f(sm.reduce_scratch()[w * HPB + h] - block_max);
       sm.reduce_scratch()[h] = block_max;
       sm.reduce_scratch_second()[h] = block_sum;
     }
@@ -413,7 +413,8 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   bf16* destination =
       write_direct
           ? output + ((size_t)token_idx * NUM_HEADS + h_start) * D_V_C
-          : mid_out + (((size_t)token_idx * NUM_HEADS + h_start) * (size_t)scratch_split_stride + split_idx) *
+          : mid_out + (((size_t)token_idx * NUM_HEADS + h_start) * (size_t)scratch_split_stride +
+                       split_idx) *
                           D_V_C;
   const size_t head_stride = write_direct ? D_V_C : (size_t)scratch_split_stride * D_V_C;
 
@@ -450,13 +451,14 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     if (write_direct) {
       out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid] = sm.reduce_scratch_second()[gid];
       if constexpr (VALID_HPB > 8) {
-        out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid + 8] = sm.reduce_scratch_second()[gid + 8];
+        out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid + 8] =
+            sm.reduce_scratch_second()[gid + 8];
       }
     } else {
       const float lse0 = global_sum[0] > 0.f ? log2f(global_sum[0]) + global_max[0] : -1e30f;
       const float lse1 = global_sum[1] > 0.f ? log2f(global_sum[1]) + global_max[1] : -1e30f;
-      const size_t lse_base =
-          (size_t)token_idx * NUM_HEADS * scratch_split_stride + (size_t)h_start * scratch_split_stride;
+      const size_t lse_base = (size_t)token_idx * NUM_HEADS * scratch_split_stride +
+                              (size_t)h_start * scratch_split_stride;
       mid_lse[lse_base + (size_t)gid * scratch_split_stride + split_idx] = lse0;
       if constexpr (VALID_HPB > 8) {
         mid_lse[lse_base + (size_t)(gid + 8) * scratch_split_stride + split_idx] = lse1;
