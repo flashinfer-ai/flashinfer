@@ -3691,8 +3691,10 @@ def trtllm_batch_decode_with_kv_cache(
         Optional contiguous int32 CUDA tensor of shape ``[batch_size]`` with
         ``request_order[launch_slot] = logical_request_index``. This is
         supported by the SM103 Cake backend for BF16 Q/O, FP8 E4M3 HND K/V,
-        head dimension 256, page size 64, 8 query heads, 1 KV head, and
-        ``q_len_per_req`` 1 or 6. Its contents may change in place between
+        head dimension 256, page size 64, and 8 query/1 KV or 32 query/2 KV
+        heads. ``q_len_per_req`` must be a positive integer shared by all
+        requests; lengths other than 1 or 6 use the generated runtime-Q
+        bindings. Its contents may change in place between
         CUDA Graph replays; a null pointer preserves the existing path.
 
     request_order_plan : Optional[CakeFmhaRequestOrderedDecodePlan] = None
@@ -3723,6 +3725,15 @@ def trtllm_batch_decode_with_kv_cache(
     """
     if request_order is not None and backend != "cake":
         raise ValueError("request_order requires the explicit backend='cake'")
+    if request_order is not None and (
+        not isinstance(q_len_per_req, int)
+        or isinstance(q_len_per_req, bool)
+        or q_len_per_req <= 0
+        or cum_seq_lens_q is not None
+    ):
+        raise ValueError(
+            "request-ordered Cake FMHA requires a uniform positive integer q_len_per_req"
+        )
     if request_order_plan is not None and request_order is None:
         raise ValueError("request_order_plan requires a device request_order tensor")
     if request_order_capture is not None and (
@@ -4120,10 +4131,6 @@ def trtllm_batch_decode_with_kv_cache(
                 _run_cake_fmha_request_ordered_paged_decode,
             )
 
-            if q_len_per_req not in (1, 6) or cum_seq_lens_q is not None:
-                raise ValueError(
-                    "request-ordered Cake FMHA requires uniform q_len_per_req 1 or 6"
-                )
             if (
                 kv_layout != "HND"
                 or window_left != -1

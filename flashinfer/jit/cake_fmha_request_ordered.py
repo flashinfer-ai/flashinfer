@@ -97,31 +97,7 @@ def _verified_source(root: Path, value: object, digest: object, label: str) -> P
     return path
 
 
-@functools.cache
-def get_cake_fmha_request_ordered_manifest(
-    num_q_heads: int = 8, num_kv_heads: int = 1
-) -> dict[str, Any]:
-    """Load and authenticate the generated-program route ledger."""
-
-    root = _source_root(num_q_heads, num_kv_heads)
-    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
-    manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
-    payload: Any = json.loads((root / manifest_name).read_text())
-    _require(isinstance(payload, dict), "root")
-    _require(payload.get("schema") == _SCHEMA, "schema")
-    _require(payload.get("target") == "sm_103a", "target")
-    _require(payload.get("shape_count") == 43, "shape_count")
-    _require(payload.get("module_count") == 13, "module_count")
-    expected_contract = dict(
-        _CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
-    )
-    if suffix:
-        expected_contract.update(q_groups_per_kv=2, query_heads_per_work_group=8)
-    _require(payload.get("contract") == expected_contract, "contract")
-    modules = payload.get("modules")
-    routes = payload.get("routes")
-    _require(isinstance(modules, list) and len(modules) == 13, "modules")
-    _require(isinstance(routes, list) and len(routes) == 43, "routes")
+def _verify_modules(root: Path, modules: list[dict[str, Any]]) -> set[str]:
     names: set[str] = set()
     for index, module in enumerate(modules):
         _require(isinstance(module, dict), f"modules[{index}]")
@@ -174,6 +150,35 @@ def get_cake_fmha_request_ordered_manifest(
             module.get("tma_workspace_bytes") == 384,
             f"modules[{index}].tma_workspace_bytes",
         )
+    return names
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_manifest(
+    num_q_heads: int = 8, num_kv_heads: int = 1
+) -> dict[str, Any]:
+    """Load and authenticate the generated-program route ledger."""
+
+    root = _source_root(num_q_heads, num_kv_heads)
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
+    payload: Any = json.loads((root / manifest_name).read_text())
+    _require(isinstance(payload, dict), "root")
+    _require(payload.get("schema") == _SCHEMA, "schema")
+    _require(payload.get("target") == "sm_103a", "target")
+    _require(payload.get("shape_count") == 43, "shape_count")
+    _require(payload.get("module_count") == 13, "module_count")
+    expected_contract = dict(
+        _CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+    )
+    if suffix:
+        expected_contract.update(q_groups_per_kv=2, query_heads_per_work_group=8)
+    _require(payload.get("contract") == expected_contract, "contract")
+    modules = payload.get("modules")
+    routes = payload.get("routes")
+    _require(isinstance(modules, list) and len(modules) == 13, "modules")
+    _require(isinstance(routes, list) and len(routes) == 43, "routes")
+    names = _verify_modules(root, modules)
     route_names: set[str] = set()
     for index, route in enumerate(routes):
         _require(isinstance(route, dict), f"routes[{index}]")
@@ -203,6 +208,58 @@ def get_cake_fmha_request_ordered_manifest(
 
 
 @functools.cache
+def get_cake_fmha_request_ordered_runtime_q_manifest(
+    num_q_heads: int = 8, num_kv_heads: int = 1
+) -> dict[str, Any]:
+    """Authenticate the supplemental bindings whose query length is grid.x."""
+    root = _source_root(num_q_heads, num_kv_heads)
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    stem = "cake_fmha_request_ordered_paged_decode" + suffix + "_runtime_q"
+    payload: Any = json.loads((root / (stem + "_manifest.json")).read_text())
+    _require(isinstance(payload, dict), "root")
+    _require(
+        payload.get("schema") == "flashinfer.cake_fmha_request_ordered_runtime_q.v1",
+        "schema",
+    )
+    _require(payload.get("target") == "sm_103a", "target")
+    _require(payload.get("module_count") == 2, "module_count")
+    _require(payload.get("binding_count") == 2, "binding_count")
+    expected_contract = dict(
+        _CONTRACT,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        q_groups_per_kv=num_q_heads // num_kv_heads // 8,
+        query_heads_per_work_group=8,
+        q_len={
+            "kind": "uniform_positive_integer",
+            "excluding": [1, 6],
+            "value_source": "grid.x",
+        },
+        ordered=True,
+        num_split=1,
+        workspace_parts=1,
+    )
+    _require(payload.get("contract") == expected_contract, "contract")
+    modules = payload.get("modules")
+    bindings = payload.get("bindings")
+    _require(isinstance(modules, list) and len(modules) == 2, "modules")
+    _require(isinstance(bindings, list) and len(bindings) == 2, "bindings")
+    names = _verify_modules(root, modules)
+    _require(all(name.startswith(stem + "_") for name in names), "module prefix")
+    for index, binding in enumerate(bindings):
+        _require(isinstance(binding, dict), f"bindings[{index}]")
+        _require(binding.get("module_name") in names, f"bindings[{index}].module_name")
+        _require(type(binding.get("write_lse")) is bool, f"bindings[{index}].write_lse")
+    _require(
+        {binding["write_lse"] for binding in bindings} == {False, True}, "LSE modes"
+    )
+    _require(
+        {binding["module_name"] for binding in bindings} == names, "binding modules"
+    )
+    return payload
+
+
+@functools.cache
 def get_cake_fmha_request_ordered_module_spec(
     name: str,
 ) -> CakeFmhaRequestOrderedModuleSpec:
@@ -212,7 +269,12 @@ def get_cake_fmha_request_ordered_module_spec(
         else (8, 1)
     )
     root = _source_root(*geometry)
-    manifest = get_cake_fmha_request_ordered_manifest(*geometry)
+    reader = (
+        get_cake_fmha_request_ordered_runtime_q_manifest
+        if "_runtime_q_" in name
+        else get_cake_fmha_request_ordered_manifest
+    )
+    manifest = reader(*geometry)
     matches = [module for module in manifest["modules"] if module["name"] == name]
     if len(matches) != 1:
         raise ValueError(f"unknown request-ordered FMHA module: {name}")

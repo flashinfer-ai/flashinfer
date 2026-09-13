@@ -176,7 +176,7 @@ def test_host_plan_requires_device_order_tensor() -> None:
         )
 
 
-@pytest.mark.parametrize("q_len", (1, 6))
+@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 8, 17, 65))
 @pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), ((8, 1), (32, 2)))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_request_ordered_capture_prepares_actual_producer_q(
@@ -358,6 +358,30 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
     uses_shared_paged_kv_idx: bool,
     q_len: int,
 ) -> None:
+    _check_request_ordered_graph_permutations(uses_shared_paged_kv_idx, q_len, 8, 1)
+
+
+@pytest.mark.parametrize("q_len", (2, 8))
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", (True, False))
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), ((8, 1), (32, 2)))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_request_ordered_runtime_q_graph_permutations(
+    uses_shared_paged_kv_idx: bool,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> None:
+    _check_request_ordered_graph_permutations(
+        uses_shared_paged_kv_idx, q_len, num_q_heads, num_kv_heads
+    )
+
+
+def _check_request_ordered_graph_permutations(
+    uses_shared_paged_kv_idx: bool,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> None:
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("request-ordered Cake FMHA requires SM103")
     if torch.cuda.get_device_properties(0).multi_processor_count != 152:
@@ -369,19 +393,19 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
     num_pages = batch_size * page_slots
     generator = torch.Generator(device=device).manual_seed(4832 + q_len)
     query = torch.randn(
-        (batch_size * q_len, 8, 256),
+        (batch_size * q_len, num_q_heads, 256),
         dtype=torch.bfloat16,
         device=device,
         generator=generator,
     )
     key = torch.randn(
-        (num_pages, 1, 64, 256),
+        (num_pages, num_kv_heads, 64, 256),
         dtype=torch.float32,
         device=device,
         generator=generator,
     ).to(torch.float8_e4m3fn)
     value = torch.randn(
-        (num_pages, 1, 64, 256),
+        (num_pages, num_kv_heads, 64, 256),
         dtype=torch.float32,
         device=device,
         generator=generator,
@@ -433,6 +457,8 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
         seq_lens_host,
         q_len,
         write_lse=True,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
     )
     request_order = torch.arange(batch_size, dtype=torch.int32, device=device)
 
@@ -460,7 +486,9 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
         inverse_order = torch.argsort(physical_order)
         physical_inputs = dict(common)
         physical_inputs.update(
-            query=query.view(batch_size, q_len, 8, 256)[physical_order].flatten(0, 1),
+            query=query.view(batch_size, q_len, num_q_heads, 256)[
+                physical_order
+            ].flatten(0, 1),
             block_tables=block_tables[physical_order],
             seq_lens=seq_lens[physical_order],
         )
@@ -471,12 +499,12 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
             backend="trtllm-gen",
             **physical_inputs,
         )
-        expected_out = reference_out.view(batch_size, q_len, 8, 256)[
+        expected_out = reference_out.view(batch_size, q_len, num_q_heads, 256)[
             inverse_order
         ].flatten(0, 1)
-        expected_lse = reference_lse.view(batch_size, q_len, 8)[inverse_order].flatten(
-            0, 1
-        )
+        expected_lse = reference_lse.view(batch_size, q_len, num_q_heads)[
+            inverse_order
+        ].flatten(0, 1)
         request_order.copy_(physical_order)
         candidate_out.fill_(float("nan"))
         candidate_lse.fill_(float("nan"))
@@ -493,4 +521,50 @@ def test_request_ordered_public_api_graph_replays_device_permutations(
             expected_lse,
             atol=1e-2,
             rtol=1e-2,
+        )
+
+
+@pytest.mark.parametrize("q_len", (2, 8, 17, 257))
+@pytest.mark.parametrize("write_lse", (False, True))
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), ((8, 1), (32, 2)))
+def test_runtime_q_plan_uses_authenticated_generated_binding(
+    q_len: int, write_lse: bool, num_q_heads: int, num_kv_heads: int
+) -> None:
+    from flashinfer.jit.cake_fmha_request_ordered import (
+        get_cake_fmha_request_ordered_module_spec,
+    )
+
+    plan = flashinfer.plan_cake_fmha_request_ordered_paged_decode(
+        (513, 769),
+        q_len,
+        write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    assert "_runtime_q_" in plan.module_name
+    assert plan.grid == (q_len, num_q_heads // 8, 2)
+    assert plan.total_tiles == 2 * q_len * (num_q_heads // 8)
+    assert plan.workspace_parts == 1
+    assert cake_api._is_authenticated_request_ordered_plan(plan)
+    assert not cake_api._is_authenticated_request_ordered_plan(
+        dataclasses.replace(plan, grid=(q_len + 1, num_q_heads // 8, 2))
+    )
+    spec = get_cake_fmha_request_ordered_module_spec(plan.module_name)
+    assert spec.tma_workspace_bytes == 384
+
+
+@pytest.mark.parametrize("q_len", (0, -1, 2.5, True))
+def test_request_order_rejects_invalid_q_before_tensor_processing(q_len) -> None:
+    tensor = torch.empty(1)
+    with pytest.raises(ValueError, match="uniform positive integer q_len_per_req"):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            1,
+            backend="cake",
+            request_order=torch.empty(1, dtype=torch.int32),
+            q_len_per_req=q_len,
         )

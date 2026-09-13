@@ -35,6 +35,7 @@ from .jit.cake_fmha import (
 )
 from .jit.cake_fmha_request_ordered import (
     get_cake_fmha_request_ordered_manifest,
+    get_cake_fmha_request_ordered_runtime_q_manifest,
     load_cake_fmha_request_ordered_module,
 )
 from .utils import get_compute_capability
@@ -81,9 +82,34 @@ def _fallback_cake_fmha_request_ordered_plan(
     num_q_heads: int = 8,
     num_kv_heads: int = 1,
 ) -> CakeFmhaRequestOrderedDecodePlan:
-    if batch_size <= 0 or q_len not in (1, 6):
+    if (
+        batch_size <= 0
+        or not isinstance(q_len, int)
+        or isinstance(q_len, bool)
+        or q_len <= 0
+    ):
         raise ValueError(
-            "request-ordered Cake FMHA requires a positive batch and q_len 1 or 6"
+            "request-ordered Cake FMHA requires a positive batch and integer q_len"
+        )
+    if q_len not in (1, 6):
+        manifest = get_cake_fmha_request_ordered_runtime_q_manifest(
+            num_q_heads, num_kv_heads
+        )
+        binding = next(
+            binding
+            for binding in manifest["bindings"]
+            if binding["write_lse"] is write_lse
+        )
+        return CakeFmhaRequestOrderedDecodePlan(
+            module_name=binding["module_name"],
+            batch_size=batch_size,
+            q_len=q_len,
+            workspace_parts=1,
+            grid=(q_len, num_q_heads // 8, batch_size),
+            total_tiles=batch_size * q_len * (num_q_heads // 8),
+            write_lse=write_lse,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
         )
     route_slug = (
         f"fallback_q{q_len}_ordered_s1_lse" if write_lse else f"fallback_q{q_len}"
@@ -143,12 +169,21 @@ def plan_cake_fmha_request_ordered_paged_decode(
     lengths = tuple(int(value) for value in kv_lens)
     if not lengths or any(value <= 0 for value in lengths):
         raise ValueError("kv_lens must contain one positive length per request")
-    if q_len not in (1, 6):
-        raise ValueError("request-ordered Cake FMHA requires q_len 1 or 6")
+    if not isinstance(q_len, int) or isinstance(q_len, bool) or q_len <= 0:
+        raise ValueError("request-ordered Cake FMHA requires a positive integer q_len")
     batch_size = len(lengths)
     logical_batch = batch_size if real_batch_size is None else int(real_batch_size)
     if not 0 < logical_batch <= batch_size:
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
+
+    if q_len not in (1, 6):
+        return _fallback_cake_fmha_request_ordered_plan(
+            batch_size=batch_size,
+            q_len=q_len,
+            write_lse=write_lse,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+        )
 
     exact = []
     for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
