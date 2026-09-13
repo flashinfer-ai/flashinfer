@@ -1518,9 +1518,12 @@ _NVFP4_SPLIT_KV_BROKEN_ARCHS = ((12, 0), (12, 1))
 
 
 def _nvfp4_kv_requires_disabled_split_kv(
-    kv_data_type: torch.dtype, device: torch.device
+    kv_data_type: torch.dtype,
+    device: torch.device,
+    head_dim_qk: Optional[int] = None,
+    head_dim_vo: Optional[int] = None,
 ) -> bool:
-    """Whether split-KV must be disabled because the KV cache is NVFP4 on an affected arch.
+    """Whether split-KV must be disabled: NVFP4 KV, on an affected arch, on the VO-split plan.
 
     This gate is an *empirical workaround*: with split-KV (flash-decoding)
     enabled, NVFP4 paged KV was observed to produce corrupted outputs whenever
@@ -1545,10 +1548,39 @@ def _nvfp4_kv_requires_disabled_split_kv(
     boundaries, with the gate-on/gate-off difference staying at output-dtype
     rounding scale. FP8 and 16-bit KV caches were never gated and keep split-KV
     everywhere.
+
+    The gate is further scoped to the plan shape the corruption was actually
+    observed on: the asymmetric VO-split plan (``head_dim_qk != head_dim_vo``,
+    i.e. Gemma-4's 512-wide QK against a 256-wide VO slice) or a head wider
+    than 256. Symmetric plans at ``head_dim <= 256`` on SM120/121 were tested
+    clean with split-KV enabled from several directions (vllm-project/vllm
+    #46329): a kernel-level A/B ladder at head_dim 128 (qo 1..9, kv to 262k,
+    fixed and auto split, ragged batches), a dense-reference comparison and a
+    needle battery served from cached prefix at head_dim 256, paired
+    gate-on/gate-off end-to-end runs on both RTX 5090 (sm120) and GB10 (sm121)
+    with byte-identical greedy retrieval to 262k, and a week of production
+    traffic on a build that predates the gate with the planner confirmed to be
+    splitting for every prefix-cache-extend request. On those shapes the gate
+    only costs: speculative-decode verify batches (``qo_len`` 2..9) are planned
+    through this wrapper and, with split-KV off, stream the whole KV from one
+    CTA row, so decode falls off linearly with context (about 9x at 262k on a
+    5090). The VO-split shape has not been re-tested with split-KV on since the
+    original report and stays gated until it is.
+
+    ``head_dim_qk``/``head_dim_vo`` default to ``None`` for callers that only
+    know the dtype and device; that conservative path keeps the arch-level
+    gate unchanged.
     """
     if not _is_nvfp4_kv_dtype(kv_data_type):
         return False
-    return get_compute_capability(device) in _NVFP4_SPLIT_KV_BROKEN_ARCHS
+    if get_compute_capability(device) not in _NVFP4_SPLIT_KV_BROKEN_ARCHS:
+        return False
+    if head_dim_qk is None:
+        # Shape unknown: keep the arch-level gate.
+        return True
+    if head_dim_vo is None:
+        head_dim_vo = head_dim_qk
+    return head_dim_qk != head_dim_vo or head_dim_qk > 256
 
 
 def _build_block_tables_from_paged_kv_indices(
@@ -2730,11 +2762,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type, self.device
+                    kv_data_type, self.device, head_dim_qk, head_dim_vo
                 ):
                     # Empirical workaround: split-KV corrupted NVFP4 KV reads
-                    # when qo_len << kv_len (decode / prefix-cache extend); see
-                    # _nvfp4_kv_requires_disabled_split_kv for details.
+                    # when qo_len << kv_len (decode / prefix-cache extend) on
+                    # the SM120/121 VO-split plan; see
+                    # _nvfp4_kv_requires_disabled_split_kv for details and the
+                    # shapes that are exempt.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
@@ -4263,11 +4297,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
                 if not disable_split_kv and _nvfp4_kv_requires_disabled_split_kv(
-                    kv_data_type, self.device
+                    kv_data_type, self.device, head_dim_qk, head_dim_vo
                 ):
                     # Empirical workaround: split-KV corrupted NVFP4 KV reads
-                    # when qo_len << kv_len (decode / prefix-cache extend); see
-                    # _nvfp4_kv_requires_disabled_split_kv for details.
+                    # when qo_len << kv_len (decode / prefix-cache extend) on
+                    # the SM120/121 VO-split plan; see
+                    # _nvfp4_kv_requires_disabled_split_kv for details and the
+                    # shapes that are exempt.
                     disable_split_kv = True
                 args.append(disable_split_kv)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
