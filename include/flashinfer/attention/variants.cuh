@@ -35,6 +35,7 @@ struct DefaultAttention : AttentionVariantBase {
   uint8_t* custom_mask_ptr;
   uint32_t qo_len, kv_len;
   uint32_t window_left;
+  int32_t window_right;
   float sm_scale_log2;
   float soft_cap_pre_tanh_scale;
 
@@ -62,6 +63,7 @@ struct DefaultAttention : AttentionVariantBase {
       }
     }
     window_left = (params.window_left >= 0) ? params.window_left : kv_len;
+    window_right = params.window_right;
   }
 
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
@@ -87,6 +89,11 @@ struct DefaultAttention : AttentionVariantBase {
     }
     if constexpr (use_sliding_window) {
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
+      if (window_right >= 0) {
+        const int64_t q_abs = static_cast<int64_t>(qo_idx) + static_cast<int64_t>(kv_len) -
+                              static_cast<int64_t>(qo_len);
+        mask &= (static_cast<int64_t>(kv_idx) <= q_abs + static_cast<int64_t>(window_right));
+      }
     }
     return mask;
   })
