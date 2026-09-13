@@ -115,6 +115,7 @@ def test_batch_decode_workspace_size_plans_with_exact_buffers(use_cuda_graph):
 def _run_batch_prefill_workspace_size_plan(
     use_cuda_graph=False,
     fixed_split_size=None,
+    disable_split_kv=False,
 ):
     batch_size = 3
     qo_len = 64
@@ -155,6 +156,8 @@ def _run_batch_prefill_workspace_size_plan(
             "fixed_split_size": fixed_split_size,
             "disable_split_kv": False,
         }
+    elif disable_split_kv:
+        plan_kwargs = {"disable_split_kv": True}
 
     float_workspace_size, int_workspace_size = wrapper.workspace_size(
         qo_indptr,
@@ -197,6 +200,12 @@ def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
 
 def test_batch_prefill_workspace_size_plans_cuda_graph_with_exact_buffers():
     _run_batch_prefill_workspace_size_plan(use_cuda_graph=True)
+
+
+def test_batch_prefill_workspace_size_plans_no_split_cuda_graph_with_exact_buffers():
+    # The unsplit graph plan is the one whose int workspace carries the padding mask;
+    # sizing and materializing must agree on it, or plan() overruns an exact buffer.
+    _run_batch_prefill_workspace_size_plan(use_cuda_graph=True, disable_split_kv=True)
 
 
 def test_batch_decode_workspace_size_rejects_unaligned_workspace_buffer():
