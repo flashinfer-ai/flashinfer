@@ -14,6 +14,8 @@ Usage:
     python bench_moe_deepseek.py --model kimi-k3 --ep 8
     # Kimi K3 compares NVFP4 experiments, not its native MXFP4 checkpoint.
     # TRTLLM BF16 is omitted because its kernels do not support SiTU.
+    # TRTLLM NVFP4 is also omitted with --use-per-token-activation: its SiTU
+    # kernels do not support per-token scaling.
 
     # Throughput benchmark (large batches: 128-4096 tokens)
     python bench_moe_deepseek.py
@@ -183,7 +185,7 @@ def _make_routing(inputs):
     return route
 
 
-def _select_backends(backends):
+def _select_backends(backends, use_per_token_activation=False):
     selected = (
         set(backends)
         if backends is not None
@@ -193,6 +195,13 @@ def _select_backends(backends):
         selected.add("trtllm-bf16")
     if "trtllm-bf16" in selected and CFG.situ_beta is not None:
         raise ValueError("TRTLLM BF16 does not support the Kimi K3 SiTU activation")
+    if CFG.situ_beta is not None and use_per_token_activation:
+        if backends is None:
+            selected.discard("trtllm-nvfp4")
+        elif "trtllm-nvfp4" in selected:
+            raise ValueError(
+                "TRTLLM NVFP4 does not support SiTU with per-token activation scaling"
+            )
     return selected
 
 
@@ -824,6 +833,7 @@ def bench_trtllm(
             and weights without quantization; FP4 activation flags do not
             affect it.
     """
+    _select_backends([f"trtllm-{precision}"], use_per_token_activation)
     from flashinfer.fused_moe import RoutingMethodType
     from flashinfer.tllm_enums import ActivationType
     from flashinfer.fused_moe.da_tuner import (
@@ -854,8 +864,6 @@ def bench_trtllm(
     )
 
     if precision == "bf16":
-        if CFG.situ_beta is not None:
-            raise ValueError("TRTLLM BF16 does not support the Kimi K3 SiTU activation")
         from flashinfer.fused_moe import (
             TrtllmBf16Config,
             trtllm_bf16_moe,
@@ -1172,9 +1180,9 @@ def run_benchmark(
     Returns:
         List of BenchResult objects
     """
-    _select_backends(backends)
-    if profile_backend == "trtllm-bf16" and CFG.situ_beta is not None:
-        raise ValueError("TRTLLM BF16 does not support the Kimi K3 SiTU activation")
+    _select_backends(backends, use_per_token_activation)
+    if profile_backend is not None:
+        _select_backends([profile_backend], use_per_token_activation)
     if tp_config < 1 or BASE_INTERMEDIATE_SIZE % tp_config != 0:
         raise ValueError(
             f"tp_config must be a positive divisor of {BASE_INTERMEDIATE_SIZE}"
@@ -1279,7 +1287,7 @@ def _benchmark_single(
     inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    selected = _select_backends(backends)
+    selected = _select_backends(backends, use_per_token_activation)
     run_cute_dsl_w4a4 = "cutedsl" in selected and profile_backend in (
         None,
         "cute-dsl",
@@ -1806,11 +1814,11 @@ def main():
     if args.profile_backend == "cutlass" and args.use_per_token_activation:
         parser.error("CUTLASS does not consume the per-token activation scale")
     try:
-        _select_backends(backends)
+        selected = _select_backends(backends, args.use_per_token_activation)
+        if args.profile_backend is not None:
+            _select_backends([args.profile_backend], args.use_per_token_activation)
     except ValueError as exc:
         parser.error(str(exc))
-    if args.profile_backend == "trtllm-bf16" and CFG.situ_beta is not None:
-        parser.error("TRTLLM BF16 does not support the Kimi K3 SiTU activation")
     if not is_sm100_family():
         print("ERROR: Requires SM100 family GPU (Blackwell: SM100, SM103)")
         return 1
@@ -1841,9 +1849,20 @@ def main():
     print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
+    backend_names = {
+        "cutedsl": "CuteDSL W4A4 and CuteDSL W4A16",
+        "cutlass": "CUTLASS",
+        "trtllm-nvfp4": "TRTLLM NVFP4",
+        "trtllm-bf16": "TRTLLM BF16",
+    }
     print(
-        "CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4"
-        + (" and TRTLLM BF16" if CFG.situ_beta is None else "")
+        "Backends: "
+        + ", ".join(
+            name
+            for backend, name in backend_names.items()
+            if backend in selected
+            and not (backend == "cutlass" and args.use_per_token_activation)
+        )
     )
     if CFG.situ_beta is not None:
         print(
@@ -1851,6 +1870,10 @@ def main():
             f"linear beta={CFG.situ_linear_beta:g})"
         )
         print("TRTLLM BF16 omitted: its kernels do not support SiTU.")
+        if args.use_per_token_activation:
+            print(
+                "TRTLLM NVFP4 omitted: its SiTU kernels do not support per-token activation scaling."
+            )
         print(
             "Kimi K3 scope: routed latent experts only; NVFP4 experiments, not native MXFP4."
         )
@@ -1878,9 +1901,15 @@ def main():
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
     )
 
-    print(
-        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
-    )
+    trtllm_names = [
+        name
+        for backend, name in backend_names.items()
+        if backend in selected and backend.startswith("trtllm-")
+    ]
+    if trtllm_names:
+        print(
+            f"{' / '.join(trtllm_names)} finalize: native (unaffected by --no-fused-finalize)."
+        )
 
     run_benchmark(
         token_counts=tokens,
