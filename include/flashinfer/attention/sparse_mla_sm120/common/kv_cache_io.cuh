@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "../arch/barrier.cuh"
+#include "../pipeline/staged_pipeline.cuh"
 #include "../arch/cp_async.cuh"
 #include "../model/kv_cache_traits.cuh"
 #include "zero_row.cuh"
@@ -58,12 +58,12 @@
 template <ModelType MT>
 struct KVIOTraits {
   using KV = KVCacheTraits<MT>;
-  // DSV3_2: IO_STRIDE = KV_GMEM_STRIDE = 656 (inline, bulk copy includes scale)
+  // DSV3_2: IO_STRIDE = BYTES_PER_TOKEN = 656 (inline, bulk copy includes scale)
   // DSV4: IO_STRIDE = D_NOPE + D_ROPE*2 = 576 (footer, data portion only)
   // GLM53_NOPE: 528 is the payload/prefetch size; the gmem row advance is the
   // runtime stride_kv_block / PAGE_BLOCK_SIZE, not this constant.
   static constexpr int IO_STRIDE =
-      KV::SCALE_IN_KV_SMEM ? KV::KV_GMEM_STRIDE : (KV::D_NOPE + KV::D_ROPE * sizeof(bf16));
+      KV::SCALE_IN_KV_SMEM ? KV::BYTES_PER_TOKEN : (KV::D_NOPE + KV::D_ROPE * sizeof(bf16));
   static_assert(IO_STRIDE % 16 == 0, "IO stride must be 16B aligned for cp.async.bulk");
 };
 
@@ -90,8 +90,8 @@ __device__ __forceinline__ int mask_idx_past_len(int idx, int pos, int len) {
 // one tile ahead of use so the LDG latency does not sit on the TMA issue chain.
 // TILE_BI <= TILE_IO_THREADS gives each IO thread at most one candidate, so the
 // thread's slot in the smem tile is io_tid.
-template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false, int TILE_BI = BI,
-          int TILE_IO_THREADS = IO_THREADS>
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT, int TILE_BI,
+          int TILE_IO_THREADS>
 __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
                                                     const uint8_t* __restrict__ kv_ptr,
                                                     uint64_t* mbar, int io_tid,
@@ -104,7 +104,7 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
   static_assert(TILE_BI <= TILE_IO_THREADS,
                 "per-thread index staging assumes at most one candidate per IO thread");
 
-  if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, TILE_BI * COPY_BYTES);
+  if (io_tid == 0) flashinfer::sparse_mla_sm120::pipeline::BulkReady::expect(mbar, TILE_BI * COPY_BYTES);
   if (io_tid >= TILE_BI) return;
 
   static_assert(COPY_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
@@ -129,8 +129,8 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
 // on the release handshake. Pure hint: padding indices are skipped, not
 // clamped. Addressing mirrors io_bulk_gather_tile; footer models also warm the
 // scale line, whose synchronous LDG sits on the gather issue path.
-template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false, int TILE_BI = BI,
-          int TILE_IO_THREADS = IO_THREADS>
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT, int TILE_BI,
+          int TILE_IO_THREADS>
 __device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __restrict__ kv_ptr,
                                                     int io_tid, size_t stride_kv_block,
                                                     uint64_t cache_policy = 0) {
@@ -158,7 +158,7 @@ __device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __re
 
 // `idx` is the same per-thread staged value passed to io_bulk_gather_tile, so
 // the footer-scale model reads each index from gmem once per tile, not twice.
-template <ModelType MT, int PAGE_BLOCK_SIZE, int TILE_BI = BI, int TILE_IO_THREADS = IO_THREADS>
+template <ModelType MT, int PAGE_BLOCK_SIZE, int TILE_BI, int TILE_IO_THREADS>
 __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
                                                  const uint8_t* __restrict__ kv_ptr, int io_tid,
                                                  size_t stride_kv_block) {
@@ -170,9 +170,10 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
   constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
   // Only reachable for footer-scale models (the inline ones return above), so
   // the width check is disjoined rather than applied to every instantiation.
-  static_assert(KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t),
-                "the footer gather moves one uint64 per token; a different footer width needs a "
-                "different load");
+  static_assert(
+      KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t) || SCALE_BYTES == sizeof(uint4),
+      "the footer gather moves one wide word per token; a different footer width "
+      "needs a different load");
   static_assert(TILE_BI <= TILE_IO_THREADS,
                 "per-thread index staging assumes at most one candidate per IO thread");
   if (io_tid >= TILE_BI) return;
@@ -187,6 +188,11 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
   const uint8_t* src = kv_ptr + (size_t)(idx / pbs) * stride_kv_block +
                        (size_t)pbs * IO::IO_STRIDE + (size_t)(idx % pbs) * SCALE_BYTES;
   src = valid ? src : sparse_mla_zero_row;
-  *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
-      __ldg(reinterpret_cast<const uint64_t*>(src));
+  if constexpr (SCALE_BYTES == sizeof(uint4)) {
+    *reinterpret_cast<uint4*>(scale_dst + io_tid * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint4*>(src));
+  } else {
+    *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint64_t*>(src));
+  }
 }

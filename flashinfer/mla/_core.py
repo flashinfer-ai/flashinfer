@@ -16,7 +16,6 @@ limitations under the License.
 
 from dataclasses import dataclass
 import functools
-import math
 import os
 from typing import List, Literal, Optional, Sequence, Tuple, Union, cast
 
@@ -156,6 +155,27 @@ def _normalize_optional_mla_sink(
     return sinks
 
 
+def _sparse_mla_reshape(
+    tensor: torch.Tensor, shape: Tuple[int, ...], name: str, *, contiguous: bool = False
+) -> torch.Tensor:
+    if tensor.is_cuda and torch.cuda.is_current_stream_capturing():
+        try:
+            result = tensor.view(shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"{name} normalization during CUDA graph capture requires a zero-copy view; "
+                "materialize contiguous input buffers eagerly before warmup and capture"
+            ) from error
+        if contiguous and not result.is_contiguous():
+            raise ValueError(
+                f"{name} normalization during CUDA graph capture requires a contiguous view; "
+                "materialize contiguous input buffers eagerly before warmup and capture"
+            )
+        return result
+    result = tensor.reshape(shape)
+    return result.contiguous() if contiguous else result
+
+
 def _normalize_sparse_mla_indices_and_lens(
     *,
     indices: torch.Tensor,
@@ -176,7 +196,9 @@ def _normalize_sparse_mla_indices_and_lens(
             raise ValueError(
                 f"Expected {name}.shape == {expected_shape}, got {tuple(indices.shape)}"
             )
-        indices = indices.reshape(batch_size * q_len_per_request, sparse_topk)
+        indices = _sparse_mla_reshape(
+            indices, (batch_size * q_len_per_request, sparse_topk), name
+        )
     elif indices.ndim == 2:
         sparse_topk = int(indices.shape[-1])
         expected_shape = (batch_size * q_len_per_request, sparse_topk)
@@ -207,7 +229,7 @@ def _normalize_sparse_mla_indices_and_lens(
                 f"Expected {name}_lens.shape == {expected_lens_shape}, got "
                 f"{tuple(lens.shape)}"
             )
-        lens = lens.reshape(-1)
+        lens = _sparse_mla_reshape(lens, (-1,), f"{name}_lens")
     elif lens.ndim == 1:
         expected_lens_shape = (batch_size * q_len_per_request,)
         if tuple(lens.shape) != expected_lens_shape:
@@ -276,85 +298,6 @@ def _normalize_sparse_mla_segments(
     return normalized
 
 
-def _workspace_tensor_view(
-    workspace_buffer: torch.Tensor,
-    *,
-    byte_offset: int,
-    shape: Tuple[int, ...],
-    dtype: torch.dtype,
-) -> Tuple[Optional[torch.Tensor], int]:
-    if not workspace_buffer.is_contiguous():
-        return None, byte_offset
-    # Keep every scratch view 16-byte aligned for vectorized kernel accesses.
-    # dtype.itemsize avoids creating a tensor on the process-wide default
-    # device while partitioning caller-owned storage during graph capture.
-    elem_size = dtype.itemsize
-    alignment = math.lcm(16, elem_size)
-    address = workspace_buffer.data_ptr() + byte_offset
-    byte_offset += (-address) % alignment
-    numel = math.prod(shape)
-    byte_end = byte_offset + numel * elem_size
-    workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
-    if byte_end > workspace_bytes:
-        return None, byte_offset
-    flat = workspace_buffer.view(torch.uint8)
-    view = flat[byte_offset:byte_end].view(dtype).view(shape)
-    return view, byte_end
-
-
-def _sparse_mla_decode_workspace(
-    workspace_buffer: torch.Tensor,
-    *,
-    num_tokens: int,
-    num_heads: int,
-    d_v: int,
-    topk: int,
-    extra_topk: int,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    if num_tokens > 64:
-        return None, None
-    # The runtime-head-count decode kernels HPB-align the scratch head dim;
-    # only the dedicated num_heads=8 instantiation strides it by the true H.
-    from ._sparse_mla_sm120_plan import _decode_scratch_heads
-
-    scratch_heads = _decode_scratch_heads(num_heads)
-    split_tile = 64
-    num_splits = (topk + split_tile - 1) // split_tile + (
-        extra_topk + split_tile - 1
-    ) // split_tile
-    mid_out, offset = _workspace_tensor_view(
-        workspace_buffer,
-        byte_offset=0,
-        shape=(num_tokens, scratch_heads, num_splits, d_v),
-        dtype=torch.bfloat16,
-    )
-    if mid_out is None:
-        return None, None
-    mid_lse, _ = _workspace_tensor_view(
-        workspace_buffer,
-        byte_offset=offset,
-        shape=(num_tokens, scratch_heads, num_splits),
-        dtype=torch.float32,
-    )
-    if mid_lse is None:
-        return None, None
-    return mid_out, mid_lse
-
-
-_NVFP4_SPARSE_MLA_SPLIT_TILE = 64
-
-
-def _nvfp4_sparse_mla_page_size(cache: torch.Tensor) -> int:
-    """Return the paged-token dimension after public-layout normalization."""
-    if cache.ndim == 3:
-        return int(cache.shape[1])
-    if cache.ndim == 4 and cache.shape[1] == 1:
-        return int(cache.shape[2])
-    if cache.ndim == 4 and cache.shape[2] == 1:
-        return int(cache.shape[1])
-    raise ValueError(f"unsupported NVFP4 sparse MLA cache shape {tuple(cache.shape)}")
-
-
 def _nvfp4_sparse_mla_workspace(
     workspace_buffer: torch.Tensor,
     *,
@@ -369,17 +312,15 @@ def _nvfp4_sparse_mla_workspace(
     Optional[torch.Tensor],
     torch.Tensor,
 ]:
-    """Partition caller-owned scratch for allocation-free NVFP4 sparse MLA."""
-    num_splits = (
-        topk + _NVFP4_SPARSE_MLA_SPLIT_TILE - 1
-    ) // _NVFP4_SPARSE_MLA_SPLIT_TILE + (
-        extra_topk + _NVFP4_SPARSE_MLA_SPLIT_TILE - 1
-    ) // _NVFP4_SPARSE_MLA_SPLIT_TILE
+    """Compatibility partitioner; prepared execution owns production scratch.
 
+    Legacy token/capacity preconditions run before loading a compiled module.
+    CPB=1 preserves the legacy allocated-split shape; successful partitioning
+    uses dimensions and dtypes projected by the compiled plan.
+    """
+    num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
     workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
     if use_prefill:
-        # Streaming prefill constructs selected-V tiles in CTA-local shared
-        # memory and only needs a final-LSE scratch row.
         bytes_per_token = num_heads * 4
     else:
         bytes_per_token = num_heads * num_splits * (512 * 2 + 4)
@@ -399,138 +340,51 @@ def _nvfp4_sparse_mla_workspace(
             f"{workspace_bytes}"
         )
 
-    offset = 0
-    mid_out: Optional[torch.Tensor] = None
-    mid_lse: Optional[torch.Tensor] = None
-    if not use_prefill:
-        mid_out, offset = _workspace_tensor_view(
-            workspace_buffer,
-            byte_offset=offset,
-            shape=(max_chunk_tokens, num_heads, num_splits, 512),
-            dtype=torch.bfloat16,
-        )
-        mid_lse, offset = _workspace_tensor_view(
-            workspace_buffer,
-            byte_offset=offset,
-            shape=(max_chunk_tokens, num_heads, num_splits),
-            dtype=torch.float32,
-        )
-        if mid_out is None or mid_lse is None:
-            raise ValueError("NVFP4 sparse MLA decode workspace partition failed")
+    from ._sparse_mla_sm120_execution import dsv4_nvfp4_format_info, resolve_dsv4_nvfp4
+    from ._sparse_mla_sm120_prepared import device_caps, _workspace_tensor_view
 
-    scratch_lse, _ = _workspace_tensor_view(
-        workspace_buffer,
-        byte_offset=offset,
-        shape=(max_chunk_tokens, num_heads),
-        dtype=torch.float32,
-    )
-    if scratch_lse is None:
-        raise ValueError("NVFP4 sparse MLA LSE workspace partition failed")
-    return max_chunk_tokens, mid_out, mid_lse, scratch_lse
-
-
-def _run_nvfp4_sparse_mla_sm120(
-    *,
-    query: torch.Tensor,
-    kv_cache: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    primary_segment: _NormalizedSparseMLASegment,
-    extra_segment: Optional[_NormalizedSparseMLASegment],
-    output: torch.Tensor,
-    output_lse: Optional[torch.Tensor],
-    sm_scale: float,
-    attn_sink: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Run the NVFP4 implementation behind the shared sparse-MLA facade."""
-    if query.dtype != torch.bfloat16 or not query.is_contiguous():
-        raise ValueError("NVFP4 sparse MLA query must be contiguous BF16")
-    num_tokens, num_heads, head_dim = query.shape
-    if head_dim != 512:
-        raise ValueError(f"NVFP4 sparse MLA requires head dim 512, got {head_dim}")
-    if num_heads not in (16, 32, 64, 128):
-        raise ValueError(
-            f"NVFP4 sparse MLA supports 16, 32, 64, or 128 query heads, got {num_heads}"
-        )
-    topk = primary_segment.indices.shape[1]
-    if topk not in (128, 512):
-        raise ValueError(
-            f"NVFP4 sparse MLA supports primary top-k 128 or 512, got {topk}"
-        )
-    extra_topk = extra_segment.indices.shape[1] if extra_segment is not None else 0
-    from ._sparse_mla_nvfp4_sm120_plan import (
-        NVFP4KernelVariant,
-        plan_nvfp4_sparse_mla_sm120,
-    )
-
-    planned = plan_nvfp4_sparse_mla_sm120(
-        num_tokens,
-        num_heads,
-        topk,
-        _nvfp4_sparse_mla_page_size(kv_cache),
-        query.device,
-        extra_topk=extra_topk,
-        extra_page_size=(
-            _nvfp4_sparse_mla_page_size(extra_segment.kv_cache)
-            if extra_segment is not None and extra_segment.kv_cache is not None
-            else 0
-        ),
-        has_topk_length=primary_segment.lengths is not None,
-        has_extra_topk_length=(
-            extra_segment is not None and extra_segment.lengths is not None
-        ),
-        has_attn_sink=attn_sink is not None,
-    )
-    if planned is None:
-        raise ValueError(
-            "no NVFP4 sparse MLA prefill or decode kernel serves "
-            f"T={num_tokens}, H={num_heads}, topk={topk}, "
-            f"extra_topk={extra_topk}"
-        )
-    use_prefill = planned.variant is NVFP4KernelVariant.PREFILL_STREAMING
-    max_chunk_tokens, mid_out, mid_lse, scratch_lse = _nvfp4_sparse_mla_workspace(
-        workspace_buffer,
-        num_tokens=num_tokens,
-        num_heads=num_heads,
+    info = dsv4_nvfp4_format_info()
+    page = info["page_size"]
+    stride = page * info["bytes_per_token"]
+    sm_count, shared = device_caps(workspace_buffer.device)
+    plan = resolve_dsv4_nvfp4(
+        tokens=num_tokens,
+        heads=num_heads,
         topk=topk,
         extra_topk=extra_topk,
-        use_prefill=use_prefill,
+        page_size=page,
+        extra_page_size=page if extra_topk else 0,
+        page_stride_bytes=stride,
+        extra_page_stride_bytes=stride if extra_topk else 0,
+        cpb=1,
+        sm_count=sm_count,
+        max_shared_bytes=shared,
+        prefill=use_prefill,
     )
-    if max_chunk_tokens != num_tokens:
-        # Kept as an internal invariant even though the workspace helper
-        # currently rejects partial batches. It prevents token slicing from
-        # being reintroduced silently in this one-launch path.
-        raise RuntimeError(
-            "NVFP4 sparse MLA workspace unexpectedly truncated the batch"
+    offset = 0
+    views = []
+    for shape, dtype, size, alignment in plan.workspace():
+        if not size:
+            views.append(None)
+            continue
+        view, offset = _workspace_tensor_view(
+            workspace_buffer,
+            byte_offset=offset,
+            shape=tuple(shape),
+            dtype=getattr(torch, str(dtype)),
+            alignment=alignment,
         )
-
-    # The shared public wrapper delegates to this same allocation-free op.
-    # This facade has already planned the phase in order to partition its
-    # caller-owned byte workspace, so pass that result through instead of
-    # constructing a wrapper and planning the call a second time.
-    from ._sparse_mla_nvfp4_sm120 import (
-        _sparse_mla_nvfp4_sm120_paged_attention,
-    )
-
-    _sparse_mla_nvfp4_sm120_paged_attention(
-        query,
-        kv_cache,
-        primary_segment.indices,
-        output,
-        output_lse if output_lse is not None else scratch_lse,
-        sm_scale,
-        topk_length=primary_segment.lengths,
-        attn_sink=attn_sink,
-        extra_kv_cache=(extra_segment.kv_cache if extra_segment is not None else None),
-        extra_indices=(extra_segment.indices if extra_segment is not None else None),
-        extra_topk_length=(
-            extra_segment.lengths if extra_segment is not None else None
-        ),
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        use_prefill=use_prefill,
-        chunks_per_block_override=planned.cpb,
-    )
-    return output_lse
+        if view is None:
+            raise ValueError("NVFP4 sparse MLA requires workspace for all query tokens")
+        views.append(view)
+    mid_out, mid_lse, scratch_lse = views
+    if mid_out is not None:
+        mid_out = mid_out.view(num_tokens, num_heads, -1, info["value_dim"])
+    if mid_lse is not None:
+        mid_lse = mid_lse.view(num_tokens, num_heads, -1)
+    if scratch_lse is None:
+        raise ValueError("NVFP4 sparse MLA LSE workspace partition failed")
+    return num_tokens, mid_out, mid_lse, scratch_lse
 
 
 def _trtllm_batch_decode_sparse_mla_sm120(
@@ -544,7 +398,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     lse: Optional[torch.Tensor],
     return_lse: bool,
     kv_scale_format: str,
-    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if not is_sm12x_supported(query.device):
         raise ValueError(
@@ -580,7 +434,9 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     primary_segment = segments[0]
     extra_segment = segments[1] if len(segments) > 1 else None
 
-    query_flat = query.reshape(batch_size * q_len_per_request, num_heads, head_dim)
+    query_flat = _sparse_mla_reshape(
+        query, (batch_size * q_len_per_request, num_heads, head_dim), "query"
+    )
     expected_out_shape = (batch_size, q_len_per_request, num_heads, 512)
     if out is None:
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
@@ -625,63 +481,28 @@ def _trtllm_batch_decode_sparse_mla_sm120(
             )
         return out
 
-    if kv_cache_format == "nvfp4":
-        if return_lse and out_lse_arg is None:
-            out_lse_arg = torch.empty(
-                flat_lse_shape, dtype=torch.float32, device=query.device
-            )
-        _run_nvfp4_sparse_mla_sm120(
-            query=query_flat,
-            kv_cache=kv_cache,
-            workspace_buffer=workspace_buffer,
-            primary_segment=primary_segment,
-            extra_segment=extra_segment,
-            output=out_flat,
-            output_lse=out_lse_arg,
-            sm_scale=float(sm_scale),
-            attn_sink=_normalize_optional_mla_sink(sinks, "backend='sparse'"),
+    from ._sparse_mla_sm120_prepared import functional_run
+
+    if return_lse and out_lse_arg is None:
+        out_lse_arg = torch.empty(
+            flat_lse_shape, dtype=torch.float32, device=query.device
         )
-        if return_lse:
-            return out, user_lse if user_lse is not None else out_lse_arg
-        return out
-    if kv_cache_format != "fp8":
-        raise ValueError(
-            f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
-        )
-
-    from ._sparse_mla_sm120 import SparseMLASm120Wrapper
-
-    runner = SparseMLASm120Wrapper(
-        max_num_tokens=query_flat.shape[0],
-        max_num_heads=num_heads,
-        kv_scale_format=kv_scale_format,
-        device=query.device,
-    )
-    extra_topk = extra_segment.indices.shape[-1] if extra_segment is not None else 0
-    mid_out, mid_lse = _sparse_mla_decode_workspace(
-        workspace_buffer,
-        num_tokens=query_flat.shape[0],
-        num_heads=num_heads,
-        d_v=512,
-        topk=primary_segment.indices.shape[-1],
-        extra_topk=extra_topk,
-    )
-
-    out_lse = runner.run(
+    out_lse = functional_run(
         query_flat,
         kv_cache,
         primary_segment.indices,
         out_flat,
+        workspace_buffer,
         float(sm_scale),
-        topk_length=primary_segment.lengths,
-        attn_sink=_normalize_optional_mla_sink(sinks, "backend='sparse'"),
-        extra_kv_cache=extra_segment.kv_cache if extra_segment is not None else None,
+        lengths=primary_segment.lengths,
+        sink=_normalize_optional_mla_sink(sinks, "backend='sparse'"),
+        extra=extra_segment.kv_cache if extra_segment is not None else None,
         extra_indices=extra_segment.indices if extra_segment is not None else None,
-        extra_topk_length=extra_segment.lengths if extra_segment is not None else None,
-        out_lse=out_lse_arg,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        return_lse=return_lse,
+        extra_lengths=extra_segment.lengths if extra_segment is not None else None,
+        lse=out_lse_arg,
+        kv_scale_format=kv_scale_format,
+        is_dsv4_nvfp4=kv_cache_format == "nvfp4",
+        extra_fp4=kv_cache_format == "fp8_dsv41_fp4_ca",
     )
 
     if return_lse:
@@ -697,13 +518,12 @@ def _check_sm120_sparse_v32_kv_cache(
             "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
             f"got {kv_cache.dtype}"
         )
-    # Inline-scale caches may pad rows beyond the model's payload. GLM NoPE
-    # stores 512 FP8 values and four FP32 scales (528B); v32/GLM_NSA also
-    # stores 128B of RoPE. The binding validates the actual row stride.
+    # v32/GLM_NSA rows are exactly 656B. GLM-5.3 NoPE has a 528B payload and
+    # the kernels take the row advance as a runtime stride, so padded rows
+    # (e.g. a legacy 656B vLLM pool) are accepted as long as the row starts
+    # with the 528B payload.
     min_row_bytes = 528 if glm53_nope else 656
-    layout_desc = (
-        f">={min_row_bytes} ({min_row_bytes}B payload, 16B-aligned padded rows allowed)"
-    )
+    layout_desc = ">=528 (528B payload, padded rows allowed)" if glm53_nope else "656"
     if kv_cache.ndim == 3:
         if kv_cache.size(-1) < min_row_bytes:
             raise ValueError(
@@ -740,9 +560,13 @@ def _normalize_sm120_sparse_v32_topk_length(
         batch_size,
         q_len_per_request,
     ):
-        return seq_lens.reshape(flat_tokens).contiguous()
+        return _sparse_mla_reshape(
+            seq_lens, (flat_tokens,), "seq_lens", contiguous=True
+        )
     if seq_lens.ndim == 1 and seq_lens.numel() == flat_tokens:
-        return seq_lens.contiguous()
+        return _sparse_mla_reshape(
+            seq_lens, (flat_tokens,), "seq_lens", contiguous=True
+        )
     if seq_lens.ndim == 1 and seq_lens.numel() == batch_size:
         return None
     raise ValueError(
@@ -1386,7 +1210,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
     bmm2_scale: float,
     sinks: Optional[torch.Tensor],
     kv_layout: Literal["HND", "NHD"],
-    kv_cache_format: Literal["fp8", "nvfp4"],
+    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"],
 ) -> torch.Tensor:
     if bmm2_scale != 1.0:
         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
@@ -1409,6 +1233,18 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
         raise ValueError("backend='sparse' requires swa_topk_lens")
     if kv_cache_format == "nvfp4" and num_heads == 8:
         raise ValueError("NVFP4 sparse MLA does not yet support 8 query heads")
+
+    # Packed FP8 row width per cache format: DSV4 is 584B (448B FP8 + 128B
+    # BF16 rope + 8B UE8M0 footer); DSV4.1 is 528B (512B all-FP8 K + 16B
+    # 32-wide-group UE8M0 footer). The mixed "fp8_dsv41_fp4_ca" form keeps the
+    # 528B main (SWA) cache and carries the compressed cache as 288B V41_FP4
+    # rows (256B E2M1 + 32B E4M3-G16 scales).
+    packed_row_bytes = (
+        528 if kv_cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca") else 584
+    )
+    packed_row_bytes_extra = (
+        288 if kv_cache_format == "fp8_dsv41_fp4_ca" else packed_row_bytes
+    )
 
     swa_kv_cache = _check_sm120_dsv4_kv_cache_layout(
         swa_kv_cache, kv_layout, "swa_kv_cache"
@@ -1433,10 +1269,10 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             )
     else:
         if swa_kv_cache.dtype == torch.uint8:
-            if swa_kv_cache.size(-1) != 584:
+            if swa_kv_cache.size(-1) != packed_row_bytes:
                 raise ValueError(
-                    "Expected packed SM120 DSV4 swa_kv_cache head dim 584, got "
-                    f"{swa_kv_cache.size(-1)}"
+                    f"Expected packed SM120 {kv_cache_format} swa_kv_cache head dim "
+                    f"{packed_row_bytes}, got {swa_kv_cache.size(-1)}"
                 )
         elif swa_kv_cache.dtype != query.dtype:
             raise ValueError(
@@ -1493,10 +1329,11 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
                 )
         else:
             if compressed_kv_cache.dtype == torch.uint8:
-                if compressed_kv_cache.size(-1) != 584:
+                if compressed_kv_cache.size(-1) != packed_row_bytes_extra:
                     raise ValueError(
-                        "Expected packed SM120 DSV4 compressed_kv_cache head dim "
-                        f"584, got {compressed_kv_cache.size(-1)}"
+                        f"Expected packed SM120 {kv_cache_format} compressed_kv_cache "
+                        f"head dim {packed_row_bytes_extra}, got "
+                        f"{compressed_kv_cache.size(-1)}"
                     )
             elif compressed_kv_cache.dtype != query.dtype:
                 raise ValueError(
@@ -1528,7 +1365,14 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
             sinks=sinks,
             lse=None,
             return_lse=False,
-            kv_scale_format="auto",
+            # fp8_dsv41 (and the mixed fp4-ca form) selects the DSV4_1 model
+            # type (32-wide UE8M0 groups) in the SM120 runner; 'fp8' stays on
+            # the DSV4 default.
+            kv_scale_format=(
+                "ue8m0_g32"
+                if kv_cache_format in ("fp8_dsv41", "fp8_dsv41_fp4_ca")
+                else "auto"
+            ),
             kv_cache_format=kv_cache_format,
         ),
     )
@@ -1869,7 +1713,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None,
     dsv4_output_scale: Optional[torch.Tensor] = None,
     *,
-    kv_cache_format: Literal["fp8", "nvfp4"] = "fp8",
+    kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode DeepSeek V4 sparse MLA.
 
@@ -1888,8 +1732,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     length for the SWA validity window.
 
     On SM120/SM121, this calls the packed sparse backend. ``swa_kv_cache`` is
-    the required packed uint8 SWA pool: 584 bytes per token for FP8 or 384
-    bytes per token for group-16 NVFP4, selected by ``kv_cache_format``.
+    the required packed uint8 SWA pool: 584 bytes per token for FP8, 528 for
+    FP8 DSv4.1 (``kv_cache_format="fp8_dsv41"``), or 384 bytes per token for
+    group-16 NVFP4, selected by ``kv_cache_format``.
     ``sparse_indices`` and ``swa_topk_lens`` describe the active SWA segment.
     To add a compressed segment, pass ``compressed_kv_cache`` as another pool
     in the same format and pass ``extra_sparse_indices`` with
@@ -1916,7 +1761,13 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     workspace_buffer : torch.Tensor
         Byte workspace used by TRTLLM-GEN or HCA split-K reduction. The
         TRTLLM-GEN multi-CTA KV counters are managed in a separate internal
-        buffer.
+        buffer. SM120 partitions this buffer into the resolved plan's partial
+        output, split LSE and final LSE. Eager FP8 may allocate temporary scratch
+        when capacity is insufficient; NVFP4 and CUDA graph capture reject
+        insufficient capacity. Warm the metadata shape eagerly before capture.
+        This scratch rule is separate from the documented output allocation
+        when ``out`` is omitted; provide ``out`` to avoid that allocation.
+        A changed tuning profile requires eager warmup and recapture.
     sparse_indices : Optional[torch.Tensor]
         TRTLLM-GEN combined sparse table, or the SM120 sparse SWA segment.
         Pass ``None`` for the explicit ``backend="cute-dsl"`` metadata path.
@@ -2055,18 +1906,33 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``[sum_q, 16, 4096]`` and group-major strides
         ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
         layout described above.
-    kv_cache_format : {"fp8", "nvfp4"}
+    kv_cache_format : {"fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"}
         SM120/SM121 sparse-cache storage format. ``"fp8"`` preserves the
-        existing 584-byte DSv4 cache ABI. ``"nvfp4"`` selects the 384-byte
-        group-16 NVFP4 cache ABI and its native prefill/decode kernels.
-        NVFP4 currently supports 16/32/64/128 heads, primary top-k 128 or 512,
-        primary page size 64, and optional extra-cache page size 2 or 64.
+        existing 584-byte DSv4 cache ABI. ``"fp8_dsv41"`` selects the
+        528-byte DeepSeek-V4.1 ABI (all-FP8 512-wide K with a 16-byte
+        32-wide-group UE8M0 footer, no BF16 rope segment). ``"nvfp4"`` selects
+        the DSV4 384-byte group-16 NVFP4 cache ABI and its prefill/decode
+        kernels. NVFP4 currently supports 16/32/64/128 heads, primary top-k
+        128 or 512, primary page size 64, and optional extra-cache page size 2
+        or 64. ``"fp8_dsv41_fp4_ca"`` is the mixed DeepSeek-V4.1 form: the main
+        (SWA) cache keeps the 528-byte FP8 ABI while the compressed cache holds
+        288-byte V41_FP4 rows (256B E2M1 + 32B E4M3-G16 scales), upconverted to
+        FP8 at gather time by the SM120 kernels. Both V4.1 forms support
+        dual-cache prefill for 8/16/32/64 heads. V4.1 uses independent positive
+        runtime page sizes for main and extra caches, including 256/64 and
+        61/53 layouts; page strides may include padding.
+        FP4 upconversion is lossy relative to direct cache dequantization.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
-    if kv_cache_format not in ("fp8", "nvfp4"):
+    if kv_cache_format not in ("fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"):
         raise ValueError(
-            f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
+            "kv_cache_format must be 'fp8', 'fp8_dsv41', 'fp8_dsv41_fp4_ca', "
+            f"or 'nvfp4', got {kv_cache_format!r}"
         )
+    if kv_cache_format == "fp8_dsv41" and backend != "sparse":
+        raise ValueError("kv_cache_format='fp8_dsv41' requires backend='sparse'")
+    if kv_cache_format == "fp8_dsv41_fp4_ca" and backend != "sparse":
+        raise ValueError("kv_cache_format='fp8_dsv41_fp4_ca' requires backend='sparse'")
     if kv_cache_format == "nvfp4" and backend != "sparse":
         raise ValueError("kv_cache_format='nvfp4' requires backend='sparse'")
 
