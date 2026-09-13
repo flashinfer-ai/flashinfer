@@ -1411,11 +1411,15 @@ class TestCuteDslMoeW4A16:
             ),
         ],
     )
+    @pytest.mark.parametrize("top_k", [2, 3])
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        top_k: int,
+        use_fused_finalize: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
@@ -1423,7 +1427,7 @@ class TestCuteDslMoeW4A16:
         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
         num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
-        num_experts, top_k = 8, 2
+        num_experts = 8
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1432,7 +1436,7 @@ class TestCuteDslMoeW4A16:
             num_local_experts=num_experts,
             top_k=top_k,
         )
-        # Give two experts one full route tile and one boundary tile each.
+        # Give each selected expert one full route tile and one boundary tile.
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
@@ -1456,7 +1460,7 @@ class TestCuteDslMoeW4A16:
             moe_output=torch.empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
             ),
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,
             tactic=tactic,

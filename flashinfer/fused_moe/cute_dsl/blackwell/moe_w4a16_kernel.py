@@ -570,7 +570,7 @@ class Sm100W4A16GroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         num_tokens: cutlass.Int64,
-        top_k: cutlass.Int64,
+        top_k: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
