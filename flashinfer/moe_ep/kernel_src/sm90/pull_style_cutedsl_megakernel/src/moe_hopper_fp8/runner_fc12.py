@@ -216,6 +216,13 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             or self.fc2_weight_block_scale is None
         ):
             raise RuntimeError("blockwise generate_inputs did not create block scales.")
+        # Activation scales are TMA-loaded: each FP32 row needs a 16-byte stride.
+        scale = self.fc1_activation_block_scale
+        if scale.stride(0) * scale.element_size() % 16:
+            cols = scale.shape[1]
+            storage = scale.new_zeros((scale.shape[0], (cols + 3) // 4 * 4))
+            storage[:, :cols].copy_(scale)
+            self.fc1_activation_block_scale = storage[:, :cols]
         self.activation_sf = self.fc1_activation_block_scale
         self.fc1_weight_sf = self.fc1_weight_block_scale
         self.fc2_weight_sf = self.fc2_weight_block_scale
@@ -747,7 +754,9 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
 
         fc1_output_byte_count = data_total_rows * intermediate_downproj
         fc1_output_sf_cols = intermediate_downproj // Fp8Fc2ActivationScaleK
-        fc1_output_sf_byte_count = data_total_rows * fc1_output_sf_cols * 4
+        # TMA requires a 16-byte row stride, including a single FC2 K tile.
+        fc1_output_sf_row_stride = (fc1_output_sf_cols + 3) // 4 * 4
+        fc1_output_sf_byte_count = data_total_rows * fc1_output_sf_row_stride * 4
         counter_slots_upper = (
             (data_total_rows + counter_token_tile - 1) // counter_token_tile
             + experts
@@ -769,7 +778,7 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             ws[offset : offset + fc1_output_sf_byte_count]
             .view(torch.uint8)
             .view(torch.float32)
-            .reshape(data_total_rows, fc1_output_sf_cols)
+            .reshape(data_total_rows, fc1_output_sf_row_stride)[:, :fc1_output_sf_cols]
         )
         offset += fc1_output_sf_byte_count
 
@@ -830,7 +839,6 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             kq = self._ws_fc1_output_torch[doff[e] : doff[e] + v_e]
             if self.fp8_scale_mode == "blockwise":
                 ref_sf = self._ref_fc1_raw_sf_per_expert[e]
-                ref_raw = self._ref_fc1_raw_fp32_per_expert[e]
                 if ref_sf is None:
                     continue
                 ksf = self._ws_fc1_output_sf_torch[doff[e] : doff[e] + v_e]
@@ -839,14 +847,14 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
                     ksf,
                     block_k=Fp8Fc2ActivationScaleK,
                 )
-                if ref_raw is None:
-                    ref_fp32 = dequantize_fp8_per_token_block(
-                        ref_q,
-                        ref_sf,
-                        block_k=Fp8Fc2ActivationScaleK,
-                    )
-                else:
-                    ref_fp32 = ref_raw
+                # Compare the same quantized hand-off on both sides. Comparing
+                # to pre-quantization SwiGLU also rejects a correct reference's
+                # normal E4M3 rounding error (up to about 6%).
+                ref_fp32 = dequantize_fp8_per_token_block(
+                    ref_q,
+                    ref_sf,
+                    block_k=Fp8Fc2ActivationScaleK,
+                )
             else:
                 fc2_activation_scale = self.fc2_activation_dequant_scale[0]
                 kfp32 = kq.to(torch.float32) * fc2_activation_scale

@@ -9,7 +9,7 @@
 #   * Non-swap uses M=64 and N=128/256, selected with
 #     FP8_NON_SWAP_M/N (defaults 64/128).
 #   * Swap-AB uses M=128/256, K=128; FP8_SWAP_AB_M selects M (default 256)
-#     and FP8_SWAP_AB_N selects token N from 16/32/64/128 (default 32).
+#     and FP8_SWAP_AB_N selects token N from 8/16/32/64/128 (default 32).
 #   * hidden must be divisible by 256 (fc2 N tile)
 #   * intermediate must be divisible by 128 (fc2 K tile / fc1 N tile / 2)
 #   * e5m2 element format is currently broken (fc1 epilogue quant path raises
@@ -152,10 +152,10 @@ if [ "$SWAP_AB" -eq 1 ]; then
     esac
     FP8_SWAP_AB_N="${FP8_SWAP_AB_N:-32}"
     case "$FP8_SWAP_AB_N" in
-        16|32|64|128)
+        8|16|32|64|128)
             ;;
         *)
-            echo "ERROR: FP8_SWAP_AB_N must be one of 16,32,64,128" >&2
+            echo "ERROR: FP8_SWAP_AB_N must be one of 8,16,32,64,128" >&2
             exit 2
             ;;
     esac

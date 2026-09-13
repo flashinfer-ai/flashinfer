@@ -8,7 +8,7 @@
 # with FP8_NON_SWAP_M/N (defaults 64/128).
 # Swap-AB uses M=128/256, K=128 and selects M/N with
 # FP8_SWAP_AB_M=128/256 (default 256) and
-# FP8_SWAP_AB_N=16/32/64/128 (default 32).
+# FP8_SWAP_AB_N=8/16/32/64/128 (default 32).
 #
 # Usage:
 #   bash <abs path>/run_functional_tests.sh --scale-mode per-tensor
@@ -140,10 +140,10 @@ if [ "$SWAP_AB" -eq 1 ]; then
     esac
     FP8_SWAP_AB_N="${FP8_SWAP_AB_N:-32}"
     case "$FP8_SWAP_AB_N" in
-        16|32|64|128)
+        8|16|32|64|128)
             ;;
         *)
-            echo "ERROR: FP8_SWAP_AB_N must be one of 16,32,64,128" >&2
+            echo "ERROR: FP8_SWAP_AB_N must be one of 8,16,32,64,128" >&2
             exit 2
             ;;
     esac
@@ -248,6 +248,8 @@ declare -a TILE_SHAPE_CASES=(
     "T08_swapab_m256_n32  | 1 | 256 | 32"
     "T09_swapab_m256_n64  | 1 | 256 | 64"
     "T10_swapab_m256_n128 | 1 | 256 | 128"
+    "T11_swapab_m128_n8   | 1 | 128 | 8"
+    "T12_swapab_m256_n8   | 1 | 256 | 8"
 )
 
 # One balanced/static problem is enough to compile and execute each geometry.

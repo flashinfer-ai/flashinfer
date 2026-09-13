@@ -318,6 +318,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # ``_setup_attributes()`` reads it inside ``__call__`` to expand the
         # warp topology to the MegaMoE layout.
         self.enable_token_comm: bool = False
+        # Standalone FC12 has no dispatch warpgroup to fold producers into.
+        self.fold_producer_warps: bool = False
         self.dispatch_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
@@ -1138,6 +1140,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
+            min_blocks_per_mp=1 if self.reallocate_folded_registers else 0,
             stream=stream,
         )
 
@@ -1487,7 +1490,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # Cluster wait after pipeline init and before producer/consumer use.
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        if cutlass.const_expr(self.enable_token_comm):
+        if cutlass.const_expr(self.enable_token_comm and self.fold_producer_warps):
+            if cutlass.const_expr(self.reallocate_folded_registers):
+                self._set_folded_producer_registers(warp_idx)
+        elif cutlass.const_expr(self.enable_token_comm):
             if warp_idx < cutlass.Int32(len(self.epilogue_warp_id)):
                 cute.arch.setmaxregister_increase(self.epi_reg_cnt)
             elif warp_idx == self.tma_a_warp_id:
@@ -1881,6 +1887,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 n_half = 0
             else:
                 n_half = epilogue_group_idx
+
+            if cutlass.const_expr(self.enable_token_comm and self.reallocate_folded_registers):
+                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
 
             (
                 tCrA,

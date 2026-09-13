@@ -58,6 +58,7 @@ class Sm90SwigluFp8Fc12Kernel:
     _setmaxnreg_max = 256
     _setmaxnreg_granularity = 8
     _sm90_cta_register_budget = 65536
+    reallocate_folded_registers = False
 
     # SMEM budget for all "non-problem-tensor" buffers (mbarriers, sched
     # work-tile buffer, and dispatch scratch).  Reserved at host side in
@@ -742,26 +743,58 @@ class Sm90SwigluFp8Fc12Kernel:
         return 32 * regs_per_warp
 
     def fit_epi_registers(self) -> None:
-        """Grow the epilogue register file into the budget freed by folding.
-
-        Only under ``fold_producer_warps``: the dropped producer warpgroup
-        returns ~5.4K registers on the 2-WG (N256 / swap M256) kernels and
-        lifts the standalone-token-back N128 epilogue off its 200-reg floor.
-        Rounds down to the setmaxnreg granularity and never lowers a count.
-        ``MEGA_FOLD_EPI_FIT=0`` disables it (A/B probe).
-        """
+        """Budget whole warpgroups against the launch's register pool."""
         if not self.fold_producer_warps:
+            self.reallocate_folded_registers = False
             return
-        if os.environ.get("MEGA_FOLD_EPI_FIT", "1") != "1":
-            return
+
+        inference_1x_pingpong = (
+            self.fp8_scale_mode == "per_tensor"
+            and self.fp8_accum_mode == "1xacc"
+            and self.pingpong
+            and not self.generate_c
+        )
+        large_accum_tile = self.mma_tiler[0] * self.mma_tiler[1] > 128 * 64
+        # Small 1xacc ping-pong inference tiles favor static allocation.
+        # Larger accumulator fragments and training stores need the extra
+        # math registers to avoid spills. A ping-pong WG owns the whole tile.
+        self.reallocate_folded_registers = not (
+            inference_1x_pingpong and not large_accum_tile
+        )
+        # Folded dispatch/TMA/scheduler share one physical warpgroup and
+        # must execute the same setmaxnreg instruction and immediate.
+        self.dispatch_reg_cnt = 48
+        if (
+            inference_1x_pingpong and large_accum_tile
+            and self.token_back_standalone
+        ):
+            # The large-tile token-back loop needs more than 32 registers.
+            # Transfer eight from each producer thread, preserving the pool.
+            self.dispatch_reg_cnt = 40
+            self.token_back_reg_cnt = 40
+        self.tma_a_reg_cnt = self.dispatch_reg_cnt
+        self.tma_b_reg_cnt = self.dispatch_reg_cnt
+        self.sched_reg_cnt = self.dispatch_reg_cnt
         n_epi = len(self.epilogue_warp_id)
         other_regs = (
             self.estimated_register_budget() // 32 - n_epi * self.epi_reg_cnt
         )
-        per_epi_warp = (self._sm90_cta_register_budget // 32 - other_regs) // n_epi
-        fit = min(self._setmaxnreg_max, (per_epi_warp // 8) * 8)
-        if fit > self.epi_reg_cnt:
-            self.epi_reg_cnt = fit
+        entry_regs = min(256, self._sm90_cta_register_budget // self.threads_per_cta)
+        entry_regs = (entry_regs // 8) * 8
+        pool = entry_regs * self.threads_per_cta
+        per_epi_warp = (pool // 32 - other_regs) // n_epi
+        self.epi_reg_cnt = min(256, (per_epi_warp // 8) * 8)
+
+    @cute.jit
+    def _set_folded_producer_registers(self, warp_idx: cutlass.Int32) -> None:
+        if warp_idx >= cutlass.Int32(len(self.epilogue_warp_id)):
+            if cutlass.const_expr(self.token_back_standalone):
+                if warp_idx < cutlass.Int32(self.token_back_warp_id[0]):
+                    cute.arch.setmaxregister_decrease(self.dispatch_reg_cnt)
+                else:
+                    cute.arch.setmaxregister_decrease(self.token_back_reg_cnt)
+            else:
+                cute.arch.setmaxregister_decrease(self.dispatch_reg_cnt)
 
     def fit_fc1_offload_registers(self) -> None:
         """Size the store server's register file to the CTA's remaining budget.
@@ -857,7 +890,7 @@ class Sm90SwigluFp8Fc12Kernel:
                 )
             fc1_output_sf_bytes = (
                 data_total_rows
-                * (intermediate_downproj // Fp8Fc2ActivationScaleK)
+                * ((intermediate_downproj // Fp8Fc2ActivationScaleK + 3) // 4 * 4)
                 * 4
             )
         else:
@@ -1184,6 +1217,33 @@ class Sm90SwigluFp8Fc12Kernel:
         )
 
     @cute.jit
+    def _issue_blockwise_fc2_partial(
+        self,
+        tiled_mma,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        accum_partial: cute.Tensor,
+        stage_idx,
+        k_begin: cutlass.Constexpr,
+        k_end: cutlass.Constexpr,
+        iket_active,
+    ) -> None:
+        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+        cute.nvgpu.warpgroup.fence()
+        if iket_active:
+            iket.range_push("wgmma_issue")
+        for k_block_idx in cutlass.range_constexpr(k_begin, k_end):
+            tile_crd = (None, None, k_block_idx, stage_idx)
+            cute.gemm(
+                tiled_mma, accum_partial, tCrA[tile_crd], tCrB[tile_crd],
+                accum_partial,
+            )
+            tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+        if iket_active:
+            iket.range_pop()
+        cute.nvgpu.warpgroup.commit_group()
+
+    @cute.jit
     def _mma_blockwise_task_tile(
         self,
         local_warp_idx: int,
@@ -1209,6 +1269,13 @@ class Sm90SwigluFp8Fc12Kernel:
         activation_scales = cute.make_rmem_tensor(
             activation_scale_layout.shape, Float32
         )
+        # Three fragments need either a small CTA or an active math-region
+        # register increase. A host-side quota alone does not prevent spill.
+        has_overlap_register_budget = (
+            self.threads_per_cta <= 256
+            or (self.fold_producer_warps and self.epi_reg_cnt >= 224)
+        )
+        overlap_fc2 = has_overlap_register_budget and cute.size(accumulators) <= 64
         num_k_blocks = cute.size(tCrA, mode=[2])
         for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
             if iket_active:
@@ -1265,30 +1332,25 @@ class Sm90SwigluFp8Fc12Kernel:
                 )
             else:
                 half_k_blocks = num_k_blocks // 2
+                if cutlass.const_expr(overlap_fc2):
+                    accum_second = cute.make_rmem_tensor(
+                        accum_temp.shape, self.acc_dtype
+                    )
+                else:
+                    accum_second = accum_temp
                 scale_plane_base = (k_tile % cutlass.Int32(2)) * cutlass.Int32(
                     2
                 )
-                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-                cute.nvgpu.warpgroup.fence()
-                if iket_active:
-                    iket.range_push("wgmma_issue")
-                for k_block_idx in cutlass.range_constexpr(half_k_blocks):
-                    tile_crd = (
-                        None, None, k_block_idx, ab_consumer_state.index
+                self._issue_blockwise_fc2_partial(
+                    tiled_mma, tCrA, tCrB, accum_temp,
+                    ab_consumer_state.index, 0, half_k_blocks, iket_active,
+                )
+                if cutlass.const_expr(overlap_fc2):
+                    self._issue_blockwise_fc2_partial(
+                        tiled_mma, tCrA, tCrB, accum_second,
+                        ab_consumer_state.index, half_k_blocks, num_k_blocks,
+                        iket_active,
                     )
-                    cute.gemm(
-                        tiled_mma,
-                        accum_temp,
-                        tCrA[tile_crd],
-                        tCrB[tile_crd],
-                        accum_temp,
-                    )
-                    tiled_mma.set(
-                        cute.nvgpu.warpgroup.Field.ACCUMULATE, True
-                    )
-                if iket_active:
-                    iket.range_pop()
-                cute.nvgpu.warpgroup.commit_group()
                 if iket_active:
                     iket.range_push("weight_sf_consumer_wait")
                 weight_sf_pipeline.consumer_wait(ab_consumer_state)
@@ -1306,7 +1368,7 @@ class Sm90SwigluFp8Fc12Kernel:
                     smem_weight_sf[n_half, ab_consumer_state.index]
                 )
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
-                cute.nvgpu.warpgroup.wait_group(0)
+                cute.nvgpu.warpgroup.wait_group(1 if overlap_fc2 else 0)
                 self._promote_accum_temp_blockwise_fc2(
                     accumulators=accumulators,
                     accum_temp=accum_temp,
@@ -1314,29 +1376,12 @@ class Sm90SwigluFp8Fc12Kernel:
                     weight_scale=weight_scale,
                 )
 
-                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-                cute.nvgpu.warpgroup.fence()
-                if iket_active:
-                    iket.range_push("wgmma_issue")
-                for k_block_idx in cutlass.range_constexpr(
-                    half_k_blocks, num_k_blocks
-                ):
-                    tile_crd = (
-                        None, None, k_block_idx, ab_consumer_state.index
+                if cutlass.const_expr(not overlap_fc2):
+                    self._issue_blockwise_fc2_partial(
+                        tiled_mma, tCrA, tCrB, accum_second,
+                        ab_consumer_state.index, half_k_blocks, num_k_blocks,
+                        iket_active,
                     )
-                    cute.gemm(
-                        tiled_mma,
-                        accum_temp,
-                        tCrA[tile_crd],
-                        tCrB[tile_crd],
-                        accum_temp,
-                    )
-                    tiled_mma.set(
-                        cute.nvgpu.warpgroup.Field.ACCUMULATE, True
-                    )
-                if iket_active:
-                    iket.range_pop()
-                cute.nvgpu.warpgroup.commit_group()
                 self._load_activation_scales_blockwise_fragment(
                     smem_activation_sf=smem_activation_sf,
                     activation_scales=activation_scales,
@@ -1349,7 +1394,7 @@ class Sm90SwigluFp8Fc12Kernel:
                 ab_pipeline.consumer_release(ab_consumer_state)
                 self._promote_accum_temp_blockwise_fc2(
                     accumulators=accumulators,
-                    accum_temp=accum_temp,
+                    accum_temp=accum_second,
                     activation_scales=activation_scales,
                     weight_scale=weight_scale,
                 )
@@ -2549,6 +2594,7 @@ class Sm90SwigluFp8Fc12Kernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
+            min_blocks_per_mp=1 if self.reallocate_folded_registers else 0,
             stream=stream,
         )
 
@@ -2905,7 +2951,10 @@ class Sm90SwigluFp8Fc12Kernel:
         # Cluster wait after pipeline init and before producer/consumer use.
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        if cutlass.const_expr(self.enable_token_comm):
+        if cutlass.const_expr(self.enable_token_comm and self.fold_producer_warps):
+            if cutlass.const_expr(self.reallocate_folded_registers):
+                self._set_folded_producer_registers(warp_idx)
+        elif cutlass.const_expr(self.enable_token_comm):
             if warp_idx < cutlass.Int32(len(self.epilogue_warp_id)):
                 cute.arch.setmaxregister_increase(self.epi_reg_cnt)
             elif warp_idx == self.tma_a_warp_id:
@@ -3333,6 +3382,9 @@ class Sm90SwigluFp8Fc12Kernel:
                 n_half = 0
             else:
                 n_half = epilogue_group_idx
+
+            if cutlass.const_expr(self.enable_token_comm and self.reallocate_folded_registers):
+                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
 
             (
                 tCrA,
