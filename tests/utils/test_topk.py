@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -3205,8 +3206,167 @@ def test_topk_clusters_ragged_transform(num_rows, seq_len, k, dtype):
 # ===================== CUB DeviceBatchedTopK backend Tests =====================
 # The CUB backend serves top_k_page_table_transform through the dispatcher, so the general
 # transform test grid above already exercises it (and the "cub" entries in the algorithm
-# parametrizations force it explicitly). The tests here cover only what is unique to the
-# CUB backend: its lengths <= 0 semantics and its binding-level workspace contract.
+# parametrizations force it explicitly). The tests here cover CUB dispatch boundaries,
+# its lengths <= 0 semantics, and its binding-level workspace contract.
+
+
+@pytest.mark.parametrize("api", ["top_k", "page_table", "ragged"])
+@pytest.mark.parametrize(
+    "tie_break",
+    [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
+    ids=["small", "large"],
+)
+@pytest.mark.parametrize(
+    ("width", "k"),
+    [(64, 2048), (4096, 2048), (64, 64)],
+    ids=["short_width", "normal_width", "equal_width"],
+)
+def test_cub_auto_physical_width_dispatch(api, tie_break, width, k, set_topk_algo):
+    """Auto must preserve native padding without disabling eligible CUB calls."""
+    _require_cub_tie_break_support()
+    if k > width and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+    set_topk_algo("auto")
+    num_rows, page_size = 4, 64
+    scores = torch.zeros((num_rows, width), device="cuda", dtype=torch.float32)
+    lengths = torch.full((num_rows,), width, device="cuda", dtype=torch.int32)
+    offsets = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32) * 10000
+    page_table = (
+        torch.arange(num_rows * (width // page_size), device="cuda", dtype=torch.int32)
+        .flip(0)
+        .reshape(num_rows, -1)
+        + 100
+    )
+    out = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
+    raw = torch.empty_like(out)
+    output_pointers = out.data_ptr(), raw.data_ptr()
+    kwargs = dict(tie_break=tie_break, dsa_graph_safe=True)
+
+    def run():
+        if api == "top_k":
+            return flashinfer.top_k(scores, k, **kwargs)
+        if api == "page_table":
+            result = flashinfer.top_k_page_table_transform(
+                scores,
+                page_table,
+                lengths,
+                k,
+                page_size=page_size,
+                out=out,
+                out_raw_indices=raw,
+                **kwargs,
+            )
+            return (result,)
+        return (
+            flashinfer.top_k_ragged_transform(scores, offsets, lengths, k, **kwargs),
+        )
+
+    def check(result):
+        indices = result[-1]
+        assert indices.shape == (num_rows, k)
+        assert indices.dtype == (torch.int64 if api == "top_k" else torch.int32)
+        if api == "top_k":
+            assert result[0].shape == indices.shape
+            assert result[0].dtype == scores.dtype
+        if api == "page_table":
+            assert (indices.data_ptr(), raw.data_ptr()) == output_pointers
+        for row in range(num_rows):
+            length = width if api == "top_k" else lengths[row].item()
+            valid = min(k, length)
+            row_scores = scores[row, :length]
+            # Stable sorting establishes exact boundary selection for both tie modes.
+            if tie_break == flashinfer.TopKTieBreak.SMALL:
+                expected = torch.argsort(row_scores, descending=True, stable=True)[
+                    :valid
+                ]
+            else:
+                expected = (
+                    length
+                    - 1
+                    - torch.argsort(row_scores.flip(0), descending=True, stable=True)[
+                        :valid
+                    ]
+                )
+            if api == "page_table":
+                _assert_unordered_indices_match(raw[row, :valid], expected)
+                assert torch.all(raw[row, valid:] == -1)
+                expected = page_table[row, expected // page_size] * page_size + (
+                    expected % page_size
+                )
+                raw_valid = raw[row, :valid].long()
+                assert torch.equal(
+                    indices[row, :valid],
+                    page_table[row, raw_valid // page_size] * page_size
+                    + raw_valid % page_size,
+                )
+            elif api == "ragged":
+                expected = expected + offsets[row]
+            else:
+                assert torch.equal(
+                    result[0][row, :valid], scores[row, indices[row, :valid]]
+                )
+                assert torch.all(result[0][row, valid:] == 0)
+            _assert_unordered_indices_match(indices[row, :valid], expected)
+            assert torch.all(indices[row, valid:] == -1)
+
+    module = flashinfer.topk.get_topk_module()
+    query_name = {
+        "top_k": "cub_topk_workspace_size",
+        "page_table": "cub_topk_page_table_transform_workspace_size",
+        "ragged": "cub_topk_ragged_transform_workspace_size",
+    }[api]
+    with patch.object(module, query_name, wraps=getattr(module, query_name)) as query:
+        check(run())
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        check(captured)
+
+        # Capture full rows, then change both selection and mapping inputs in place.
+        # Shrinking to partial/empty rows must overwrite previously valid output slots.
+        scores[:, 1::2] = 1
+        lengths.copy_(
+            torch.tensor(
+                [width, min(width - 1, k), width // 4 if width > k else width // 2, 0],
+                device="cuda",
+                dtype=torch.int32,
+            )
+        )
+        page_table.add_(1000)
+        offsets.add_(1000)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(captured)
+        check(run())
+        assert query.called == (k <= width)
+
+
+@pytest.mark.parametrize("api", ["top_k", "page_table", "ragged"])
+def test_cub_forced_short_width(api, set_topk_algo):
+    """Explicit CUB retains its existing physical-width validation."""
+    _require_cub_tie_break_support()
+    set_topk_algo("cub")
+    scores = torch.zeros((4, 64), device="cuda")
+    lengths = torch.full((4,), 64, device="cuda", dtype=torch.int32)
+    kwargs = dict(tie_break=flashinfer.TopKTieBreak.LARGE, dsa_graph_safe=True)
+    with pytest.raises(RuntimeError, match="0 < top_k <= d"):
+        if api == "top_k":
+            flashinfer.top_k(scores, 2048, **kwargs)
+        elif api == "page_table":
+            page_table = torch.ones((4, 1), device="cuda", dtype=torch.int32)
+            flashinfer.top_k_page_table_transform(
+                scores, page_table, lengths, 2048, page_size=64, **kwargs
+            )
+        else:
+            offsets = torch.zeros_like(lengths)
+            flashinfer.top_k_ragged_transform(scores, offsets, lengths, 2048, **kwargs)
 
 
 @pytest.mark.parametrize(

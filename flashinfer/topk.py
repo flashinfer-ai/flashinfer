@@ -646,7 +646,9 @@ def can_use_clusters_topk(algo, device, deterministic, tie_break, dsa_graph_safe
     return (algo is None or algo == "clusters") and not deterministic and cap[0] == 10
 
 
-def can_use_cub_topk(algo, input_tensor, tie_break, deterministic, sorted_output=False):
+def can_use_cub_topk(
+    algo, input_tensor, k, tie_break, deterministic, sorted_output=False
+):
     """Whether the CUB (DeviceBatchedTopK) backend can serve this call."""
 
     # CUB returns unsorted results and has no reproducible-ordering mode, so
@@ -658,6 +660,9 @@ def can_use_cub_topk(algo, input_tensor, tie_break, deterministic, sorted_output
     if input_tensor.dtype not in (torch.float32, torch.float16, torch.bfloat16):
         return False
     d = input_tensor.size(1)
+    # Preserve native short-row padding in auto mode; forced CUB keeps its shape error.
+    if algo is None and k > d:
+        return False
     if d > (1 << 21):
         return False  # DeviceBatchedTopK per-segment limit
     # Pre-SM90 devices only have the single-block backend (d <= 8192) and no
@@ -960,7 +965,7 @@ def top_k(
     )
 
     if can_use_cub_topk(
-        algo, input, tie_break, deterministic, sorted
+        algo, input, k, tie_break, deterministic, sorted
     ) and is_cub_topk_beneficial(
         algo,
         batch_size,
@@ -1219,7 +1224,7 @@ def top_k_page_table_transform(
     )
 
     if can_use_cub_topk(
-        algo, input, tie_break, deterministic
+        algo, input, k, tie_break, deterministic
     ) and is_cub_page_table_transform_beneficial(
         algo,
         input.size(0),
@@ -1398,7 +1403,7 @@ def top_k_ragged_transform(
     )
 
     if can_use_cub_topk(
-        algo, input, tie_break, deterministic
+        algo, input, k, tie_break, deterministic
     ) and is_cub_ragged_transform_beneficial(
         algo,
         input.size(0),
