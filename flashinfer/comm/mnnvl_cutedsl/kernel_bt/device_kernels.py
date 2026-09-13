@@ -1127,6 +1127,7 @@ class _MaterializeRMSNormDeviceKernel:
         weight_bias: float,
         write_residual_output: bool,
         enable_pdl: bool,
+        apply_rms_norm: bool = True,
     ) -> None:
         self.hidden_size = hidden_size
         self.capacity_m = capacity_m
@@ -1135,6 +1136,10 @@ class _MaterializeRMSNormDeviceKernel:
         self.weight_bias = weight_bias
         self.write_residual_output = write_residual_output
         self.enable_pdl = enable_pdl
+        # When False the tail only materialises the all-reduced value into
+        # residual_output; the sum-of-squares, rsqrt and norm store are not
+        # emitted at all.
+        self.apply_rms_norm = apply_rms_norm
         self.fragments = hidden_size // VEC_BF16
         self.trips = math.ceil(self.fragments / threads)
         self.warps = threads // WARP_SIZE
@@ -1192,18 +1197,19 @@ class _MaterializeRMSNormDeviceKernel:
         )
         gamma_fragments.fill(BFloat16(0.0))
         prenorm_fragments.fill(BFloat16(0.0))
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = tidx + trip * self.threads
-            if fragment < self.fragments:
-                gamma_pointer = cute.make_ptr(
-                    BFloat16,
-                    (gamma.iterator + Int64(fragment) * VEC_BF16).llvm_ptr,
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                gamma_fragments[trip, None].store(
-                    packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
-                )
+        if cutlass.const_expr(self.apply_rms_norm):
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = tidx + trip * self.threads
+                if fragment < self.fragments:
+                    gamma_pointer = cute.make_ptr(
+                        BFloat16,
+                        (gamma.iterator + Int64(fragment) * VEC_BF16).llvm_ptr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    gamma_fragments[trip, None].store(
+                        packed_u32x4_to_bf16x8(load_global_u32x4(gamma_pointer))
+                    )
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
@@ -1226,7 +1232,8 @@ class _MaterializeRMSNormDeviceKernel:
                 while fragment_has_negative_zero(packed):
                     packed = load_global_u32x4(mailbox_pointer, volatile=True)
                 prenorm = packed_u32x4_to_bf16x8(packed)
-                prenorm_fragments[trip, None].store(prenorm)
+                if cutlass.const_expr(self.apply_rms_norm):
+                    prenorm_fragments[trip, None].store(prenorm)
 
                 if cutlass.const_expr(self.write_residual_output):
                     output_offset = (
@@ -1237,38 +1244,40 @@ class _MaterializeRMSNormDeviceKernel:
                         packed,
                     )
 
-                values = prenorm.to(Float32)
-                thread_sum = thread_sum + (values * values).reduce(
-                    cute.ReductionOp.ADD,
-                    init_val=Float32(0.0),
-                    reduction_profile=0,
-                )
+                if cutlass.const_expr(self.apply_rms_norm):
+                    values = prenorm.to(Float32)
+                    thread_sum = thread_sum + (values * values).reduce(
+                        cute.ReductionOp.ADD,
+                        init_val=Float32(0.0),
+                        reduction_profile=0,
+                    )
 
         smem = cutlass.utils.SmemAllocator()
         warp_sums = smem.allocate_array(Float32, self.warps)
-        full_sum = _block_sum(thread_sum, warp_sums, self.warps)
-        inverse_rms = cute.math.rsqrt(
-            full_sum / Float32(self.hidden_size) + Float32(self.rms_epsilon),
-            fastmath=True,
-        )
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = tidx + trip * self.threads
-            if fragment < self.fragments:
-                gamma_value = gamma_fragments[trip, None].load().to(Float32)
-                if cutlass.const_expr(self.weight_bias != 0.0):
-                    gamma_value = gamma_value + Float32(self.weight_bias)
-                result = (
-                    prenorm_fragments[trip, None].load().to(Float32)
-                    * inverse_rms
-                    * gamma_value
-                ).to(BFloat16)
-                output_offset = (
-                    Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
-                )
-                store_global_u32x4(
-                    Int64((norm_output.iterator + output_offset).toint()),
-                    bf16x8_to_packed_u32x4(result),
-                )
+        if cutlass.const_expr(self.apply_rms_norm):
+            full_sum = _block_sum(thread_sum, warp_sums, self.warps)
+            inverse_rms = cute.math.rsqrt(
+                full_sum / Float32(self.hidden_size) + Float32(self.rms_epsilon),
+                fastmath=True,
+            )
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = tidx + trip * self.threads
+                if fragment < self.fragments:
+                    gamma_value = gamma_fragments[trip, None].load().to(Float32)
+                    if cutlass.const_expr(self.weight_bias != 0.0):
+                        gamma_value = gamma_value + Float32(self.weight_bias)
+                    result = (
+                        prenorm_fragments[trip, None].load().to(Float32)
+                        * inverse_rms
+                        * gamma_value
+                    ).to(BFloat16)
+                    output_offset = (
+                        Int64(token) * self.hidden_size + Int64(fragment) * VEC_BF16
+                    )
+                    store_global_u32x4(
+                        Int64((norm_output.iterator + output_offset).toint()),
+                        bf16x8_to_packed_u32x4(result),
+                    )
 
         cute.arch.barrier()
         if cutlass.const_expr(self.enable_pdl):

@@ -85,6 +85,38 @@ BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1 = BTAllReduceTuning(
     collective=BTCollectiveTuning(reduction_threads=320)
 )
 
+# hidden_size=5120, bf16. A 5120-wide token is 640 bf16x8
+# vectors, so the PRESET_1 shape (elements_per_thread=8, threads=128) tiles it
+# in exactly 5 CTAs with no predicated tail, while PRESET_0 keeps the narrower
+# 2-element/256-thread tiling for the small-M unicast regime. prefetch_group
+# tracks top_k; every other knob matches the H8192 presets because the BT
+# kernels size their grids with ceil() and predicate the tail, so they are
+# already shape-tolerant.
+BT_FINALIZE_GB300_TP4_H5120_K6_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=2, threads=256, prefetch_group=6
+)
+BT_FINALIZE_GB300_TP4_H5120_K6_PRESET_1 = BTFinalizeTuning(prefetch_group=6)
+BT_FINALIZE_GB300_TP4_H5120_K3_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=2, threads=256, prefetch_group=3
+)
+BT_FINALIZE_GB300_TP4_H5120_K3_PRESET_1 = BTFinalizeTuning(prefetch_group=3)
+BT_FINALIZE_GB300_TP8_H5120_K6_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=2, threads=256, prefetch_group=6
+)
+BT_FINALIZE_GB300_TP8_H5120_K6_PRESET_1 = BTFinalizeTuning(prefetch_group=6)
+BT_FINALIZE_GB300_TP8_H5120_K3_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=2, threads=256, prefetch_group=3
+)
+BT_FINALIZE_GB300_TP8_H5120_K3_PRESET_1 = BTFinalizeTuning(prefetch_group=3)
+BT_ALL_REDUCE_GB300_TP4_H5120_PRESET_0 = BTAllReduceTuning()
+BT_ALL_REDUCE_GB300_TP4_H5120_PRESET_1 = BTAllReduceTuning(
+    collective=BTCollectiveTuning(reduction_threads=320)
+)
+BT_ALL_REDUCE_GB300_TP8_H5120_PRESET_0 = BTAllReduceTuning()
+BT_ALL_REDUCE_GB300_TP8_H5120_PRESET_1 = BTAllReduceTuning(
+    collective=BTCollectiveTuning(reduction_threads=320)
+)
+
 
 @dataclass(slots=True)
 class BTProtocolState:
@@ -299,6 +331,7 @@ class BTProtocol:
         include_shared_expert: bool,
         add_residual: bool,
         write_residual_output: bool,
+        apply_rms_norm: bool = True,
         finalize_tunings: tuple[BTFinalizeTuning, ...],
         all_reduce_tunings: tuple[BTAllReduceTuning, ...],
         group: dist.ProcessGroup,
@@ -315,6 +348,7 @@ class BTProtocol:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        self.apply_rms_norm = apply_rms_norm
 
         tail_cache = {
             tuning: self._compile_tail(tuning)
@@ -455,6 +489,7 @@ class BTProtocol:
             weight_bias=self.weight_bias,
             write_residual_output=self.write_residual_output,
             enable_pdl=tuning.enable_pdl,
+            apply_rms_norm=self.apply_rms_norm,
         )
         prenorm_elements = LAMPORT_GENERATIONS * self.capacity_m * self.hidden_size
         rms_norm = cute.compile(

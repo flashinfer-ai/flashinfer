@@ -725,6 +725,7 @@ class _LamportResidualRMSNormDeviceKernel:
         weight_bias: float,
         add_residual: bool,
         write_residual_output: bool,
+        apply_rms_norm: bool = True,
         enable_pdl: bool,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
@@ -745,6 +746,10 @@ class _LamportResidualRMSNormDeviceKernel:
         self.weight_bias = weight_bias
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        # When False the collective stops after the Lamport reduce (+ residual)
+        # and the cluster sum-of-squares, its barrier and the norm store are
+        # never emitted.
+        self.apply_rms_norm = apply_rms_norm
         self.enable_pdl = enable_pdl
         self.fragments = hidden // VEC_BF16
         self.groups_per_cta = threads // rank_lanes
@@ -952,52 +957,56 @@ class _LamportResidualRMSNormDeviceKernel:
         for trip in cutlass.range_constexpr(self.trips):
             fragment = base_fragment + trip * self.fragment_stride
             if fragment < self.fragments and rank_lane == 0:
-                values = prenorm_fragments[trip, None].load().to(Float32)
-                thread_sum = thread_sum + (values * values).reduce(
-                    cute.ReductionOp.ADD,
-                    init_val=Float32(0.0),
-                    reduction_profile=0,
-                )
+                if cutlass.const_expr(self.apply_rms_norm):
+                    values = prenorm_fragments[trip, None].load().to(Float32)
+                    thread_sum = thread_sum + (values * values).reduce(
+                        cute.ReductionOp.ADD,
+                        init_val=Float32(0.0),
+                        reduction_profile=0,
+                    )
 
         smem = cutlass.utils.SmemAllocator()
         warp_sums = smem.allocate_array(Float32, self.warps)
         cluster_sums = smem.allocate_array(Float32, self.cluster_size)
-        cta_sum = _group_leader_block_sum(
-            thread_sum,
-            warp_sums,
-            self.warps,
-            self.rank_lanes,
-        )
-        if tidx < self.cluster_size:
-            local_slot = cluster_sums + cluster_rank
-            remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
-            store_shared_cluster_f32(remote_slot, cta_sum)
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-
-        full_sum = Float32(0.0)
-        for peer in cutlass.range_constexpr(self.cluster_size):
-            full_sum = full_sum + cute.arch.load(
-                (cluster_sums + peer).llvm_ptr,
-                Float32,
+        if cutlass.const_expr(self.apply_rms_norm):
+            cta_sum = _group_leader_block_sum(
+                thread_sum,
+                warp_sums,
+                self.warps,
+                self.rank_lanes,
             )
-        inv_rms = cute.math.rsqrt(
-            full_sum / Float32(self.hidden) + Float32(self.rms_epsilon),
-            fastmath=True,
-        )
-        for trip in cutlass.range_constexpr(self.trips):
-            fragment = base_fragment + trip * self.fragment_stride
-            if fragment < self.fragments and rank_lane == 0:
-                gamma_values = gamma_fragments[trip, None].load().to(Float32)
-                if cutlass.const_expr(self.weight_bias != 0.0):
-                    gamma_values = gamma_values + Float32(self.weight_bias)
-                result = (
-                    prenorm_fragments[trip, None].load().to(Float32)
-                    * inv_rms
-                    * gamma_values
-                ).to(BFloat16)
-                output_element = Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
-                store_global_u32x4(
-                    Int64((norm_output.iterator + output_element).toint()),
-                    bf16x8_to_packed_u32x4(result),
+            if tidx < self.cluster_size:
+                local_slot = cluster_sums + cluster_rank
+                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                store_shared_cluster_f32(remote_slot, cta_sum)
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+
+            full_sum = Float32(0.0)
+            for peer in cutlass.range_constexpr(self.cluster_size):
+                full_sum = full_sum + cute.arch.load(
+                    (cluster_sums + peer).llvm_ptr,
+                    Float32,
                 )
+            inv_rms = cute.math.rsqrt(
+                full_sum / Float32(self.hidden) + Float32(self.rms_epsilon),
+                fastmath=True,
+            )
+            for trip in cutlass.range_constexpr(self.trips):
+                fragment = base_fragment + trip * self.fragment_stride
+                if fragment < self.fragments and rank_lane == 0:
+                    gamma_values = gamma_fragments[trip, None].load().to(Float32)
+                    if cutlass.const_expr(self.weight_bias != 0.0):
+                        gamma_values = gamma_values + Float32(self.weight_bias)
+                    result = (
+                        prenorm_fragments[trip, None].load().to(Float32)
+                        * inv_rms
+                        * gamma_values
+                    ).to(BFloat16)
+                    output_element = (
+                        Int64(token) * self.hidden + Int64(fragment) * VEC_BF16
+                    )
+                    store_global_u32x4(
+                        Int64((norm_output.iterator + output_element).toint()),
+                        bf16x8_to_packed_u32x4(result),
+                    )
