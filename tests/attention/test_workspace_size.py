@@ -112,6 +112,59 @@ def test_batch_decode_workspace_size_plans_with_exact_buffers(use_cuda_graph):
     assert wrapper._plan_info is not None
 
 
+def test_batch_decode_workspace_size_plans_fa2_no_split_cuda_graph():
+    batch_size = 2
+    kv_len = 2
+    page_size = 1
+    num_qo_heads = 16
+    num_kv_heads = 2
+    head_dim = 128
+    dtype = torch.float16
+
+    indptr, indices, last_page_len = _paged_kv_inputs(batch_size, kv_len, page_size)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024),
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=torch.empty_like(indptr),
+        paged_kv_indices_buffer=torch.empty_like(indices),
+        paged_kv_last_page_len_buffer=torch.empty_like(last_page_len),
+        backend="fa2",
+    )
+    plan_args = (
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+    )
+    plan_kwargs = {
+        "q_data_type": dtype,
+        "kv_data_type": dtype,
+        "disable_split_kv": True,
+    }
+
+    float_workspace_size, int_workspace_size = wrapper.workspace_size(
+        *plan_args, **plan_kwargs
+    )
+    wrapper.reset_workspace_buffer(
+        _byte_workspace(float_workspace_size),
+        _byte_workspace(int_workspace_size),
+    )
+    wrapper.plan(*plan_args, **plan_kwargs)
+    torch.cuda.current_stream().synchronize()
+
+    plan = list(wrapper._plan_info)
+    assert float_workspace_size == 0
+    assert (
+        int_workspace_size
+        == plan[2] + torch.empty((), dtype=torch.int32).element_size()
+    )
+    assert plan[0] == batch_size
+
+
 def _run_batch_prefill_workspace_size_plan(
     use_cuda_graph=False,
     fixed_split_size=None,
