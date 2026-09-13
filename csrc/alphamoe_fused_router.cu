@@ -190,11 +190,21 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
             float local_max_high = _fmax_5;
             float _fmax_6 = fmaxf(local_max_low, local_max_high);
             float local_value = _fmax_6;
-            float _warp_reduce_0 = local_value;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-            float best_value = _warp_reduce_0;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
             #pragma unroll
             for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
@@ -205,9 +215,9 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
                     }
                 }
             }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_0;
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
             if (lane == (unsigned int)route) {
                 selected_logit = best_value;
                 selected_expert = best_index;
@@ -233,21 +243,21 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
         if ((unsigned int)softmax_top_k > lane) {
             selected_for_max = selected_logit;
         }
-        float _warp_reduce_1 = selected_for_max;
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-        float selected_max = _warp_reduce_1;
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
         float selected_exp = 0.0f;
         if ((unsigned int)softmax_top_k > lane) {
             float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
             selected_exp = _exp2_0;
         }
-        float _warp_reduce_2 = selected_exp;
+        float _warp_reduce_1 = selected_exp;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-        float selected_sum = _warp_reduce_2;
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
         float _rcp_0 = approx_rcp(selected_sum);
         float selected_sum_rcp = _rcp_0;
         if (lane < (unsigned int)top_k) {
@@ -716,11 +726,21 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
             float local_max_high = _fmax_5;
             float _fmax_6 = fmaxf(local_max_low, local_max_high);
             float local_value = _fmax_6;
-            float _warp_reduce_0 = local_value;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-            float best_value = _warp_reduce_0;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
             #pragma unroll
             for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
@@ -731,9 +751,9 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
                     }
                 }
             }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_0;
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
             if (lane == (unsigned int)route) {
                 selected_logit = best_value;
                 selected_expert = best_index;
@@ -759,21 +779,21 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
         if ((unsigned int)softmax_top_k > lane) {
             selected_for_max = selected_logit;
         }
-        float _warp_reduce_1 = selected_for_max;
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-        float selected_max = _warp_reduce_1;
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
         float selected_exp = 0.0f;
         if ((unsigned int)softmax_top_k > lane) {
             float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
             selected_exp = _exp2_0;
         }
-        float _warp_reduce_2 = selected_exp;
+        float _warp_reduce_1 = selected_exp;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-        float selected_sum = _warp_reduce_2;
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
         float _rcp_0 = approx_rcp(selected_sum);
         float selected_sum_rcp = _rcp_0;
         if (lane < (unsigned int)top_k) {
@@ -1285,11 +1305,21 @@ kernel_alpha_moe_fused_router_routed(float* __restrict__ logits, float* __restri
             float local_max_high = _fmax_5;
             float _fmax_6 = fmaxf(local_max_low, local_max_high);
             float local_value = _fmax_6;
-            float _warp_reduce_0 = local_value;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-            float best_value = _warp_reduce_0;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
             #pragma unroll
             for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
@@ -1300,9 +1330,9 @@ kernel_alpha_moe_fused_router_routed(float* __restrict__ logits, float* __restri
                     }
                 }
             }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_0;
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
             if (lane == (unsigned int)route) {
                 selected_logit = best_value;
                 selected_expert = best_index;
@@ -1325,21 +1355,21 @@ kernel_alpha_moe_fused_router_routed(float* __restrict__ logits, float* __restri
         if ((unsigned int)softmax_top_k > lane) {
             selected_for_max = selected_logit;
         }
-        float _warp_reduce_1 = selected_for_max;
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-        float selected_max = _warp_reduce_1;
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
         float selected_exp = 0.0f;
         if ((unsigned int)softmax_top_k > lane) {
             float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
             selected_exp = _exp2_0;
         }
-        float _warp_reduce_2 = selected_exp;
+        float _warp_reduce_1 = selected_exp;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-        float selected_sum = _warp_reduce_2;
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
         float _rcp_0 = approx_rcp(selected_sum);
         float selected_sum_rcp = _rcp_0;
         if (lane < (unsigned int)top_k) {
@@ -1808,11 +1838,21 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
             float local_max_high = _fmax_5;
             float _fmax_6 = fmaxf(local_max_low, local_max_high);
             float local_value = _fmax_6;
-            float _warp_reduce_0 = local_value;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-            float best_value = _warp_reduce_0;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
             #pragma unroll
             for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
@@ -1823,9 +1863,9 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
                     }
                 }
             }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_0;
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
             if (lane == (unsigned int)route) {
                 selected_logit = best_value;
                 selected_expert = best_index;
@@ -1848,21 +1888,21 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
         if ((unsigned int)softmax_top_k > lane) {
             selected_for_max = selected_logit;
         }
-        float _warp_reduce_1 = selected_for_max;
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-        float selected_max = _warp_reduce_1;
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
         float selected_exp = 0.0f;
         if ((unsigned int)softmax_top_k > lane) {
             float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
             selected_exp = _exp2_0;
         }
-        float _warp_reduce_2 = selected_exp;
+        float _warp_reduce_1 = selected_exp;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-        float selected_sum = _warp_reduce_2;
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
         float _rcp_0 = approx_rcp(selected_sum);
         float selected_sum_rcp = _rcp_0;
         if (lane < (unsigned int)top_k) {
@@ -2383,11 +2423,21 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
             float local_max_high = _fmax_5;
             float _fmax_6 = fmaxf(local_max_low, local_max_high);
             float local_value = _fmax_6;
-            float _warp_reduce_0 = local_value;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-            float best_value = _warp_reduce_0;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
             #pragma unroll
             for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
@@ -2398,9 +2448,9 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
                     }
                 }
             }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_0;
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
             if (lane == (unsigned int)route) {
                 selected_logit = best_value;
                 selected_expert = best_index;
@@ -2426,21 +2476,21 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
         if ((unsigned int)softmax_top_k > lane) {
             selected_for_max = selected_logit;
         }
-        float _warp_reduce_1 = selected_for_max;
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-        float selected_max = _warp_reduce_1;
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
         float selected_exp = 0.0f;
         if ((unsigned int)softmax_top_k > lane) {
             float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
             selected_exp = _exp2_0;
         }
-        float _warp_reduce_2 = selected_exp;
+        float _warp_reduce_1 = selected_exp;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-        float selected_sum = _warp_reduce_2;
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
         float _rcp_0 = approx_rcp(selected_sum);
         float selected_sum_rcp = _rcp_0;
         if (lane < (unsigned int)top_k) {
@@ -2980,11 +3030,21 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
             float local_max_high = _fmax_5;
             float _fmax_6 = fmaxf(local_max_low, local_max_high);
             float local_value = _fmax_6;
-            float _warp_reduce_0 = local_value;
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1)
-                _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-            float best_value = _warp_reduce_0;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
             #pragma unroll
             for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
@@ -2995,9 +3055,9 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
                     }
                 }
             }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_0;
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
             if (lane == (unsigned int)route) {
                 selected_logit = best_value;
                 selected_expert = best_index;
@@ -3020,21 +3080,21 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
         if ((unsigned int)softmax_top_k > lane) {
             selected_for_max = selected_logit;
         }
-        float _warp_reduce_1 = selected_for_max;
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 = max_noftz(_warp_reduce_1, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset));
-        float selected_max = _warp_reduce_1;
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
         float selected_exp = 0.0f;
         if ((unsigned int)softmax_top_k > lane) {
             float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
             selected_exp = _exp2_0;
         }
-        float _warp_reduce_2 = selected_exp;
+        float _warp_reduce_1 = selected_exp;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
-        float selected_sum = _warp_reduce_2;
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
         float _rcp_0 = approx_rcp(selected_sum);
         float selected_sum_rcp = _rcp_0;
         if (lane < (unsigned int)top_k) {
@@ -3659,14 +3719,17 @@ void Run(TensorView logits, TensorView topk_weights, TensorView topk_ids,
   const RouterLaunchConfig config = GetRouterLaunchConfig(device_id);
   const bool use_small = m <= kSmallMLimit;
   const int64_t grid_x =
-      use_small ? std::max<int64_t>(
-                      1, std::min<int64_t>((m + kSmallGeneratedWarps - 1) / kSmallGeneratedWarps,
-                                           config.sm_count))
-                : std::max<int64_t>(
-                      1, std::min<int64_t>((((m + 3) / 4 + config.sm_count - 1) / config.sm_count) *
-                                               config.sm_count,
-                                           static_cast<int64_t>(config.sm_count) *
-                                               std::min(2, config.active_blocks_per_sm)));
+      use_small
+          ? std::max<int64_t>(
+                1, std::min<int64_t>((m + kSmallGeneratedWarps - 1) / kSmallGeneratedWarps,
+                                     config.sm_count))
+          : std::max<int64_t>(
+                1, std::min<int64_t>(
+                       ((m <= 512) ? (std::min<int64_t>((m + 7) / 8, config.sm_count))
+                                   : ((((m + 3) / 4 + config.sm_count - 1) / config.sm_count) *
+                                      config.sm_count)),
+                       static_cast<int64_t>(config.sm_count) *
+                           std::min(2, config.active_blocks_per_sm)));
   const int64_t cooperative_capacity =
       static_cast<int64_t>(use_small ? config.small_active_blocks_per_sm
                                      : config.active_blocks_per_sm) *
