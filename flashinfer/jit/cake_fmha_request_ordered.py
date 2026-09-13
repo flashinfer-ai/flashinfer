@@ -54,11 +54,18 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(f"invalid request-ordered FMHA manifest: {message}")
 
 
-def _source_root(num_q_heads: int = 8, num_kv_heads: int = 1) -> Path:
+def _source_root(
+    num_q_heads: int = 8, num_kv_heads: int = 1, *, runtime_q: bool = False
+) -> Path:
     _require((num_q_heads, num_kv_heads) in ((8, 1), (32, 2)), "head geometry")
     suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
     directory = "request_ordered_paged_decode" + suffix
-    manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
+    manifest_name = (
+        "cake_fmha_request_ordered_paged_decode"
+        + suffix
+        + ("_runtime_q" if runtime_q else "")
+        + "_manifest.json"
+    )
     installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
     checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory
     for candidate in (installed, checkout):
@@ -212,7 +219,7 @@ def get_cake_fmha_request_ordered_runtime_q_manifest(
     num_q_heads: int = 8, num_kv_heads: int = 1
 ) -> dict[str, Any]:
     """Authenticate the supplemental bindings whose query length is grid.x."""
-    root = _source_root(num_q_heads, num_kv_heads)
+    root = _source_root(num_q_heads, num_kv_heads, runtime_q=True)
     suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
     stem = "cake_fmha_request_ordered_paged_decode" + suffix + "_runtime_q"
     payload: Any = json.loads((root / (stem + "_manifest.json")).read_text())
@@ -268,10 +275,11 @@ def get_cake_fmha_request_ordered_module_spec(
         if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_")
         else (8, 1)
     )
-    root = _source_root(*geometry)
+    runtime_q = "_runtime_q_" in name
+    root = _source_root(*geometry, runtime_q=runtime_q)
     reader = (
         get_cake_fmha_request_ordered_runtime_q_manifest
-        if "_runtime_q_" in name
+        if runtime_q
         else get_cake_fmha_request_ordered_manifest
     )
     manifest = reader(*geometry)
