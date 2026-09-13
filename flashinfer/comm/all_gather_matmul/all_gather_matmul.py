@@ -117,6 +117,4 @@ def prepare_all_gather_matmul(
         _prepare_all_gather_matmul_cake_packed_qkv,
     )
 
-    return _prepare_all_gather_matmul_cake_packed_qkv(
-        inp, w, group, verbose=verbose
-    )
+    return _prepare_all_gather_matmul_cake_packed_qkv(inp, w, group, verbose=verbose)

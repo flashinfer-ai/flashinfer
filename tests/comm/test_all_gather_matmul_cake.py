@@ -944,11 +944,17 @@ def test_validate_inputs_keeps_packed_qkv_routes_private(
     ("arch", "dtype", "world_size", "n", "message"),
     [
         (
-            "sm_100a", torch.bfloat16, 4, 2560,
+            "sm_100a",
+            torch.bfloat16,
+            4,
+            2560,
             "requires bfloat16 and SM100/SM103 TP8 or SM103 TP4",
         ),
         (
-            "sm_103a", torch.float16, 4, 2560,
+            "sm_103a",
+            torch.float16,
+            4,
+            2560,
             "requires bfloat16 and SM100/SM103 TP8 or SM103 TP4",
         ),
         ("sm_103a", torch.bfloat16, 2, 2560, "requires exact K=8192"),
@@ -1156,9 +1162,7 @@ def _fake_prepared_packed_qkv(
             descriptor_entry,
         )[1],
     )
-    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv(
-        inp, weight, group
-    )
+    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv(inp, weight, group)
     calls = SimpleNamespace(
         validation=validation_calls,
         arch=arch_calls,

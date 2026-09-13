@@ -1788,8 +1788,12 @@ def _prepare_all_gather_matmul_cake_packed_qkv(
                     if state.initialization_event is not None:
                         main_stream.wait_event(state.initialization_event)
                     workspace.fused_copy_buffers = (
-                        torch.tensor(peer_scratch_ptrs, dtype=torch.int64, device=device),
-                        torch.tensor(peer_signal_ptrs, dtype=torch.int64, device=device),
+                        torch.tensor(
+                            peer_scratch_ptrs, dtype=torch.int64, device=device
+                        ),
+                        torch.tensor(
+                            peer_signal_ptrs, dtype=torch.int64, device=device
+                        ),
                         torch.zeros(7, dtype=torch.uint32, device=device),
                     )
                     state.initialization_event = torch.cuda.Event(enable_timing=False)
