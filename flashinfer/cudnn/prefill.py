@@ -179,6 +179,9 @@ def _sdpa_prefill_key_fn(
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
         scale,
+        # A packed LSE binds a ragged offset to the Stats tensor; a padded one
+        # does not. The two are different graphs.
+        batch_offsets_stats is not None,
     )
     return key
 
@@ -831,9 +834,10 @@ def cudnn_batch_prefill_with_kv_cache(
         ``batch_offsets_units``.  Only used for non-paged (3-D) KV; with
         ``batch_offsets_units="tokens"`` it defaults to ``batch_offsets_k``.
     batch_offsets_stats : Optional[torch.Tensor]
-        Cumulative per-request start offsets into the LSE / stats tensor,
-        shape ``(batch_size + 1,)``, in the units given by
-        ``batch_offsets_units``.
+        Cumulative per-request start offsets into a packed LSE tensor, shape
+        ``(batch_size + 1,)``, in the units given by ``batch_offsets_units``
+        (element offsets are ``token_offset * num_heads_qo``).  Derived from
+        ``batch_offsets_q`` when omitted and the LSE is packed.
     batch_offsets_units : str
         Units of the ``batch_offsets_*`` tensors. ``"elements"`` (default, the
         historical behavior): offsets are pre-scaled tensor-element offsets,
@@ -849,9 +853,14 @@ def cudnn_batch_prefill_with_kv_cache(
         ``(total_qo_tokens, num_heads_qo, head_dim_vo)``.  Allocated internally
         when ``None``.
     lse : Optional[torch.Tensor]
-        Pre-allocated LSE tensor, shape
-        ``(batch_size, max_token_per_sequence, num_heads_qo)``.  Allocated
-        internally when ``None`` and ``return_lse`` is ``True``.
+        Pre-allocated LSE tensor, float32.  Either packed,
+        ``(total_qo_tokens, num_heads_qo)`` -- the FlashInfer convention, row
+        ``t`` is query token ``t`` -- or padded,
+        ``(batch_size, max_token_per_sequence, num_heads_qo)``, the historical
+        cuDNN-only layout in which each request occupies its own
+        ``max_token_per_sequence`` rows.  Allocated internally as the packed
+        form when ``None`` and ``return_lse`` is ``True`` (the ``"cubin"``
+        backend allocates and accepts the padded form only).
     is_cuda_graph_compatible : bool
         Whether to plan the operation in a CUDA-graph-capture-safe mode.
     backend : Optional[str]
@@ -864,9 +873,10 @@ def cudnn_batch_prefill_with_kv_cache(
     -------
     Tuple[torch.Tensor, Optional[torch.Tensor]]
         ``(output, lse)`` where ``output`` has shape
-        ``(total_qo_tokens, num_heads_qo, head_dim_vo)``; ``lse`` has shape
-        ``(batch_size, max_token_per_sequence, num_heads_qo)`` when
-        ``return_lse=True``, else ``None``.
+        ``(total_qo_tokens, num_heads_qo, head_dim_vo)``; ``lse`` is the
+        buffer described under ``lse`` -- packed
+        ``(total_qo_tokens, num_heads_qo)`` unless a padded one was passed in
+        -- when ``return_lse=True``, else ``None``.
 
     Note
     ----
@@ -913,19 +923,31 @@ def cudnn_batch_prefill_with_kv_cache(
     elif v_cache.dim() == 4:
         d_vo = v_cache.shape[3]
 
-    if return_lse:
-        if lse is None:
-            lse = torch.empty(
-                num_sequences,
-                max_token_per_sequence,
-                h_qo,
-                device=q.device,
-                dtype=torch.float32,
-            )
+    use_cudnn_graph = CUDNN_AVAILABLE and backend != "cubin"
 
-    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
+    # The LSE is packed (total_qo_tokens, h_qo) -- FlashInfer's convention, the
+    # shape every other backend returns and the wrappers allocate -- unless the
+    # caller hands in the historical padded (batch, max_token_per_sequence,
+    # h_qo) buffer. The cubin backend writes the padded form only. A packed LSE
+    # is declared to cuDNN as a ragged Stats tensor over the query token
+    # indptr, exactly like the packed q it accompanies.
+    packed_shape = (num_tokens, h_qo)
+    padded_shape = (num_sequences, max_token_per_sequence, h_qo)
+    if return_lse and lse is None:
+        lse = torch.empty(
+            packed_shape if use_cudnn_graph else padded_shape,
+            device=q.device,
+            dtype=torch.float32,
+        )
+    lse_packed = lse is not None and tuple(lse.shape) == packed_shape
+    if lse is not None and not lse_packed and tuple(lse.shape) != padded_shape:
         raise ValueError(
-            "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
+            f"lse must have shape {packed_shape} (packed, one row per query token) "
+            f"or {padded_shape} (padded, one block per request); got {tuple(lse.shape)}"
+        )
+    if lse_packed and not use_cudnn_graph:
+        raise ValueError(
+            f"the cubin backend writes a padded LSE of shape {padded_shape}; got {tuple(lse.shape)}"
         )
 
     if o_data_type is None:
@@ -977,6 +999,31 @@ def cudnn_batch_prefill_with_kv_cache(
             lse=lse,
             o_data_type=o_data_type,
         )
+
+        if return_lse and lse_packed and batch_offsets_stats is None:
+            # Each request's rows of the packed LSE start where its query
+            # tokens start. Token-unit offsets are the q indptr itself (the
+            # graph applies the per-tensor multiplier h_qo); element-unit q
+            # offsets are token_offset * h_qo * d_qk, so the Stats' element
+            # offsets are those divided by d_qk. A single request without
+            # offsets starts at row 0 and spans the buffer.
+            if batch_offsets_q is None:
+                batch_offsets_stats = torch.tensor(
+                    [
+                        0,
+                        num_tokens
+                        if batch_offsets_units == "tokens"
+                        else num_tokens * h_qo,
+                    ],
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+            elif batch_offsets_units == "tokens":
+                batch_offsets_stats = batch_offsets_q
+            else:
+                batch_offsets_stats = torch.div(
+                    batch_offsets_q, d_qk, rounding_mode="floor"
+                )
 
         if batch_offsets_units == "tokens":
             h_kv = k_cache.shape[1]
