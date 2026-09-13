@@ -1,8 +1,8 @@
 # SM120 W4A8 Split Kernel Drop
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
-`hanyueh/sm120-mxfp4mxfp8-split`, commit `ed30d53`, plus the local package rename and decode N16 heuristic
-backport awaiting a source-repository commit.
+`hanyueh/sm120-mxfp4mxfp8-split`, commit
+`0d61c208a1545edd6e18ef16d0cb30d39f4e7ef2`.
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -23,10 +23,6 @@ keeps a separate native Green Context graph because the graph captures that
 layer's weight pointers. Layer execution is sequential, so the graphs safely
 reuse the same physical buffers without multiplying the symmetric heap by the
 model's MoE layer count.
-
-FlashInfer adaptation: `src/token_comm.py` imports `_nanosleep` and
-`spin_wait` from this drop's `moe_sm120_mxfp4mxfp8_split.moe_utils` instead of the
-unrelated `moe_nvfp4_swapab` package. The helper implementations are identical.
 
 `runtime/green_context.py` also injects the native Green Context graph as a
 child node when an outer CUDA stream capture is active. CUDA does not permit a

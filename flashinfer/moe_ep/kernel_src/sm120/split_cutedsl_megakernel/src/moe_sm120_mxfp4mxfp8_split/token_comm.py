@@ -968,7 +968,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 # Rendezvous before publishing fc1_ready_counter so every
                 # lane observes token, scale, weight, and metadata completion.
                 cute.arch.sync_warp()
-                cute.arch.fence_acq_rel_sys()
+                cute.arch.fence_acq_rel_gpu()
                 if cutlass.const_expr(self.comm_backend != "nvshmem_ibgda"):
                     cute.arch.fence_proxy("async.global")
 

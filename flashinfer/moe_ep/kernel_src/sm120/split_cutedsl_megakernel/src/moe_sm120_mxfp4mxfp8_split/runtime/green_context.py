@@ -304,10 +304,13 @@ class NativeGreenContextGraph:
         launch_k1: Callable[[], None],
         launch_k2: Callable[[], None],
         launch_k2_drain: Optional[Callable[[], None]],
+        launch_rank_barrier: Optional[Callable[[], None]],
         launch_k2_finalizer: Optional[Callable[[], None]],
         launch_k3: Optional[Callable[[], None]],
-        launch_reset: Optional[Callable[[], None]],
+        launch_reset: Optional[Callable[[], None]] = None,
+        streaming_k3: bool,
         k1_sm_count: int,
+        k1_grid_blocks: Optional[tuple[int, ...]] = None,
         k2_grid_blocks: Optional[int] = None,
         green_resources: Optional[NativeGreenContextResources] = None,
         device: Optional[int] = None,
@@ -335,6 +338,10 @@ class NativeGreenContextGraph:
         )
         try:
             if launch_reset is not None:
+                # Reset belongs to the same replay DAG as queue publication
+                # and the two worker grids. Capturing it on the root stream
+                # prevents a later replay from reclaiming queue ownership
+                # while an earlier Green-Context consumer is still retiring.
                 with torch.cuda.stream(root_stream):
                     launch_reset()
             capture_ready.record(root_stream)
@@ -346,16 +353,26 @@ class NativeGreenContextGraph:
                 # Same G1 stream: the drain worker begins only after K1 has
                 # released its SM partition.
                 launch_k2_drain()
+            if streaming_k3 and launch_k3 is not None:
+                # Per-row ready flags allow K3 to consume completed source
+                # tokens without a rank-global K2 tail rendezvous.
+                launch_k3()
             k1_done.record(k1_stream)
             k2_done.record(k2_stream)
             root_stream.wait_event(k1_done)
             root_stream.wait_event(k2_done)
+            if launch_rank_barrier is not None:
+                # Capture the EP rendezvous after both Green Context worker
+                # streams have retired and before finalization/K3. Keeping it
+                # in this graph avoids a host-side Green/ordinary-context
+                # submission boundary.
+                launch_rank_barrier()
             if launch_k2_finalizer is not None:
                 # The worker kernels deliberately skip the global tail.
                 # This one-CTA node reuses the original rank barrier/reset
                 # after both shared-queue consumers have drained.
                 launch_k2_finalizer()
-            if launch_k3 is not None:
+            if not streaming_k3 and launch_k3 is not None:
                 launch_k3()
             (graph,) = _check_cuda(
                 cudart.cudaStreamEndCapture(raw_root),
@@ -370,6 +387,8 @@ class NativeGreenContextGraph:
         k1_handles = cls._function_handles(k1_executor)
         if k2_drain_executor is not None:
             k1_handles.update(cls._function_handles(k2_drain_executor))
+        if streaming_k3 and k3_executor is not None:
+            k1_handles.update(cls._function_handles(k3_executor))
         k2_handles = cls._function_handles(k2_executor)
         if k1_handles and k2_handles and k1_handles & k2_handles:
             _check_cuda(cuda.cuGraphDestroy(graph), "cuGraphDestroy")
@@ -418,6 +437,10 @@ class NativeGreenContextGraph:
                 green_resources.execution_contexts[0],
                 green_resources.execution_contexts[3],
             ]
+        if k1_grid_blocks is None:
+            k1_grid_blocks = (k1_sm_count,)
+        if not k1_grid_blocks or min(k1_grid_blocks) <= 0:
+            raise ValueError("k1_grid_blocks must contain positive grid sizes")
         if k2_grid_blocks is None:
             k2_grid_blocks = k2_sm_count
         if k2_grid_blocks <= 0:
@@ -482,10 +505,11 @@ class NativeGreenContextGraph:
                 else:
                     # Public CuTeDSL 4.6 uses a CUDA-dialect host shim whose
                     # executor does not expose CUfunction handles. K1/K2 are
-                    # persistent cluster=1 kernels, so their captured grid
-                    # volumes are exactly their disjoint SM allocations.
+                    # persistent cluster=1 kernels. Explicit grid sets cover
+                    # auxiliary workers such as a 2-CTA/SM K2 drain launched
+                    # on the released K1 Green Context.
                     context_index = (
-                        0 if grid_blocks == k1_sm_count
+                        0 if grid_blocks in k1_grid_blocks
                         else 1
                         if grid_blocks == k2_grid_blocks
                         else None

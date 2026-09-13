@@ -151,6 +151,7 @@ class _CompiledSplit:
     runtime_k2: dict[str, Any]
     runtime_k2_drain: dict[str, Any] | None
     runtime_k2_finalizer: dict[str, Any] | None
+    graph_owns_epoch_reset: bool
 
 
 @dataclass
@@ -555,6 +556,9 @@ class MegaMoESm120W4A8Frontend:
                     max_active_clusters=k2_drain_launch_clusters,
                 ),
             )
+        k1_graph_grid_blocks = [spec.kernel.k1_sms]
+        if k2_drain_launch_clusters > 0:
+            k1_graph_grid_blocks.append(k2_drain_launch_clusters)
 
         if bundle.k2_finalizer is not None:
             runtime_finalizer = dict(base_runtime, stream=root_cuda)
@@ -586,6 +590,9 @@ class MegaMoESm120W4A8Frontend:
             compiled_finalizer.to(None) if compiled_finalizer else None
         )
         k3_executor = compiled_k3.to(None)
+        graph_owns_epoch_reset = (
+            spec.kernel.k2_tail_reclaim or finalizer_executor is not None
+        )
         all_kernels_ready = time.monotonic()
         graph = NativeGreenContextGraph.capture(
             root_stream=root_stream,
@@ -602,14 +609,21 @@ class MegaMoESm120W4A8Frontend:
                 if drain_executor is not None
                 else None
             ),
+            launch_rank_barrier=None,
             launch_k2_finalizer=(
                 (lambda: finalizer_executor(**runtime_finalizer))
                 if finalizer_executor is not None
                 else None
             ),
             launch_k3=lambda: k3_executor(**runtime_k3),
-            launch_reset=lambda: self._reset_execution(execution),
+            launch_reset=(
+                (lambda: self._reset_execution(execution))
+                if graph_owns_epoch_reset
+                else None
+            ),
+            streaming_k3=False,
             k1_sm_count=spec.kernel.k1_sms,
+            k1_grid_blocks=tuple(k1_graph_grid_blocks),
             k2_grid_blocks=k2_launch_clusters,
         )
         graph_captured = time.monotonic()
@@ -641,6 +655,7 @@ class MegaMoESm120W4A8Frontend:
             runtime_k2=runtime_k2,
             runtime_k2_drain=runtime_drain,
             runtime_k2_finalizer=runtime_finalizer,
+            graph_owns_epoch_reset=graph_owns_epoch_reset,
         )
         return self._compiled
 
@@ -660,6 +675,8 @@ class MegaMoESm120W4A8Frontend:
 
     def run(self, inputs: MegaMoESm120W4A8Inputs) -> torch.Tensor:
         compiled = self._ensure_compiled(inputs)
+        if not compiled.graph_owns_epoch_reset:
+            self._reset_execution(compiled.execution)
         compiled.graph.launch(torch.cuda.current_stream())
         return inputs.output
 

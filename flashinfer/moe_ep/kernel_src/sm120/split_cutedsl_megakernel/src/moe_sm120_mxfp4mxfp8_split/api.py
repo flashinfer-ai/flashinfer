@@ -25,8 +25,9 @@ from .jit_config import Sm120JitConfig
 # Bump for every generated-kernel code path or opaque workspace change. This
 # Revision 23 adds the 320-row DP4 decode specialization. The bucket is part
 # of the problem record, while the ABI bump also invalidates any standalone
-# 320-row artifacts compiled with the former N64 heuristic.
-KERNEL_CACHE_ABI = 23
+# 320-row artifacts compiled with the former N64 heuristic. Revision 25
+# narrows rank-local synchronization and removes tail-off graph reset nodes.
+KERNEL_CACHE_ABI = 25
 
 
 @dataclass(frozen=True)

@@ -1368,21 +1368,23 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             fc2_output_workspace_native = self._view_local(
                 local_workspace, "fc2_output_workspace",
             )
-            fc2_output_workspace_u8 = self._make_typed_view(
-                local_workspace,
-                self._local_offsets["fc2_output_workspace"],
-                cutlass.Uint8,
-                (pool_token_capacity * self.hidden * (
-                    int(self.fc2_output_dtype.width) // 8
-                ),),
-                None,
-                self._local_region_by_name["fc2_output_workspace"].align,
+            # Token communication needs only byte-addressable base pointers.
+            # A full Uint8 view can exceed CuTe's signed 32-bit layout-size
+            # limit at large token counts, so keep a one-element pointer view
+            # and perform every byte offset explicitly in Int64.
+            fc2_output_workspace_u8 = cute.make_tensor(
+                cute.recast_ptr(
+                    fc2_output_workspace_native.iterator,
+                    dtype=cutlass.Uint8,
+                ),
+                cute.make_layout(1),
             )
             fc2_done_counter = self._view_local(
                 local_workspace, "fc2_done_counter",
             )
-            combine_output_u8 = cute.recast_tensor(
-                combine_output, cutlass.Uint8,
+            combine_output_u8 = cute.make_tensor(
+                cute.recast_ptr(combine_output.iterator, dtype=cutlass.Uint8),
+                cute.make_layout(1),
             )
         else:
             fc2_output_workspace_native = None
