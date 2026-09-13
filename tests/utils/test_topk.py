@@ -3235,6 +3235,9 @@ def test_cub_topk_physical_width(api, algo, dtype, width, k, set_topk_algo):
         # padding sentinel. LARGE must not select synthetic padded positions.
         scores[:, 0] = float("-inf")
         scores[:, -1] = float("inf")
+    storage = torch.empty((num_rows, width + 2), device="cuda", dtype=dtype)
+    storage[:, 1 : width + 1].copy_(scores)
+    scores = storage[:, 1 : width + 1]
     lengths = torch.tensor([width, 17, 0, width], device="cuda", dtype=torch.int32)
     offsets = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32) * 100000
     page_width = (width + page_size - 1) // page_size
@@ -3344,8 +3347,12 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
     set_topk_algo("cub")
     num_rows, page_size = 4, 64
     scores = (torch.arange(width, device="cuda") % 7).to(dtype).repeat(num_rows, 1)
-    short_lengths = [64, 17, 1, 0]
-    long_lengths = [width] * num_rows
+    window_start = 0 if api == "top_k" else 5
+    max_length = width - window_start
+    row_starts = torch.full((num_rows,), window_start, device="cuda", dtype=torch.int32)
+    page_table_row_starts = torch.zeros_like(row_starts)
+    short_lengths = [min(64, max_length), 17, 1, 0]
+    long_lengths = [max_length] * num_rows
     capture_lengths = short_lengths if capture_length == "short" else long_lengths
     if capture_length == "short":
         assert max(capture_lengths) < k
@@ -3371,13 +3378,15 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
                 lengths,
                 k,
                 page_size=page_size,
+                row_starts=row_starts,
+                page_table_row_starts=page_table_row_starts,
                 out=out,
                 out_raw_indices=raw,
                 **kwargs,
             )
         elif api == "ragged":
             return flashinfer.top_k_ragged_transform(
-                scores, offsets, lengths, k, **kwargs
+                scores, offsets, lengths, k, row_starts=row_starts, **kwargs
             )
         raise AssertionError(f"Unexpected API: {api}")
 
@@ -3390,7 +3399,9 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
                 length
                 - 1
                 - torch.argsort(
-                    scores[row, :length].flip(0), descending=True, stable=True
+                    scores[row, window_start : window_start + length].flip(0),
+                    descending=True,
+                    stable=True,
                 )[:valid]
             )
             if api == "top_k":
@@ -3426,7 +3437,7 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
         replay_lengths = [capture_lengths, capture_lengths]
     else:
         opposite_lengths = long_lengths if capture_length == "short" else short_lengths
-        boundary_lengths = [0, min(width, k - 1), min(width, k), min(width, k + 1)]
+        boundary_lengths = [0] + [min(max_length, n) for n in (k - 1, k, k + 1)]
         replay_lengths = [
             capture_lengths,
             opposite_lengths,
