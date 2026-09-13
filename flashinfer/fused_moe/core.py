@@ -1322,6 +1322,7 @@ def cutlass_fused_moe(
     *,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
+    backend: str = "cutlass",
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1514,7 +1515,18 @@ def cutlass_fused_moe(
     - It implements both tensor parallelism and expert parallelism.
     - Currently, some advanced features like FP8 block scaling and minimum latency mode
         are not implemented for Blackwell architecture.
+
+    backend : str
+        ``"cutlass"`` preserves the existing backend. ``"cake"`` selects the
+        prepared TP8-local SiTU complete call; output and workspace are required.
+        See the Cake SiTU guide for its TRTLLM shuffled NVFP4 weight layout.
     """
+    if backend == "cake":
+        from .cake_kimi_k3_situ import _cake_situ_fused_moe
+
+        return _cake_situ_fused_moe(locals())
+    if backend != "cutlass":
+        raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     major, minor = get_compute_capability(input.device)
     device_arch = f"{major * 10 + minor}"
 
@@ -1617,6 +1629,7 @@ def cutlass_fused_moe_workspace_size(
     use_packed_weights: bool = False,
     use_wfp4afp8_humming: bool = False,
     device: Optional[torch.device] = None,
+    backend: str = "cutlass",
 ) -> int:
     """Return the workspace buffer size in bytes required by :func:`cutlass_fused_moe`.
 
@@ -1654,7 +1667,17 @@ def cutlass_fused_moe_workspace_size(
     ----
     Allocate one workspace buffer per CUDA stream context.  Overlapping
     micro-batches on separate streams each need their own buffer.
+
+    backend : str
+        ``"cake"`` returns the prepared SiTU scratch size using host metadata
+        only. It requires BF16/uint8, TP8, SiTU and the documented fixed geometry.
     """
+    if backend == "cake":
+        from .cake_kimi_k3_situ import _cake_situ_workspace_size
+
+        return _cake_situ_workspace_size(locals())
+    if backend != "cutlass":
+        raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     if max_num_tokens <= 0:
         raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
     if hidden_size <= 0:
@@ -7841,3 +7864,6 @@ def trtllm_mxint4_block_scale_routed_moe(
         valid_hidden_size,
         valid_intermediate_size,
     )
+
+
+from .cake_kimi_k3_situ import cutlass_fused_moe_prepare_workspace  # noqa: E402,F401
