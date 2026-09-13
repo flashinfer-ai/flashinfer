@@ -130,8 +130,8 @@ constexpr int64_t kDescriptorCount = 3;
 constexpr int32_t kMainThreads = 192;
 constexpr int32_t kMainSmemBytes = CAKE_MAIN_SMEM_BYTES;
 constexpr uint32_t kFusedPeerCopyCtas = CAKE_FUSED_PEER_COPY_CTAS;
-constexpr bool kPackedQkvExperimentSupported =
-    CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED;
+constexpr bool kSm103PackedQkvSpecialization =
+    CAKE_SM103_PACKED_QKV_SPECIALIZATION;
 
 static_assert(sizeof(CUtensorMap) == 128);
 
@@ -329,16 +329,14 @@ inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code,
   TVM_FFI_CHECK(n == 1280 || n == 2048 || n == 2560, ValueError)
       << "n must be 1280, 2048, or 2560";
   if (n == 2560) {
-    TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 4 &&
+    TVM_FFI_CHECK(kSm103PackedQkvSpecialization && world_size == 4 &&
                       dtype_code == 0,
                   ValueError)
         << "the packed-QKV experiment requires SM103, world_size=4, and bfloat16";
   }
   if (n == 1280) {
-    TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 8 &&
-                      dtype_code == 0,
-                  ValueError)
-        << "N=1280 requires the SM103, world_size=8, bfloat16 packed-QKV route";
+    TVM_FFI_CHECK(world_size == 8 && dtype_code == 0, ValueError)
+        << "N=1280 requires the world_size=8, bfloat16 packed-QKV route";
   }
   static auto bf16_ws2 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
       CAKE_MODULE_IDENT,
@@ -470,7 +468,8 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
   const uint32_t grid_x =
       static_cast<uint32_t>((chunk_rows / 128) * (n / 256));
   const uint32_t grid_y =
-      static_cast<uint32_t>(world_size == 8 && rows == 512 && n == 1280 ? 4 : 1);
+      static_cast<uint32_t>(kSm103PackedQkvSpecialization && world_size == 8 &&
+                            rows == 512 && n == 1280 ? 4 : 1);
   CUstream stream = reinterpret_cast<CUstream>(
       static_cast<uintptr_t>(cuda_stream));
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
@@ -544,12 +543,12 @@ void RunPreparedPackedQkvImpl(
                 TypeError)
       << "flag_peers must have int64 dtype";
   TVM_FFI_CHECK(
-      kPackedQkvExperimentSupported &&
-          ((world_size == 4 && weight.size(1) == 2560) ||
-           (world_size == 8 && weight.size(1) == 1280)),
+      ((kSm103PackedQkvSpecialization && world_size == 4 &&
+        weight.size(1) == 2560) ||
+       (world_size == 8 && weight.size(1) == 1280)),
       ValueError)
-      << "prepared packed-QKV launch requires SM103 and exact profile "
-         "world_size=4,N=2560 or world_size=8,N=1280";
+      << "prepared packed-QKV launch requires SM100/SM103 world_size=8,N=1280 "
+         "or SM103 world_size=4,N=2560";
   TVM_FFI_CHECK(rank >= 0 && rank < world_size, ValueError)
       << "rank is outside the process group";
   TVM_FFI_CHECK(flag_peers.ndim() == 1 &&
@@ -636,7 +635,7 @@ void RunPreparedPackedQkvImpl(
   }
 
   if (fused != nullptr) {
-    TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 8 &&
+    TVM_FFI_CHECK(kSm103PackedQkvSpecialization && world_size == 8 &&
                       rows == 512 && weight.size(1) == 1280, ValueError)
         << "fused peer copy requires exact SM103 TP8 M512 N1280";
     const std::array<const TensorView*, 3> buffers = {
@@ -1024,11 +1023,12 @@ def _constraints_for_arch(arch: str) -> dict[str, Any]:
         },
         "world_sizes": list(_COMMON_CONSTRAINTS["world_sizes"]),
     }
-    if arch == "sm_103a":
-        constraints["prepared_packed_qkv"] = {
-            "dtypes": ["bfloat16"],
-            "n_by_world_size": {"4": [2560], "8": [1280]},
-        }
+    constraints["prepared_packed_qkv"] = {
+        "dtypes": ["bfloat16"],
+        "n_by_world_size": (
+            {"4": [2560], "8": [1280]} if arch == "sm_103a" else {"8": [1280]}
+        ),
+    }
     return constraints
 
 
@@ -1043,7 +1043,7 @@ def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
         .replace("CAKE_MAIN_SMEM_BYTES", str(main_smem_bytes))
         .replace("CAKE_FUSED_PEER_COPY_CTAS", str(_FUSED_PEER_COPY_CTAS))
         .replace(
-            "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED",
+            "CAKE_SM103_PACKED_QKV_SPECIALIZATION",
             "true" if manifest["arch"] == "sm_103a" else "false",
         )
     )
@@ -1053,7 +1053,7 @@ def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
             "CAKE_MODULE_IDENT",
             "CAKE_MAIN_SMEM_BYTES",
             "CAKE_FUSED_PEER_COPY_CTAS",
-            "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED",
+            "CAKE_SM103_PACKED_QKV_SPECIALIZATION",
         )
     ):
         raise RuntimeError("Cake all-gather matmul host launch template is incomplete")
@@ -1265,8 +1265,12 @@ def _validate_inputs(
             "the Cake backend requires the NVSHMEM symmetric-memory backend"
         )
     arch = _target_arch(inp.device)
-    if packed_qkv_experiment and (arch != "sm_103a" or inp.dtype != torch.bfloat16):
-        raise ValueError("the packed-QKV experiment requires SM103 and bfloat16")
+    if packed_qkv_experiment and (
+        inp.dtype != torch.bfloat16 or (world_size == 4 and arch != "sm_103a")
+    ):
+        raise ValueError(
+            "packed-QKV requires bfloat16 and SM100/SM103 TP8 or SM103 TP4"
+        )
     return device_index, rank, world_size, _group_name(group)
 
 
@@ -1281,13 +1285,15 @@ def _ensure_launch_state(
 ) -> None:
     if state.flags is not None:
         return
-    flags = symm_mem.empty(2, dtype=torch.uint32, device=device_index)
+    # Two phase epochs followed by two world-sized mailbox banks per phase.
+    flag_slots = 2 + 4 * world_size
+    flags = symm_mem.empty(flag_slots, dtype=torch.uint32, device=device_index)
     handle = symm_mem.rendezvous(flags, group=group_name)
     if int(handle.rank) != rank or int(handle.world_size) != world_size:
         raise RuntimeError("barrier symmetric-memory topology does not match group")
     flags.zero_()
     peer_ptrs = [
-        int(handle.get_buffer(peer, (2,), torch.uint32, 0).data_ptr())
+        int(handle.get_buffer(peer, (flag_slots,), torch.uint32, 0).data_ptr())
         for peer in range(world_size)
     ]
     state.flags = flags
@@ -1463,7 +1469,7 @@ def _validate_prepared_view(
 
 
 @dataclass(frozen=True)
-class _PreparedPackedQkvSm103Launcher:
+class _PreparedPackedQkvLauncher:
     group: dist.ProcessGroup = field(repr=False)
     group_id: int
     group_name: str
@@ -1607,14 +1613,14 @@ class _PreparedPackedQkvSm103Launcher:
                 raise
 
 
-def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
+def _prepare_all_gather_matmul_cake_packed_qkv(
     inp: torch.Tensor,
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
     verbose: bool = False,
-) -> _PreparedPackedQkvSm103Launcher:
-    """Bind immutable host state for an exact SM103/BF16 packed-QKV route."""
+) -> _PreparedPackedQkvLauncher:
+    """Bind BF16 packed QKV for SM100/SM103 TP8 or SM103 TP4."""
 
     device_index, rank, world_size, group_name = _validate_inputs(
         inp, w, group, packed_qkv_experiment=True
@@ -1772,7 +1778,12 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
                 weight_fingerprint=weight_fingerprint,
             )
             native_bound = None
-            if world_size == 8 and rows == 512 and int(w.shape[1]) == 1280:
+            if (
+                arch == "sm_103a"
+                and world_size == 8
+                and rows == 512
+                and int(w.shape[1]) == 1280
+            ):
                 if workspace.fused_copy_buffers is None:
                     if state.initialization_event is not None:
                         main_stream.wait_event(state.initialization_event)
@@ -1800,7 +1811,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
                     int(signal_pad.data_ptr()),
                     *native_expected_peer_args,
                 )
-            launcher = _PreparedPackedQkvSm103Launcher(
+            launcher = _PreparedPackedQkvLauncher(
                 group=group,
                 group_id=id(group),
                 group_name=group_name,

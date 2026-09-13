@@ -28,6 +28,14 @@ struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
+
+// Keep the exported descriptor ABI independent of the CUDA header alignment.
+struct alignas(128) FlashInferTensorMap {
+  CUtensorMap value;
+};
+static_assert(sizeof(FlashInferTensorMap) == 128, "CUtensorMap ABI size must remain 128 bytes");
+static_assert(alignof(FlashInferTensorMap) == 128, "CUtensorMap ABI alignment must remain 128 bytes");
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -81,9 +89,6 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
-// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
-// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
-
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
     uint32_t ticks = 0x989680;
     asm volatile(
@@ -97,6 +102,23 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+}
+
+// Source-faithful relaxed CTA wait used only by a typed protocol that does
+// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
+
+__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, 10000000;\n\t"
+        "@P1 bra.uni DONE_RELAXED;\n\t"
+        "bra.uni LAB_WAIT_RELAXED;\n\t"
+        "DONE_RELAXED:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
 // Exact source ports may request the PTX suspendTimeHint operand explicitly.
@@ -324,7 +346,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -343,41 +365,52 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0(int32_t pg_world, int32_t
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (elect_sync()) {
-        // nvlink_barrier(pg_flags) phase=0
-        {
-            const int __ws = pg_world;
-            const int __me = pg_rank;
-            const int __slot = 0;
-            unsigned* __local_flag = pg_flags[__me] + __slot;
-            unsigned __old_sense = 0u;
-            const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+    // nvlink_barrier(pg_flags) phase=0 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 0;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            for (int __r = 0; __r < __ws; ++__r) {
-                unsigned* __peer_flag = pg_flags[__r] + __slot;
-                unsigned __old_peer;
-                asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                    : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                if (__r == __me) __old_sense = __old_peer;
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
+                }
+                asm volatile("fence.proxy.alias;" ::: "memory");
             }
-            asm volatile("fence.proxy.alias;" ::: "memory");
-            while (true) {
-                unsigned __v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
-            }
+            __syncwarp();
             asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
+            }
         }
     }
 }
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -396,41 +429,52 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1(int32_t pg_world, int32_t
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (elect_sync()) {
-        // nvlink_barrier(pg_flags) phase=1
-        {
-            const int __ws = pg_world;
-            const int __me = pg_rank;
-            const int __slot = 1;
-            unsigned* __local_flag = pg_flags[__me] + __slot;
-            unsigned __old_sense = 0u;
-            const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+    // nvlink_barrier(pg_flags) phase=1 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 1;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            for (int __r = 0; __r < __ws; ++__r) {
-                unsigned* __peer_flag = pg_flags[__r] + __slot;
-                unsigned __old_peer;
-                asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                    : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                if (__r == __me) __old_sense = __old_peer;
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
+                }
+                asm volatile("fence.proxy.alias;" ::: "memory");
             }
-            asm volatile("fence.proxy.alias;" ::: "memory");
-            while (true) {
-                unsigned __v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
-            }
+            __syncwarp();
             asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
+            }
         }
     }
 }
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -449,41 +493,52 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0(int32_t pg_world, int32_t
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (elect_sync()) {
-        // nvlink_barrier(pg_flags) phase=0
-        {
-            const int __ws = pg_world;
-            const int __me = pg_rank;
-            const int __slot = 0;
-            unsigned* __local_flag = pg_flags[__me] + __slot;
-            unsigned __old_sense = 0u;
-            const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+    // nvlink_barrier(pg_flags) phase=0 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 0;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            for (int __r = 0; __r < __ws; ++__r) {
-                unsigned* __peer_flag = pg_flags[__r] + __slot;
-                unsigned __old_peer;
-                asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                    : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                if (__r == __me) __old_sense = __old_peer;
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
+                }
+                asm volatile("fence.proxy.alias;" ::: "memory");
             }
-            asm volatile("fence.proxy.alias;" ::: "memory");
-            while (true) {
-                unsigned __v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
-            }
+            __syncwarp();
             asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
+            }
         }
     }
 }
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -502,41 +557,52 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1(int32_t pg_world, int32_t
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (elect_sync()) {
-        // nvlink_barrier(pg_flags) phase=1
-        {
-            const int __ws = pg_world;
-            const int __me = pg_rank;
-            const int __slot = 1;
-            unsigned* __local_flag = pg_flags[__me] + __slot;
-            unsigned __old_sense = 0u;
-            const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+    // nvlink_barrier(pg_flags) phase=1 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 1;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            for (int __r = 0; __r < __ws; ++__r) {
-                unsigned* __peer_flag = pg_flags[__r] + __slot;
-                unsigned __old_peer;
-                asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                    : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                if (__r == __me) __old_sense = __old_peer;
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
+                }
+                asm volatile("fence.proxy.alias;" ::: "memory");
             }
-            asm volatile("fence.proxy.alias;" ::: "memory");
-            while (true) {
-                unsigned __v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
-            }
+            __syncwarp();
             asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
+            }
         }
     }
 }
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -555,41 +621,52 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p0(int32_t pg_world, int32_t
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (elect_sync()) {
-        // nvlink_barrier(pg_flags) phase=0
-        {
-            const int __ws = pg_world;
-            const int __me = pg_rank;
-            const int __slot = 0;
-            unsigned* __local_flag = pg_flags[__me] + __slot;
-            unsigned __old_sense = 0u;
-            const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+    // nvlink_barrier(pg_flags) phase=0 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 0;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (0 * 2 + __bank) * __ws;
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            for (int __r = 0; __r < __ws; ++__r) {
-                unsigned* __peer_flag = pg_flags[__r] + __slot;
-                unsigned __old_peer;
-                asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                    : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                if (__r == __me) __old_sense = __old_peer;
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
+                }
+                asm volatile("fence.proxy.alias;" ::: "memory");
             }
-            asm volatile("fence.proxy.alias;" ::: "memory");
-            while (true) {
-                unsigned __v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
-            }
+            __syncwarp();
             asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
+            }
         }
     }
 }
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 
@@ -608,41 +685,52 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1(int32_t pg_world, int32_t
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    if (elect_sync()) {
-        // nvlink_barrier(pg_flags) phase=1
-        {
-            const int __ws = pg_world;
-            const int __me = pg_rank;
-            const int __slot = 1;
-            unsigned* __local_flag = pg_flags[__me] + __slot;
-            unsigned __old_sense = 0u;
-            const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+    // nvlink_barrier(pg_flags) phase=1 owner_warp=0
+    {
+        const int __ws = pg_world;
+        const int __me = pg_rank;
+        const int __warp = warp;
+        const int __lane = lane;
+        if (__warp == 0) {
+            unsigned* __local_epoch = pg_flags[__me] + 1;
+            unsigned __previous_epoch;
+            asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                : "=r"(__previous_epoch) : "l"(__local_epoch) : "memory");
+            const unsigned __epoch = __previous_epoch + 1u;
+            const int __bank = (int)(__epoch & 1u);
+            const int __mailbox_base = 2 + (1 * 2 + __bank) * __ws;
             asm volatile("fence.proxy.async.global;" ::: "memory");
-            for (int __r = 0; __r < __ws; ++__r) {
-                unsigned* __peer_flag = pg_flags[__r] + __slot;
-                unsigned __old_peer;
-                asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                    : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                if (__r == __me) __old_sense = __old_peer;
+            if (__lane < __ws) {
+                unsigned* __peer_mailbox = pg_flags[__lane] + __mailbox_base + __me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__peer_mailbox), "r"(__epoch) : "memory");
+                unsigned* __local_mailbox = pg_flags[__me] + __mailbox_base + __lane;
+                while (true) {
+                    unsigned __v;
+                    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v != __epoch) continue;
+                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_mailbox) : "memory");
+                    if (__v == __epoch) break;
+                }
+                asm volatile("fence.proxy.alias;" ::: "memory");
             }
-            asm volatile("fence.proxy.alias;" ::: "memory");
-            while (true) {
-                unsigned __v;
-                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
-            }
+            __syncwarp();
             asm volatile("fence.proxy.async.global;" ::: "memory");
+            if (__lane == 0) {
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_epoch), "r"(__epoch) : "memory");
+            }
         }
     }
 }
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -659,7 +747,7 @@ kernel_cake_blackwell_all_gather_matmul_barrier_ws8_p1(int32_t pg_world, int32_t
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_blackwell_all_gather_matmul_float16_ws2(FlashInferTensorMap const* A_local, FlashInferTensorMap const* A_scratch, FlashInferTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -727,6 +815,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -931,7 +1020,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -951,7 +1040,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -968,7 +1057,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws2(CakeTensorMap const* A_local
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(FlashInferTensorMap const* A_local, FlashInferTensorMap const* A_scratch, FlashInferTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1036,6 +1125,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -1240,7 +1330,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -1260,7 +1350,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -1277,7 +1367,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2(CakeTensorMap const* A_loca
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_blackwell_all_gather_matmul_float16_ws4(FlashInferTensorMap const* A_local, FlashInferTensorMap const* A_scratch, FlashInferTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1345,6 +1435,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -1549,7 +1640,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -1569,7 +1660,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -1586,7 +1677,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws4(CakeTensorMap const* A_local
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(FlashInferTensorMap const* A_local, FlashInferTensorMap const* A_scratch, FlashInferTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1654,6 +1745,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -1858,7 +1950,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -1878,7 +1970,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -1895,7 +1987,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_blackwell_all_gather_matmul_float16_ws8(FlashInferTensorMap const* A_local, FlashInferTensorMap const* A_scratch, FlashInferTensorMap const* B, __half* __restrict__ C, __half* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1963,6 +2055,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -2167,7 +2260,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -2187,7 +2280,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACCUM_OFFSET 0
 #define NUM_TMA_PIPE_STAGES 4
@@ -2204,7 +2297,7 @@ kernel_cake_blackwell_all_gather_matmul_float16_ws8(CakeTensorMap const* A_local
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_local, CakeTensorMap const* A_scratch, CakeTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
+kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(FlashInferTensorMap const* A_local, FlashInferTensorMap const* A_scratch, FlashInferTensorMap const* B, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ scratch_payload, unsigned int* __restrict__ ready, unsigned int ready_target, int rank, int M)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -2272,6 +2365,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
     if (warp == 0) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
@@ -2476,7 +2570,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAINLOOP_PIPE_STAGES
 #undef NUM_TMA_PIPE_STAGES
 #undef SMEM_SMEM_A_OFF
@@ -2496,7 +2590,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws8(CakeTensorMap const* A_loca
 #undef smem_b_addr
 #undef tma_full_addr
 
-#define CAKE_INF CUDART_INF_F
+#define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 128
 
@@ -2541,6 +2635,6 @@ kernel_cake_blackwell_all_gather_matmul_fused_peer_copy(unsigned int* __restrict
 
 } // extern "C"
 
-#undef CAKE_INF
+#undef FLASHINFER_INF
 #undef NUM_MAIN_STAGES
 #undef THREADS

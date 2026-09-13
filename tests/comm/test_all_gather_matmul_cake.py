@@ -101,9 +101,9 @@ def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
     rendered = backend._render_host_source("test_module", manifest)
 
     assert "constexpr int32_t kMainSmemBytes = 197632;" in rendered
-    assert "kPackedQkvExperimentSupported =\n    false;" in rendered
+    assert "kSm103PackedQkvSpecialization =\n    false;" in rendered
     assert "CAKE_MAIN_SMEM_BYTES" not in rendered
-    assert "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED" not in rendered
+    assert "CAKE_SM103_PACKED_QKV_SPECIALIZATION" not in rendered
     assert "main_cuda_stream != 0" not in rendered
     assert "comm_cuda_stream != 0 && bridge_cuda_event != 0" in rendered
     assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 6
@@ -144,8 +144,9 @@ def test_host_prepared_launcher_has_fixed_tp8_peer_abi(tmp_path, monkeypatch):
     assert "std::array<const TensorView*, 7> peer_signal" in rendered
     assert "std::array<int64_t, 7> expected_peer_scratch" in rendered
     assert "std::array<int64_t, 7> expected_peer_signal" in rendered
-    assert "world_size == 4 && weight.size(1) == 2560" in rendered
-    assert "world_size == 8 && weight.size(1) == 1280" in rendered
+    normalized = " ".join(rendered.split())
+    assert "world_size == 4 && weight.size(1) == 2560" in normalized
+    assert "world_size == 8 && weight.size(1) == 1280" in normalized
     assert "int64_t ready_target, int64_t main_cuda_stream" in rendered
     assert "static_cast<uint32_t>(ready_target)" in rendered
     assert "cuMemsetD32Async" not in rendered
@@ -176,7 +177,7 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
         source.count(b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };")
         == 1
     )
-    assert source.count(b"CakeTensorMap const*") == 18
+    assert source.count(b"FlashInferTensorMap const*") == 18
     assert backend._resolved_main_smem_bytes(source) == 197632
     if arch == "sm_103a":
         assert manifest["launch"]["main"]["grid_y"] == (
@@ -212,16 +213,16 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
     }
     assert manifest["launch"]["main"]["grid_x"] == ("(min(M, 2432) / 128) * (N / 256)")
     rendered = backend._render_host_source("test_module", manifest)
-    assert "kPackedQkvExperimentSupported =\n    true;" in rendered
-    assert (
-        "kPackedQkvExperimentSupported && world_size == 8 &&\n"
-        "                      dtype_code == 0" in rendered
-    )
+    assert "kSm103PackedQkvSpecialization =\n    true;" in rendered
+    assert "world_size == 8 && dtype_code == 0" in rendered
 
     _, sm100_manifest = backend._program_source("sm_100a")
-    assert "prepared_packed_qkv" not in sm100_manifest["constraints"]
+    assert sm100_manifest["constraints"]["prepared_packed_qkv"] == {
+        "dtypes": ["bfloat16"],
+        "n_by_world_size": {"8": [1280]},
+    }
     sm100_rendered = backend._render_host_source("test_module", sm100_manifest)
-    assert "kPackedQkvExperimentSupported =\n    false;" in sm100_rendered
+    assert "kSm103PackedQkvSpecialization =\n    false;" in sm100_rendered
 
 
 @pytest.mark.parametrize(
@@ -748,7 +749,7 @@ def test_ensure_launch_state_records_initialization_after_device_state(monkeypat
         world_size = 4
 
         def get_buffer(self, peer, shape, dtype, offset):
-            assert shape == (2,)
+            assert shape == (18,)
             assert dtype == torch.uint32
             assert offset == 0
             return FakePeer(1000 + peer)
@@ -936,14 +937,20 @@ def test_validate_inputs_keeps_packed_qkv_routes_private(
         inp, weight, subgroup, packed_qkv_experiment=True
     ) == (3, rank, world_size, "tp-group")
     assert "_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
-    assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103" not in backend.__all__
+    assert "_prepare_all_gather_matmul_cake_packed_qkv" not in backend.__all__
 
 
 @pytest.mark.parametrize(
     ("arch", "dtype", "world_size", "n", "message"),
     [
-        ("sm_100a", torch.bfloat16, 4, 2560, "requires SM103 and bfloat16"),
-        ("sm_103a", torch.float16, 4, 2560, "requires SM103 and bfloat16"),
+        (
+            "sm_100a", torch.bfloat16, 4, 2560,
+            "requires bfloat16 and SM100/SM103 TP8 or SM103 TP4",
+        ),
+        (
+            "sm_103a", torch.float16, 4, 2560,
+            "requires bfloat16 and SM100/SM103 TP8 or SM103 TP4",
+        ),
         ("sm_103a", torch.bfloat16, 2, 2560, "requires exact K=8192"),
         ("sm_103a", torch.bfloat16, 4, 1280, "requires exact K=8192"),
         ("sm_103a", torch.bfloat16, 8, 2560, "requires exact K=8192"),
@@ -1149,7 +1156,7 @@ def _fake_prepared_packed_qkv(
             descriptor_entry,
         )[1],
     )
-    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv_sm103(
+    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv(
         inp, weight, group
     )
     calls = SimpleNamespace(
@@ -1242,7 +1249,7 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert calls.arch == [torch.device("cuda:3")]
     assert calls.module == ["sm_103a"]
     assert len(calls.descriptor) == 1
-    assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103" not in backend.__all__
+    assert "_prepare_all_gather_matmul_cake_packed_qkv" not in backend.__all__
     with pytest.raises(AttributeError):
         launcher.peer_routes = ()
 
