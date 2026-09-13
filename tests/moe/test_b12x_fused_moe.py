@@ -329,8 +329,9 @@ def test_static_workspace_uses_disjoint_route_output_scratch():
 
 
 @cute_dsl_available
-def test_static_workspace_pads_odd_retained_group_geometry():
-    """Five N128 slices are padded to six before retained2 scheduling."""
+def test_static_workspace_rounds_odd_retained_group_count_up():
+    """Five N128 slices keep their native extent; retained2 rounds the
+    group count up so the phantom sixth slice has a route-scratch slot."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     workspace = moe_dispatch.allocate_sm120_static_workspace(
@@ -344,7 +345,7 @@ def test_static_workspace_pads_odd_retained_group_geometry():
         quant_mode="nvfp4",
     )
 
-    assert workspace.n == 768
+    assert workspace.n == 640
     assert workspace.route_output_scratch.shape == (8, 3, 256)
 
 
@@ -905,13 +906,13 @@ def test_wrapper_cuda_graph_capture_requires_preallocated_buffers(monkeypatch):
     moe = b12x_moe_mod.B12xMoEWrapper(
         num_experts=1,
         top_k=1,
-        hidden_size=16,
+        hidden_size=128,
         intermediate_size=16,
         use_cuda_graph=False,
     )
     monkeypatch.setattr(b12x_moe_mod, "_is_cuda_graph_capturing", lambda: True)
 
-    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    x = torch.empty((1, 128), dtype=torch.bfloat16)
     weight = torch.empty((1, 1, 1), dtype=torch.uint8)
     scale = torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn)
     alpha = torch.ones((1,), dtype=torch.float32)
