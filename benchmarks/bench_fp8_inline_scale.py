@@ -309,6 +309,12 @@ def main():
         f"num_kv_heads={args.num_kv_heads} (mha: qo={args.num_kv_heads}, "
         f"gqa: qo={2 * args.num_kv_heads})  batch={args.batch_size}  page={args.page_size}"
     )
+    print(
+        "configs: fp8_tensor = per-tensor scale; "
+        "fp8_inline = per-(token, head) inline scale; "
+        "kv_eq_qo = KV dtype == Q/O (non-quantized)"
+    )
+    print("times in µs (median of iters)")
     print()
 
     for head_dim in args.head_dims:
@@ -316,10 +322,10 @@ def main():
             print(f"===== head_dim={head_dim} kv_len={kv_len} =====")
             print(
                 f"{'mode':>22} {'gqa':>4} {'q_dtype':>7} | "
-                f"{'fp8_tensor':>11} {'fp8_inline':>11} {'kv_eq_qo':>10} | "
+                f"{'fp8_tensor(µs)':>14} {'fp8_inline(µs)':>14} {'kv_eq_qo(µs)':>12} | "
                 f"{'inl/tensor':>11} {'inl/qo':>9}"
             )
-            print("-" * 92)
+            print("-" * 104)
             for mode in args.modes:
                 for gqa in [False, True]:
                     for q_dtype in q_dtypes:
@@ -343,9 +349,9 @@ def main():
                         gqa_s = "gqa" if gqa else "mha"
                         print(
                             f"{_MODE_DISPLAY[mode]:>22} {gqa_s:>4} {q_dtype:>7} | "
-                            f"{_f_us(times['fp8_tensor']):>11} "
-                            f"{_f_us(times['fp8_inline']):>11} "
-                            f"{_f_us(times['kv_eq_qo']):>10} | "
+                            f"{_f_us(times['fp8_tensor']):>14} "
+                            f"{_f_us(times['fp8_inline']):>14} "
+                            f"{_f_us(times['kv_eq_qo']):>12} | "
                             f"{_f_ratio(times['fp8_inline'], times['fp8_tensor']):>11} "
                             f"{_f_ratio(times['fp8_inline'], times['kv_eq_qo']):>9}"
                         )
