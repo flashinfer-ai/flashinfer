@@ -155,6 +155,76 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
         assert naive_vs_descriptor  # value is correct
 
 
+@pytest.mark.parametrize("kernel", ["naive", "persistent", "descriptor_persistent"])
+@pytest.mark.parametrize("alpha", [1.0, 2.0])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_sm_constraint_gemm_beta_zero_does_not_read_c(kernel, alpha, dtype):
+    # When c is not passed, the wrapper allocates it with torch.empty. With
+    # beta == 0 the epilogue must not read that buffer: 0.0 * NaN is NaN, so a
+    # single read turns the whole result into NaN.
+    if kernel == "descriptor_persistent" and dtype == torch.float32:
+        pytest.skip("descriptor persistent does not support float32")
+
+    M = N = K = 256
+    a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
+
+    if kernel == "naive":
+        run = lambda c: flashinfer.triton.sm_constraint_gemm.gemm(
+            a, b, c=c, alpha=alpha
+        )
+    elif kernel == "persistent":
+        run = lambda c: flashinfer.triton.sm_constraint_gemm.gemm_persistent(
+            a, b, c=c, alpha=alpha
+        )
+    else:
+        bT = b.T.contiguous()
+        run = lambda c: flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent(
+            a, bT, c=c, alpha=alpha
+        )
+
+    # Leave NaN behind in a block of exactly the output's size and dtype, so the
+    # caching allocator hands it to the torch.empty inside the wrapper.
+    run(torch.zeros((M, N), device="cuda", dtype=dtype))  # warm up (compile)
+    stale = torch.full((M, N), float("nan"), device="cuda", dtype=dtype)
+    stale_ptr = stale.data_ptr()
+    del stale
+
+    out = run(None)  # c=None, beta=0.0
+    assert out.data_ptr() == stale_ptr  # the poisoned block was reused
+    assert torch.isfinite(out).all()
+    # Nothing about the buffer may reach the result.
+    assert torch.equal(out, run(torch.zeros((M, N), device="cuda", dtype=dtype)))
+
+
+@pytest.mark.parametrize("kernel", ["naive", "persistent", "descriptor_persistent"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_sm_constraint_gemm_beta_nonzero_reads_c(kernel, dtype):
+    # The other half of the contract: with beta != 0 the epilogue still folds c
+    # in. alpha = 0 zeroes the product, so the result must be exactly beta * c.
+    if kernel == "descriptor_persistent" and dtype == torch.float32:
+        pytest.skip("descriptor persistent does not support float32")
+
+    M = N = K = 256
+    a = torch.randn((M, K), device="cuda", dtype=torch.float16).to(dtype)
+    b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
+    c = torch.randn((M, N), device="cuda", dtype=dtype)
+    expected = (0.5 * c.float()).to(dtype)
+
+    if kernel == "naive":
+        out = flashinfer.triton.sm_constraint_gemm.gemm(a, b, c=c, alpha=0.0, beta=0.5)
+    elif kernel == "persistent":
+        out = flashinfer.triton.sm_constraint_gemm.gemm_persistent(
+            a, b, c=c, alpha=0.0, beta=0.5
+        )
+    else:
+        out = flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent(
+            a, b.T.contiguous(), c=c, alpha=0.0, beta=0.5
+        )
+
+    assert torch.equal(out, expected)
+
+
 def print_all_on_failure(
     a, b, c_unmodified, c_torch, c_naive, c_persistent, c_descriptor
 ):
