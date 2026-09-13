@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import math
+import weakref
 
 import flashinfer
 import flashinfer.cake_fmha as cake_api
@@ -51,7 +52,8 @@ def _route(
     }
 
 
-def _manifest() -> dict:
+def _manifest(num_q_heads: int = 8, num_kv_heads: int = 1) -> dict:
+    assert (num_q_heads, num_kv_heads) == (8, 1)
     exact_lengths = (8193, 57345, 73729, 81921)
     return {
         "routes": [
@@ -129,7 +131,11 @@ def test_decode_api_exposes_order_pointer_and_host_plan_at_the_end() -> None:
             flashinfer.decode.trtllm_batch_decode_with_kv_cache
         ).parameters
     )
-    assert parameters[-2:] == ["request_order", "request_order_plan"]
+    assert parameters[-3:] == [
+        "request_order",
+        "request_order_plan",
+        "request_order_capture",
+    ]
 
 
 def test_request_order_requires_explicit_cake_backend() -> None:
@@ -168,6 +174,179 @@ def test_host_plan_requires_device_order_tensor() -> None:
             backend="cake",
             request_order_plan=plan,
         )
+
+
+@pytest.mark.parametrize("q_len", (1, 6))
+@pytest.mark.parametrize(("num_q_heads", "num_kv_heads"), ((8, 1), (32, 2)))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_request_ordered_capture_prepares_actual_producer_q(
+    q_len: int, num_q_heads: int, num_kv_heads: int
+) -> None:
+    """Two live graphs retain their own real captured-Q descriptor bindings."""
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("request-ordered Cake FMHA requires SM103")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 152:
+        pytest.skip("request-ordered Cake FMHA requires a 152-SM device")
+
+    batch, page_slots = 2, 4
+    lengths = (73, 137)
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(48320 + q_len)
+    base = torch.randn(
+        batch * q_len,
+        num_q_heads,
+        256,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    key, value = (
+        torch.randn(
+            batch * page_slots,
+            num_kv_heads,
+            64,
+            256,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+        ).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    tables = torch.arange(batch * page_slots, dtype=torch.int32, device=device).view(
+        batch, page_slots
+    )
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    order = torch.arange(batch, dtype=torch.int32, device=device)
+    qk = torch.tensor([math.log2(math.e) / 16], dtype=torch.float32, device=device)
+    pv = torch.ones(1, dtype=torch.float32, device=device)
+    plan = flashinfer.plan_cake_fmha_request_ordered_paged_decode(
+        lengths, q_len, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+    )
+    assert plan.workspace_parts == 1
+
+    def invoke(query, workspace, output, preparation=None):
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=(key, value),
+            workspace_buffer=workspace,
+            out=output,
+            block_tables=tables,
+            seq_lens=seq_lens,
+            max_seq_len=max(lengths),
+            bmm1_scale_log2=qk,
+            bmm2_scale=pv,
+            backend="cake",
+            enable_pdl=True,
+            q_len_per_req=q_len,
+            request_order=order,
+            request_order_plan=plan,
+            request_order_capture=preparation,
+        )
+
+    def reference(query):
+        rows = []
+        for request, length in enumerate(lengths):
+            k = key[tables[request].long()].float().permute(0, 2, 1, 3)
+            v = value[tables[request].long()].float().permute(0, 2, 1, 3)
+            k = k.reshape(-1, num_kv_heads, 256)[:length]
+            v = v.reshape(-1, num_kv_heads, 256)[:length]
+            head_indices = torch.arange(num_q_heads, device=device) // (
+                num_q_heads // num_kv_heads
+            )
+            k, v = k[:, head_indices], v[:, head_indices]
+            q = query.view(batch, q_len, num_q_heads, 256)[request].float()
+            scores = torch.einsum("qhd,khd->hqk", q, k) / 16
+            visible = length - q_len + torch.arange(q_len, device=device) + 1
+            mask = torch.arange(length, device=device)[None, :] < visible[:, None]
+            probabilities = scores.masked_fill(~mask[None, :, :], -torch.inf).softmax(
+                -1
+            )
+            rows.append(torch.einsum("hqk,khd->qhd", probabilities, v))
+        return torch.cat(rows).to(torch.bfloat16)
+
+    # Keep the eager producer result alive to force an actual new Q allocation
+    # in capture. Module/resource warming still follows the ordinary public API.
+    warm_query = base * 1.0
+    warm_workspace = torch.empty(388, dtype=torch.uint8, device=device)
+    warm_output = torch.empty_like(base)
+    invoke(warm_query, warm_workspace, warm_output)
+    torch.cuda.synchronize()
+
+    # A second Q cannot overwrite a pending descriptor slot in the same graph.
+    # Discard this unpublished graph, then prove the workspace claim is released
+    # by preparing and running an ordinary launch through that same allocation.
+    rejected_workspace = torch.empty(388, dtype=torch.uint8, device=device)
+    rejected_output = torch.empty_like(base)
+    rejected_preparation = cake_api.CakeFmhaRequestOrderedCapture([plan])
+    rejected_graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(rejected_graph):
+            first_query = base * 3.0
+            second_query = base * 4.0
+            invoke(
+                first_query, rejected_workspace, rejected_output, rejected_preparation
+            )
+            with pytest.raises(RuntimeError, match="different tensor bindings"):
+                invoke(
+                    second_query,
+                    rejected_workspace,
+                    rejected_output,
+                    rejected_preparation,
+                )
+    finally:
+        rejected_preparation.discard()
+    assert not rejected_preparation.finalized
+    with pytest.raises(RuntimeError, match="already finished"):
+        rejected_preparation.finalize()
+    del rejected_graph, first_query, second_query
+    invoke(warm_query, rejected_workspace, rejected_output)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        rejected_output, reference(warm_query), atol=0.1, rtol=0.1
+    )
+    del rejected_workspace, rejected_output, rejected_preparation
+
+    graphs = []
+    for factor in (1.0, 2.0):
+        workspace = torch.empty(388, dtype=torch.uint8, device=device)
+        workspace_ref = weakref.ref(workspace)
+        output = torch.empty_like(base)
+        preparation = cake_api.CakeFmhaRequestOrderedCapture([plan])
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                produced_query = base * factor
+                captured_query_ptr = produced_query.data_ptr()
+                invoke(produced_query, workspace, output, preparation)
+                # This reversible lifecycle error must leave the recorded
+                # transaction available for proper finalization after capture.
+                with pytest.raises(RuntimeError, match="after capture ends"):
+                    preparation.finalize()
+            preparation.finalize()
+        except BaseException:
+            preparation.discard()
+            raise
+        assert captured_query_ptr != warm_query.data_ptr()
+        assert preparation.finalized
+        with pytest.raises(RuntimeError, match="already finished"):
+            preparation.finalize()
+        del produced_query, workspace
+        assert workspace_ref() is not None
+        graphs.append((graph, preparation, output, factor, workspace_ref))
+
+    # Both graphs replay after both descriptor sets have been finalized. Their
+    # workspaces live through their preparation objects, not a shared scratch slot.
+    for permutation in ((1, 0), (0, 1)):
+        order.copy_(torch.tensor(permutation, dtype=torch.int32, device=device))
+        base.mul_(0.75)
+        for graph, preparation, output, factor, workspace_ref in graphs:
+            assert preparation.finalized and workspace_ref() is not None
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output, reference(base * factor), atol=0.1, rtol=0.1
+            )
 
 
 @pytest.mark.parametrize(
