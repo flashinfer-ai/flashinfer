@@ -889,6 +889,11 @@ def _derive_has_q_offset(
     )
 
 
+# Heavy-first causal raster gate (perf-neutral on B300A for uniform-length
+# causal, so the ordinary sequence-local raster is always used).
+_ENABLE_HEAVY_FIRST_CAUSAL_RASTER = False
+
+
 def _uses_heavy_first_static_causal_raster(
     *,
     mask_type: str,
@@ -904,6 +909,8 @@ def _uses_heavy_first_static_causal_raster(
     the ordinary sequence-local raster.
     """
 
+    if not _ENABLE_HEAVY_FIRST_CAUSAL_RASTER:
+        return False
     return mask_type == "causal" and window_left < 0 and not has_q_offset
 
 
