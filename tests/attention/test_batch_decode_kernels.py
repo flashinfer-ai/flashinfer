@@ -1582,10 +1582,15 @@ def test_tensor_core_decode_cuda_graph_padding_without_split_kv():
     mask = wrapper._int_workspace_buffer[
         block_valid_mask_offset : block_valid_mask_offset + padded_batch_size
     ].bool()
-    if mask.all():
+    # The plan without CUDA graphs has no padding: its batch is the real CTA count.
+    num_real = ref_wrapper._plan_info[0]
+    if padded_batch_size == num_real:
         pytest.skip(
             f"plan did not pad on this device (padded_batch_size={padded_batch_size})"
         )
+    # Check the mask itself, so a plan that leaves it unwritten fails instead of skipping.
+    expected_mask = torch.arange(padded_batch_size, device="cuda:0") < num_real
+    torch.testing.assert_close(mask, expected_mask)
 
     o = wrapper.run(q, kv_data)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
