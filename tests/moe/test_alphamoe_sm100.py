@@ -4,9 +4,9 @@ The frozen device TU in ``csrc/alphamoe_sm100.cu`` is a generated Loom
 schedule of the Alpha-MoE up+SwiGLU+down megakernel. The torch reference
 reproduced below rounds each routed per-128-block down contribution to BF16
 before accumulating, exactly like the kernel's
-``cp.reduce.async.bulk .add.noftz.bf16`` output path — the two computations
-differ ONLY in accumulation order: the reference adds in a fixed
-(expert, intermediate-block) order while the kernel's cross-CTA reduce-adds
+``cp.reduce.async.bulk .add.noftz.bf16`` output path. The candidate also
+reassociates FP32 scale multiplication. For BF16 accumulation, the reference
+adds in a fixed (expert, intermediate-block) order while the kernel's reduce-adds
 land in hardware scheduling order, which is nondeterministic run to run.
 BF16 addition is commutative but not associative, so:
 
@@ -301,9 +301,9 @@ def _reference(case, *, out_init=None, plan_extent=None, return_abs_sum=False):
 def _assert_order_tolerant(out, expected, abs_sum, label):
     """Contract tolerance widened by an accumulation-order bound near zero.
 
-    The kernel and the reference differ only in BF16 accumulation order, so a
+    In addition to FP32 scale reassociation, BF16 accumulation order can move a
     near-zero output element (catastrophic cancellation of O(abs_sum)
-    partials) legitimately moves by a few ulp of the PARTIAL-SUM magnitude —
+    partials) by a few ulp of the PARTIAL-SUM magnitude —
     which can exceed ``atol + rtol*|ref|`` when |ref| is tiny. Bound each
     element by the larger of the FP8-tier contract tolerance and 2 ulp of the
     accumulated |contribution| mass (ulp_bf16(x) <= x * 2**-7).
@@ -389,8 +389,8 @@ def test_alphamoe_sm100_matches_reference(
             f"max |diff|={(out.float() - expected.float()).abs().max().item()}"
         )
     else:
-        # 3+ addends: kernel and reference differ only by accumulation order;
-        # assert the contract tolerance widened by the near-zero order bound.
+        # 3+ addends: retain the contract tolerance and near-zero order bound.
+        # FP32 scale reassociation remains subject to these existing assertions.
         _assert_order_tolerant(out, expected, abs_sum, label)
 
 
