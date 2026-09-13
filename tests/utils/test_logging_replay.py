@@ -26,8 +26,12 @@ with all decorated FlashInfer APIs. For each API, we:
 5. Verify: original_output ≈ dumped_output ≈ replayed_output
 """
 
+import json
 import os
+import subprocess
 import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 import torch
@@ -361,6 +365,117 @@ def test_cli_replay(level10_environment):
 # =============================================================================
 # Tests for FLASHINFER_DUMP_INCLUDE / FLASHINFER_DUMP_EXCLUDE filtering
 # =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("dump_include", "also_call_decode"),
+    [("*", False), ("*prefill*", True)],
+    ids=["single-record", "prefill-filter"],
+)
+def test_trtllm_mla_prefill_logging_attribution_in_fresh_process(
+    tmp_path: Path,
+    dump_include: str,
+    also_call_decode: bool,
+):
+    """The compatibility wrapper owns one prefill-named logging event.
+
+    A subprocess is required because ``flashinfer.api_logging`` snapshots its
+    logging and dump-filter environment when the module is imported.
+    """
+    repo_root = Path(__file__).parents[2]
+    dump_dir = tmp_path / "dumps"
+    log_path = tmp_path / "api.log"
+    script = textwrap.dedent(
+        """
+        import os
+
+        import torch
+
+        import flashinfer.decode as decode
+        import flashinfer.mla._core as core
+        import flashinfer.prefill as prefill
+
+        calls = []
+
+        def shared_impl(*args, **kwargs):
+            calls.append((args, kwargs))
+            return torch.tensor([len(calls)], dtype=torch.int32)
+
+        assert not hasattr(
+            core._trtllm_batch_decode_with_kv_cache_mla_impl, "__wrapped__"
+        )
+        core._trtllm_batch_decode_with_kv_cache_mla_impl = shared_impl
+        required = (
+            torch.empty(1),
+            torch.empty(1),
+            torch.empty(1, dtype=torch.uint8),
+            64,
+            256,
+            64,
+            torch.zeros(1, 1, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            1,
+        )
+
+        prefill_result = prefill.trtllm_prefill_with_kv_cache_mla(*required)
+        assert prefill_result.item() == 1
+        if os.environ["FLASHINFER_TEST_CALL_DECODE"] == "1":
+            decode_result = decode.trtllm_batch_decode_with_kv_cache_mla(*required)
+            assert decode_result.item() == 2
+        """
+    )
+    env = os.environ.copy()
+    pythonpath = [str(repo_root)]
+    if env.get("PYTHONPATH"):
+        pythonpath.append(env["PYTHONPATH"])
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": "",
+            "FLASHINFER_DUMP_DIR": str(dump_dir),
+            "FLASHINFER_DUMP_INCLUDE": dump_include,
+            "FLASHINFER_DUMP_MAX_COUNT": "10",
+            "FLASHINFER_DUMP_MAX_SIZE_GB": "1",
+            "FLASHINFER_LOGDEST": str(log_path),
+            "FLASHINFER_LOGLEVEL": "10",
+            "FLASHINFER_TEST_CALL_DECODE": "1" if also_call_decode else "0",
+            "FLASHINFER_WORKSPACE_BASE": str(tmp_path / "workspace"),
+            "PYTHONPATH": os.pathsep.join(pythonpath),
+        }
+    )
+    for name in (
+        "FLASHINFER_DUMP_EXCLUDE",
+        "FLASHINFER_DUMP_SAFETENSORS",
+        "FLASHINFER_TRACE_DUMP",
+    ):
+        env.pop(name, None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    dump_subdirs = [path for path in dump_dir.iterdir() if path.is_dir()]
+    assert len(dump_subdirs) == 1
+    metadata_records = [
+        json.loads(line)
+        for line in (dump_subdirs[0] / "metadata.jsonl").read_text().splitlines()
+        if line
+    ]
+    assert {
+        (record["function_name"], record["call_sequence"])
+        for record in metadata_records
+    } == {("trtllm_prefill_with_kv_cache_mla", 1)}
+    assert metadata_records[-1]["execution_status"] == "completed"
+
+    log_text = log_path.read_text()
+    assert log_text.count("FlashInfer API Call: trtllm_prefill_with_kv_cache_mla") == 1
+    assert "FlashInfer API Call: trtllm_batch_decode_with_kv_cache_mla" not in log_text
 
 
 def test_dump_include_filter(tmp_path):
