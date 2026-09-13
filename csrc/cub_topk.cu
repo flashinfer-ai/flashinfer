@@ -774,13 +774,12 @@ void cub_topk(TensorView input, TensorView output_indices, TensorView output_val
                             static_cast<c_type*>(output_values.data_ptr()), indices_ptr,
                             maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
                             /*query_bytes_out=*/nullptr, stream);
-    if (status != cudaSuccess) {
-      return true;
+    if (status == cudaSuccess && top_k > max_len) {
+      CUBFillTopKTailsKernel<0><<<static_cast<uint32_t>(num_rows), kFillTailsThreads, 0, stream>>>(
+          indices_ptr, static_cast<c_type*>(output_values.data_ptr()),
+          cuda::make_constant_iterator(max_len), num_rows, top_k);
+      status = cudaGetLastError();
     }
-    CUBFillTopKTailsKernel<0><<<static_cast<uint32_t>(num_rows), kFillTailsThreads, 0, stream>>>(
-        indices_ptr, static_cast<c_type*>(output_values.data_ptr()),
-        cuda::make_constant_iterator(max_len), num_rows, top_k);
-    status = cudaGetLastError();
     return true;
   });
 
