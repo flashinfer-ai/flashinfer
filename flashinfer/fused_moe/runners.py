@@ -660,16 +660,13 @@ class MoERunner(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
-def _fold_trtllm_nvfp4_activation_scale(
+def _validate_nvfp4_activation_global_scale(
     act: MoEActivationPack,
-    view: dict,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Fold the activation global scale into TRTLLM/Cake GEMM1 scalars."""
-    output1 = view.get("output1_scale_scalar")
-    output1_gate = view.get("output1_scale_gate_scalar")
-    if act.hidden_states_scale_global is None:
-        return output1, output1_gate
+) -> torch.Tensor | None:
+    """Validate mutable NVFP4 activation-scale metadata before use."""
     scale = act.hidden_states_scale_global
+    if scale is None:
+        return None
     if scale.device != act.hidden_states_q.device:
         raise ValueError(
             "hidden_states_scale_global must be on the same device as hidden_states_q."
@@ -683,6 +680,19 @@ def _fold_trtllm_nvfp4_activation_scale(
         raise ValueError("hidden_states_scale_global must be finite.")
     if not (scale > 0).all().item():
         raise ValueError("hidden_states_scale_global must be positive.")
+    return scale
+
+
+def _fold_trtllm_nvfp4_activation_scale(
+    act: MoEActivationPack,
+    view: dict,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Fold the activation global scale into TRTLLM/Cake GEMM1 scalars."""
+    output1 = view.get("output1_scale_scalar")
+    output1_gate = view.get("output1_scale_gate_scalar")
+    scale = _validate_nvfp4_activation_global_scale(act)
+    if scale is None:
+        return output1, output1_gate
     inv_scale = scale.reciprocal()
     if output1 is not None:
         output1 = (output1 * inv_scale).contiguous()
@@ -4035,9 +4045,8 @@ class CuteDslRunner(MoERunner):
                 raise ValueError(
                     "hidden_states_scale_global is supported only for NVFP4×NVFP4."
                 )
-            w1_alpha = (
-                w1_alpha / act.hidden_states_scale_global.to(w1_alpha.device)
-            ).contiguous()
+            activation_scale_global = _validate_nvfp4_activation_global_scale(act)
+            w1_alpha = (w1_alpha / activation_scale_global).contiguous()
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
