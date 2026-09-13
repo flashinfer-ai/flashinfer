@@ -2672,6 +2672,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend == "fa3"
                     and qo_indptr is not None
                     and qo_indptr.numel() > 1
+                    # fp8 queries are only supported by fa3 (see run()), so
+                    # leave the backend untouched for them.
+                    and q_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2)
                     and int((qo_indptr[1:] - qo_indptr[:-1]).max().item()) <= 64
                 ):
                     self._backend = "fa2"

@@ -18,7 +18,7 @@ if get_compute_capability(torch.device("cuda"))[0] != 9:
 PAGE_SIZE, HQ, HKV, DIM, KV_LEN = 16, 32, 8, 128, 8192
 
 
-def _plan(q_len, batch):
+def _plan(q_len, batch, q_dtype=torch.float16, kv_dtype=torch.float16):
     pages = KV_LEN // PAGE_SIZE
     workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
     wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
@@ -44,8 +44,8 @@ def _plan(q_len, batch):
         pos_encoding_mode="NONE",
         causal=True,
         logits_soft_cap=0.0,
-        q_data_type=torch.float16,
-        kv_data_type=torch.float16,
+        q_data_type=q_dtype,
+        kv_data_type=kv_dtype,
     )
     return wrapper
 
