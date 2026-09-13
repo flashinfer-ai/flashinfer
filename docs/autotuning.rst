@@ -426,3 +426,15 @@ with ``torchrun``), you could use separate output files per rank and merge them 
    ``rename()`` syscall.  This is atomic on all local filesystems and is
    expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
    semantics.  FlashInfer's cubin caching also relies on this guarantee.
+
+cuTile Autotuning
+-----------------
+
+The cuTile (``backend="cutile"``) GEMM/BMM ops autotune their tile shape,
+CTA count and occupancy on the first call for each problem shape and cache the
+result per process. To disable this and always use the built-in default config
+(e.g. for deterministic timing or to skip tuning overhead), set:
+
+.. code-block:: bash
+
+    export FLASHINFER_CUTILE_AUTOTUNE_DISABLED=1

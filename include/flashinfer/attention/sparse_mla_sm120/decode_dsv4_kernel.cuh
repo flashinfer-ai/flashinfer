@@ -12,6 +12,7 @@
 #include "common/d2_load_b.cuh"
 #include "common/fp8_quant.cuh"
 #include "common/online_softmax.cuh"
+#include "common/zero_row.cuh"
 #include "model/kv_cache_traits.cuh"
 #include "model/scale_convert.cuh"
 
@@ -403,11 +404,16 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
 #pragma unroll
     for (int e = 0; e < EPW; e++) {
       const int entry_idx = e * Cfg::IO_THREADS + lane;
-      const int idx = (idx_raw[e] >= 0) ? idx_raw[e] : 0;
+      // Masked candidates gather the shared zero row, never a mutable cache
+      // slot: a NaN there would leak through 0 * NaN in the value MMA.
+      const bool valid = idx_raw[e] >= 0;
+      const int idx = valid ? idx_raw[e] : 0;
       const int block_idx_g = idx / section_pbs;
       const int local_idx_g = idx - block_idx_g * section_pbs;
-      const uint8_t* data_base =
-          section_kv + (size_t)block_idx_g * section_stride + (size_t)local_idx_g * IO_STRIDE;
+      const uint8_t* data_base = valid ? section_kv + (size_t)block_idx_g * section_stride +
+                                             (size_t)local_idx_g * IO_STRIDE
+                                       : sparse_mla_zero_row;
+      static_assert(DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         DSV4_BULK_NOPE_BYTES, sm.mbar_full(buf));
       cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + D_NOPE,

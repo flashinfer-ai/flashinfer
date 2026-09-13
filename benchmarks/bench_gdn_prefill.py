@@ -20,6 +20,15 @@ Performance benchmark for GDN (Gated Delta Network) prefill kernel.
 Compares FlashInfer GDN prefill against FLA baseline across
 Qwen3.5 family model configurations.
 
+The default timing is CUDA events around each call, so host dispatch is inside
+the number. Pass --use-cuda-graph to replay a captured graph instead and compare
+kernels alone.
+
+The cuDNN column pays one conversion the native path does not: FlashInfer's
+public alpha is linear space and cuDNN's GDN engine takes a log gate, so the
+wrapper runs a .log() inside the timed call. Every column passes
+output_state=None so no backend is charged a state copy another avoids.
+
 Usage:
   python bench_gdn_prefill.py
   python bench_gdn_prefill.py --warmup 10 --iters 100
@@ -45,6 +54,24 @@ try:
 except ImportError:
     fla_gdn = None
     _has_fla = False
+
+
+def _cudnn_rejection_reason(device):
+    """Why the cuDNN backend cannot run this benchmark, or None if it can."""
+    tokens, heads, dim = 64, 1, 128
+    qkv = dict(dtype=torch.float16, device=device)
+    try:
+        chunk_gated_delta_rule(
+            torch.randn(tokens, heads, dim, **qkv),
+            torch.randn(tokens, heads, dim, **qkv),
+            torch.randn(tokens, heads, dim, **qkv),
+            cu_seqlens=torch.tensor([0, tokens], dtype=torch.int32, device=device),
+            backend="cudnn",
+        )
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
 
 HEAD_CONFIGS = [
     # (h_qk, h_v, d, label)
@@ -83,6 +110,8 @@ SEQ_CONFIGS = [
     (tuple(8192 * (i + 1) for i in range(32)), "8192x32"),
 ]
 
+DRIFT_THRESHOLD = 0.02
+
 
 def _gdn_tflops(total_tokens, h_v, d, time_ms):
     """Calculate TFLOPS: 2 GEMMs (kv outer product + q@state) per token per head."""
@@ -98,8 +127,8 @@ def get_num_rotating_buffers(num_iters: int, q, k, v) -> int:
     return max(1, min(num_iters, (total_bytes + nbytes - 1) // nbytes))
 
 
-def bench_fi(args, endpoints, h_qk, h_v, d):
-    """Benchmark FlashInfer GDN prefill."""
+def bench_fi(args, endpoints, h_qk, h_v, d, backend="auto"):
+    """Benchmark FlashInfer GDN prefill on the given public API backend."""
     device = "cuda"
     dtype = torch.float16
     N = len(endpoints)
@@ -114,10 +143,11 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
     # FlashInfer's g is the linear-space forget gate alpha in (0, 1)
     # ("defaults to all ones" = no decay). Log-space gates (e.g. logsigmoid)
     # are out of domain and produce NaN outputs/state.
-    g = torch.rand(T, h_v, dtype=torch.float32, device=device)
+    g = torch.rand(T, h_v, dtype=torch.float32, device=device).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
     beta = torch.rand(T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
-    state_out = torch.zeros_like(h0)
 
     num_buffer = get_num_rotating_buffers(args.iters, q, k, v)
     q = [q.clone() for _ in range(num_buffer)]
@@ -138,8 +168,7 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
             True,
             cu_seqlens,
             False,
-            None,
-            state_out,
+            backend=backend,
         )
         rotation_buffer_idx += 1
 
@@ -151,24 +180,27 @@ def bench_fi(args, endpoints, h_qk, h_v, d):
         use_cuda_graph=args.use_cuda_graph,
     )
     torch.cuda.empty_cache()
-    return np.average(times)
+    return float(np.median(times))
 
 
 def bench_fla(args, endpoints, h_qk, h_v, d):
     """Benchmark FLA baseline."""
     device = "cuda"
     dtype = torch.float16
-    h = h_v
     N = len(endpoints)
     T = endpoints[-1]
     cu_seqlens = torch.tensor([0] + list(endpoints), dtype=torch.int32, device=device)
 
-    q = torch.randn((1, T, h, d), dtype=dtype, device=device)
+    q = torch.randn((1, T, h_qk, d), dtype=dtype, device=device)
     k = F.normalize(
-        torch.randn(1, T, h, d, dtype=torch.float32, device=device), p=2, dim=-1
+        torch.randn(1, T, h_qk, d, dtype=torch.float32, device=device), p=2, dim=-1
     ).to(dtype)
     v = torch.randn((1, T, h_v, d), dtype=dtype, device=device)
-    g = F.logsigmoid(torch.rand(1, T, h_v, dtype=torch.float32, device=device))
+    g = (
+        torch.rand(1, T, h_v, dtype=torch.float32, device=device)
+        .clamp_min(torch.finfo(torch.float32).tiny)
+        .log()
+    )
     beta = torch.rand(1, T, h_v, dtype=torch.float32, device=device).sigmoid()
     h0 = torch.randn((N, h_v, d, d), dtype=torch.float32, device=device)
 
@@ -202,7 +234,7 @@ def bench_fla(args, endpoints, h_qk, h_v, d):
         use_cuda_graph=args.use_cuda_graph,
     )
     torch.cuda.empty_cache()
-    return np.average(times)
+    return float(np.median(times))
 
 
 def main():
@@ -212,6 +244,11 @@ def main():
     parser.add_argument("--cooling-time", type=float, default=0.1)
     parser.add_argument("--use-cupti", action="store_true")
     parser.add_argument("--use-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--skip-cudnn",
+        action="store_true",
+        help="Do not measure the cuDNN backend column",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -230,6 +267,11 @@ def main():
             "Benchmarking FlashInfer only."
         )
 
+    cudnn_reason = None if args.skip_cudnn else _cudnn_rejection_reason(device)
+    has_cudnn = not args.skip_cudnn and cudnn_reason is None
+    if cudnn_reason is not None:
+        print(f"Warning: cuDNN backend unavailable: {cudnn_reason}")
+
     print(f"\nGPU: {torch.cuda.get_device_name(0)} [{arch_label}]")
     print("Models: Qwen3.5 family (397B, 122B, 35B, 27B, 9B, 4B, 2B, 0.8B), d=128")
     print()
@@ -238,28 +280,59 @@ def main():
         f"{'Heads':<15s}  {'Seqlens':<16s}  {'h_qk':>4s} {'h_v':>4s}"
         f"  {fi_col:>22s}  {'TFLOPS':>7s}"
     )
+    if has_cudnn:
+        header += f"  {'cuDNN':>10s}  {'FI/cuDNN':>9s}"
     if _has_fla:
         header += f"  {'FLA/Triton':>10s}  {'Speedup':>8s}"
     print(header)
     print("-" * len(header))
 
+    order = ["FI"]
+    if has_cudnn:
+        order.append("cuDNN")
+    if _has_fla:
+        order.append("FLA")
+
     for h_qk, h_v, d, h_label in HEAD_CONFIGS:
         for endpoints, s_label in SEQ_CONFIGS:
             gc.collect()
             T = endpoints[-1]
-            fi_ms = bench_fi(args, endpoints, h_qk, h_v, d)
-            time.sleep(args.cooling_time)
+            block_medians = {name: [] for name in order}
+            for name in order + order[::-1]:
+                if name == "FLA":
+                    block_medians[name].append(bench_fla(args, endpoints, h_qk, h_v, d))
+                else:
+                    block_medians[name].append(
+                        bench_fi(
+                            args,
+                            endpoints,
+                            h_qk,
+                            h_v,
+                            d,
+                            backend="cudnn" if name == "cuDNN" else "auto",
+                        )
+                    )
+                time.sleep(args.cooling_time)
+            fi_ms = float(np.median(block_medians["FI"]))
             tflops = _gdn_tflops(T, h_v, d, fi_ms)
             row = (
                 f"{h_label:<15s}  {s_label:<16s}  {h_qk:>4d} {h_v:>4d}"
                 f"  {fi_ms:>21.3f}ms  {tflops:>6.1f}"
             )
+            if has_cudnn:
+                cudnn_ms = float(np.median(block_medians["cuDNN"]))
+                speedup = fi_ms / cudnn_ms
+                marker = "+" if speedup > 1.0 else "-"
+                row += f"  {cudnn_ms:>9.3f}ms  {speedup:>8.2f}x {marker}"
             if _has_fla:
-                fla_ms = bench_fla(args, endpoints, h_qk, h_v, d)
-                time.sleep(args.cooling_time)
+                fla_ms = float(np.median(block_medians["FLA"]))
                 speedup = fla_ms / fi_ms
                 marker = "+" if speedup > 1.0 else "-"
                 row += f"  {fla_ms:>9.3f}ms  {speedup:>7.2f}x {marker}"
+            outer = block_medians[order[0]]
+            drift = abs(outer[1] - outer[0]) / np.median(outer)
+            if drift > DRIFT_THRESHOLD:
+                row += f"  drift {drift * 100:.1f}%"
             print(row)
         print()
 

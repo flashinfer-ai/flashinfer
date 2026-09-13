@@ -41,14 +41,14 @@ def _build_nvfp4_moe_config(*, offset, local_num_experts, max_tokens):
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmFp4Config,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=NUM_EXPERTS, top_k=TOP_K),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=offset,
