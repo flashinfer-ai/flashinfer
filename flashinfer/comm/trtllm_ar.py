@@ -18,7 +18,7 @@ import functools
 import logging
 from ctypes import c_void_p, cast, create_string_buffer
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 from typing_extensions import deprecated
 
 from flashinfer.comm.mnnvl import CommBackend, SymmDeviceMemory, TorchDistBackend
@@ -1260,6 +1260,8 @@ def trtllm_moe_finalize_allreduce_fusion(
     expert_scale_factor: Optional[torch.Tensor],
     routed_scaling_factor: Optional[float],
     weight_bias: Optional[float] = None,
+    *,
+    backend: Literal["trtllm", "cake"] = "trtllm",
 ) -> None:
     """
     Parameters:
@@ -1285,7 +1287,13 @@ def trtllm_moe_finalize_allreduce_fusion(
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+    - backend: implementation to launch. ``"trtllm"`` preserves the existing
+      backend. ``"cake"`` selects the source-built SM100/SM103 kernels for
+      hidden size 7168 and tensor-parallel sizes 2, 4, or 8.
     """
+
+    if backend not in ("trtllm", "cake"):
+        raise ValueError(f"backend must be 'trtllm' or 'cake', got {backend!r}")
 
     # The Lamport allreduce payload is the finalized token output [token_num, hidden_dim],
     # not the padded/permuted expert buffer allreduce_in.
@@ -1298,6 +1306,31 @@ def trtllm_moe_finalize_allreduce_fusion(
         raise ValueError(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
+
+    if backend == "cake":
+        from ..jit.cake_moe_finalize_comm import run_cake_moe_finalize
+
+        run_cake_moe_finalize(
+            backend="cake",
+            allreduce_in=allreduce_in,
+            residual_in=residual_in,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            norm_out=norm_out,
+            residual_out=residual_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+            workspace_ptrs=workspace_ptrs,
+            launch_with_pdl=launch_with_pdl,
+            world_rank=world_rank,
+            world_size=world_size,
+            eps=eps,
+            shared_expert_output=shared_expert_output,
+            expert_scale_factor=expert_scale_factor,
+            routed_scaling_factor=routed_scaling_factor,
+            weight_bias=weight_bias,
+        )
+        return
 
     get_trtllm_comm_module().trtllm_moe_finalize_allreduce_fusion(
         allreduce_in=allreduce_in,
