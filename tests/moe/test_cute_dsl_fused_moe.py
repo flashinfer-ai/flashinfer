@@ -1411,6 +1411,9 @@ class TestCuteDslMoeW4A16:
             ),
         ],
     )
+    @pytest.mark.parametrize(
+        "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
+    )
     @pytest.mark.parametrize("top_k", [2, 3])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     def test_route_tile_boundary_accuracy(
@@ -1418,6 +1421,7 @@ class TestCuteDslMoeW4A16:
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        half_tile_tail: bool,
         top_k: int,
         use_fused_finalize: bool,
     ):
@@ -1426,7 +1430,8 @@ class TestCuteDslMoeW4A16:
         )
         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
-        num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
+        num_tokens = route_tile + (route_tile // 2 + 1 if half_tile_tail else 1)
+        hidden_size, intermediate_size = 256, 512
         num_experts = 8
         tensors = create_moe_tensors(
             num_tokens=num_tokens,

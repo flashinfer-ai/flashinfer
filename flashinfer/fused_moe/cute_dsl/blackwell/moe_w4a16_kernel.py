@@ -2244,7 +2244,9 @@ class Sm100W4A16GroupedGemmKernel:
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         self.epilog_sync_barrier.arrive_and_wait()
-                    elif tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    elif (
+                        tma_distance_to_boundary >= (subtile_idx + 1) * self.epi_tile_n
+                    ):
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         if cutlass.const_expr(not self.fuse_activation):
