@@ -40,32 +40,21 @@
 //               and a compact 528B pool are the same kernel (the payload prefix
 //               is identical). A flat 2D cache must be packed at 528B.
 //   DOTS3_SWA: d_nope=1024, d_rope=64, UE8M0 scale footer, 1160B/token
+//   DSV4_1:  d_nope=512, d_rope=0, UE8M0 scale footer (32-wide groups),
+//            528B/token. DeepSeek-V4.1 quantizes the full 512-wide K (rope
+//            lanes included) to FP8, so there is no BF16 rope segment: the
+//            geometry matches GLM53_NOPE while the scale placement matches
+//            DSV4. The 528B payload collides with GLM53_NOPE's, so this type
+//            can only be selected explicitly, never inferred from widths.
 //
 // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
 // positional window rather than a genuine top-k. It is the first model whose
 // d_v diverges from 512 (it is 1024), so it opts out of the shared D_V assert
 // in kv_cache_traits.cuh.
-enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA };
-
-// Bytes per packed KV cache token row, per model type. For GLM53_NOPE this is
-// the payload; the gmem row advance is a runtime stride >= this value.
-constexpr int bytes_per_token(ModelType mt) {
-  switch (mt) {
-    case ModelType::DSV3_2:
-    case ModelType::GLM_NSA:
-      return 656;
-    case ModelType::GLM53_NOPE:
-      return 528;
-    case ModelType::DSV4:
-      return 584;
-    case ModelType::DOTS3_SWA:
-      return 1160;
-  }
-  return 0;  // unreachable for a valid ModelType
-}
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1 };
 
 // Prefill kernel variants selected by the Python dispatch planner
-// (flashinfer/mla/_sparse_mla_sm120_plan.py, KernelVariant; the values must
+// (flashinfer/mla/_sparse_mla_sm120_policy.py, KernelVariant; the values must
 // match). The C++ dispatch is policy-free: it launches the named variant and
 // re-checks the variant's envelope defensively. DECODE_SPLITK=0 never crosses
 // this boundary (decode goes through the standalone decode entry points).
@@ -73,11 +62,8 @@ enum class PrefillVariant : int64_t { SG = 1, MG = 2, MG_DUAL = 3, SWAPAB = 4 };
 
 enum class ScaleFormat { POW2_FP32, UE8M0_BYTE, ARBITRARY_FP32 };
 
-// ComputeMode selects the MMA precision path.
-//   FP8:  QK and XV use UE8M0 block-scaled FP8 MMA; Q is quantized to FP8
-//         on the fly; KV stays FP8 in smem. Highest throughput.
-//   BF16: QK and XV use BF16 MMA; FP8 KV is dequantized to BF16 in smem.
-//         Lower throughput but higher accuracy. Current dispatch sites use
-//         ComputeMode::BF16 for the DSV4 prefill path when topk == 128,
-//         including dual-cache variants.
-enum class ComputeMode { FP8, BF16 };
+// Selects NoPE QK operands, not the complete attention numerical route.
+// Prefill PV remains FP8 for both modes; BF16 QK dequantizes FP8 K operands.
+// DSV4 single-cache prefill selects BF16 QK for topk <= 256; dual uses BF16 QK.
+// The explicit full-BF16 attention route is separate.
+enum class QkComputeMode { FP8, BF16 };

@@ -33,7 +33,7 @@ else:
     from bench_sparse_mla_nvfp4_decode import _quantize_fp8_cache
 
 from flashinfer.mla import nvfp4_quantize_pack_sparse_mla_cache
-from flashinfer.mla._sparse_mla_nvfp4_sm120 import (
+from flashinfer.mla._sparse_mla_sm120_dsv4_nvfp4 import (
     get_sparse_mla_nvfp4_sm120_module,
 )
 from flashinfer.mla._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner

@@ -28,17 +28,15 @@
 
 #pragma once
 
+#include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
 
-// FP32 ↔ UE8M0 scale conversion utilities.
-//
-// UE8M0 = unsigned 8-bit exponent, 0 mantissa bits.
-// Represents powers of 2: value = 2^(ue8m0 - 127).
-// Range: [2^-127, 2^128].
-//
-// FlashMLA stores FP32 scales rounded to power-of-2 (via 2^ceil(log2(scale))),
-// so FP32→UE8M0 is exact (just extract the exponent byte).
+#include "kv_cache_traits.cuh"
+#include "model_type.h"
+
+// Extract or rebuild FP32 exponent bits without rounding or mantissa handling.
+// Rebuilding byte 0 yields zero; byte 255 yields positive infinity.
 
 namespace detail {
 __host__ __device__ __forceinline__ uint32_t float_as_uint(float v) {
@@ -61,18 +59,52 @@ __host__ __device__ __forceinline__ float uint_as_float(uint32_t v) {
 }
 }  // namespace detail
 
-__host__ __device__ __forceinline__ uint8_t fp32_to_ue8m0(float v) {
+__host__ __device__ __forceinline__ uint8_t fp32_exponent_byte(float v) {
   return static_cast<uint8_t>((detail::float_as_uint(v) >> 23) & 0xFF);
 }
 
-__host__ __device__ __forceinline__ float ue8m0_to_fp32(uint8_t v) {
+__host__ __device__ __forceinline__ float fp32_from_exponent_byte(uint8_t v) {
   uint32_t bits = static_cast<uint32_t>(v) << 23;
   return detail::uint_as_float(bits);
 }
 
-// Pack 2 FP32 scales into UE8M0x2 (uint16_t): low byte = first, high byte = second
-__host__ __device__ __forceinline__ uint16_t fp32x2_to_ue8m0x2(float a, float b) {
-  uint8_t ea = fp32_to_ue8m0(a);
-  uint8_t eb = fp32_to_ue8m0(b);
+// Pack exponent bytes: low byte = first, high byte = second.
+__host__ __device__ __forceinline__ uint16_t fp32_exponent_byte_pair(float a, float b) {
+  uint8_t ea = fp32_exponent_byte(a);
+  uint8_t eb = fp32_exponent_byte(b);
   return static_cast<uint16_t>(ea) | (static_cast<uint16_t>(eb) << 8);
+}
+
+// Per-format scale -> UE8M0 conversion for block-scaled MMA. UE8M0 caches
+// need no conversion; both FP32 formats reduce to the exponent byte.
+template <ScaleFormat F>
+struct ScaleConvert {
+  static_assert(F == ScaleFormat::POW2_FP32 || F == ScaleFormat::ARBITRARY_FP32,
+                "add a ScaleConvert specialization for this scale format");
+  __device__ static __forceinline__ uint8_t to_ue8m0(float scale) { return fp32_exponent_byte(scale); }
+};
+
+template <>
+struct ScaleConvert<ScaleFormat::UE8M0_BYTE> {
+  __device__ static __forceinline__ uint8_t to_ue8m0(uint8_t scale) { return scale; }
+};
+
+__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DSV3_2>::scale_to_ue8m0(float scale) {
+  return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+}
+
+__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::GLM53_NOPE>::scale_to_ue8m0(float scale) {
+  return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+}
+
+__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DOTS3_SWA>::scale_to_ue8m0(uint8_t scale) {
+  return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+}
+
+__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DSV4>::scale_to_ue8m0(uint8_t scale) {
+  return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+}
+
+__device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DSV4_1>::scale_to_ue8m0(uint8_t scale) {
+  return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
 }
