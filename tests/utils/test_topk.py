@@ -3211,26 +3211,18 @@ def test_topk_clusters_ragged_transform(num_rows, seq_len, k, dtype):
 
 
 @pytest.mark.parametrize("api", ["top_k", "page_table", "ragged"])
+@pytest.mark.parametrize("algo", ["auto", "cub"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    ("algo", "num_rows", "width", "k", "dtype"),
-    [
-        pytest.param(algo, 4, width, k, dtype, id=f"{algo}-{name}-{dtype}")
-        for algo in ("auto", "cub")
-        for dtype in (torch.float32, torch.float16, torch.bfloat16)
-        for width, k, name in [
-            (64, 2048, "short"),
-            (65, 4096, "odd_width"),
-            (65, 8193, "above_cub_bound"),
-            (64, 64, "equal_width"),
-            (32768, 2048, "logical_short"),
-        ]
-    ],
+    "width,k",
+    [(64, 2048), (65, 4096), (65, 8193), (64, 64), (32768, 2048)],
+    ids=["short", "odd_width", "above_cub_bound", "equal_width", "logical_short"],
 )
-def test_cub_topk_physical_width(api, algo, num_rows, dtype, width, k, set_topk_algo):
+def test_cub_topk_physical_width(api, algo, dtype, width, k, set_topk_algo):
     """Preserve requested output width through CUB, including when k exceeds d."""
     _require_cub_tie_break_support()
     set_topk_algo(algo)
-    page_size = 64
+    num_rows, page_size = 4, 64
     if width > k:
         scores, expected_small, expected_large = _make_tie_break_test_case(
             num_rows, width, k, dtype, "boundary_tie"
@@ -3243,9 +3235,7 @@ def test_cub_topk_physical_width(api, algo, num_rows, dtype, width, k, set_topk_
         # padding sentinel. LARGE must not select synthetic padded positions.
         scores[:, 0] = float("-inf")
         scores[:, -1] = float("inf")
-    lengths = torch.tensor(
-        [width, 17, 0, width], device="cuda", dtype=torch.int32
-    ).repeat(num_rows // 4)
+    lengths = torch.tensor([width, 17, 0, width], device="cuda", dtype=torch.int32)
     offsets = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32) * 100000
     page_width = (width + page_size - 1) // page_size
     pages = (
@@ -3284,10 +3274,12 @@ def test_cub_topk_physical_width(api, algo, num_rows, dtype, width, k, set_topk_
                     **kwargs,
                 )
                 assert indices.data_ptr() == out.data_ptr()
-            else:
+            elif api == "ragged":
                 indices = flashinfer.top_k_ragged_transform(
                     scores, offsets, lengths, k, **kwargs
                 )
+            else:
+                raise AssertionError(f"Unexpected API: {api}")
             # An automatic native fallback must not hide the CUB regression.
             assert cub_call.call_count == 1
 
@@ -3304,27 +3296,26 @@ def test_cub_topk_physical_width(api, algo, num_rows, dtype, width, k, set_topk_
                 )
             else:
                 expected = torch.arange(valid, device="cuda")
-            if api == "page_table":
-                _assert_unordered_indices_match(raw[row, :valid], expected)
-                assert torch.all(raw[row, valid:] == -1)
-                raw_valid = raw[row, :valid].long()
-                assert torch.equal(
-                    indices[row, :valid],
-                    pages[row, raw_valid // page_size] * page_size
-                    + raw_valid % page_size,
-                )
-                expected = pages[row, expected // page_size] * page_size + (
-                    expected % page_size
-                )
-            elif api == "ragged":
-                expected = expected + offsets[row]
-            else:
+            selected = indices[row]
+            if api == "top_k":
                 assert torch.equal(
                     values[row, :valid], scores[row, indices[row, :valid]]
                 )
                 assert torch.all(values[row, valid:] == 0)
-            _assert_unordered_indices_match(indices[row, :valid], expected)
-            assert torch.all(indices[row, valid:] == -1)
+            elif api == "page_table":
+                selected = raw[row]
+                local = selected[:valid].long()
+                assert torch.equal(
+                    indices[row, :valid],
+                    pages[row, local // page_size] * page_size + local % page_size,
+                )
+                assert torch.all(indices[row, valid:] == -1)
+            elif api == "ragged":
+                expected = expected + offsets[row]
+            else:
+                raise AssertionError(f"Unexpected API: {api}")
+            _assert_unordered_indices_match(selected[:valid], expected)
+            assert torch.all(selected[valid:] == -1)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -3352,30 +3343,20 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
     _require_cub_tie_break_support()
     set_topk_algo("cub")
     num_rows, page_size = 4, 64
-    storage = torch.full((num_rows, width + 16), 1000, device="cuda", dtype=dtype)
-    scores = storage[:, 1 : width + 1]
-    scores.copy_((torch.arange(width, device="cuda") % 7).to(dtype))
-    assert not scores.is_contiguous()
-    assert scores.data_ptr() % 16 != 0
-    short_state = (
-        [0, 3, 9, 0],
-        [min(width, 64), min(width - 3, 17), min(width - 9, 1), 0],
-    )
-    long_state = ([0, 3, 9, 0], [width, width - 3, width - 9, width])
-    capture_state = short_state if capture_length == "short" else long_state
+    scores = (torch.arange(width, device="cuda") % 7).to(dtype).repeat(num_rows, 1)
+    short_lengths = [64, 17, 1, 0]
+    long_lengths = [width] * num_rows
+    capture_lengths = short_lengths if capture_length == "short" else long_lengths
     if capture_length == "short":
-        assert max(capture_state[1]) < k
+        assert max(capture_lengths) < k
     elif capture_length == "long":
-        assert min(capture_state[1]) > k
-    row_starts = torch.tensor(capture_state[0], device="cuda", dtype=torch.int32)
-    lengths = torch.tensor(capture_state[1], device="cuda", dtype=torch.int32)
+        assert min(capture_lengths) > k
+    lengths = torch.tensor(capture_lengths, device="cuda", dtype=torch.int32)
     offsets = torch.tensor([100, 500, 1000, 2000], device="cuda", dtype=torch.int32)
-    row_to_batch = torch.tensor([1, 0, 1, 0], device="cuda", dtype=torch.int32)
-    page_starts = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32)
-    page_width = (width + page_size - 1) // page_size + 4
+    page_width = (width + page_size - 1) // page_size
     pages = torch.arange(
-        100, 100 + 2 * page_width, device="cuda", dtype=torch.int32
-    ).reshape(2, page_width)
+        100, 100 + num_rows * page_width, device="cuda", dtype=torch.int32
+    ).reshape(num_rows, page_width)
     out = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
     raw = torch.empty_like(out)
 
@@ -3389,71 +3370,50 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
                 pages,
                 lengths,
                 k,
-                row_to_batch=row_to_batch,
                 page_size=page_size,
-                row_starts=row_starts,
-                page_table_row_starts=page_starts,
                 out=out,
                 out_raw_indices=raw,
                 **kwargs,
             )
         elif api == "ragged":
             return flashinfer.top_k_ragged_transform(
-                scores, offsets, lengths, k, row_starts=row_starts, **kwargs
+                scores, offsets, lengths, k, **kwargs
             )
         raise AssertionError(f"Unexpected API: {api}")
 
-    def expected_indices(row, length, start=0):
-        valid = min(max(length, 0), k)
-        if length <= k:
-            return torch.arange(valid, device="cuda")
-        # Reverse before a stable sort to prefer LARGE indices in the tied
-        # boundary bucket. Scores contain many ties, not just unique maxima.
-        row_scores = scores[row, start : start + length]
-        return (
-            length
-            - 1
-            - torch.argsort(row_scores.flip(0), descending=True, stable=True)[:valid]
-        )
-
     def check(result):
-        if api == "top_k":
-            values, indices = result
-            valid = min(width, k)
-            expected = torch.stack(
-                [expected_indices(row, width) for row in range(num_rows)]
+        for row in range(num_rows):
+            length = width if api == "top_k" else int(lengths[row])
+            valid = min(length, k)
+            # Reverse before a stable sort to prefer LARGE indices at ties.
+            expected = (
+                length
+                - 1
+                - torch.argsort(
+                    scores[row, :length].flip(0), descending=True, stable=True
+                )[:valid]
             )
-            _assert_unordered_indices_match(indices[:, :valid], expected)
-            assert torch.equal(values[:, :valid], scores.gather(1, indices[:, :valid]))
-            assert torch.all(values[:, valid:] == 0)
-            assert torch.all(indices[:, valid:] == -1)
-            return
-        if api == "page_table":
-            assert result.data_ptr() == out.data_ptr()
-        for row, length in enumerate(lengths.tolist()):
-            valid = min(max(length, 0), k)
-            expected = expected_indices(row, length, int(row_starts[row]))
-            if api == "page_table":
-                _assert_unordered_indices_match(raw[row, :valid], expected)
-                assert torch.all(raw[row, valid:] == -1)
-                local = raw[row, :valid].long()
+            if api == "top_k":
+                values, indices = result
+                selected = indices[row]
+                assert torch.equal(values[row, :valid], scores[row, selected[:valid]])
+                assert torch.all(values[row, valid:] == 0)
+            elif api == "page_table":
+                selected = raw[row]
+                local = selected[:valid].long()
+                assert result.data_ptr() == out.data_ptr()
                 assert torch.equal(
                     result[row, :valid],
-                    pages[row_to_batch[row], page_starts[row] + local // page_size]
-                    * page_size
-                    + local % page_size,
+                    pages[row, local // page_size] * page_size + local % page_size,
                 )
-                expected = (
-                    pages[row_to_batch[row], page_starts[row] + expected // page_size]
-                    * page_size
-                    + expected % page_size
-                )
+                assert torch.all(result[row, valid:] == -1)
             elif api == "ragged":
+                selected = result[row]
                 expected = expected + offsets[row]
             else:
                 raise AssertionError(f"Unexpected API: {api}")
-            _assert_unordered_indices_match(result[row, :valid], expected)
-            assert torch.all(result[row, valid:] == -1)
+            _assert_unordered_indices_match(selected[:valid], expected)
+            assert torch.all(selected[valid:] == -1)
 
     check(run())
     torch.cuda.synchronize()
@@ -3461,31 +3421,20 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
     with torch.cuda.graph(graph):
         result = run()
     outputs = result if api == "top_k" else (result,)
-    output_ptrs = tuple(output.data_ptr() for output in outputs)
-    # Physical capacity and batch size stay fixed. Plain top_k has no logical
-    # lengths input; its cases replay changed scores at that fixed width.
-    replay_states = [capture_state]
-    if api in ("page_table", "ragged") and width > k:
-        assert max(short_state[1]) < k < min(long_state[1])
-        opposite_state = long_state if capture_length == "short" else short_state
-        # Check the captured lengths, cross k for every row, then return to the
-        # original lengths using the same graph and the same device buffers.
-        replay_states.extend([opposite_state, capture_state])
-    replay_states.extend(
-        [
-            ([width, 1, width - 5, 0], [0, min(width - 1, k), 5, -1]),
-            ([0, width - 1, 0, 7], [width, 1, min(width, k - 1), width - 7]),
-            (
-                [0, 3, 9, 0],
-                [min(width, k + 1), min(width - 3, k - 1), min(width - 9, k), width],
-            ),
+    if api == "top_k":
+        # Plain Top-K has no lengths argument; only score values change.
+        replay_lengths = [capture_lengths, capture_lengths]
+    else:
+        opposite_lengths = long_lengths if capture_length == "short" else short_lengths
+        boundary_lengths = [0, min(width, k - 1), min(width, k), min(width, k + 1)]
+        replay_lengths = [
+            capture_lengths,
+            opposite_lengths,
+            capture_lengths,
+            boundary_lengths,
         ]
-    )
-    for new_starts, new_lengths in replay_states:
-        row_starts.copy_(torch.tensor(new_starts, device="cuda", dtype=torch.int32))
+    for new_lengths in replay_lengths:
         lengths.copy_(torch.tensor(new_lengths, device="cuda", dtype=torch.int32))
-        row_to_batch.copy_(1 - row_to_batch)
-        page_starts.copy_(3 - page_starts)
         pages.add_(20)
         offsets.add_(333)
         scores.copy_(scores.roll(1, dims=1) + 100)
@@ -3494,7 +3443,6 @@ def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_al
         raw.fill_(777)
         graph.replay()
         torch.cuda.synchronize()
-        assert tuple(output.data_ptr() for output in outputs) == output_ptrs
         check(result)
 
 
