@@ -16,6 +16,16 @@ by different examples:
 | `FlashInferFP32LayerNorm` | FP32 LayerNorm helper |
 | `FlashInferFeedForward` | FFN helper using FlashInfer-capable linear layers |
 
+## Standalone Kernel Examples
+
+`alphamoe_nvfp4_aligned_moe.py` demonstrates the SM100/SM103 fused AlphaMoE
+NVFP4 up → SwiGLU → down API with linear per-16 E4M3 scales, an externally
+aligned routing plan, and a caller-owned BF16 accumulator:
+
+```bash
+python examples/pytorch/alphamoe_nvfp4_aligned_moe.py
+```
+
 ## FlashInfer API and Backend Selection
 
 Backend selection is exposed through model config fields, command-line options,

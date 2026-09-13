@@ -166,6 +166,10 @@ from .trtllm_gen_routing import (  # noqa: F401
     trtllm_gen_routing as trtllm_gen_routing,
 )
 
+from .alphamoe_nvfp4_sm100 import (  # noqa: F401
+    alphamoe_nvfp4_aligned_moe as alphamoe_nvfp4_aligned_moe,
+)
+
 from .bgmv_moe import (  # noqa: F401
     BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     bgmv_moe as bgmv_moe,
@@ -334,6 +338,7 @@ __all__ = [
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
     "hash_topk",
+    "alphamoe_nvfp4_aligned_moe",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
     "bgmv_moe",

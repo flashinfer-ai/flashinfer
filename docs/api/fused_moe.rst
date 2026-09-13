@@ -122,6 +122,22 @@ TensorRT-LLM Fused MoE
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 
+AlphaMoE NVFP4 (SM100/SM103)
+-----------------------------
+
+The AlphaMoE path consumes packed E2M1 activations and weights with linear
+per-16 E4M3 scales plus a pre-aligned routing plan. It fuses the gate/up
+projection, SwiGLU requantization, and down projection into one kernel and
+accumulates into a caller-owned BF16 output tensor. Three contiguous FP32
+``[E]`` tensors provide the per-expert static ModelOpt scales: the gate scale
+is applied before SiLU, the up scale before SwiGLU multiplication, and the down
+scale before route weighting.
+
+.. autosummary::
+    :toctree: ../generated
+
+    alphamoe_nvfp4_aligned_moe
+
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------
 

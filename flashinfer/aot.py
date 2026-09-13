@@ -99,6 +99,7 @@ from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -723,6 +724,8 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_nvfp4_sm100_module())
         # Multi-LoRA MoE BGMV kernel
         if has_bgmv_moe:
             jit_specs.append(gen_bgmv_moe_module())
