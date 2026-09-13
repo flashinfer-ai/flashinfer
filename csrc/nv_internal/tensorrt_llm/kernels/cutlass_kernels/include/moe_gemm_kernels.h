@@ -223,7 +223,15 @@ struct TmaWarpSpecializedGroupedGemmInput {
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};
 
-  static std::array<size_t, 20> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
+  // Gather-A GEMM1 fusion: when set, the mainloop gathers its A operand rows
+  // directly from the unpermuted activations (ptr_act stays the expert-sliced
+  // view of the *permuted* layout in the dense path; with gather enabled,
+  // ptr_act[e] points at the shared unpermuted base and ptr_gather_a_index[e]
+  // points at the expert's slice of permuted_source_token_ids).
+  bool use_gather_a = false;
+  int const** ptr_gather_a_index = nullptr;
+
+  static std::array<size_t, 21> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
@@ -316,12 +324,14 @@ class MoeGemmRunner {
   void moeGemm(GroupedGemmInput<T, WeightType, ScaleBiasType, OutputType> inputs,
                TmaWarpSpecializedGroupedGemmInput hopper_inputs);
 
+  // supports_gather_a appends gather-A duplicates (SM90 GEMM1 fused-permute
+  // mainloop) of each eligible TMA WS config.
   std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(
-      bool supports_finalize_fusion) const;
+      bool supports_finalize_fusion, bool supports_gather_a = false) const;
   static std::vector<cutlass_extensions::CutlassGemmConfig> getConfigs(
-      int sm, bool supports_finalize_fusion);
+      int sm, bool supports_finalize_fusion, bool supports_gather_a = false);
   static std::vector<cutlass_extensions::CutlassGemmConfig> getTmaWarpSpecializedConfigs(
-      int sm, bool supports_finalize_fusion);
+      int sm, bool supports_finalize_fusion, bool supports_gather_a = false);
   static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
   [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;

@@ -96,6 +96,31 @@ constexpr bool isValidHopperMOESpecialisation() {
 #endif
 }
 
+// Gather-A GEMM1 variant (SM90 only): the mainloop row-gathers its A operand
+// from the unpermuted activations instead of reading a pre-expanded copy.
+// Restricted to 16-bit same-type activation/weight (no fp8/fp4/mixed input),
+// default epilogue and no epilogue fusion. Cluster shape (1x1x1 only) and
+// swap_ab (must be false) are checked at the instantiation/dispatch sites
+// since they are value parameters there.
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidSM90GatherAMOESpecialisation() {
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+  return cutlass::platform::is_same<T, WeightType>::value &&
+         (cutlass::platform::is_same<T, half>::value
+#ifdef ENABLE_BF16
+          || cutlass::platform::is_same<T, __nv_bfloat16>::value
+#endif
+          ) &&
+         cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value &&
+         Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
+#else
+  return false;
+#endif
+}
+
 template <typename T, typename WeightType,
           typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =

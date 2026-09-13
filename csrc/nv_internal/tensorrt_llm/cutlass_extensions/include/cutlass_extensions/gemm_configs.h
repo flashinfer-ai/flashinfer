@@ -364,6 +364,7 @@ struct CutlassGemmConfig {
 
   EpilogueFusionType epilogue_fusion_type = EpilogueFusionType::NONE;
   bool swap_ab = false;
+  bool gather_a = false;
 
   CutlassGemmConfig() = default;
 
@@ -445,7 +446,8 @@ struct CutlassGemmConfig {
              << "\n\tepi sched: " << (int)epilogue_schedule
              << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false")
              << "\n\tepilogue fusion type: " << (int)epilogue_fusion_type
-             << "\n\tswap_ab: " << (swap_ab ? "true" : "false");
+             << "\n\tswap_ab: " << (swap_ab ? "true" : "false")
+             << "\n\tgather_a: " << (gather_a ? "true" : "false");
     } else if (tile_config_sm80 !=
                tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic) {
       assert(sm_version < 90 && "Invalid cutlass GEMM config");
@@ -475,7 +477,8 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
             << ", fallback_cluster_shape_enum: " << int(config.fallback_cluster_shape)
             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false")
             << ", epilogue_fusion_type: " << int(config.epilogue_fusion_type)
-            << ", swap_ab: " << (config.swap_ab ? "true" : "false");
+            << ", swap_ab: " << (config.swap_ab ? "true" : "false")
+            << ", gather_a: " << (config.gather_a ? "true" : "false");
     }
     else
     {
