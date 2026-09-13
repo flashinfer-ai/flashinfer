@@ -68,7 +68,10 @@ PCIE_IPC_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce"
 # candidate encoding changes. The autotuner's own metadata records library and
 # driver versions but nothing about this op, and a dev checkout does not move
 # the FlashInfer version.
-PCIE_IPC_TUNE_VERSION = 4
+PCIE_IPC_TUNE_VERSION = 3
+# Only workspaces that admit stream publication search the additional tactic.
+# Preserve their existing namespace without invalidating original-path caches.
+_PCIE_IPC_MEMOP_TUNE_VERSION = 4
 
 # Not all powers of two: the extra entries are block counts the search selected
 # on real hardware, and it cannot converge on a configuration its own grid
@@ -204,6 +207,23 @@ def tactic_to_config(tactic: Sequence[int]) -> IpcLaunchConfig:
         raise ValueError(f"tactic {tactic!r} names no variant: {exc}") from exc
 
 
+def _cache_key_head(
+    world_size: int,
+    profile: str,
+    max_blocks: int,
+    max_numel: int,
+    memop_supported: bool,
+) -> Tuple:
+    head = (
+        _PCIE_IPC_MEMOP_TUNE_VERSION if memop_supported else PCIE_IPC_TUNE_VERSION,
+        int(world_size),
+        str(profile),
+        int(max_blocks),
+        int(max_numel),
+    )
+    return head + (True,) if memop_supported else head
+
+
 def cache_covers_workspace(
     world_size: int,
     profile: str,
@@ -231,14 +251,7 @@ def cache_covers_workspace(
     prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
     # cache_key_extras up to the dtype, with the closing paren traded for the
     # separator that must follow it.
-    head = (
-        PCIE_IPC_TUNE_VERSION,
-        int(world_size),
-        str(profile),
-        int(max_blocks),
-        int(max_numel),
-        bool(memop_supported),
-    )
+    head = _cache_key_head(world_size, profile, max_blocks, max_numel, memop_supported)
     needle = repr(head)[:-1] + ", "
     return any(
         key.startswith(prefix) and needle in key
@@ -357,15 +370,9 @@ def cache_key_extras(
     autotuner requires: the tuple must come out the same for the caller's real
     tensors and for the ones it synthesizes.
     """
-    return (
-        PCIE_IPC_TUNE_VERSION,
-        int(world_size),
-        str(profile),
-        int(max_blocks),
-        int(max_numel),
-        bool(memop_supported),
-        str(dtype),
-    )
+    return _cache_key_head(
+        world_size, profile, max_blocks, max_numel, memop_supported
+    ) + (str(dtype),)
 
 
 def pack_config(config: IpcLaunchConfig) -> int:
@@ -545,12 +552,13 @@ class PcieIpcAllReduceRunner(TunableRunner):
         return hash(
             (
                 type(self).__name__,
-                PCIE_IPC_TUNE_VERSION,
-                ws.world_size,
-                ws.profile,
-                ws.max_blocks,
-                ws.max_numel,
-                ws.memop_supported,
+                *_cache_key_head(
+                    ws.world_size,
+                    ws.profile,
+                    ws.max_blocks,
+                    ws.max_numel,
+                    ws.memop_supported,
+                ),
             )
         )
 

@@ -30,7 +30,17 @@ using tvm::ffi::Array;
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
+// Local eligibility sizes this rank's optional region; the group still decides
+// whether the SM120 protocol may be enabled.
+bool pcie_ipc_memop_supported();
+
 namespace {
+
+size_t memop_workspace_bytes(int world_size) {
+  return (world_size == 4 || world_size == 8) && pcie_ipc_memop_supported()
+             ? fi::ce_binary_flag_bytes(world_size)
+             : 0;
+}
 
 // Everything the launcher needs that does not change between calls. The
 // workspace itself is owned by the caller (see pcie_ipc_all_reduce.cuh).
@@ -121,7 +131,7 @@ int64_t pcie_ipc_workspace_size(int64_t world_size, int64_t max_numel, int64_t e
   TVM_FFI_ICHECK_GT(max_blocks, 0) << "max_blocks must be positive";
   return fi::workspace_size(static_cast<int>(world_size), max_numel, static_cast<int>(elem_size),
                             static_cast<int>(max_blocks)) +
-         static_cast<int64_t>(fi::ce_binary_flag_bytes(static_cast<int>(world_size)));
+         static_cast<int64_t>(memop_workspace_bytes(static_cast<int>(world_size)));
 }
 
 /*!
@@ -158,9 +168,12 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   handle->layout = fi::compute_workspace_layout(world_size, max_numel, static_cast<int>(elem_size),
                                                 static_cast<int>(max_blocks));
   handle->views = fi::make_peer_views(ptrs, world_size, static_cast<int>(rank), handle->layout);
-  for (int peer = 0; peer < world_size; ++peer) {
-    handle->ce.binary_flags[peer] = reinterpret_cast<int32_t*>(reinterpret_cast<char*>(ptrs[peer]) +
-                                                               handle->layout.total_bytes);
+  const size_t memop_bytes = memop_workspace_bytes(world_size);
+  if (memop_bytes != 0) {
+    for (int peer = 0; peer < world_size; ++peer) {
+      handle->ce.binary_flags[peer] = reinterpret_cast<int32_t*>(
+          reinterpret_cast<char*>(ptrs[peer]) + handle->layout.total_bytes);
+    }
   }
   handle->rank = static_cast<int>(rank);
   handle->world_size = world_size;
@@ -168,8 +181,8 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   handle->max_numel = max_numel;
   handle->elem_size = static_cast<int>(elem_size);
 
-  cudaError_t err = cudaMemset(reinterpret_cast<void*>(ptrs[rank]), 0,
-                               handle->layout.total_bytes + fi::ce_binary_flag_bytes(world_size));
+  cudaError_t err =
+      cudaMemset(reinterpret_cast<void*>(ptrs[rank]), 0, handle->layout.total_bytes + memop_bytes);
   if (err != cudaSuccess) {
     delete handle;
     TVM_FFI_LOG_AND_THROW(RuntimeError)
@@ -211,7 +224,7 @@ void pcie_ipc_set_memop_enabled(fptr_t handle, bool enabled) {
   auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
   TVM_FFI_ICHECK(!h->launched && !h->memop_configured)
       << "memory-operation protocol must be configured once before the first launch";
-  TVM_FFI_ICHECK(!enabled || (h->world_size != 2 && pcie_ipc_memop_supported()))
+  TVM_FFI_ICHECK(!enabled || (h->ce.binary_flags[h->rank] != nullptr && pcie_ipc_memop_supported()))
       << "memory-operation protocol requires SM120 and stream memory operation support";
   h->ce.memop_enabled = enabled;
   h->memop_configured = true;
@@ -235,7 +248,7 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
   ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   auto stream = get_stream(inp.device());
-  h->launched = true;
+  if (h->ce.binary_flags[h->rank] != nullptr) h->launched = true;
 
   TVM_FFI_ICHECK(inp.IsContiguous() && out.IsContiguous()) << "input and output must be contiguous";
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(inp.dtype()), encode_dlpack_dtype(out.dtype()))

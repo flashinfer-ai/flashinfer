@@ -23,6 +23,7 @@ consequences, and one of the consequences is a hang.
 
 import inspect
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -408,6 +409,59 @@ def _synthesise_cache(monkeypatch, *entries) -> None:
     monkeypatch.setattr(AutoTuner.get(), "_file_configs", configs, raising=False)
 
 
+@pytest.mark.parametrize("memop_supported", [False, True])
+def test_original_and_memop_cache_namespaces_remain_loadable(
+    memop_supported, monkeypatch, tmp_path
+) -> None:
+    """Original v3 caches still hit; enabled SM120 retains its separate v4 key."""
+    from flashinfer.autotuner import AutoTuner
+
+    workspace_fields = dict(
+        world_size=4, profile=PROFILE_ROOTCPLX, max_blocks=128, max_numel=6144 * 128
+    )
+    # Literal persisted formats, independent of the current key builder.
+    if memop_supported:
+        head = (4, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True)
+    else:
+        head = (3, 4, PROFILE_ROOTCPLX, 128, 6144 * 128)
+    extras = head + ("torch.bfloat16",)
+    tactic = (6, 1, 256) if memop_supported else (1, 8, 256)
+    file_key = str(
+        (
+            "flashinfer::pcie_ipc_all_reduce",
+            "PcieIpcAllReduceRunner",
+            ((1, 4096),),
+            extras,
+        )
+    )
+    path = tmp_path / "pcie-ipc.json"
+    path.write_text(json.dumps({file_key: ["PcieIpcAllReduceRunner", list(tactic)]}))
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    assert tuner.load_configs(str(path))
+
+    workspace = SimpleNamespace(**workspace_fields, memop_supported=memop_supported)
+    runner = tuning.PcieIpcAllReduceRunner(workspace)
+    inp = torch.empty(1, 4096, dtype=torch.bfloat16)
+    assert runner.get_cache_key_extras([inp]) == extras
+    assert hash(runner) == hash(("PcieIpcAllReduceRunner", *head))
+    assert tuning.cache_covers_workspace(
+        **workspace_fields, memop_supported=memop_supported
+    )
+    assert not tuning.cache_covers_workspace(
+        **workspace_fields, memop_supported=not memop_supported
+    )
+    hit, runner_id, loaded_tactic, _ = tuner.search_cache(
+        tuning.PCIE_IPC_CUSTOM_OP,
+        [runner],
+        (tuple(inp.shape),),
+        tuning.pcie_ipc_tuning_config(),
+        inputs=[inp],
+    )
+    assert hit and runner_id == 0
+    assert loaded_tactic == tactic
+
+
 def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -> None:
     """A key mismatch misses every entry, which looks exactly like a hit."""
     tuned = dict(
@@ -590,7 +644,7 @@ def test_pinning_a_searched_dimension_moved_the_tune_version() -> None:
 def test_custom_op_name_is_stable() -> None:
     """It is baked into every persisted cache key; renaming it orphans the file."""
     assert tuning.PCIE_IPC_CUSTOM_OP == "flashinfer::pcie_ipc_all_reduce"
-    assert tuning.PCIE_IPC_TUNE_VERSION == 4
+    assert tuning.PCIE_IPC_TUNE_VERSION == 3
 
 
 def test_pack_config_is_injective_over_the_candidate_space() -> None:

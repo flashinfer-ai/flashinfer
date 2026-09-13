@@ -281,10 +281,16 @@ class PcieIpcAllReduceWorkspace:
             nbytes = 0
             self._joint_check({"error": f"{type(e).__name__}: {e}"}, "preparing")
             raise  # unreachable: _joint_check raises on every rank
-        self._joint_check({"error": None}, "preparing")
-        capabilities = [None] * self.world_size
-        dist.all_gather_object(capabilities, local_memop_supported, group=group)
-        self.memop_supported = self.world_size in (4, 8) and all(capabilities)
+        # Carry eligibility in the existing preparation exchange. Mixed groups
+        # agree on the original protocol without adding a collective to it.
+        prepared = self._joint_check(
+            {"error": None, "memop_supported": local_memop_supported},
+            "preparing",
+            require_identical=False,
+        )
+        self.memop_supported = self.world_size in (4, 8) and all(
+            entry["memop_supported"] for entry in prepared
+        )
 
         # --- stage 3: allocate and share, then bind --------------------------
         # NOTE: create_shared_buffer() runs its own all_gather_object and
@@ -297,7 +303,8 @@ class PcieIpcAllReduceWorkspace:
             self._handle = module.init(
                 self._ipc_ptrs, self.rank, max_numel, self.elem_size, max_blocks
             )
-            module.set_memop_enabled(self._handle, self.memop_supported)
+            if self.memop_supported:
+                module.set_memop_enabled(self._handle, True)
             # init() zeroes this rank's slab; no peer may push into it until
             # every rank has done so.
             torch.cuda.synchronize(self.device)
@@ -323,11 +330,15 @@ class PcieIpcAllReduceWorkspace:
             raise
         dist.barrier(group=group)
 
-    def _joint_check(self, local: dict, what: str) -> None:
+    def _joint_check(
+        self, local: dict, what: str, *, require_identical: bool = True
+    ) -> List[dict]:
         """Gather per-rank outcomes and fail the whole group, or none of it.
 
         Raises the same error on every rank, so the caller can rely on all
-        ranks taking the same branch afterwards.
+        ranks taking the same branch afterwards. Capability outcomes may differ
+        when require_identical is false; callers receive the successful entries
+        and choose one protocol for the whole group.
         """
         gathered: List[Optional[dict]] = [None] * self.world_size
         dist.all_gather_object(gathered, local, group=self.group)
@@ -340,13 +351,16 @@ class PcieIpcAllReduceWorkspace:
         mismatched = {
             key: [g[key] for g in entries]
             for key in local
-            if key != "error" and len({repr(g[key]) for g in entries}) > 1
+            if require_identical
+            and key != "error"
+            and len({repr(g[key]) for g in entries}) > 1
         }
         if mismatched:
             raise ValueError(
                 "every rank must build the workspace with identical arguments, "
                 f"but these differ across the group: {mismatched}"
             )
+        return entries
 
     @property
     def handle(self) -> int:
