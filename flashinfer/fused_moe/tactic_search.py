@@ -15,6 +15,10 @@ ConcreteMoeTactic = tuple[int, int]
 MoeTacticKey = int | ConcreteMoeTactic
 
 
+class _NoFiniteTacticsError(RuntimeError):
+    """Signal that one factorized subset has no measurable tactic."""
+
+
 @dataclass(frozen=True)
 class FactorizedTactic:
     """Describe one legal complete tactic through two opaque coordinates."""
@@ -148,6 +152,10 @@ class FactorizedTacticSpace:
         """Return every legal complete tactic for exhaustive diagnostics."""
         return tuple(tactic for tile in self.tiles for tactic in self._by_tile[tile])
 
+    def tactics_for_tile(self, tile_n: int) -> tuple[FactorizedTactic, ...]:
+        """Return every legal complete tactic for one tile."""
+        return tuple(self._by_tile[tile_n])
+
     def restricted_to_public_tactics(
         self, public_tactics: Sequence[MoeTactic]
     ) -> FactorizedTacticSpace:
@@ -198,29 +206,41 @@ class FactorizedSearch:
         # point remains a complete runner tactic, so the full operation is always the authority.
         finalists: list[FactorizedTactic] = []
         for tile_n in space.tiles:
-            current = space.anchor(tile_n)
-            for _ in range(self._max_sweeps):
-                before = current
-                current = self._best(space.fc1_sweep(tile_n, current.fc2), measure)
-                current = self._best(space.fc2_sweep(tile_n, current.fc1), measure)
-                current = space.compose(tile_n, current.fc1, current.fc2)
-                if current == before:
-                    break
-            finalists.append(current)
+            try:
+                current = space.anchor(tile_n)
+                for _ in range(self._max_sweeps):
+                    before = current
+                    current = self._best(space.fc1_sweep(tile_n, current.fc2), measure)
+                    current = self._best(space.fc2_sweep(tile_n, current.fc1), measure)
+                    current = space.compose(tile_n, current.fc1, current.fc2)
+                    if current == before:
+                        break
+                finalists.append(current)
+            except _NoFiniteTacticsError:
+                # A failed pinned slice does not prove the whole tile is unsupported. The
+                # exceptional path may profile the remaining complete tactics exhaustively;
+                # the ordinary path retains factorized cardinality.
+                try:
+                    finalists.append(
+                        self._best(space.tactics_for_tile(tile_n), measure)
+                    )
+                except _NoFiniteTacticsError:
+                    continue
 
         # Revisit only the small per-tile finalist set for the cross-tile decision. Callers may
         # memoize exact measurements; the decisive flag still identifies this final authority.
         scored = []
+        finite_finalists = []
         for tactic in finalists:
             timing = float(measure(tactic, True))
             if not math.isfinite(timing):
-                raise RuntimeError(
-                    f"Non-finite decisive timing for tile={tactic.tile_n}, "
-                    f"tactic={tactic.tactic!r}"
-                )
+                continue
             scored.append((timing, repr(tactic.tactic), tactic))
+            finite_finalists.append(tactic)
+        if not scored:
+            raise RuntimeError("Factorized search has no finite tactics")
         winner = min(scored, key=lambda item: (item[0], item[1]))[2]
-        return FactorizedSearchResult(winner=winner, finalists=tuple(finalists))
+        return FactorizedSearchResult(winner=winner, finalists=tuple(finite_finalists))
 
     @staticmethod
     def _best(
@@ -233,9 +253,10 @@ class FactorizedSearch:
         observations = []
         for tactic in tactics:
             timing = float(measure(tactic, False))
-            if not math.isfinite(timing):
-                raise RuntimeError(
-                    f"Non-finite factorized timing for {tactic.tactic!r}"
-                )
-            observations.append((timing, repr(tactic.tactic), tactic))
+            if math.isfinite(timing):
+                observations.append((timing, repr(tactic.tactic), tactic))
+        if not observations:
+            raise _NoFiniteTacticsError(
+                "Factorized coordinate sweep has no finite tactics"
+            )
         return min(observations, key=lambda item: (item[0], item[1]))[2]

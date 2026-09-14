@@ -37,6 +37,7 @@ from flashinfer.fused_moe.da_tuner import (
     RoutingRealizationKey,
     publish_compiled_plan,
 )
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
 from flashinfer.fused_moe.tactic_search import FactorizedSearch, FactorizedTactic
 from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import RoutingInputMode
@@ -339,6 +340,18 @@ def run_dist_aware_tactic(
             "DA runtime backend does not match its operation domain: "
             f"{runtime_backend.value} != {backend_identity.value}"
         )
+    if routing_input_mode == RoutingInputMode.FromLogits:
+        routing_logits = inputs[routing_id_index]
+        hidden_states = inputs[MoeRunnerInputs.idx("hidden_states")]
+        if not isinstance(routing_logits, torch.Tensor) or not isinstance(
+            hidden_states, torch.Tensor
+        ):
+            raise TypeError("FromLogits DA requires tensor routing and hidden states")
+        if routing_logits.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                "FromLogits DA requires routing_logits and hidden_states to have "
+                "the same number of tokens"
+            )
     # The adapter declares the only content-mutable inputs used by value-aware profiling and
     # later device-side distribution selection.
     routing_adapter = DaMoeRoutingAdapter(

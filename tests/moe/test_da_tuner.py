@@ -1,5 +1,8 @@
 """Host-only tests for distribution-aware MoE tuning policy."""
 
+import math
+
+import pytest
 import torch
 
 from flashinfer.fused_moe.da_tuner import (
@@ -66,6 +69,29 @@ def test_full_op_measurement_pair_uses_abba_order_and_reuses_cache():
         measure_second,
     ) == (2.0, 3.0)
     assert order == ["a", "b", "b", "a"]
+
+
+def test_full_op_measurement_pair_does_not_publish_partial_results():
+    measurements = FullOpMeasurementCache()
+    first_values = iter((1.0, 3.0, 5.0, 7.0))
+    second_values = iter((2.0, math.inf, 6.0, 8.0))
+
+    with pytest.raises(RuntimeError, match="Non-finite full MoE timing"):
+        measurements.measure_counterbalanced_pair(
+            ("shape", "da"),
+            lambda: next(first_values),
+            ("shape", "noda"),
+            lambda: next(second_values),
+        )
+
+    assert measurements.count == 0
+    assert measurements.measure_counterbalanced_pair(
+        ("shape", "da"),
+        lambda: next(first_values),
+        ("shape", "noda"),
+        lambda: next(second_values),
+    ) == (6.0, 7.0)
+    assert measurements.count == 2
 
 
 def test_singleton_pruning_preserves_preferred_distribution_eager_winner():

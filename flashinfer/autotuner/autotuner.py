@@ -25,18 +25,13 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    TYPE_CHECKING,
     TypeAlias,
 )
 
 import torch
 
 from flashinfer.autotune_cache import ManagedCacheEntry
-from flashinfer.fused_moe.tactic_search import (
-    FactorizedSearchResult,
-    FactorizedTactic,
-    FactorizedTacticSpace,
-    MoeTacticKey,
-)
 from flashinfer.tllm_utils import delay_kernel
 from flashinfer.utils import (
     next_positive_power_of_2,
@@ -51,6 +46,13 @@ from flashinfer.autotuner.initializers import (
     autotuner_initializer_rand_scaled,
 )
 
+if TYPE_CHECKING:
+    from flashinfer.fused_moe.tactic_search import (
+        FactorizedSearchResult,
+        FactorizedTacticSpace,
+        MoeTacticKey,
+    )
+
 # This version should be updated whenever the nvfp4_cutlass backend is changed,
 # such as when new kernels or configs are added. In such cases, the tuning configs
 # should also be updated. Currently, this process is manual, but it should be automated in the future.
@@ -62,7 +64,7 @@ class _FactorizedMoeRunner(Protocol):
 
     def get_factorized_tactic_space(
         self, inputs: list[torch.Tensor]
-    ) -> FactorizedTacticSpace:
+    ) -> "FactorizedTacticSpace":
         """Return the runner's legal complete FC1/FC2 tactic universe."""
         ...
 
@@ -1442,7 +1444,7 @@ class AutoTuner:
         # Ordinary factorized results are process-local because they retain measured finalists.
         self._factorized_search_cache: dict[
             ProfilingCacheKey,
-            tuple[FactorizedSearchResult, dict[MoeTacticKey, float]],
+            tuple["FactorizedSearchResult", dict["MoeTacticKey", float]],
         ] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
@@ -1816,6 +1818,7 @@ class AutoTuner:
         inputs: list[torch.Tensor] | None = None,
         *,
         require_profiling_policy: bool = False,
+        input_shapes_are_optimization_profile: bool = False,
     ) -> tuple[bool, int, Any, OptimizationProfile | None]:
         """Search for cached profiling results matching the current configuration.
 
@@ -1836,6 +1839,8 @@ class AutoTuner:
                 when choose_one can profile and when selecting its resulting winner.
                 Lookup-only callers leave this False, even inside tuning contexts.
                 Legacy v1 policy checks are unchanged.
+            input_shapes_are_optimization_profile: Whether input_shapes came from a generated
+                optimization profile rather than runtime inputs.
 
         Returns:
             A tuple containing:
@@ -1862,12 +1867,15 @@ class AutoTuner:
             )
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
-                cache_key = AutoTuner._get_cache_key(
-                    custom_op,
-                    r,
-                    input_shapes,
-                    tuning_config,
-                    r.get_cache_key_extras(inputs) if inputs is not None else (),
+                extras = r.get_cache_key_extras(inputs) if inputs is not None else ()
+                cache_key = (
+                    AutoTuner._get_cache_key_from_optimization_profile(
+                        custom_op, r, input_shapes, tuning_config, extras
+                    )
+                    if input_shapes_are_optimization_profile
+                    else AutoTuner._get_cache_key(
+                        custom_op, r, input_shapes, tuning_config, extras
+                    )
                 )
                 runner_keys.append((r_id, cache_key))
                 if cache_key in winners:
@@ -2057,6 +2065,45 @@ class AutoTuner:
             new_config
         )
         return new_config
+
+    def _record_tactic_profile_failure(
+        self,
+        custom_op: str,
+        runner: TunableRunner,
+        tactic: Any,
+        tensors: list[torch.Tensor],
+        optimization_profile: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        error: Exception,
+    ) -> None:
+        """Clear CUDA error state and retain one failed tactic observation."""
+        shapes = self._get_input_sizes(tensors)
+        logger.debug(
+            f"[Autotuner]: Skipping tactic {runner} {tactic}, "
+            f"due to failure while profiling: {error}"
+        )
+        logger.debug(
+            f"[Autotuner]: Failed when profiling {runner} {tactic}, "
+            f"shapes={shapes}. Error occurred: {error}"
+        )
+        # Synchronization surfaces an asynchronous launch failure; cudaGetLastError then clears
+        # the sticky runtime error before a later tactic attempts CUDA Graph capture.
+        with contextlib.suppress(Exception):
+            torch.cuda.synchronize()
+        with contextlib.suppress(Exception):
+            torch.cuda.cudart().cudaGetLastError()
+        self.stats.failed_tactics.setdefault(
+            f"{custom_op}::{runner.__class__.__name__}", set()
+        ).add(_tactic_to_json_hashable(tactic))
+        self.stats.failed_profiling_count.setdefault(custom_op, set()).add(
+            AutoTuner._get_cache_key_from_optimization_profile(
+                custom_op,
+                runner,
+                optimization_profile,
+                tuning_config,
+                runner.get_cache_key_extras(tensors),
+            )
+        )
 
     def choose_one(
         self,
@@ -2254,6 +2301,7 @@ class AutoTuner:
                         tuning_config,
                         inputs=inputs,
                         require_profiling_policy=True,
+                        input_shapes_are_optimization_profile=True,
                     )
                     if not is_cache_hit:
                         input_preparation_oom = False
@@ -2353,6 +2401,9 @@ class AutoTuner:
                             if getattr(r, "use_factorized_moe_tactic_search", False):
                                 from flashinfer.fused_moe.tactic_search import (
                                     FactorizedSearch,
+                                    FactorizedTactic,
+                                    FactorizedTacticSpace,
+                                    MoeTacticKey,
                                 )
 
                                 concrete_tactics = [
@@ -2377,7 +2428,7 @@ class AutoTuner:
                                     candidate: FactorizedTactic, decisive: bool
                                 ) -> float:
                                     """Lazily materialize and time one complete runner tactic."""
-                                    nonlocal runner_handles_precompile
+                                    nonlocal runner_handles_precompile, skipped_count
                                     _ = decisive
                                     public_tactic = candidate.public_identity()
                                     if isinstance(public_tactic, list):
@@ -2395,41 +2446,61 @@ class AutoTuner:
                                     if cached_timing is not None:
                                         return cached_timing
 
-                                    # PrimsTS compiles only coordinate points the search visits.
-                                    # A generic preparation-only runner still receives its legacy
-                                    # one-time fallback preparation before the first measurement.
-                                    if runner_handles_precompile is not False:
-                                        handled = r.precompile_tactics(
-                                            preparation_inputs,
-                                            [public_tactic],
-                                            p,
-                                            **preparation_kwargs,
-                                        )
-                                        if runner_handles_precompile is None:
-                                            runner_handles_precompile = handled
-                                            if not handled and (
-                                                "do_preparation" in runner_arg_names
-                                            ):
-                                                r(
-                                                    preparation_inputs,
-                                                    tactic=-1,
-                                                    do_preparation=True,
-                                                    **preparation_kwargs,
-                                                )
-                                    time_measured = self._profile_single_kernel(
-                                        r,
-                                        tensors,
-                                        public_tactic,
-                                        effective_tuning_config,
-                                        input_tensor_batches=prepared_input_batches,
-                                    )
-                                    factorized_timings[identity] = time_measured
                                     self.stats.profiled_tactic_count[custom_op] = (
                                         self.stats.profiled_tactic_count.get(
                                             custom_op, 0
                                         )
                                         + 1
                                     )
+                                    try:
+                                        # PrimsTS compiles only coordinate points the search visits.
+                                        # A generic preparation-only runner still receives its legacy
+                                        # one-time fallback preparation before the first measurement.
+                                        if runner_handles_precompile is not False:
+                                            handled = r.precompile_tactics(
+                                                preparation_inputs,
+                                                [public_tactic],
+                                                p,
+                                                **preparation_kwargs,
+                                            )
+                                            if runner_handles_precompile is None:
+                                                runner_handles_precompile = handled
+                                                if not handled and (
+                                                    "do_preparation" in runner_arg_names
+                                                ):
+                                                    r(
+                                                        preparation_inputs,
+                                                        tactic=-1,
+                                                        do_preparation=True,
+                                                        **preparation_kwargs,
+                                                    )
+                                        time_measured = self._profile_single_kernel(
+                                            r,
+                                            tensors,
+                                            public_tactic,
+                                            effective_tuning_config,
+                                            input_tensor_batches=prepared_input_batches,
+                                        )
+                                    except torch.cuda.OutOfMemoryError:
+                                        if _tune_process_group is None:
+                                            raise
+                                        with contextlib.suppress(Exception):
+                                            torch.cuda.empty_cache()
+                                        skipped_count += 1
+                                        time_measured = float("inf")
+                                    except Exception as error:
+                                        skipped_count += 1
+                                        self._record_tactic_profile_failure(
+                                            custom_op,
+                                            r,
+                                            public_tactic,
+                                            tensors,
+                                            p.get_opt_shapes(),
+                                            tuning_config,
+                                            error,
+                                        )
+                                        time_measured = float("inf")
+                                    factorized_timings[identity] = time_measured
                                     return time_measured
 
                                 search_result = FactorizedSearch(
@@ -2441,12 +2512,14 @@ class AutoTuner:
                                 winner_time = measure_factorized(
                                     search_result.winner, True
                                 )
-                                factorized_cache_key = AutoTuner._get_cache_key(
-                                    custom_op,
-                                    r,
-                                    p.get_opt_shapes(),
-                                    tuning_config,
-                                    r.get_cache_key_extras(tensors),
+                                factorized_cache_key = (
+                                    AutoTuner._get_cache_key_from_optimization_profile(
+                                        custom_op,
+                                        r,
+                                        p.get_opt_shapes(),
+                                        tuning_config,
+                                        r.get_cache_key_extras(tensors),
+                                    )
                                 )
                                 self._factorized_search_cache[factorized_cache_key] = (
                                     search_result,
@@ -2525,48 +2598,14 @@ class AutoTuner:
                                     time_measured = float("inf")
                                 except Exception as e:
                                     skipped_count += 1
-                                    shapes = self._get_input_sizes(tensors)
-                                    logger.debug(
-                                        f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
-                                    )
-                                    logger.debug(
-                                        f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
-                                    )
-
-                                    # Clear any pending async CUDA errors (e.g.
-                                    # cudaErrorIllegalInstruction from a failed
-                                    # kernel warmup run) so they don't surface
-                                    # later during CUDA graph capture.
-                                    # torch.cuda.synchronize() surfaces the error
-                                    # but does NOT clear the sticky CUDA error flag;
-                                    # only cudaGetLastError() resets it.
-                                    with contextlib.suppress(Exception):
-                                        torch.cuda.synchronize()
-                                    with contextlib.suppress(Exception):
-                                        torch.cuda.cudart().cudaGetLastError()
-
-                                    # Record the failed tactic value for the
-                                    # blocklist generator.
-                                    self.stats.failed_tactics.setdefault(
-                                        f"{custom_op}::{r.__class__.__name__}", set()
-                                    ).add(_tactic_to_json_hashable(tac))
-
-                                    # Record the failed profiling combinations
-                                    if (
-                                        custom_op
-                                        not in self.stats.failed_profiling_count
-                                    ):
-                                        self.stats.failed_profiling_count[custom_op] = (
-                                            set()
-                                        )
-                                    self.stats.failed_profiling_count[custom_op].add(
-                                        AutoTuner._get_cache_key(
-                                            custom_op,
-                                            r,
-                                            p.get_opt_shapes(),
-                                            tuning_config,
-                                            r.get_cache_key_extras(tensors),
-                                        )
+                                    self._record_tactic_profile_failure(
+                                        custom_op,
+                                        r,
+                                        tac,
+                                        tensors,
+                                        p.get_opt_shapes(),
+                                        tuning_config,
+                                        e,
                                     )
 
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
@@ -2584,12 +2623,14 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
-                            cache_key = AutoTuner._get_cache_key(
-                                custom_op,
-                                runners[runner_id],
-                                p.get_opt_shapes(),
-                                tuning_config,
-                                runners[runner_id].get_cache_key_extras(tensors),
+                            cache_key = (
+                                AutoTuner._get_cache_key_from_optimization_profile(
+                                    custom_op,
+                                    runners[runner_id],
+                                    p.get_opt_shapes(),
+                                    tuning_config,
+                                    runners[runner_id].get_cache_key_extras(tensors),
+                                )
                             )
                             self._winner_cache()[cache_key] = (tactic, p)
                             profiling_policy = self._profiling_policy(tuning_config)
@@ -2658,18 +2699,17 @@ class AutoTuner:
         runner: TunableRunner,
         tuning_config: TuningConfig,
         inputs: list[torch.Tensor],
-    ) -> tuple[FactorizedSearchResult, dict[MoeTacticKey, float]] | None:
+    ) -> tuple["FactorizedSearchResult", dict["MoeTacticKey", float]] | None:
         """Return the process-local ordinary coordinate result for one cache domain."""
         with self._lock:
             if self._override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
             input_shapes = tuple(self._get_input_sizes(inputs))
             nearest_profile = self._find_nearest_profile(input_shapes, tuning_config)
-            cache_key = AutoTuner._get_cache_key(
+            cache_key = AutoTuner._get_cache_key_from_nearest_profile(
                 custom_op,
                 runner,
                 nearest_profile,
-                tuning_config,
                 runner.get_cache_key_extras(inputs),
             )
             record = self._factorized_search_cache.get(cache_key)
@@ -2734,7 +2774,7 @@ class AutoTuner:
                 profile = next(
                     candidate
                     for candidate in profiles
-                    if self._find_nearest_profile(
+                    if self._canonicalize_optimization_profile_shapes(
                         candidate.get_opt_shapes(), tuning_config
                     )
                     == nearest_profile
@@ -2745,7 +2785,7 @@ class AutoTuner:
                     f"while ranking '{custom_op}'"
                 ) from e
 
-            cache_key = AutoTuner._get_cache_key(
+            cache_key = AutoTuner._get_cache_key_from_optimization_profile(
                 custom_op,
                 runner,
                 profile.get_opt_shapes(),
@@ -3519,13 +3559,59 @@ class AutoTuner:
         tuning_config: TuningConfig,
         extras: tuple[Any, ...] = (),
     ) -> ProfilingCacheKey:
+        return cls._get_cache_key_from_nearest_profile(
+            custom_op,
+            runner,
+            cls._find_nearest_profile(input_shapes, tuning_config),
+            extras,
+        )
+
+    @classmethod
+    def _get_cache_key_from_nearest_profile(
+        cls,
+        custom_op: str,
+        runner: TunableRunner,
+        nearest_profile: tuple[tuple[int, ...], ...],
+        extras: tuple[Any, ...] = (),
+    ) -> ProfilingCacheKey:
+        """Build a cache key from profile shapes that were already bucket-mapped."""
         return ProfilingCacheKey(
             custom_op=custom_op,
             runner_class_name=runner.__class__.__name__,
             runner_hash=hash(runner),
-            nearest_profile=cls._find_nearest_profile(input_shapes, tuning_config),
+            nearest_profile=nearest_profile,
             extras=extras,
         )
+
+    @classmethod
+    def _get_cache_key_from_optimization_profile(
+        cls,
+        custom_op: str,
+        runner: TunableRunner,
+        optimization_profile: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        extras: tuple[Any, ...] = (),
+    ) -> ProfilingCacheKey:
+        """Build a cache key from generated profile shapes without remapping buckets."""
+        return cls._get_cache_key_from_nearest_profile(
+            custom_op,
+            runner,
+            cls._canonicalize_optimization_profile_shapes(
+                optimization_profile, tuning_config
+            ),
+            extras,
+        )
+
+    @staticmethod
+    def _canonicalize_optimization_profile_shapes(
+        optimization_profile: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Mask constraint-derived dimensions while preserving mapped dynamic buckets."""
+        canonical = [list(shape) for shape in optimization_profile]
+        for constraint_spec in tuning_config.constraint_specs:
+            canonical[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
+        return tuple(tuple(shape) for shape in canonical)
 
     @staticmethod
     def _profiling_policy(tuning_config: TuningConfig) -> tuple:
