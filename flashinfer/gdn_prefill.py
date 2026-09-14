@@ -40,6 +40,7 @@ from .gdn_kernels import (
     cp_delta_rule_dsl_sm120,
 )
 from .gdn_kernels.delta_rule_dsl.varlen_helper import (
+    choose_cp_chunk_len_host,
     is_integer_dtype,
     should_use_cp_host,
 )
@@ -448,12 +449,18 @@ def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
 
 def get_cp_max_seqlen(
     total_seq_len: int, num_seqs: int, max_seqlen: Optional[int]
-) -> int:
-    """Return the caller-provided CP sequence bound or its balanced fallback."""
+) -> tuple[int, int]:
+    """Return the CP tuning estimate and correctness-safe launch bound.
+
+    The tuning value estimates balanced per-sequence work so chunk selection
+    can maximize parallelism. The launch value must cover every sequence to
+    avoid under-launch when the actual lengths are imbalanced.
+    """
     if max_seqlen is not None:
-        return max_seqlen
+        return max_seqlen, max_seqlen
     cp_num_seqs = 1 if num_seqs == 0 else num_seqs
-    return (total_seq_len + cp_num_seqs - 1) // cp_num_seqs
+    tuning_max_seqlen = (total_seq_len + cp_num_seqs - 1) // cp_num_seqs
+    return tuning_max_seqlen, total_seq_len
 
 
 def _cp_delta_rule_rejection_reason(
@@ -656,11 +663,11 @@ def chunk_gated_delta_rule(
         Maximum logical sequence length. The CP kernels use this host-side hint
         to bound their per-sequence launch grids without reading ``cu_seqlens``
         back from the GPU. Pass the exact maximum for variable-length or
-        imbalanced batches. When omitted, CP assumes a balanced batch and uses
-        ``ceil(total_seq_len / num_seqs)``. That fallback can under-launch an
-        imbalanced batch, so callers allowing unequal sequence lengths must
-        provide this argument whenever ``use_cp=True`` or ``use_cp="auto"`` may
-        select the CP path.
+        imbalanced batches. When omitted, CP conservatively uses
+        ``total_seq_len`` as the launch bound while using
+        ``ceil(total_seq_len / num_seqs)`` only to tune its chunk length. This
+        remains correct for imbalanced batches but may launch surplus CTAs, so
+        providing the exact maximum avoids unnecessary work.
 
     Returns
     -------
@@ -923,7 +930,22 @@ def chunk_gated_delta_rule(
                 if _arch_major in (9, 10, 12)
                 else {}
             )
-            cp_max_seqlen = get_cp_max_seqlen(total_seq_len, num_seqs, max_seqlen)
+            cp_tuning_max_seqlen, cp_launch_max_seqlen = get_cp_max_seqlen(
+                total_seq_len,
+                num_seqs,
+                max_seqlen,
+            )
+            cp_chunk_len = _cp_chunk_len
+            if cp_chunk_len is None:
+                cp_chunk_len = choose_cp_chunk_len_host(
+                    cp_tuning_max_seqlen,
+                    num_sab_heads,
+                    _sm_count,
+                    device_capability=_device_capability,
+                    total_seqlen=total_seq_len,
+                    num_seqs=num_seqs,
+                    device_name=_device_name,
+                )
             cp_delta_rule_dsl(
                 output,
                 output_state,
@@ -935,8 +957,8 @@ def chunk_gated_delta_rule(
                 cu_seqlens,
                 _scale,
                 initial_state=initial_state,
-                max_seqlen=cp_max_seqlen,
-                cp_chunk_len=_cp_chunk_len,
+                max_seqlen=cp_launch_max_seqlen,
+                cp_chunk_len=cp_chunk_len,
                 **state_indices_kwargs,
                 **checkpoint_kwargs,
             )
