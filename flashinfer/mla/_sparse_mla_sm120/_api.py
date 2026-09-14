@@ -29,13 +29,13 @@
 """Sparse-MLA SM120 public Wrapper/config facade and legacy launch adapters.
 
 Wrapper and functional entry points share prepared execution in
-:mod:`._sparse_mla_sm120_prepared`. The lazy raw module and format bridges live in
-:mod:`._sparse_mla_sm120_execution`; compatibility aliases remain here.
+:mod:`._prepared`. The lazy raw module and format bridges live in
+:mod:`._execution`; compatibility aliases remain here.
 DSv3.2, GLM-NSA, DSV4, GLM53_NOPE, DOTS3_SWA and explicit DSV4.1 storage
 are supported. DSV4 NVFP4 has its own format and calibration policy.
 
 Default ordinary routing uses the crossover and CPB policy in
-:mod:`._sparse_mla_sm120_policy`: eligible calls up to 64 tokens decode unless
+:mod:`._policy`: eligible calls up to 64 tokens decode unless
 calibration prefers prefill; larger calls prefill when supported. Missing
 calibration keeps decode-first and the launcher's CPB heuristic.
 Explicit DSV4.1 FP8/BF16 routes remain untuned, with decode CPB=1.
@@ -59,23 +59,21 @@ from typing import Optional
 
 import torch
 
-from ._sparse_mla_sm120_execution import (
+from ._execution import (
     get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
     normalize_kv_scale_format as _normalize_kv_scale_format,
     resolve_model_type as _resolve_model_type,
     KV_SCALE_FORMATS as _KV_SCALE_FORMATS,  # noqa: F401
 )
-from ..api_logging import flashinfer_api
-from ..utils import (
+from ...api_logging import flashinfer_api
+from ...utils import (
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
 )
 
-# The _DECODE_*_DISPATCH pair sets are re-exported here on purpose: vLLM's
-# has_flashinfer_sparse_mla_sm120_config probes membership of
-# ``flashinfer.mla._sparse_mla_sm120._DECODE_DSV4_DISPATCH`` directly.
-from ._sparse_mla_sm120_policy import (
+# Package-root compatibility exports also expose the decode capability probes.
+from ._policy import (
     _BI,
     _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
@@ -106,7 +104,7 @@ from ._sparse_mla_sm120_policy import (
 )
 
 # Public calibration API, re-exported for the flashinfer.mla lazy export.
-from ._sparse_mla_sm120_calibration import (  # noqa: E402
+from ._calibration import (  # noqa: E402
     SparseMLASm120CalibrationReport,  # noqa: F401  (lazy re-export)
     calibrate_sparse_mla_sm120,  # noqa: F401  (lazy re-export)
 )
@@ -281,7 +279,7 @@ def supported_sparse_mla_sm120_configs(
             f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
         )
     if kv_cache_format == "nvfp4":
-        from ._sparse_mla_sm120_execution import dsv4_nvfp4_format_info
+        from ._execution import dsv4_nvfp4_format_info
 
         facts = dsv4_nvfp4_format_info()
         return {
@@ -300,7 +298,7 @@ def supported_sparse_mla_sm120_configs(
             )
         }
 
-    from ._sparse_mla_sm120_execution import format_info, main_page_sizes
+    from ._execution import format_info, main_page_sizes
 
     probes = (
         _DECODE_DSV3_2_TOPKS,
@@ -423,7 +421,7 @@ def _check_last_dim(
 
 
 def _bytes_per_token_for_model_type(model_type: int) -> int:
-    from ._sparse_mla_sm120_execution import format_info
+    from ._execution import format_info
 
     return format_info(model_type)["bytes_per_token"]
 
@@ -1057,7 +1055,7 @@ class _SparseMLAPagedAttentionRunner:
         ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
         query axis is normalized before planning and launch.
         """
-        from ._sparse_mla_sm120_prepared import wrapper_run
+        from ._prepared import wrapper_run
 
         return wrapper_run(
             self,
@@ -1098,7 +1096,7 @@ SparseMLASm120Wrapper = _SparseMLAPagedAttentionRunner
 
 
 # Decode-DSv3.2 / DSv4: chunks_per_block (cpb) comes from the calibrated
-# analytical model in _sparse_mla_sm120_calibration. Constants are calibrated once per
+# analytical model in _calibration. Constants are calibrated once per
 # (device, family) during autotune() tuning mode and cached on disk; without
 # them the launcher's built-in heuristic (cpb_override=-1) is used.
 
@@ -1210,7 +1208,7 @@ def sparse_mla_sm120_decode_dsv4(
     The decode-dsv4 path is the split-K decode variant where each block handles
     ``chunks_per_block`` chunks of 64 candidates each. The wall-time-optimal
     value is shape-dependent; this wrapper picks it per call with the
-    calibrated analytical model in :mod:`._sparse_mla_sm120_calibration`.
+    calibrated analytical model in :mod:`._calibration`.
 
     Behaviour:
 
@@ -1379,7 +1377,7 @@ def dsv41_fp4_quantize_pack_sparse_mla_cache(
             "latent_kv must be [num_pages, page_size, 512] with an optional "
             "singleton latent-head axis (HND or NHD)"
         )
-    from ._sparse_mla_sm120_execution import format_info
+    from ._execution import format_info
 
     bytes_per_token = format_info(_MODEL_TYPE_DSV4_1)["fp4_bytes_per_token"]
     cache_shape = (

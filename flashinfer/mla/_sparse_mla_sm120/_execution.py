@@ -4,7 +4,7 @@ from collections.abc import Iterator, Mapping
 from types import MappingProxyType
 import functools
 
-from ..jit.mla import gen_sparse_mla_sm120_module
+from ...jit.mla import gen_sparse_mla_sm120_module
 
 K = TypeVar("K")
 

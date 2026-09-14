@@ -42,14 +42,14 @@ import enum
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Optional, TypeVar
+from typing import Iterator, Optional, TypeVar
 
 import torch
 
-from ..autotuner import AutoTuner
-from . import _sparse_mla_sm120_calibration as _cpb
-from ._sparse_mla_sm120_calibration import CalibrationError
-from ._sparse_mla_sm120_execution import FormatValues, format_info
+from ...autotuner import AutoTuner
+from . import _calibration as _cpb
+from ._calibration import CalibrationError
+from ._execution import FormatValues, format_info
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +96,21 @@ _PAGE_BLOCK_SIZE = 64
 
 
 class _DecodeDispatchEnvelope:
-    """Compatibility membership probe backed by compiled resolver capabilities."""
+    """Compiled decode capabilities for downstream compatibility probes.
+
+    Membership covers runtime heads/topk. Iteration yields each dedicated head
+    specialization paired with the minimum legal runtime topk, not every legal
+    pair: ordinary decode has no topk specializations.
+    """
 
     def __init__(self, model: int) -> None:
         self.model = model
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        from ._execution import query
+
+        topk = format_info(self.model)["min_topk"]
+        return ((head, topk) for head in query("decode_head_counts", self.model))
 
     def __contains__(self, pair: object) -> bool:
         if not isinstance(pair, tuple) or len(pair) != 2:
@@ -153,7 +164,7 @@ _DECODE_DSV4_1_CALIBRATION_GRID = frozenset(
 
 @functools.cache
 def _decode_scratch_heads(num_heads: int) -> int:
-    from ._sparse_mla_sm120_execution import query
+    from ._execution import query
 
     return query("decode_scratch_heads", num_heads)
 
@@ -234,7 +245,7 @@ def filter_metadata_selection(
     sm_count: int,
     max_shared_bytes: int,
 ) -> Optional[PlannedCall]:
-    from ._sparse_mla_sm120_execution import metadata_candidates
+    from ._execution import metadata_candidates
 
     if metadata.model != _MODEL_TYPE_DSV4_1:
         return selected
@@ -285,7 +296,7 @@ def _candidates(
     extra_page_size: int = 64,
     precision: str = "default",
 ) -> frozenset[int]:
-    from ._sparse_mla_sm120_execution import query
+    from ._execution import query
 
     return frozenset(
         query(
@@ -455,7 +466,7 @@ def _resolve_cpb(
         and not skipped
         and not _cpb.is_calibration_failed(device, cpb_family)
     ):
-        from ._sparse_mla_sm120_execution import (
+        from ._execution import (
             get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
         )
 
@@ -478,7 +489,7 @@ def _resolve_cpb(
         and not _cpb.is_crossover_failed(device, family)
         and not _cpb.crossover_grid_complete(device, family)
     ):
-        from ._sparse_mla_sm120_execution import (
+        from ._execution import (
             get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
         )
 
@@ -529,7 +540,7 @@ def _resolve_cpb(
             # stay on the model (their measured pick error is within ~6%).
             and extra_topk == 0
         ):
-            from ._sparse_mla_sm120_execution import (
+            from ._execution import (
                 get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
             )
 

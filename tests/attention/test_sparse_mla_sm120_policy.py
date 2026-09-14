@@ -43,7 +43,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4_policy as native_policy
+from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as native_policy
 from flashinfer.mla import (
     SparseMLASm120DecodeConfig,
     supported_sparse_mla_sm120_configs,
@@ -65,7 +65,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _decode_dispatch_error_message,
     _resolve_model_type,
 )
-from flashinfer.mla._sparse_mla_sm120_policy import (
+from flashinfer.mla._sparse_mla_sm120._policy import (
     _PREFILL_IMPL_SWAPAB,
     _normalize_prefill_impl,
     decode_splitk_eligible,
@@ -125,7 +125,7 @@ DSV4_NVFP4_SUPPORT = {
 
 def block_module_loading(monkeypatch):
     from flashinfer.jit.core import JitSpec
-    from flashinfer.mla import _sparse_mla_sm120_calibration as calibration
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as calibration
 
     monkeypatch.setattr(calibration, "refresh_store", lambda: None)
 
@@ -152,6 +152,56 @@ def test_wrapper_construction_does_not_load_module(monkeypatch):
     _SparseMLAPagedAttentionRunner(
         kv_scale_format="ue8m0_g32", extra_kv_fp4=True, compute_precision="bf16"
     )
+
+
+def test_downstream_imports_stay_lazy() -> None:
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import torch
+from unittest.mock import patch
+from flashinfer.jit.core import JitSpec
+
+initialized = torch.cuda.is_initialized()
+with (
+    patch.object(JitSpec, "build_and_load", side_effect=AssertionError("early JIT")),
+    patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("early CUDA")),
+):
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _sparse_mla_sm120_paged_attention,
+        _DECODE_DSV4_DISPATCH,
+        _DECODE_MAX_TOKENS,
+        _SparseMLAPagedAttentionRunner,
+        get_sparse_mla_sm120_module,
+    )
+    from flashinfer.mla._sparse_mla_sm120 import _api, _policy
+    from flashinfer.mla import SparseMLASm120Wrapper
+    assert _sparse_mla_sm120_paged_attention is _api._sparse_mla_sm120_paged_attention
+    assert _SparseMLAPagedAttentionRunner is SparseMLASm120Wrapper
+    assert get_sparse_mla_sm120_module is _api.get_sparse_mla_sm120_module
+    assert _DECODE_DSV4_DISPATCH is _policy._DECODE_DSV4_DISPATCH
+    assert _DECODE_MAX_TOKENS == 64
+assert torch.cuda.is_initialized() == initialized
+""",
+        ],
+        check=True,
+    )
+
+
+def test_downstream_decode_dispatch_iteration() -> None:
+    supported_heads = frozenset(h for h, k in _DECODE_DSV4_DISPATCH)
+    assert supported_heads == frozenset({8, 16, 32, 64, 128})
+    pairs = tuple(_DECODE_DSV4_DISPATCH)
+    assert pairs
+    assert len(pairs) == len(set(pairs))
+    assert all(pair in _DECODE_DSV4_DISPATCH for pair in pairs)
+    assert (48, 384) in _DECODE_DSV4_DISPATCH
+    assert (48, 384) not in pairs
 
 
 def test_supported_configs_families() -> None:
@@ -508,8 +558,8 @@ def test_extra_cache_args_pairing() -> None:
 @pytest.fixture
 def known_crossover(monkeypatch):
     """Inject a decode_max_tokens lookup without touching disk/GPU state."""
-    from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
-    from flashinfer.mla import _sparse_mla_sm120_policy as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
+    from flashinfer.mla._sparse_mla_sm120 import _policy as plan_mod
 
     block_module_loading(monkeypatch)
     monkeypatch.setattr(plan_mod, "_candidates", recorded_candidates)
@@ -1114,8 +1164,8 @@ def test_sparse_mla_sm120_wrapper_public_export() -> None:
 
 
 def test_actual_metadata_policy_filters_measured_prefill(monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_execution as execution
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
     metadata = execution.AttentionMetadata(
         5,
@@ -1160,7 +1210,7 @@ def test_actual_metadata_policy_filters_measured_prefill(monkeypatch):
 
 @pytest.fixture
 def planner_state(monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
     block_module_loading(monkeypatch)
     monkeypatch.setattr(

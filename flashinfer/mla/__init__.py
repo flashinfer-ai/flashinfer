@@ -58,9 +58,9 @@ def __getattr__(name: str):
         globals()[name] = value
         return value
     if name in _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS:
-        from . import _sparse_mla_sm120_dsv4_nvfp4
+        from ._sparse_mla_sm120 import _dsv4_nvfp4
 
-        value = getattr(_sparse_mla_sm120_dsv4_nvfp4, name)
+        value = getattr(_dsv4_nvfp4, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
