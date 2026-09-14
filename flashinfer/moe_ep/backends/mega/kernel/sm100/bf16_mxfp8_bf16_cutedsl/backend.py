@@ -10,7 +10,11 @@ from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_mxfp8_cutedsl_runtime_requirements
-from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
+from ......core.validation.common import (
+    validate_bf16_mxfp8_cutedsl_cuda,
+    validate_mega_arch,
+    validate_mega_fleet_params,
+)
 from ......weights import MoEWeightPack
 from ..common.bf16_staging import (
     stage_mega_moe_inputs,
@@ -54,6 +58,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
+        validate_bf16_mxfp8_cutedsl_cuda()
         validate_mega_arch()
         validate_mega_fleet_params(
             fleet_params,

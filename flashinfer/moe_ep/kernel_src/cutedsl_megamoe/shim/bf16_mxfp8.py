@@ -270,6 +270,11 @@ class MegaMoEBf16Mxfp8Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        from flashinfer.moe_ep.core.validation.common import (
+            validate_bf16_mxfp8_cutedsl_cuda,
+        )
+
+        validate_bf16_mxfp8_cutedsl_cuda()
         ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self.release()
         import cutlass
@@ -432,6 +437,11 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16Mxfp8SymmBuffer:
+    from flashinfer.moe_ep.core.validation.common import (
+        validate_bf16_mxfp8_cutedsl_cuda,
+    )
+
+    validate_bf16_mxfp8_cutedsl_cuda()
     from .knob_cache import resolve_knobs
     from .tuner import (
         describe_invalid_knobs,

@@ -262,6 +262,28 @@ def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
     )
 
 
+_BF16_MXFP8_CUTEDSL_MIN_CUDA_VERSION = "13.2"
+
+
+def is_bf16_mxfp8_cutedsl_supported() -> bool:
+    """BF16xMXFP8 CuTeDSL mega kernels require CUDA 13.2+ for the MXFP8 -> BF16 conversions."""
+    from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+    return is_cuda_version_at_least(_BF16_MXFP8_CUTEDSL_MIN_CUDA_VERSION)
+
+
+def validate_bf16_mxfp8_cutedsl_cuda() -> None:
+    """Reject BF16xMXFP8 CuTeDSL mega kernels on toolchains before CUDA 13.2."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    if is_bf16_mxfp8_cutedsl_supported():
+        return
+    raise MoEEpConfigError(
+        "sm100_bf16_mxfp8_bf16_cutedsl requires CUDA 13.2+; "
+        f"current CUDA version is {get_cuda_version()}."
+    )
+
+
 def validate_mega_arch() -> None:
     import torch
 

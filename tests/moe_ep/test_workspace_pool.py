@@ -13,6 +13,13 @@ from unittest import mock
 
 import pytest
 
+from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
+
+cuda_13_2_required = pytest.mark.skipif(
+    not is_bf16_mxfp8_cutedsl_supported(),
+    reason="bf16_mxfp8 requires CUDA 13.2+",
+)
+
 
 def _pool():
     from flashinfer.moe_ep.core.kernel import workspace_pool
@@ -248,6 +255,7 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
     _assert_two_layers_share_one_symm_buffer(_layer, tensors)
 
 
+@cuda_13_2_required
 @pytest.mark.arch_blackwell
 def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
     """Two same-geometry mixed layers share a workspace through destroy."""
