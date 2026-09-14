@@ -1881,7 +1881,7 @@ def _group_gemm_fp8_nt_groupwise_contiguous_reference(
 def _group_gemm_fp8_nt_groupwise_contiguous_init(
     *,
     M: int,
-    num_groups: int,
+    num_groups: int = 2,
     N: int = 128,
     K: int = 128,
     K_div_128: int = 0,
