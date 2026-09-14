@@ -1278,3 +1278,41 @@ def test_nvfp4_plan_rechecks_lookup_after_lazy_calibration(
     assert planned is not None
     assert planned.variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
     assert planned.cpb == 4
+
+
+def test_nvfp4_plan_refines_exact_tokens_in_tuning(planner_state, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    planner_state[_profile_key()] = _profile({})
+    native_policy._plan_memo.clear()
+    monkeypatch.setattr(
+        native_policy.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+
+    refined = []
+
+    def fake_refine(device, *, tokens, **fields):
+        refined.append(tokens)
+        current = planner_state[native_policy._request_key(**fields)]
+        current["buckets"][str(tokens)] = {
+            "variant": "decode_splitk",
+            "cpb": 4,
+            "decode_s": 2e-5,
+            "prefill_s": 1e-5,
+        }
+        return current["buckets"][str(tokens)]
+
+    monkeypatch.setattr(native_policy, "refine_nvfp4", fake_refine)
+    planned = _plan(12)
+    assert refined == [12]
+    assert planned is not None
+    assert planned.variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
+    assert planned.cpb == 4
+    # The stored exact entry serves later calls without refining again.
+    assert _plan(12).cpb == 4
+    assert refined == [12]
+    # Above the decode envelope no refinement is attempted.
+    assert _plan(8192).variant is native_policy.NVFP4KernelVariant.PREFILL_STREAMING
+    assert refined == [12]

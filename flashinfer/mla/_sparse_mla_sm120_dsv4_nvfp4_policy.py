@@ -33,7 +33,7 @@ import json
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -294,6 +294,37 @@ def plan_nvfp4_sparse_mla_sm120(
         with _cpb._store_lock:
             profile = _cpb.get_profile(key, device)
             scope_epoch = _cpb._constants_version
+
+    if (
+        profile is not None
+        and decode_ok
+        and str(num_tokens) not in profile["buckets"]
+        and AutoTuner.get().is_tuning_mode
+        and not _autotune_skipped()
+        and not _cpb._target_capturing(device)
+    ):
+        # Tuning mode: measure this exact token count once so the selection
+        # stops interpolating from the canonical grid.
+        try:
+            refined = refine_nvfp4(
+                device,
+                tokens=num_tokens,
+                num_heads=num_heads,
+                topk=topk,
+                primary_page_size=primary_page_size,
+                extra_topk=extra_topk,
+                extra_page_size=extra_page_size,
+                has_topk_length=has_topk_length,
+                has_extra_topk_length=has_extra_topk_length,
+                has_attn_sink=has_attn_sink,
+            )
+        except (CalibrationError, RuntimeError) as error:
+            logger.debug("NVFP4 refine skipped at tokens=%d: %s", num_tokens, error)
+            refined = None
+        if refined is not None:
+            with _cpb._store_lock:
+                profile = _cpb.get_profile(key, device)
+                scope_epoch = _cpb._constants_version
 
     # Each bucket stores its own selection.  The shared selector consumes the
     # decision directly, so NVFP4 does not inherit FP8's monotonic crossover
@@ -574,6 +605,97 @@ def _make_calibration_calls(
     return build_decode, prefill
 
 
+@dataclass(frozen=True)
+class _Nvfp4MeasureContext:
+    """Device-resident pools and the loaded module shared across buckets."""
+
+    device: torch.device
+    module: Any
+    primary_cache: torch.Tensor
+    primary_slots: int
+    extra_cache: Optional[torch.Tensor]
+    extra_slots: int
+
+
+def _nvfp4_measure_context(
+    device: torch.device,
+    primary_page_size: int,
+    topk: int,
+    extra_topk: int,
+    extra_page_size: int,
+) -> _Nvfp4MeasureContext:
+    from ._sparse_mla_sm120_execution import get_sparse_mla_dsv4_nvfp4_module
+
+    primary_cache, primary_slots, extra_cache, extra_slots = (
+        _allocate_calibration_pools(
+            device, primary_page_size, topk, extra_topk, extra_page_size
+        )
+    )
+    return _Nvfp4MeasureContext(
+        device=device,
+        module=get_sparse_mla_dsv4_nvfp4_module(),
+        primary_cache=primary_cache,
+        primary_slots=primary_slots,
+        extra_cache=extra_cache,
+        extra_slots=extra_slots,
+    )
+
+
+def _measure_nvfp4_bucket(
+    ctx: _Nvfp4MeasureContext,
+    *,
+    num_heads: int,
+    topk: int,
+    extra_topk: int,
+    has_topk_length: bool,
+    has_extra_topk_length: bool,
+    has_attn_sink: bool,
+    num_tokens: int,
+) -> dict:
+    index_sets = _make_index_sets(
+        num_tokens=num_tokens,
+        topk=topk,
+        primary_slots=ctx.primary_slots,
+        extra_topk=extra_topk,
+        extra_slots=ctx.extra_slots,
+        device=ctx.device,
+    )
+    build_decode, prefill = _make_calibration_calls(
+        module=ctx.module,
+        device=ctx.device,
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        primary_cache=ctx.primary_cache,
+        extra_topk=extra_topk,
+        extra_cache=ctx.extra_cache,
+        has_topk_length=has_topk_length,
+        has_extra_topk_length=has_extra_topk_length,
+        has_attn_sink=has_attn_sink,
+    )
+    chunk = dsv4_nvfp4_format_info()["chunk_width"]
+    num_splits = (topk + chunk - 1) // chunk
+    num_splits += (extra_topk + chunk - 1) // chunk
+    best_cpb = 1
+    best_decode_us = float("inf")
+    for cpb in range(1, num_splits + 1):
+        latency_us = _time_indexed_calls(build_decode(cpb), index_sets, ctx.device)
+        if latency_us <= best_decode_us:
+            best_cpb, best_decode_us = cpb, latency_us
+    measured_prefill_us = _time_indexed_calls(prefill, index_sets, ctx.device)
+    use_decode = best_decode_us <= _CROSSOVER_MARGIN * measured_prefill_us
+    return {
+        "variant": (
+            NVFP4KernelVariant.DECODE_SPLITK.value
+            if use_decode
+            else NVFP4KernelVariant.PREFILL_STREAMING.value
+        ),
+        "cpb": best_cpb,
+        "decode_s": best_decode_us / 1e6,
+        "prefill_s": measured_prefill_us / 1e6,
+    }
+
+
 @_cpb._target_calibration
 def calibrate_nvfp4_sparse_mla_sm120(
     device: torch.device,
@@ -653,81 +775,33 @@ def calibrate_nvfp4_sparse_mla_sm120(
             not _cpb._activate_store()[1]["overlay"],
         )
 
-    from ._sparse_mla_sm120_execution import get_sparse_mla_dsv4_nvfp4_module
-
-    module = get_sparse_mla_dsv4_nvfp4_module()
-    primary_cache, primary_slots, extra_cache, extra_slots = (
-        _allocate_calibration_pools(
-            device,
-            primary_page_size,
-            topk,
-            extra_topk,
-            extra_page_size,
-        )
+    ctx = _nvfp4_measure_context(
+        device, primary_page_size, topk, extra_topk, extra_page_size
     )
-    num_splits = (
-        topk + dsv4_nvfp4_format_info()["chunk_width"] - 1
-    ) // dsv4_nvfp4_format_info()["chunk_width"]
-    num_splits += (
-        extra_topk + dsv4_nvfp4_format_info()["chunk_width"] - 1
-    ) // dsv4_nvfp4_format_info()["chunk_width"]
-    cpb_by_t: dict[int, int] = {}
-    decode_us: dict[int, float] = {}
-    prefill_us: dict[int, float] = {}
-    decode_by_t: dict[int, bool] = {}
-
-    for num_tokens in _CROSSOVER_PROBED_T:
-        index_sets = _make_index_sets(
-            num_tokens=num_tokens,
-            topk=topk,
-            primary_slots=primary_slots,
-            extra_topk=extra_topk,
-            extra_slots=extra_slots,
-            device=device,
-        )
-        build_decode, prefill = _make_calibration_calls(
-            module=module,
-            device=device,
-            num_tokens=num_tokens,
+    buckets = {
+        str(num_tokens): _measure_nvfp4_bucket(
+            ctx,
             num_heads=num_heads,
             topk=topk,
-            primary_cache=primary_cache,
             extra_topk=extra_topk,
-            extra_cache=extra_cache,
             has_topk_length=has_topk_length,
             has_extra_topk_length=has_extra_topk_length,
             has_attn_sink=has_attn_sink,
+            num_tokens=num_tokens,
         )
-        best_cpb = 1
-        best_decode_us = float("inf")
-        for cpb in range(1, num_splits + 1):
-            latency_us = _time_indexed_calls(build_decode(cpb), index_sets, device)
-            if latency_us <= best_decode_us:
-                best_cpb, best_decode_us = cpb, latency_us
-        measured_prefill_us = _time_indexed_calls(prefill, index_sets, device)
-        cpb_by_t[num_tokens] = best_cpb
-        decode_us[num_tokens] = best_decode_us
-        prefill_us[num_tokens] = measured_prefill_us
-        decode_by_t[num_tokens] = (
-            best_decode_us <= _CROSSOVER_MARGIN * measured_prefill_us
-        )
-
+        for num_tokens in _CROSSOVER_PROBED_T
+    }
+    cpb_by_t = {t: buckets[str(t)]["cpb"] for t in _CROSSOVER_PROBED_T}
+    decode_us = {t: buckets[str(t)]["decode_s"] * 1e6 for t in _CROSSOVER_PROBED_T}
+    prefill_us = {t: buckets[str(t)]["prefill_s"] * 1e6 for t in _CROSSOVER_PROBED_T}
+    decode_by_t = {
+        t: buckets[str(t)]["variant"] == NVFP4KernelVariant.DECODE_SPLITK.value
+        for t in _CROSSOVER_PROBED_T
+    }
     profile = {
         "request": json.loads(key),
         "sample_kind": "full_capacity_canonical_layout",
-        "buckets": {
-            str(t): {
-                "variant": (
-                    NVFP4KernelVariant.DECODE_SPLITK.value
-                    if decode_by_t[t]
-                    else NVFP4KernelVariant.PREFILL_STREAMING.value
-                ),
-                "cpb": cpb_by_t[t],
-                "decode_s": decode_us[t] / 1e6,
-                "prefill_s": prefill_us[t] / 1e6,
-            }
-            for t in _CROSSOVER_PROBED_T
-        },
+        "buckets": buckets,
     }
     persisted = _cpb.publish_calibration(device, _FAMILY, profiles={key: profile})
     failed = _cpb._store_projection(_FAMILY, "failed")
@@ -759,6 +833,61 @@ def calibrate_nvfp4_sparse_mla_sm120(
         prefill_us,
         persisted,
     )
+
+
+@_cpb._target_calibration
+def refine_nvfp4(
+    device: torch.device,
+    *,
+    tokens: int,
+    num_heads: int,
+    topk: int,
+    primary_page_size: int,
+    extra_topk: int,
+    extra_page_size: int,
+    has_topk_length: bool,
+    has_extra_topk_length: bool,
+    has_attn_sink: bool,
+) -> Optional[dict]:
+    """Measure one exact token count and merge it into the stored profile.
+
+    Returns the refined bucket entry, or ``None`` when refinement does not
+    apply (outside the decode envelope, no stored profile, or the exact entry
+    already measured).
+    """
+    if not 1 <= tokens <= _DECODE_MAX_TOKENS:
+        return None
+    key = _request_key(
+        num_heads=num_heads,
+        topk=topk,
+        primary_page_size=primary_page_size,
+        extra_topk=extra_topk,
+        extra_page_size=extra_page_size,
+        has_topk_length=has_topk_length,
+        has_extra_topk_length=has_extra_topk_length,
+        has_attn_sink=has_attn_sink,
+    )
+    with _cpb._store_lock:
+        profile = _cpb.get_profile(key, device)
+        if profile is None or str(tokens) in profile["buckets"]:
+            return None
+        ctx = _nvfp4_measure_context(
+            device, primary_page_size, topk, extra_topk, extra_page_size
+        )
+        entry = _measure_nvfp4_bucket(
+            ctx,
+            num_heads=num_heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            has_topk_length=has_topk_length,
+            has_extra_topk_length=has_extra_topk_length,
+            has_attn_sink=has_attn_sink,
+            num_tokens=tokens,
+        )
+        entry["provenance"] = "refined"
+        profile["buckets"][str(tokens)] = entry
+        persisted = _cpb.publish_calibration(device, _FAMILY, profiles={key: profile})
+    return {**entry, "persisted": persisted}
 
 
 __all__ = [
