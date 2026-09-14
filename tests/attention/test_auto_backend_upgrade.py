@@ -351,8 +351,7 @@ def _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, tag):
     "h_qo,h_kv,d_qk,d_vo",
     [
         (64, 8, 128, 128),
-        # (128, 128, 192, 128) is deliberately absent: CUTLASS measures ~10%
-        # faster there on B200, so the per-shape table orders it CUTLASS-first.
+        (128, 128, 192, 128),
         (32, 8, 256, 256),  # CUTLASS declines d256; only cuDNN serves it
     ],
 )
@@ -362,7 +361,10 @@ def test_auto_prefers_cudnn_on_sm100a(h_qo, h_kv, d_qk, d_vo):
 
 
 @requires_cudnn_upgrade
-@pytest.mark.parametrize("h_qo,h_kv,d_qk,d_vo", [(64, 8, 128, 128), (32, 8, 256, 256)])
+@pytest.mark.parametrize(
+    "h_qo,h_kv,d_qk,d_vo",
+    [(64, 8, 128, 128), (128, 128, 192, 128), (32, 8, 256, 256)],
+)
 def test_auto_cudnn_matches_fa2_varlen_with_lse(h_qo, h_kv, d_qk, d_vo):
     """Same token-unit indptrs to both backends; output AND packed base-2 LSE
     must agree. Random lengths exercise the cu_seq_len-driven padding mask."""

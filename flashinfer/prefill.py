@@ -1693,16 +1693,34 @@ def _build_block_tables_from_paged_kv_indices(
 #   d192/128 MHA   CUTLASS 1.09-1.12x faster than cuDNN -> CUTLASS first
 _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
 
-# Shapes whose measured winner is not the global default. Keyed on
-# (head_dim_qk, head_dim_vo); anything absent uses the default order above.
+# Per-shape overrides of the default order, keyed on
+# (head_dim_qk, head_dim_vo). Deliberately EMPTY: a head-dim key turned out to
+# be the wrong granularity.
 #
-# (192, 128): 128-head MHA on B200 -- CUTLASS 14.16 ms vs cuDNN 15.62 ms in the
-# sweep, and 14.11/14.88/14.71 vs 15.65/16.16/16.43 over three further 50-iter
-# runs. A consistent ~9-12% against ~0.5 ms run-to-run spread, so ordering
-# CUTLASS first here is a measurement, not a coin flip.
-_BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM = {
-    (192, 128): ("cutlass", "cudnn"),
-}
+# The 128-head d192/128 cell looked like a clean CUTLASS win at (b16, s4096) --
+# 14.16 vs 15.62 ms, reproduced over four runs. Sweeping the rest of that cell
+# on B200 showed the winner flips with sequence length and head config, not
+# head dim (medians, 30 iters after 10 warmup):
+#
+#   b4  s1024  128x128   CUTLASS 0.334   cuDNN 0.265   cuDNN  1.26x
+#   b16 s1024  128x128   CUTLASS 1.257   cuDNN 1.030   cuDNN  1.22x
+#   b64 s1024  128x128   CUTLASS 5.764   cuDNN 4.178   cuDNN  1.38x
+#   b8  s2048   32x8     CUTLASS 0.509   cuDNN 0.383   cuDNN  1.33x
+#   b8  s2048   64x8     CUTLASS 0.969   cuDNN 0.716   cuDNN  1.35x
+#   b1  s4096  128x128   CUTLASS 0.738   cuDNN 0.816   CUTLASS 1.11x
+#   b16 s4096  128x128   CUTLASS 14.061  cuDNN 15.818  CUTLASS 1.12x
+#   b4  s16384 128x128   CUTLASS 49.555  cuDNN 68.782  CUTLASS 1.39x
+#
+# cuDNN takes 5 of 8 -- every short-sequence case and every GQA case -- while
+# CUTLASS only leads long-sequence MHA. Pinning the whole head-dim to CUTLASS
+# would trade 1.22-1.38x away on the majority to win 1.11-1.39x on the rest, so
+# the default order stands and this table stays empty until a heuristic keyed on
+# the axes that actually discriminate (sequence length, MHA vs GQA) is measured
+# across architectures. Until then, callers who know their shape can pin the
+# order with the environment variable below.
+_BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM: Dict[
+    Tuple[int, int], Tuple[str, ...]
+] = {}
 
 # Escape hatch: a comma-separated order (e.g. "cutlass,cudnn", or "cudnn" to pin
 # one backend) overrides both tables. Intended for benchmarking and regression
