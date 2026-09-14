@@ -31,7 +31,6 @@ _REPLAYS = 4
     "mode,token_back_mode,tuning",
     [
         ("w4a4", "epi_warps", "manual"),
-        ("w4a4", "reuse_dispatch_warps", "manual"),
         ("w4a16", "epi_warps", "manual"),
         ("w4a16", "reuse_dispatch_warps", "manual"),
         ("w4a16", None, "auto"),

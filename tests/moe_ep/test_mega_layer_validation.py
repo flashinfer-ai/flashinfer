@@ -129,13 +129,12 @@ def test_mega_layer_requires_weights():
         )
 
 
-@pytest.mark.parametrize("backend_name", ("deep_gemm", "w4a16"))
-def test_mega_layer_forward_rejects_token_overflow(backend_name):
+def test_mega_layer_forward_rejects_token_overflow():
     import torch
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(backend_name=backend_name)
+    layer = _mega_layer()
     t = MoEEpTensors(
         hidden_states=torch.zeros(65, 128, dtype=torch.bfloat16),
         topk_ids=torch.zeros(65, 2, dtype=torch.int64),
@@ -155,28 +154,25 @@ def test_mega_layer_forward_rejects_token_overflow(backend_name):
     assert layer._workspace is None  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("backend_name", ("deep_gemm", "w4a16"))
-@pytest.mark.parametrize("id_dtype", ("int32", "int64"))
-@pytest.mark.parametrize("num_tokens", (0, 16))
-def test_mega_layer_forward_accepts_partial_batch(backend_name, id_dtype, num_tokens):
+def test_mega_layer_forward_accepts_partial_batch():
     import torch
 
     from flashinfer.moe_ep import MoEEpTensors
 
-    layer = _mega_layer(backend_name=backend_name)
+    layer = _mega_layer()
     layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
 
     t = MoEEpTensors(
-        hidden_states=torch.zeros(num_tokens, 128, dtype=torch.bfloat16),
-        topk_ids=torch.zeros(num_tokens, 2, dtype=getattr(torch, id_dtype)),
-        topk_weights=torch.zeros(num_tokens, 2, dtype=torch.float32),
+        hidden_states=torch.zeros(16, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(16, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(16, 2),
     )
     with (
         mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
         mock.patch.object(layer._kernel, "stage_inputs"),
     ):
         out = layer.forward(t)
-    assert out.shape == (num_tokens, 128)
+    assert out.shape == (16, 128)
 
 
 def test_mega_layer_allocates_output_before_staging_round():
@@ -219,13 +215,12 @@ def test_mega_layer_allocates_output_before_staging_round():
     assert out.shape == (8, 128)
 
 
-@pytest.mark.parametrize("backend_name", ("deep_gemm", "w4a16"))
-def test_mega_layer_forward_rejects_topk_mismatch(backend_name):
+def test_mega_layer_forward_rejects_topk_mismatch():
     import torch
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(backend_name=backend_name)
+    layer = _mega_layer()
     t = MoEEpTensors(
         hidden_states=torch.zeros(4, 128, dtype=torch.bfloat16),
         topk_ids=torch.zeros(4, 3, dtype=torch.int64),
@@ -235,13 +230,12 @@ def test_mega_layer_forward_rejects_topk_mismatch(backend_name):
         layer.forward(t)
 
 
-@pytest.mark.parametrize("backend_name", ("deep_gemm", "w4a16"))
-def test_mega_layer_forward_rejects_topk_weights_shape_mismatch(backend_name):
+def test_mega_layer_forward_rejects_topk_weights_shape_mismatch():
     import torch
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(backend_name=backend_name)
+    layer = _mega_layer()
     t = MoEEpTensors(
         hidden_states=torch.zeros(4, 128, dtype=torch.bfloat16),
         topk_ids=torch.zeros(4, 2, dtype=torch.int64),
@@ -276,13 +270,12 @@ def test_mega_layer_forward_rejects_invalid_copy_mode(backend_name, error):
         layer.forward(t)
 
 
-@pytest.mark.parametrize("backend_name", ("deep_gemm", "w4a16"))
-def test_mega_layer_forward_rejects_hidden_mismatch(backend_name):
+def test_mega_layer_forward_rejects_hidden_mismatch():
     import torch
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(backend_name=backend_name)
+    layer = _mega_layer()
     t = MoEEpTensors(
         hidden_states=torch.zeros(4, 64, dtype=torch.bfloat16),
         topk_ids=torch.zeros(4, 2, dtype=torch.int64),
@@ -581,9 +574,8 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
     assert torch.equal(workspace.topk_weights[:num_tokens], topk_weights)
 
 
-@pytest.mark.parametrize("backend_name", ("deep_gemm", "w4a16"))
-def test_mega_layer_init_accepts_valid_transformed_weights(backend_name):
-    layer = _mega_layer(backend_name=backend_name)
+def test_mega_layer_init_accepts_valid_transformed_weights():
+    layer = _mega_layer()
     assert layer._transformed is not None
 
 

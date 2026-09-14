@@ -43,7 +43,7 @@ def _require_blackwell():
 
 
 def _single_rank_layer(
-    backend_name: str, hidden: int = 2048, intermediate: int = 1024, tuning="manual"
+    backend_name: str, hidden: int = 2048, intermediate: int = 1024, knobs=None
 ):
     """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging."""
     import torch
@@ -82,8 +82,6 @@ def _single_rank_layer(
     )
 
     assert backend_name in ("nvfp4", "mxfp8", "w4a16"), backend_name
-    assert tuning in ("manual", "auto"), tuning
-    assert tuning == "manual" or backend_name == "w4a16"
     if backend_name == "nvfp4":
         mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
@@ -98,7 +96,7 @@ def _single_rank_layer(
             intermediate_size=intermediate,
             top_k=topk,
             gate_up_clamp=10.0,
-            knobs="auto" if tuning == "auto" else {},
+            knobs={} if knobs is None else knobs,
         )
 
     layer = MoEEpMegaLayer(
@@ -157,15 +155,7 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize(
-    "backend_name,tuning",
-    [
-        ("nvfp4", "manual"),
-        ("mxfp8", "manual"),
-        ("w4a16", "manual"),
-        ("w4a16", "auto"),
-    ],
-)
+@pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8", "w4a16"])
 @pytest.mark.parametrize(
     "hidden,intermediate",
     [
@@ -177,7 +167,7 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
     ],
 )
 def test_mega_layer_graph_capture_replay_matches_eager(
-    monkeypatch, request, backend_name, tuning, hidden, intermediate
+    monkeypatch, request, backend_name, hidden, intermediate
 ):
     import torch
 
@@ -187,7 +177,10 @@ def test_mega_layer_graph_capture_replay_matches_eager(
     if backend_name == "w4a16":
         request.getfixturevalue("w4a16_single_rank_runtime")
     layer, problem = _single_rank_layer(
-        backend_name, hidden, intermediate, tuning=tuning
+        backend_name,
+        hidden,
+        intermediate,
+        knobs="auto" if backend_name == "w4a16" else None,
     )
     try:
         t = _random_batch(problem, seed=3)

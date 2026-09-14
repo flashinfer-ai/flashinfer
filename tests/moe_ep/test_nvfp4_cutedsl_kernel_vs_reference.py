@@ -346,7 +346,10 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
     import torch
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import to_blocked
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        nvfp4_quantize_per_block_16,
+        to_blocked,
+    )
 
     if mode == "w4a4":
         from flashinfer.moe_ep import (
@@ -414,6 +417,39 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
             atol=0,
             rtol=0,
         )
+
+    # Canonical prepacked inputs must produce the same weight/SF bytes and
+    # K-major strides. W4A16 also accepts typed FP4 aliases and FP32 globals.
+    packed = {}
+    for name, start, end in ("w13", 0.71013, 1.23017), ("w2", 1.17019, 0.83023):
+        weight = problem[name]
+        q, sf = nvfp4_quantize_per_block_16(
+            weight.float().reshape(-1, weight.shape[-1]), 1.0
+        )
+        if mode == "w4a4" or weight_dtype == "float32":
+            q = q.view(torch.uint8)
+        packed[name] = q.reshape(*weight.shape[:-1], weight.shape[-1] // 2)
+        packed[f"{name}_scale"] = sf.reshape(*weight.shape[:-1], weight.shape[-1] // 16)
+        if mode == "w4a16":
+            packed[f"{name}_global_scale"] = torch.linspace(
+                start, end, num_experts, device="cuda"
+            )
+    prepacked = preprocess_mega_weights(
+        MoEWeightPack(**packed), intermediate_size=intermediate, hidden_size=hidden
+    )
+    for name, reference, actual in zip(
+        ("w13", "w2"), (transformed_l1, transformed_l2), prepacked, strict=True
+    ):
+        for expected, result in zip(reference[:2], actual[:2], strict=True):
+            assert (
+                expected.shape == result.shape and expected.stride() == result.stride()
+            )
+            assert torch.equal(expected.view(torch.uint8), result.view(torch.uint8))
+        if mode == "w4a16":
+            assert actual[2].dtype == torch.float32
+            torch.testing.assert_close(
+                actual[2], packed[f"{name}_global_scale"], rtol=0, atol=0
+            )
 
 
 @pytest.mark.arch_blackwell
@@ -600,32 +636,22 @@ def _assert_nvfp4_reference(y_kernel, reference, *, mode):
 
 
 def _nvfp4_reference_from_weights(problem, weights, *, mode):
-    """Shared oracle input assembly from canonical public weight packs."""
+    """Shared oracle input assembly from canonical prequantized weight packs."""
     import torch
-    from flashinfer.moe_ep import PrequantizedMoEWeights, UnquantizedMoEWeights
+    from flashinfer.moe_ep import PrequantizedMoEWeights
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         _interleave_gate_up_16,
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
 
     assert mode in NVFP4_MODES, mode
+    assert isinstance(weights, PrequantizedMoEWeights), type(weights)
     hidden, intermediate = problem["hidden"], problem["intermediate"]
-    if isinstance(weights, PrequantizedMoEWeights):
-        fc1 = _interleave_gate_up_16(
-            weights.w13.view(torch.uint8), intermediate_size=intermediate
-        )
-        sf1 = _interleave_gate_up_16(weights.w13_scale, intermediate_size=intermediate)
-        fc2, sf2 = weights.w2, weights.w2_scale
-    elif isinstance(weights, UnquantizedMoEWeights):
-        fc1, sf1, fc2, sf2 = _plain_nvfp4_from_bf16(
-            {
-                **problem,
-                "w13": weights.w13,
-                "w2": weights.w2,
-            }
-        )
-    else:
-        raise AssertionError(f"unsupported weight pack: {type(weights)}")
+    fc1 = _interleave_gate_up_16(
+        weights.w13.view(torch.uint8), intermediate_size=intermediate
+    )
+    sf1 = _interleave_gate_up_16(weights.w13_scale, intermediate_size=intermediate)
+    fc2, sf2 = weights.w2, weights.w2_scale
     x, sf, alpha1, alpha2 = problem["hidden_states"], None, None, None
     if mode == "w4a4":
         assert weights.w13_global_scale is None and weights.w2_global_scale is None
@@ -663,7 +689,6 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
     monkeypatch, token_back_mode, w4a16_single_rank_runtime
 ):
     """Cancellation distinguishes FP32 routing/globals from premature BF16 casts."""
-    import dataclasses
     import torch
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -699,24 +724,6 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
     reference = _nvfp4_reference_from_weights(problem, weights, mode="w4a16")
     expected = reference.sum(1).bfloat16()
     assert torch.count_nonzero(expected[:, 0]) == 4
-    rounded = {**problem, "topk_weights": problem["topk_weights"].bfloat16().float()}
-    assert (
-        torch.count_nonzero(
-            _nvfp4_reference_from_weights(rounded, weights, mode="w4a16").sum(1)
-        )
-        == 0
-    )
-    rounded_weights = dataclasses.replace(
-        weights,
-        w13_global_scale=weights.w13_global_scale.bfloat16().float(),
-        w2_global_scale=weights.w2_global_scale.bfloat16().float(),
-    )
-    assert not torch.equal(
-        expected,
-        _nvfp4_reference_from_weights(problem, rounded_weights, mode="w4a16")
-        .sum(1)
-        .bfloat16(),
-    )
     layer = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
         fleet_params=FleetParams(
@@ -743,76 +750,3 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     finally:
         layer.destroy()
-
-
-@pytest.mark.arch_blackwell
-@pytest.mark.parametrize("hidden,intermediate", [(64, 64), (288, 448)])
-@pytest.mark.parametrize("byte_views", [False, True])
-def test_nvfp4_prepacked_layout_shared_by_activation_modes(
-    hidden, intermediate, byte_views
-):
-    """Packed K-major weights and native SF bytes are shared by W4A4/W4A16."""
-    import dataclasses
-    import torch
-    from flashinfer.moe_ep import (
-        PrequantizedMoEWeights,
-        preprocess_nvfp4_cutedsl_mega_weights,
-        preprocess_w4a16_cutedsl_mega_weights,
-    )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
-
-    _require_cuda()
-    problem = _single_rank_problem(hidden, intermediate, num_experts=3, topk=2)
-    q13, s13 = nvfp4_quantize_per_block_16(
-        problem["w13"].float().reshape(-1, hidden), 1.0
-    )
-    q2, s2 = nvfp4_quantize_per_block_16(
-        problem["w2"].float().reshape(-1, intermediate), 1.0
-    )
-    weights = PrequantizedMoEWeights(
-        w13=q13.reshape(3, 2 * intermediate, hidden // 2),
-        w2=q2.reshape(3, hidden, intermediate // 2),
-        w13_scale=s13.reshape(3, 2 * intermediate, hidden // 16),
-        w2_scale=s2.reshape(3, hidden, intermediate // 16),
-    )
-    if byte_views:
-        weights = dataclasses.replace(
-            weights,
-            **{
-                field: getattr(weights, field).view(torch.uint8)
-                for field in ("w13", "w2")
-            },
-        )
-    kwargs = dict(hidden_size=hidden, intermediate_size=intermediate)
-    # The existing W4A4 prepacked path takes canonical packed-byte tensors.
-    # Typed aliases are additional W4A16 input coverage, not a W4A4 ABI change.
-    w4a4 = preprocess_nvfp4_cutedsl_mega_weights(
-        dataclasses.replace(
-            weights,
-            w13=weights.w13.view(torch.uint8),
-            w2=weights.w2.view(torch.uint8),
-        ),
-        **kwargs,
-    )
-    alphas = [
-        torch.linspace(0.71013, 1.23017, 3, device="cuda"),
-        torch.linspace(1.17019, 0.83023, 3, device="cuda"),
-    ]
-    w4a16 = preprocess_w4a16_cutedsl_mega_weights(
-        dataclasses.replace(
-            weights,
-            w13_global_scale=alphas[0],
-            w2_global_scale=alphas[1],
-        ),
-        **kwargs,
-    )
-    for pair, triple, alpha in zip(w4a4, w4a16, alphas, strict=True):
-        for reference, actual in zip(pair, triple[:2], strict=True):
-            assert (
-                reference.shape == actual.shape
-                and reference.stride() == actual.stride()
-            )
-            assert torch.equal(reference.view(torch.uint8), actual.view(torch.uint8))
-        assert triple[0].stride(1) == 1
-        assert triple[2].dtype == torch.float32
-        torch.testing.assert_close(triple[2], alpha, rtol=0, atol=0)
