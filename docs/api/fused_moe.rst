@@ -122,6 +122,15 @@ TensorRT-LLM Fused MoE
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 
+AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
+--------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    alphamoe_interleave_gated_weights
+    alphamoe_fp8_block_scale_aligned_moe
+
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------
 

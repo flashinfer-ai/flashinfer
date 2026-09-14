@@ -725,6 +725,9 @@ def moe_a2a_combine(
         :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
         corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).  Requires
         ``enable_rank_mask=True``.
+    backend : MoeAlltoAllBackend
+        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
+        with a workspace initialized by the Cake backend.
 
     Returns
     -------
@@ -802,6 +805,9 @@ def moe_a2a_sanitize_expert_ids(
     enable_pdl : Optional[bool]
         Whether to use programmatic dependent launch.  ``None`` auto-detects
         from the device.
+    backend : MoeAlltoAllBackend
+        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
+        with a workspace initialized by the Cake backend.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(expert_ids.device)
@@ -840,6 +846,9 @@ def moe_a2a_get_workspace_size_per_rank(
     eplb_stats_num_experts : int
         Number of experts reserved for the EPLB gathered-stats region
         (``0`` disables it).
+    backend : MoeAlltoAllBackend
+        Communication backend used to size the workspace. Defaults to
+        ``"trtllm"``; pass ``"cake"`` for the Cake backend.
 
     Returns
     -------
@@ -985,6 +994,9 @@ class MoeAlltoAll:
         eplb_stats_num_experts : int
             Number of experts reserved for the EPLB gathered-stats region
             (``0`` disables it).
+        backend : MoeAlltoAllBackend
+            Communication backend used to size the workspace. Defaults to
+            ``"trtllm"``; pass ``"cake"`` for the Cake backend.
 
         Returns
         -------
