@@ -66,21 +66,6 @@ def test_route_abi_override_manifest_has_no_base_version_entries() -> None:
     assert override_versions == {6, 7, 8, 9}
 
 
-def _m537_mixed_producer_shapes(header: str) -> set[tuple[int, int]]:
-    """(M, K) whose native producer is the M537 mixed kernel, which indexes the
-    prepacked L2T layout. M=537 now carries two producer families, so which
-    layout a shape needs can no longer be inferred from its M."""
-    body = header[
-        header.index(
-            "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
-        ) : header.index("// Direct-only n16 diagnostic entry")
-    ]
-    return {
-        (537, int(match.group(1)))
-        for match in re.finditer(r"launch_m537_\w*kernel<\s*(\d+)", body)
-    }
-
-
 def test_the_two_formerly_pinned_problems_keep_their_fused_admission() -> None:
     # Given: 32760x1536x1536 and 32760x8960x1536 reached the fused runner only
     # because they carried a pinned tactic, and pinned prefixes were unioned into
@@ -160,52 +145,24 @@ def test_no_module_ships_a_shape_keyed_tactic_table() -> None:
 
 
 def _has_native_producer(m: int, k: int) -> bool:
-    """Can the producer actually launch this (M, K)?
-
-    This used to be read off per-shape kernel instantiations in the C++ header
-    (_native_producer_shapes below). The runtime-M/K conversion replaced those
-    with one launcher that takes the geometry as arguments -- which is what let
-    110 instantiations collapse to 34 -- so scanning for them now reports their
-    absence rather than a coverage gap. What has to hold instead is that the
-    shape computes a legal geometry at all.
-
-    Reachability is deliberately NOT folded in here: the FFI still carries its
-    own shape guard, and the tests assert against _ffi_guard_shapes() right
-    beside this, so a shape that computes a geometry but cannot get through the
-    entry point still fails.
-    """
+    """Whether the shape has a legal producer geometry."""
     return bool(sm120_producer_variants(m, k))
 
 
-def _native_producer_shapes(header: str) -> set[tuple[int, int]]:
-    """Every exact (M, K) the C++ producer dispatcher can actually launch.
-
-    Read off the kernel instantiations rather than the ``if`` conditions: an
-    instantiation is what has to exist for the launch to succeed, and its
-    template arguments carry M and K directly.
-    """
-    body = header[
-        header.index(
-            "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
-        ) : header.index("// Direct-only n16 diagnostic entry")
-    ]
-    shapes: set[tuple[int, int]] = set()
-    for pattern in (
-        r"launch_large_m_kernel<\s*(\d+)\s*,\s*(\d+)",
-        r"launch_small_m_kernel<\s*(\d+)\s*,\s*(\d+)",
-        r"nvfp4_smooth_quantize_lora_down_large_m_sm120_kernel<\s*(\d+)\s*,\s*(\d+)",
-    ):
-        for match in re.finditer(pattern, body):
-            shapes.add((int(match.group(1)), int(match.group(2))))
-    # These two launchers template on K alone; their M is fixed by the namespace.
-    for match in re.finditer(r"launch_m512_kernel<\s*(\d+)", body):
-        shapes.add((512, int(match.group(1))))
-    for match in re.finditer(r"launch_m537_\w*kernel<\s*(\d+)", body):
-        shapes.add((537, int(match.group(1))))
-    # The base kernel takes no template arguments at all; its shape is the pair
-    # of constants the namespace declares.
-    shapes.add((64, 3072))
-    return shapes
+def _specialized_producer_shapes(header: str) -> set[tuple[int, int]]:
+    """Read the remaining fixed-M/K instantiations from the family dispatcher."""
+    start = header.index(
+        "inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120("
+    )
+    end = header.index(
+        "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(", start
+    )
+    return {
+        (537, int(match.group(1)))
+        for match in re.finditer(
+            r"launch_m537_mixed_kernel<\s*(\d+)", header[start:end]
+        )
+    }
 
 
 def _producer_header() -> str:
@@ -239,18 +196,15 @@ def test_every_fused_admission_has_a_prefix_that_can_run() -> None:
     )
 
 
-def test_every_native_producer_is_admitted() -> None:
-    # Given: a producer instantiation costs compile time and binary size, and
-    # earns nothing unless some shape can route to it.
-    # When: the compiled set is compared with the admission set.
-    # Then: no producer is stranded. This is the direction that actually drifted:
-    # nineteen shapes ran the unfused prefix because their (M, K) had no
-    # producer at all, which no test could see from the Python side alone.
-    native = _native_producer_shapes(_producer_header())
-    stranded = sorted(native - set(SM120_FUSED_LINEAR_MK))
-    assert stranded == [], (
-        f"{stranded} have a compiled producer that no shape can reach"
-    )
+def test_every_specialized_producer_is_admitted() -> None:
+    specialized = _specialized_producer_shapes(_producer_header())
+    assert specialized, "the source scan must cover the fixed-M/K M537 family"
+    assert specialized <= set(SM120_FUSED_LINEAR_MK)
+    for m, k in specialized:
+        assert any(
+            family == SM120_FAMILY_M537
+            for family, _, _ in sm120_producer_variants(m, k)
+        ), f"the compiled M537 producer for {(m, k)} cannot be selected"
 
 
 @pytest.mark.parametrize(

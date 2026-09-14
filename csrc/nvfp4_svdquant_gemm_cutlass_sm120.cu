@@ -34,7 +34,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_template_sm120.h"
 #include "flashinfer/gemm/svdquant_sm120_prefix_route.h"
@@ -329,7 +328,6 @@ struct LoraDownCublasLtState {
   cublasLtMatrixLayout_t down_layout = nullptr;
   cublasLtMatmulPreference_t preference = nullptr;
   std::array<cublasLtMatmulHeuristicResult_t, kMaxHeuristicResults> heuristics{};
-  int heuristic_count = 0;
   int heuristic_index = 0;
   int device_id = -1;
   int m = 0;
@@ -370,7 +368,6 @@ struct LoraDownCublasLtState {
       handle = nullptr;
     }
     heuristics = {};
-    heuristic_count = 0;
     heuristic_index = 0;
     device_id = -1;
     m = 0;
@@ -454,15 +451,11 @@ LoraDownCublasLtState& lora_down_cublaslt_state(int device_id, int m, int k) {
     } else if (m == 1935) {
       heuristic_index = k == 5120 ? 2 : k == 5376 ? 4 : k == 7168 ? 5 : 0;
     }
-    if (char const* value = std::getenv("SVDQ_SM120_LORA_DOWN_HEURISTIC_INDEX")) {
-      heuristic_index = std::atoi(value);
-    }
     TVM_FFI_ICHECK(heuristic_index >= 0 && heuristic_index < returned_results)
-        << "SVDQ_SM120_LORA_DOWN_HEURISTIC_INDEX must be in [0, " << returned_results << "), got "
+        << "SM120 LoRA-down heuristic index must be in [0, " << returned_results << "), got "
         << heuristic_index;
     TVM_FFI_ICHECK_EQ(state.heuristics[heuristic_index].state, CUBLAS_STATUS_SUCCESS)
         << "cuBLASLt heuristic is invalid for SM120 LoRA-down";
-    state.heuristic_count = returned_results;
     state.heuristic_index = heuristic_index;
     state.device_id = device_id;
     state.m = m;
@@ -704,29 +697,13 @@ void nvfp4_svdquant_gemm(TensorView a, TensorView b, TensorView a_sf, TensorView
 }
 
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
-// Producer half of the one-FFI fused linear: the exact-shape cuBLASLt-prefix
-// gate and the native fused producer, in the order the fused route launches
-// them. Factored out of nvfp4_svdquant_linear_sm120 without changing it so the
-// diagnostic probe seam measures this code rather than a copy of the gate that
-// could drift from it.
+// Both the L2T layout and the producer kernel are selected by the producer half
+// of the runtime tactic.
 void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView global_scale,
                                       TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
                                       TensorView down, TensorView workspace_buffer,
                                       int producer_family = -1, int tiling0 = 0, int tiling1 = 0,
                                       int tiling2 = 0, int address_policy = 0) {
-  // The cuBLASLt prefix is producer family 3, chosen by the tactic like every
-  // other producer. It used to be gated by an 8-shape "measured faster" list
-  // here, reconciled against a second copy in the route ladder -- both were
-  // fitted on one card, and the cross-SKU numbers say such a fit does not
-  // transport: three shapes flip sign between two SM120 parts. Which prefix
-  // wins is a measurement, and the autotuner is the thing that measures.
-  //
-  // Removing it also closes a hazard the two tables created together. The
-  // variant index in a tactic names a producer geometry on the Python side; the
-  // route ladder read the same field as an index into ITS list, so an ordinary
-  // geometry variant of 1 or 2 could silently flip the prefix on a ladder shape
-  // -- handing the prepacked L2T matrix to a prefix that reads it row-major.
-  // One meaning for the field, one dispatch, no reconciliation.
   if (producer_family == 3) {
     nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
                                                    down, workspace_buffer);
@@ -805,21 +782,6 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
   }
 }
 
-#if defined(FLASHINFER_ENABLE_SVDQ_SM120_DIAGNOSTIC_PROBE)
-// Diagnostic-only seam for the P1/P2 producer-vs-K3 decomposition. It runs the
-// producer half of the fused route and nothing else, so an isolated producer
-// measurement launches exactly the kernels production launches. Unreachable
-// from svdquant_linear: the symbol exists only in the probe build, which the
-// JIT spec caches under its own module name, and no production Python path
-// names it.
-void nvfp4_svdquant_producer_probe_sm120(TensorView x, TensorView pqs, TensorView global_scale,
-                                         TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
-                                         TensorView down, TensorView workspace_buffer) {
-  dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
-                                   workspace_buffer);
-}
-#endif
-
 #endif
 
 int64_t nvfp4_svdquant_gemm_tactic_num() {
@@ -874,10 +836,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm, torch_ext::nvfp4_svdquant_gem
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_smooth_lora_down_cublaslt_sm120,
                               torch_ext::nvfp4_quantize_smooth_lora_down_cublaslt_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_linear_sm120, torch_ext::nvfp4_svdquant_linear_sm120);
-#if defined(FLASHINFER_ENABLE_SVDQ_SM120_DIAGNOSTIC_PROBE)
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_producer_probe_sm120,
-                              torch_ext::nvfp4_svdquant_producer_probe_sm120);
-#endif
 #endif
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_svdquant_gemm_tactic_num,
                               torch_ext::nvfp4_svdquant_gemm_tactic_num);
