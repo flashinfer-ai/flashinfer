@@ -60,6 +60,12 @@ exact shape being warmed (:func:`refine_cpb`): the pick +/- a small candidate
 window is timed and the measured best persists as a per-shape override. The
 model remains the proposal and the fallback for every shape never warmed
 (off-grid ``num_heads``, dual-cache calls, non-tuning processes).
+
+DSV4.1 and NVFP4 skip the analytical model: each exact cache configuration
+stores one measured per-bucket profile (:func:`_calibrate_dsv41`). Tuning-mode
+DSV4.1 selection of an off-grid token count measures that count once
+(:func:`refine_dsv41`), and the exact entry then takes priority over
+nearest-up bucket interpolation.
 """
 
 from __future__ import annotations
@@ -2059,7 +2065,8 @@ def calibrate_sparse_mla_sm120(
     DSV4.1 profiles measure all eight token buckets, independent phase decisions
     and complete decode CPB sweeps. Each exact H/K/cache configuration counts as
     one entry. Profiles do not certify arbitrary ragged distributions. Runtime
-    token counts use the next larger bucket; counts above 64 require legal prefill.
+    token counts use an exact refined entry when tuning measured one, else the
+    next larger bucket; counts above 64 require legal prefill.
 
     Returns
     -------
