@@ -90,7 +90,7 @@ def _expected_auto_backend(d_qk, d_vo):
         if (
             backend == "cutlass"
             and _cutlass_upgrade_arch()
-            and ((d_qk == 128 and d_vo == 128) or d_qk == 192)
+            and (d_qk, d_vo) in {(128, 128), (192, 128)}
         ):
             return "cutlass"
     return "fa2"
@@ -216,9 +216,14 @@ def test_auto_declines_when_semantics_would_be_dropped(tag, plan_kwargs):
 
 
 @requires_cutlass_arch
-@pytest.mark.parametrize("d_qk,d_vo", [(256, 256), (64, 64)])
+@pytest.mark.parametrize("d_qk,d_vo", [(256, 256), (64, 64), (192, 192)])
 def test_auto_declines_outside_cutlass_head_dims(d_qk, d_vo):
-    """``get_fmha_module`` serves square d128 and d192 only."""
+    """`auto` routes to CUTLASS only at (128,128) and (192,128).
+
+    ``DISPATCH_head_dim`` accepts (192,128), (128,128) and (64,64), so 192/192
+    is outside the kernel and d64 is inside it but outside `auto`'s measured
+    domain. Both must stay off the CUTLASS path.
+    """
     resolved = _plan_only("auto", 4, 1024, 1024, 32, 32, d_qk, d_vo)
     assert resolved != "cutlass", (
         f"auto upgraded to cutlass at d_qk={d_qk}/d_vo={d_vo}, which "
@@ -545,3 +550,71 @@ def test_auto_declines_cudnn_on_non_int32_indptr_under_cuda_graph():
     )
     # Anything but cudnn: the point is that plan() resolved instead of raising.
     assert wrapper._backend != "cudnn"
+
+
+@requires_cutlass_arch
+def test_auto_declines_cutlass_under_cuda_graph(monkeypatch):
+    """`fmha_varlen_plan` reallocates its work buffers per plan() call.
+
+    A captured graph would keep pointing at the previous allocation, so CUTLASS
+    is not graph-safe; `auto` must route elsewhere rather than hand back a
+    backend that replays a stale plan.
+    """
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cutlass")
+    dev = torch.device("cuda")
+    batch, s_q, s_kv = 2, 512, 512
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
+    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace,
+        "NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=qo_indptr.clone(),
+        kv_indptr_buf=kv_indptr.clone(),
+        backend="auto",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        32,
+        32,
+        128,
+        head_dim_vo=128,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    assert wrapper._backend == "fa2"
+
+
+@requires_cutlass_arch
+def test_explicit_cutlass_refuses_cuda_graph():
+    """An explicit `backend="cutlass"` says so plainly instead of going stale."""
+    dev = torch.device("cuda")
+    batch, s_q, s_kv = 2, 512, 512
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
+    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace,
+        "NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=qo_indptr.clone(),
+        kv_indptr_buf=kv_indptr.clone(),
+        backend="cutlass",
+    )
+    with pytest.raises(ValueError, match="not CUDA-graph safe"):
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            32,
+            32,
+            128,
+            head_dim_vo=128,
+            causal=True,
+            q_data_type=DTYPE,
+            kv_data_type=DTYPE,
+        )

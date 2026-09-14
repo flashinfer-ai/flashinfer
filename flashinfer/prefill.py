@@ -1732,6 +1732,14 @@ _RAGGED_AUTO_ORDER_ENV = "FLASHINFER_RAGGED_AUTO_BACKEND_ORDER"
 # (head_dim_qk, head_dim_vo) pairs validated against FA2 on the cuDNN path.
 _CUDNN_RAGGED_AUTO_HEAD_DIMS = frozenset({(128, 128), (192, 128), (256, 256)})
 
+# (head_dim_qk, head_dim_vo) pairs `auto` may route to CUTLASS. `DISPATCH_head_dim`
+# in csrc/fmha_cutlass_sm100.cu accepts exactly (192,128), (128,128) and (64,64);
+# the pairs are listed rather than tested as `head_dim_qk == 192`, which would
+# also admit unsupported shapes such as 192/192. (64,64) is inside the kernel's
+# domain but outside `auto`'s: this PR never measured it, so it stays on FA2
+# until someone does.
+_CUTLASS_RAGGED_AUTO_HEAD_DIMS = frozenset({(128, 128), (192, 128)})
+
 # `fmha_varlen_plan` allocates the CUTLASS work-index buffers at this fixed
 # capacity, and `plan_kernel` writes one entry per (qo_tile, head, batch) work
 # item without a bounds check, so a problem that generates more work items than
@@ -1789,6 +1797,7 @@ def _blackwell_ragged_auto_upgrade(
     has_multi_item_scoring: bool,
     cudnn_indptr_is_int32: bool,
     cutlass_work_items: int,
+    cuda_graph_enabled: bool,
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
@@ -1839,7 +1848,6 @@ def _blackwell_ragged_auto_upgrade(
             ):
                 return backend
         elif backend == "cutlass":
-            # get_fmha_module's domain: square d128, or d192 (rectangular OK).
             if (
                 (is_sm100a_supported(device) or is_sm110a_supported(device))
                 and q_data_type in (torch.float16, torch.bfloat16)
@@ -1849,8 +1857,13 @@ def _blackwell_ragged_auto_upgrade(
                 # reports unsupported *head dimensions*. Mismatched output
                 # dtype is therefore out of domain, not a slow path.
                 and o_data_type == q_data_type
-                and ((head_dim_qk == 128 and head_dim_vo == 128) or head_dim_qk == 192)
+                and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
                 and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
+                # `fmha_varlen_plan` allocates fresh work-index buffers on every
+                # call, so a re-plan silently leaves a captured graph pointing at
+                # the previous allocation. Until those buffers are updated in
+                # place, CUTLASS is not graph-safe and `auto` stays away.
+                and not cuda_graph_enabled
             ):
                 return backend
     return None
@@ -4559,6 +4572,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         cutlass_work_items=_cutlass_plan_work_items(
                             qo_indptr_host, num_qo_heads
                         ),
+                        cuda_graph_enabled=self.is_cuda_graph_enabled,
                     )
                     if upgraded is not None:
                         self._backend = upgraded
@@ -4586,9 +4600,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
+                # insert the wrapper's device at the 9th position (0-indexed) of
+                # get_module_args. `self.device`, not `qo_indptr.device`: the
+                # caller may pass a host indptr, and the module has to be built
+                # for the device the kernel will run on.
                 new_get_module_args = (
-                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                    get_module_args[:9] + (self.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
@@ -4618,10 +4635,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
+            if self.is_cuda_graph_enabled:
+                # `fmha_varlen_plan` allocates new work-index buffers per call,
+                # so a captured graph keeps pointing at the previous ones. The
+                # fix is to update them in place; until then, refuse rather than
+                # replay against a stale plan. `auto` never lands here -- it
+                # treats graph mode as CUTLASS-ineligible and routes elsewhere.
+                raise ValueError(
+                    "the cutlass backend allocates its plan buffers per plan() "
+                    "call and is not CUDA-graph safe; use backend='auto' to get "
+                    "a graph-safe backend, or an explicit 'cudnn'/'fa2'"
+                )
+            # Device mirrors, not the caller's tensors: in CUDA-graph mode the
+            # kernel reads the registered buffers, and a host-side indptr would
+            # otherwise be planned against.
             self._plan_info = fmha_varlen_plan(
-                self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
+                self._cached_module,
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
+                num_qo_heads,
+                causal,
             )
-            self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
+            self._max_qo_len = torch.max(
+                self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
+            ).item()
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
