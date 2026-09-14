@@ -214,8 +214,9 @@ def prepare(
     preference,
     *,
     owned,
-    caller_scratch,
-    caller_lse,
+    caller_mid=False,
+    caller_mlse=False,
+    caller_lse=False,
     current=None,
 ):
     plan = resolve_execution(metadata, device, precision, is_dsv4_nvfp4, preference)
@@ -233,8 +234,9 @@ def prepare(
         )
     mid = mlse = lse = None
     if owned:
-        if not caller_scratch:
+        if not caller_mid:
             mid = torch.empty(workspace[0][0], dtype=workspace[0][1], device=device)
+        if not caller_mlse:
             mlse = torch.empty(workspace[1][0], dtype=workspace[1][1], device=device)
         if not caller_lse:
             lse = torch.empty(workspace[2][0], dtype=workspace[2][1], device=device)
@@ -355,7 +357,8 @@ def wrapper_run(
             is_dsv4_nvfp4,
             pref,
             owned=True,
-            caller_scratch=mid_out is not None,
+            caller_mid=mid_out is not None,
+            caller_mlse=mid_lse is not None,
             caller_lse=out_lse is not None,
             current=current,
         )
@@ -446,7 +449,8 @@ def functional_run(
             is_dsv4_nvfp4,
             0,
             owned=False,
-            caller_scratch=True,
+            caller_mid=True,
+            caller_mlse=True,
             caller_lse=True,
             current=current,
         )

@@ -32,6 +32,16 @@ def gen_mla_module() -> JitSpec:
     )
 
 
+def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+    """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
+    """Compatibility alias: the MMA layout probes live in the unified module."""
+    return gen_sparse_mla_sm120_module()
+
+
 def gen_sparse_mla_sm120_module() -> JitSpec:
     """Sparse-MLA paged attention for SM120.
 
