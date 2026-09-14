@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
@@ -155,7 +156,29 @@ class MoELayer:
     >>> out = layer(act_pack, weight_pack)
     """
 
+    @flashinfer_api
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
+        """Build the layer and the set of backend runners it will autotune over.
+
+        Every backend in ``config.backend`` whose hardware preconditions the
+        target device satisfies gets a runner; the rest are skipped here rather
+        than at call time, so an unsupported backend costs nothing per call.
+
+        Parameters
+        ----------
+        config : MoEConfig
+            Routing, quantization, expert geometry, activation, backend
+            candidates and execution parameters. Cross-field constraints are
+            validated by ``MoEConfig`` itself.
+        device : torch.device or None
+            Device whose compute capability selects the usable backends.
+            ``None`` → the current CUDA device.
+
+        Raises
+        ------
+        RuntimeError
+            If no configured backend is usable on this device's architecture.
+        """
         self.config = config
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.tuner = AutoTuner.get()
@@ -242,11 +265,41 @@ class MoELayer:
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
+    @flashinfer_api
     def __call__(
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Run the MoE layer, selecting and caching the fastest usable backend.
+
+        Only runners that support this pack's ``routing_input_mode`` compete —
+        not every backend has an in-kernel router — and the winner is cached
+        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+
+        Parameters
+        ----------
+        act_pack : MoEActivationPack
+            Backend-native activations plus routing inputs for this call.
+        weight_pack : MoEWeightPack
+            Expert weights, prepared for the selected backend's native layout.
+
+        Returns
+        -------
+        torch.Tensor or list of torch.Tensor
+            The layer output. With ``config.finalize.do_finalize=False`` the
+            unreduced TRTLLM intermediates are returned instead, as
+            ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``,
+            leaving the combine to the caller.
+
+        Raises
+        ------
+        ValueError
+            If ``act_pack.num_tokens`` exceeds the
+            ``execution.tune_max_num_tokens`` ceiling the layer was built with.
+        NotImplementedError
+            If no usable backend supports this pack's ``routing_input_mode``.
+        """
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(

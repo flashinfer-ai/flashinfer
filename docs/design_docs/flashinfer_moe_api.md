@@ -93,7 +93,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | Config | Owns |
 | --- | --- |
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
-| QuantConfig | weight / activation / output QuantFormat axes; deprecated QuantVariant preset |
+| QuantConfig | weight / activation / output QuantFormat axes |
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
@@ -629,11 +629,37 @@ This tracker is scoped to the PR #3093 MVP, not the full long-range API design. 
 
 ### Release Gates (do before this ships in a tagged release)
 
-The branch can merge to `main` early for team review and may land in a nightly/early release. To avoid implying any stability/observability commitment on a still-evolving API surface, the MVP **intentionally ships the new unified MoE APIs without the `@flashinfer_api` decorator** (no logging / repro-trace / stability contract). This is deliberate — not an oversight — and reserves the right to change `MoEConfig` / `MoELayer` / `MoEActivationPack` / `MoEWeightPack` / the runners / `prepare_weights` freely pre-release.
+The branch can merge to `main` early for team review and may land in a nightly/early release. To avoid implying any stability/observability commitment on a still-evolving API surface, the MVP **intentionally shipped the new unified MoE APIs without the `@flashinfer_api` decorator** (no logging / repro-trace / stability contract). That was deliberate — not an oversight — and reserved the right to change `MoEConfig` / `MoELayer` / `MoEActivationPack` / `MoEWeightPack` / the runners / `prepare_weights` freely pre-release.
+
+**Status (v0.7.0 release cut): the logging half of the gate is closed.** `MoELayer.__init__`
+and `MoELayer.__call__` now carry `@flashinfer_api`, which makes the unified MoE API an
+official, observable FlashInfer entry point. `"MoELayer"` was added to the class-name
+prefix list in `flashinfer/api_logging.py` so calls log as `MoELayer.__call__` rather than
+a bare `__call__`, and so the name is usable as a `FLASHINFER_DUMP_INCLUDE` /
+`FLASHINFER_DUMP_EXCLUDE` pattern.
+
+Both remaining gates below are blocked on the same root cause, and it is not an MoE
+problem: the API-observability infrastructure addresses arguments as *flat parameters*.
+`flashinfer/trace/template.py::_get_tensor` resolves a tensor with `kwargs.get(param)`
+plus an optional tuple index, and `api_logging.py::_extract_value_for_dump` recurses only
+through `list` / `tuple` / `dict`. The unified MoE API deliberately groups its tensors
+into two lifetime-scoped dataclasses (`MoEActivationPack`, `MoEWeightPack` — see the
+rationale above this section), so neither mechanism can see inside them.
 
 | Status | Gate | Notes |
 | --- | --- | --- |
-| [ ] | Add `@flashinfer_api` (+ a `TraceTemplate` per the `CLAUDE.md` "Trace Template Checklist") to the public unified MoE APIs **at release time**, not before. | The decorator carries logging/repro + an implied stability contract; §4.1/§6 describe the intended end-state. The decorated legacy MoE functions (`trtllm_*_moe`, `cutlass_fused_moe`) already ship in v0.6.12 and are untouched here. |
+| [x] | Add `@flashinfer_api` to the public unified MoE execution entry points **at release time**, not before. | Done on `MoELayer.__init__` and `MoELayer.__call__`. `__init__` is decorated so the config is logged crash-safely *before* backend discovery and `runner.build()` (JIT compile) run — the two places construction actually fails. The runners' `pack_inputs` / `forward` are deliberately **not** decorated: they are `TunableRunner` plumbing driven by the autotuner in a tight per-tactic loop, and `MoELayer.__call__` already logs the same tensors one level up. The frozen `*Config` dataclasses and their `supported()` / `prepare_weights()` / `prepare_activations()` classmethods are **not** decorated either — see the per-entry-point rationale in the PR description. |
+| [ ] | Make level-10 (`FLASHINFER_LOGLEVEL=10`) dumps of `MoELayer.__call__` contain the actual input tensors. | **Partial today.** `_extract_value_for_dump` walks `list` / `tuple` / `dict` but falls through to `_serialize_value` for any other object, so a pack is recorded as `{"type": "MoEActivationPack", "repr": ...}` metadata and its tensors never reach `inputs.pt`. Levels 1/3/5 are unaffected (shape/dtype/device/stats all come from the pack repr and the output tensor). Fixing this means teaching `_extract_value_for_dump` to recurse into dataclasses — a change to the shared walker that alters dump contents for *every* decorated API, so it is out of scope for an rc cut. |
+| [ ] | Add a `TraceTemplate` for `MoELayer.__call__` per the `CLAUDE.md` "Trace Template Checklist". | **Blocked on trace infrastructure, not on MoE.** No attribute traversal exists in `_get_tensor` / `Tensor(param=...)`, and the routing/quant shape axes live on `self.config` rather than in the signature, so no template can reach a single tensor or axis today (`flashinfer/trace/` contains zero references to `MoELayer` / the packs). Closing this gate requires either dotted-path parameter support or a pack-flattening adapter; both are trace-framework changes and belong in their own PR. Until then `MoELayer` gets the logging half of `@flashinfer_api` but no `fi_trace`. Bare `@flashinfer_api` with no `trace=` is established house style for exactly this case (e.g. `flashinfer/norm/__init__.py:392`, `flashinfer/fused_moe/core.py:5409`). |
+
+To keep the decorator from being actively harmful while those gates are open,
+`MoEActivationPack` and `MoEWeightPack` now define metadata-only `__repr__`s
+(`flashinfer/fused_moe/api.py`). Without them the inherited dataclass `__repr__` calls
+`repr()` on every tensor field, and `api_logging.py` reaches that repr on the level-3+
+logging path *and* the level-10 metadata path. `_serialize_value` documents the hazard in
+its own source — "Do not call str()/repr() on containers that may hold CUDA tensors.
+Tensor repr can read device data and invalidate CUDA graph capture." — but its guard is
+keyed on the concrete container types and a dataclass slips past it.
 
 ### Landed In Current Branch
 
@@ -653,7 +679,7 @@ The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_b
 ```python
 import torch
 from flashinfer.fused_moe import (
-    MoEConfig, RoutingConfig, QuantConfig, QuantFormat, QuantVariant, ExpertConfig,
+    MoEConfig, RoutingConfig, QuantConfig, QuantFormat, ExpertConfig,
     SwiGLU, ExecutionConfig, MoELayer,
     MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
 )
@@ -663,7 +689,7 @@ from flashinfer.autotuner import autotune
 # 1. Config — three-axis QuantFormat; explicit candidate set.
 config = MoEConfig(
     routing=RoutingConfig(num_experts=32, top_k=2),
-    quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),  # or QuantConfig(variant=QuantVariant.NVFP4)
+    quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
     activation=SwiGLU(alpha=1.0, beta=0.0),              # typed + hashable
     backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
@@ -755,9 +781,10 @@ has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
 The class-level matrix below is generated from the registered runner classes.
-The Quantization column is the MMA pair ``weight×activation``, so the two
-W4A16 encodings appear as ``MXFP4×BF16`` (TRTLLM / CUTLASS SM90) and
-``NVFP4×BF16`` (CuTe-DSL / b12x). Regenerate its contents with:
+The Quantization column is always the MMA pair ``weight×activation``
+(``NVFP4×NVFP4``, not ``NVFP4``). The two W4A16 encodings appear as
+``MXFP4×BF16`` (TRTLLM / CUTLASS SM90) and ``NVFP4×BF16`` (CuTe-DSL / b12x).
+Regenerate its contents with:
 
 ```bash
 python scripts/generate_moe_activation_matrix.py --write
@@ -768,7 +795,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | --- | --- | --- | --- |
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
-| `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU` |
+| `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
@@ -838,7 +865,7 @@ This is the May 27, 2026 working slice (executed May 31, 2026). It should improv
 Decisions made while executing the cut above, recorded so reviewers see the *why*, not just the diff.
 
 - **P0 — branch alignment verified.** Local `moe_api`, `origin/moe_api`, and PR #3093 head all resolve to the same commit (`1f74494b` at the time of writing), so the cut edits the live PR state. The most recent prior change on the branch (`fix(fused_moe): align TrtllmFp4RoutedRunner with hybrid token buckets`) is already reflected in `runners.py`.
-- **P1 / CR1 — single-knob `QuantVariant`, explicit `BackendOptions(candidates=...)`.** The CPU config tests (`tests/moe/test_moe_api.py`) were rewritten to match the implementation rather than the other way around. Rationale: the implementation deliberately collapsed the older `QuantDtype` + `QuantGranularity` + `Fp8Variant` triple into one `QuantVariant` enum (`NVFP4`, `MxFp8`, `DeepSeekFp8`, `FP8PerTensor`, `MxInt4`, `MXFP4`, `BF16`). One knob is simpler for the MVP and still distinguishes the cases reviewers flagged (C14 MXFP4 block size, C28 activation+weight dtype) because each becomes a distinct enum member. The `|` pipe-operator sugar and a richer multi-field `QuantConfig` are listed as Explicit Non-Goals for this MVP, so the canonical spelling is the explicit `BackendOptions(candidates=(...))` already used by the GPU test (`tests/moe/test_unified_moe_api.py`) and the benchmark. Verified: 84 CPU tests pass in the B200 container. **Superseded (2026-09):** `QuantConfig` now carries `weight` / `activation` / `output` `QuantFormat` axes and `QuantVariant` is a deprecated preset; see "QuantConfig three-axis formats" below.
+- **P1 / CR1 — single-knob `QuantVariant`, explicit `BackendOptions(candidates=...)`.** The CPU config tests (`tests/moe/test_moe_api.py`) were rewritten to match the implementation rather than the other way around. Rationale: the implementation deliberately collapsed the older `QuantDtype` + `QuantGranularity` + `Fp8Variant` triple into one `QuantVariant` enum (`NVFP4`, `MxFp8`, `DeepSeekFp8`, `FP8PerTensor`, `MxInt4`, `MXFP4`, `BF16`). One knob is simpler for the MVP and still distinguishes the cases reviewers flagged (C14 MXFP4 block size, C28 activation+weight dtype) because each becomes a distinct enum member. The `|` pipe-operator sugar and a richer multi-field `QuantConfig` are listed as Explicit Non-Goals for this MVP, so the canonical spelling is the explicit `BackendOptions(candidates=(...))` already used by the GPU test (`tests/moe/test_unified_moe_api.py`) and the benchmark. Verified: 84 CPU tests pass in the B200 container. **Superseded (2026-09):** `QuantConfig` now carries `weight` / `activation` / `output` `QuantFormat` axes and `QuantVariant` has been removed; see "QuantConfig three-axis formats" below.
 - **Runner rework (blocker fix) — delegate to the canonical inner runners.** `TrtllmFp4RoutedRunner` now wraps `core.MoERunner` (newly exported from `get_trtllm_moe_sm100_module()`), mirroring how `CuteDslRunner` wraps `CuteDslFusedMoERunner`. `pack_inputs` builds the `MoEInputs` list (with an allocated output buffer and the kernel-required `topk_weights` placeholder for `PackedPrecomputed`) plus a static weight/config kwargs dict; `forward`/`get_valid_tactics` delegate to the inner runner, which owns the one fragile raw-op launch. This keeps the unified adapters thin and resistant to future `core.py` signature drift. The CuteDSL adapter additionally appends the optional `moe_output` buffer (index 11) its tuning_config declares as dynamic. The nvfp4 activation scale is viewed to `float8_e4m3fn` (the canonical Pack may carry raw `uint8` bytes; trtllm-gen accepts the *linear* scale layout, so no per-call swizzle is needed). Validated on B200: all 9 `tests/moe/test_unified_moe_api.py` pass.
 - **P1 / CR3 — offset read from config, not a dead parameter.** `pack_inputs` no longer takes a `local_expert_offset` argument (no caller ever passed it, so it silently defaulted to 0); it reads `ExpertConfig.local_expert_offset` off the runner's own config. A focused SM100 test (`TestTrtllmRoutedPackingContract`) decodes the packed ids for offsets 0/32/96 and asserts GLOBAL ids are packed, with `local_expert_offset` passed to the kernel separately.
 - **P1 / CR6 — fail fast at construction.** `MoELayer._validate_mvp_scope` raises `NotImplementedError` for any non-`NVFP4` quant variant or non-`Swiglu` activation, and the "no usable backend" error now names the MVP-supported backend set. Pre-routed-only is structural (the layer consumes `MoEActivationPack`, which carries `selected_experts`/`final_scales`). Covered by CPU tests in `TestMoELayerMVPValidation`.
@@ -1039,23 +1066,20 @@ kernel); (5) tighten the quantized-numeric net via the QuantSpec scale policy
 
 ### QuantConfig three-axis formats (2026-09)
 
-The single-knob `QuantVariant` (Decision Log, 2026-05-31 / CR1) collapsed dtype +
-granularity into one enum. `W4A16` then grew two weight encodings (MXFP4 on
-TRTLLM/CUTLASS SM90, NVFP4 on CuTe-DSL/b12x), and `MXFP4` already meant
-MXFP4×MXFP8 rather than MXFP4×MXFP4.
-
 `QuantConfig` now has three `QuantFormat` axes: `weight`, `activation`, and
 `output`. `QuantConfig` itself is structural only (members must be
 `QuantFormat`; no `torch.dtype` coercion). Legal combinations are runner
 capabilities: `supported_quant_variants` plus `supported_output_formats`.
-`QuantVariant` remains a deprecated preset that expands every member except
-`W4A16`, which must be spelled as `weight=QuantFormat.MXFP4` or
-`weight=QuantFormat.NVFP4` with `activation=QuantFormat.BF16`, or expanded via
-`QuantConfig.from_variant(QuantVariant.W4A16, w4a16_weight=...)`. An omitted
-axis is BF16 (unquantized): `QuantConfig()` is BF16×BF16 and
+`QuantVariant` has been removed; spell every scheme as an explicit pair. W4A16
+is `weight=QuantFormat.MXFP4` (TRTLLM / CUTLASS SM90) or
+`weight=QuantFormat.NVFP4` (CuTe-DSL / b12x) with `activation=QuantFormat.BF16`.
+An omitted axis is BF16 (unquantized): `QuantConfig()` is BF16×BF16 and
 `QuantConfig(weight=QuantFormat.MXFP4)` is MXFP4×BF16; MXFP4×MXFP8 needs both
 axes. Axes describe the MMA numeric format, not the dtype of the tensor that
 crosses the Python API.
+`output` defaults to BF16 and every current runner declares
+`supported_output_formats == (BF16,)`, so the activation matrix is keyed by the
+`weight×activation` pair only.
 
 ### Explicit Non-Goals For This MVP
 

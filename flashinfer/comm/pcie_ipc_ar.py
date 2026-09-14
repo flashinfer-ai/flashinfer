@@ -34,14 +34,15 @@ from .pcie_ipc_policy import IpcLaunchConfig, get_pcie_ipc_launch_config
 from .pcie_ipc_topology import resolve_pcie_ipc_profile
 from .pcie_ipc_tuning import (
     PCIE_IPC_CUSTOM_OP,
-    TUNE_BATCHES,
     TUNE_REPEAT,
     TUNE_WARMUP,
+    generate_tune_batches,
     PcieIpcAllReduceRunner,
     cache_covers_workspace,
     default_cache_path,
     pack_config,
     pcie_ipc_tuning_config,
+    TABLE_TACTIC,
     resolve_tuned_config,
     tuned_batches_for,
     warn_no_tune_group,
@@ -100,6 +101,8 @@ def get_pcie_ipc_comm_module():
         init=init,
         dispose=dispose,
         all_reduce=all_reduce,
+        memop_supported=module.pcie_ipc_memop_supported,
+        set_memop_enabled=module.pcie_ipc_set_memop_enabled,
     )
 
 
@@ -183,7 +186,7 @@ class PcieIpcAllReduceWorkspace:
         dtype: torch.dtype = torch.bfloat16,
         max_blocks: int = 128,
         profile: Optional[str] = None,
-        tune_batches: Sequence[int] = TUNE_BATCHES,
+        tune_batches: Optional[Sequence[int]] = None,
         tune_cache: Optional[str] = None,
     ) -> None:
         # Construction is a staged transaction. Every rank must execute the same
@@ -203,6 +206,7 @@ class PcieIpcAllReduceWorkspace:
         self.max_numel = max_numel
         self.max_blocks = max_blocks
         self.profile = ""
+        self.memop_supported = False
         self.profile_reason = ""
         # Resolved launch configurations, keyed exactly. Consulted before any
         # AutoTuner call because even a pure cache lookup there takes a global
@@ -210,11 +214,17 @@ class PcieIpcAllReduceWorkspace:
         self._tuned: Dict[Tuple[int, int, torch.dtype], IpcLaunchConfig] = {}
         self._runner: Optional[PcieIpcAllReduceRunner] = None
         self._tune_group: Optional[ProcessGroup] = None
-        self._tune_batches = tuple(int(b) for b in tune_batches)
+        # None means "derive a ladder from max_numel at tune() time". An
+        # explicit list is honoured as given and only checked for coverage; see
+        # _warn_if_coverage_falls_short for why that is a warning, not an error.
+        self._tune_batches = (
+            None if tune_batches is None else tuple(int(b) for b in tune_batches)
+        )
         self._tune_cache = tune_cache or default_cache_path(self.world_size)
         self._tune_cache_exists = False
         self._tuned_configs_loaded = False
         self._warned_untuned = False
+        self._warned_stale_entry = False
 
         # --- stage 1: local validation, encoded rather than raised -----------
         error: Optional[str] = None
@@ -263,6 +273,7 @@ class PcieIpcAllReduceWorkspace:
             self.profile = decision.profile
             self.profile_reason = decision.reason
             module = get_pcie_ipc_comm_module()
+            local_memop_supported = bool(module.memop_supported())
             nbytes = module.workspace_size(
                 self.world_size, max_numel, self.elem_size, max_blocks
             )
@@ -270,7 +281,16 @@ class PcieIpcAllReduceWorkspace:
             nbytes = 0
             self._joint_check({"error": f"{type(e).__name__}: {e}"}, "preparing")
             raise  # unreachable: _joint_check raises on every rank
-        self._joint_check({"error": None}, "preparing")
+        # Carry eligibility in the existing preparation exchange. Mixed groups
+        # agree on the original protocol without adding a collective to it.
+        prepared = self._joint_check(
+            {"error": None, "memop_supported": local_memop_supported},
+            "preparing",
+            require_identical=False,
+        )
+        self.memop_supported = self.world_size in (4, 8) and all(
+            entry["memop_supported"] for entry in prepared
+        )
 
         # --- stage 3: allocate and share, then bind --------------------------
         # NOTE: create_shared_buffer() runs its own all_gather_object and
@@ -283,6 +303,8 @@ class PcieIpcAllReduceWorkspace:
             self._handle = module.init(
                 self._ipc_ptrs, self.rank, max_numel, self.elem_size, max_blocks
             )
+            if self.memop_supported:
+                module.set_memop_enabled(self._handle, True)
             # init() zeroes this rank's slab; no peer may push into it until
             # every rank has done so.
             torch.cuda.synchronize(self.device)
@@ -308,11 +330,15 @@ class PcieIpcAllReduceWorkspace:
             raise
         dist.barrier(group=group)
 
-    def _joint_check(self, local: dict, what: str) -> None:
+    def _joint_check(
+        self, local: dict, what: str, *, require_identical: bool = True
+    ) -> List[dict]:
         """Gather per-rank outcomes and fail the whole group, or none of it.
 
         Raises the same error on every rank, so the caller can rely on all
-        ranks taking the same branch afterwards.
+        ranks taking the same branch afterwards. Capability outcomes may differ
+        when require_identical is false; callers receive the successful entries
+        and choose one protocol for the whole group.
         """
         gathered: List[Optional[dict]] = [None] * self.world_size
         dist.all_gather_object(gathered, local, group=self.group)
@@ -325,13 +351,16 @@ class PcieIpcAllReduceWorkspace:
         mismatched = {
             key: [g[key] for g in entries]
             for key in local
-            if key != "error" and len({repr(g[key]) for g in entries}) > 1
+            if require_identical
+            and key != "error"
+            and len({repr(g[key]) for g in entries}) > 1
         }
         if mismatched:
             raise ValueError(
                 "every rank must build the workspace with identical arguments, "
                 f"but these differ across the group: {mismatched}"
             )
+        return entries
 
     @property
     def handle(self) -> int:
@@ -459,7 +488,11 @@ class PcieIpcAllReduceWorkspace:
         # Settled against the loaded keys, where the answer is known, rather
         # than inferred from a miss later.
         self._tuned_configs_loaded = exists and cache_covers_workspace(
-            self.world_size, self.profile, self.max_blocks, self.max_numel
+            self.world_size,
+            self.profile,
+            self.max_blocks,
+            self.max_numel,
+            self.memop_supported,
         )
         self._joint_check(
             {
@@ -468,6 +501,23 @@ class PcieIpcAllReduceWorkspace:
                 "covers": self._tuned_configs_loaded,
             },
             "loading the tune cache",
+        )
+
+    def _warn_stale_tuned_entry(self, tactic) -> None:
+        """Say once that the cache holds entries this build no longer accepts."""
+        if self._warned_stale_entry:
+            return
+        self._warned_stale_entry = True
+        warnings.warn(
+            f"PCIe IPC all-reduce ignored a tuned entry from {self._tune_cache}: "
+            f"tactic {tactic!r} is not launchable in this build, so this shape "
+            "falls back to a seed configuration. The cache key still matches, "
+            "so this is not a stale workspace -- it is a cache written before "
+            "the set of legal configurations narrowed. Re-tune to regain the "
+            "measured configurations; other shapes in the same file may still "
+            "be in use, so the loss is partial and otherwise unsignalled.",
+            UserWarning,
+            stacklevel=4,
         )
 
     def _warn_if_untuned(self) -> None:
@@ -574,7 +624,13 @@ class PcieIpcAllReduceWorkspace:
         """Cold path: search or look up, then make the group agree."""
         hidden = inp.shape[-1]
         batch = inp.numel() // hidden
-        tuning_config = pcie_ipc_tuning_config(self._tune_batches)
+        # The lookup has to use the same buckets the search used, or a
+        # configuration profiled under one mapping is read back under another.
+        # With a derived ladder that means regenerating it for this hidden --
+        # pcie_ipc_tuning_config is lru_cached on the tuple, so an equal ladder
+        # yields the identical mapper object, which _find_nearest_profile's own
+        # cache requires.
+        tuning_config = pcie_ipc_tuning_config(self._batches_for(hidden))
         can_profile = tuner.is_tuning_mode and self._runner.can_profile(inp.device)
         if can_profile:
             _, tactic = tuner.choose_one(
@@ -602,6 +658,18 @@ class PcieIpcAllReduceWorkspace:
                 inputs=[inp],
             )
         config = resolve_tuned_config(seed, tactic, self.world_size, self.max_blocks)
+        if tactic != TABLE_TACTIC and config is seed:
+            # A matching key with an unusable value: world size, profile,
+            # max_blocks, max_numel, dtype and the tune version are all in the
+            # key, so the legal set narrowed without the version moving with it.
+            #
+            # Worth its own message because the two existing ones cannot reach
+            # it: both are gated on `_tuned_configs_loaded`, which is settled
+            # from the loaded *keys*, so they ask "did anyone tune this?" and
+            # not "is this value still legal?". The loss is otherwise silent
+            # and partial -- some shapes keep their tuned configuration, others
+            # quietly drop to the seed.
+            self._warn_stale_tuned_entry(tactic)
 
         # Unconditional, even when the cache missed and `config is seed`. The
         # ranks would otherwise have to agree on whether to run this collective
@@ -884,11 +952,12 @@ class PcieIpcAllReduceWorkspace:
         skipped: List[int] = []
         try:
             for hidden in hiddens:
+                requested = self._batches_for(hidden)
+                if self._tune_batches is not None:
+                    self._warn_if_coverage_falls_short(requested, hidden, dtype)
                 batches = [
                     b
-                    for b in tuned_batches_for(
-                        hidden, self._tune_batches, self.max_numel
-                    )
+                    for b in tuned_batches_for(hidden, requested, self.max_numel)
                     if self.launch_config(
                         torch.empty((b, hidden), dtype=dtype, device=self.device)
                     )
@@ -913,7 +982,7 @@ class PcieIpcAllReduceWorkspace:
                         tuner.choose_one(
                             PCIE_IPC_CUSTOM_OP,
                             [self._runner],
-                            pcie_ipc_tuning_config(self._tune_batches),
+                            pcie_ipc_tuning_config(tuple(requested)),
                             [inp],
                         )
                         covered.append((hidden, batch))
@@ -938,7 +1007,25 @@ class PcieIpcAllReduceWorkspace:
         self._tuned.clear()
         self._tuned_configs_loaded = True
         dist.barrier(group=self.group)
-        if self.rank == 0:
+        # What makes this worth refusing rather than warning is stated to the
+        # caller below. The mechanism is not: the copy-engine path has several
+        # internal streams and kernels to load, which a shortened warmup does
+        # not absorb, so too few samples can pick the wrong data plane outright
+        # rather than merely a worse block count within the right one.
+        if warmup < TUNE_WARMUP or repeat < TUNE_REPEAT:
+            if self.rank == 0:
+                warnings.warn(
+                    f"not persisting the tuned configurations: they were "
+                    f"measured with warmup={warmup} repeat={repeat}, below the "
+                    f"defaults ({TUNE_WARMUP}/{TUNE_REPEAT}). Too few samples "
+                    f"can pick the wrong variant outright, and a file written "
+                    f"here is indistinguishable from a good one to every "
+                    f"process that later loads it. The results are live in this "
+                    f"process; re-run at the default counts to persist them.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        elif self.rank == 0:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             tuner.save_configs(path)
         # Nobody leaves before the file is on disk: a peer that rebuilt its
@@ -970,6 +1057,54 @@ class PcieIpcAllReduceWorkspace:
             )
         self._tune_group = dist.new_group(ranks=ranks, backend="gloo")
         return self._tune_group
+
+    def _batches_for(self, hidden: int) -> Tuple[int, ...]:
+        """Single source for the ladder: the tuning search and the serving
+        lookup must agree on it exactly, so both read it from here rather than
+        each deriving it.
+        """
+        if self._tune_batches is not None:
+            return self._tune_batches
+        ladder = generate_tune_batches(hidden, self.max_numel, self.elem_size)
+        # A workspace too small to hold even one row at this hidden yields an
+        # empty ladder, and an empty bucket set is rejected outright by
+        # autotune(). Such a shape is not admissible anyway -- the caller is
+        # about to be told so -- but the lookup path reaches here first, so give
+        # it a one-bucket ladder rather than an exception from three frames down.
+        return ladder or (1,)
+
+    def _warn_if_coverage_falls_short(
+        self, batches: Sequence[int], hidden: int, dtype: torch.dtype
+    ) -> None:
+        """Say when an explicit bucket list leaves the top of the range untuned.
+
+        Buckets map with floor semantics, so a shape above the largest one is
+        served by whatever was measured there. That is fine when the gap is
+        small and wrong when it is two orders of magnitude: at hidden 6144 the
+        default list stops at 1.5 MiB, and the configuration it picks there runs
+        a 96 MiB collective 30% slower than the one measured at 96 MiB.
+
+        A warning rather than an error, because tuning only the decode range is
+        a legitimate choice -- a deployment that never issues a prefill
+        collective has no reason to pay for measuring one.
+        """
+        if not batches:
+            return
+        elem = torch.empty((), dtype=dtype).element_size()
+        tuned_bytes = max(batches) * hidden * elem
+        admitted_bytes = self.max_numel * elem
+        if tuned_bytes * 8 >= admitted_bytes:
+            return
+        warnings.warn(
+            f"tuning stops at {max(batches)} rows ({tuned_bytes >> 20} MiB at "
+            f"hidden {hidden}) but this workspace admits up to "
+            f"{admitted_bytes >> 20} MiB. Buckets map downwards, so every "
+            f"larger shape will run the configuration measured at the top of "
+            f"this list. Pass tune_batches covering the shapes you serve, or "
+            f"leave it unset to have the ladder derived from max_numel.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def destroy(self) -> None:
         """Release the handle and the shared slab.

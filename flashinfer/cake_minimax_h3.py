@@ -130,7 +130,44 @@ class MiniMaxH3Mxfp8PreAttention:
         debug_q_bf16: Optional[torch.Tensor] = None,
         debug_k_bf16: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the prepared pipeline into the caller-owned output tensors."""
+        """Run the prepared pipeline into the caller-owned output tensors.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            BF16 hidden states with shape ``[M, 5376]``.
+        x_norm_weight : torch.Tensor
+            BF16 RMSNorm weight with shape ``[5376]``.
+        adaln_scale, adaln_shift : torch.Tensor
+            BF16 AdaLN scale and shift tables with shape ``[9, 5376]``.
+        adaln_index : torch.Tensor
+            Contiguous int32 AdaLN row indices with shape ``[M]``.
+        qkv_weight_q : torch.Tensor
+            E4M3-quantized QKV projection weight with shape ``[21504, 5376]``.
+        qkv_weight_sf : torch.Tensor
+            Packed uint8 MXFP8 scales for ``qkv_weight_q``.
+        q_norm_weight, k_norm_weight : torch.Tensor
+            BF16 Q and K RMSNorm weights with shape ``[128]``.
+        rope_cos_sin : torch.Tensor
+            BF16 split-half NeoX RoPE values with shape ``[M, 96]``.
+        out_q : torch.Tensor
+            Caller-owned E4M3 output with shape ``[P, M, 56 / P, 3, 128]``.
+        out_sf : torch.Tensor
+            Caller-owned packed uint8 MXFP8 output scales.
+        debug_q_bf16, debug_k_bf16 : torch.Tensor, optional
+            Optional caller-owned BF16 Q and K debug outputs. Supply both or
+            neither.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            The same ``(out_q, out_sf)`` objects supplied by the caller.
+
+        Notes
+        -----
+        Every tensor must be the same object passed when constructing this
+        prepared operation; rebinding any tensor requires a new instance.
+        """
 
         current = {
             "x": x,

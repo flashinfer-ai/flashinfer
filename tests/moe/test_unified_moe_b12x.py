@@ -52,7 +52,6 @@ from flashinfer.fused_moe.api import (
     MoEFinalizeConfig,
     QuantConfig,
     QuantFormat,
-    QuantVariant,
     RoutingConfig,
     RoutingInputMode,
 )
@@ -66,6 +65,7 @@ from tests.moe.test_b12x_fused_moe import (  # noqa: E402
     cute_dsl_available,
     sm120_required,
 )
+from tests.moe.utils import quant_id
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ class TestB12xUnifiedValidation:
     ):
         return MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig.from_variant(variant, w4a16_weight=QuantFormat.NVFP4),
+            quant=variant,
             experts=experts or ExpertConfig(intermediate_size=512),
             activation=SwiGLU() if activation is None else activation,
             backend=BackendOptions((backend,)),
@@ -149,7 +149,10 @@ class TestB12xUnifiedValidation:
     def test_b12x_constructor_defers_idempotent_wrapper_build(self, monkeypatch):
         import flashinfer.fused_moe.cute_dsl as cute_dsl
 
-        config = self._config(B12xNvfp4Config(), QuantVariant.NVFP4)
+        config = self._config(
+            B12xNvfp4Config(),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        )
 
         class Wrapper:
             pass
@@ -194,8 +197,16 @@ class TestB12xUnifiedValidation:
     @pytest.mark.parametrize(
         "runner_type,backend,variant",
         (
-            (B12xNvfp4Runner, B12xNvfp4Config(), QuantVariant.NVFP4),
-            (B12xW4A16Runner, B12xW4A16Config(), QuantVariant.W4A16),
+            (
+                B12xNvfp4Runner,
+                B12xNvfp4Config(),
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            ),
+            (
+                B12xW4A16Runner,
+                B12xW4A16Config(),
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            ),
         ),
     )
     @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
@@ -213,7 +224,7 @@ class TestB12xUnifiedValidation:
     def test_b12x_nvfp4_accepts_geglu_tanh(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
-            QuantVariant.NVFP4,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             activation=GeGLUTanh(),
         )
         self._mock_environment(monkeypatch)
@@ -222,7 +233,7 @@ class TestB12xUnifiedValidation:
     def test_b12x_w4a16_rejects_geglu_tanh(self, monkeypatch):
         config = self._config(
             B12xW4A16Config(),
-            QuantVariant.W4A16,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
             activation=GeGLUTanh(),
         )
         self._mock_environment(monkeypatch)
@@ -245,7 +256,10 @@ class TestB12xUnifiedValidation:
     def test_b12x_environment_not_supported(
         self, monkeypatch, environment, error, match
     ):
-        config = self._config(B12xNvfp4Config(), QuantVariant.NVFP4)
+        config = self._config(
+            B12xNvfp4Config(),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        )
         self._mock_environment(monkeypatch, **environment)
         with pytest.raises(error, match=match):
             self._runner(config).check_support()
@@ -253,7 +267,7 @@ class TestB12xUnifiedValidation:
     def test_b12x_does_not_support_expert_parallelism(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
-            QuantVariant.NVFP4,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(
                 intermediate_size=512,
                 local_expert_offset=4,
@@ -268,7 +282,7 @@ class TestB12xUnifiedValidation:
     def test_b12x_does_not_support_unfinalized_output(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
-            QuantVariant.NVFP4,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
         self._mock_environment(monkeypatch)
@@ -279,7 +293,7 @@ class TestB12xUnifiedValidation:
     def test_layer_skips_runner_when_support_check_fails(self, monkeypatch):
         config = self._config(
             B12xNvfp4Config(),
-            QuantVariant.NVFP4,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         )
         monkeypatch.setattr(
             "flashinfer.fused_moe.layer.get_compute_capability", lambda _: (12, 0)
@@ -299,15 +313,30 @@ class TestB12xUnifiedValidation:
     @pytest.mark.parametrize(
         "runner_type,backend,variant",
         (
-            (B12xNvfp4Runner, B12xNvfp4Config(), QuantVariant.W4A16),
-            (B12xW4A16Runner, B12xW4A16Config(), QuantVariant.NVFP4),
+            (
+                B12xNvfp4Runner,
+                B12xNvfp4Config(),
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            ),
+            (
+                B12xW4A16Runner,
+                B12xW4A16Config(),
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            ),
         ),
+        ids=[
+            "NVFP4xNVFP4-runner-NVFP4xBF16-quant",
+            "NVFP4xBF16-runner-NVFP4xNVFP4-quant",
+        ],
     )
     def test_quantization_backend_mismatch_rejected(
         self, runner_type, backend, variant
     ):
         config = self._config(backend, variant)
-        with pytest.raises(NotImplementedError, match=f"QuantVariant.{variant.name}"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"weight={variant.weight.name}, activation={variant.activation.name}",
+        ):
             self._runner(config, runner_type).check_support()
 
     def test_w4a16_prepare_does_not_expose_fp16_mode(self):
@@ -428,7 +457,7 @@ def _make_b12x_tensors(
 def _make_b12x_layer_and_packs(
     tensors,
     *,
-    variant: QuantVariant,
+    quant: QuantConfig,
     activation: str,
     intermediate_size: int,
     num_experts: int,
@@ -437,7 +466,7 @@ def _make_b12x_layer_and_packs(
 ):
     activation_config = _B12X_ACTIVATIONS[activation]
     hidden_size = tensors["x_bf16"].shape[1]
-    if variant is QuantVariant.NVFP4:
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         backend_config = B12xNvfp4Config()
         prepared = backend_config.prepare_weights(
             tensors["w1_weight_bf16"],
@@ -479,7 +508,7 @@ def _make_b12x_layer_and_packs(
     weight_pack.prepare_for(backend_key, prepared)
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig.from_variant(variant, w4a16_weight=QuantFormat.NVFP4),
+        quant=quant,
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=num_experts,
@@ -502,7 +531,7 @@ def _run_b12x_unified(layer, act_pack, weight_pack):
 def _b12x_reference(
     tensors,
     *,
-    variant: QuantVariant,
+    quant: QuantConfig,
     activation: str,
     intermediate_size: int,
     num_experts: int,
@@ -518,7 +547,9 @@ def _b12x_reference(
         hidden_size=tensors["x_bf16"].shape[1],
         intermediate_size=intermediate_size,
         fc2_input_scale=(
-            tensors["fc2_input_scale"] if variant is QuantVariant.NVFP4 else None
+            tensors["fc2_input_scale"]
+            if quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
+            else None
         ),
     )
     if activation == "relu2":
@@ -543,7 +574,7 @@ def _assert_b12x_accurate(actual, expected):
 
 def _assert_b12x_case(
     *,
-    variant: QuantVariant,
+    quant: QuantConfig,
     activation: str,
     num_tokens: int,
     top_k: int,
@@ -561,7 +592,7 @@ def _assert_b12x_case(
     )
     layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
         tensors,
-        variant=variant,
+        quant=quant,
         activation=activation,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -570,7 +601,7 @@ def _assert_b12x_case(
     actual = _run_b12x_unified(layer, act_pack, weight_pack)
     expected = _b12x_reference(
         tensors,
-        variant=variant,
+        quant=quant,
         activation=activation,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -581,20 +612,132 @@ def _assert_b12x_case(
 
 _B12X_DISPATCH_CASES = (
     # Existing numerical, micro, static, dynamic, and ReLU2 paths.
-    (QuantVariant.NVFP4, "silu", 1, 8, 256, 256, 512),
-    (QuantVariant.NVFP4, "silu", 128, 1, 256, 256, 512),
-    (QuantVariant.NVFP4, "silu", 515, 8, 384, 256, 512),
-    (QuantVariant.NVFP4, "silu", 128, 2, 8, 1024, 2048),
-    (QuantVariant.NVFP4, "gelu_tanh", 64, 2, 64, 512, 256),
-    (QuantVariant.NVFP4, "relu2", 1, 1, 256, 256, 512),
-    (QuantVariant.NVFP4, "relu2", 128, 2, 256, 256, 512),
-    (QuantVariant.NVFP4, "relu2", 512, 8, 256, 256, 512),
-    (QuantVariant.W4A16, "silu", 1, 2, 64, 512, 256),
-    (QuantVariant.W4A16, "silu", 64, 2, 256, 256, 512),
-    (QuantVariant.W4A16, "silu", 384, 2, 256, 256, 512),
-    (QuantVariant.W4A16, "relu2", 2, 2, 64, 512, 256),
-    (QuantVariant.W4A16, "relu2", 64, 2, 256, 256, 512),
-    (QuantVariant.W4A16, "relu2", 384, 2, 256, 256, 512),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "silu",
+        1,
+        8,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "silu",
+        128,
+        1,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "silu",
+        515,
+        8,
+        384,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "silu",
+        128,
+        2,
+        8,
+        1024,
+        2048,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "gelu_tanh",
+        64,
+        2,
+        64,
+        512,
+        256,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "relu2",
+        1,
+        1,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "relu2",
+        128,
+        2,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        "relu2",
+        512,
+        8,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        "silu",
+        1,
+        2,
+        64,
+        512,
+        256,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        "silu",
+        64,
+        2,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        "silu",
+        384,
+        2,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        "relu2",
+        2,
+        2,
+        64,
+        512,
+        256,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        "relu2",
+        64,
+        2,
+        256,
+        256,
+        512,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        "relu2",
+        384,
+        2,
+        256,
+        256,
+        512,
+    ),
 )
 
 
@@ -605,6 +748,19 @@ class TestUnifiedB12xConformance:
     @pytest.mark.parametrize(
         "variant,activation,num_tokens,top_k,num_experts,hidden_size,intermediate_size",
         _B12X_DISPATCH_CASES,
+        ids=[
+            f"{quant_id(quant)}-{activation}-t{num_tokens}-k{top_k}"
+            f"-e{num_experts}-h{hidden_size}-i{intermediate_size}"
+            for (
+                quant,
+                activation,
+                num_tokens,
+                top_k,
+                num_experts,
+                hidden_size,
+                intermediate_size,
+            ) in _B12X_DISPATCH_CASES
+        ],
     )
     def test_dispatch_accuracy(
         self,
@@ -617,7 +773,7 @@ class TestUnifiedB12xConformance:
         intermediate_size,
     ):
         _assert_b12x_case(
-            variant=variant,
+            quant=variant,
             activation=activation,
             num_tokens=num_tokens,
             top_k=top_k,
@@ -629,16 +785,31 @@ class TestUnifiedB12xConformance:
     @pytest.mark.parametrize(
         "variant,activation,num_tokens,intermediate_size",
         (
-            (QuantVariant.NVFP4, "silu", 8, 704),
-            (QuantVariant.NVFP4, "silu", 128, 704),
-            (QuantVariant.W4A16, "silu", 32, 192),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+                "silu",
+                8,
+                704,
+            ),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+                "silu",
+                128,
+                704,
+            ),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                "silu",
+                32,
+                192,
+            ),
         ),
     )
     def test_ragged_intermediate(
         self, variant, activation, num_tokens, intermediate_size
     ):
         _assert_b12x_case(
-            variant=variant,
+            quant=variant,
             activation=activation,
             num_tokens=num_tokens,
             top_k=2,
@@ -652,7 +823,7 @@ class TestUnifiedB12xConformance:
     )
     def test_micro_pairs_exceed_experts(self, num_tokens, top_k, num_experts):
         _assert_b12x_case(
-            variant=QuantVariant.NVFP4,
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             activation="silu",
             num_tokens=num_tokens,
             top_k=top_k,
@@ -673,10 +844,13 @@ class TestUnifiedB12xConformance:
             seed=123,
         )
         outputs = {}
-        for variant in (QuantVariant.NVFP4, QuantVariant.W4A16):
+        for variant in (
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        ):
             layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
                 tensors,
-                variant=variant,
+                quant=variant,
                 activation="silu",
                 intermediate_size=512,
                 num_experts=256,
@@ -685,23 +859,50 @@ class TestUnifiedB12xConformance:
             outputs[variant] = _run_b12x_unified(layer, act_pack, weight_pack).float()
         expected = _b12x_reference(
             tensors,
-            variant=QuantVariant.W4A16,
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
             activation="silu",
             intermediate_size=512,
             num_experts=256,
             top_k=2,
         )
-        a4_error = (outputs[QuantVariant.NVFP4] - expected).abs()
-        a16_error = (outputs[QuantVariant.W4A16] - expected).abs()
+        a4_error = (
+            outputs[QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)]
+            - expected
+        ).abs()
+        a16_error = (
+            outputs[QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16)]
+            - expected
+        ).abs()
         assert a16_error.mean() < 0.75 * a4_error.mean()
         assert a16_error.square().mean() < 0.5 * a4_error.square().mean()
 
     @pytest.mark.parametrize(
         "variant,activation,num_tokens,hidden_size,intermediate_size,num_experts",
         (
-            (QuantVariant.NVFP4, "silu", 128, 256, 512, 256),
-            (QuantVariant.NVFP4, "relu2", 128, 256, 512, 256),
-            (QuantVariant.W4A16, "silu", 2, 512, 256, 64),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+                "silu",
+                128,
+                256,
+                512,
+                256,
+            ),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+                "relu2",
+                128,
+                256,
+                512,
+                256,
+            ),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                "silu",
+                2,
+                512,
+                256,
+                64,
+            ),
         ),
     )
     def test_cuda_graph(
@@ -724,7 +925,7 @@ class TestUnifiedB12xConformance:
         )
         layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
             tensors,
-            variant=variant,
+            quant=variant,
             activation=activation,
             intermediate_size=intermediate_size,
             num_experts=num_experts,
@@ -746,9 +947,18 @@ class TestUnifiedB12xConformance:
     @pytest.mark.parametrize(
         "variant,source_format",
         (
-            (QuantVariant.NVFP4, "modelopt"),
-            (QuantVariant.W4A16, "modelopt"),
-            (QuantVariant.W4A16, "compressed_tensors"),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+                "modelopt",
+            ),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                "modelopt",
+            ),
+            (
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+                "compressed_tensors",
+            ),
         ),
     )
     def test_matches_legacy_wrapper(self, variant, source_format):
@@ -765,7 +975,7 @@ class TestUnifiedB12xConformance:
         )
         layer, act_pack, weight_pack = _make_b12x_layer_and_packs(
             tensors,
-            variant=variant,
+            quant=variant,
             activation="silu",
             intermediate_size=512,
             num_experts=256,
@@ -784,7 +994,9 @@ class TestUnifiedB12xConformance:
             top_k=2,
             hidden_size=256,
             intermediate_size=512,
-            quant_mode="w4a16" if variant is QuantVariant.W4A16 else "nvfp4",
+            quant_mode="w4a16"
+            if variant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
+            else "nvfp4",
             source_format=source_format,
         )
         legacy = wrapper.run(
@@ -816,7 +1028,9 @@ class TestUnifiedB12xConformance:
         for source_format in ("modelopt", "compressed_tensors"):
             _, _, weight_pack = _make_b12x_layer_and_packs(
                 tensors,
-                variant=QuantVariant.W4A16,
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.BF16
+                ),
                 activation="silu",
                 intermediate_size=512,
                 num_experts=8,

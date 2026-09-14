@@ -1,15 +1,20 @@
 # Cake warp-decode validation
 
-`benchmarks/cake_warp_decode.py` is the standalone SM103 validation and
-benchmark entry point. It prepares one public TRTLLM NVFP4 physical fixture per
-geometry and shares those exact activation, routing, weight, and scale tensors
-between Cake and `trtllm_fp4_block_scale_routed_moe`.
+`benchmarks/cake_warp_decode.py` is the standalone exact-SM100/SM103 validation
+and benchmark entry point. It prepares one public TRTLLM NVFP4 physical fixture
+per activation-qualified geometry. SwiGLU rows share the exact activation,
+routing, weight, and scale tensors between Cake and
+`trtllm_fp4_block_scale_routed_moe`. The official runner does not support
+standalone SiLU, so that configuration uses Cake export repeatability and the
+separate source/export release receipt for numeric validation.
 
 ## Correctness gate
 
-Run from an editable FlashInfer checkout on an SM103 GPU. The editable install
-stages the repository CUDA/include trees under ``flashinfer/data``; setting
-``PYTHONPATH`` alone is not sufficient for JIT builds:
+Run from an editable FlashInfer checkout on an exact SM100 or SM103 GPU. The
+harness selects `sm100a` for compute capability 10.0 and `sm103a` for compute
+capability 10.3, and rejects every other target. The editable install stages the
+repository CUDA/include trees under ``flashinfer/data``; setting ``PYTHONPATH``
+alone is not sufficient for JIT builds:
 
 ```bash
 git submodule update --init --depth 1 \
@@ -29,19 +34,31 @@ python benchmarks/cake_warp_decode.py \
 
 The mandatory dense matrix is:
 
-| Hidden | Intermediate | Experts | Top-k | Tokens |
-|---:|---:|---:|---:|---:|
-| 2048 | 512 | 512 | 10 | every value from 1 through 32 |
-| 2048 | 1536 | 60 | 4 | every value from 1 through 32 |
+| Activation | Hidden | Intermediate | Experts | Top-k | Tokens |
+|---|---:|---:|---:|---:|---:|
+| SwiGLU | 2048 | 512 | 512 | 10 | every value from 1 through 32 |
+| SwiGLU | 2048 | 1536 | 60 | 4 | every value from 1 through 32 |
+| standalone SiLU | 6144 | 1536 | 192 | 4 | every value from 1 through 32 |
+
+GEMM1 fixture construction is activation-aware. Its logical BF16 weight shape
+is `[E, 2 * I, H]` for gated SwiGLU and `[E, I, H]` for standalone SiLU; both
+are prepared into the production NVFP4 shuffled ABI expected by their
+activation-qualified generated schedules. The E2M1 weight tensor uses the
+production `MajorK` 32-row MMA layout: physical row `p` maps back to logical
+row `(p & ~31) + ((p & 7) << 2) + ((p & 31) >> 3)`. The corresponding E4M3
+block-scale tensor uses the production `R128c4` layout.
 
 Every row prepares the exported workspace on non-default stream A, launches on
-distinct non-default stream B, compares finalized BF16 output against the
-official routed-MoE baseline with `atol=1e-2` and `rtol=1e-2`, and launches twice
-into the same caller-owned output and workspace. Pointer and byte-capacity
-stability are part of the gate. Workspace preparation returns a generation
-receipt only after its asynchronous initialization is complete; launch validates
-that receipt on stream B. The receipt is explicitly released after the last
-launch, with a weak-reference finalizer retained for exceptional exits.
+distinct non-default stream B, and launches twice into the same caller-owned
+output and workspace. SwiGLU compares finalized BF16 output against the official
+routed-MoE baseline with `atol=1e-2` and `rtol=1e-2`. Standalone SiLU records the
+official baseline as `N/A` and compares two independently prepared exported Cake
+calls; its source/export numeric parity comes from the release validation receipt
+over identical physical inputs. Pointer and byte-capacity stability are part of
+the gate. Workspace preparation returns a generation receipt only after its
+asynchronous initialization is complete; launch validates that receipt on stream
+B. The receipt is explicitly released after the last launch, with a weak-reference
+finalizer retained for exceptional exits.
 
 The public runner validates during input packing that every expert ID satisfies
 `0 <= id < num_experts`. It records the tensor identity, storage address,
@@ -85,7 +102,9 @@ idempotent success, so a bookkeeping mistake cannot masquerade as proven GPU
 retirement. One retirement case per geometry launches on stream B, immediately
 re-prepares the same workspace on stream C without synchronizing B, launches the
 replacement generation, and releases it without synchronizing C. The
-replacement output must match the official baseline.
+replacement output must match the official baseline for SwiGLU or an
+independently prepared exported Cake call for standalone SiLU. Source/export
+parity remains a separate release gate.
 
 A captured graph retains workspace pointers and completion-event nodes. Keep the
 runner, workspace, and receipt alive until every possible replay is finished;
@@ -104,15 +123,16 @@ selector transitions:
 
 - E512: T=1, 2, 22, 23, 32.
 - E60: T=1, 7, 8, 10, 11, 12, 16, 17, 32.
+- standalone-SiLU E192: T=1, 2, 32.
 
 Workspace preparation occurs on stream A before capture on distinct stream B.
-The harness first replays the graph without mutation and checks the original
-baseline. Before the next replay it changes the graph-stable expert IDs, BF16
-routing weights, and the packed GEMM1/GEMM2 weights and scales of a routed
-expert, then replays from distinct stream C. The mutated replay must match a
-fresh baseline evaluation, the baseline output must differ from its pre-mutation
-value, and caller output/workspace pointers and capacity must remain stable
-across both replays. Receipt release occurs immediately after replay submission,
+The harness first replays the graph without mutation and checks the applicable
+numeric reference. Before the next replay it changes the graph-stable expert
+IDs, BF16 routing weights, and the packed GEMM1/GEMM2 weights and scales of a
+routed expert, then replays from distinct stream C. The mutated replay must
+match a fresh reference evaluation, the reference output must differ from its
+pre-mutation value, and caller output/workspace pointers and capacity must remain
+stable across both replays. Receipt release occurs immediately after replay submission,
 without a caller-side stream synchronization, and must safely wait for the
 completion event embedded in the captured graph. While that graph executable is
 still alive, the harness immediately re-prepares and releases the exact same
@@ -135,6 +155,8 @@ The selector boundary labels in the JSON receipt distinguish E60 `_e64_scan1`
 at T=11, `_e64_scan2` at T=12..16, and the general route packer at T=17..32.
 They distinguish E512 direct routing through T=22 from the general route packer
 at T=23..32.
+Standalone-SiLU E192 uses the static direct route at T=1 and the persistent
+direct route at T=2..32.
 
 ## CUPTI benchmark gate
 
@@ -157,21 +179,39 @@ back to another timer. Quantization, workspace allocation/preparation, first-use
 compilation, and warm-up occur outside the measured samples.
 
 For every benchmark shape, exported workspace preparation runs on non-default
-stream A while parity checks and all CUPTI sessions run on distinct non-default
+stream A while validation and all CUPTI sessions run on distinct non-default
 stream B. The exported output and workspace must retain their caller-owned
-address/capacity through the complete ABBA/BAAB sequence, after which the
-generation receipt is explicitly released.
+address/capacity through the measurement, after which the generation receipt is
+explicitly released.
 
-Each result row alternates exported Cake and the official FlashInfer routed-MoE
-baseline in ABBA and BAAB rounds. Every position is a separate repository
-`bench_gpu_time` CUPTI/cold-L2 session. The receipt records the exact order and
-measurement for every position, each arm's aggregate median,
+Each SwiGLU result row alternates exported Cake and the official FlashInfer
+routed-MoE baseline in ABBA and BAAB rounds. Every position is a separate
+repository `bench_gpu_time` CUPTI/cold-L2 session. The receipt records the exact
+order and measurement for every position, each arm's aggregate median,
 `exported_over_flashinfer_baseline`, and the worst per-round ratio.
 `--paired-rounds` must be even and at least two so both orderings have equal
 representation.
 
+Standalone SiLU has no supported official TRT-LLM NVFP4 baseline. Its benchmark
+row therefore reports one exported Cake absolute CUPTI distribution and sets
+`flashinfer_baseline.status`, parity, and the speedup ratio to `N/A`; it must not
+claim an official speedup. Source/export parity is a correctness release receipt,
+not a timed peer and not a substitute denominator.
+
+To measure only the standalone-SiLU selector boundaries on either exact target:
+
+```bash
+python benchmarks/cake_warp_decode.py \
+  --mode benchmark \
+  --geometry e192_i1536_k4_silu \
+  --benchmark-tokens 1 2 32 \
+  --warmup 5 \
+  --repetitions 30 \
+  --json-out artifacts/cake_warp_decode_silu_absolute.json
+```
+
 Use `--benchmark-tokens 1 11 17 24 32` to request a smaller explicit
-performance slice; correctness mode always retains the full two-geometry,
+performance slice; correctness mode always retains the full three-configuration,
 T=1..32 matrix.
 
 ## Compute Sanitizer entry point
@@ -186,7 +226,7 @@ compute-sanitizer --tool synccheck --target-processes all \
   --geometry e60_i1536_k4 \
   --sanitizer-tokens 11
 
-compute-sanitizer --tool memcheck --target-processes all \
+compute-sanitizer --tool racecheck --target-processes all \
   python benchmarks/cake_warp_decode.py \
   --mode sanitizer \
   --geometry e512_i512_k10 \

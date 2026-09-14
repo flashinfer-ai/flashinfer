@@ -111,8 +111,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         dest="quant_variant",
         choices=("bf16", "nvfp4", "nvfp4_w4a16", "mxfp4", "mxfp4_w4a16"),
         default="bf16",
-        help="Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations "
-        "(not the legacy QuantVariant.MXFP4 preset with MXFP8 activations).",
+        help="Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations.",
     )
     parser.add_argument(
         "--activation-type",

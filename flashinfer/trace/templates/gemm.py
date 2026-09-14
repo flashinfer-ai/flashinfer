@@ -2263,7 +2263,15 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
         "return_lse": Scalar("bool"),
         "enable_pdl": Scalar("bool", optional=True),
         "skip_softmax_threshold_scale_factor": Scalar("float32", optional=True),
-        "skip_all_rows_active_check": Scalar("bool", optional=True),
+        "skip_all_rows_active_check": Scalar(
+            "bool",
+            optional=True,
+            description=(
+                "Defaults to True for the all-rows-active fast path; paired CPU "
+                "length mirrors take precedence, and False without mirrors "
+                "requests device-derived row checking."
+            ),
+        ),
     },
     outputs={
         "output": Tensor(
