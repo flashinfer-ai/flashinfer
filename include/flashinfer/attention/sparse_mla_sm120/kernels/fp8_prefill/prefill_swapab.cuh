@@ -157,6 +157,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     for (int ti = 0; ti < actual_ni; ti++) {
       const int buf = ti & 1;
       const int next = ld_idx(ti + 2);
+      // Surplus IO lanes skip gathering but keep this wait to stay paced with
+      // the ring phases rather than falling behind into a retired phase.
       Ring::Free::wait(sm.mbar_wr + buf, wr_phase);
       io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
                                      cold.page_stride_bytes, kv_l2_policy);

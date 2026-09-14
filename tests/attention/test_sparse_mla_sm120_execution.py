@@ -319,6 +319,85 @@ def test_dual_resolved_execution_and_optional_mismatch(model, variant, extra_fp4
         call(torch.full((4,), 128, device="cuda", dtype=torch.int32))
 
 
+@pytest.mark.parametrize("operand", ["indices", "extra_indices"])
+def test_nvfp4_legacy_rejects_width_before_narrowing(operand, sm12x):
+    from flashinfer.mla._sparse_mla_sm120_execution import (
+        get_sparse_mla_dsv4_nvfp4_module,
+    )
+
+    module = get_sparse_mla_dsv4_nvfp4_module()
+    q = torch.empty(0, 16, 512, device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty(1, 64, 384, device="cuda", dtype=torch.uint8)
+    idx = torch.empty(
+        0,
+        2**32 + 128 if operand == "indices" else 128,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    extra = (
+        torch.empty(0, 2**31 - 1, device="cuda", dtype=torch.int32)
+        if operand == "extra_indices"
+        else None
+    )
+    splits = 2 + ((extra.shape[1] + 63) // 64 if extra is not None else 0)
+    mid = torch.empty(0, 16, splits, 512, device="cuda", dtype=torch.bfloat16)
+    mlse = torch.empty(0, 16, splits, device="cuda")
+    lse = torch.empty(0, 16, device="cuda")
+    message = (
+        "unsupported NVFP4 heads/topk" if extra is None else "NVFP4 extra_topk exceeds"
+    )
+    with pytest.raises(RuntimeError, match=message):
+        module.sparse_mla_sm120_nvfp4_decode(
+            q,
+            cache,
+            idx,
+            mid,
+            mlse,
+            q,
+            lse,
+            splits,
+            512**-0.5,
+            None,
+            None,
+            cache if extra is not None else None,
+            extra,
+            None,
+            1,
+            False,
+        )
+
+
+def test_nvfp4_resolver_extra_width_boundary(sm12x):
+    from flashinfer.mla._sparse_mla_sm120_execution import (
+        get_sparse_mla_dsv4_nvfp4_module,
+    )
+
+    module = get_sparse_mla_dsv4_nvfp4_module()
+    limit = 2**31 - 1 - 576
+
+    def resolve(extra_topk):
+        return resolve_dsv4_nvfp4(
+            tokens=1,
+            heads=16,
+            topk=512,
+            extra_topk=extra_topk,
+            page_size=64,
+            extra_page_size=64,
+            page_stride_bytes=24576,
+            extra_page_stride_bytes=24576,
+            cpb=1,
+            sm_count=148,
+            max_shared_bytes=101376,
+        )
+
+    plan = resolve(limit)
+    assert plan.inspect()["active_splits"] == 8 + (limit + 63) // 64
+    assert module.supports_attention(16, 512, 64, limit, 64)
+    assert not module.supports_attention(16, 512, 64, limit + 1, 64)
+    with pytest.raises(RuntimeError, match="NVFP4 extra_topk exceeds"):
+        resolve(limit + 1)
+
+
 @pytest.mark.parametrize(
     "cpb,prefill,stage1",
     [

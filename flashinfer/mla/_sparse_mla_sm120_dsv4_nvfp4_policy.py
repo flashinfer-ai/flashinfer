@@ -69,8 +69,8 @@ def _supports(
 
 
 # One profile bucket per canonical grid point; the store validator requires
-# the full grid.  Non-probe decode batches use the next larger bucket's
-# measured CPB.
+# the full grid. Non-probe decode batches use an exact refined entry when
+# available, otherwise the next larger canonical bucket's measured CPB.
 _CROSSOVER_PROBED_T = _cpb._PROFILE_T
 _CROSSOVER_MARGIN = _cpb._CROSSOVER_MARGIN
 
@@ -118,13 +118,6 @@ _plan_memo: dict[tuple, NVFP4KernelVariant] = {}
 _plan_epoch = -1
 _calibration_lock = threading.RLock()
 _calibrating: set[tuple[str | None, str, str]] = set()
-
-
-def _token_bucket(num_tokens: int) -> int:
-    for bucket in _CROSSOVER_PROBED_T:
-        if num_tokens <= bucket:
-            return bucket
-    return _CROSSOVER_PROBED_T[-1]
 
 
 def _request_key(
@@ -334,11 +327,10 @@ def plan_nvfp4_sparse_mla_sm120(
         if profile is None or num_tokens > _DECODE_MAX_TOKENS
         else _cpb._profile_bucket(profile, num_tokens)
     )
-    t_bucket = _token_bucket(num_tokens) if num_tokens <= _DECODE_MAX_TOKENS else -1
     memo_key = (
         scope_epoch,
         key,
-        t_bucket,
+        num_tokens,
         _cpb._device_key(device),
     )
     global _plan_epoch
@@ -867,26 +859,34 @@ def refine_nvfp4(
         has_extra_topk_length=has_extra_topk_length,
         has_attn_sink=has_attn_sink,
     )
+    profile = _cpb.get_profile(key, device)
+    if profile is None or str(tokens) in profile["buckets"]:
+        return None
+    ctx = _nvfp4_measure_context(
+        device, primary_page_size, topk, extra_topk, extra_page_size
+    )
+    entry = _measure_nvfp4_bucket(
+        ctx,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        has_topk_length=has_topk_length,
+        has_extra_topk_length=has_extra_topk_length,
+        has_attn_sink=has_attn_sink,
+        num_tokens=tokens,
+    )
+    entry["provenance"] = "refined"
     with _cpb._store_lock:
         profile = _cpb.get_profile(key, device)
         if profile is None or str(tokens) in profile["buckets"]:
             return None
-        ctx = _nvfp4_measure_context(
-            device, primary_page_size, topk, extra_topk, extra_page_size
-        )
-        entry = _measure_nvfp4_bucket(
-            ctx,
-            num_heads=num_heads,
-            topk=topk,
-            extra_topk=extra_topk,
-            has_topk_length=has_topk_length,
-            has_extra_topk_length=has_extra_topk_length,
-            has_attn_sink=has_attn_sink,
-            num_tokens=tokens,
-        )
-        entry["provenance"] = "refined"
         profile["buckets"][str(tokens)] = entry
-        persisted = _cpb.publish_calibration(device, _FAMILY, profiles={key: profile})
+        persisted = _cpb.publish_calibration(
+            device,
+            _FAMILY,
+            profiles={key: profile},
+            profile_buckets={key: {str(tokens): entry}},
+        )
     return {**entry, "persisted": persisted}
 
 

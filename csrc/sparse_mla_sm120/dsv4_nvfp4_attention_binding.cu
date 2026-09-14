@@ -42,10 +42,11 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   CHECK_DEVICE(q, indices);
   CHECK_DEVICE(q, output);
   CHECK_DEVICE(q, out_lse);
+  TVM_FFI_ICHECK_LE(q.size(0), INT_MAX) << "NVFP4 tokens exceed integer range";
+  TVM_FFI_ICHECK(has_instance(q.size(1), indices.size(1))) << "unsupported NVFP4 heads/topk";
   const int tokens = static_cast<int>(q.size(0));
   const int heads = static_cast<int>(q.size(1));
   const int topk = static_cast<int>(indices.size(1));
-  TVM_FFI_ICHECK_GT(topk, 0);
   TVM_FFI_ICHECK_EQ(indices.size(0), tokens);
   TVM_FFI_ICHECK_EQ(output.ndim(), 3);
   TVM_FFI_ICHECK_EQ(output.size(0), tokens);
@@ -94,8 +95,9 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
     TVM_FFI_ICHECK_EQ(idx.ndim(), 2);
     TVM_FFI_ICHECK(idx.IsContiguous());
     TVM_FFI_ICHECK_EQ(idx.size(0), tokens);
+    TVM_FFI_ICHECK_GT(idx.size(1), 0);
+    TVM_FFI_ICHECK_LE(idx.size(1), MaxExtraTopK) << "NVFP4 extra_topk exceeds integer chunk range";
     p.extra_topk = static_cast<int>(idx.size(1));
-    TVM_FFI_ICHECK_GT(p.extra_topk, 0);
     const auto extra_layout = parse_nvfp4_paged_layout(cache);
     TVM_FFI_ICHECK(
         execution::visit_extra_page(extra_layout.page_size, [](auto) { return true; }).supported)
