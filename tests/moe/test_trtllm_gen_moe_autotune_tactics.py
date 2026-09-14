@@ -363,6 +363,47 @@ def _enumerate_valid_tactics(
     "activation_type",
     [
         pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Situ, id="Situ"),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_tokens,required_tiles,excluded_tiles",
+    [
+        pytest.param(8192, {128, 192, 256}, set(), id="average-below-192"),
+        pytest.param(10752, {128, 192, 256}, set(), id="average-equals-192"),
+        pytest.param(11200, {192, 256}, {128}, id="average-above-192"),
+    ],
+)
+def test_nvfp4_irregular_tile_ladder_brackets_average(
+    activation_type, num_tokens, required_tiles, excluded_tiles
+):
+    """An irregular tile ladder must bracket the average routed rows."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in [(10, 0), (10, 3)]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=False).build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=384,
+        num_experts=896,
+        num_tokens=num_tokens,
+        use_per_token_scaling=False,
+        activation_type=activation_type,
+    )
+
+    tile_ns = {int(tactic[0]) for tactic in valid_tactics}
+    assert required_tiles.issubset(tile_ns)
+    assert tile_ns.isdisjoint(excluded_tiles)
+
+
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
         pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
