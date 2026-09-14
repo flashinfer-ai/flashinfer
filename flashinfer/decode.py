@@ -461,7 +461,8 @@ def get_batch_decode_module(*args):
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
     return op
 
 
@@ -3187,7 +3188,8 @@ class TrtllmGenDecodeModule:
         self._op = self._mod.build_and_load()
         from flashinfer.jit.cubin_loader import setup_cubin_loader
 
-        setup_cubin_loader(self._mod.get_library_path())
+        for library_path in self._mod.get_library_paths():
+            setup_cubin_loader(library_path)
 
     def _paged_run(
         self,

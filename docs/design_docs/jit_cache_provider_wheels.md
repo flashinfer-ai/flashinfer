@@ -63,7 +63,7 @@ flowchart LR
     shim --> sm90["provider sm90a"]
     shim --> sm120["provider sm120f"]
     runtime["FlashInfer AOT resolver"] --> shim
-    runtime -->|"module + target SM"| selected["one compatible provider root"]
+    runtime -->|"module + target SM"| selected["one or more compatible provider roots"]
 ```
 
 Provider wheels register the `flashinfer.jit_cache.providers` entry-point group.
@@ -81,10 +81,11 @@ The entry point returns a generated manifest with this schema:
 ```
 
 The module list is generated from the packaged files, rather than maintained by
-hand. Runtime accepts a provider only when its FlashInfer version matches, its
-manifest contains the requested module, and its architecture set covers every
-target in the active compilation context. If no provider matches, normal JIT
-compilation remains the fallback.
+hand. Runtime accepts a provider only when its full CUDA-specific version
+matches the shim, its manifest contains the requested module, and its
+architecture set covers at least one target in the active compilation context.
+If no provider matches a call's target device, normal JIT compilation remains
+the fallback.
 
 ### Target Compatibility Policy
 
@@ -117,6 +118,33 @@ provider to have an identical inventory. The `sm80` provider therefore serves
 SM86 without claiming `sm86` in its manifest, while an installed native `sm89`
 provider remains preferred on SM89. Architecture-specific `a` providers remain
 exact.
+
+### Heterogeneous Systems
+
+Provider selection is performed independently for every visible CUDA
+architecture. If a process sees both SM103 and SM120 devices, for example, a
+module available from both providers resolves to both shared libraries. The
+JIT loader keeps both modules loaded and dispatches each exported function call
+using the CUDA devices referenced by its tensor arguments. Calls that pass only
+raw pointers or planning metadata use PyTorch's current CUDA device. TVM FFI
+loads each shared library with handle-local symbol resolution on Linux, so the
+same exported function names can coexist. Modules that use FlashInfer's cubin
+callback register it separately for every selected provider library.
+
+An architecture-specific module does not need to exist in every provider. It
+can load from the SM103 provider and run on an SM103 tensor even while an SM120
+device is visible. If a call targets an architecture not covered by any loaded
+copy, or one call spans architectures that no single provider covers, the
+loader lazily builds and uses the normal multi-architecture JIT module. With
+`FLASHINFER_DISABLE_JIT=1`, that uncovered call raises the existing
+`MissingJITCacheError` instead.
+
+A minimal installation for that heterogeneous system can request both providers
+explicitly:
+
+```bash
+flashinfer install-jit-cache-wheel --mode minimal --sm sm103a --sm sm120f
+```
 
 ## Installation Modes
 
@@ -326,8 +354,11 @@ Before deploying the provider-only release workflow:
    representative sm80, sm90a, sm100a, sm120f, and sm121a systems.
 5. Install the default shim with every provider and repeat the tests to verify
    deterministic architecture selection.
-6. Test a process with heterogeneous visible GPUs. Until a provider contains
-   all required targets, it should miss AOT cleanly and fall back to JIT.
+6. Install both matching providers on a heterogeneous host, then run one process
+   with JIT disabled and exercise the same module on each GPU. Verify that each
+   call resolves to its device's provider and that modules present in only one
+   provider still remain usable on that provider's device. The canary accepts
+   both providers in one invocation: `--provider sm103a --provider sm120f`.
 7. Keep selection tests proving that architecture-specific providers do not
    match another compute capability, compatible baselines and family targets are
    ranked below exact targets, and new family targets do not require a code

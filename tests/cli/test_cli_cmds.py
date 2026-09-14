@@ -290,6 +290,14 @@ def test_select_jit_cache_provider_tags_prefers_best_available(
     assert _select_jit_cache_provider_tags((target,), available) == expected
 
 
+def test_select_jit_cache_provider_tags_keeps_heterogeneous_targets():
+    from flashinfer.__main__ import _select_jit_cache_provider_tags
+
+    assert _select_jit_cache_provider_tags(
+        ("sm103a", "sm120f"), ("sm100f", "sm103a", "sm120f")
+    ) == ("sm103a", "sm120f")
+
+
 def test_read_jit_cache_provider_tags_from_shim_metadata(tmp_path):
     from flashinfer.__main__ import _read_jit_cache_provider_tags
 
