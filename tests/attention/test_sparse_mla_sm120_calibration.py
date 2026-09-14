@@ -1791,6 +1791,65 @@ def test_refine_dsv41_merges_exact_token_entry(store, monkeypatch):
     assert calls == [5]
 
 
+def test_refine_nvfp4_merges_exact_token_entry(store, monkeypatch):
+    from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4_policy as native
+
+    fields = dict(
+        num_heads=64,
+        topk=128,
+        primary_page_size=64,
+        extra_topk=0,
+        extra_page_size=0,
+        has_topk_length=True,
+        has_extra_topk_length=False,
+        has_attn_sink=False,
+    )
+    key = native._request_key(**fields)
+    profile = {
+        "request": json.loads(key),
+        "buckets": {
+            str(t): {
+                "variant": "decode_splitk",
+                "cpb": 1,
+                "decode_s": 1e-5,
+                "prefill_s": 1e-5,
+            }
+            for t in cpb_mod._PROFILE_T
+        },
+    }
+    cpb_mod.publish_calibration(store, "dsv4_nvfp4", profiles={key: profile})
+
+    calls = []
+
+    def measure(ctx, **kwargs):
+        calls.append(kwargs["num_tokens"])
+        return {
+            "variant": "prefill_streaming",
+            "cpb": 3,
+            "decode_s": 2e-5,
+            "prefill_s": 1e-5,
+        }
+
+    monkeypatch.setattr(native, "_nvfp4_measure_context", lambda *args: object())
+    monkeypatch.setattr(native, "_measure_nvfp4_bucket", measure)
+
+    # Canonical-grid buckets and out-of-envelope counts are not refined.
+    assert native.refine_nvfp4(store, tokens=8, **fields) is None
+    assert native.refine_nvfp4(store, tokens=65, **fields) is None
+    assert not calls
+
+    entry = native.refine_nvfp4(store, tokens=5, **fields)
+    assert calls == [5]
+    assert entry["provenance"] == "refined" and entry["cpb"] == 3
+    stored = cpb_mod.get_profile(key, store)
+    assert stored["buckets"]["5"]["provenance"] == "refined"
+    # The exact entry wins over nearest-up bucket interpolation.
+    assert cpb_mod._profile_bucket(stored, 5)["cpb"] == 3
+    # Repeat refinement is a no-op.
+    assert native.refine_nvfp4(store, tokens=5, **fields) is None
+    assert calls == [5]
+
+
 def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
     from types import SimpleNamespace
     from flashinfer.mla import _sparse_mla_sm120_policy as policy
