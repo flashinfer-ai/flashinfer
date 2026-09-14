@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ctypes
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -48,14 +49,19 @@ def _is_library_filename(maps_line: str, lib_name: str) -> bool:
     is silent until the first symbol lookup, which then fails with an opaque
     ``undefined symbol: cudaDeviceReset``.
 
-    Accepts the forms the loader actually produces -- ``libcudart.so``, ``libcudart.so.12`` and the
-    hash-suffixed ``libcudart-d0da41ae.so.11.0`` -- and rejects names that merely start with
-    ``lib_name`` and continue into a different library.
+    The whole filename is validated, not a prefix: the name must be ``lib_name``, optionally
+    followed by a ``-<build>`` suffix, then ``.so`` and zero or more numeric version components.
+    Checking only the part before ``.so`` is not enough, because ``.so`` also occurs inside names
+    like ``libcudart.something``, and a trailing ``.backup`` would otherwise be ignored.
+
+    Accepts the forms the loader produces -- ``libcudart.so``, ``libcudart.so.12``,
+    ``libcudart.so.11.0`` and ``libcudart-d0da41ae.so.11.0``. Rejects everything else, including
+    paths where the name appears only in a directory component.
     """
     if "/" not in maps_line:
         return False
-    stem = maps_line.strip().rsplit("/", 1)[-1].rpartition(".so")[0]
-    return stem == lib_name or stem.startswith(f"{lib_name}-")
+    filename = maps_line.strip().rsplit("/", 1)[-1]
+    return re.fullmatch(rf"{re.escape(lib_name)}(?:-[^.]+)?\.so(?:\.\d+)*", filename) is not None
 
 
 def find_loaded_library(lib_name) -> Optional[str]:
