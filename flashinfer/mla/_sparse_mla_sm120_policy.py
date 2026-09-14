@@ -206,6 +206,21 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         profile = result if result["status"] != "failed" else None
     if profile is None:
         return None
+    if (
+        allowed
+        and m.tokens <= _DECODE_MAX_TOKENS
+        and str(m.tokens) not in profile["buckets"]
+        and not _cpb._target_capturing(device)
+    ):
+        # Tuning mode: measure this exact token count once so the selection
+        # stops interpolating from the canonical grid.
+        try:
+            refined = _cpb.refine_dsv41(request, device, m.tokens)
+        except (CalibrationError, RuntimeError) as error:
+            logger.debug("DSV4.1 refine skipped at tokens=%d: %s", m.tokens, error)
+            refined = None
+        if refined is not None:
+            profile = _cpb.get_dsv41_profile(request, device)
     bucket = _cpb._profile_bucket(profile, m.tokens)
     if bucket is None:
         return PlannedCall(KernelVariant.PREFILL_SG, -1)

@@ -998,7 +998,16 @@ def test_all_calibration_entries_reject_target_capture_before_work(monkeypatch):
     monkeypatch.setattr(native, "_autotune_skipped", lambda: False)
     native._maybe_calibrate(
         device=target,
-        family="native",
+        key=native._request_key(
+            num_heads=16,
+            topk=128,
+            primary_page_size=64,
+            extra_topk=0,
+            extra_page_size=0,
+            has_topk_length=False,
+            has_extra_topk_length=False,
+            has_attn_sink=False,
+        ),
         num_heads=16,
         topk=128,
         primary_page_size=64,
@@ -1370,13 +1379,14 @@ def test_public_force_keeps_old_unit_on_measurement_failure(store, monkeypatch):
     assert report.constants_calibrated == ("dsv4",)
 
 
-def test_native_phase_and_cpb_publish_once(store, monkeypatch):
+def test_native_profile_publishes_once(store, monkeypatch):
     from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4_policy as native
     from flashinfer.mla import _sparse_mla_sm120_execution as execution
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(native, "_eligible", lambda *args: (True, True))
     monkeypatch.setattr(native, "_CROSSOVER_PROBED_T", (4, 8))
+    monkeypatch.setattr(cpb_mod, "_PROFILE_T", (4, 8))
     monkeypatch.setattr(native, "dsv4_nvfp4_format_info", lambda: {"chunk_width": 64})
     monkeypatch.setattr(execution, "get_sparse_mla_dsv4_nvfp4_module", lambda: object())
     monkeypatch.setattr(
@@ -1594,7 +1604,10 @@ def test_legacy_glm_calibration_invalidated(isolated_cpb):
     cpb_mod._store_states.clear()
     cpb_mod._active_scope = None
     assert cpb_mod.get_constants(device, "glm53_nope") == current
-    assert json.loads(isolated_cpb.read_text())["schema_version"] == 2
+    assert (
+        json.loads(isolated_cpb.read_text())["schema_version"]
+        == cpb_mod._SCHEMA_VERSION
+    )
 
 
 def test_public_profile_reuse_force_and_failure(store, monkeypatch):
@@ -1739,6 +1752,108 @@ def test_runtime_exact_lookup_unknown_persistence_and_precision(store, monkeypat
     )
     assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
     assert policy.profile_selection(m._replace(tokens=4), store, "fp8").variant == 1
+
+
+def test_refine_dsv41_merges_exact_token_entry(store, monkeypatch):
+    request = cpb_mod._Dsv41Request(16, 128)
+    profile = {
+        "request": request.effective,
+        "buckets": {
+            str(t): {"variant": 0, "cpb": 1, "decode_s": 1e-5, "prefill_s": 1e-5}
+            for t in cpb_mod._PROFILE_T
+        },
+    }
+    cpb_mod.publish_calibration(store, "dsv4_1", profiles={request.key: profile})
+
+    calls = []
+
+    def measure(req, ctx, tokens):
+        calls.append(tokens)
+        return {"variant": 1, "cpb": 3, "decode_s": 2e-5, "prefill_s": 1e-5}
+
+    monkeypatch.setattr(cpb_mod, "_dsv41_measure_context", lambda *args: object())
+    monkeypatch.setattr(cpb_mod, "_measure_dsv41_bucket", measure)
+
+    # Canonical-grid buckets and out-of-range counts are not refined.
+    assert cpb_mod.refine_dsv41(request, store, 8) is None
+    assert cpb_mod.refine_dsv41(request, store, 65) is None
+    assert not calls
+
+    entry = cpb_mod.refine_dsv41(request, store, 5)
+    assert calls == [5]
+    assert entry["provenance"] == "refined" and entry["cpb"] == 3
+    stored = cpb_mod.get_dsv41_profile(request, store)
+    assert stored["buckets"]["5"]["provenance"] == "refined"
+    # The exact entry wins over nearest-up bucket interpolation.
+    assert cpb_mod._profile_bucket(stored, 5)["cpb"] == 3
+    # Repeat refinement is a no-op.
+    assert cpb_mod.refine_dsv41(request, store, 5) is None
+    assert calls == [5]
+
+
+def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
+    from types import SimpleNamespace
+    from flashinfer.mla import _sparse_mla_sm120_policy as policy
+    from flashinfer.mla._sparse_mla_sm120_execution import AttentionMetadata
+
+    request = cpb_mod._Dsv41Request(16, 128)
+    profile = {
+        "request": request.effective,
+        "buckets": {
+            str(t): {"variant": 0, "cpb": 1, "decode_s": 1e-5, "prefill_s": 1e-5}
+            for t in cpb_mod._PROFILE_T
+        },
+    }
+    cpb_mod.publish_calibration(store, "dsv4_1", profiles={request.key: profile})
+    monkeypatch.setattr(
+        policy.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+
+    refined = []
+
+    def fake_refine(req, device, tokens):
+        refined.append(tokens)
+        current = cpb_mod.get_dsv41_profile(req, device)
+        current["buckets"][str(tokens)] = {
+            "variant": 1,
+            "cpb": 3,
+            "decode_s": 2e-5,
+            "prefill_s": 1e-5,
+        }
+        cpb_mod.publish_calibration(device, "dsv4_1", profiles={req.key: current})
+        return current["buckets"][str(tokens)]
+
+    monkeypatch.setattr(cpb_mod, "refine_dsv41", fake_refine)
+    m = AttentionMetadata(
+        5,
+        5,
+        16,
+        128,
+        0,
+        64,
+        0,
+        64 * 528,
+        0,
+        528,
+        128,
+        0,
+        16,
+        False,
+        False,
+        False,
+        False,
+        0,
+    )
+    selected = policy.profile_selection(m, store, "fp8")
+    assert refined == [5]
+    assert selected.variant == 1 and selected.cpb == 3
+    # The stored exact entry serves later calls without refining again.
+    assert policy.profile_selection(m, store, "fp8").cpb == 3
+    assert refined == [5]
+    # Off-grid counts above the decode envelope still take the prefill route.
+    assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
 
 
 def test_dsv41_fallback_does_not_start_legacy_measurement(store, monkeypatch):
