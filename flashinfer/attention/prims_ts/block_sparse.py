@@ -34,7 +34,7 @@ from typing import Literal
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     prims_ts_block_sparse_trace_dispatch,
     prims_ts_block_sparse_wrapper_trace_dispatch,
@@ -238,7 +238,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         # previously published revision intact and runnable.
         self._plan_state = candidate
 
-    @flashinfer_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
+    @flashinfer_experimental_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
@@ -342,7 +342,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_api(trace=prims_ts_block_sparse_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_block_sparse_trace_dispatch)
 def block_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -588,7 +588,9 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             )
         self._plan_state = candidate
 
-    @flashinfer_api(trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch)
+    @flashinfer_experimental_api(
+        trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch
+    )
     def run(
         self,
         q: torch.Tensor,
@@ -694,7 +696,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
 def block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,

@@ -21,7 +21,7 @@ from typing import Any, Literal, Optional, cast
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_one_shot_trace_dispatch,
     prims_ts_decode_mla_trace_dispatch,
@@ -1422,7 +1422,7 @@ def _launch_mla_decode(
     return runtime.out
 
 
-@flashinfer_api(trace=prims_ts_decode_mla_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_decode_mla_trace_dispatch)
 def prims_ts_batch_mla_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1644,12 +1644,12 @@ def prims_ts_batch_mla_decode_with_kv_cache(
 class BatchMLADecodePagedTSWrapper:
     """Compile and reuse task-scheduled paged MLA decode launches."""
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self) -> None:
         """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._plan_state: Optional[_MLADecodePlanState] = None
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         device: int | str | torch.device,
@@ -1799,7 +1799,7 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=int(dict(policy)["split_kv"]),
         )
 
-    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
+    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
     def run(
         self,
         query: torch.Tensor,
@@ -1913,7 +1913,7 @@ class BatchMLADecodePagedTSWrapper:
         )
 
 
-@flashinfer_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
 def batch_mla_decode_with_paged_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
