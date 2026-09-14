@@ -503,7 +503,9 @@ def test_nontranspose_disk_cache_round_trip(monkeypatch, tmp_path):
     dt_bias = torch.rand(HV, dtype=torch.float32, device=dev)
     state = torch.randn(B, HV, D, D, dtype=torch.float32, device=dev)
 
-    out1, state1 = gated_delta_rule_decode(q, k, v, state.clone(), A_log, a, dt_bias, b)
+    out1, state1 = gated_delta_rule_decode(
+        q, k, v, state.clone(), A_log, a, dt_bias, b, backend="flashinfer"
+    )
     artifacts = list(tmp_path.glob("gdn_decode_nontranspose_*_cute_dsl/*.o"))
     assert len(artifacts) == 1, f"expected one exported artifact, got {artifacts}"
 
@@ -513,6 +515,8 @@ def test_nontranspose_disk_cache_round_trip(monkeypatch, tmp_path):
         raise AssertionError("cute.compile ran despite a valid disk artifact")
 
     monkeypatch.setattr(nt_mod.cute, "compile", _no_recompile)
-    out2, state2 = gated_delta_rule_decode(q, k, v, state.clone(), A_log, a, dt_bias, b)
+    out2, state2 = gated_delta_rule_decode(
+        q, k, v, state.clone(), A_log, a, dt_bias, b, backend="flashinfer"
+    )
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
     torch.testing.assert_close(state1, state2, atol=0, rtol=0)
