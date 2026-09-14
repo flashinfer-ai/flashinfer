@@ -33,17 +33,25 @@ from .core import (
     gen_jit_spec,
     logger,
     sm100a_nvcc_flags,
+    sm100f_nvcc_flags,
     sm103a_nvcc_flags,
 )
 
 DcpSpecVariant = Literal["v1", "v4"]
-DcpSpecTarget = Literal["sm100a", "sm103a"]
+DcpSpecTarget = Literal["sm100a", "sm103a", "sm100f"]
 
 _DCP_SPEC_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
+    "sm100f": sm100f_nvcc_flags,
 }
-_TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
+# The DCP manifest shares source bodies between SM100 and SM103. Compile those
+# authenticated bodies with the family target for SM107.
+_TARGET_MANIFEST_ARCH = {
+    "sm100a": "sm_100a",
+    "sm103a": "sm_103a",
+    "sm100f": "sm_100a",
+}
 _DCP_JIT_BINDINGS = {
     "dcp_spec_bf16_v1": "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "dcp_spec_bf16_v4": "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
