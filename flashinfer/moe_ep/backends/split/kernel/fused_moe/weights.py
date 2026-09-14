@@ -152,7 +152,7 @@ def materialize_fused_moe_weights(
     if not pack.native_views:
         raise ValueError(
             f"No fused_moe backend in MoEConfig matches quant pair "
-            f"weight={pair[0].name}, activation={pair[1].name}. "
+            f"weight={quant.pair[0].name}, activation={quant.pair[1].name}. "
             f"Configured backends: {[type(c).__name__ for c in moe_config.backend]}"
         )
     return pack
