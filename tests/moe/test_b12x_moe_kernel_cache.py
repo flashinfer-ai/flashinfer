@@ -30,6 +30,8 @@ on one artifact and the cache silently serves the wrong binary.
 
 import inspect
 import re
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -425,3 +427,200 @@ def test_direct_micro_probe_roundtrip(tmp_path, monkeypatch):
     assert dm._read_probe("kernel_a") is True
     dm._write_probe("kernel_b", False)
     assert dm._read_probe("kernel_b") is False
+
+
+def test_direct_micro_dispatch_shares_disk_name_for_equivalent_shapes(monkeypatch):
+    """Dispatch must reuse the disk artifact across compatible runtime m values."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch as dispatch
+
+    build = dispatch.build_direct_micro_kernel
+    names = []
+
+    def build_without_device_query(*args, **kwargs):
+        return build(*args, **kwargs, max_active_ctas=148)
+
+    def capture_compile(kernel, *, topk_ids_dtype, disk_kernel_name):
+        names.append(disk_kernel_name)
+        return object(), True
+
+    monkeypatch.setattr(
+        dispatch, "build_direct_micro_kernel", build_without_device_query
+    )
+    monkeypatch.setattr(dispatch, "compile_direct_micro_kernel", capture_compile)
+    monkeypatch.setattr(dispatch, "_DIRECT_MICRO_LAUNCH_CACHE", {})
+    monkeypatch.setattr(dispatch, "_DIRECT_MICRO_KERNEL_CACHE", {})
+    # At n=256, m=3 and m=4 share the same FC1 chunk configuration.
+    for m in (3, 4):
+        dispatch._DIRECT_MICRO_LAUNCH_CACHE.clear()
+        dispatch._DIRECT_MICRO_KERNEL_CACHE.clear()
+        dispatch._get_direct_micro_kernel(64, m, 512, 256, 2)
+    assert len(names) == 2
+    assert names[0] == names[1]
+
+
+@pytest.fixture
+def direct_micro_compile_stub(tmp_path, monkeypatch):
+    """Exercise cache orchestration without compiling or querying a GPU."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+        moe_direct_micro_kernel as dm,
+    )
+
+    state = SimpleNamespace(
+        artifact=object(),
+        reference=object(),
+        options=[],
+        cached=False,
+        accepts=True,
+        reference_error=None,
+        artifact_error=None,
+    )
+
+    def compile_stub(*args, options):
+        state.options.append(options)
+        if "--enable-tvm-ffi" in options.split():
+            if state.artifact_error is not None:
+                raise state.artifact_error
+            return state.artifact
+        if state.reference_error is not None:
+            raise state.reference_error
+        return state.reference
+
+    def cache_stub(module, name, compile_fn, **kwargs):
+        if not state.cached:
+            result = compile_fn()
+            assert result is state.artifact
+            state.cached = True
+        return state.artifact
+
+    def inspect_stub(compiled, block_dim):
+        assert compiled is state.reference
+        assert block_dim == 512
+        return state.accepts
+
+    monkeypatch.setattr(dm, "make_ptr", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        dm.cute.runtime, "make_fake_compact_tensor", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(dm.cute.runtime, "make_fake_stream", lambda **kwargs: object())
+    monkeypatch.setattr(dm.cute, "compile", compile_stub)
+    monkeypatch.setattr(dm, "compiled_direct_micro_accepts_block_dim", inspect_stub)
+    monkeypatch.setattr(dm, "build_and_load_cute_dsl_kernel", cache_stub)
+    monkeypatch.setattr(dm, "cute_dsl_cache_disabled", lambda: False)
+    monkeypatch.setattr(dm, "_kernel_source_files", lambda: ())
+    monkeypatch.setattr(dm, "_probe_path", lambda name: tmp_path / f"{name}.json")
+    state.dm = dm
+    state.kernel = SimpleNamespace(m_const=0, launch_block_dim=512)
+    return state
+
+
+@pytest.mark.parametrize(
+    "options", [None, "--opt-level 0", "--opt-level 1 --enable-tvm-ffi"]
+)
+def test_direct_micro_probe_matches_compiler_options(
+    direct_micro_compile_stub, options
+):
+    state = direct_micro_compile_stub
+    compiled, accepts = state.dm.compile_direct_micro_kernel(
+        state.kernel, options=options, disk_kernel_name="kernel"
+    )
+    assert compiled is state.artifact
+    assert accepts is True
+    artifact_options, probe_options = state.options
+    assert "--enable-tvm-ffi" in artifact_options.split()
+    assert probe_options.split() == [
+        token for token in artifact_options.split() if token != "--enable-tvm-ffi"
+    ]
+
+
+@pytest.mark.parametrize("failure", ["inspection", "reference"])
+def test_direct_micro_failed_probe_recovers(direct_micro_compile_stub, failure):
+    """Failed probes are not persisted, and a later cache hit can recover."""
+    state = direct_micro_compile_stub
+    state.accepts = None
+    if failure == "reference":
+        state.reference_error = RuntimeError("reference compile failed")
+        with pytest.warns(RuntimeWarning, match="reference compilation failed"):
+            result = state.dm.compile_direct_micro_kernel(
+                state.kernel, disk_kernel_name="kernel"
+            )
+    else:
+        result = state.dm.compile_direct_micro_kernel(
+            state.kernel, disk_kernel_name="kernel"
+        )
+    assert result == (state.artifact, False)
+    assert not state.dm._probe_path("kernel").exists()
+    assert len(state.options) == 2
+
+    state.options.clear()
+    state.reference_error = None
+    state.accepts = True
+    assert state.dm.compile_direct_micro_kernel(
+        state.kernel, disk_kernel_name="kernel"
+    ) == (state.artifact, True)
+    assert len(state.options) == 1
+    assert "--enable-tvm-ffi" not in state.options[0].split()
+    assert state.dm._read_probe("kernel") is True
+
+
+@pytest.mark.parametrize("accepts", [True, False])
+def test_direct_micro_warm_cache_uses_record(direct_micro_compile_stub, accepts):
+    """Both supported and known-unsupported records avoid all warm compiles."""
+    state = direct_micro_compile_stub
+    state.accepts = accepts
+    assert state.dm.compile_direct_micro_kernel(
+        state.kernel, disk_kernel_name="kernel"
+    ) == (state.artifact, accepts)
+    assert state.dm._read_probe("kernel") is accepts
+    state.options.clear()
+    state.reference_error = AssertionError("warm cache must not probe")
+    assert state.dm.compile_direct_micro_kernel(
+        state.kernel, disk_kernel_name="kernel"
+    ) == (state.artifact, accepts)
+    assert state.options == []
+
+
+@pytest.mark.parametrize("cache_disabled", [True, False])
+def test_direct_micro_uncached_unknown_returns_false(
+    direct_micro_compile_stub, monkeypatch, cache_disabled
+):
+    state = direct_micro_compile_stub
+    state.accepts = None
+    monkeypatch.setattr(state.dm, "cute_dsl_cache_disabled", lambda: cache_disabled)
+    assert state.dm.compile_direct_micro_kernel(
+        state.kernel, disk_kernel_name="kernel" if cache_disabled else None
+    ) == (state.artifact, False)
+    assert not state.dm._probe_path("kernel").exists()
+
+
+def test_direct_micro_artifact_compile_failure_propagates(direct_micro_compile_stub):
+    state = direct_micro_compile_stub
+    state.artifact_error = RuntimeError("artifact compile failed")
+    with pytest.raises(RuntimeError, match="artifact compile failed"):
+        state.dm.compile_direct_micro_kernel(state.kernel, disk_kernel_name="kernel")
+    assert len(state.options) == 1
+    assert not state.dm._probe_path("kernel").exists()
+
+
+@pytest.mark.parametrize("error_type", [KeyError, RuntimeError])
+def test_direct_micro_inspection_failure_is_unknown(monkeypatch, error_type):
+    """Both introspection misses and unexpected probe failures remain unknown."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+        moe_direct_micro_kernel as dm,
+    )
+
+    class BrokenCompile:
+        @property
+        def kernel_info(self):
+            raise error_type("inspection failed")
+
+    monkeypatch.setitem(
+        sys.modules, "cuda.bindings", SimpleNamespace(driver=None, runtime=None)
+    )
+    monkeypatch.setattr(dm, "_PROBE_FAILURE_WARNED", False)
+    if error_type is RuntimeError:
+        with pytest.warns(RuntimeWarning, match="probe failed"):
+            assert (
+                dm.compiled_direct_micro_accepts_block_dim(BrokenCompile(), 512) is None
+            )
+    else:
+        assert dm.compiled_direct_micro_accepts_block_dim(BrokenCompile(), 512) is None

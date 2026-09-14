@@ -1496,9 +1496,7 @@ def _get_direct_micro_kernel(
         entry = compile_direct_micro_kernel(
             kernel,
             topk_ids_dtype=topk_ids_dtype,
-            disk_kernel_name=_disk_kernel_name(
-                f"direct_micro_m{m}_k{k}_n{n}_t{num_topk}", compile_key
-            ),
+            disk_kernel_name=_disk_kernel_name("direct_micro", compile_key),
         )
         _DIRECT_MICRO_KERNEL_CACHE[compile_key] = entry
     compiled, accepts = entry
