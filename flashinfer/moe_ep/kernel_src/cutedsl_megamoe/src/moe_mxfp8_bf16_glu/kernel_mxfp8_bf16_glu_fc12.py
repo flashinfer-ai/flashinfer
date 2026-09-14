@@ -627,6 +627,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         topk_scores: cute.Tensor,
         fc1_done_counter: cute.Tensor,
         offs: Optional[cute.Tensor],
+        expert_token_sizes: Optional[cute.Tensor],
         load_balance_counter: Optional[cute.Tensor],
         token_comm_args,
     ) -> None:
@@ -671,6 +672,13 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         ):
             raise TypeError("fc1_done_counter must be Int32.")
 
+        if cutlass.const_expr(
+            (offs is not None) and (expert_token_sizes is not None)
+        ):
+            raise ValueError(
+                "Exactly one of offs / expert_token_sizes must be provided."
+            )
+
         if self.enable_token_comm:
             if token_comm_args is None:
                 raise ValueError(
@@ -681,14 +689,26 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                     "offs must be None in token-communication sizes mode."
                 )
         else:
-            if offs is None:
+            if cutlass.const_expr(
+                (offs is None) and (expert_token_sizes is None)
+            ):
                 raise ValueError(
-                    "offs is required for the lean prefix-sum scheduler."
+                    "One of offs / expert_token_sizes is required for the lean "
+                    "scheduler."
                 )
+
+        if offs is not None:
             if cutlass.const_expr(cute.rank(offs) != 1):
                 raise ValueError("offs must be rank 1.")
             if cutlass.const_expr(offs.element_type is not cutlass.Int32):
                 raise TypeError("offs must be Int32.")
+        if expert_token_sizes is not None:
+            if cutlass.const_expr(cute.rank(expert_token_sizes) != 1):
+                raise ValueError("expert_token_sizes must be rank 1.")
+            if cutlass.const_expr(
+                expert_token_sizes.element_type is not cutlass.Int32
+            ):
+                raise TypeError("expert_token_sizes must be Int32.")
 
         if cutlass.const_expr(load_balance_counter is not None):
             if cutlass.const_expr(cute.rank(load_balance_counter) != 1):
@@ -842,6 +862,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         max_active_clusters: cutlass.Constexpr = None,
         stream: cuda.CUstream = None,
         load_balance_counter: Optional[cute.Tensor] = None,
+        expert_token_sizes: Optional[cute.Tensor] = None,
         token_comm_args=None,
     ) -> None:
         """Trace and launch the lean two-phase mixed mainloop.
@@ -855,10 +876,10 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         * ``fc2_weight``: ``[experts, I, hidden]`` FP8, I stride one.
         * ``fc2_weight_sf``: existing atom-swizzled E8M0/K32 storage.
         * ``fc2_output``: ``[physical_tokens, 1, hidden]`` BF16 destination.
-        * Lean scheduler: pass cumulative expert ends in ``offs`` and leave
-          ``token_comm_args`` unset.
-        * Mega scheduler: omit ``offs``; ``token_comm_args`` must expose
-          ``expert_recv_count_sum`` or a prebuilt ``expert_token_sizes`` view.
+        * Scheduler: pass exactly one of cumulative expert ends in ``offs`` or
+          raw per-expert counts in ``expert_token_sizes``.
+        * Mega scheduler: omitted explicit sizes are derived from
+          ``token_comm_args``.
         """
         self._validate_inputs(
             activation,
@@ -871,6 +892,7 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             topk_scores,
             fc1_done_counter,
             offs,
+            expert_token_sizes,
             load_balance_counter,
             token_comm_args,
         )
@@ -928,6 +950,14 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         tokens, hidden = activation.shape
         experts, hidden_w1, intermediate_gateup = fc1_weight.shape
         experts_w2, intermediate, hidden_w2 = fc2_weight.shape
+
+        if cutlass.const_expr(
+            expert_token_sizes is not None
+            and expert_token_sizes.shape[0] != experts
+        ):
+            raise ValueError(
+                "expert_token_sizes must contain one entry per expert."
+            )
 
         # Swap-AB views.  Weight is A (M,K,L=expert); token data is B
         # (N,K,L=1).  No physical transpose is performed.
@@ -1094,16 +1124,19 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
             override_num_stages=self.num_sched_stages,
             is_swap_ab=True,
         )
-        # Select one scheduler range source at trace time and omit the absent
-        # optional argument entirely.  This preserves the lean prefix-sum ABI
-        # and avoids forwarding Python ``None`` through CuTeDSL call layers.
-        if cutlass.const_expr(self.enable_token_comm):
+        # MegaMoE derives its sizes from dispatch metadata when the caller did
+        # not supply an explicit view.  The local path may use either source.
+        if cutlass.const_expr(
+            self.enable_token_comm and expert_token_sizes is None
+        ):
             expert_token_sizes = (
                 self.token_comm_scheduler_expert_token_sizes(
                     token_comm_args,
                     experts,
                 )
             )
+
+        if cutlass.const_expr(expert_token_sizes is not None):
             sched_params = MoEFusedFc12SchedulerParams(
                 **sched_kwargs,
                 expert_token_sizes=expert_token_sizes,
