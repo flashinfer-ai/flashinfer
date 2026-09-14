@@ -351,10 +351,13 @@ __device__ __forceinline__ void tc_fence_before() {
 // with generic-proxy stores (sBt/xs_w/prevb — the x-fold, scaled-B fold, and
 // prev-state fold below) are read by the tensor core through the async proxy,
 // and PTX's async-proxy rules require fence.proxy.async between the generic
-// writes and the MMA reads.  The producing stores are published CTA-wide by
-// __syncthreads() before each UMMA block; the issuing warp then executes this
-// fence before its elected single-thread umma issue (same placement idiom as
-// CUTLASS's fence_view_async_shared for register-computed UMMA operands).
+// writes and the MMA reads. The fence is per-thread scope: it orders only the
+// EXECUTING thread's prior generic operations, so every thread that produced
+// operand cells executes it after its final generic store and BEFORE the
+// __syncthreads() that publishes the fill CTA-wide to the elected UMMA issuer
+// (the issuing warp's own fence cannot cover the other warps' stores; same
+// placement idiom as CUTLASS's fence_view_async_shared for register-computed
+// UMMA operands).
 // cp.async-staged tiles (b/c) do not need it: cp.async writes are already
 // async-proxy operations whose completion is tracked by wait_group.
 __device__ __forceinline__ void fence_async_view() {
@@ -1070,10 +1073,16 @@ __global__ void __launch_bounds__(256)
           *reinterpret_cast<__nv_bfloat16*>(sw_ptr(sBt, n4 + 2, t >> 3) + ((t & 7) << 1)) = q2;
           *reinterpret_cast<__nv_bfloat16*>(sw_ptr(sBt, n4 + 3, t >> 3) + ((t & 7) << 1)) = q3;
         }
+        // Cross-proxy ordering: EVERY thread that produced sBt/xs_w cells with
+        // generic stores fences its own writes into the async proxy AFTER its
+        // final store and BEFORE the barrier (fence.proxy.async orders only
+        // the executing thread's prior generic operations; a warp-0-only fence
+        // cannot cover the fills by the other warps). The barrier then
+        // publishes the fenced writes CTA-wide to the elected UMMA issuer.
+        fence_async_view();  // generic sBt/xs_w fills -> async-proxy UMMA reads
         __syncthreads();
         const uint32_t tmb = *tmem_base_sh;  // tc_alloc by w0 happened before this sync
         if (w == 0) {
-          fence_async_view();  // generic sBt/xs_w fills -> async-proxy UMMA reads
           tc_fence_after();
           if (tc_elect_one()) {
             const uint64_t dA = TC_DESC_KMAJ(sBt);
@@ -1337,6 +1346,18 @@ __global__ void __launch_bounds__(256)
     }
   }
   cp_async_wait_all();
+  if constexpr (SV) {
+    // Cross-proxy ordering: EVERY producer of generic-stored UMMA operands
+    // fences its own fills here, after its final generic smem store and before
+    // the barrier that publishes them to the intra1/intra2/inter2 issuers:
+    //   threads 0..127   -> xs_w  (raw x tile, intra2's B operand)
+    //   threads 128..255 -> prevb (inter2's B operand, non-chain path)
+    //   all threads      -> prevb chain scatter above (chain path)
+    // A fence confined to the issuing warp cannot order stores made by the
+    // other producer warps; csm/bs need no fence (cp.async-staged, completed
+    // by wait_group above).
+    fence_async_view();  // generic xs_w/prevb fills -> async-proxy UMMA reads
+  }
   __syncthreads();
 
   // ---- SV: issue intra1 (C·B^T) on the tensor-core path -----------------
@@ -1543,7 +1564,8 @@ __global__ void __launch_bounds__(256)
     // pairs (+8 cells per K=16 step), B = xs_w via an MN-major descriptor on
     // the raw bf16 x tile (rows beyond len are zero-filled).
     if (w == 0) {
-      fence_async_view();  // generic xs_w fill -> async-proxy UMMA reads
+      // xs_w/prevb generic fills were fenced per-producer-thread before the
+      // staging barrier above; only the tcgen05 thread-sync fence remains here.
       tc_fence_after();
       if (tc_elect_one()) {
         const uint64_t dX = TC_DESC_MNMAJ(xs_w);
