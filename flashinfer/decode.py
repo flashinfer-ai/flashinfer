@@ -924,7 +924,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The ``prims-ts`` backend uses the task-scheduled decode kernel on SM100a/SM103a.
             It is the only backend that accepts ``is_causal=False`` with
             ``q_len_per_req > 1``. It requires ``kv_layout="HND"`` and does not
-            support ``use_cuda_graph=True``. Manual CUDA graph capture binds
+            support ``use_cuda_graph=True``. K and V both use ``kv_data_type``
+            here; the QK-BF16/PV-FP8 mixed mode is available only through
+            ``BatchDecodePagedTSWrapper`` directly. Manual CUDA graph capture binds
             to one completed plan; recapture after re-planning. See the
             `PrimTS decode guide <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/kernels/fmha_decode/README.md>`_
             for metadata requirements.
@@ -1873,7 +1875,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 max_seq_len_q=q_len_per_req,
                 packed_query=q_len_per_req > 1,
                 q_data_type=q_data_type,
-                kv_data_type=kv_data_type,
+                k_data_type=kv_data_type,
+                v_data_type=kv_data_type,
                 o_data_type=o_data_type,
                 mask_type="causal" if is_causal else "dense",
                 window_left=window_left,
