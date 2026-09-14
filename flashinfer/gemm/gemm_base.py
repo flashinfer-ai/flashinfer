@@ -18,7 +18,6 @@ import functools
 import logging
 import os
 import warnings
-from collections import defaultdict
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
@@ -69,7 +68,7 @@ from .gemm_mm_mxfp8_cute_dsl import (
 from .kernels.utils import (
     _SM100_CLUSTER_SHAPE_MN_CANDIDATES,
     _SM100_MMA_TILER_MN_CANDIDATES,
-    _score_sm100_mm_fp4_tactic,
+    _rank_mm_fp4_autotune_tactics,
     _select_sm100_mm_fp4_cute_dsl_tactic,
     _select_sm107_mm_fp4_cute_dsl_tactic,
 )
@@ -236,8 +235,6 @@ def get_gemm_module():
                     dtype=torch.uint8,
                     device="cpu",
                 )
-                with torch.cuda.device(a.device):
-                    cublas_handle = torch.cuda.current_blas_handle()
                 count = module.bmm_fp8_get_algos(
                     a,
                     b,
@@ -245,7 +242,6 @@ def get_gemm_module():
                     scale_a,
                     scale_b,
                     workspace_buffer,
-                    cublas_handle,
                     algo_buf,
                 )
                 result = (algo_buf, count)
@@ -268,8 +264,6 @@ def get_gemm_module():
                 **kwargs,
             ) -> torch.Tensor:
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
-                with torch.cuda.device(a.device):
-                    cublas_handle = torch.cuda.current_blas_handle()
                 # The cuBLASLt algo list is enumerated per-shape, so a tactic
                 # tuned at a different (bucketed) M may be out of range here.
                 # Fall back to the heuristic default (the tactic==-1 path) on an
@@ -284,14 +278,11 @@ def get_gemm_module():
                             scale_a,
                             scale_b,
                             workspace_buffer,
-                            cublas_handle,
                             algo_buf,
                             tactic,
                         )
                         return out
-                module.bmm_fp8(
-                    a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
-                )
+                module.bmm_fp8(a, b, out, scale_a, scale_b, workspace_buffer)
                 return out
 
         return CublasFp8GemmRunner()
@@ -735,11 +726,11 @@ def mm_bf16(
         explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
-        with at most 64 K tiles), and cluster Split-K otherwise. With
-        autotuning, one call profiles the low-M kernels on the M <= 32
-        buckets and the cuBLASLt fallback on the larger ones, so a single
-        large-M warm-up tunes both ranges; with bias the direct kernel is
-        excluded.
+        with at most 64 K tiles; requires CuTe DSL >= 4.7), and cluster Split-K
+        otherwise. With autotuning, one call profiles the available low-M
+        kernels on the M <= 32 buckets and the cuBLASLt fallback on the larger
+        ones, so a single large-M warm-up tunes both ranges; with bias the
+        direct kernel is excluded.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -1048,6 +1039,577 @@ def bmm_bf16(
 
     bf16_gemm_sm100(A, B, None, False, out, workspace_buffer, backends)
     return out
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_masked_bmm_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    masked_m: torch.Tensor,
+    transpose_a: bool = False,
+    transpose_b: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cutile"] = "cutile",
+):
+    """Validate shapes, dtypes and backend support for the cuTile masked_bmm path."""
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "The masked_bmm cuTile backend supports float16 / bfloat16 inputs only; "
+            f"got {a.dtype}."
+        )
+    if a.dtype != b.dtype:
+        raise ValueError(
+            f"masked_bmm requires `a` and `b` to share a dtype; got {a.dtype} and {b.dtype}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutile": _cutile_masked_bmm_requirement,
+    },
+)
+@flashinfer_api
+def masked_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    masked_m: torch.Tensor,
+    transpose_a: bool = False,
+    transpose_b: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cutile"] = "cutile",
+) -> torch.Tensor:
+    r"""Masked batched matrix multiplication ``C = A @ B`` with a per-batch M mask.
+
+    Computes a batched GEMM where each batch ``q`` only produces the first
+    ``masked_m[q]`` rows of the output; rows beyond the mask are left
+    unspecified (callers typically zero them). This is the grouped/masked GEMM
+    used by MoE-style expert routing.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Batched input, shape ``(Q, M, K)`` (or ``(Q, K, M)`` if ``transpose_a``),
+        float16 or bfloat16, contiguous.
+    b : torch.Tensor
+        Batched input, shape ``(Q, K, N)`` (or ``(Q, N, K)`` if ``transpose_b``),
+        same dtype as ``a``, contiguous.
+    masked_m : torch.Tensor
+        Per-batch row count, shape ``(Q,)``, int32.
+    transpose_a, transpose_b : bool
+        Whether ``a`` / ``b`` are stored transposed (see shapes above).
+    out : Optional[torch.Tensor]
+        Optional output tensor, shape ``(Q, M, N)``. Allocated if omitted.
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` (the cuda.tile
+        Python backend) is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The output tensor ``C`` of shape ``(Q, M, N)``.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.masked_bmm_cutile import masked_bmm as _masked_bmm_cutile
+
+        c = _masked_bmm_cutile(a, b, masked_m, transpose_a, transpose_b)
+        if out is not None:
+            out.copy_(c)
+            return out
+        return c
+
+    raise ValueError(f"Unsupported backend for masked_bmm: {backend!r}")
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_gemm_alpha_beta_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    num_sms: Optional[int] = None,
+    backend: Literal["cutile"] = "cutile",
+):
+    """Validate shapes, dtypes and backend support for the cuTile gemm_alpha_beta path."""
+    if a.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float8_e4m3fn,
+    ):
+        raise ValueError(
+            "The gemm_alpha_beta cuTile backend supports float16 / bfloat16 / "
+            f"float32 / float8_e4m3fn inputs only; got {a.dtype}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutile": _cutile_gemm_alpha_beta_requirement,
+    },
+)
+@flashinfer_api
+def gemm_alpha_beta(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = True,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    num_sms: Optional[int] = None,
+    backend: Literal["cutile"] = "cutile",
+) -> torch.Tensor:
+    r"""GEMM with alpha/beta scaling: ``C = alpha * (A @ B) + beta * C``.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Input, shape ``(M, K)`` (or ``(K, M)`` if ``trans_a``).
+    b : torch.Tensor
+        Input, shape ``(K, N)`` (or ``(N, K)`` if ``trans_b``; default ``trans_b=True``).
+    c : torch.Tensor
+        Accumulator / output tensor, shape ``(M, N)``. Read when ``beta != 0`` and
+        written in place.
+    trans_a, trans_b : bool
+        Whether ``a`` / ``b`` are stored transposed.
+    alpha, beta : float
+        Scaling factors.
+    num_sms : Optional[int]
+        Optional override for the number of SMs used by the grid.
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The output tensor ``C``.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.gemm_alpha_beta_cutile import (
+            gemm_alpha_beta as _gemm_alpha_beta_cutile,
+        )
+
+        return _gemm_alpha_beta_cutile(a, b, c, trans_a, trans_b, alpha, beta, num_sms)
+
+    raise ValueError(f"Unsupported backend for gemm_alpha_beta: {backend!r}")
+
+
+@supported_compute_capability([90, 100, 103, 110, 120, 121])
+def _cutile_ragged_bmm_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m: int,
+    max_m_device: Optional[torch.Tensor] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile"] = "cutile",
+):
+    """Validate shapes, dtypes and backend support for the cuTile ragged_bmm path."""
+    if a.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "The ragged_bmm cuTile backend supports float16 / bfloat16 inputs only; "
+            f"got {a.dtype}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutile": _cutile_ragged_bmm_requirement,
+    },
+)
+@flashinfer_api
+def ragged_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m: int,
+    max_m_device: Optional[torch.Tensor] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile"] = "cutile",
+) -> torch.Tensor:
+    r"""Ragged batched matrix multiplication with non-even M segments.
+
+    Matrix ``A`` is flattened along its M dimension with ``m_indptr`` defining
+    the per-group segment boundaries (grouped/variable-length GEMM).
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Flattened batched input; the M dimension is segmented by ``m_indptr``.
+    b : torch.Tensor
+        Batched weights, shape ``(Q, K, N)`` (or transposed per ``transpose_b``).
+    m_indptr : torch.Tensor
+        Segment offsets, shape ``(Q + 1,)``, int32.
+    max_m : int
+        Maximum segment length (host int, used for grid sizing).
+    max_m_device : Optional[torch.Tensor]
+        Optional device-side copy of ``max_m``.
+    transpose_a, transpose_b : bool
+        Whether ``a`` / ``b`` are stored transposed.
+    out_dtype : Optional[torch.dtype]
+        Output dtype; defaults to ``a.dtype``.
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The ragged output tensor.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.ragged_bmm_cutile import ragged_bmm as _ragged_bmm_cutile
+
+        return _ragged_bmm_cutile(
+            a,
+            b,
+            m_indptr,
+            max_m,
+            max_m_device,
+            transpose_a,
+            transpose_b,
+            out_dtype,
+        )
+
+    raise ValueError(f"Unsupported backend for ragged_bmm: {backend!r}")
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_ragged_block_scaled_bmm_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m: int,
+    max_m_device: Optional[torch.Tensor] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
+    segment_alignment: int = 128,
+    backend: Literal["cutile"] = "cutile",
+):
+    """Validate shapes, dtypes and backend support for the cuTile ragged_block_scaled_bmm path."""
+    # Only NT layout (a row-major, b transposed) is implemented; a transposed
+    # input would otherwise trip an assert deep in the kernel.
+    if transpose_a or not transpose_b:
+        raise ValueError(
+            "ragged_block_scaled_bmm cuTile backend only supports NT layout "
+            f"(transpose_a=False, transpose_b=True); got transpose_a={transpose_a}, "
+            f"transpose_b={transpose_b}."
+        )
+    # This is the block-scaled FP8 path: FP8 inputs dequantized by fp32 scales.
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if a.dtype not in fp8_dtypes or b.dtype not in fp8_dtypes:
+        raise ValueError(
+            "ragged_block_scaled_bmm cuTile backend expects FP8 (float8_e4m3fn / "
+            f"float8_e5m2) inputs; got a.dtype={a.dtype}, b.dtype={b.dtype}."
+        )
+    if b_scale.dtype != torch.float32 or (
+        a_scale is not None and a_scale.dtype != torch.float32
+    ):
+        raise ValueError(
+            "ragged_block_scaled_bmm cuTile backend expects float32 block scales; "
+            f"got a_scale.dtype={None if a_scale is None else a_scale.dtype}, "
+            f"b_scale.dtype={b_scale.dtype}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutile": _cutile_ragged_block_scaled_bmm_requirement,
+    },
+)
+@flashinfer_api
+def ragged_block_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m: int,
+    max_m_device: Optional[torch.Tensor] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
+    segment_alignment: int = 128,
+    backend: Literal["cutile"] = "cutile",
+) -> torch.Tensor:
+    r"""Ragged block-scaled batched matrix multiplication (FP8 block-scaled).
+
+    Like :func:`ragged_bmm` but with per-block scale tensors applied to ``a``
+    and ``b`` (block-scaled FP8 inputs dequantized to ``out_dtype``).
+
+    Parameters
+    ----------
+    a, b : torch.Tensor
+        Block-scaled (FP8) batched inputs; ``a``'s M dimension is segmented by
+        ``m_indptr``.
+    a_scale, b_scale : torch.Tensor
+        Per-block scale tensors for ``a`` and ``b``.
+    m_indptr : torch.Tensor
+        Segment offsets, shape ``(Q + 1,)``, int32.
+    max_m : int
+        Maximum segment length (host int, used for grid sizing).
+    max_m_device : Optional[torch.Tensor]
+        Optional device-side copy of ``max_m``.
+    transpose_a, transpose_b : bool
+        Whether ``a`` / ``b`` are stored transposed.
+    out_dtype : Optional[torch.dtype]
+        Output dtype (e.g. ``torch.bfloat16``).
+    segment_alignment : int
+        Row alignment the caller guarantees for every ``m_indptr`` segment offset
+        (default 128). Bounds the largest internal tile (``BLOCK_M`` must divide it);
+        pass 256, with 256-aligned segments, to enable the large-M fast path. It is a
+        caller contract — it cannot be checked at runtime without a host sync that
+        would break CUDA-graph capture.
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The ragged block-scaled output tensor.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.ragged_block_scaled_bmm_cutile import (
+            ragged_block_scaled_bmm as _ragged_block_scaled_bmm_cutile,
+        )
+
+        return _ragged_block_scaled_bmm_cutile(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indptr,
+            max_m,
+            max_m_device,
+            transpose_a,
+            transpose_b,
+            out_dtype,
+            segment_alignment=segment_alignment,
+        )
+
+    raise ValueError(f"Unsupported backend for ragged_block_scaled_bmm: {backend!r}")
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_masked_scaled_bmm_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    block_scale_type: str,
+    max_m_device: Optional[torch.Tensor] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile"] = "cutile",
+):
+    """Validate backend support for the cuTile masked_scaled_bmm path (Blackwell-only)."""
+    if block_scale_type not in ("nvfp4", "mxfp4", "mxfp8", "mixed"):
+        raise ValueError(
+            "masked_scaled_bmm supports block_scale_type in "
+            f"('nvfp4', 'mxfp4', 'mxfp8', 'mixed'); got {block_scale_type!r}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutile": _cutile_masked_scaled_bmm_requirement,
+    },
+)
+@flashinfer_api
+def masked_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    block_scale_type: str,
+    max_m_device: Optional[torch.Tensor] = None,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["cutile"] = "cutile",
+) -> torch.Tensor:
+    r"""Masked block-scaled batched matrix multiplication (FP8/FP4 block-scaled).
+
+    Like :func:`masked_bmm` but with per-block scale tensors applied to ``a`` and
+    ``b`` (block-scaled FP8/FP4 inputs). Each batch ``q`` only produces the first
+    ``masked_m[q]`` rows of the output. Blackwell-only (uses ``mma_scaled``).
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Block-scaled batched input (FP8/FP4), shape ``(Q, M, K_A)``.
+    b : torch.Tensor
+        Block-scaled batched weights (FP8/FP4), shape ``(Q, N, K_B)``.
+    a_scale, b_scale : torch.Tensor
+        MX-swizzled per-block scale tensors for ``a`` and ``b``.
+    masked_m : torch.Tensor
+        Per-batch row count, shape ``(Q,)``, int32.
+    block_scale_type : str
+        One of ``"nvfp4"``, ``"mxfp4"``, ``"mxfp8"``, ``"mixed"``.
+    max_m_device : Optional[torch.Tensor]
+        Optional device-side scalar with ``max(masked_m)``; computed on device
+        when omitted (avoids a host sync).
+    transpose_a, transpose_b : bool
+        Whether ``a`` / ``b`` are stored transposed (only NT is supported).
+    out_dtype : Optional[torch.dtype]
+        Output dtype; defaults to ``torch.bfloat16``.
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The output tensor ``C`` of shape ``(Q, M, N)``.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.masked_scaled_bmm_cutile import (
+            masked_scaled_bmm as _masked_scaled_bmm_cutile,
+        )
+
+        return _masked_scaled_bmm_cutile(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            masked_m,
+            block_scale_type,
+            max_m_device,
+            transpose_a,
+            transpose_b,
+            out_dtype,
+        )
+
+    raise ValueError(f"Unsupported backend for masked_scaled_bmm: {backend!r}")
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _cutile_ragged_scaled_bmm_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m: int,
+    block_scale_type: str,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    static_persistent: bool = True,
+    swizzled_layout_a: bool = True,
+    a_global_scale: Optional[torch.Tensor] = None,
+    b_global_scale: Optional[torch.Tensor] = None,
+    backend: Literal["cutile"] = "cutile",
+):
+    """Validate backend support for the cuTile ragged_scaled_bmm path (Blackwell-only)."""
+    if block_scale_type not in ("nvfp4", "mxfp4", "mxfp8", "mixed"):
+        raise ValueError(
+            "ragged_scaled_bmm supports block_scale_type in "
+            f"('nvfp4', 'mxfp4', 'mxfp8', 'mixed'); got {block_scale_type!r}."
+        )
+    return True
+
+
+@backend_requirement(
+    {
+        "cutile": _cutile_ragged_scaled_bmm_requirement,
+    },
+)
+@flashinfer_api
+def ragged_scaled_bmm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    m_indptr: torch.Tensor,
+    max_m: int,
+    block_scale_type: str,
+    transpose_a: bool = False,
+    transpose_b: bool = True,
+    static_persistent: bool = True,
+    swizzled_layout_a: bool = True,
+    a_global_scale: Optional[torch.Tensor] = None,
+    b_global_scale: Optional[torch.Tensor] = None,
+    backend: Literal["cutile"] = "cutile",
+) -> torch.Tensor:
+    r"""Ragged block-scaled batched matrix multiplication (FP8/FP4 block-scaled).
+
+    Like :func:`ragged_block_scaled_bmm` but block-scaled with ``mma_scaled``
+    (Blackwell-only) and supporting NVFP4/MXFP4/MXFP8/mixed plus optional global
+    scales. Matrix ``A`` is a ragged stack ``(total_m, K_A)`` partitioned by
+    ``m_indptr``; ``B`` is batched ``(Q, N, K_B)``. Output is ``(total_m, N)``
+    (float32).
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Ragged block-scaled input (FP8/FP4), shape ``(total_m, K_A)``, segmented
+        by ``m_indptr``.
+    b : torch.Tensor
+        Batched block-scaled weights (FP8/FP4), shape ``(Q, N, K_B)``.
+    a_scale, b_scale : torch.Tensor
+        MX-swizzled per-block scale tensors for ``a`` and ``b``.
+    m_indptr : torch.Tensor
+        Segment offsets, shape ``(Q + 1,)``; each entry must be a multiple of 128.
+    max_m : int
+        Upper bound on any single segment length (host int, used for grid sizing).
+    block_scale_type : str
+        One of ``"nvfp4"``, ``"mxfp4"``, ``"mxfp8"``, ``"mixed"``.
+    transpose_a, transpose_b : bool
+        Whether ``a`` / ``b`` are stored transposed (only NT is supported).
+    static_persistent : bool
+        Kept for API compatibility with the ocean signature.
+    swizzled_layout_a : bool
+        Whether ``a_scale`` uses the swizzled layout (only ``True`` is supported).
+    a_global_scale : Optional[torch.Tensor]
+        Optional scalar global scale for ``a``.
+    b_global_scale : Optional[torch.Tensor]
+        Optional per-batch ``(Q,)`` global scale for ``b``.
+    backend : str
+        Implementation backend. Currently only ``"cutile"`` is supported.
+
+    Returns
+    -------
+    torch.Tensor
+        The ragged block-scaled output tensor ``C`` of shape ``(total_m, N)``.
+    """
+    if backend == "cutile":
+        from .kernels.cutile.ragged_scaled_bmm_cutile import (
+            ragged_scaled_bmm as _ragged_scaled_bmm_cutile,
+        )
+
+        return _ragged_scaled_bmm_cutile(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indptr,
+            max_m,
+            block_scale_type,
+            transpose_a,
+            transpose_b,
+            static_persistent,
+            swizzled_layout_a,
+            a_global_scale,
+            b_global_scale,
+        )
+
+    raise ValueError(f"Unsupported backend for ragged_scaled_bmm: {backend!r}")
 
 
 @functools.cache
@@ -1465,7 +2027,7 @@ def get_mm_bf16_cublaslt_module():
     )
 
 
-_CUTE_DSL_BF16_AUTOTUNE_VERSION = 11
+_CUTE_DSL_BF16_AUTOTUNE_VERSION = 12
 # M bound of the CuTe-DSL low-M kernels; larger M runs the cuBLASLt fallback.
 _CUTE_DSL_BF16_MAX_M = 32
 
@@ -1869,8 +2431,8 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
 def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
-    Every runner is listed whatever the real M, so that one autotune call
-    profiles the low-M kernels on the buckets M <= 32 and the cuBLASLt
+    Every available runner is listed whatever the real M, so that one autotune
+    call profiles the low-M kernels on the buckets M <= 32 and the cuBLASLt
     fallback on the buckets above (custom ``tuning_buckets`` are assigned the
     same way). ``[0]`` is the no-autotune default and the autotuner's
     fallback, so it must serve the real inputs: cuBLASLt above 32; below, the
@@ -1880,6 +2442,7 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     cannot serve the real inputs (bias, N, K) are dropped: they serve no
     bucket either.
     """
+    from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
 
     a, b, *_ = inputs
@@ -1888,12 +2451,21 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     major, minor = torch.cuda.get_device_capability(a.device)
     compute_capability = major * 10 + minor
     direct = _cute_dsl_direct_bf16_gemm_runner(compute_capability)
-    warp_splitk = _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability)
+    # Older DSLs lack cutlass.experimental but can use the other runners.
+    warp_splitk = (
+        _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability)
+        if is_cute_dsl_experimental_available()
+        else None
+    )
     cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
     fallback = _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability)
 
     if m > _CUTE_DSL_BF16_MAX_M:
-        return [fallback, warp_splitk, cluster_splitk, direct]
+        return [
+            runner
+            for runner in (fallback, warp_splitk, cluster_splitk, direct)
+            if runner is not None
+        ]
     prefer_direct = direct.supports_inputs(inputs) and prefer_direct_bf16_gemm_sm100(
         m, n, k
     )
@@ -1902,7 +2474,11 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
         if prefer_direct
         else (warp_splitk, cluster_splitk, direct)
     )
-    return [runner for runner in kernels if runner.supports_inputs(inputs)] + [fallback]
+    return [
+        runner
+        for runner in kernels
+        if runner is not None and runner.supports_inputs(inputs)
+    ] + [fallback]
 
 
 def bf16_gemm_sm100(
@@ -7379,29 +7955,19 @@ def _cute_dsl_gemm_fp4_runner(
                                         )
                                     )
 
-            # Rank configs and autotune the top-N instead of the entire O(100).
-            # Current heuristic cannot distinguish use_prefetch, so autotuner profiles both.
+            # Rank individual tactics so the limit is an actual benchmark
+            # budget. Group-counting with ``max_tactics // 2`` only produced
+            # the intended number for SM100's two use_prefetch variants; SM103
+            # and SM107 groups usually contain one tactic.
             sm_count = get_device_sm_count(a.device)
-            config_tactics = defaultdict(list)
-            for t in valid_tactics:
-                # group by everything except use_prefetch (t[3])
-                tile, cluster, swap_ab, _, kernel_type, tma_store = t
-                config_key = (tile, cluster, swap_ab, kernel_type, tma_store)
-                config_tactics[config_key].append(t)
-            ranked_configs = sorted(
-                config_tactics.values(),
-                key=lambda ts: _score_sm100_mm_fp4_tactic(
-                    m, n, real_k, sm_count, ts[0][0], ts[0][1], ts[0][2]
-                ),
-                reverse=True,
+            return _rank_mm_fp4_autotune_tactics(
+                valid_tactics,
+                m,
+                n,
+                real_k,
+                sm_count,
+                _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS,
             )
-            return [
-                t
-                for ts in ranked_configs[
-                    : _MM_FP4_CUTE_DSL_MAX_TUNING_CONFIGS // 2
-                ]  # // 2 for prefetch and non-prefetch
-                for t in ts
-            ]
 
         def forward(
             self,
@@ -8971,7 +9537,11 @@ def _check_group_gemm_fp8_nt_groupwise_problem_size(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["trtllm", "cutile"] = "trtllm",
+    segment_alignment: int = 1,
 ):
+    """Validate the grouped FP8 groupwise GEMM problem size, scales and layout."""
+    if segment_alignment < 1:
+        raise ValueError(f"segment_alignment must be >= 1, but got {segment_alignment}")
     if a.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         raise ValueError(f"a must be a float8 tensor, but got {a.dtype}")
     if b.dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
@@ -9045,6 +9615,7 @@ def group_gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,  # (cum_m, n)
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["trtllm", "cutile"] = "trtllm",
+    segment_alignment: int = 1,
 ) -> torch.Tensor:
     r"""Perform group GEMM with FP8 data types using groupwise scaling. Currently only supported on NVIDIA
     Blackwell architecture.
@@ -9093,6 +9664,16 @@ def group_gemm_fp8_nt_groupwise(
         grouped GEMM kernel; ``"cutile"`` uses the cuTile Python kernel.
         Defaults to ``"trtllm"``.
 
+    segment_alignment: int
+        Row alignment the caller GUARANTEES for every ``m_indptr`` segment offset.
+        ``cutile``-backend only. Default ``1`` (arbitrary) uses a gather-based
+        fused kernel. Passing a multiple of 128 (segment token counts padded to
+        that many rows — the common MoE case) selects a much faster
+        aligned-segment TMA kernel. It is a caller contract: it cannot be
+        validated at runtime without a host sync that would break CUDA-graph
+        capture, and a wrong value silently corrupts output. Ignored by
+        ``trtllm``.
+
     Returns
     -------
     out: torch.Tensor
@@ -9124,8 +9705,9 @@ def group_gemm_fp8_nt_groupwise(
     if out is None:
         out = torch.empty(out_shape, dtype=out_dtype, device=a.device)
 
-    # cuTile backend: pure cuda.tile Python kernel. Iterates over groups and
-    # dispatches the existing ``gemm_fp8_nt_groupwise_cutile`` per group.
+    # cuTile backend: pure cuda.tile Python kernel. A single fused persistent
+    # launch handles all groups (boundaries read on-device from ``m_indptr``),
+    # so it is CUDA-graph-capturable — no per-group host loop / D2H sync.
     # Constraints are checked by ``_cutile_group_gemm_fp8_nt_groupwise_requirement``.
     if backend == "cutile":
         from .kernels.cutile.gemm_fp8_nt_groupwise_cutile import (
@@ -9141,6 +9723,7 @@ def group_gemm_fp8_nt_groupwise(
             out=out,
             scale_granularity_mnk=scale_granularity_mnk,
             scale_major_mode=scale_major_mode or "K",
+            segment_alignment=segment_alignment,
         )
 
     if is_sm12x_supported(a.device):

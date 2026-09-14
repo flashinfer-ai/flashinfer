@@ -250,7 +250,7 @@ def test_validate_compute_consistency_requires_do_finalize():
         MoEConfig,
         MoEFinalizeConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
     )
@@ -262,7 +262,7 @@ def test_validate_compute_consistency_requires_do_finalize():
     fleet = _split(num_experts=8, world_size=4)
     moe_config = MoEConfig(
         routing=RoutingConfig(num_experts=8, top_k=4),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=2048,
             local_expert_offset=0,

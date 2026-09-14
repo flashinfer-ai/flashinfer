@@ -689,25 +689,34 @@ def _trtllm_batch_decode_sparse_mla_sm120(
     return out
 
 
-def _check_sm120_sparse_v32_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
+def _check_sm120_sparse_v32_kv_cache(
+    kv_cache: torch.Tensor, *, glm53_nope: bool = False
+) -> torch.Tensor:
     if kv_cache.dtype != torch.uint8:
         raise ValueError(
             "SM120 sparse MLA v32/GLM backend expects packed uint8 kv_cache, "
             f"got {kv_cache.dtype}"
         )
+    # Inline-scale caches may pad rows beyond the model's payload. GLM NoPE
+    # stores 512 FP8 values and four FP32 scales (528B); v32/GLM_NSA also
+    # stores 128B of RoPE. The binding validates the actual row stride.
+    min_row_bytes = 528 if glm53_nope else 656
+    layout_desc = (
+        f">={min_row_bytes} ({min_row_bytes}B payload, 16B-aligned padded rows allowed)"
+    )
     if kv_cache.ndim == 3:
-        if kv_cache.size(-1) != 656:
+        if kv_cache.size(-1) < min_row_bytes:
             raise ValueError(
-                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim 656, "
-                f"got {tuple(kv_cache.shape)}"
+                "SM120 sparse MLA v32/GLM expects packed kv_cache last dim "
+                f"{layout_desc}, got {tuple(kv_cache.shape)}"
             )
         return kv_cache
     if kv_cache.ndim == 4:
-        if kv_cache.size(1) != 1 or kv_cache.size(-1) != 656:
+        if kv_cache.size(1) != 1 or kv_cache.size(-1) < min_row_bytes:
             raise ValueError(
                 "SM120 sparse MLA v32/GLM expects public HND kv_cache shape "
-                "[num_pages, 1, page_size, 656] or 3D shorthand "
-                f"[num_pages, page_size, 656], got {tuple(kv_cache.shape)}"
+                f"[num_pages, 1, page_size, {layout_desc}] or 3D shorthand "
+                f"[num_pages, page_size, {layout_desc}], got {tuple(kv_cache.shape)}"
             )
         return kv_cache
     raise ValueError(f"Expected kv_cache.ndim == 3 or 4, got {kv_cache.ndim}")
@@ -824,7 +833,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
             f"{expected_block_tables_shape}, got {tuple(block_tables.shape)}"
         )
 
-    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache)
+    kv_cache = _check_sm120_sparse_v32_kv_cache(kv_cache, glm53_nope=glm53_nope)
     topk_length = _normalize_sm120_sparse_v32_topk_length(
         seq_lens,
         batch_size=batch_size,
@@ -3450,7 +3459,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``[num_pages, 1, page_size, kv_lora_rank + qk_rope_head_dim]`` and uses
         the query-compatible dense dtype. For the SM120/SM121 v32/GLM sparse
         backend, this is a packed uint8 cache with 656 bytes per token, shaped
-        ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``.
+        ``[num_pages, page_size, 656]`` or ``[num_pages, 1, page_size, 656]``;
+        for GLM-5.3 NoPE the payload is 528 bytes per token and padded rows
+        (any last dim >= 528, including a legacy 656 pool) are accepted.
     workspace_buffer : torch.Tensor
         Pre-allocated workspace buffer. Must be zero-initialized on first use
         by kernels that use semaphore state.
@@ -3685,14 +3696,6 @@ def trtllm_batch_decode_with_kv_cache_mla(
         kv_lora_rank == nope_mla_dimensions.kv_lora_rank
         and qk_rope_head_dim == nope_mla_dimensions.qk_rope_head_dim
     )
-    if is_nope_mla and sparse_mla_top_k <= 0:
-        raise ValueError(
-            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
-        )
-    if is_nope_mla and sparse_mla_top_k_lens is None:
-        raise ValueError(
-            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
-        )
     if sparse_mla_top_k_lens is not None:
         if not is_nope_mla:
             raise ValueError(
@@ -3710,6 +3713,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
             "sparse_mla_top_k_lens",
         )
         sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
+
+    if kv_cache.dtype == torch.uint8 and sparse_mla_top_k <= 0:
+        raise NotImplementedError(
+            "Dense MLA decode does not support packed uint8 KV caches yet: no "
+            "backend has an NVFP4 MLA decode kernel. The NVFP4 MLA cache write "
+            "path is available via nvfp4_quantize_append_paged_mla_kv_cache."
+        )
 
     backend = _validate_mla_dcp_args(
         query=query,
@@ -3734,6 +3744,24 @@ def trtllm_batch_decode_with_kv_cache_mla(
             backend = "sparse"
         elif cc[0] != 10:
             backend = "xqa"
+
+    # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
+    # active top-k length; the SM120 sparse backend bounds each row by its
+    # -1 entries instead and does not consume sparse_mla_top_k_lens.
+    if is_nope_mla and backend != "sparse":
+        if sparse_mla_top_k <= 0:
+            raise ValueError(
+                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+            )
+        if sparse_mla_top_k_lens is None:
+            raise ValueError(
+                "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+            )
+    if sparse_mla_top_k_lens is not None and backend == "sparse":
+        raise ValueError(
+            "sparse_mla_top_k_lens is not supported by the SM120 sparse MLA "
+            "backend; pass per-token active top-k lengths via seq_lens instead"
+        )
 
     if backend == "xqa":
         if multi_ctas_kv_counter_buffer is not None:

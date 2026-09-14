@@ -22,7 +22,6 @@ from typing import Optional
 
 import torch
 
-from .api_logging import flashinfer_api
 from .utils import (
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
@@ -31,7 +30,7 @@ from .utils import (
 )
 
 _BLOCK_N = 128
-_D128_HEAD_DIM = 128
+_HEAD_DIM = 128
 _D256_HEAD_DIM = 256
 _BF16_PAGE_SIZE = 16
 _FP8_PAGE_SIZE = 64
@@ -45,51 +44,25 @@ _FP8_MIN_SPLIT_LOCAL_BLOCKS = 4
 _FP8_D256_CP1_MIN_LOCAL_BLOCKS = 128
 _FP8_D256_CP4_MIN_LOCAL_BLOCKS = 64
 _FP8_RETAIN_KV_L2_MAX_BLOCKS = 18
-_BF16_SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
-_FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 7, 8)
+_BF16_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
+_FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _FP8_D256_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 7, 8)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
-@flashinfer_api
 def get_dcp_spec_workspace_size_bytes(
     batch_size: int,
     q_len_per_req: int,
     num_qo_heads: int,
     num_split: int = _MAX_NUM_SPLIT,
     *,
-    head_dim: int = _D128_HEAD_DIM,
+    head_dim: int = _HEAD_DIM,
 ) -> int:
-    """Bytes for Cake FMHA Split-KV BF16 partial-O and FP32 partial-LSE scratch.
+    """Bytes for Cake FMHA Split-KV BF16 partial-O and FP32 partial-LSE scratch."""
 
-    Pass ``head_dim=256`` for the FP8/page64 D256 ratio-16 production profile;
-    the default remains the D128 profile.
-
-    Parameters
-    ----------
-    batch_size : int
-        Number of requests in the batch.
-    q_len_per_req : int
-        Number of speculative query rows per request.
-    num_qo_heads : int
-        Number of rank-local query/output heads.
-    num_split : int
-        Maximum Split-KV fanout to reserve, in the inclusive range [2, 16].
-    head_dim : int
-        Keyword-only query/output head dimension; supported values are 128 and
-        256.
-
-    Returns
-    -------
-    int
-        Required caller-owned workspace size in bytes.
-    """
-
-    if min(batch_size, q_len_per_req, num_qo_heads, head_dim) <= 0:
-        raise ValueError(
-            "batch_size, q_len_per_req, num_qo_heads, and head_dim must be positive"
-        )
-    if head_dim not in (_D128_HEAD_DIM, _D256_HEAD_DIM):
+    if min(batch_size, q_len_per_req, num_qo_heads) <= 0:
+        raise ValueError("batch_size, q_len_per_req, and num_qo_heads must be positive")
+    if head_dim not in (_HEAD_DIM, _D256_HEAD_DIM):
         raise ValueError("Cake FMHA workspace head_dim must be 128 or 256")
     if not 2 <= num_split <= _MAX_NUM_SPLIT:
         raise ValueError(f"num_split must be in [2, {_MAX_NUM_SPLIT}]")
@@ -97,28 +70,12 @@ def get_dcp_spec_workspace_size_bytes(
     return partial_rows * (head_dim * 2 + 4)
 
 
-@flashinfer_api
 def get_dcp_spec_counter_bytes(
     batch_size: int,
     q_len_per_req: int,
     num_kv_heads: int,
 ) -> int:
-    """Bytes for the v4 completion tickets, zeroed once then self-reset.
-
-    Parameters
-    ----------
-    batch_size : int
-        Number of requests in the batch.
-    q_len_per_req : int
-        Number of speculative query rows per request.
-    num_kv_heads : int
-        Number of rank-local KV heads.
-
-    Returns
-    -------
-    int
-        Required caller-owned completion-buffer size in bytes.
-    """
+    """Bytes for the v4 completion tickets, zeroed once then self-reset."""
 
     if min(batch_size, q_len_per_req, num_kv_heads) <= 0:
         raise ValueError("batch_size, q_len_per_req, and num_kv_heads must be positive")
@@ -211,7 +168,7 @@ def _select_fp8_num_split(
     sm_count: int,
     local_blocks: int,
     cp_world: int,
-    head_dim: int = _D128_HEAD_DIM,
+    head_dim: int = _HEAD_DIM,
 ) -> int:
     """Fill one SM wave while retaining two FP8 K/V block pairs per CTA."""
 
@@ -246,22 +203,6 @@ def _select_fp8_num_split(
     return num_split if num_split >= 2 else 1
 
 
-def _validate_nonempty_split_assignment(*, num_split: int, local_blocks: int) -> None:
-    """Reject a Split-KV launch that would assign no K/V pair to a split."""
-
-    if local_blocks == 0 and num_split == 1:
-        # A completely empty rank is a valid DCP input.  The single-CTA path
-        # materializes its exact O=0/LSE=-inf identity without a K/V pair.
-        return
-    total_pairs = (local_blocks + 1) // 2
-    if num_split > total_pairs:
-        raise RuntimeError(
-            "Cake FMHA DCP Split-KV requires at least one K/V block pair per "
-            f"split, got num_split={num_split}, local_blocks={local_blocks}, "
-            f"total_pairs={total_pairs}"
-        )
-
-
 def _is_cuda_version_at_least(version: str) -> bool:
     from .jit.cpp_ext import is_cuda_version_at_least
 
@@ -275,10 +216,7 @@ def _select_target(device: torch.device) -> str:
             "DCP speculative FMHA requires compute capability 10.0 "
             f"(B200/GB200) or 10.3 (B300/GB300), got {capability[0]}.{capability[1]}"
         )
-    # Keep B200 on its architecture-specific target even when the toolkit can
-    # also emit the forward-compatible family target.  SM103 requires the
-    # family target, while SM100 benefits from retaining its independent JIT
-    # and performance baseline.
+    # Base and add-on sources use the same exact product architecture names.
     if capability == (10, 0):
         if _is_cuda_version_at_least("12.8"):
             return "sm100a"
@@ -287,11 +225,11 @@ def _select_target(device: torch.device) -> str:
             "12.8 or newer"
         )
     if _is_cuda_version_at_least("12.9"):
-        return "sm100f"
+        return "sm103a"
     if capability == (10, 3):
         raise RuntimeError(
             "DCP speculative FMHA on compute capability 10.3 requires CUDA 12.9 "
-            "or newer for the sm_100f family target"
+            "or newer for the sm_103a exact target"
         )
     raise AssertionError(f"unreachable DCP target capability: {capability}")
 
@@ -339,9 +277,9 @@ def _validate_core_inputs(
             "query shape does not match the DCP specialization: "
             f"got {tuple(query.shape)}, expected tokens={batch_size * q_len_per_req}"
         )
-    if profile == "bf16_p16" and head_dim != _D128_HEAD_DIM:
+    if profile == "bf16_p16" and head_dim != _HEAD_DIM:
         raise ValueError("the BF16/page16 DCP profile requires head_dim=128")
-    if profile == "fp8_p64" and head_dim not in (_D128_HEAD_DIM, _D256_HEAD_DIM):
+    if profile == "fp8_p64" and head_dim not in (_HEAD_DIM, _D256_HEAD_DIM):
         raise ValueError("the FP8/page64 DCP profile requires head_dim=128 or 256")
     if head_dim == _D256_HEAD_DIM:
         profile = "fp8_p64_d256"
@@ -371,10 +309,10 @@ def _validate_core_inputs(
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
     group_ratio = num_qo_heads // num_kv_heads
-    if head_dim == _D128_HEAD_DIM:
+    if head_dim == _HEAD_DIM:
         if not 1 <= group_ratio <= 8:
             raise ValueError(
-                f"DCP D128 head group ratio must be in [1, 8], got {group_ratio}"
+                f"DCP head group ratio must be in [1, 8], got {group_ratio}"
             )
     elif (
         num_qo_heads != 16
@@ -453,17 +391,17 @@ def run_dcp_spec_decode(
     out: torch.Tensor,
     lse: torch.Tensor,
     completion_buffer: Optional[torch.Tensor],
-    backend: str = "cake",
 ) -> None:
     """Run one rank-local Cake FMHA DCP speculative specialization."""
 
-    if backend != "cake":
-        raise ValueError(
-            f"DCP speculative decode requires backend='cake', got {backend!r}"
-        )
     if q_len_per_req <= 0 or query.shape[0] % q_len_per_req != 0:
         raise ValueError("query token count must be divisible by q_len_per_req")
     batch_size = query.shape[0] // q_len_per_req
+    if batch_size <= 0:
+        raise ValueError(
+            "DCP speculative FMHA requires a non-empty batch, got "
+            f"query.shape[0]={query.shape[0]}"
+        )
     num_qo_heads, num_kv_heads, profile, page_size = _validate_core_inputs(
         query,
         k_cache,
@@ -513,9 +451,6 @@ def run_dcp_spec_decode(
             local_blocks=local_blocks,
             cp_world=cp_world,
             head_dim=query.shape[-1],
-        )
-        _validate_nonempty_split_assignment(
-            num_split=num_split, local_blocks=local_blocks
         )
         head_dim = query.shape[-1]
         if head_dim == _D256_HEAD_DIM:
@@ -594,7 +529,6 @@ def run_dcp_spec_decode(
         sm_count=sm_count,
         local_blocks=local_blocks,
     )
-    _validate_nonempty_split_assignment(num_split=num_split, local_blocks=local_blocks)
     from .jit.cake_dcp import load_dcp_spec_module
 
     if num_split == 1:

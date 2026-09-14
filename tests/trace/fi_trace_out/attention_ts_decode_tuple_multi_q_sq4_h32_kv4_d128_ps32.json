@@ -1,6 +1,6 @@
 {
   "name": "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "One-shot PrimTS GQA decode over FlashInfer native CSR paged KV metadata using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
+  "description": "One-shot PrimTS GQA decode over a fixed row-strided page table using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.batch_decode_with_paged_kv_cache",
@@ -38,13 +38,9 @@
       "type": "const",
       "value": 32
     },
-    "len_indptr": {
+    "max_pages_per_seq": {
       "type": "var",
-      "description": "Length of the native CSR indptr."
-    },
-    "num_kv_indices": {
-      "type": "var",
-      "description": "Number of referenced page IDs."
+      "description": "Physical page-table capacity per request."
     },
     "len_qo_indptr": {
       "type": "var",
@@ -54,7 +50,8 @@
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (16, 32, 64, 128)",
-    "len_indptr == batch_size + 1",
+    "max_pages_per_seq * page_size >= max(seq_lens_kv)",
+    "min(seq_lens_kv) >= 1",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
     "window_left == -1 or mask_type == 'causal'",
@@ -89,19 +86,14 @@
       ],
       "dtype": "bfloat16"
     },
-    "paged_kv_indptr": {
+    "block_tables": {
       "shape": [
-        "len_indptr"
+        "batch_size",
+        "max_pages_per_seq"
       ],
       "dtype": "int32"
     },
-    "paged_kv_indices": {
-      "shape": [
-        "num_kv_indices"
-      ],
-      "dtype": "int32"
-    },
-    "paged_kv_last_page_len": {
+    "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],

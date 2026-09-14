@@ -52,6 +52,25 @@ inline size_t alignOffset(size_t offset, size_t alignment = kCachelineAlignment)
   return (offset + alignment - 1) & ~(alignment - 1);
 }
 
+inline int64_t outputScaleExtent(int64_t numRows, int64_t elementsPerToken,
+                                 tl_throughput::MoeA2ACombineQuantMode quantMode,
+                                 tl_throughput::MoeA2ACombineSwizzleSFMode swizzleMode) {
+  using tl_throughput::MoeA2ACombineQuantMode;
+  using tl_throughput::MoeA2ACombineSwizzleSFMode;
+  int64_t const blockSize = quantMode == MoeA2ACombineQuantMode::NVFP4 ? 16 : 32;
+  int64_t const scaleColumns = (elementsPerToken + blockSize - 1) / blockSize;
+  switch (swizzleMode) {
+    case MoeA2ACombineSwizzleSFMode::LINEAR:
+      return numRows * scaleColumns;
+    case MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4:
+      return ((numRows + 127) / 128 * 128) * ((scaleColumns + 3) / 4 * 4);
+    case MoeA2ACombineSwizzleSFMode::SWIZZLE_8x4:
+      return ((numRows + 7) / 8 * 8) * ((scaleColumns + 3) / 4 * 4);
+  }
+  TVM_FFI_ICHECK(false) << "Unsupported output scale-factor layout";
+  return 0;
+}
+
 inline bool hasActiveRankMask(Optional<TensorView> const& maskTensor) {
   return maskTensor.has_value();
 }
@@ -270,6 +289,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   params.local_num_tokens = localNumTokens;
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.workspace = workspaceBase;
+  params.workspace_stride_bytes = static_cast<uint64_t>(strideBytes);
   params.enable_eplb = enableEplb;
   params.eplb_stats_num_experts = static_cast<int>(eplbStatsNumExperts);
   params.eplb_local_stats =
@@ -447,6 +468,8 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   params.local_num_tokens = static_cast<int>(localNumTokens);
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);
+  params.workspace = workspaceBase;
+  params.workspace_stride_bytes = static_cast<uint64_t>(strideBytes);
   params.use_low_precision = useLowPrecision;
   params.prepare_payload = payloadInWorkspace ? nullptr : payload.data_ptr();
   params.output_data = output.data_ptr();
@@ -455,28 +478,56 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
   params.output_scalar_scale = static_cast<float>(outputScalarScale);
 
+  // Keep the intermediate alive until both the accumulation and quantization
+  // launches have been enqueued on the caller's current stream.
+  Tensor accumulationStorage;
+
   // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
-    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
-    auto const sm_version = tensorrt_llm::common::getSMVersion();
-    TVM_FFI_ICHECK(sm_version >= 100)
-        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
         << "Quantization only supports for fp16 or bf16 inputs";
-    params.output_scales = outputScales.value().data_ptr();
+    TensorView const& scales = outputScales.value();
+    CHECK_INPUT(scales);
+    CHECK_DEVICE(payload, scales);
 
     if (output.dtype() == dl_float8_e4m3fn) {
       // TODO(siyuan): currently only support MXFP8 quantization
-      CHECK_INPUT_AND_TYPE(outputScales.value(), dl_uint8);
+      CHECK_INPUT_TYPE(scales, dl_uint8);
       params.quant_mode = MoeA2ACombineQuantMode::MXFP8;
     } else if (output.dtype() == dl_uint8) {
       // packed fp4
-      params.quant_mode = outputScales.value().dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
-                                                                   : MoeA2ACombineQuantMode::NVFP4;
+      TVM_FFI_ICHECK(scales.dtype() == dl_uint8 || scales.dtype() == dl_float8_e4m3fn)
+          << "packed fp4 output_scales must have uint8 (MXFP4) or float8_e4m3fn (NVFP4) "
+             "dtype";
+      params.quant_mode = scales.dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
+                                                     : MoeA2ACombineQuantMode::NVFP4;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Quantization not supported for output dtype: " << output.dtype();
     }
+
+    TVM_FFI_ICHECK(sfLayout >= static_cast<int64_t>(MoeA2ACombineSwizzleSFMode::SWIZZLE_128x4) &&
+                   sfLayout <= static_cast<int64_t>(MoeA2ACombineSwizzleSFMode::LINEAR))
+        << "sf_layout must be layout_128x4, layout_8x4, or layout_linear";
+    auto const swizzleMode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
+    int64_t const expectedScales =
+        outputScaleExtent(localNumTokens, elementsPerToken, params.quant_mode, swizzleMode);
+    TVM_FFI_ICHECK_EQ(scales.numel(), expectedScales)
+        << "output_scales extent does not match the requested quantization layout";
+
+    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
+    // Validate the public tensor contract first so malformed inputs report their causal error
+    // consistently on every architecture.
+    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    TVM_FFI_ICHECK(sm_version >= 100)
+        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
+    params.output_scales = scales.data_ptr();
+    // Preserve the public physical payload boundary through the inverse
+    // combine: each owner stores one BF16/FP16 partial before the final
+    // quantizer reads the byte-carried intermediate.
+    accumulationStorage =
+        alloc_tensor({localNumTokens, elementsPerToken}, payload.dtype(), payload.device());
+    params.accumulation_data = accumulationStorage.data_ptr();
   } else if (useLowPrecision) {
     // Low-precision combine upcasts the FP8 recv buffers to a BF16 output; no output scales.
     TVM_FFI_ICHECK(output.dtype() == dl_bfloat16)

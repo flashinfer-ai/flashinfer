@@ -165,6 +165,9 @@ def test_decode_pretranspose_pool_reuses_compile_across_outer_layouts(
             pool_compile_calls += 1
         return original_compile(*args, **kwargs)
 
+    # Pin the disk cache off: a populated cache would satisfy the reuse
+    # property with zero compiles, breaking the count-based assertion.
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
     pretranspose_module._get_compiled_decode_kernel.cache_clear()
     monkeypatch.setattr(pretranspose_module.cute, "compile", counted_compile)
 

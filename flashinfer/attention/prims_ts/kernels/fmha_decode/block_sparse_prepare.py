@@ -604,12 +604,15 @@ class _PrepareRoutesBase:
         use_proxy_routes: bool,
         use_causal_mask: bool = False,
         apply_token_mask: bool = False,
+        store_score_words: bool = False,
         page_size: int | None = None,
     ) -> None:
         if not isinstance(use_proxy_routes, bool):
             raise TypeError("use_proxy_routes must be a bool")
         if not isinstance(apply_token_mask, bool):
             raise TypeError("apply_token_mask must be a bool")
+        if not isinstance(store_score_words, bool):
+            raise TypeError("store_score_words must be a bool")
         if not isinstance(use_causal_mask, bool):
             raise TypeError("use_causal_mask must be a bool")
         if use_proxy_routes and page_size is not None:
@@ -617,7 +620,9 @@ class _PrepareRoutesBase:
 
         num_q_blocks = (seq_len_q + q_block_size - 1) // q_block_size
         num_rows = batch_size * num_kv_heads * num_q_blocks
-        stores_score_words = use_proxy_routes or apply_token_mask
+        # Structural score words (sequence tail, invalid atoms) can be stored
+        # without a caller token mask; proxy routes and token masks require them.
+        stores_score_words = use_proxy_routes or apply_token_mask or store_score_words
         layout = _BlockSparseRouteLayout.create(
             kv_route_size=kv_route_size,
             kv_block_size=kv_block_size,
@@ -893,6 +898,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
         use_proxy_routes: bool,
         use_causal_mask: bool = False,
         apply_token_mask: bool = False,
+        store_score_words: bool = False,
     ) -> None:
         super().__init__(
             batch_size=batch_size,
@@ -905,6 +911,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
             use_proxy_routes=use_proxy_routes,
             use_causal_mask=use_causal_mask,
             apply_token_mask=apply_token_mask,
+            store_score_words=store_score_words,
         )
 
     @cute.jit
