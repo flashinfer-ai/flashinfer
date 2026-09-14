@@ -60,8 +60,9 @@ Standalone — needs only FlashInfer (EP is in the default install), torch, and 
 so `scripts/parse_results.py` parses both. The 28-case driver issues one `srun` per config:
 
 ```bash
-# inside an salloc (-N 8); JOBID set; RW holds the checkout + the .sqsh
-ssh prenyx "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
+# inside an salloc (-N 8); JOBID set; RW holds the checkout + the .sqsh;
+# LOGIN_HOST is your cluster login node
+ssh "$LOGIN_HOST" "cd $RW && JOBID=<jid> REMOTE_WORK=$RW \
   IMAGE=$RW/flashinfer-ep-pt2605.sqsh ONE_SCRIPT=run_ep_matrix_one_pt.sh \
   bash $RW/flashinfer/benchmarks/run_ep_matrix.sh"
 ```
