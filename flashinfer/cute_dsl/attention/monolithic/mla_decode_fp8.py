@@ -153,6 +153,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_max_splits: int = MAX_SPLITS,
         enable_dcp: bool = False,
         cp_world: int = 1,
+        cp_interleave_granularity: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -194,11 +195,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             a smaller specialization must cap runtime split-KV accordingly.
         :type reducer_max_splits: int
         :param enable_dcp: Statically enable decode context-parallel causal
-            masking over a cyclic rank-local KV shard.
+            masking over a block-cyclic rank-local KV shard.
         :type enable_dcp: bool
-        :param cp_world: Compile-time DCP world size. Rank-local key ``k`` maps
-            to global key ``k * cp_world + cp_rank``.
+        :param cp_world: Compile-time DCP world size.
         :type cp_world: int
+        :param cp_interleave_granularity: Number of consecutive global tokens
+            assigned to one rank before ownership advances to the next rank.
+            This is a compile-time parameter when DCP is enabled.
+        :type cp_interleave_granularity: int
         """
 
         self.latent_dim = 512
@@ -231,12 +235,30 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # specializations load each request's actual length from its indptr.
         if cp_world < 1:
             raise ValueError(f"cp_world must be positive, got {cp_world}")
+        if not isinstance(cp_interleave_granularity, int) or isinstance(
+            cp_interleave_granularity, bool
+        ):
+            raise TypeError(
+                "cp_interleave_granularity must be an integer, got "
+                f"{type(cp_interleave_granularity).__name__}"
+            )
+        if cp_interleave_granularity < 1:
+            raise ValueError(
+                "cp_interleave_granularity must be positive, got "
+                f"{cp_interleave_granularity}"
+            )
         if not enable_dcp and cp_world != 1:
             raise ValueError(
                 "cp_world must be 1 when decode context parallelism is disabled"
             )
+        if not enable_dcp and cp_interleave_granularity != 1:
+            raise ValueError(
+                "cp_interleave_granularity must be 1 when decode context "
+                "parallelism is disabled"
+            )
         self.enable_dcp = enable_dcp
         self.cp_world = cp_world
+        self.cp_interleave_granularity = cp_interleave_granularity
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         (
@@ -1165,7 +1187,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             newest query. Present only in the statically enabled DCP
             specialization.
         :type causal_seqlens_kv_global: cute.Tensor
-        :param cp_rank: Runtime rank of this cyclic KV shard
+        :param cp_rank: Runtime rank of this block-cyclic KV shard
         :type cp_rank: cutlass.Int32
         :param block_split_kvs: The per-block split_kv values tensor
         :type block_split_kvs: cute.Tensor
@@ -1929,6 +1951,62 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if q_tile_idx == self.num_q_tiles - 1:
             valid_rows = self.tail_q_rows
         return valid_rows
+
+    @cute.jit
+    def dcp_local_key_to_global(
+        self, local_key: cutlass.Int32, cp_rank: cutlass.Int32
+    ) -> cutlass.Int32:
+        """Map a compact rank-local key index to its global token index."""
+        if cutlass.const_expr(self.cp_interleave_granularity == 1):
+            # Preserve the original token-cyclic specialization exactly.
+            return self.cp_world * local_key + cp_rank
+
+        local_block = local_key // self.cp_interleave_granularity
+        return (
+            local_key
+            + ((self.cp_world - 1) * local_block + cp_rank)
+            * self.cp_interleave_granularity
+        )
+
+    @cute.jit
+    def dcp_global_bound_to_local_bound(
+        self, global_bound: cutlass.Int32, cp_rank: cutlass.Int32
+    ) -> cutlass.Int32:
+        """Count this rank's keys below an exclusive global token bound."""
+        if cutlass.const_expr(self.cp_interleave_granularity == 1):
+            # Preserve the original token-cyclic specialization exactly.
+            local_bound_numer = global_bound - cp_rank
+            return cute.ceil_div(
+                cutlass.max(local_bound_numer, cutlass.Int32(0)), self.cp_world
+            )
+
+        nonnegative_bound = cutlass.max(global_bound, cutlass.Int32(0))
+        global_cycle = self.cp_world * self.cp_interleave_granularity
+        full_cycles = nonnegative_bound // global_cycle
+        cycle_remainder = nonnegative_bound - full_cycles * global_cycle
+        rank_remainder = cutlass.max(
+            cycle_remainder - cp_rank * self.cp_interleave_granularity,
+            cutlass.Int32(0),
+        )
+        rank_remainder = cutlass.min(rank_remainder, self.cp_interleave_granularity)
+        return full_cycles * self.cp_interleave_granularity + rank_remainder
+
+    @cute.jit
+    def dcp_flat_query_row_to_local_bound(
+        self,
+        flat_q_row: cutlass.Int32,
+        physical_k: cutlass.Int32,
+        causal_global: cutlass.Int32,
+        q_len: cutlass.Int32,
+        cp_rank: cutlass.Int32,
+    ) -> cutlass.Int32:
+        """Return the visible local prefix for one flattened query row."""
+        query_token = flat_q_row // self.num_heads
+        query_global_bound = causal_global - (q_len - 1) + query_token
+        return cutlass.min(
+            physical_k,
+            self.dcp_global_bound_to_local_bound(query_global_bound, cp_rank),
+        )
 
     @cute.kernel
     def reduction_kernel(
@@ -3015,6 +3093,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # static power of two, so the remaining division is a shift.
         tile_n = self.mma_qk_tiler[1]
         first_q_token = cutlass.Int32(0)
+        dcp_mask_local_bound = cutlass.Int32(0)
         if cutlass.const_expr(self.num_q_tiles > 1):
             first_q_token = (
                 common_params.blk_coord[1] * self.mma_qk_tiler[0]
@@ -3024,18 +3103,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # M128 tile has the smallest visible rank-local K bound.  Compute
             # that bound once per query tile, then cap it by the physical
             # rank-local K extent so a partial physical tail is still masked.
-            dcp_bound_numerator = cutlass.max(
-                common_params.causal_seq_len
-                - common_params.cp_rank
-                - (common_params.q_len - 1)
-                + first_q_token,
-                cutlass.Int32(0),
+            earliest_global_bound = (
+                common_params.causal_seq_len - (common_params.q_len - 1) + first_q_token
             )
-            earliest_local_bound = (
-                dcp_bound_numerator + self.cp_world - 1
-            ) // self.cp_world
+            earliest_local_bound = self.dcp_global_bound_to_local_bound(
+                earliest_global_bound, common_params.cp_rank
+            )
             effective_local_bound = cutlass.min(common_params.K, earliest_local_bound)
             first_mask_tile_idx = effective_local_bound // tile_n
+            if cutlass.const_expr(self.seq_len_q == 1):
+                # Every flattened row represents the same query token. Reuse
+                # the tile-level prefix in the score mask instead of mapping
+                # every local key back to a global coordinate.
+                dcp_mask_local_bound = effective_local_bound
         else:
             first_mask_tile_idx = cutlass.max(
                 (common_params.K - common_params.q_len + 1 + first_q_token) // tile_n,
@@ -3076,6 +3156,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 row_max,
                 row_sum,
                 correction_factor,
+                dcp_mask_local_bound,
                 is_second_compute_warp,
                 False,
                 is_local_last_tile,
@@ -3117,6 +3198,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 row_max,
                 row_sum,
                 correction_factor,
+                dcp_mask_local_bound,
                 is_second_compute_warp,
                 k_index >= first_mask_tile_idx,
                 True,
@@ -3450,6 +3532,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_max: cutlass.Float32,
         row_sum: cutlass.Float32,
         correction_factor: cutlass.Float32,
+        dcp_mask_local_bound: cutlass.Int32,
         is_second_compute_warp: bool,
         apply_mask: bool,
         is_local_last_tile: cutlass.Boolean,
@@ -3482,6 +3565,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type row_sum: cutlass.Float32
         :param correction_factor: The correction factor
         :type correction_factor: cutlass.Float32
+        :param dcp_mask_local_bound: Visible rank-local prefix for the
+            single-query DCP specialization. Unused for non-DCP or Q > 1.
+        :type dcp_mask_local_bound: cutlass.Int32
         :param apply_mask: Whether the tile needs K-bound / causal masking (Python bool
             for the unmasked/masked bulk loops; runtime cutlass.Boolean for a
             work-split final tile at the exact per-query-tile mask boundary).
@@ -3540,11 +3626,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #   r = q_token * H + q_head,
         # the usual key < K - S_q + 1 + q_token predicate is equivalent to
         #   H * (key - K + S_q) <= r.
-        # With cyclic DCP, local key k maps to W*k+rank, producing
-        #   H * (W*k + rank - G + S_q) <= r.
-        # Both forms avoid integer division/modulo. The enclosing apply_mask
-        # branch remains compile-time false for dense bulk K tiles, so they do
-        # not execute any of this row-dependent arithmetic.
+        # A DCP thread's 64 score elements all share one M row, so convert that
+        # row's global causal bound to one local prefix outside the score loop.
+        # Q1 reuses the prefix already computed for dense-tile classification.
+        # The enclosing apply_mask branch remains compile-time false for dense
+        # bulk K tiles, so they execute none of this row-dependent arithmetic.
         # Masked positions are filled with a large negative sentinel (not -inf)
         # to avoid NaN propagation when an entire row becomes masked. The DCP
         # epilogue turns such an empty row into the neutral O=0, LSE=-inf pair.
@@ -3552,28 +3638,37 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                if apply_mask:
-                    flat_q_row = (
-                        common_params.blk_coord[1] * self.mma_qk_tiler[0]
-                        + common_params.blk_coord[0] * cta_m_rows
-                        + tTR_tS[i][0]
-                    )
-                    key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if cutlass.const_expr(self.enable_dcp):
-                        mask_threshold = self.num_heads * (
-                            self.cp_world * key_pos
-                            + common_params.cp_rank
-                            - common_params.causal_seq_len
-                            + common_params.q_len
+            if apply_mask:
+                if cutlass.const_expr(self.enable_dcp):
+                    dcp_thread_local_bound = dcp_mask_local_bound
+                    if cutlass.const_expr(self.seq_len_q > 1):
+                        flat_q_row = (
+                            common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                            + common_params.blk_coord[0] * cta_m_rows
+                            + tTR_tS[0][0]
                         )
+                        dcp_thread_local_bound = self.dcp_flat_query_row_to_local_bound(
+                            flat_q_row,
+                            common_params.K,
+                            common_params.causal_seq_len,
+                            common_params.q_len,
+                            common_params.cp_rank,
+                        )
+                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                        key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
                         tTR_rAcc[i] = (
                             tTR_rAcc[i]
-                            if cute.elem_less(key_pos, common_params.K)
-                            and not cute.elem_less(flat_q_row, mask_threshold)
+                            if cute.elem_less(key_pos, dcp_thread_local_bound)
                             else self.acc_dtype(-1.0e6)
                         )
-                    else:
+                else:
+                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                        flat_q_row = (
+                            common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                            + common_params.blk_coord[0] * cta_m_rows
+                            + tTR_tS[i][0]
+                        )
+                        key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
                         mask_threshold = self.num_heads * (
                             key_pos - common_params.K + common_params.q_len
                         )
@@ -3612,27 +3707,36 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    flat_q_row = (
-                        common_params.blk_coord[1] * self.mma_qk_tiler[0]
-                        + common_params.blk_coord[0] * cta_m_rows
-                        + tTR_tS[i][0]
-                    )
-                    key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
-                    if cutlass.const_expr(self.enable_dcp):
-                        mask_threshold = self.num_heads * (
-                            self.cp_world * key_pos
-                            + common_params.cp_rank
-                            - common_params.causal_seq_len
-                            + common_params.q_len
+                if cutlass.const_expr(self.enable_dcp):
+                    dcp_thread_local_bound = dcp_mask_local_bound
+                    if cutlass.const_expr(self.seq_len_q > 1):
+                        flat_q_row = (
+                            common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                            + common_params.blk_coord[0] * cta_m_rows
+                            + tTR_tS[0][0]
                         )
+                        dcp_thread_local_bound = self.dcp_flat_query_row_to_local_bound(
+                            flat_q_row,
+                            common_params.K,
+                            common_params.causal_seq_len,
+                            common_params.q_len,
+                            common_params.cp_rank,
+                        )
+                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                        key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
                         tTR_rAcc[i] = (
                             tTR_rAcc[i]
-                            if cute.elem_less(key_pos, common_params.K)
-                            and not cute.elem_less(flat_q_row, mask_threshold)
+                            if cute.elem_less(key_pos, dcp_thread_local_bound)
                             else self.acc_dtype(-1.0e6)
                         )
-                    else:
+                else:
+                    for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                        flat_q_row = (
+                            common_params.blk_coord[1] * self.mma_qk_tiler[0]
+                            + common_params.blk_coord[0] * cta_m_rows
+                            + tTR_tS[i][0]
+                        )
+                        key_pos = tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index
                         mask_threshold = self.num_heads * (
                             key_pos - common_params.K + common_params.q_len
                         )
@@ -4124,11 +4228,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
     ) -> cutlass.Boolean:
         """Whether this row has a visible key in the current local K split."""
         first_local_key = common_params.k_index * self.mma_qk_tiler[1]
+        first_global_key = self.dcp_local_key_to_global(
+            first_local_key, common_params.cp_rank
+        )
         mask_threshold = self.num_heads * (
-            self.cp_world * first_local_key
-            + common_params.cp_rank
-            - common_params.causal_seq_len
-            + common_params.q_len
+            first_global_key - common_params.causal_seq_len + common_params.q_len
         )
         return cute.elem_less(first_local_key, common_params.K) and not cute.elem_less(
             flat_q_row, mask_threshold
