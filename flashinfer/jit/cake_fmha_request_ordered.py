@@ -179,7 +179,9 @@ def get_cake_fmha_request_ordered_manifest(
         _CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
     )
     if suffix:
-        expected_contract.update(q_groups_per_kv=2, query_heads_per_work_group=8)
+        expected_contract.update(
+            q_groups_per_kv=[1, 2], query_heads_per_work_group=[8, 16]
+        )
     _require(payload.get("contract") == expected_contract, "contract")
     modules = payload.get("modules")
     routes = payload.get("routes")
@@ -200,10 +202,12 @@ def get_cake_fmha_request_ordered_manifest(
         _require(isinstance(plan, dict), f"routes[{index}].build_plan")
         _require(plan.get("q_len") in (1, 6), f"routes[{index}].build_plan.q_len")
         if suffix:
+            wide_q6 = plan.get("fused_q6") is True and plan.get("write_lse") is False
             _require(
                 plan.get("num_q_heads") == 32
                 and plan.get("num_kv_heads") == 2
-                and plan.get("q_groups_per_kv") == 2,
+                and plan.get("q_groups_per_kv") == (1 if wide_q6 else 2)
+                and plan.get("query_heads_per_work_group", 8) == (16 if wide_q6 else 8),
                 f"routes[{index}].build_plan.head_geometry",
             )
             _require(

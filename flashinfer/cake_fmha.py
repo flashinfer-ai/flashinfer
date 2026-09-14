@@ -160,7 +160,7 @@ def _dynamic_fused_q6_cake_fmha_request_ordered_plan(
     """Bind the exported six-query/six-split schedule to runtime B."""
     if num_kv_splits != 6 or write_lse or (num_q_heads, num_kv_heads) != (32, 2):
         return None
-    names = set()
+    matches = set()
     for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
         "routes"
     ]:
@@ -174,22 +174,23 @@ def _dynamic_fused_q6_cake_fmha_request_ordered_plan(
             and build["write_lse"] is False
             and build["uniform_kv_len"] == 0
             and build["total_tiles"] == 1
-            and tuple(build["grid"][:2]) == (6, 4)
+            and tuple(build["grid"][:2]) == (6, 2)
             and not build["segmented_clc"]
             and not build["static_one_tile"]
             and not build["low_q1_cga_ctas"]
             and not build["high_batch_two_wave"]
             and not build["two_cta_reducer"]
         ):
-            names.add(route["module_name"])
-    if len(names) != 1:
+            matches.add((route["module_name"], tuple(build["grid"][:2])))
+    if len(matches) != 1:
         return None
+    module_name, grid_axes = matches.pop()
     return CakeFmhaRequestOrderedDecodePlan(
-        module_name=names.pop(),
+        module_name=module_name,
         batch_size=batch_size,
         q_len=6,
         workspace_parts=6,
-        grid=(6, 4, batch_size),
+        grid=(*grid_axes, batch_size),
         total_tiles=1,
         write_lse=False,
         num_q_heads=32,

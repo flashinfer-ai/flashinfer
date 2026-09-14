@@ -641,6 +641,32 @@ def test_runtime_q_plan_uses_authenticated_generated_binding(
     assert spec.tma_workspace_bytes == 384
 
 
+@pytest.mark.parametrize("batch_size", (1, 8, 32, 160, 192, 224, 256))
+def test_fused_q6_plan_uses_authenticated_physical_kv_groups(batch_size: int) -> None:
+    plan = flashinfer.plan_cake_fmha_request_ordered_paged_decode(
+        (513,) * batch_size,
+        6,
+        num_q_heads=32,
+        num_kv_heads=2,
+        num_kv_splits=6,
+    )
+    assert plan.grid == (6, 2, batch_size)
+    assert plan.workspace_parts == 6 and plan.total_tiles == 1
+    assert cake_api._is_authenticated_request_ordered_plan(plan)
+    assert not cake_api._is_authenticated_request_ordered_plan(
+        dataclasses.replace(plan, grid=(6, 4, batch_size))
+    )
+    with pytest.raises(ValueError, match="no exported dynamic request-order schedule"):
+        flashinfer.plan_cake_fmha_request_ordered_paged_decode(
+            (513,) * batch_size,
+            6,
+            write_lse=True,
+            num_q_heads=32,
+            num_kv_heads=2,
+            num_kv_splits=6,
+        )
+
+
 @pytest.mark.parametrize("q_len", (0, -1, 2.5, True))
 def test_request_order_rejects_invalid_q_before_tensor_processing(q_len) -> None:
     tensor = torch.empty(1)

@@ -64,6 +64,16 @@ package.
 
 .. currentmodule:: flashinfer.cake_fmha
 
+The SM103a request-ordered BF16-query/FP8-KV path also accepts an explicit
+six-part plan for six-query decode with 32 query heads and two KV heads,
+without returning LSE. Each workgroup handles the 16 query heads associated
+with one KV head, so the authenticated plan has grid ``(6, 2, batch_size)``.
+The logical tensor layout, completion-buffer allocation and descriptor
+capture API remain unchanged. Call
+``flashinfer.plan_cake_fmha_request_ordered_paged_decode`` before graph capture
+to obtain the current plan; a plan carrying the previous four-workgroup grid
+does not authenticate against this exported route.
+
 .. autosummary::
     :toctree: ../generated
 
