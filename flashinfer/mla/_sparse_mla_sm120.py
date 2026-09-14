@@ -63,6 +63,24 @@ index tiles; the tail tile is not masked), with ``topk >= 513`` for
 DOTS3_SWA so its sliding window fits the buffer. The binding rejects ragged
 widths loudly.
 
+``out_lse`` and the split-K ``mid_lse`` partials use **base-2** LSEs across
+all decode and prefill families, including the NVFP4 variant in
+:mod:`._sparse_mla_nvfp4_sm120`. The kernels scale QK by ``log2(e)`` and
+use ``exp2`` for softmax. For a non-empty row without ``attn_sink``::
+
+    out_lse == log2(sum_k exp2(qk_k * sm_scale * log2(e)))
+            == logsumexp(qk * sm_scale) / ln(2)
+
+The sum includes valid candidates from both KV caches when an extra cache
+is supplied. Before combining these values with natural-log LSEs, convert
+with ``lse_e = out_lse * ln(2)``. The split-K merge already uses base 2 and
+requires no conversion. Empty rows without a sink and empty split partials
+use the sentinel ``-1e30`` instead of ``-inf``.
+
+``attn_sink`` is a natural-logit input converted internally to base 2. Its
+softmax mass is included in ``out_lse``, but not in ``mid_lse``. The sink
+relations documented below use natural units.
+
 The decode launch parameter ``chunks_per_block`` is picked per call by the
 calibrated analytical model in :mod:`._sparse_mla_sm120_cpb` when constants
 are available (calibrated once per device during ``autotune()`` tuning mode,
@@ -844,7 +862,9 @@ def _sparse_mla_sm120_paged_attention(
     output : torch.Tensor
         In-place output, shape ``[num_tokens, num_heads, d_v]``, dtype bf16.
     out_lse : torch.Tensor
-        In-place log-sum-exp, shape ``[num_tokens, num_heads]``, dtype float32.
+        In-place log-sum-exp, shape ``[num_tokens, num_heads]``, dtype
+        float32. Base 2, not natural log: ``out_lse * ln(2)`` converts (see
+        the module docstring).
     sm_scale : float
         Softmax scale (typically ``1 / sqrt(d_qk)``).
     d_v : int
@@ -863,8 +883,10 @@ def _sparse_mla_sm120_paged_attention(
         for uniform top-k.
     attn_sink : Optional[torch.Tensor]
         Per-head learnable bias added pre-softmax, shape ``[num_heads]``,
-        dtype float32. FlashMLA V4 convention: ``output *= sigmoid(lse -
-        sink)`` and ``lse' = log(exp(lse) + exp(sink))``.
+        dtype float32, a natural-domain logit. FlashMLA V4 convention:
+        ``output *= sigmoid(lse - sink)`` and ``lse' = log(exp(lse) +
+        exp(sink))``, both written here in natural units -- the kernel
+        converts the sink internally and returns ``lse'`` in base 2.
     extra_kv_cache : Optional[torch.Tensor]
         Optional secondary KV cache (DSv4 C4A / C128A layers). When provided,
         ``extra_indices`` must also be passed. DSV4-only.
@@ -886,7 +908,8 @@ def _sparse_mla_sm120_paged_attention(
         Pre-allocated split-K LSE scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits]``, dtype float32. Pair with
         ``mid_out`` when the call dispatches to a decode kernel; the head
-        dimension follows the same rule as ``mid_out``.
+        dimension follows the same rule as ``mid_out``. Per-split partials are
+        base-2 LSEs, the same convention as ``out_lse``.
     prefill_impl : Optional[str]
         Prefill-kernel override for calls that dispatch to prefill. ``None``
         or ``"auto"`` keeps the default order (swapAB preferred where
@@ -1253,7 +1276,7 @@ class _SparseMLAPagedAttentionRunner:
         passed, that buffer is used; otherwise the wrapper uses an internal
         lazily-sized buffer. When ``return_lse=True``, returns a view into the
         LSE buffer sized to the actual ``num_tokens``; otherwise returns
-        ``None``.
+        ``None``. The values are base-2 LSEs (see the module docstring).
 
         Accepts ``q``/``output`` either as 3-D ``[num_tokens, num_heads, head_dim]``
         or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
@@ -1444,6 +1467,9 @@ def sparse_mla_sm120_decode_dsv3_2(
 ) -> torch.Tensor:
     """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM120.
 
+    ``out_lse`` and ``mid_lse`` use base-2 LSEs; ``attn_sink`` is a
+    natural-logit input (see the module docstring).
+
     ``chunks_per_block`` follows the same contract as the DSv4 decode helper:
     an explicit value is used directly; otherwise the calibrated analytical
     model picks one when its constants are available (calibrated once per
@@ -1541,19 +1567,23 @@ def sparse_mla_sm120_decode_dsv4(
         ceil(topk / 64) + ceil(extra_topk / 64)`` (64-wide candidate tiles;
         DOTS3_SWA tiles 32).
     mid_lse : torch.Tensor
-        Scratch, ``[T, num_heads, num_splits]`` float32.
+        Scratch, ``[T, num_heads, num_splits]`` float32. Holds base-2
+        per-split LSEs, the same convention as ``out_lse``.
     output : torch.Tensor
         In-place output, ``[T, num_heads, d_v]`` bf16.
     out_lse : torch.Tensor
-        In-place log-sum-exp, ``[T, num_heads]`` float32.
+        In-place log-sum-exp, ``[T, num_heads]`` float32. Base 2, not
+        natural log (see the module docstring).
     sm_scale : float
         Softmax scale.
     topk_length : Optional[torch.Tensor]
         Per-token effective top-k length, ``[T]`` int32.
     attn_sink : Optional[torch.Tensor]
         Per-head learnable bias added pre-softmax, shape ``[num_heads]``,
-        dtype float32. FlashMLA V4 convention: ``output *= sigmoid(lse -
-        sink)`` and ``lse' = log(exp(lse) + exp(sink))``.
+        dtype float32, a natural-domain logit. FlashMLA V4 convention:
+        ``output *= sigmoid(lse - sink)`` and ``lse' = log(exp(lse) +
+        exp(sink))``, both written here in natural units -- the kernel
+        converts the sink internally and returns ``lse'`` in base 2.
     extra_kv_cache : Optional[torch.Tensor]
         Optional secondary KV cache (DSv4 C4A / C128A layers). When provided,
         ``extra_indices`` must also be passed.
