@@ -24,6 +24,7 @@ This package provides high-performance normalization kernels:
 - Quantized variants with FP8/FP4 output
 """
 
+import contextlib
 import functools
 import os
 import warnings
@@ -31,7 +32,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from ..api_logging import flashinfer_api
+from ..api_logging import flashinfer_api, warn_experimental_backend_once
 from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
@@ -41,6 +42,7 @@ from ..trace.templates.norm import (
     layernorm_quant_trace,
     layernorm_trace,
     rmsnorm_quant_trace,
+    rmsnorm_fp4quant_trace,
     rmsnorm_trace,
 )
 from ..utils import (
@@ -681,12 +683,79 @@ def _layernorm_quant_fake(
 
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
 # These require SM100+ (Blackwell) GPUs and nvidia-cutlass-dsl
-try:
-    from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
+with contextlib.suppress(ImportError):
     from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
-except ImportError:
-    # nvidia-cutlass-dsl not installed, these functions will not be available
-    pass
+
+
+@flashinfer_api(trace=rmsnorm_fp4quant_trace)
+def rmsnorm_fp4quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    y_fp4: torch.Tensor | None = None,
+    block_scale: torch.Tensor | None = None,
+    global_scale: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    block_size: int = 16,
+    scale_format: str | None = None,
+    is_sf_swizzled_layout: bool = False,
+    enable_pdl: bool | None = None,
+    *,
+    backend: str = "cute-dsl",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse RMSNorm and FP4 quantization.
+
+    Parameters and outputs follow :func:`flashinfer.cute_dsl.rmsnorm_fp4quant`.
+    ``backend="cute-dsl"`` (default) and ``"auto"`` use the existing CuTe kernel.
+    Explicit ``backend="triton"`` selects an experimental SM120 implementation:
+    contiguous BF16 2D/3D inputs, NVFP4/E4M3, hidden size divisible by 16 in
+    [64, 8192], and either scale layout. Triton is imported only on this path.
+    Preallocated typed FP4/FP8 outputs are supported and must not alias inputs.
+
+    The Triton backend uses FP32 normalization without an intermediate BF16
+    rounding and does not promise bitwise equality with CuTe. Finite inputs
+    with representable FP32 intermediate arithmetic and a finite positive
+    device global scale are required. Global scale is read at execution time:
+    dequantization is ``FP4 * block_scale / global_scale``. Zero blocks use a
+    zero block scale. Padded swizzled scale entries are unspecified.
+
+    For Triton, ``enable_pdl=None`` or ``False`` uses ordinary stream ordering;
+    ``True`` is unsupported. The backend is JIT-only, warns once on explicit
+    selection, and is never selected automatically, including when
+    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. See the experimental
+    backend README for a runnable example and the tested dependency versions.
+    """
+    if backend == "triton":
+        warn_experimental_backend_once("rmsnorm_fp4quant", backend)
+        from ..experimental.triton_rmsnorm_fp4quant.backend import run
+
+        return run(
+            input,
+            weight,
+            y_fp4,
+            block_scale,
+            global_scale,
+            eps,
+            block_size,
+            scale_format,
+            is_sf_swizzled_layout,
+            enable_pdl,
+        )
+    if backend not in ("auto", "cute-dsl"):
+        raise ValueError(f"Unknown rmsnorm_fp4quant backend: {backend}")
+    from ..cute_dsl import rmsnorm_fp4quant as cute_rmsnorm_fp4quant
+
+    return cute_rmsnorm_fp4quant(
+        input,
+        weight,
+        y_fp4,
+        block_scale,
+        global_scale,
+        eps,
+        block_size,
+        scale_format,
+        is_sf_swizzled_layout,
+        enable_pdl,
+    )
 
 
 # ============================================================
