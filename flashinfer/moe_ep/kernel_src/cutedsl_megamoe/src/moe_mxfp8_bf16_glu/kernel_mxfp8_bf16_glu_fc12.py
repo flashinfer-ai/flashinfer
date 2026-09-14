@@ -951,14 +951,6 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         experts, hidden_w1, intermediate_gateup = fc1_weight.shape
         experts_w2, intermediate, hidden_w2 = fc2_weight.shape
 
-        if cutlass.const_expr(
-            expert_token_sizes is not None
-            and expert_token_sizes.shape[0] != experts
-        ):
-            raise ValueError(
-                "expert_token_sizes must contain one entry per expert."
-            )
-
         # Swap-AB views.  Weight is A (M,K,L=expert); token data is B
         # (N,K,L=1).  No physical transpose is performed.
         fc1_weight_gemm = cute.make_tensor(
