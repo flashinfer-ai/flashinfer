@@ -314,6 +314,50 @@ class TestAPILogging:
         finally:
             Path(log_file).unlink(missing_ok=True)
 
+    def test_class_method_logging_explicit_allowlist(self):
+        """Classes on the explicit allow-list are prefixed even without "Wrapper".
+
+        ``test_class_method_logging`` above only covers the ``"Wrapper" in
+        class_name`` branch, which passes by name matching. The decorator has a
+        second branch -- an explicit allow-list -- for stateful entry points
+        whose class name does not contain "Wrapper". ``MoELayer`` is the reason
+        that branch matters in practice: its entry point is ``__call__``, so
+        without the prefix every unified-MoE call logs as a bare ``__call__``,
+        which is unreadable and useless as a ``FLASHINFER_DUMP_INCLUDE`` /
+        ``FLASHINFER_DUMP_EXCLUDE`` pattern (it would match any other decorated
+        ``__call__``).
+        """
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
+            log_file = f.name
+
+        try:
+            decorator = self.setup_logging(level=1, dest=log_file)
+
+            # Name deliberately does NOT contain "Wrapper", so a pass here can
+            # only come from the allow-list branch.
+            class MoELayer:
+                @decorator
+                def __call__(self, x):
+                    return x * 3
+
+            # Negative control: same shape, name absent from the allow-list.
+            class NotOnTheAllowList:
+                @decorator
+                def __call__(self, x):
+                    return x * 3
+
+            assert MoELayer()(5) == 15
+            assert NotOnTheAllowList()(5) == 15
+
+            with open(log_file, "r") as f:
+                log_contents = f.read()
+
+            assert "Wrapper" not in "MoELayer"  # guards the premise of this test
+            assert "MoELayer.__call__" in log_contents
+            assert "NotOnTheAllowList.__call__" not in log_contents
+        finally:
+            Path(log_file).unlink(missing_ok=True)
+
     def test_crash_safety_inputs_logged_before_execution(self):
         """Test that inputs are logged BEFORE execution (crash-safe)."""
         with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
