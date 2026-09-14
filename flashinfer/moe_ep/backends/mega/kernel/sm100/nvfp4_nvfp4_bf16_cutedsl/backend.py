@@ -152,7 +152,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and fleet_params.max_tokens_per_rank in (256, 4096)
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
-            and not k.in_kernel_fc2_reduce
+            and not k.enable_in_kernel_fc2_reduce
             and k.combine_dtype == "bf16"
             and k.apply_topk_in_fc1
         )
