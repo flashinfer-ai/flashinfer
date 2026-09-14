@@ -59,12 +59,31 @@ the wheel platform tag. For example, an x86 CUDA 13 provider is
 
 ```mermaid
 flowchart LR
-    shim["flashinfer-jit-cache shim"] --> sm80["provider sm80"]
-    shim --> sm90["provider sm90a"]
-    shim --> sm120["provider sm120f"]
-    runtime["FlashInfer AOT resolver"] --> shim
-    runtime -->|"module + target SM"| selected["one or more compatible provider roots"]
+    subgraph install["Install time"]
+        shim["flashinfer-jit-cache shim"]
+        wheels["installed provider wheels<br/>(sm80, sm90a, sm120f, ...)"]
+        shim -->|"default dependency metadata"| wheels
+    end
+
+    subgraph runtime["Runtime"]
+        resolver["FlashInfer AOT resolver"]
+        registry["shim provider registry"]
+        selected["selected provider root(s)"]
+        modules["loaded module .so file(s)"]
+
+        resolver -->|"query installed providers"| registry
+        registry -->|"manifests + provider roots"| resolver
+        resolver -->|"filter by module + target SM"| selected
+        selected -->|"load directly"| modules
+    end
+
+    shim -.->|"exposes"| registry
+    wheels -.->|"entry-point manifests"| registry
+    wheels -.->|"contain"| selected
 ```
+
+The direct load is intentional, but provider roots become eligible only after
+the shim registry discovers and returns their entry-point manifests.
 
 Provider wheels register the `flashinfer.jit_cache.providers` entry-point group.
 The entry point returns a generated manifest with this schema:
