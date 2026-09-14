@@ -1166,6 +1166,8 @@ class GmemCResource(MemoryResource):
                         (tma_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
                     )
                     prims.cp_async_bulk_commit_group()
+                if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                    prims.cp_async_bulk_wait_group(0, read=True)
         elif cutlass.const_expr(call_in_tma == calls_per_tma - 1):
             tma_col_base = col_base - Int32(call_in_tma * epi_t2r_repx)
             if (warp_idx == Int32(self.cfg.epilogue_warp_idx)) & prims.elect_sync():

@@ -1897,17 +1897,6 @@ def _batched_gemm_kernel_bf16_body(
                     alignment=8,
                 )
             )
-        if cutlass.const_expr(
-            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
-        ):
-            proxy_barrier_alloc = smem_allocator.add(
-                SmemAllocation(
-                    "proxy_cluster_mbarriers",
-                    dtype=cutlass.Int64,
-                    count=2 * pcfgs["proxy"].num_stages,
-                    alignment=8,
-                )
-            )
         if cutlass.const_expr(cfg.use_early_exit and cfg.use_clc_fast_drain):
             fast_drain_response_alloc = smem_allocator.add(
                 SmemAllocation(
@@ -1924,14 +1913,29 @@ def _batched_gemm_kernel_bf16_body(
                     alignment=8,
                 )
             )
+    if cutlass.const_expr(
+        cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+    ):
+        proxy_barrier_alloc = smem_allocator.add(
+            SmemAllocation(
+                "proxy_cluster_mbarriers",
+                dtype=cutlass.Int64,
+                count=2 * pcfgs["proxy"].num_stages,
+                alignment=8,
+            )
+        )
     smem_allocator.compute_layout()
 
     clc_response_ptr = None
     fast_drain_response_ptr = None
     fast_drain_mbar_ptr = None
-    if cutlass.const_expr(cfg.is_persistent):
+    if cutlass.const_expr(
+        cfg.is_persistent
+        or (cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0)
+    ):
         smem_allocator.allocate()
         smem_base = smem_allocator.smem_base.data_ptr()
+    if cutlass.const_expr(cfg.is_persistent):
         clc_response_ptr = cute.make_ptr(
             cutlass.Int128,
             smem_base + clc_response_alloc.offset,
@@ -1952,15 +1956,6 @@ def _batched_gemm_kernel_bf16_body(
             pcfgs["work_throttle"] = replace(
                 pcfgs["work_throttle"], barrier_ptr=work_throttle_barrier_ptr
             )
-        if cutlass.const_expr(
-            cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
-        ):
-            proxy_barrier_ptr = cute.make_ptr(
-                cutlass.Int64,
-                smem_base + proxy_barrier_alloc.offset,
-                mem_space=cutlass.AddressSpace.smem,
-            )
-            pcfgs["proxy"] = replace(pcfgs["proxy"], barrier_ptr=proxy_barrier_ptr)
         if cutlass.const_expr(cfg.use_early_exit and cfg.use_clc_fast_drain):
             fast_drain_response_ptr = cute.make_ptr(
                 cutlass.Int128,
@@ -1972,6 +1967,15 @@ def _batched_gemm_kernel_bf16_body(
                 smem_base + fast_drain_mbar_alloc.offset,
                 mem_space=cutlass.AddressSpace.smem,
             )
+    if cutlass.const_expr(
+        cfg.has_gather and cfg.has_cluster and cfg.num_sync_warps > 0
+    ):
+        proxy_barrier_ptr = cute.make_ptr(
+            cutlass.Int64,
+            smem_base + proxy_barrier_alloc.offset,
+            mem_space=cutlass.AddressSpace.smem,
+        )
+        pcfgs["proxy"] = replace(pcfgs["proxy"], barrier_ptr=proxy_barrier_ptr)
 
     # TMEM allocator
     tmem_allocator = TmemAllocator()

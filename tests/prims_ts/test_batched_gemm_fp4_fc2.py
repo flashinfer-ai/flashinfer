@@ -614,11 +614,11 @@ class TestFp4Fc2HT:
 
     @pytest.mark.timeout(240)
     @pytest.mark.parametrize(
-        ("epi_tile_n", "tmem_ldst_max_num_regs"),
-        ((64, 32), (128, 64)),
+        ("epi_tile_n", "tmem_ldst_max_num_regs", "num_stages_workid"),
+        ((64, 32, 3), (128, 64, 3), (64, 32, 1)),
     )
     def test_ht_tile256_k256_no_swap_multi_work_tile_overlap(
-        self, epi_tile_n, tmem_ldst_max_num_regs
+        self, epi_tile_n, tmem_ldst_max_num_regs, num_stages_workid
     ):
         """Exercise both TMEM windows on persistent resident clusters.
 
@@ -656,6 +656,7 @@ class TestFp4Fc2HT:
             sf_bits=8,
             **uniform_pipeline_stage_overrides(4),
             tile_scheduler=1,
+            num_stages_workid=num_stages_workid,
             num_stages_tmem_acc=1,
             sf_layout_a=int(SfLayout.R128c4),
             sf_layout_b=int(SfLayout.R128c4),
@@ -673,7 +674,8 @@ class TestFp4Fc2HT:
         assert result, (
             "FP4 FC2 persistent overlap handoff failed: "
             f"epi_tile_n={epi_tile_n}, "
-            f"tmem_ldst_max_num_regs={tmem_ldst_max_num_regs}"
+            f"tmem_ldst_max_num_regs={tmem_ldst_max_num_regs}, "
+            f"num_stages_workid={num_stages_workid}"
         )
 
     @pytest.mark.timeout(240)
