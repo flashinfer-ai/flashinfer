@@ -114,6 +114,13 @@ class RoutingConfig:
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
     routed_scaling_factor: Optional[float] = None
+    # Append new fields BELOW this KW_ONLY sentinel. ``_: KW_ONLY`` is a
+    # ``dataclasses`` marker, not a real field -- every field declared after it
+    # becomes keyword-only. That way a field added later can never silently
+    # rebind an existing positional argument at a call site that still looks
+    # correct. The fields above keep their current binding, so adding this
+    # changes nothing for existing callers.
+    _: KW_ONLY
 
     def __repr__(self) -> str:
         parts = [f"num_experts={self.num_experts!r}", f"top_k={self.top_k!r}"]
@@ -338,6 +345,13 @@ class ExpertConfig:
     local_expert_offset: int = 0
     local_num_experts: Optional[int] = None
     num_fused_shared_experts: int = 0
+    # Append new fields BELOW this KW_ONLY sentinel. ``_: KW_ONLY`` is a
+    # ``dataclasses`` marker, not a real field -- every field declared after it
+    # becomes keyword-only. That way a field added later can never silently
+    # rebind an existing positional argument at a call site that still looks
+    # correct. The fields above keep their current binding, so adding this
+    # changes nothing for existing callers.
+    _: KW_ONLY
 
     def __post_init__(self) -> None:
         if self.num_fused_shared_experts < 0:
