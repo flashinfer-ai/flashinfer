@@ -1453,12 +1453,17 @@ class FmhaDecodeConfig:
                 )
             return
 
-        if not (self.q_dtype == self.kv_dtype == self.out_dtype):
-            raise ValueError("block-sparse requires q_dtype == kv_dtype == out_dtype")
-        if self.q_dtype not in (Float16, BFloat16):
-            raise ValueError(
-                "block-sparse supports only matching Float16 or BFloat16 IO"
-            )
+        # Sage attention dequantizes 8-bit Q/K/V into a 16-bit output;
+        # ``validate_sage_profile`` owns its dtype and profile checks.
+        if not self.use_sage_attention:
+            if not (self.q_dtype == self.kv_dtype == self.out_dtype):
+                raise ValueError(
+                    "block-sparse requires q_dtype == kv_dtype == out_dtype"
+                )
+            if self.q_dtype not in (Float16, BFloat16):
+                raise ValueError(
+                    "block-sparse supports only matching Float16 or BFloat16 IO"
+                )
 
         kv_block_size = _validate_sparse_kv_block_size(self.kv_block_size)
         selected_q_tile = _select_block_sparse_q_tile_size(
@@ -1939,8 +1944,6 @@ class FmhaDecodeConfig:
             )
         if self.use_paged_kv or self.headdim != 128:
             raise ValueError("Sage attention requires contiguous K/V with headdim=128")
-        if self.use_block_sparse:
-            raise ValueError("Sage attention does not support block-sparse routes yet")
         if not self.streams_tmem_p_fragments:
             raise ValueError(
                 "Sage attention requires a two-instance Keeps profile: "
@@ -1948,19 +1951,20 @@ class FmhaDecodeConfig:
             )
         if self.heads_q_per_kv <= 0:
             raise ValueError("Sage attention requires a shape-aware decode config")
+        # Scale addressing resolves the tile through the work tile, so the
+        # static and persistent grids share one kernel. The remaining features
+        # publish partials or reshape the Q domain and stay unsupported.
         if (
             self.use_split_kv
             or self.use_separate_reduction_kernel
             or self.use_cluster_smem_reduction
-            or self.use_persistent_scheduler
             or self.use_variable_seqlens_q
             or self.use_sliding_window_causal
             or self.use_attention_sinks
         ):
             raise ValueError(
-                "Sage attention supports the static direct-output grid only, "
-                "without split-KV, persistent scheduling, variable-Q, "
-                "sliding-window, or attention-sink features"
+                "Sage attention supports the direct-output grid only, without "
+                "split-KV, variable-Q, sliding-window, or attention-sink features"
             )
 
     @property
@@ -2238,7 +2242,7 @@ class FmhaDecodeConfig:
         # below. Block-sparse structural, masking, and reduction constraints
         # are validated separately, and a dense contiguous launch is direct.
         if self.use_block_sparse:
-            return profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+            return self._uses_contiguous_grouped_keeps_recipe
         if (
             self._uses_contiguous_grouped_keeps_recipe
             and direct

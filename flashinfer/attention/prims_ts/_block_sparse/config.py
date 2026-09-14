@@ -373,6 +373,7 @@ def _validate_block_sparse_static_profile(
     output_dtype: torch.dtype | None,
     max_blocks_per_row: object = _CAPACITY_UNSET,
     page_size: int | None = None,
+    use_proxy_routes: bool = False,
     sage: SageAttentionParams | None = None,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection.
@@ -380,7 +381,8 @@ def _validate_block_sparse_static_profile(
     With ``sage`` the 8-bit dtype rules of Sage attention replace the matching
     16-bit rule, the output defaults to bfloat16, the block sizes must select a
     streamed Keeps profile (Q64/KV256 or Q128/KV128), and the scale block sizes
-    are validated against the selected Q tile.
+    are validated against the selected Q tile; proxy routes additionally
+    require the summary K scales.
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -457,6 +459,9 @@ def _validate_block_sparse_static_profile(
             q_dtype=q_dtype,
             kv_dtype=kv_dtype,
             out_dtype=output_dtype,
+            summary_seq_len=(
+                ceil_div(seq_len_kv, kv_block_size) if use_proxy_routes else None
+            ),
         )
         dtype_key = _dtype_key(q_dtype)
     kv_route_size = _select_block_sparse_kv_route_size(

@@ -44,10 +44,12 @@ class SageAttentionParams:
     ``k_scale`` is fp32 ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]`` in
     the trtllm-gen flat layout. ``v_scale`` and the optional ``v_mean`` are
     fp32 ``[Hkv, D]``; ``v_mean`` is added back to the normalized output when
-    V was quantized around its per-channel mean. ``k_summary_scale`` carries
-    the flat-layout scales of block-sparse proxy summaries and is not consumed
-    by dense attention. Every scale must be positive and finite; the kernel
-    does not check the values.
+    V was quantized around its per-channel mean. ``k_summary_scale`` is fp32
+    ``[Hkv, flat_scale_numel(B, num_kv_blocks, k_block_size)]``: the flat-layout
+    scales of block-sparse proxy K summaries, quantized as one more K sequence
+    of ``num_kv_blocks`` tokens. It is required by proxy routes and rejected
+    otherwise. Every scale must be positive and finite; the kernel does not
+    check the values.
     """
 
     q_scale: torch.Tensor
@@ -57,6 +59,16 @@ class SageAttentionParams:
     v_mean: torch.Tensor | None = None
     q_block_size: int = 1
     k_block_size: int = 16
+
+
+def sage_v_mean_launch_tensor(params: SageAttentionParams) -> torch.Tensor:
+    """Return the tensor bound to the V mean slot of a Sage launch.
+
+    The adapter signature always carries the slot; without ``v_mean`` the
+    kernel never dereferences it, so ``v_scale`` stands in.
+    """
+
+    return params.v_scale if params.v_mean is None else params.v_mean
 
 
 def flat_scale_numel(batch_size: int, seq_len: int, block_size: int) -> int:
@@ -170,16 +182,35 @@ def validate_sage_params(
     kv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     device: torch.device | None = None,
+    summary_seq_len: int | None = None,
 ) -> None:
-    """Validate the block sizes, dtypes and scale tensors of one dense call."""
+    """Validate the block sizes, dtypes and scale tensors of one call.
+
+    ``summary_seq_len`` is the number of KV blocks when block-sparse proxy
+    routes are enabled; ``k_summary_scale`` must then cover that summary
+    sequence in the flat layout and must be absent otherwise.
+    """
 
     if not isinstance(params, SageAttentionParams):
         raise TypeError("sage must be a SageAttentionParams instance")
     _validate_block_sizes(params, tile_size_q)
     _validate_dtypes(q_dtype, kv_dtype, out_dtype)
-    if params.k_summary_scale is not None:
-        raise ValueError(
-            "k_summary_scale is consumed only by block-sparse proxy routes"
+    if summary_seq_len is None:
+        if params.k_summary_scale is not None:
+            raise ValueError(
+                "k_summary_scale is consumed only by block-sparse proxy routes"
+            )
+    elif params.k_summary_scale is None:
+        raise ValueError("k_summary_scale is required by block-sparse proxy routes")
+    else:
+        _validate_scale_tensor(
+            params.k_summary_scale,
+            "k_summary_scale",
+            expected_shape=(
+                num_kv_heads,
+                flat_scale_numel(batch_size, summary_seq_len, params.k_block_size),
+            ),
+            device=device,
         )
     _validate_scale_tensor(
         params.q_scale,
@@ -223,5 +254,6 @@ __all__ = [
     "flat_scale_numel",
     "flat_scale_slot",
     "log2_block_size",
+    "sage_v_mean_launch_tensor",
     "validate_sage_params",
 ]

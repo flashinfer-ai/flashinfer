@@ -138,6 +138,23 @@ def quantize_v_channels(
     return quantized, v_scale, v_mean
 
 
+def quantize_v_channels_with_scale(
+    values: torch.Tensor,
+    v_scale: torch.Tensor,
+    v_mean: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Quantize ``[B, S, Hkv, D]`` values with existing per-channel V scales.
+
+    Block-sparse proxy summaries share the V scale of the tokens they stand
+    for; with V smoothing they are built from ``V - v_mean``.
+    """
+
+    values = values.float()
+    if v_mean is not None:
+        values = values - v_mean[None, None]
+    return _quantize_with_scale(values, v_scale[None, None], torch.float8_e4m3fn)
+
+
 def dequantize_v_channels(
     quantized: torch.Tensor,
     v_scale: torch.Tensor,

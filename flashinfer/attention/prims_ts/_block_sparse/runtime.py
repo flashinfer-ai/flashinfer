@@ -27,7 +27,11 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
-from ..sage import SageAttentionParams, validate_sage_params
+from ..sage import (
+    SageAttentionParams,
+    sage_v_mean_launch_tensor,
+    validate_sage_params,
+)
 from .common import _SIGNED_INT32_MAX
 
 if TYPE_CHECKING:
@@ -435,6 +439,7 @@ def validate_block_sparse_run(
             kv_dtype=state.kv_dtype,
             out_dtype=state.output_dtype,
             device=state.device,
+            summary_seq_len=num_kv_blocks if use_proxy_routes else None,
         )
 
     effective_scale = (
@@ -482,6 +487,7 @@ def sage_scale_tensors(
         for name, tensor in (
             ("q_scale", sage.q_scale),
             ("k_scale", sage.k_scale),
+            ("k_summary_scale", sage.k_summary_scale),
             ("v_scale", sage.v_scale),
             ("v_mean", sage.v_mean),
         )
@@ -492,18 +498,18 @@ def sage_scale_tensors(
 def sage_launch_args(sage: SageAttentionParams | None) -> tuple[torch.Tensor, ...]:
     """Return the scale tensors a Sage adapter consumes, in ABI order.
 
-    The V mean slot is always bound so the adapter signature stays fixed;
-    without ``v_mean`` the kernel never reads it and ``v_scale`` fills it.
+    Dense and block-sparse adapters share the order. The summary K scales are
+    present only for proxy plans, and the V mean slot is always bound
+    (``sage_v_mean_launch_tensor``) even when the plan has no ``v_mean``.
     """
 
     if sage is None:
         return ()
-    return (
-        sage.q_scale,
-        sage.k_scale,
-        sage.v_scale,
-        sage.v_scale if sage.v_mean is None else sage.v_mean,
-    )
+    tensors = [sage.q_scale, sage.k_scale]
+    if sage.k_summary_scale is not None:
+        tensors.append(sage.k_summary_scale)
+    tensors.extend((sage.v_scale, sage_v_mean_launch_tensor(sage)))
+    return tuple(tensors)
 
 
 def record_block_sparse_run_args(
@@ -545,13 +551,14 @@ def launch_block_sparse(
 
     sparse_format = state.sparse_format
     use_proxy_routes = state.use_proxy_routes
+    sage_args = state.sage_launch_args
     if not state.use_block_sparse:
         state.compiled(
             run_args.q,
             run_args.k,
             run_args.v,
             run_args.out,
-            *state.sage_launch_args,
+            *sage_args,
             run_args.sm_scale,
         )
     elif run_args.paged_kv is not None:
@@ -590,6 +597,7 @@ def launch_block_sparse(
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
+            *sage_args,
             run_args.sm_scale,
         )
     elif sparse_format == "bitmask" and not use_proxy_routes:
@@ -604,6 +612,7 @@ def launch_block_sparse(
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
+            *sage_args,
             run_args.sm_scale,
         )
     elif sparse_format == "bsr" and use_proxy_routes:
@@ -624,6 +633,7 @@ def launch_block_sparse(
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
+            *sage_args,
             run_args.sm_scale,
         )
     elif sparse_format == "bitmask" and use_proxy_routes:
@@ -642,6 +652,7 @@ def launch_block_sparse(
             state.row_route_offsets,
             state.route_workspace,
             state.max_blocks_per_row,
+            *sage_args,
             run_args.sm_scale,
         )
     else:

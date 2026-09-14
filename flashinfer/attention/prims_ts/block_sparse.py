@@ -221,20 +221,18 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ordered on one stream or externally synchronized. Unordered concurrent
         runs require distinct wrappers.
 
-        ``sage`` enables Sage attention on a dense plan whose block sizes select
-        a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
+        ``sage`` enables Sage attention in both modes when the block sizes
+        select a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
         ``torch.float8_e4m3fn`` with the per-block scales of
         :class:`SageAttentionParams`, V is ``torch.float8_e4m3fn`` with
         per-channel scales, and the output is ``torch.bfloat16`` (the default)
-        or ``torch.float16``. The scale block sizes are compile-time; the scale
-        tensors are bound to the plan and validated again by every ``run()``.
+        or ``torch.float16``. Block-sparse proxy routes additionally require
+        ``k_summary_scale`` for the quantized K summaries. The scale block
+        sizes are compile-time; the scale tensors are bound to the plan and
+        validated again by every ``run()``.
         """
 
         if use_block_sparse:
-            if sage is not None:
-                raise NotImplementedError(
-                    "Sage attention is not supported by block-sparse plans yet"
-                )
             if max_blocks_per_row is None:
                 raise ValueError(
                     "max_blocks_per_row is required by a block-sparse plan"
@@ -268,6 +266,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             max_blocks_per_row=(
                 max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
             ),
+            use_proxy_routes=use_proxy_routes,
             sage=sage,
         )
         if use_proxy_routes and static.mask_type != "dense":
@@ -337,7 +336,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``[B, num_kv_blocks, Hkv, D]``. Both are block means over the block's
         structural tokens (the final partial block averages only the tokens it
         covers); a proxy block stands for that many identical tokens, so its
-        probability carries the block's token mass.
+        probability carries the block's token mass. With Sage attention the
+        summaries are E4M3: K summaries are dequantized with
+        ``k_summary_scale`` and V summaries share ``v_scale`` (built from
+        ``V - v_mean`` when a mean is used).
 
         Every row must fit the planned semantic-block capacity. Reusable runs
         trust routing values. CuTe DSL assertions can diagnose violations when

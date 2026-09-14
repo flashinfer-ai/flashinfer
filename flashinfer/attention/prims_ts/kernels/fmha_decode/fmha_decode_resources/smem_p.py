@@ -394,6 +394,25 @@ class SmemPResource(DecodeGenResourceBase):
             route_is_proxy=_route_is_proxy(route_flags),
         )
 
+    @producer_work
+    @cute.jit
+    def compute_sage_proxy_route_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        route_flags: Int32,
+        sage_scale_arr: cutlass.Array,
+    ) -> None:
+        """Stream exact or proxy K32 fragments with per-group Sage scales."""
+        assert self.cfg.use_block_sparse_proxy_routes and self.cfg.use_sage_attention
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=_route_is_proxy(route_flags),
+            sage_scale_arr=sage_scale_arr,
+        )
+
     @cute.jit
     def _compute_p_fragments_impl(
         self,
