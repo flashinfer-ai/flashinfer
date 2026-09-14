@@ -52,6 +52,22 @@ FlashInfer provides three packages:
 
 This eliminates compilation and downloading overhead at runtime.
 
+.. note::
+
+    A module that ships prebuilt in ``flashinfer-jit-cache`` is loaded from
+    the wheel before the source tree is consulted, so while these packages are
+    installed an edit under ``csrc/`` or ``include/`` has no effect and the
+    prebuilt kernel keeps running. Clearing ``~/.cache/flashinfer`` does not
+    change that -- the artifact does not come from there. Set
+    ``FLASHINFER_FORCE_JIT=1`` to ignore prebuilt artifacts and build every
+    module from source:
+
+    .. code-block:: bash
+
+        export FLASHINFER_FORCE_JIT=1
+
+    It logs the artifact it bypasses, once per module.
+
 
 .. _install-from-source:
 
