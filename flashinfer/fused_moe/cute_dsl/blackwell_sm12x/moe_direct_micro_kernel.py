@@ -5079,11 +5079,6 @@ _CUTE_DSL_MODULE = "b12x_moe_direct_micro"
 # recomputed after a reload.
 _PROBE_SUFFIX = ".launch_probe.json"
 
-# Options for the reference compile the block-dim probe measures. Deliberately
-# without --enable-tvm-ffi, which makes a compile opaque to introspection; see
-# the probe() docstring in compile_direct_micro_kernel.
-_PROBE_OPTIONS = "--opt-level 2"
-
 
 def _kernel_source_files() -> Tuple[str, ...]:
     """Source files whose content invalidates the on-disk kernel cache.
@@ -5128,7 +5123,7 @@ def _write_probe(kernel_name: str, accepts: bool) -> None:
     so it is not covered by that build's module lock. The write is atomic and
     the value is a pure function of the artifact, so a concurrent writer can
     only produce the identical file; a reader that arrives in between sees no
-    sidecar and falls back to the MMA micro kernel for that launch.
+    sidecar and retries the reference probe, falling back if that probe fails.
     """
     path = _probe_path(kernel_name)
     tmp = path.with_suffix(f".tmp.{os.getpid()}")
@@ -5138,9 +5133,8 @@ def _write_probe(kernel_name: str, accepts: bool) -> None:
             json.dump({"accepts_block_dim": accepts}, f)
         os.replace(tmp, path)
     except Exception:
-        # Losing the sidecar costs the direct micro backend on the next
-        # process, not correctness: a missing probe reads as "cannot launch"
-        # and the dispatch falls back to the MMA micro kernel.
+        # A missing sidecar triggers a reference probe on the next process.
+        # If recovery fails, dispatch safely falls back to the MMA micro kernel.
         pass
     finally:
         if tmp.exists():
@@ -5182,6 +5176,9 @@ def compile_direct_micro_kernel(
     resolved_options = options or "--opt-level 2 --enable-tvm-ffi"
     if "--enable-tvm-ffi" not in resolved_options:
         resolved_options = f"{resolved_options} --enable-tvm-ffi"
+    probe_options = " ".join(
+        token for token in resolved_options.split() if token != "--enable-tvm-ffi"
+    )
     compile_m = int(kernel.m_const) if int(kernel.m_const) != 0 else 8
     # A fake stream rather than ``current_cuda_stream()``: a live stream handle
     # baked into an exported .o is meaningless to the process that reloads it.
@@ -5236,20 +5233,31 @@ def compile_direct_micro_kernel(
         Measured on the reference side for direct_micro_m1_k256_n512_t2
         (sm_121a): 74 regs, 768 max threads per block, against a 512-thread
         CTA. This costs one extra compile, paid once per artifact on a
-        cold miss and never again: the answer is persisted next to the ``.o``
-        and every later process reads it back.
+        cold miss: successful measurements are persisted next to the ``.o``.
+        A later process retries the reference probe if the record is missing.
         """
-        return compiled_direct_micro_accepts_block_dim(
-            compile_with(_PROBE_OPTIONS), block_dim
-        )
+        try:
+            reference = compile_with(probe_options)
+        except Exception as exc:
+            import warnings
+
+            warnings.warn(
+                "direct micro reference compilation failed "
+                f"({type(exc).__name__}: {exc}); falling back to the MMA micro "
+                "MoE backend for this launch.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+        return compiled_direct_micro_accepts_block_dim(reference, block_dim)
 
     if disk_kernel_name is None or cute_dsl_cache_disabled():
-        return compile_fn(), probe()
+        return compile_fn(), probe() is True
 
     # The probe can only run against a fresh compile, so capture it from inside
     # the closure: on a cache hit the closure never runs and the recorded value
-    # is read back instead.
-    probed: dict[str, bool] = {}
+    # is read back instead, or recovered with a new reference probe if missing.
+    probed: dict[str, bool | None] = {}
 
     def compile_and_probe():
         compiled = compile_fn()
@@ -5263,28 +5271,24 @@ def compile_direct_micro_kernel(
         extra_key_files=_kernel_source_files(),
     )
     if "accepts" in probed:
-        _write_probe(disk_kernel_name, probed["accepts"])
-        return compiled, probed["accepts"]
-    recorded = _read_probe(disk_kernel_name)
-    # A missing sidecar means "unknown", which must read as "cannot launch":
-    # guessing True risks a CUDA launch failure, while False costs only the
-    # fallback to the MMA micro kernel.
-    return compiled, bool(recorded)
+        accepts = probed["accepts"]
+    else:
+        accepts = _read_probe(disk_kernel_name)
+        if accepts is None:
+            accepts = probe()
+    if accepts is not None:
+        _write_probe(disk_kernel_name, accepts)
+    return compiled, accepts is True
 
 
 _PROBE_FAILURE_WARNED = False
 
 
 def _compiled_cuda_library(compiled):
-    """The ``cudaLibrary_t`` backing a freshly compiled kernel.
+    """Extract the CUDA library from a non-TVM-FFI reference compile.
 
-    Two object shapes reach this. A ``--enable-tvm-ffi`` compile returns a
-    ``TVMFFIJitCompiledFunctionWithKwargs`` whose ``.to(None).jit_module`` is
-    None, so the legacy chain below raises; it exposes the library through the
-    public ``.library`` property instead (which lazily materializes it and
-    raises RuntimeError for a host-only compile). Older non-TVM-FFI compiles
-    only have the ``.to(None).jit_module.cuda_library`` chain, kept so a
-    caller passing explicit ``options`` is not broken.
+    Try the DSL's library loader, then its public library property, with
+    compatibility fallbacks for older executor and JIT-module object shapes.
     """
     # Callers must pass a compile made *without* --enable-tvm-ffi: a TVM-FFI
     # compile exposes no route to its device code at all (see the probe()
@@ -5323,10 +5327,13 @@ def _compiled_cuda_library(compiled):
     return cuda_library
 
 
-def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
+def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool | None:
     """Return whether the compiled direct micro kernel can launch ``block_dim``
     threads (register pressure can cap CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK
     below the 512-thread CTA the fused body wants).
+
+    Return None when inspection fails and launch support remains unknown.
+    Only successful measurements (True or False) should be persisted.
 
     Only meaningful for a *freshly compiled* kernel. A kernel reloaded from the
     disk cache is a bare ``tvm_ffi.Function`` -- ``ExternalBinaryModule``
@@ -5367,7 +5374,7 @@ def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
     except (AttributeError, KeyError, TypeError):
         # Expected introspection misses on this DSL version; fall back to the
         # MMA micro kernel silently.
-        return False
+        return None
     except Exception as exc:
         # Anything else means the probe itself broke (e.g. a DSL internals
         # change). Warn once so the direct micro backend is not silently
@@ -5383,7 +5390,7 @@ def compiled_direct_micro_accepts_block_dim(compiled, block_dim: int) -> bool:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        return False
+        return None
 
 
 __all__ = [
