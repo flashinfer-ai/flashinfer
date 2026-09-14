@@ -16,6 +16,8 @@ Run on one Blackwell GPU from the FlashInfer repo root::
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
@@ -119,15 +121,22 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
         )
 
     elif quant_type == "bf16":
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.staging import (
-            stage_mega_moe_inputs as torch_stage,
-        )
-        from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.staging import (
-            stage_mega_moe_inputs as fused_stage,
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl import (
+            staging,
         )
 
-        stage = fused_stage if fused else torch_stage
-        stage(hidden_states, topk_weights, topk_ids, x, idx_out, w_out)
+        with patch.object(
+            staging,
+            "_torch_stage_mega_moe_inputs",
+            wraps=staging._torch_stage_mega_moe_inputs,
+        ) as fallback:
+            staging.stage_mega_moe_inputs(
+                hidden_states, topk_weights, topk_ids, x, idx_out, w_out
+            )
+            if not fused or hidden_states.shape[0] == 0:
+                fallback.assert_called_once()
+            else:
+                fallback.assert_not_called()
 
 
 @pytest.mark.arch_blackwell

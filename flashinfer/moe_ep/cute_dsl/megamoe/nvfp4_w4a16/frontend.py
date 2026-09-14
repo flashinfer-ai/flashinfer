@@ -14,6 +14,7 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     resolve_gate_up_clamp,
     sym_zeros,
@@ -129,6 +130,7 @@ class MegaMoEW4A16Frontend:
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         if self._config.gate_up_clamp != clamp:
+            ensure_not_capturing("set_gate_up_clamp (clamp change)")
             self.release()
             self._config = dataclasses.replace(self._config, gate_up_clamp=clamp)
 
@@ -149,16 +151,13 @@ class MegaMoEW4A16Frontend:
             self.config, {**knobs, "gate_up_clamp": self.config.gate_up_clamp}
         )
         if new_config != self._config:
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-                ensure_not_capturing,
-            )
-
             ensure_not_capturing("apply_knobs (config change)")
             self.release()
             self._config = new_config
 
     def release(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
         self._mega = None
 
@@ -181,6 +180,7 @@ class MegaMoEW4A16Frontend:
         if self._mega is not None:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         import cutlass
         import cutlass.cute as cute
         from .megamoe_kernel import Sm100W4A16MegaMoEKernel
@@ -404,6 +404,7 @@ class MegaMoEW4A16Frontend:
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
         if self._reduce is None:
+            ensure_not_capturing("top-k reducer cute.compile")
             reducer = TopkReduce(
                 self.config.hidden,
                 self.config.num_topk,
@@ -468,7 +469,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import resolve_knobs
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import resolve_knobs, with_knobs
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
     # lookup; an explicit dict (including {}) bypasses cache and defaults.
@@ -500,8 +501,8 @@ def get_symm_buffer_for_w4a16_mega_moe(
         num_total_experts=num_total_experts,
         hidden=hidden,
         intermediate=intermediate,
-        **optional_config,
     )
+    cfg = with_knobs(cfg, optional_config)
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)

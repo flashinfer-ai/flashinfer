@@ -313,7 +313,10 @@ def validate_mega_arch_sm120() -> None:
 
 
 def validate_fleet_weights(
-    weights: MoEWeightPack, params: FleetParams, world_size: int
+    weights: MoEWeightPack,
+    params: FleetParams,
+    world_size: int,
+    supports_global_weight_scales: bool = False,
 ) -> None:
     """Check canonical weight layout matches EP sizing for this rank."""
     if world_size <= 0:
@@ -328,6 +331,13 @@ def validate_fleet_weights(
     if not isinstance(pack, MoEWeightPack):
         raise MoEEpConfigError(
             f"layer weights must be MoEWeightPack, got {type(pack).__name__}"
+        )
+    if not supports_global_weight_scales and (
+        pack.w13_global_scale is not None or pack.w2_global_scale is not None
+    ):
+        raise MoEEpConfigError(
+            "global weight scales require a backend that supports them; "
+            "only W4A16 MegaMoE currently supports separate per-expert scales"
         )
     hidden = params.token_hidden_size
     for name in ("w13", "w2"):

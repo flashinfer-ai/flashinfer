@@ -154,8 +154,15 @@ _MXFP8_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
 }
 
 # W4A16 uses the measured flag4/epi-warp atomic profile at every buffer size.
-# Reuse the existing N128 profile without NVFP4's larger-batch transitions.
-_W4A16_TOKEN_KNOBS: Dict[str, Any] = dict(_SMALL_TOKEN_KNOBS)
+_W4A16_TOKEN_KNOBS: Dict[str, Any] = {
+    "mma_tiler_mnk": (256, 128, 256),
+    "cluster_shape_mnk": (2, 1, 1),
+    "group_hint": 512,
+    "flag_batch": 4,
+    "epi_flag_batch": (2, 4),
+    "token_back_mode": "epi_warps",
+    "load_balance_mode": "atomic_counter",
+}
 
 # TODO: WIP BF16 supports one validated fixed MMA/cluster geometry.
 _BF16_TOKEN_KNOBS: Dict[str, Any] = {

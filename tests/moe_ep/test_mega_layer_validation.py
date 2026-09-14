@@ -129,6 +129,54 @@ def test_mega_layer_requires_weights():
         )
 
 
+@pytest.mark.parametrize("backend_name", ("w4a4", "w4a16", "split"))
+@pytest.mark.parametrize("scale_field", ("w13_global_scale", "w2_global_scale"))
+def test_layer_global_weight_scale_support(backend_name, scale_field):
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpConfigError,
+        MoEEpLayer,
+        PrequantizedMoEWeights,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    config_types = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
+    backend = "nccl_ep"
+    if backend_name in config_types:
+        backend = MegaConfig(
+            megakernel=config_types[backend_name](intermediate_size=128, top_k=2),
+            preprocess_weights=False,
+        )
+    weights = PrequantizedMoEWeights(
+        torch.zeros(2, 256, 64, dtype=torch.uint8),
+        torch.zeros(2, 128, 64, dtype=torch.uint8),
+        torch.zeros(2, 256, 8, dtype=torch.float8_e4m3fn),
+        torch.zeros(2, 128, 8, dtype=torch.float8_e4m3fn),
+        **{scale_field: torch.full((2,), 2.0)},
+    )
+    with (
+        mock.patch("torch.cuda.is_available", return_value=False),
+        nullcontext()
+        if backend_name == "w4a16"
+        else pytest.raises(MoEEpConfigError, match="global weight scales"),
+    ):
+        layer = MoEEpLayer(
+            BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            FleetParams(num_experts=2, max_tokens_per_rank=64, token_hidden_size=128),
+            weights,
+            backend=backend,
+        )
+        layer.destroy()
+
+
 def test_mega_layer_forward_rejects_token_overflow():
     import torch
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +75,7 @@ def stage_mega_moe_inputs(
     live-count memo. Empty batches use the original single tail-fill operation.
     Strided, misaligned and aliased views keep their existing torch behavior.
     A new specialization first seen during capture also uses torch staging.
+    ``FLASHINFER_MEGA_FUSED_STAGE=0`` forces the original torch path.
     """
     torch_args = (
         hidden_states,
@@ -84,7 +86,9 @@ def stage_mega_moe_inputs(
         topk_weights_out,
     )
     tensors = (hidden_states, topk_ids, topk_weights, x, topk_idx_out, topk_weights_out)
-    if not _supported(tensors):
+    if os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") == "0" or not _supported(
+        tensors
+    ):
         return _torch_stage_mega_moe_inputs(*torch_args)
     from ......kernel_src.cutedsl_megamoe import ensure_not_capturing
 

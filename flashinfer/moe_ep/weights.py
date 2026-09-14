@@ -150,7 +150,10 @@ class PrequantizedMoEWeights(MoEWeightPack):
     ``w13_global_scale`` and ``w2_global_scale`` are optional per-expert FP32
     weight decode scales (``None`` means one). They are separate from block
     scales and from activation quantization. The W4A16 mega backend applies
-    them after FP32 GEMM accumulation.
+    them after FP32 GEMM accumulation. Only W4A16 MegaMoE supports these
+    fields; layer construction rejects them for other backends. When preparing
+    weights directly, use ``preprocess_w4a16_cutedsl_mega_weights`` for packs
+    with global scales.
     """
 
     w13: torch.Tensor

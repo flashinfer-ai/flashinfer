@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
 class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
+    supports_global_weight_scales = True
+
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_nvfp4_bf16_cutedsl"
@@ -167,6 +169,16 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
             top_k=self._kernel_config.top_k,
             quantize_input=True,
         )
+
+    def validate_capture_ready(
+        self, workspace: Any, transformed_weights: TransformedMegaWeights
+    ) -> None:
+        mega = workspace._frontend._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "MegaMoE workspace is not warmed for CUDA graph capture; "
+                "call layer.warmup(..., workspace=workspace) first"
+            )
 
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool

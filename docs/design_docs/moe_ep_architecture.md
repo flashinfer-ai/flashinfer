@@ -134,10 +134,12 @@ hidden sizes divisible by 32, intermediate sizes divisible by 64, and
 dispatch, both GEMMs, and combine in one MegaMoE launch. The final top-k
 reduction is separate.
 
-`PrequantizedMoEWeights` global scales are optional keyword-only additions.
-The W4A16 backend applies them after FP32 accumulation. For numerical tests
+`PrequantizedMoEWeights` global scales are optional and supported only by
+W4A16 MegaMoE, which applies them after FP32 accumulation. Layer construction
+rejects these fields for other backends. For direct preparation of packs with
+global scales, use `preprocess_w4a16_cutedsl_mega_weights`. For numerical tests
 and the shared-weight EP benchmark, see
-`tests/moe_ep/test_cutedsl_w4a16_mega.py` and
+`tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py` and
 `benchmarks/bench_cute_dsl_moe_distributed.py`.
 
 ### Split (dispatch → inner kernel → combine)
