@@ -26,6 +26,12 @@ from .decode import (
     get_prims_ts_batch_decode_workspace_size,
     prims_ts_batch_decode_with_kv_cache,
 )
+from .dsv4_csa import (
+    prims_ts_dsv4_csa,
+    prims_ts_dsv4_csa_rope_quant,
+    prims_ts_dsv4_hca_rope_quant,
+    prims_ts_dsv4_sparse_mla_rope_quant,
+)
 from .context import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
@@ -52,6 +58,10 @@ __all__ = [
     "batch_decode_with_paged_kv_cache",
     "get_prims_ts_batch_decode_workspace_size",
     "prims_ts_batch_decode_with_kv_cache",
+    "prims_ts_dsv4_csa",
+    "prims_ts_dsv4_sparse_mla_rope_quant",
+    "prims_ts_dsv4_csa_rope_quant",
+    "prims_ts_dsv4_hca_rope_quant",
     "BatchMLADecodePagedTSWrapper",
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",

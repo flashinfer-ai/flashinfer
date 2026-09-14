@@ -1508,6 +1508,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         split_kv=1,
         workspace_views=object(),
         compiled=object(),
+        policy=(("kernel", "throughput_2cta"),),
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)

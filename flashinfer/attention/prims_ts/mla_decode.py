@@ -1047,6 +1047,8 @@ def _get_compiled_mla_decode(
     import cutlass
     import cutlass.cute as cute
 
+    from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
+
     device_index = compile_spec.device_index
     num_heads = compile_spec.num_heads
     kv_lora_rank = compile_spec.kv_lora_rank
@@ -1164,24 +1166,50 @@ def _get_compiled_mla_decode(
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
+    compile_args = [
+        q_latent_fake,
+        q_rope_fake,
+        c_latent_fake,
+        c_rope_fake,
+        page_offsets_fake,
+        out_fake,
+        lse_fake,
+        workspace_fake,
+        cutlass.Int32(compile_spec.split_kv),
+        cache_seqs_fake,
+        qo_indptr_fake,
+        None,
+        cutlass.Float32(1.0),
+        cutlass.Float32(1.0),
+    ]
+    if isinstance(kernel, MlaDecodeTs):
+        # DSV4's raw Gather4 tensor-map pair has its own ABI slot.  Dense
+        # throughput-2CTA does not use it, so retain an explicit optional
+        # pointer rather than aliasing kernel_workspace.
+        compile_args.insert(8, None)
+        # The sparse DSV4 specialization has a separate per-query scan-width
+        # input between raw cache lengths and packed-Q offsets.  Dense MLA
+        # keeps it specialized to None.
+        compile_args.insert(11, None)
+        # The 2CTA kernel has one additional cache argument for its sparse
+        # specialization.  Compile the dense path with an ignored tensor
+        # rather than an optional pointer so TVM-FFI retains an unambiguous
+        # runtime ABI.
+        compile_args.append(c_latent_fake)
+        # Throughput-2CTA accepts maxQ as a runtime scheduler scalar. Dense
+        # MLA keeps the existing static policy key, while DSV4 can reuse one
+        # specialization across serving B/maxQ changes.
+        compile_args.append(cutlass.Int32(max_seq_len_q))
+        # Dense MLA does not use DSV4's skip-correction approximation.  Keep
+        # the shared 2CTA runtime ABI explicit and select the disabled value.
+        compile_args.append(cutlass.Float32(0.0))
+        # Dense MLA does not use DSv4's inverse-RoPE/FP8-quant outputs.
+        compile_args.extend((None, None))
+    compile_args.append(stream_fake)
     with torch.cuda.device(device_index):
         compiled = cute.compile[cute.FrontendNext](
             kernel,
-            q_latent_fake,
-            q_rope_fake,
-            c_latent_fake,
-            c_rope_fake,
-            page_offsets_fake,
-            out_fake,
-            lse_fake,
-            workspace_fake,
-            cutlass.Int32(compile_spec.split_kv),
-            cache_seqs_fake,
-            qo_indptr_fake,
-            None,
-            cutlass.Float32(1.0),
-            cutlass.Float32(1.0),
-            stream_fake,
+            *compile_args,
             options=_COMPILE_OPTIONS,
         )
     return compiled
@@ -1379,9 +1407,11 @@ def _launch_mla_decode(
     qo_indptr: Optional[torch.Tensor],
     packed_query: bool,
     kv_lora_rank: int,
+    max_seq_len_q: int,
     split_kv: int,
     workspace: _MLAWorkspaceViews,
     compiled: Callable[..., object],
+    uses_throughput_2cta: bool,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1403,7 +1433,7 @@ def _launch_mla_decode(
     c_latent = runtime.normalized_cache[..., :kv_lora_rank].permute(1, 2, 0)
     c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
     page_offsets = block_tables.transpose(0, 1)
-    compiled(
+    launch_args = [
         q_latent,
         q_rope,
         c_latent,
@@ -1418,7 +1448,15 @@ def _launch_mla_decode(
         None,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
-    )
+    ]
+    if uses_throughput_2cta:
+        launch_args.insert(8, None)
+        launch_args.insert(11, None)
+        launch_args.append(c_latent)
+        launch_args.append(max_seq_len_q)
+        launch_args.append(0.0)
+        launch_args.extend((None, None))
+    compiled(*launch_args)
     return runtime.out
 
 
@@ -1635,9 +1673,11 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         qo_indptr=qo_indptr,
         packed_query=packed_query,
         kv_lora_rank=kv_lora_rank,
+        max_seq_len_q=max_seq_len_q,
         split_kv=spec.split_kv,
         workspace=workspace,
         compiled=compiled,
+        uses_throughput_2cta=dict(spec.policy)["kernel"] == "throughput_2cta",
     )
 
 
@@ -1910,6 +1950,8 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=state.split_kv,
             workspace=state.workspace_views,
             compiled=state.compiled,
+            max_seq_len_q=state.max_seq_len_q,
+            uses_throughput_2cta=(dict(state.policy)["kernel"] == "throughput_2cta"),
         )
 
 

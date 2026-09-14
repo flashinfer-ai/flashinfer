@@ -263,7 +263,25 @@ def staged_qk_mma_k_tile(smem_k, tmem_s, iterations: int):
     smem_k.release()
 
 
-def staged_pv_mma_v_tile(smem_v, smem_p, tmem_o, iterations: int):
+def staged_qk_mma_k_tile_from_acquired_s(smem_k, tmem_s, iterations: int):
+    """Issue one QK tile into an S stage acquired by the source handoff FSM.
+
+    The generated DSV4 W8 task acquires S[0]/S[1] before its work-tile loop.
+    Thereafter it commits QK[n] and acquires the next reusable S stage before
+    PV[n-1].  Calling the ordinary helper here would add a second acquire and
+    destroy that producer-state contract.
+    """
+    smem_k.wait()
+    for k_subtile_idx in range(iterations):
+        desc_k_base = smem_k.k_desc(k_subtile_idx=k_subtile_idx)
+        tmem_s.qk_mma(desc_k_base=desc_k_base, k_subtile_idx=k_subtile_idx)
+    tmem_s.commit()
+    smem_k.release()
+
+
+def staged_pv_mma_v_tile(
+    smem_v, smem_p, tmem_o, iterations: int, *, is_tail: bool = False
+):
     """Consume one whole V stage plus one P stage and produce one O tile."""
     smem_p.wait()
     desc_p_base = smem_p.p_desc()
@@ -275,10 +293,34 @@ def staged_pv_mma_v_tile(smem_v, smem_p, tmem_o, iterations: int):
             desc_p_base=desc_p_base,
             desc_v_base=desc_v_base,
             v_subtile_idx=v_subtile_idx,
+            is_tail=is_tail,
         )
     tmem_o.commit()
     smem_v.release()
     smem_p.release()
+
+
+def staged_pv_mma_v_tile_source_direct_p(
+    smem_v, smem_p, tmem_o, iterations: int, *, is_tail: bool = False
+):
+    """Source-K128 whole-O PV helper without a P mbarrier transition."""
+    desc_p_base = (
+        smem_p.p_desc_source_direct_tail()
+        if is_tail
+        else smem_p.p_desc_source_direct_prior()
+    )
+    smem_v.wait()
+    tmem_o.acquire()
+    for v_subtile_idx in range(iterations):
+        desc_v_base = smem_v.v_desc(v_subtile_idx=v_subtile_idx)
+        tmem_o.pv_mma(
+            desc_p_base=desc_p_base,
+            desc_v_base=desc_v_base,
+            v_subtile_idx=v_subtile_idx,
+            is_tail=is_tail,
+        )
+    tmem_o.commit()
+    smem_v.release()
 
 
 def staged_pv_mma_v_tile_per_n(
@@ -288,6 +330,7 @@ def staged_pv_mma_v_tile_per_n(
     *,
     iterations_pv_k: int,
     iterations_pv_n: int,
+    is_tail: bool = False,
 ):
     """Consume P/V and publish one O pipeline token per PV N-slice."""
     smem_p.wait()
@@ -302,10 +345,48 @@ def staged_pv_mma_v_tile_per_n(
                 desc_v_base=desc_v_base,
                 pv_n_idx=pv_n_idx,
                 pv_k_idx=pv_k_idx,
+                is_tail=is_tail,
             )
         tmem_o.commit()
     smem_v.release()
     smem_p.release()
+
+
+def staged_pv_mma_v_tile_per_n_source_direct_p(
+    smem_v,
+    smem_p,
+    tmem_o,
+    *,
+    iterations_pv_k: int,
+    iterations_pv_n: int,
+    is_tail: bool = False,
+):
+    """Issue source DSV4 PV without TS's independent P mbarrier pipeline.
+
+    The caller must use the source S handoff: its QK-commit/next-S-acquire
+    sequence is the only P-ready dependency.  ``SmemPResource`` selects the
+    appropriate one of its two physical SMEM buffers from the logical K tile
+    index, so this helper intentionally omits P wait/release as well.
+    """
+    desc_p_base = (
+        smem_p.p_desc_source_direct_tail()
+        if is_tail
+        else smem_p.p_desc_source_direct_prior()
+    )
+    smem_v.wait()
+    for pv_n_idx in range(iterations_pv_n):
+        tmem_o.acquire()
+        for pv_k_idx in range(iterations_pv_k):
+            desc_v_base = smem_v.v_desc_n_major(pv_n_idx=pv_n_idx, pv_k_idx=pv_k_idx)
+            tmem_o.pv_mma_n_major(
+                desc_p_base=desc_p_base,
+                desc_v_base=desc_v_base,
+                pv_n_idx=pv_n_idx,
+                pv_k_idx=pv_k_idx,
+                is_tail=is_tail,
+            )
+        tmem_o.commit()
+    smem_v.release()
 
 
 def staged_pv_mma_tmem_p(
