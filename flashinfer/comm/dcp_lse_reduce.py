@@ -24,7 +24,7 @@ does not call ``libnccl_longseq`` and does not use the Helix/MNNVL A2A kernel.
 import functools
 import weakref
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 import torch
 import torch.distributed._symmetric_memory as symm_mem
@@ -193,8 +193,7 @@ def decode_cp_a2a_lse_reduce(
     workspace: torch.Tensor,
     cp_rank: int,
     cp_size: int,
-    is_lse_base_on_e: bool = False,
-    enable_pdl: Optional[bool] = None,
+    lse_mode: Literal["base2", "basee"] = "base2",
 ) -> torch.Tensor:
     """Fuse an NCCL LSA DCP A2A exchange with the LSE-weighted reduce.
 
@@ -208,12 +207,14 @@ def decode_cp_a2a_lse_reduce(
     Parameters
     ----------
     partial_o : torch.Tensor
-        ``[..., cp_size, head_dim]`` CUDA tensor (fp16 or bf16).
-        Typical layout: ``[batch, local_heads, cp_size, head_dim]``.
+        ``[batch, heads, cp_size, head_dim]`` CUDA tensor (fp16 or bf16), or
+        more generally ``[..., cp_size, head_dim]``.
         ``partial_o[..., peer, :]`` is the slice destined for that CP rank.
     partial_lse : torch.Tensor
-        ``[..., cp_size]`` CUDA float32 tensor. Leading dims must match
-        ``partial_o``.
+        ``[batch, heads, cp_size]`` CUDA float32 tensor, or more generally
+        ``[..., cp_size]``. Its leading dimensions must match ``partial_o``.
+        ``heads`` is simply the number of heads present in the input; it may
+        be local or total because this operation does not shard the head axis.
     workspace : torch.Tensor
         Rendezvoused NCCL symmetric-memory tensor from
         :func:`decode_cp_a2a_lse_reduce_create_workspace`. Reuse it only from
@@ -222,18 +223,18 @@ def decode_cp_a2a_lse_reduce(
         This rank's index in the CP group.
     cp_size : int
         Context-parallel group size.
-    is_lse_base_on_e : bool
-        ``True`` for natural-log LSE, ``False`` for base-2 (FlashInfer MLA).
-    enable_pdl : bool, optional
-        Accepted for API compatibility. The ported NCCL device kernels do not
-        use programmatic dependent launch.
+    lse_mode : Literal["base2", "basee"]
+        Logarithm base used by ``partial_lse``. ``"base2"`` is the default
+        produced by FlashInfer MLA; ``"basee"`` selects natural-log LSE.
 
     Returns
     -------
     torch.Tensor
-        ``[..., head_dim]`` in the same dtype as ``partial_o``.
+        ``[batch, heads, head_dim]``, or more generally ``[..., head_dim]``,
+        in the same dtype as ``partial_o``.
     """
-    del enable_pdl
+    if lse_mode not in ("base2", "basee"):
+        raise ValueError(f"lse_mode must be 'base2' or 'basee', got {lse_mode!r}")
     group_name = _get_workspace_state(workspace).group_name
     get_dcp_lse_reduce_module()
     return torch.ops.flashinfer.decode_cp_a2a_lse_reduce(
@@ -242,7 +243,7 @@ def decode_cp_a2a_lse_reduce(
         workspace,
         cp_rank,
         cp_size,
-        is_lse_base_on_e,
+        lse_mode == "basee",
         group_name,
     )
 

@@ -68,7 +68,7 @@ def process_group():
 def _reference_lse_reduce(
     partial_o: torch.Tensor,
     partial_lse: torch.Tensor,
-    is_lse_base_on_e: bool,
+    lse_mode: str,
 ) -> torch.Tensor:
     recv_o = partial_o
     recv_lse = partial_lse.clone()
@@ -81,7 +81,7 @@ def _reference_lse_reduce(
     lse_max = torch.where(torch.isneginf(lse_max), torch.zeros_like(lse_max), lse_max)
     weights = (
         torch.exp(recv_lse - lse_max)
-        if is_lse_base_on_e
+        if lse_mode == "basee"
         else torch.exp2(recv_lse - lse_max)
     )
     denom = weights.sum(dim=-1, keepdim=True)
@@ -131,18 +131,30 @@ def test_workspace_size_validation(kwargs, error):
         decode_cp_a2a_lse_reduce_workspace_size(**params)
 
 
+def test_lse_mode_validation():
+    with pytest.raises(ValueError, match="lse_mode must be 'base2' or 'basee'"):
+        decode_cp_a2a_lse_reduce(
+            torch.empty(0),
+            torch.empty(0),
+            torch.empty(0),
+            cp_rank=0,
+            cp_size=1,
+            lse_mode="invalid",
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("is_lse_base_on_e", [True, False])
-def test_single_rank_reference_is_identity(dtype, is_lse_base_on_e):
+@pytest.mark.parametrize("lse_mode", ["base2", "basee"])
+def test_single_rank_reference_is_identity(dtype, lse_mode):
     partial_o = torch.randn(3, 1, 16, dtype=dtype)
     partial_lse = torch.randn(3, 1)
-    actual = _reference_lse_reduce(partial_o, partial_lse, is_lse_base_on_e)
+    actual = _reference_lse_reduce(partial_o, partial_lse, lse_mode)
     torch.testing.assert_close(actual, partial_o[:, 0])
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("is_lse_base_on_e", [True, False])
-def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
+@pytest.mark.parametrize("lse_mode", ["base2", "basee"])
+def test_lse_reduce(process_group, dtype, lse_mode):
     group = dist.group.WORLD
     cp_rank = dist.get_rank(group)
     cp_size = dist.get_world_size(group)
@@ -180,7 +192,7 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
     )
     recv_o = torch.stack([tensor[..., cp_rank, :] for tensor in all_o], dim=-2)
     recv_lse = torch.stack([tensor[..., cp_rank] for tensor in all_lse], dim=-1)
-    expected = _reference_lse_reduce(recv_o, recv_lse, is_lse_base_on_e)
+    expected = _reference_lse_reduce(recv_o, recv_lse, lse_mode)
 
     # Three calls exercise slot 0, slot 1, and slot 0 reuse without re-init.
     for _ in range(3):
@@ -190,8 +202,7 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
             ws,
             cp_rank=cp_rank,
             cp_size=cp_size,
-            is_lse_base_on_e=is_lse_base_on_e,
-            enable_pdl=None,
+            lse_mode=lse_mode,
         )
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-3)
 
@@ -209,7 +220,7 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
             ws,
             cp_rank=cp_rank,
             cp_size=cp_size,
-            is_lse_base_on_e=is_lse_base_on_e,
+            lse_mode=lse_mode,
         )
 
     # CUDA graph capture uses a distinct stream, so it needs a separately
@@ -233,7 +244,7 @@ def test_lse_reduce(process_group, dtype, is_lse_base_on_e):
             graph_ws,
             cp_rank=cp_rank,
             cp_size=cp_size,
-            is_lse_base_on_e=is_lse_base_on_e,
+            lse_mode=lse_mode,
         )
     dist.barrier(group=group)
     for _ in range(4):

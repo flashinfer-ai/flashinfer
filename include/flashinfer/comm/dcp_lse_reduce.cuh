@@ -137,10 +137,13 @@ __device__ static inline float sanitize_lse(float l) {
 //
 // The source is already sliced per destination, which is the layout the DCP
 // all-to-all convention uses:
-//   partial_o   [num_tokens, local_heads, nranks, head_dim]
-//   partial_lse [num_tokens, local_heads, nranks]
+//   partial_o   [batch, heads, nranks, head_dim]
+//   partial_lse [batch, heads, nranks]
+//   output      [batch, heads, head_dim]
+// `heads` may be local or total; the kernel treats every batch/head entry as
+// an independent reduction and does not shard the head axis.
 // The destination layout inside the peer's slot is
-//   [src_rank][token][local_head][*]
+//   [src_rank][flattened batch/head entry][*]
 //
 // The grid is persistent and cooperatively launched:
 //   1. block 0 selects the graph-safe device epoch; grid sync;
