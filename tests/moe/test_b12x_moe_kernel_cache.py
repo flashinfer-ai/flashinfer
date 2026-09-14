@@ -443,11 +443,14 @@ def test_direct_micro_dispatch_shares_disk_name_for_equivalent_shapes(monkeypatc
         names.append(disk_kernel_name)
         return object(), True
 
-    monkeypatch.setattr(dispatch, "build_direct_micro_kernel", build_without_device_query)
+    monkeypatch.setattr(
+        dispatch, "build_direct_micro_kernel", build_without_device_query
+    )
     monkeypatch.setattr(dispatch, "compile_direct_micro_kernel", capture_compile)
     monkeypatch.setattr(dispatch, "_DIRECT_MICRO_LAUNCH_CACHE", {})
     monkeypatch.setattr(dispatch, "_DIRECT_MICRO_KERNEL_CACHE", {})
-    for m in (2, 3):
+    # At n=256, m=3 and m=4 share the same FC1 chunk configuration.
+    for m in (3, 4):
         dispatch._DIRECT_MICRO_LAUNCH_CACHE.clear()
         dispatch._DIRECT_MICRO_KERNEL_CACHE.clear()
         dispatch._get_direct_micro_kernel(64, m, 512, 256, 2)
@@ -513,7 +516,9 @@ def direct_micro_compile_stub(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "options", [None, "--opt-level 0", "--opt-level 1 --enable-tvm-ffi"]
 )
-def test_direct_micro_probe_matches_compiler_options(direct_micro_compile_stub, options):
+def test_direct_micro_probe_matches_compiler_options(
+    direct_micro_compile_stub, options
+):
     state = direct_micro_compile_stub
     compiled, accepts = state.dm.compile_direct_micro_kernel(
         state.kernel, options=options, disk_kernel_name="kernel"
@@ -614,6 +619,8 @@ def test_direct_micro_inspection_failure_is_unknown(monkeypatch, error_type):
     monkeypatch.setattr(dm, "_PROBE_FAILURE_WARNED", False)
     if error_type is RuntimeError:
         with pytest.warns(RuntimeWarning, match="probe failed"):
-            assert dm.compiled_direct_micro_accepts_block_dim(BrokenCompile(), 512) is None
+            assert (
+                dm.compiled_direct_micro_accepts_block_dim(BrokenCompile(), 512) is None
+            )
     else:
         assert dm.compiled_direct_micro_accepts_block_dim(BrokenCompile(), 512) is None
