@@ -278,6 +278,7 @@ def create_load_task(
                     sq.commit()
 
                     def load_k_tile(*, tile_offset: int) -> None:
+                        """Issue the K TMA loads for one tile across the K head-dim stages."""
                         for head_dim_stage_idx in range(num_head_dim_stages_k):
                             sk.try_acquire()
                             sk.acquire()
@@ -305,6 +306,11 @@ def create_load_task(
                     def load_v_tile(
                         *, tile_offset: int, reuse_cached_page_ids: bool = False
                     ) -> None:
+                        """Issue the V TMA loads for one tile across the V head-dim stages.
+
+                        With ``reuse_cached_page_ids`` the loads reuse page IDs staged by
+                        ``cache_v_tile`` instead of re-reading the page table.
+                        """
                         for head_dim_stage_idx in range(num_head_dim_stages_v):
                             sv.try_acquire()
                             sv.acquire()
@@ -438,6 +444,11 @@ def create_load_task(
             spo: SmemPageOffsetsKvResource | None,
             wq: WorkQueue | None,
         ) -> None:
+            """Load-warp schedule: stage Q, then stream K and V tiles through their rings.
+
+            K runs one tile ahead of V so QK(i+1) can start while PV(i) waits for V.
+            Page offsets are read once per tile when paged.
+            """
             sq.init_load_state()
             sk.init_load_state()
             sv.init_load_state()
@@ -688,7 +699,9 @@ def create_load_task(
                             inst_idx=1,
                         )
                         sq.commit()
-                    for head_dim_stage_idx in range(smem_k_or_kv.cfg.num_head_dim_stages_k):
+                    for head_dim_stage_idx in range(
+                        smem_k_or_kv.cfg.num_head_dim_stages_k
+                    ):
                         sk.try_acquire()
                         sk.acquire()
                         sk.k_load_stage(
@@ -841,6 +854,11 @@ def create_mma_task(
             vd0: TmemStatsDoneResource,
             wq: WorkQueue | None = None,
         ) -> None:
+            """MMA-warp schedule with separate S and P TMEM pipelines.
+
+            Prologue issues QK for the first tile; the steady-state loop then alternates
+            QK(i+1) into S with PV(i) from P, consuming K and V from independent rings.
+            """
             sq.init_descriptor_state()
             sk.init_descriptor_state()
             sv.init_descriptor_state()

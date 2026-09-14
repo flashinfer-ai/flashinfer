@@ -374,6 +374,10 @@ def _dtype_key(dtype: torch.dtype) -> str:
 
 
 def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+    """Validate run-time Q/K/V tensor dtypes.
+
+    Q and K must match; V may differ only for the QK-BF16/PV-FP8 path.
+    """
     _dtype_key(q.dtype)
     if q.dtype != k.dtype:
         raise NotImplementedError(
@@ -1641,6 +1645,7 @@ def _resolve_paged_context_scheduler(
 
 
 def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec:
+    """Build the contiguous compile key, including separate QK and PV dtype keys."""
     return _ContextCompileSpec(
         device_index=geometry.device_index,
         max_seq_len_q=geometry.max_seq_len_q,
@@ -1667,6 +1672,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
 def _paged_context_compile_spec(
     geometry: _PagedContextPlanGeometry,
 ) -> _PagedContextCompileSpec:
+    """Build the paged compile key, including separate QK and PV dtype keys."""
     return _PagedContextCompileSpec(
         device_index=geometry.device_index,
         max_seq_len_q=geometry.max_seq_len_q,
@@ -2449,8 +2455,8 @@ class BatchPrefillTSWrapper:
         head_dim: int,
         head_dim_vo: int | None = None,
         q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-        pv_dtype: Optional[torch.dtype] = None,
+        k_dtype: torch.dtype,
+        v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         packed: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
@@ -2489,12 +2495,12 @@ class BatchPrefillTSWrapper:
             dimensions are supported for non-absorbed MLA with QK=192/V=128.
         q_dtype : torch.dtype
             Query dtype.
-        kv_dtype : torch.dtype
-            Key dtype, and the value dtype when ``pv_dtype`` is omitted. It
+        k_dtype : torch.dtype
+            Key dtype, and the value dtype when ``v_dtype`` is omitted. It
             must currently equal ``q_dtype``.
-        pv_dtype : torch.dtype, optional
-            Value dtype; defaults to ``kv_dtype``. May differ from
-            ``kv_dtype`` only for the QK-BF16/PV-FP8 combination.
+        v_dtype : torch.dtype, optional
+            Value dtype; defaults to ``k_dtype``. May differ from
+            ``k_dtype`` only for the QK-BF16/PV-FP8 combination.
         out_dtype : torch.dtype, optional
             Output dtype; defaults to ``q_dtype``.
         packed : bool
@@ -2511,11 +2517,11 @@ class BatchPrefillTSWrapper:
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
-        resolved_pv_dtype = kv_dtype if pv_dtype is None else pv_dtype
-        if kv_dtype != q_dtype:
+        resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
+        if k_dtype != q_dtype:
             raise NotImplementedError(
                 "attention-ts context requires Q and K to use the same dtype; "
-                f"got q_dtype={q_dtype} and kv_dtype={kv_dtype}"
+                f"got q_dtype={q_dtype} and k_dtype={k_dtype}"
             )
         geometry = _resolve_context_plan_geometry(
             device=device,
@@ -2526,8 +2532,8 @@ class BatchPrefillTSWrapper:
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             head_dim_vo=head_dim_vo,
-            qk_dtype=kv_dtype,
-            pv_dtype=resolved_pv_dtype,
+            qk_dtype=k_dtype,
+            pv_dtype=resolved_v_dtype,
             packed=packed,
             mask_type=mask_type,
             window_left=window_left,
@@ -2843,8 +2849,8 @@ class BatchPrefillPagedTSWrapper:
         num_kv_heads: int,
         head_dim: int,
         q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
-        pv_dtype: Optional[torch.dtype] = None,
+        k_dtype: torch.dtype,
+        v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
         mask_type: Literal["dense", "causal"] = "dense",
@@ -2898,12 +2904,12 @@ class BatchPrefillPagedTSWrapper:
             Query, key, value, and output head dimension.
         q_dtype : torch.dtype
             Query dtype.
-        kv_dtype : torch.dtype
-            Key cache dtype, and the value cache dtype when ``pv_dtype`` is
+        k_dtype : torch.dtype
+            Key cache dtype, and the value cache dtype when ``v_dtype`` is
             omitted. It must currently equal ``q_dtype``.
-        pv_dtype : torch.dtype, optional
-            Value cache dtype; defaults to ``kv_dtype``. May differ from
-            ``kv_dtype`` only for the QK-BF16/PV-FP8 combination.
+        v_dtype : torch.dtype, optional
+            Value cache dtype; defaults to ``k_dtype``. May differ from
+            ``k_dtype`` only for the QK-BF16/PV-FP8 combination.
         out_dtype : torch.dtype, optional
             Output dtype; defaults to ``q_dtype``.
         page_size : int
@@ -2931,11 +2937,11 @@ class BatchPrefillPagedTSWrapper:
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
-        resolved_pv_dtype = kv_dtype if pv_dtype is None else pv_dtype
-        if kv_dtype != q_dtype:
+        resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
+        if k_dtype != q_dtype:
             raise NotImplementedError(
                 "attention-ts paged context requires Q and K to use the same "
-                f"dtype; got q_dtype={q_dtype} and kv_dtype={kv_dtype}"
+                f"dtype; got q_dtype={q_dtype} and k_dtype={k_dtype}"
             )
         geometry = _resolve_paged_plan_geometry(
             device=device,
@@ -2945,8 +2951,8 @@ class BatchPrefillPagedTSWrapper:
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            qk_dtype=kv_dtype,
-            pv_dtype=resolved_pv_dtype,
+            qk_dtype=k_dtype,
+            pv_dtype=resolved_v_dtype,
             page_size=page_size,
             mask_type=mask_type,
             window_left=window_left,
@@ -3157,7 +3163,9 @@ def batch_prefill(
     Parameters
     ----------
     q, k, v : torch.Tensor
-        Fixed or packed query, key, and value tensors.
+        Fixed or packed query, key, and value tensors. Q and K share one
+        dtype; V matches it or is ``torch.float8_e4m3fn`` with
+        ``torch.bfloat16`` Q/K.
     qo_indptr, kv_indptr : torch.Tensor, optional
         Cumulative query and K/V offsets for packed-ragged input.
     mask_type : {"dense", "causal", "variable_window"}
@@ -3218,8 +3226,8 @@ def batch_prefill(
         head_dim=geometry.head_dim,
         head_dim_vo=geometry.head_dim_vo,
         q_dtype=geometry.qk_dtype,
-        kv_dtype=geometry.qk_dtype,
-        pv_dtype=geometry.pv_dtype,
+        k_dtype=geometry.qk_dtype,
+        v_dtype=geometry.pv_dtype,
         out_dtype=geometry.output_dtype,
         packed=geometry.packed,
         mask_type=mask_type,
@@ -3264,7 +3272,8 @@ def batch_prefill_with_paged_kv_cache(
     ``qo_indptr`` describes Q rows, ``block_tables`` supplies one fixed
     row-strided page table, and ``seq_lens_kv`` supplies logical K/V lengths.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
-    256; Q, K, and V must share one supported dtype.
+    256. Q and K must share one supported dtype; V matches it or is
+    ``torch.float8_e4m3fn`` alongside ``torch.bfloat16`` Q/K.
 
     This convenience API reads request metadata on the host to derive exact
     plan bounds and is not CUDA-graph-capturable. Capture-sensitive callers
@@ -3344,8 +3353,8 @@ def batch_prefill_with_paged_kv_cache(
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
         q_dtype=geometry.qk_dtype,
-        kv_dtype=geometry.qk_dtype,
-        pv_dtype=geometry.pv_dtype,
+        k_dtype=geometry.qk_dtype,
+        v_dtype=geometry.pv_dtype,
         out_dtype=geometry.output_dtype,
         page_size=page_size,
         mask_type=mask_type,
