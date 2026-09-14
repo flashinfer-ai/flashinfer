@@ -28,14 +28,14 @@ def test_prefill_default_backend_preserves_flashinfer_graph(
 
     generator = torch.Generator(device="cuda").manual_seed(42)
     total = batch_size * seq_len
-    q = torch.randn(
-        (total, num_q_heads, 128), generator=generator, device="cuda"
-    ).to(torch.bfloat16)
+    q = torch.randn((total, num_q_heads, 128), generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
     k = torch.randn(q.shape, generator=generator, device="cuda").to(q.dtype)
     k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-    v = torch.randn(
-        (total, num_v_heads, 128), generator=generator, device="cuda"
-    ).to(q.dtype)
+    v = torch.randn((total, num_v_heads, 128), generator=generator, device="cuda").to(
+        q.dtype
+    )
     g = torch.rand((total, num_v_heads), generator=generator, device="cuda")
     beta = torch.rand(g.shape, generator=generator, device="cuda")
     cu_seqlens = torch.arange(batch_size + 1, dtype=torch.int64, device="cuda")
