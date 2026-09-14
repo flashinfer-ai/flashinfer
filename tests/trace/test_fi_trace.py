@@ -559,7 +559,8 @@ def test_gated_residual_rmsnorm_fi_trace():
 
 
 @pytest.mark.parametrize("post_input_scale", [False, True])
-def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale):
+@pytest.mark.parametrize("alpha", [None, 1.0, 0.5])
+def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale, alpha):
     import flashinfer.norm
 
     branch = torch.empty(2, 8192, dtype=torch.bfloat16)
@@ -573,7 +574,7 @@ def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale):
         branch=branch,
         residual=residual,
         next_weight=next_weight,
-        alpha=gate,
+        alpha=gate if alpha is None else alpha,
         beta=gate,
         post_eps=1e-8,
         next_eps=1e-5,
@@ -588,8 +589,27 @@ def test_gated_residual_next_rmsnorm_fi_trace(post_input_scale):
     assert defn["axes"]["hidden_size"]["value"] == 8192
     assert defn["outputs"]["residual_out"]["dtype"] == "float32"
     assert defn["outputs"]["ffn_input"]["dtype"] == "bfloat16"
+    if alpha is not None:
+        assert defn["inputs"]["alpha"] == {"shape": None, "dtype": "float32"}
+        assert defn["name"] == "gated_residual_next_rmsnorm_scalar_alpha_h8192"
     if post_input_scale:
         assert defn["inputs"]["post_weight"]["dtype"] == "bfloat16"
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.5])
+def test_gated_residual_next_rmsnorm_scalar_init_standalone(alpha):
+    from flashinfer.norm import gated_residual_next_rmsnorm
+
+    inputs = gated_residual_next_rmsnorm.fi_init(num_rows=2, alpha=alpha, device="cpu")
+    assert inputs["alpha"] == alpha
+    defn = gated_residual_next_rmsnorm.fi_trace(**inputs)
+    namespace = {}
+    exec(defn["init"], namespace)
+    restored = namespace["_gated_residual_next_rmsnorm_scalar_init"](
+        num_rows=2, alpha=alpha, device="cpu"
+    )
+    assert restored["alpha"] == alpha
+    assert gated_residual_next_rmsnorm.fi_trace(**restored) == defn
 
 
 def test_rmsnorm_sigmoid_gate_fi_trace():

@@ -36,7 +36,7 @@ from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
     fused_rmsnorm_silu_trace,
-    gated_residual_next_rmsnorm_trace,
+    gated_residual_next_rmsnorm_trace_dispatch,
     gated_residual_rmsnorm_trace,
     gemma_fused_add_rmsnorm_trace,
     gemma_rmsnorm_trace,
@@ -221,13 +221,22 @@ def supports_gated_residual_next_rmsnorm(
     branch: torch.Tensor,
     residual: torch.Tensor,
     next_weight: torch.Tensor,
-    alpha: torch.Tensor,
+    alpha: Union[torch.Tensor, float],
     beta: torch.Tensor,
     *,
     post_weight: Optional[torch.Tensor] = None,
 ) -> bool:
-    """Return whether tensors satisfy the SM100/SM103 two-norm kernel contract."""
-    tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, alpha, beta)
+    """Return whether inputs satisfy the SM100/SM103 two-norm kernel contract."""
+    tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, beta)
+    if isinstance(alpha, torch.Tensor):
+        if (
+            alpha.shape != (_GATED_RESIDUAL_HIDDEN_SIZE,)
+            or alpha.dtype != torch.float32
+        ):
+            return False
+        tensors += (alpha,)
+    elif not isinstance(alpha, (int, float)):
+        return False
     if post_weight is not None:
         tensors += (post_weight,)
     return (
@@ -243,12 +252,10 @@ def supports_gated_residual_next_rmsnorm(
                 and post_weight.dtype == torch.bfloat16
             )
         )
-        and alpha.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
         and beta.shape == (_GATED_RESIDUAL_HIDDEN_SIZE,)
         and branch.dtype == torch.bfloat16
         and residual.dtype == torch.float32
         and next_weight.dtype == torch.bfloat16
-        and alpha.dtype == torch.float32
         and beta.dtype == torch.float32
         and all(
             tensor.is_cuda
@@ -262,12 +269,12 @@ def supports_gated_residual_next_rmsnorm(
     )
 
 
-@flashinfer_api(trace=gated_residual_next_rmsnorm_trace)
+@flashinfer_api(trace=gated_residual_next_rmsnorm_trace_dispatch)
 def gated_residual_next_rmsnorm(
     branch: torch.Tensor,
     residual: torch.Tensor,
     next_weight: torch.Tensor,
-    alpha: torch.Tensor,
+    alpha: Union[torch.Tensor, float],
     beta: torch.Tensor,
     post_eps: float = 1e-6,
     next_eps: float = 1e-6,
@@ -296,8 +303,12 @@ def gated_residual_next_rmsnorm(
         FP32 residual stream with the same shape as ``branch``.
     next_weight : torch.Tensor
         BF16 weight for the second RMSNorm, with shape ``(8192,)``.
-    alpha, beta : torch.Tensor
-        FP32 gate tensors with shape ``(8192,)``.
+    alpha : Union[torch.Tensor, float]
+        FP32 stream gate with shape ``(8192,)``, or a scalar coefficient.
+        Use ``1.0`` for an ungated stream. Scalar values specialize the kernel
+        without allocating or loading an alpha tensor.
+    beta : torch.Tensor
+        FP32 branch gate with shape ``(8192,)``.
     post_eps, next_eps : float
         Epsilons for the branch and residual-stream RMSNorms.
     next_gain_center : float
@@ -341,11 +352,17 @@ def gated_residual_next_rmsnorm(
             raise ValueError(
                 f"{name} must match branch shape, expected dtype, device, and layout"
             )
+    # Scalar specializations never read the alpha tensor argument; reuse beta
+    # to preserve the tensor ABI without allocating a constant gate vector.
+    if isinstance(alpha, torch.Tensor):
+        alpha_tensor, alpha_scalar = alpha, None
+    else:
+        alpha_tensor, alpha_scalar = beta, float(alpha)
     _gated_residual_next_rmsnorm_impl(
         branch,
         residual,
         next_weight,
-        alpha,
+        alpha_tensor,
         beta,
         residual_out,
         ffn_input,
@@ -354,6 +371,7 @@ def gated_residual_next_rmsnorm(
         next_gain_center,
         post_weight,
         post_gain_center,
+        alpha_scalar,
     )
     return residual_out, ffn_input
 
@@ -375,6 +393,7 @@ def _gated_residual_next_rmsnorm_impl(
     next_gain_center: float,
     post_weight: Optional[torch.Tensor],
     post_gain_center: float,
+    alpha_scalar: Optional[float] = None,
 ) -> None:
     _gated_residual_next_rmsnorm_cute(
         branch,
@@ -389,6 +408,7 @@ def _gated_residual_next_rmsnorm_impl(
         ffn_input,
         post_weight,
         post_gain_center,
+        alpha_scalar,
     )
 
 
@@ -406,6 +426,7 @@ def _gated_residual_next_rmsnorm_fake(
     next_gain_center: float,
     post_weight: Optional[torch.Tensor],
     post_gain_center: float,
+    alpha_scalar: Optional[float] = None,
 ) -> None:
     return None
 

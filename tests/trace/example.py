@@ -29,6 +29,7 @@ dsv41_fp8_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
 gated_residual_rmsnorm_h8192.json
 gated_residual_next_rmsnorm_h8192.json
+gated_residual_next_rmsnorm_scalar_alpha_h8192.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
@@ -328,18 +329,19 @@ if torch.cuda.get_device_capability() == (10, 3):
         gated_beta,
         1e-6,
     )
-    flashinfer.norm.gated_residual_next_rmsnorm(
-        gated_branch,
-        gated_residual,
-        gated_weight,
-        gated_alpha,
-        gated_beta,
-        post_eps=1e-8,
-        next_eps=1e-5,
-        next_gain_center=1.0,
-        post_weight=gated_weight,
-        post_gain_center=1.0,
-    )
+    for alpha in (gated_alpha, 1.0):
+        flashinfer.norm.gated_residual_next_rmsnorm(
+            gated_branch,
+            gated_residual,
+            gated_weight,
+            alpha,
+            gated_beta,
+            post_eps=1e-8,
+            next_eps=1e-5,
+            next_gain_center=1.0,
+            post_weight=gated_weight,
+            post_gain_center=1.0,
+        )
 
     gate_input = torch.randn(8, 32, 64, dtype=torch.bfloat16, device=device)
     gate = torch.randn_like(gate_input)

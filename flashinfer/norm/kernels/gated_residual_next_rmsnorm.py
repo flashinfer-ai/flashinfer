@@ -126,6 +126,7 @@ def _dual_norm_kernel(
     gain: cutlass.Constexpr,
     has_post_weight: cutlass.Constexpr,
     post_gain: cutlass.Constexpr,
+    alpha_scalar: cutlass.Constexpr,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cy, _ = cute.arch.block_idx()
@@ -146,11 +147,10 @@ def _dual_norm_kernel(
     wc = ((None, None), (0, col))
 
     tBr, tSt, tRo, tFo = gBr[rc], gSt[rc], gRo[rc], gFo[rc]
-    tAl, tBe, tWt = gAl[wc], gBe[wc], gWt[wc]
+    tBe, tWt = gBe[wc], gWt[wc]
 
     fBr = cute.make_fragment_like(tBr)
     fSt = cute.make_fragment_like(tSt)
-    fAl = cute.make_fragment_like(tAl)
     fBe = cute.make_fragment_like(tBe)
     fWt = cute.make_fragment_like(tWt)
     fRo = cute.make_fragment_like(tRo)
@@ -158,7 +158,10 @@ def _dual_norm_kernel(
 
     cute.autovec_copy(tBr, fBr)
     cute.autovec_copy(tSt, fSt)
-    cute.autovec_copy(tAl, fAl)
+    if const_expr(alpha_scalar is None):
+        tAl = gAl[wc]
+        fAl = cute.make_fragment_like(tAl)
+        cute.autovec_copy(tAl, fAl)
     cute.autovec_copy(tBe, fBe)
     cute.autovec_copy(tWt, fWt)
     if const_expr(has_post_weight):
@@ -182,7 +185,12 @@ def _dual_norm_kernel(
     b = fBr.load().to(Float32)
     if const_expr(has_post_weight):
         b = b * (fPw.load().to(Float32) + post_gain)
-    u = fAl.load().to(Float32) * fSt.load().to(Float32)
+    if const_expr(alpha_scalar is None):
+        u = fAl.load().to(Float32) * fSt.load().to(Float32)
+    elif const_expr(alpha_scalar == 1.0):
+        u = fSt.load().to(Float32)
+    else:
+        u = Float32(alpha_scalar) * fSt.load().to(Float32)
     v = fBe.load().to(Float32) * b
 
     pA = (b * b).reduce(cute.ReductionOp.ADD, 0.0, 0)
@@ -224,6 +232,7 @@ def _launch(
     gain: cutlass.Constexpr,
     has_post_weight: cutlass.Constexpr,
     post_gain: cutlass.Constexpr,
+    alpha_scalar: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
 ):
     tiler = (1, VEC)
@@ -250,6 +259,7 @@ def _launch(
         gain,
         has_post_weight,
         post_gain,
+        alpha_scalar,
     ).launch(
         grid=[mBr.shape[0], CLUSTER_N, 1],
         block=[THREADS, 1, 1],
@@ -270,6 +280,7 @@ def _get_compiled(
     next_gain_center: float,
     has_post_weight: bool,
     post_gain_center: float,
+    alpha_scalar: float | None = None,
 ):
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
@@ -310,6 +321,9 @@ def _get_compiled(
             f"gc{_float_key(next_gain_center)}",
             f"pw{int(has_post_weight)}",
             f"pgc{_float_key(post_gain_center)}",
+            "alpha_tensor"
+            if alpha_scalar is None
+            else f"alpha{_float_key(alpha_scalar)}",
         )
     )
     return build_and_load_cute_dsl_kernel(
@@ -330,6 +344,7 @@ def _get_compiled(
             next_gain_center,
             has_post_weight,
             post_gain_center,
+            alpha_scalar,
             cuda_stream,
             options="--enable-tvm-ffi",
         ),
@@ -350,6 +365,7 @@ def run(
     ffn_input: torch.Tensor,
     post_weight: torch.Tensor | None = None,
     post_gain_center: float = 0.0,
+    alpha_scalar: float | None = None,
 ) -> None:
     if branch.shape[0] == 0:
         return
@@ -359,6 +375,7 @@ def run(
         float(next_gain_center),
         post_weight is not None,
         float(post_gain_center) if post_weight is not None else 0.0,
+        alpha_scalar,
     )
     fn(
         branch,
@@ -385,6 +402,7 @@ def gated_residual_next_rmsnorm(
     ffn_input: torch.Tensor,
     post_weight: torch.Tensor | None = None,
     post_gain_center: float = 0.0,
+    alpha_scalar: float | None = None,
 ) -> None:
     """Run the fixed-width fused gated-residual plus next-RMSNorm kernel."""
     run(
@@ -400,4 +418,5 @@ def gated_residual_next_rmsnorm(
         ffn_input,
         post_weight,
         post_gain_center,
+        alpha_scalar,
     )

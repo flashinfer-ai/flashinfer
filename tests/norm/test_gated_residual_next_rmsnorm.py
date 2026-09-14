@@ -3,7 +3,9 @@
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
+import flashinfer.norm as norm
 from flashinfer.norm import (
     gated_residual_next_rmsnorm,
     supports_gated_residual_next_rmsnorm,
@@ -56,6 +58,34 @@ def _assert_close(actual, expected):
     torch.testing.assert_close(actual[1], expected[1], rtol=0.015625, atol=0.03125)
 
 
+@pytest.mark.parametrize("alpha", [1, 1.0, 0.5, -1.0])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_scalar_alpha_support_and_dispatch(monkeypatch, alpha, capability):
+    # Check scalar dispatch without a GPU or allocating an alpha vector.
+    monkeypatch.setattr(norm, "_HAS_CUTE_DSL_FUSED_NORM", True)
+    monkeypatch.setattr(norm, "_is_aligned", lambda *_: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
+    calls = []
+    monkeypatch.setattr(
+        norm, "_gated_residual_next_rmsnorm_cute", lambda *args: calls.append(args)
+    )
+    with FakeTensorMode():
+        branch = torch.empty(1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        residual = torch.empty(1, HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        weight = torch.empty(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        beta = torch.empty(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        inputs = (branch, residual, weight, alpha, beta)
+        assert supports_gated_residual_next_rmsnorm(*inputs)
+        residual_out, ffn_input = gated_residual_next_rmsnorm(*inputs)
+        assert residual_out.shape == branch.shape
+        assert residual_out.dtype == torch.float32
+        assert ffn_input.shape == branch.shape
+        assert ffn_input.dtype == torch.bfloat16
+        assert len(calls) == 1
+        assert calls[0][2] is beta
+        assert calls[0][-1] == float(alpha)
+
+
 @pytest.mark.parametrize("rows", [0, 1, 17, 128, 2048])
 @pytest.mark.parametrize("post_gain_center", [None, 0.0, 1.0])
 def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
@@ -89,6 +119,27 @@ def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
     torch.testing.assert_close(residual_out, expected_residual, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(ffn_input, expected_ffn, rtol=0.015625, atol=0.03125)
     assert not torch.equal(ffn_input, rounded_ffn)
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.5, -1.0])
+@pytest.mark.parametrize("rows", [0, 1, 17])
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_scalar_alpha_matches_tensor(alpha, rows, post_input_scale):
+    torch.manual_seed(1000 + rows)
+    inputs = list(_inputs(rows))
+    if not supports_gated_residual_next_rmsnorm(*inputs):
+        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+    kwargs = {}
+    if post_input_scale:
+        kwargs = {"post_weight": inputs[2], "post_gain_center": 1.0}
+    inputs[3] = alpha
+    assert supports_gated_residual_next_rmsnorm(
+        *inputs, post_weight=kwargs.get("post_weight")
+    )
+    actual = _call(inputs, **kwargs)
+    _assert_close(actual, _reference(inputs, **kwargs))
+    inputs[3] = torch.full_like(inputs[4], alpha)
+    _assert_close(actual, _call(inputs, **kwargs))
 
 
 def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
@@ -131,10 +182,15 @@ def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
 
 
 @pytest.mark.parametrize("post_input_scale", [False, True])
-def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(post_input_scale):
+@pytest.mark.parametrize("alpha", [None, 1.0, 0.5])
+def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(
+    post_input_scale, alpha
+):
     inputs = list(_inputs(17))
     if not supports_gated_residual_next_rmsnorm(*inputs):
         pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
+    if alpha is not None:
+        inputs[3] = alpha
     kwargs = {}
     if post_input_scale:
         kwargs = {

@@ -440,6 +440,52 @@ gated_residual_next_rmsnorm_trace = TraceTemplate(
 )
 
 
+def _gated_residual_next_rmsnorm_scalar_init(
+    *,
+    num_rows: int,
+    hidden_size: int = 8192,
+    alpha: float = 1.0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    inputs = _gated_residual_next_rmsnorm_init(
+        num_rows=num_rows, hidden_size=hidden_size, device=device, seed=seed
+    )
+    inputs["alpha"] = float(alpha)
+    return inputs
+
+
+_gated_residual_next_rmsnorm_scalar_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _gated_residual_next_rmsnorm_init,
+)
+
+
+gated_residual_next_rmsnorm_scalar_trace = TraceTemplate(
+    op_type="gated_residual_next_rmsnorm",
+    name_prefix="gated_residual_next_rmsnorm_scalar_alpha",
+    description="Blend a normalized branch with a scalar stream gate and apply RMSNorm.",
+    axes=gated_residual_next_rmsnorm_trace.axes,
+    inputs={**gated_residual_next_rmsnorm_trace.inputs, "alpha": Scalar("float32")},
+    outputs=gated_residual_next_rmsnorm_trace.outputs,
+    tags=["status:verified", "fused"],
+    reference=_gated_residual_next_rmsnorm_reference,
+    check=_gated_residual_next_rmsnorm_check,
+    init=_gated_residual_next_rmsnorm_scalar_init,
+)
+
+
+def gated_residual_next_rmsnorm_trace_dispatch(**kwargs):
+    if isinstance(kwargs.get("alpha"), (int, float)):
+        return gated_residual_next_rmsnorm_scalar_trace
+    return gated_residual_next_rmsnorm_trace
+
+
+gated_residual_next_rmsnorm_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    gated_residual_next_rmsnorm_trace,
+    gated_residual_next_rmsnorm_scalar_trace,
+)
+
+
 @torch.no_grad()
 def _rmsnorm_sigmoid_gate_reference(input, gate, eps=1e-5):
     values = input.to(torch.float32)
