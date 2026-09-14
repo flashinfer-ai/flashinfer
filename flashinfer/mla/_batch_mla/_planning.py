@@ -6,7 +6,7 @@ you may not use this file except in compliance with the License.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 
 import torch
 
@@ -582,6 +582,11 @@ class _MLAPlanArguments:
     _kv_indices_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
     _kv_len_arr_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
     _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
+        default=None, repr=False, compare=False
+    )
+    # Plan info of the FA2/FA3 plan a CUDA graph was captured with; a replan
+    # keeps the kernel configuration recorded there.
+    _graph_plan_info: Optional[Sequence[int]] = field(
         default=None, repr=False, compare=False
     )
     _metadata_resolver: _MLAPlanMetadataResolver = field(

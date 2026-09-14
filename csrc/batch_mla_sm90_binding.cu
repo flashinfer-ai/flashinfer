@@ -25,7 +25,8 @@ using tvm::ffi::Tuple;
 Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionSM90Plan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
-    TensorView kv_len, int64_t num_heads, int64_t head_dim_o, bool causal);
+    TensorView kv_len, int64_t num_heads, int64_t head_dim_o, bool causal, int64_t graph_num_blks_x,
+    int64_t graph_cta_tile_q);
 
 void BatchMLAPagedAttentionSM90Run(TensorView float_workspace_buffer,
                                    TensorView int_workspace_buffer, Array<int64_t> plan_info_vec,

@@ -123,11 +123,15 @@ void BatchMLAPagedAttentionSM90Run(
                 ? static_cast<const float*>(maybe_ckv_scale_arr.value().data_ptr())
                 : nullptr;
 
-        cudaError_t status =
-            mla::BatchMLAPageAttentionHopper<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
-                params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
+        // The planner picks the Q tile from the longest packed query in the
+        // batch; 16 and 32 run the swap-AB layout (see hopper::HopperKernelTraits).
+        DISPATCH_MLA_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+          cudaError_t status =
+              mla::BatchMLAPageAttentionHopper<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q>(
+                  params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
 
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "Failed to run MLA, error: " << cudaGetErrorString(status);
+          TVM_FFI_ICHECK(status == cudaSuccess)
+              << "Failed to run MLA, error: " << cudaGetErrorString(status);
+        });
       });
 }

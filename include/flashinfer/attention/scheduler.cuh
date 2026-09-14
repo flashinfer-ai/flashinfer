@@ -1527,6 +1527,10 @@ struct MLAPlanInfo {
   int64_t work_indptr_offset;
   int64_t partial_o_offset;
   int64_t partial_lse_offset;
+  // Packed query rows per CTA (16, 32 or 64); the SM90 kernel is instantiated
+  // per tile. Together with num_blks_x this is the kernel configuration a
+  // CUDA graph captures, which later replans keep (see MLAPlan).
+  int64_t cta_tile_q;
 
   std::vector<int64_t> ToVector() const {
     return {num_blks_x,
@@ -1546,13 +1550,14 @@ struct MLAPlanInfo {
             kv_end_offset,
             work_indptr_offset,
             partial_o_offset,
-            partial_lse_offset};
+            partial_lse_offset,
+            cta_tile_q};
   }
 
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 18) {
+    if (vec.size() != 19) {
       std::ostringstream err_msg;
-      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 18, but got " << vec.size();
+      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 19, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     num_blks_x = vec[0];
@@ -1573,8 +1578,26 @@ struct MLAPlanInfo {
     work_indptr_offset = vec[15];
     partial_o_offset = vec[16];
     partial_lse_offset = vec[17];
+    cta_tile_q = vec[18];
   }
 };
+
+// Q tile for a batch whose longest request packs `max_packed_qo_len` =
+// qo_len * num_heads query rows: the smallest power of two in
+// [min_cta_tile_q, 64] that holds them, so no request needs more Q tiles than
+// it would with the 64-row tile. Narrower tiles only pay off with one CTA per
+// work item; the second CTA of a cluster would stream KV for rows that do not
+// exist.
+inline uint32_t MLASelectCtaTileQ(int max_packed_qo_len, uint32_t min_cta_tile_q,
+                                  int cluster_size) {
+  constexpr uint32_t kMaxCtaTileQ = 64;
+  if (cluster_size != 1) return kMaxCtaTileQ;
+  uint32_t cta_tile_q = min_cta_tile_q;
+  while (cta_tile_q < kMaxCtaTileQ && static_cast<int>(cta_tile_q) < max_packed_qo_len) {
+    cta_tile_q *= 2;
+  }
+  return cta_tile_q;
+}
 
 template <typename IdType>
 inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
@@ -1583,7 +1606,20 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                            size_t& staged_int_workspace_bytes, IdType* qo_indptr_h,
                            IdType* kv_indptr_h, IdType* kv_len_arr_h, uint32_t batch_size,
                            uint32_t num_heads, uint32_t head_dim_o, bool causal,
-                           cudaStream_t stream) {
+                           uint32_t min_cta_tile_q, uint32_t graph_num_blks_x,
+                           uint32_t graph_cta_tile_q, cudaStream_t stream) {
+  // min_cta_tile_q is the narrowest Q tile the kernel can run (16, 32 or 64).
+  // graph_num_blks_x / graph_cta_tile_q are the values of the plan a CUDA
+  // graph was captured with (0 when not replanning under a graph): the graph
+  // replays that kernel and grid, so the plan keeps them. Any tile and cluster
+  // size give correct results; the captured ones may just be less efficient.
+  FLASHINFER_CHECK(min_cta_tile_q == 16 || min_cta_tile_q == 32 || min_cta_tile_q == 64,
+                   "min_cta_tile_q must be 16, 32 or 64");
+  FLASHINFER_CHECK(graph_num_blks_x <= 2, "graph_num_blks_x must be 0, 1 or 2");
+  FLASHINFER_CHECK(graph_cta_tile_q == 0 || (graph_cta_tile_q >= min_cta_tile_q &&
+                                             (graph_cta_tile_q == 16 || graph_cta_tile_q == 32 ||
+                                              graph_cta_tile_q == 64)),
+                   "graph_cta_tile_q must be 0 or a supported Q tile");
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1591,6 +1627,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
 
   // step 0. determine the number of blocks in x and y dimensions
   int accum_packed_qo_len = 0;
+  int max_packed_qo_len = 0;
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec;
   for (uint32_t i = 0; i < batch_size; ++i) {
     if (qo_indptr_h[i + 1] - qo_indptr_h[i] < 0) {
@@ -1603,6 +1640,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i];
     int packed_qo_len = qo_len * num_heads;
     accum_packed_qo_len += packed_qo_len;
+    max_packed_qo_len = std::max(max_packed_qo_len, packed_qo_len);
 
     int kv_len = kv_len_arr_h[i];
     idx_qo_kv_len_vec.push_back({i, qo_len, kv_len});
@@ -1610,7 +1648,9 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int avg_packed_qo_len = accum_packed_qo_len / batch_size;
 
   int cluster_size;
-  if (avg_packed_qo_len > 64) {
+  if (graph_num_blks_x != 0) {
+    cluster_size = graph_num_blks_x;
+  } else if (avg_packed_qo_len > 64) {
     cluster_size = 2;  // two ctas in a cluster
   } else {
     cluster_size = 1;  // one cta in a cluster
@@ -1618,7 +1658,10 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   uint32_t num_clusters = num_sm / cluster_size;
   plan_info.num_blks_x = cluster_size;
   plan_info.num_blks_y = num_clusters;
-  const int cta_tile_q = 64;
+  const int cta_tile_q = graph_cta_tile_q != 0
+                             ? graph_cta_tile_q
+                             : MLASelectCtaTileQ(max_packed_qo_len, min_cta_tile_q, cluster_size);
+  plan_info.cta_tile_q = cta_tile_q;
   int cluster_tile_q = cluster_size * cta_tile_q;
 
   int64_t total_kv_lens = 0;
