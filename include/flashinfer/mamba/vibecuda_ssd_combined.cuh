@@ -347,6 +347,19 @@ __device__ __forceinline__ void tc_fence_after() {
 __device__ __forceinline__ void tc_fence_before() {
   asm volatile("tcgen05.fence::before_thread_sync;");
 }
+// Cross-proxy ordering for tcgen05.mma SMEM operands: tiles that warps filled
+// with generic-proxy stores (sBt/xs_w/prevb — the x-fold, scaled-B fold, and
+// prev-state fold below) are read by the tensor core through the async proxy,
+// and PTX's async-proxy rules require fence.proxy.async between the generic
+// writes and the MMA reads.  The producing stores are published CTA-wide by
+// __syncthreads() before each UMMA block; the issuing warp then executes this
+// fence before its elected single-thread umma issue (same placement idiom as
+// CUTLASS's fence_view_async_shared for register-computed UMMA operands).
+// cp.async-staged tiles (b/c) do not need it: cp.async writes are already
+// async-proxy operations whose completion is tracked by wait_group.
+__device__ __forceinline__ void fence_async_view() {
+  asm volatile("fence.proxy.async.shared::cta;");
+}
 __device__ __forceinline__ void tc_wait_ld() { asm volatile("tcgen05.wait::ld.sync.aligned;"); }
 __device__ __forceinline__ void tc_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;"); }
 __device__ __forceinline__ void tc_ld_x8(uint32_t taddr, float (&v)[8]) {
@@ -1060,6 +1073,7 @@ __global__ void __launch_bounds__(256)
         __syncthreads();
         const uint32_t tmb = *tmem_base_sh;  // tc_alloc by w0 happened before this sync
         if (w == 0) {
+          fence_async_view();  // generic sBt/xs_w fills -> async-proxy UMMA reads
           tc_fence_after();
           if (tc_elect_one()) {
             const uint64_t dA = TC_DESC_KMAJ(sBt);
@@ -1529,6 +1543,7 @@ __global__ void __launch_bounds__(256)
     // pairs (+8 cells per K=16 step), B = xs_w via an MN-major descriptor on
     // the raw bf16 x tile (rows beyond len are zero-filled).
     if (w == 0) {
+      fence_async_view();  // generic xs_w fill -> async-proxy UMMA reads
       tc_fence_after();
       if (tc_elect_one()) {
         const uint64_t dX = TC_DESC_MNMAJ(xs_w);
