@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "batch_mla_config.inc"
+#include "batch_mla_plan_update.cuh"
 #include "tvm/ffi/container/array.h"
 #include "tvm/ffi/container/tuple.h"
 #include "tvm_ffi_utils.h"
@@ -37,3 +38,4 @@ void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchMLAPagedAttentionPlan);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, BatchMLAPagedAttentionRun);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(commit_cuda_graph_plan_update, CommitBatchMLACudaGraphPlanUpdate);

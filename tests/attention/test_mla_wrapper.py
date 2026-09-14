@@ -12,7 +12,6 @@ import weakref
 import torch
 import pytest
 
-
 COMMON_PLAN_KWARGS = dict(
     num_heads=16,
     head_dim_ckv=4,
@@ -118,12 +117,120 @@ def test_batch_mla_module_proxy_rejects_invalid_workspace_prefix(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batch_mla_module_proxy_preallocated_staging_uses_only_caller_storage(
+    monkeypatch,
+):
+    import flashinfer.jit.attention.modules as attention_modules
+
+    class _RawModule:
+        def __init__(self):
+            self.plan_args = None
+            self.plan_info = [index * 3 for index in range(18)]
+
+        def plan(self, *args):
+            self.plan_args = args
+            args[2].view(torch.uint8).fill_(0xA5)
+            return self.plan_info, 37
+
+    raw = _RawModule()
+    proxy = attention_modules._BatchMLAModuleProxy(raw)
+    float_workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
+    int_workspace = torch.full((64,), 0xCD, dtype=torch.uint8, device="cuda")
+    scratch = torch.full((64,), 0xEF, dtype=torch.uint8, pin_memory=True)
+    expected_int_workspace = int_workspace.clone()
+    expected_scratch = torch.full((64,), 0xA5, dtype=torch.uint8)
+    tail_args = tuple([None] * 6)
+
+    def _reject_allocation(*args, **kwargs):
+        raise AssertionError(f"unexpected allocation: args={args}, kwargs={kwargs}")
+
+    monkeypatch.setattr(attention_modules.torch, "empty", _reject_allocation)
+
+    plan_info, staged_int_workspace_bytes = proxy.plan_with_preallocated_staging(
+        float_workspace,
+        int_workspace,
+        scratch,
+        *tail_args,
+    )
+
+    assert plan_info is raw.plan_info
+    assert staged_int_workspace_bytes == 37
+    assert raw.plan_args == (
+        float_workspace,
+        int_workspace,
+        scratch,
+        *tail_args,
+    )
+    assert torch.equal(scratch, expected_scratch)
+    assert torch.equal(int_workspace, expected_int_workspace)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("staged_int_workspace_bytes", "int_workspace_bytes", "scratch_bytes"),
+    [(-1, 64, 64), (33, 64, 32), (65, 64, 64)],
+)
+def test_batch_mla_module_proxy_preallocated_staging_rejects_invalid_prefix(
+    staged_int_workspace_bytes,
+    int_workspace_bytes,
+    scratch_bytes,
+):
+    from flashinfer.jit.attention.modules import _BatchMLAModuleProxy
+
+    class _RawModule:
+        def plan(self, *_args):
+            return [0] * 18, staged_int_workspace_bytes
+
+    proxy = _BatchMLAModuleProxy(_RawModule())
+    with pytest.raises(ValueError, match="staged_int_workspace_bytes"):
+        proxy.plan_with_preallocated_staging(
+            torch.empty(1, dtype=torch.uint8, device="cuda"),
+            torch.empty(int_workspace_bytes, dtype=torch.uint8, device="cuda"),
+            torch.empty(scratch_bytes, dtype=torch.uint8, pin_memory=True),
+            *([None] * 6),
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batch_mla_module_proxy_preallocated_staging_keeps_raw_nine_arg_contract():
+    from flashinfer.jit.attention.modules import _BatchMLAModuleProxy
+
+    class _RawModule:
+        def __init__(self):
+            self.plan_calls = 0
+
+        def plan(self, *_args):
+            self.plan_calls += 1
+            return [0] * 18, 0
+
+    raw = _RawModule()
+    proxy = _BatchMLAModuleProxy(raw)
+    args = (
+        torch.empty(1, dtype=torch.uint8, device="cuda"),
+        torch.empty(64, dtype=torch.uint8, device="cuda"),
+        torch.empty(64, dtype=torch.uint8, pin_memory=True),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+        8,
+        128,
+        False,
+    )
+
+    with pytest.raises(TypeError):
+        proxy.plan_with_preallocated_staging(*args, torch.empty(1, dtype=torch.int32))
+
+    assert raw.plan_calls == 0
+
+
 def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     wrapper = wrapper_cls.__new__(wrapper_cls)
     wrapper._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._pin_memory_int_workspace_buffer = torch.empty(16, dtype=torch.uint8)
     wrapper._use_cuda_graph = use_cuda_graph
+    wrapper._enable_cuda_graph_plan_update = False
     wrapper._backend = "fa2"
     wrapper.device = torch.device("cpu")
     wrapper._qo_indptr_buf = None
@@ -167,6 +274,21 @@ def _dense_metadata():
         block_tables=torch.tensor([[7], [8]], dtype=torch.int32),
         seq_lens=torch.tensor([1, 1], dtype=torch.int32),
     )
+
+
+def test_public_plan_run_and_legacy_mirror_access_are_warning_free(monkeypatch):
+    import flashinfer.mla as mla
+
+    _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    query = torch.empty(2, 16, 6, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 1, 6, dtype=torch.bfloat16)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        wrapper.plan(metadata=_dense_metadata(), **COMMON_PLAN_KWARGS)
+        wrapper.run(query=query, kv_cache=kv_cache)
+        assert wrapper._cached_module is wrapper._planned_backend._cached_module
 
 
 def test_mla_plan_metadata_accepts_cpu_dense_and_derives_csr():
@@ -1737,6 +1859,7 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
         )
     )
 
+    wrapper._cuda_graph_plan_update_stream = 17
     failing_module = None
 
     class _FailsAfterPlanningStarts(_FakeBatchMLAModule):
@@ -1769,6 +1892,7 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
             **common,
         )
 
+    assert wrapper._cuda_graph_plan_update_stream == 17
     assert failing_module is not None
     assert failing_module.int_workspace_arg is int_workspace
     assert failing_module.pin_workspace_arg is not pin_workspace
@@ -1826,6 +1950,7 @@ def test_cuda_graph_replan_keeps_only_current_backend_and_stable_graph_storage(
     )
     old_backend_refs = []
     for index in range(32):
+        wrapper._cuda_graph_plan_update_stream = 17
         old_backend_refs.append(weakref.ref(wrapper._planned_backend))
         previous_pin_workspace = (
             wrapper._planned_backend._pin_memory_int_workspace_buffer
@@ -1840,6 +1965,7 @@ def test_cuda_graph_replan_keeps_only_current_backend_and_stable_graph_storage(
             ),
             **common,
         )
+        assert getattr(wrapper, "_cuda_graph_plan_update_stream", None) is None
         assert (
             wrapper._planned_backend._pin_memory_int_workspace_buffer
             is not previous_pin_workspace

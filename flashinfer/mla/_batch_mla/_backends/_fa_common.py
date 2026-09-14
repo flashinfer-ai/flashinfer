@@ -7,20 +7,74 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    ClassVar,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import torch
 
 from ....jit import gen_batch_mla_module
 from ....utils import MaskMode, check_shape_dtype_device, get_compute_capability
+from ._fa_cuda_graph_plan_update import (
+    _acquire_mla_cuda_graph_plan_update_slot,
+    _check_current_mla_cuda_graph_frozen_contract,
+    _make_mla_cuda_graph_frozen_contract,
+    _make_mla_cuda_graph_plan_update_state,
+    _resolve_mla_cuda_graph_plan_update,
+    _stage_mla_cuda_graph_plan_update_copies,
+)
+from .._contracts import MLAPlanMetadata
 from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
 from .._planning import _MLAPlanArguments
+
+if TYPE_CHECKING:
+    from ._fa_cuda_graph_plan_update import (
+        _MLACudaGraphPlanUpdateState,
+    )
 
 
 class _GeneratedBatchMLAModule(Protocol):
     def plan(self, *args: object) -> object: ...
 
     def plan_with_staged_workspace_bytes(self, *args: object) -> tuple[object, int]: ...
+
+    def plan_with_preallocated_staging(
+        self,
+        float_workspace_buffer: torch.Tensor,
+        int_workspace_buffer: torch.Tensor,
+        page_locked_int_workspace_buffer: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+        num_heads: int,
+        head_dim_o: int,
+        causal: bool,
+    ) -> tuple[list[int], int]: ...
+
+    def commit_cuda_graph_plan_update(
+        self,
+        live_int_workspace: torch.Tensor,
+        live_qo_indptr: torch.Tensor,
+        live_kv_indptr: torch.Tensor,
+        live_kv_indices: torch.Tensor,
+        live_kv_len_arr: torch.Tensor,
+        candidate_int_workspace: torch.Tensor,
+        candidate_qo_indptr: torch.Tensor,
+        candidate_kv_indptr: torch.Tensor,
+        source_kv_indices: torch.Tensor,
+        candidate_kv_len_arr: torch.Tensor,
+        staged_int_workspace_bytes: int,
+        live_kv_indices_length: int,
+    ) -> None: ...
 
     def run(self, *args: object) -> object: ...
 
@@ -498,6 +552,7 @@ _FaBackendT = TypeVar("_FaBackendT", bound="_BatchMLAPagedAttentionFaBackendBase
 
 class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
     _plan_capabilities: ClassVar[Optional[MLAPlanCapabilities]] = None
+    _cuda_graph_plan_update_state: "_MLACudaGraphPlanUpdateState"
 
     def __init__(
         self,
@@ -596,6 +651,52 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             scale_mode=args.scale_mode,
             use_profiler=args.use_profiler,
         )
+        if args._use_cuda_graph and args._enable_cuda_graph_plan_update:
+            assert backend._qo_indptr_buf is not None
+            assert backend._kv_indptr_buf is not None
+            assert backend._kv_indices_buf is not None
+            assert backend._kv_len_arr_buf is not None
+            qo_indptr_host = (
+                csr.qo_indptr
+                if csr.qo_indptr.device.type == "cpu"
+                else csr.qo_indptr.to(device="cpu")
+            )
+            frozen_plan_info = cast(Sequence[int], backend._plan_info)
+            frozen = _make_mla_cuda_graph_frozen_contract(
+                backend_type=type(backend),
+                module=backend._cached_module,
+                device=backend.device,
+                float_workspace=backend._float_workspace_buffer,
+                int_workspace=backend._int_workspace_buffer,
+                qo_indptr=backend._qo_indptr_buf,
+                kv_indptr=backend._kv_indptr_buf,
+                kv_indices=backend._kv_indices_buf,
+                kv_len_arr=backend._kv_len_arr_buf,
+                batch_size=csr.qo_indptr.numel() - 1,
+                total_qo_rows=int(qo_indptr_host.tolist()[-1]),
+                num_heads=args.num_heads,
+                head_dim_ckv=args.head_dim_ckv,
+                page_size=args.page_size,
+                causal=args.causal,
+                sm_scale=args.sm_scale,
+                q_data_type=args.q_data_type,
+                kv_data_type=args.kv_data_type,
+                use_profiler=args.use_profiler,
+                plan_info=frozen_plan_info,
+                staged_int_workspace_bytes=backend._staged_int_workspace_bytes,
+            )
+            if backend.device.type == "cuda":
+                update_state = _make_mla_cuda_graph_plan_update_state(
+                    frozen=frozen,
+                    reusable_device_workspace=backend._int_workspace_buffer,
+                    reusable_planner_workspace=(
+                        backend._pin_memory_int_workspace_buffer
+                    ),
+                    qo_indptr=backend._qo_indptr_buf,
+                    kv_indptr=backend._kv_indptr_buf,
+                    kv_len_arr=backend._kv_len_arr_buf,
+                )
+                backend._cuda_graph_plan_update_state = update_state
         return backend
 
     def run_from_wrapper(
@@ -639,3 +740,97 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             ckv_scale_arr=ckv_scale_arr,
             kpe_scale=kpe_scale,
         )
+
+    def update_cuda_graph_plan_from_wrapper(
+        self,
+        *,
+        metadata: MLAPlanMetadata,
+    ) -> None:
+        # plan_from_wrapper creates update state only after validating every
+        # reserved graph buffer. Keep that narrowing local: eager instances of
+        # this backend legitimately retain None in these inherited fields.
+        if TYPE_CHECKING:
+            assert self._qo_indptr_buf is not None
+            assert self._kv_indptr_buf is not None
+            assert self._kv_indices_buf is not None
+            assert self._kv_len_arr_buf is not None
+        state = self._cuda_graph_plan_update_state
+        frozen = state.frozen
+        resolved = _resolve_mla_cuda_graph_plan_update(
+            metadata=metadata,
+            frozen=frozen,
+        )
+        _check_current_mla_cuda_graph_frozen_contract(
+            frozen,
+            backend_type=type(self),
+            module=self._cached_module,
+            device=self.device,
+            float_workspace=self._float_workspace_buffer,
+            int_workspace=self._int_workspace_buffer,
+            qo_indptr=self._qo_indptr_buf,
+            kv_indptr=self._kv_indptr_buf,
+            kv_indices=self._kv_indices_buf,
+            kv_len_arr=self._kv_len_arr_buf,
+            head_dim_ckv=self._head_dim_ckv,
+            page_size=self._page_size,
+            causal=self._causal,
+            sm_scale=self._sm_scale,
+            q_data_type=self._q_data_type,
+            kv_data_type=self._kv_data_type,
+            use_profiler=self._use_profiler,
+            plan_info=cast(Sequence[int], self._plan_info),
+            staged_int_workspace_bytes=self._staged_int_workspace_bytes,
+        )
+        slot = _acquire_mla_cuda_graph_plan_update_slot(state)
+        try:
+            slot.qo_indptr.copy_(resolved.qo_indptr)
+            slot.kv_indptr.copy_(resolved.kv_indptr)
+            slot.kv_len_arr.copy_(resolved.kv_len_arr)
+
+            candidate_plan_info, candidate_staged_int_workspace_bytes = (
+                self._cached_module.plan_with_preallocated_staging(
+                    self._float_workspace_buffer,
+                    state.candidate.int_workspace,
+                    slot.planner_workspace,
+                    slot.qo_indptr,
+                    slot.kv_indptr,
+                    slot.kv_len_arr,
+                    frozen.num_heads,
+                    frozen.head_dim_ckv,
+                    frozen.causal,
+                )
+            )
+            if tuple(candidate_plan_info) != frozen.plan_info:
+                raise RuntimeError("candidate plan_info changed")
+            if (
+                candidate_staged_int_workspace_bytes
+                != frozen.staged_int_workspace_bytes
+            ):
+                raise RuntimeError("candidate staged_int_workspace_bytes changed")
+
+            _stage_mla_cuda_graph_plan_update_copies(
+                slot,
+                state.candidate.int_workspace,
+                state.candidate.qo_indptr,
+                state.candidate.kv_indptr,
+                state.candidate.kv_len_arr,
+            )
+
+            self._cached_module.commit_cuda_graph_plan_update(
+                self._int_workspace_buffer,
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
+                self._kv_indices_buf,
+                self._kv_len_arr_buf,
+                state.candidate.int_workspace,
+                state.candidate.qo_indptr,
+                state.candidate.kv_indptr,
+                resolved.kv_indices,
+                state.candidate.kv_len_arr,
+                frozen.staged_int_workspace_bytes,
+                resolved.live_kv_indices,
+            )
+        except Exception:
+            if slot.status == "in-use":
+                slot.status = "idle"
+            raise
