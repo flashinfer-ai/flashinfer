@@ -56,7 +56,6 @@ from .api import (  # noqa: F401
     MoEWeightPack,
     QuantConfig,
     QuantFormat,
-    QuantVariant,
     RoutingConfig,
     TrtllmBf16Config,
     TrtllmFp4Config,
@@ -154,6 +153,11 @@ from ..tllm_enums import (
     RoutingMethodType,
 )
 
+from .alphamoe_sm100 import (  # noqa: F401
+    alphamoe_fp8_block_scale_aligned_moe as alphamoe_fp8_block_scale_aligned_moe,
+    alphamoe_interleave_gated_weights as alphamoe_interleave_gated_weights,
+)
+
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
@@ -224,6 +228,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "alphamoe_fp8_block_scale_aligned_moe",
+    "alphamoe_interleave_gated_weights",
     # Typed activation values
     "ActivationConfig",
     "GELU",
@@ -291,7 +297,6 @@ __all__ = [
     "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
     "QuantFormat",
-    "QuantVariant",
     "RoutingConfig",
     "TrtllmBf16Config",
     "TrtllmFp4Config",

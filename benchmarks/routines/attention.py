@@ -2484,11 +2484,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 "prims-ts",
                 "supports FP16, BF16, and FP8 E4M3 inputs only",
             )
-        elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 256):
+        elif (head_dim_qk, head_dim_vo) not in ((128, 128), (192, 128), (256, 256)):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires equal QK/VO head dimensions in {128, 256}",
+                "requires QK/VO head dimensions (128,128), (192,128), or (256,256)",
             )
         elif num_qo_heads % num_kv_heads != 0:
             _drop_backend(backends, "prims-ts", "requires Hq to be divisible by Hkv")
@@ -2783,6 +2783,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
+            head_dim_vo=head_dim_vo,
             q_dtype=q.dtype,
             kv_dtype=k.dtype,
             packed=True,

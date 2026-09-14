@@ -32,9 +32,7 @@ Unified MoE API
 ---------------
 
 Backend-agnostic configuration and layer types. ``QuantConfig`` carries the MMA
-weight / activation formats and the layer output format as ``QuantFormat`` axes;
-``QuantVariant`` is a deprecated preset that expands to a ``(weight, activation)``
-pair.
+weight / activation formats and the layer output format as ``QuantFormat`` axes.
 
 .. autosummary::
     :toctree: ../generated
@@ -44,7 +42,6 @@ pair.
     RoutingConfig
     QuantConfig
     QuantFormat
-    QuantVariant
     ExpertConfig
     ExecutionConfig
     MoEFinalizeConfig

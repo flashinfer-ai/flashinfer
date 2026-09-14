@@ -29,8 +29,8 @@ import torch
 
 pytest.importorskip(
     "cutlass",
-    minversion="4.7.0",
-    reason="PrimTS attention tests require nvidia-cutlass-dsl==4.7.0",
+    minversion="4.7.0a0",
+    reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0a0",
 )
 
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
@@ -698,7 +698,7 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
     monkeypatch.setattr(
         context_module,
         "_prepare_out",
-        lambda out, *, q, output_dtype: out,
+        lambda out, *, q, output_dtype, head_dim_vo=None: out,
     )
     argument_names = (
         "k",
@@ -726,6 +726,7 @@ def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
         wrapper._plan_state = context_module._ContextPlanState(
             geometry=SimpleNamespace(
                 output_dtype=out.dtype,
+                head_dim_vo=None,
                 packed=True,
                 mask_type="dense",
             ),
@@ -1003,6 +1004,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
+        "head_dim_vo",
         "q_dtype",
         "kv_dtype",
         "out_dtype",
@@ -1032,6 +1034,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "output_scale",
         "validate",
     )
+    assert plan_parameters["head_dim_vo"].default is None
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
     assert run_parameters["variable_window_cta_starts"].kind is (
@@ -1609,7 +1612,7 @@ def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
     monkeypatch.setattr(
         context_module,
         "_prepare_out",
-        lambda out, *, q, output_dtype: out,
+        lambda out, *, q, output_dtype, head_dim_vo=None: out,
     )
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
@@ -1620,6 +1623,7 @@ def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
             max_seq_len_q=1,
             max_seq_len_k=1,
             head_dim=128,
+            head_dim_vo=None,
             output_dtype=torch.int32,
             packed=False,
             mask_type="variable_window",
@@ -2639,6 +2643,12 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
         context_module._dsl_supports_ldtm_stat()
         and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
     )
+    if torch.cuda.get_device_capability() == (10, 7):
+        # SM103 above supports both native and inline-PTX reduction. SM107
+        # additionally needs a native wrapper because DSL 4.7 targets sm_100f.
+        from cutlass.experimental import primitives as prims
+
+        expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
         context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
     )
@@ -5282,3 +5292,174 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     _assert_context_correct(graph_out, second)
+
+
+# Non-absorbed MLA: separate compact Q/K=192, V/O=128.
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    ("packed", "q_lens", "k_lens", "large_masked_scores"),
+    [
+        pytest.param(False, (65,), (65,), False, id="fixed-b1-single-tile"),
+        pytest.param(False, (257, 257), (513, 513), False, id="fixed-b2-partial"),
+        pytest.param(False, (128,) * 4, (256,) * 4, False, id="fixed-b4-aligned"),
+        pytest.param(True, (257,), (513,), False, id="packed-b1-partial"),
+        pytest.param(True, (256, 256), (512, 512), False, id="packed-b2-replay"),
+        pytest.param(True, (65, 257), (129, 513), False, id="packed-b2-mixed"),
+        pytest.param(
+            True,
+            (1, 127, 128, 385),
+            (65, 128, 257, 513),
+            False,
+            id="packed-b4-mixed",
+        ),
+        pytest.param(False, (257,), (513,), True, id="fixed-b1-large-masked-scores"),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mla_prefill(
+    dtype, out_dtype, packed, q_lens, k_lens, large_masked_scores, causal
+):
+    """Validate batched MLA with fixed/ragged lengths, dtype pairs and graph replay."""
+    torch.manual_seed(123)
+    batch_size = len(q_lens)
+    hq, hkv = (8, 2) if packed else (96, 1)
+    q = torch.randn(sum(q_lens), hq, 192, device="cuda")
+    k = torch.randn(sum(k_lens), hkv, 192, device="cuda")
+    v = torch.randn(sum(k_lens), hkv, 128, device="cuda")
+    if large_masked_scores:
+        # The first row's visible keys have strongly negative scores, while
+        # future keys in the same K tile are strongly positive. Including a
+        # masked maximum would underflow every valid probability. Put the
+        # signal in the separate 64-element QK tail as well.
+        q.zero_()
+        k.zero_()
+        q[..., 128:] = 16
+        k[..., 128:] = 16
+        k[: k_lens[0] - q_lens[0] + 1, :, 128:] = -16
+    # Exercise descales with large FP8 operands, as in the benchmark.
+    operand_scale = 16 if dtype == torch.float8_e4m3fn else 1
+    q = (q * operand_scale).to(dtype)
+    k = (k * operand_scale).to(dtype)
+    v = (v * operand_scale).to(dtype)
+    sm_scale = 1 / (math.sqrt(192) * operand_scale**2)
+    output_scale = 0.75 / operand_scale
+    qo = (
+        torch.tensor(_cumulative(q_lens), device="cuda", dtype=torch.int32)
+        if packed
+        else None
+    )
+    ko = (
+        torch.tensor(_cumulative(k_lens), device="cuda", dtype=torch.int32)
+        if packed
+        else None
+    )
+
+    def reference(q_lengths, k_lengths):
+        expected = []
+        q_offset = k_offset = 0
+        for nq, nk in zip(q_lengths, k_lengths, strict=True):
+            qr = q[q_offset : q_offset + nq].float().transpose(0, 1)
+            kr = k[k_offset : k_offset + nk].float().transpose(0, 1)
+            vr = v[k_offset : k_offset + nk].float().transpose(0, 1)
+            kr = kr.repeat_interleave(hq // hkv, dim=0)
+            vr = vr.repeat_interleave(hq // hkv, dim=0)
+            scores = (qr @ kr.transpose(-1, -2)) * sm_scale
+            if causal:
+                mask = torch.arange(nk, device="cuda")[None, :] > (
+                    nk - nq + torch.arange(nq, device="cuda")[:, None]
+                )
+                scores.masked_fill_(mask, -torch.inf)
+            expected.append((scores.softmax(-1) @ vr).transpose(0, 1) * output_scale)
+            q_offset += nq
+            k_offset += nk
+        return torch.cat(expected)
+
+    expected = reference(q_lens, k_lens)
+    if not packed:
+        q = q.reshape(batch_size, q_lens[0], hq, 192)
+        k = k.reshape(batch_size, k_lens[0], hkv, 192)
+        v = v.reshape(batch_size, k_lens[0], hkv, 128)
+        expected = expected.reshape(batch_size, q_lens[0], hq, 128)
+    out = torch.empty((*q.shape[:-1], 128), dtype=out_dtype, device="cuda")
+    replay_shift = (
+        min(129, q_lens[-1] - 1, k_lens[0] - q_lens[0])
+        if packed and batch_size > 1
+        else 0
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=q.device,
+        batch_size=batch_size,
+        max_seq_len_q=max(q_lens) + replay_shift,
+        max_kv_len=max(k_lens) + int(replay_shift > 0),
+        num_qo_heads=hq,
+        num_kv_heads=hkv,
+        head_dim=192,
+        head_dim_vo=128,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        packed=packed,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        out_dtype=out_dtype,
+    )
+    actual = wrapper.run(q, k, v, qo, ko, out=out)
+    assert actual is out
+    assert actual.shape == expected.shape
+    has_fp8 = torch.float8_e4m3fn in (dtype, out_dtype)
+    atol, rtol = (0.13, 0.05) if has_fp8 else (0.01, 0.02)
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+    relative_l2 = torch.linalg.vector_norm(
+        actual.float() - expected
+    ) / torch.linalg.vector_norm(expected)
+    assert relative_l2.item() < (0.05 if has_fp8 else 0.01)
+    allocated = batch_prefill(
+        q,
+        k,
+        v,
+        qo_indptr=qo,
+        kv_indptr=ko,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        out_dtype=out_dtype,
+    )
+    assert allocated.shape == out.shape and allocated.dtype == out_dtype
+    torch.testing.assert_close(allocated.float(), expected, atol=atol, rtol=rtol)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, qo, ko, out=out, validate=False)
+    out.zero_()
+    graph.replay()
+    torch.testing.assert_close(out.float(), expected, atol=atol, rtol=rtol)
+    if replay_shift:
+        # Reuse the captured plan and storage while changing request lengths.
+        # In the equal-length case this also activates a previously empty Q tile.
+        changed_q = list(q_lens)
+        changed_q[0] += replay_shift
+        changed_q[-1] -= replay_shift
+        qo[1:-1].add_(replay_shift)
+        out.zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), reference(changed_q, k_lens), atol=atol, rtol=rtol
+        )
+        changed_k = list(k_lens)
+        changed_k[0] += 1
+        changed_k[-1] -= 1
+        ko[1:-1].add_(1)
+        out.zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), reference(changed_q, changed_k), atol=atol, rtol=rtol
+        )
+    with pytest.raises(ValueError, match="out must have shape"):
+        wrapper.run(q, k, v, qo, ko, out=torch.empty_like(q, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="v must have"):
+        wrapper.run(q, k, torch.empty_like(k), qo, ko)

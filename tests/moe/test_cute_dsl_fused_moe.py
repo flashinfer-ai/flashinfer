@@ -3446,7 +3446,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         mxfp8_quantize,
     )
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.fused_moe import CuteDslConfig, QuantVariant
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
 
     torch.manual_seed(20260827)
     device = torch.device("cuda")
@@ -3488,7 +3488,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
     view = CuteDslConfig.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.MXFP4,
+        quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
