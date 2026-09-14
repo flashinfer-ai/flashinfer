@@ -19,7 +19,7 @@ import re
 import pytest
 
 from flashinfer.aot import _gen_blackwell_bf16_bmm_aot_specs
-from flashinfer.jit.gemm import blackwell_bf16_bmm
+from flashinfer.jit.gemm import cake_blackwell_bf16_bmm as blackwell_bf16_bmm
 
 
 @pytest.mark.parametrize(

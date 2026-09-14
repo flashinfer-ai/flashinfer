@@ -101,7 +101,7 @@ from .jit.gemm import (
     gen_trtllm_low_latency_gemm_module,
     gen_blackwell_bf16_bmm_module,
 )
-from .jit.gemm.blackwell_bf16_bmm import BlackwellBf16BmmTarget
+from .jit.gemm.cake_blackwell_bf16_bmm import BlackwellBf16BmmTarget
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
