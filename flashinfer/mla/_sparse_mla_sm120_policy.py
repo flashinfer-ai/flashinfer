@@ -79,11 +79,6 @@ _MODEL_TYPE_DSV4_1 = 5
 # divergence (its latent V is the full 1024-wide latent, rope excluded).
 _D_V_BY_MODEL_TYPE = FormatValues({model: model for model in range(6)}, "value_dim")
 
-# Construction-time d_v validation must not evaluate FormatValues (that loads
-# the JIT module). This static set mirrors the compiled format table; a test
-# asserts parity with _D_V_BY_MODEL_TYPE once loaded.
-_SUPPORTED_D_V = frozenset({512, 1024})
-
 # Kernel-family names used in the public config query and error messages.
 _MODEL_TYPE_TO_FAMILY = _cpb.MODEL_FAMILIES
 

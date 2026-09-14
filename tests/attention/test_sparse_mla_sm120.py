@@ -3290,19 +3290,18 @@ def test_sparse_mla_sm120_dots3_swa_runner(num_tokens: int) -> None:
 
 
 def test_sparse_mla_sm120_runner_rejects_unknown_d_v() -> None:
-    """The runner accepts every model type's d_v and nothing else."""
+    """Construction stays JIT-free; a d_v outside the compiled format table is
+    rejected on the first run."""
     device = torch.device("cuda")
     for d_v in (512, 1024):
         _SparseMLAPagedAttentionRunner(d_v=d_v, device=device)
+    runner = _SparseMLAPagedAttentionRunner(d_v=768, device=device)
+    kv_bf16 = torch.zeros(2, 64, 1, 512, device=device, dtype=torch.bfloat16)
+    q = torch.zeros(1, 8, 512, device=device, dtype=torch.bfloat16)
+    indices = torch.zeros(1, 128, device=device, dtype=torch.int32)
+    output = torch.zeros(1, 8, 768, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="d_v"):
-        _SparseMLAPagedAttentionRunner(d_v=768, device=device)
-    # The static construction-time set must mirror the compiled format table.
-    from flashinfer.mla._sparse_mla_sm120_policy import (
-        _SUPPORTED_D_V,
-        _D_V_BY_MODEL_TYPE,
-    )
-
-    assert frozenset(_D_V_BY_MODEL_TYPE.values()) == _SUPPORTED_D_V
+        runner.run(q, quantize_kv_dsv4(kv_bf16), indices, output, 512**-0.5)
 
 
 def test_sparse_mla_sm120_runner_wide_lse_buffer() -> None:
