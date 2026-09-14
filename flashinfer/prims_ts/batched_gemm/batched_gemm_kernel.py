@@ -1858,9 +1858,7 @@ def _batched_gemm_kernel_bf16_body(
                 [gmem_c._alloc_sc],
             ]
         )
-    tmem_ptr_alloc = smem_allocator.add_tmem_ptr(
-        _make_tmem_ptr_smem_allocation()
-    )
+    tmem_ptr_alloc = smem_allocator.add_tmem_ptr(_make_tmem_ptr_smem_allocation())
     tmem_dealloc_mbar_alloc = None
     if cutlass.const_expr(cfg.has_cluster):
         tmem_dealloc_mbar_alloc = smem_allocator.add(
@@ -1910,9 +1908,7 @@ def _batched_gemm_kernel_bf16_body(
                     alignment=8,
                 )
             )
-        if cutlass.const_expr(
-            cfg.use_early_exit and cfg.use_clc_fast_drain
-        ):
+        if cutlass.const_expr(cfg.use_early_exit and cfg.use_clc_fast_drain):
             fast_drain_response_alloc = smem_allocator.add(
                 SmemAllocation(
                     "work_queue_fast_drain_response",
@@ -1946,9 +1942,7 @@ def _batched_gemm_kernel_bf16_body(
             smem_base + workid_barrier_alloc.offset,
             mem_space=cutlass.AddressSpace.smem,
         )
-        pcfgs["workid"] = replace(
-            pcfgs["workid"], barrier_ptr=workid_barrier_ptr
-        )
+        pcfgs["workid"] = replace(pcfgs["workid"], barrier_ptr=workid_barrier_ptr)
         if cutlass.const_expr(cfg.use_work_throttle_barrier):
             work_throttle_barrier_ptr = cute.make_ptr(
                 cutlass.Int64,
@@ -1966,12 +1960,8 @@ def _batched_gemm_kernel_bf16_body(
                 smem_base + proxy_barrier_alloc.offset,
                 mem_space=cutlass.AddressSpace.smem,
             )
-            pcfgs["proxy"] = replace(
-                pcfgs["proxy"], barrier_ptr=proxy_barrier_ptr
-            )
-        if cutlass.const_expr(
-            cfg.use_early_exit and cfg.use_clc_fast_drain
-        ):
+            pcfgs["proxy"] = replace(pcfgs["proxy"], barrier_ptr=proxy_barrier_ptr)
+        if cutlass.const_expr(cfg.use_early_exit and cfg.use_clc_fast_drain):
             fast_drain_response_ptr = cute.make_ptr(
                 cutlass.Int128,
                 smem_base + fast_drain_response_alloc.offset,
@@ -3286,10 +3276,12 @@ def gemm(
                 tma_c_format = cuda.TensorMapDataFormat.BYTE
             else:
                 tma_c_format = cuda.TensorMapDataFormat.DEFAULT
-            if cutlass.const_expr(cfg.dtype_c_bits == 16):
-                tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(
-                    tma_store_cols * 2
-                )
+            if cutlass.const_expr(
+                cfg.dtype_c_bits == 16
+                and cfg.use_tile256_tmem_overlap
+                and cfg.num_epilogue_warps == 4
+            ):
+                tma_c_swizzle = _tma_swizzle_for_fastest_dim_bytes(tma_store_cols * 2)
             else:
                 tma_c_swizzle = cuda.TensorMapSwizzle.none
             tma_c_desc = cuda.create_tensor_map_tiled_from_tensor(

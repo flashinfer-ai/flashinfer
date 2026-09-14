@@ -169,9 +169,7 @@ def test_non_swap_ht256_overlap_uses_epilogue_tile_width(
     max_swizzled_cols = 128 * 8 // cfg.dtype_c_bits
     assert cfg.non_swap_tma_store_cols == min(cfg.epi_tile_n, max_swizzled_cols)
     assert cfg.epi_tile_n % cfg.non_swap_tma_store_cols == 0
-    tma_store_bytes = (
-        cfg.tile_m * cfg.non_swap_tma_store_cols * cfg.dtype_c_bits // 8
-    )
+    tma_store_bytes = cfg.tile_m * cfg.non_swap_tma_store_cols * cfg.dtype_c_bits // 8
     assert cfg.num_bytes_c_per_stage % tma_store_bytes == 0
 
 
@@ -268,7 +266,7 @@ def test_trtllm_equiv_task_manager_smem_matches_kernel_allocation():
     _, _, smem_allocator, _ = _build_schedule_validate(cfg, num_k_tiles=16)
 
     assert smem_allocator.total_smem_bytes == 217088
-    assert smem_allocator.barrier_smem_bytes == 368
+    assert smem_allocator.barrier_smem_bytes == 464
     assert [
         (r.name, r.pipeline_config.num_stages)
         for r in smem_allocator._barrier_resources
@@ -277,15 +275,18 @@ def test_trtllm_equiv_task_manager_smem_matches_kernel_allocation():
         ("SmemB", 5),
         ("SmemSfA", 6),
         ("SmemSfB", 6),
+        ("WorkQueue", 3),
         ("TmemC", 1),
+        ("WorkThrottle", 3),
     ]
 
     tmem_ptr = _make_tmem_ptr_smem_allocation()
     assert (tmem_ptr.size_bytes, tmem_ptr.alignment, tmem_ptr.count) == (8, 8, 1)
 
-    # GPU assembly adds the aligned TMEM pointer, the cluster deallocation
-    # mbarrier, the CLC response, and two 3-stage scheduler barrier pairs.
-    scheduler_data_bytes = 8 + 8 + 48 + 48 + 48
+    # GPU assembly additionally adds the aligned TMEM pointer, the cluster
+    # deallocation mbarrier, and the CLC response. Scheduler barrier pairs are
+    # already included in ``barrier_smem_bytes``.
+    scheduler_data_bytes = 8 + 8 + 48
     assert (
         smem_allocator.total_smem_bytes
         + scheduler_data_bytes

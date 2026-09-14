@@ -1477,7 +1477,9 @@ class BatchedGemmConfig:
         """Largest legal non-swap ``32x32b`` TMEM load under the configured cap."""
         # The DeepSeek epilogue carries a same-sized FP32 dequant accumulator
         # through the K loop and retains its existing conservative fragment.
-        if self.has_deepseek_fp8:
+        # Non-overlap schedules likewise retain the established four-fragment
+        # layout; the wider load control belongs to the tile256 overlap path.
+        if self.has_deepseek_fp8 or not self.use_tile256_tmem_overlap:
             return max(1, self.epi_tile_n // 4)
 
         width_limit = min(self.epi_tile_n, self.tmem_ldst_max_num_regs)
@@ -2668,13 +2670,9 @@ def validate_config(
         int(CtaRasterOrder.ALONG_N),
     ):
         raise ValueError(
-            "cta_raster_order must be ALONG_M or "
-            f"ALONG_N, got {cfg.cta_raster_order}"
+            f"cta_raster_order must be ALONG_M or ALONG_N, got {cfg.cta_raster_order}"
         )
-    if (
-        cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N)
-        and not cfg.is_persistent
-    ):
+    if cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N) and not cfg.is_persistent:
         raise ValueError("cta_raster_order=ALONG_N requires persistent scheduling")
 
     if cfg.cluster_m not in (1, 2):
@@ -2898,8 +2896,7 @@ def validate_config(
 
     if cfg.tmem_ldst_max_num_regs not in (32, 64):
         raise ValueError(
-            "tmem_ldst_max_num_regs must be 32 or 64, got "
-            f"{cfg.tmem_ldst_max_num_regs}"
+            f"tmem_ldst_max_num_regs must be 32 or 64, got {cfg.tmem_ldst_max_num_regs}"
         )
 
     if cfg.use_tma_oob_opt not in (0, 1):

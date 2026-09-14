@@ -401,6 +401,13 @@ class _DummyResource(MemoryResource):
     def load_overlap_subtile(self, stage_info, *, subtile_idx: cutlass.Constexpr[int]):
         pass
 
+    @consumer_work_decorator(
+        returns=("t2r_rmem", "t2r_rmem_1", "t2r_output_call_idx"),
+        work_attrs=WorkAttr.AUXILIARY,
+    )
+    def preload_non_swap_overlap(self, stage_info):
+        pass
+
     # TmemC
     @producer_work()
     def mma(
@@ -459,6 +466,17 @@ class _DummyResource(MemoryResource):
         t2r_rmem_1,
         t2r_output_call_idx,
         subtile_idx: cutlass.Constexpr[int],
+    ):
+        pass
+
+    @producer_work()
+    def store_non_swap_overlap(
+        self,
+        stage_info,
+        *,
+        t2r_rmem,
+        t2r_rmem_1,
+        t2r_output_call_idx,
     ):
         pass
 
@@ -619,6 +637,8 @@ def _cfg(**overrides) -> SimpleNamespace:
         "is_swap_ab": False,
         "epi_tile_n": 32,
         "tile_n": 64,
+        "non_swap_tmem_load_num_regs": 32,
+        "non_swap_tmem_overlap_loads": 1,
         "epilogue_warp_idx": 9,
         "epilogue_regs": 24,
         "workid_warp_idx": 10,

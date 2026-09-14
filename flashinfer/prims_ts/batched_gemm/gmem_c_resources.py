@@ -1086,8 +1086,7 @@ class GmemCResource(MemoryResource):
         calls_per_tma = max(1, tma_store_cols // epi_t2r_repx)
         call_in_tma = call_idx % calls_per_tma
         use_tile256_overlap = (
-            self.cfg.use_tile256_tmem_overlap
-            and self.cfg.num_epilogue_warps == 4
+            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
         )
         # In the max-overlap path, wait only when the next TMA group is about
         # to reuse the scratch box. Keep the waits at the actual store sites:
@@ -1095,11 +1094,12 @@ class GmemCResource(MemoryResource):
         # the independent epilogue math and shortens the intended overlap.
         smem_box_base = self.sC
         smem_col = Int32(call_in_tma * epi_t2r_repx)
-        if cutlass.const_expr(self.cfg.dtype_c_bits == 16):
+        if cutlass.const_expr(self.cfg.dtype_c_bits == 16 and use_tile256_overlap):
             # Match the TMA descriptor's 32/64/128-byte swizzle. Split the
-            # fragment into 16-byte atoms because TMA swizzling permutes those
-            # atoms within each row; a wider vector store could cross a
-            # swizzle boundary.
+            # coalesced max-overlap fragment into 16-byte atoms because TMA
+            # swizzling permutes those atoms within each row; a wider vector
+            # store could cross a swizzle boundary. Non-overlap schedules keep
+            # the established row-vector staging layout below.
             if token_in_bounds:
                 if cutlass.const_expr(use_tile256_overlap):
                     if call_in_tma == Int32(0):
@@ -1108,9 +1108,7 @@ class GmemCResource(MemoryResource):
                             barrier_id=9,
                             thread_count=self.cfg.num_epilogue_warps * 32,
                         )
-                self._stage_non_swap_16bit_tma_vec(
-                    vec_out, row_in_tile, smem_col
-                )
+                self._stage_non_swap_16bit_tma_vec(vec_out, row_in_tile, smem_col)
             else:
                 zero_vec = cutlass.vector.full_like(vec_out, 0.0)
                 if cutlass.const_expr(use_tile256_overlap):
@@ -1120,9 +1118,7 @@ class GmemCResource(MemoryResource):
                             barrier_id=9,
                             thread_count=self.cfg.num_epilogue_warps * 32,
                         )
-                self._stage_non_swap_16bit_tma_vec(
-                    zero_vec, row_in_tile, smem_col
-                )
+                self._stage_non_swap_16bit_tma_vec(zero_vec, row_in_tile, smem_col)
         else:
             smem_row = smem_box_base.subview(
                 row_in_tile * Int32(tma_store_cols) + smem_col
@@ -1138,9 +1134,7 @@ class GmemCResource(MemoryResource):
                 smem_row.store(
                     vec_out,
                     vector_size=epi_t2r_repx,
-                    alignment=(
-                        (1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx
-                    ),
+                    alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
                 )
             else:
                 zero_vec = cutlass.vector.full_like(vec_out, 0.0)
@@ -1154,9 +1148,7 @@ class GmemCResource(MemoryResource):
                 smem_row.store(
                     zero_vec,
                     vector_size=epi_t2r_repx,
-                    alignment=(
-                        (1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx
-                    ),
+                    alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
                 )
 
         cute.arch.fence_view_async_shared()
@@ -1190,14 +1182,10 @@ class GmemCResource(MemoryResource):
         )
 
     @cute.jit
-    def _non_swap_16bit_tma_smem_element_offset(
-        self, m_local_row, n_local_col
-    ):
+    def _non_swap_16bit_tma_smem_element_offset(self, m_local_row, n_local_col):
         """Map a row-major 16-bit C element into the TMA-swizzled scratch."""
         tma_store_cols = Int32(self.cfg.non_swap_tma_store_cols)
-        smem_offset_bytes = (
-            m_local_row * tma_store_cols + n_local_col
-        ) * Int32(2)
+        smem_offset_bytes = (m_local_row * tma_store_cols + n_local_col) * Int32(2)
         if cutlass.const_expr(self.cfg.non_swap_tma_store_cols >= 64):
             swizzle_mask = (m_local_row % Int32(8)) * Int32(16)
         elif cutlass.const_expr(self.cfg.non_swap_tma_store_cols >= 32):
@@ -1209,9 +1197,7 @@ class GmemCResource(MemoryResource):
         return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
 
     @cute.jit
-    def _stage_non_swap_16bit_tma_vec(
-        self, vec_out, m_local_row, n_local_col
-    ):
+    def _stage_non_swap_16bit_tma_vec(self, vec_out, m_local_row, n_local_col):
         """Stage a 16-bit fragment as independently swizzled 16-byte atoms."""
         epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
         full_atoms = epi_t2r_repx // 8
@@ -1230,9 +1216,7 @@ class GmemCResource(MemoryResource):
         tail_elems = epi_t2r_repx % 8
         if cutlass.const_expr(tail_elems != 0):
             atom_col = full_atoms * 8
-            tail = tuple(
-                vec_out[atom_col + elem_idx] for elem_idx in range(tail_elems)
-            )
+            tail = tuple(vec_out[atom_col + elem_idx] for elem_idx in range(tail_elems))
             smem_offset = self._non_swap_16bit_tma_smem_element_offset(
                 m_local_row, n_local_col + Int32(atom_col)
             )
