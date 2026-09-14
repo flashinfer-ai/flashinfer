@@ -723,6 +723,56 @@ def rmsnorm_fp4quant(
     selection, and is never selected automatically, including when
     ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. See the experimental
     backend README for a runnable example and the tested dependency versions.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        CUDA input with shape ``(M, K)`` or ``(B, S, K)``. CuTe accepts FP16
+        or BF16; Triton requires contiguous BF16 and ``64 <= K <= 8192``
+        with ``K`` divisible by 16.
+    weight : torch.Tensor
+        RMSNorm weights of shape ``(K,)``, on the input device with the same
+        dtype. Triton requires contiguous storage.
+    y_fp4 : torch.Tensor, optional
+        Preallocated packed output with dtype ``torch.float4_e2m1fn_x2``
+        and the input shape with its last dimension halved. Allocated when
+        omitted. Triton requires contiguous, nonoverlapping output storage.
+    block_scale : torch.Tensor, optional
+        Preallocated block scales, allocated when omitted. Row-major shape
+        matches the input with its last dimension divided by ``block_size``;
+        swizzled storage is flattened and padded to 128-row by 4-block tiles.
+        E4M3 uses ``torch.float8_e4m3fn``; CuTe UE8M0 uses ``torch.uint8``.
+        Triton requires contiguous, nonoverlapping output storage.
+    global_scale : torch.Tensor, optional
+        Device FP32 tensor of shape ``(1,)``; omitted means one. For Triton,
+        a finite positive value scales the per-block maxima before E4M3
+        rounding and is read at execution time. Reconstruct values with
+        ``FP4 * block_scale / global_scale``.
+    eps : float
+        Positive RMSNorm stability constant, default ``1e-6``.
+    block_size : int
+        Elements per quantization block: 16 for NVFP4 (default), or 32 for
+        CuTe MXFP4. Triton supports only 16.
+    scale_format : str, optional
+        ``"e4m3"`` or ``"ue8m0"``. When omitted, CuTe infers the format from
+        ``block_size``. Triton accepts only ``None`` or ``"e4m3"``.
+    is_sf_swizzled_layout : bool
+        Whether to use padded 128x4 swizzled scale storage instead of
+        row-major storage. Default is ``False``; padding is unspecified.
+    enable_pdl : bool, optional
+        CuTe enables Programmatic Dependent Launch when supported unless
+        explicitly disabled. Triton accepts ``None`` or ``False`` for
+        ordinary stream ordering and rejects ``True``.
+    backend : str
+        ``"cute-dsl"`` (default) or ``"auto"`` selects CuTe. Explicit
+        ``"triton"`` selects the experimental SM120 backend and warns once.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        Packed FP4 values and per-block scales, reusing supplied output
+        buffers. See :func:`flashinfer.cute_dsl.rmsnorm_fp4quant` for full
+        details of the CuTe implementation.
     """
     if backend == "triton":
         warn_experimental_backend_once("rmsnorm_fp4quant", backend)
