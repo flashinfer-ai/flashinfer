@@ -823,10 +823,10 @@ class TmemCResource(MemoryResource):
         swapAB: 16x256b, 4 regs per 8 columns, two 16-row loads.
         """
         base_col = self.tmem_raw_addr & 0xFFFF
-        base_row = self.tmem_raw_addr >> 16
         stage_col_offset = stage_info.stage_idx * self._tmem_c_cols_per_stage()
 
         warp_idx = cute.arch.warp_idx()
+        tmem_sp = cute.arch.make_warp_uniform(warp_idx % 4)
         warp_in_group = warp_idx % self.cfg.num_epilogue_warps
         warp_in_group = cute.arch.make_warp_uniform(warp_in_group)
 
@@ -878,20 +878,30 @@ class TmemCResource(MemoryResource):
             if cutlass.const_expr(not self.cfg.has_deepseek_fp8_two_epilogue):
                 col_offset += warpgroup_idx * Int32(self.cfg.epi_tile_n)
             col_id = base_col + self._alloc_c.offset + stage_col_offset + col_offset
-            addr = (base_row << 16) | col_id
 
             shape = "16x256b"
             if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
-                addr = addr + warpgroup_idx * Int32(0x100000)
-                tmem = prims.make_tmem_ptr(addr, cutlass.Float32)
+                tmem = prims.make_tmem_ptr_from_warp_row_col(
+                    self.tmem_raw_addr + warpgroup_idx * Int32(0x100000),
+                    tmem_sp,
+                    col_id,
+                    cutlass.Float32,
+                )
                 swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
                 slice0 = prims.tcgen05_ld(shape, tmem, num=swap_t2r_repx)
                 slice1 = cutlass.vector.full([swap_t2r_repx * 4], 0.0, cutlass.Float32)
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
                 cute.arch.fence_view_async_tmem_load()
                 return (slice0, slice1, call_idx_for_output)
-            tmem0 = prims.make_tmem_ptr(addr, cutlass.Float32)
-            tmem1 = prims.make_tmem_ptr(addr + 0x100000, cutlass.Float32)
+            tmem0 = prims.make_tmem_ptr_from_warp_row_col(
+                self.tmem_raw_addr, tmem_sp, col_id, cutlass.Float32
+            )
+            tmem1 = prims.make_tmem_ptr_from_warp_row_col(
+                self.tmem_raw_addr + 0x100000,
+                tmem_sp,
+                col_id,
+                cutlass.Float32,
+            )
             swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
             slice0 = prims.tcgen05_ld(shape, tmem0, num=swap_t2r_repx)  # 4 * repx FP32
             slice1 = prims.tcgen05_ld(shape, tmem1, num=swap_t2r_repx)  # 4 * repx FP32
@@ -901,7 +911,6 @@ class TmemCResource(MemoryResource):
         else:
             # 32x32b: 1 reg per column
             epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
-            row_offset = warp_in_group * 32
             col_offset = logical_call_idx * epi_t2r_repx
             if cutlass.const_expr(
                 self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
@@ -913,10 +922,11 @@ class TmemCResource(MemoryResource):
                     self.cfg.tile_n - self.cfg.epi_tile_n
                 )
             col_id = base_col + self._alloc_c.offset + stage_col_offset + col_offset
-            current_addr = ((base_row + row_offset) << 16) | col_id
 
             shape = "32x32b"
-            tmem = prims.make_tmem_ptr(current_addr, cutlass.Float32)
+            tmem = prims.make_tmem_ptr_from_warp_row_col(
+                self.tmem_raw_addr, tmem_sp, col_id, cutlass.Float32
+            )
             c_rmem = prims.tcgen05_ld(shape, tmem, num=max(1, epi_t2r_repx))
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             cute.arch.fence_view_async_tmem_load()
