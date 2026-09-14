@@ -424,3 +424,124 @@ def test_auto_is_reresolved_on_replan():
     assert wrapper._backend == "fa2"
     wrapper.plan(*plan_args, **plan_kwargs)
     assert wrapper._backend == BLACKWELL_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Eligibility conditions that exist so `auto` never picks a backend which then
+# fails. Each mirrors a constraint the backend enforces later, at a point where
+# raising would strand a caller who only ever asked for "auto".
+# ---------------------------------------------------------------------------
+
+
+def _plan_only_indptr(backend, batch, s_q, s_kv, h_qo, h_kv, d_qk, d_vo, **plan_kwargs):
+    """Resolve the backend from indptrs alone.
+
+    ``plan()`` never touches q/k/v, so skipping them lets the capacity case use
+    a token count whose real tensors would not fit in memory.
+    """
+    dev = torch.device("cuda")
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend=backend
+    )
+    qo_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_q
+    kv_indptr = torch.arange(0, batch + 1, dtype=torch.int32, device=dev) * s_kv
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        h_qo,
+        h_kv,
+        d_qk,
+        head_dim_vo=d_vo,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+        **plan_kwargs,
+    )
+    return wrapper._backend
+
+
+@requires_cutlass_arch
+def test_auto_declines_cutlass_on_output_dtype_mismatch(monkeypatch):
+    """bf16 in / fp16 out is outside the CUTLASS dispatch, not a slow path.
+
+    ``DISPATCH_DTYPE_IN_OUT`` only handles ``out == in`` for fp16/bf16; anything
+    else lands in its FP8 branch, which a bf16 input does not match, and the
+    call dies reporting unsupported *head dimensions*. Pinned to cutlass so the
+    assertion is about cutlass rather than about cuDNN taking the shape first.
+    """
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cutlass")
+
+    assert (
+        _plan_only_indptr("auto", 2, 512, 512, 32, 32, 128, 128, o_data_type=DTYPE)
+        == "cutlass"
+    )
+    assert (
+        _plan_only_indptr(
+            "auto", 2, 512, 512, 32, 32, 128, 128, o_data_type=torch.float16
+        )
+        == "fa2"
+    )
+
+
+@requires_cutlass_arch
+def test_auto_declines_cutlass_beyond_plan_work_capacity(monkeypatch):
+    """`fmha_varlen_plan`'s work-index buffers are a fixed 131072 entries.
+
+    ``plan_kernel`` writes one entry per (qo_tile, head, batch) with no bounds
+    check, so `auto` must not route an oversized problem there. The pair below
+    straddles the limit on head count alone, which keeps the two cases identical
+    in every other respect.
+    """
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cutlass")
+    batch, s_q = 64, 8192  # ceil(8192/256) = 32 tiles per request
+
+    # 32 * 64 * 16 = 32768 work items -- inside capacity.
+    assert (
+        _plan_only_indptr("auto", batch, s_q, s_q, 16, 16, 128, 128, o_data_type=DTYPE)
+        == "cutlass"
+    )
+    # 32 * 64 * 128 = 262144 work items -- would overrun the buffers.
+    assert (
+        _plan_only_indptr(
+            "auto", batch, s_q, s_q, 128, 128, 128, 128, o_data_type=DTYPE
+        )
+        == "fa2"
+    )
+
+
+@requires_cudnn_upgrade
+def test_auto_declines_cudnn_on_non_int32_indptr_under_cuda_graph():
+    """Under capture, cuDNN's int32 indptr requirement is unsatisfiable.
+
+    Outside graph mode ``plan()`` re-dtypes the buffers in place, so cuDNN stays
+    eligible; with buffers registered to a graph it raises instead. `auto` has
+    to route around that rather than resolve to a backend that cannot run.
+    """
+    dev = torch.device("cuda")
+    batch, s_q, s_kv = 2, 512, 512
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    qo_indptr_buf = torch.arange(0, batch + 1, dtype=torch.int64, device=dev) * s_q
+    kv_indptr_buf = torch.arange(0, batch + 1, dtype=torch.int64, device=dev) * s_kv
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace,
+        "NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=qo_indptr_buf,
+        kv_indptr_buf=kv_indptr_buf,
+        backend="auto",
+    )
+    wrapper.plan(
+        qo_indptr_buf.to(torch.int32),
+        kv_indptr_buf.to(torch.int32),
+        32,
+        32,
+        128,
+        head_dim_vo=128,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    # Anything but cudnn: the point is that plan() resolved instead of raising.
+    assert wrapper._backend != "cudnn"

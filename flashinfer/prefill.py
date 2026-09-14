@@ -1732,6 +1732,28 @@ _RAGGED_AUTO_ORDER_ENV = "FLASHINFER_RAGGED_AUTO_BACKEND_ORDER"
 # (head_dim_qk, head_dim_vo) pairs validated against FA2 on the cuDNN path.
 _CUDNN_RAGGED_AUTO_HEAD_DIMS = frozenset({(128, 128), (192, 128), (256, 256)})
 
+# `fmha_varlen_plan` allocates the CUTLASS work-index buffers at this fixed
+# capacity, and `plan_kernel` writes one entry per (qo_tile, head, batch) work
+# item without a bounds check, so a problem that generates more work items than
+# this overruns them. `auto` therefore treats capacity as an eligibility
+# condition and leaves oversized problems on another backend; an explicit
+# `backend="cutlass"` is unaffected and still hits the underlying limit.
+_CUTLASS_PLAN_WORK_CAPACITY = 131072
+_CUTLASS_PLAN_QO_TILE_SIZE = 256
+
+
+def _cutlass_plan_work_items(qo_indptr_host: torch.Tensor, num_qo_heads: int) -> int:
+    """Work items `fmha_varlen_plan` will emit: one per (qo_tile, head, batch).
+
+    Mirrors the loop nest in ``plan_kernel``. Computed from the host indptr
+    copy `plan()` already materialises, so it costs no extra device sync.
+    """
+    qo_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
+    tiles_per_request = (qo_lens + (_CUTLASS_PLAN_QO_TILE_SIZE - 1)) // (
+        _CUTLASS_PLAN_QO_TILE_SIZE
+    )
+    return int(tiles_per_request.sum().item()) * num_qo_heads
+
 
 def _blackwell_ragged_auto_order(head_dim_qk: int, head_dim_vo: int) -> Tuple[str, ...]:
     """Backend preference order for this shape.
@@ -1758,12 +1780,15 @@ def _blackwell_ragged_auto_upgrade(
     head_dim_vo: int,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
     pos_encoding_mode: int,
     *,
     has_custom_mask: bool,
     window_left: int,
     logits_soft_cap: float,
     has_multi_item_scoring: bool,
+    cudnn_indptr_is_int32: bool,
+    cutlass_work_items: int,
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
@@ -1783,6 +1808,12 @@ def _blackwell_ragged_auto_upgrade(
     ``cu_seq_len_q/kv`` for the mask and as ragged offsets scaled in-engine).
     That keeps the caller contract identical to every other backend and puts no
     conversion kernel on the run path; older cuDNN falls through to ``cutlass``.
+
+    Every condition here is an *eligibility* test, never a deferred error: a
+    backend this function returns must be able to serve the call. Conditions the
+    backend would otherwise raise on later therefore belong in this walk, so
+    ``auto`` routes past them instead of failing (``cudnn_indptr_is_int32`` and
+    ``cutlass_work_items`` both exist for that reason).
     """
     if (
         kv_layout != "NHD"
@@ -1800,6 +1831,11 @@ def _blackwell_ragged_auto_upgrade(
                 is_sm100a_supported(device)
                 and _cudnn_supports_direct_seqlens(q_data_type)
                 and (head_dim_qk, head_dim_vo) in _CUDNN_RAGGED_AUTO_HEAD_DIMS
+                # cuDNN reads the indptrs as int32. plan() can re-dtype them
+                # eagerly, but not buffers already registered with a captured
+                # graph, where it raises instead -- so in that case cuDNN
+                # cannot serve the call and must not be selected.
+                and cudnn_indptr_is_int32
             ):
                 return backend
         elif backend == "cutlass":
@@ -1807,7 +1843,14 @@ def _blackwell_ragged_auto_upgrade(
             if (
                 (is_sm100a_supported(device) or is_sm110a_supported(device))
                 and q_data_type in (torch.float16, torch.bfloat16)
+                # DISPATCH_DTYPE_IN_OUT only handles out == in for fp16/bf16;
+                # any other pairing falls into its FP8 branch, which a bf16 or
+                # fp16 input does not match, and the call dies on a check that
+                # reports unsupported *head dimensions*. Mismatched output
+                # dtype is therefore out of domain, not a slow path.
+                and o_data_type == q_data_type
                 and ((head_dim_qk == 128 and head_dim_vo == 128) or head_dim_qk == 192)
+                and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
             ):
                 return backend
     return None
@@ -4492,6 +4535,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         head_dim_vo,
                         q_data_type,
                         kv_data_type,
+                        o_data_type,
                         PosEncodingMode[pos_encoding_mode].value,
                         has_custom_mask=self._custom_mask_buf is not None,
                         window_left=window_left,
@@ -4500,6 +4544,20 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                             prefix_len_ptr is not None
                             or token_pos_in_items_ptr is not None
                             or max_item_len_ptr is not None
+                        ),
+                        # Outside graph mode the cuDNN branch below converts a
+                        # non-int32 indptr in place, so any dtype is fine; under
+                        # capture it raises, and `auto` must route around that
+                        # rather than pick a backend that cannot run.
+                        cudnn_indptr_is_int32=(
+                            not self.is_cuda_graph_enabled
+                            or (
+                                self._qo_indptr_buf.dtype == torch.int32
+                                and self._kv_indptr_buf.dtype == torch.int32
+                            )
+                        ),
+                        cutlass_work_items=_cutlass_plan_work_items(
+                            qo_indptr_host, num_qo_heads
                         ),
                     )
                     if upgraded is not None:
