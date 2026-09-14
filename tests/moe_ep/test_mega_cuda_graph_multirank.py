@@ -27,7 +27,17 @@ _REPLAYS = 4
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
-def test_nvfp4_mega_two_rank_graph_replay_lockstep():
+@pytest.mark.parametrize(
+    "mode,token_back_mode,tuning",
+    [
+        ("w4a4", "epi_warps", "manual"),
+        ("w4a4", "reuse_dispatch_warps", "manual"),
+        ("w4a16", "epi_warps", "manual"),
+        ("w4a16", "reuse_dispatch_warps", "manual"),
+        ("w4a16", None, "auto"),
+    ],
+)
+def test_nvfp4_mega_two_rank_graph_replay_lockstep(mode, token_back_mode, tuning):
     pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -45,6 +55,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         MoEEpMegaLayer,
         MoEEpTensors,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         MoEWeightPack,
         ensure_moe_ep_cuda_device,
     )
@@ -53,6 +64,13 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
 
+    assert mode in ("w4a4", "w4a16"), mode
+    assert tuning in ("manual", "auto"), tuning
+    assert tuning == "manual" or (mode == "w4a16" and token_back_mode is None)
+    configs = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
     mega = MoEEpLayer(
         bootstrap=bootstrap,
         fleet_params=FleetParams(
@@ -62,10 +80,13 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         ),
         weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
         backend=MegaConfig(
-            megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            megakernel=configs[mode](
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 gate_up_clamp=problem["gate_up_clamp"],
+                knobs="auto"
+                if tuning == "auto"
+                else {"token_back_mode": token_back_mode},
             ),
             quantize_input=True,
             preprocess_weights=True,

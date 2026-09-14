@@ -6,11 +6,35 @@ Compares two activation contracts over the same routed-MoE workload:
 - W4A4 quantizes BF16 activations to NVFP4 before the MoE, using per-tensor
   scaling by default or per-token scaling with ``--use-per-token-activation``.
 - W4A16 keeps activations in BF16 and decodes NVFP4 weights online.
+- Optional W4A16 MegaMoE fuses EP communication with expert compute, using
+  the same packed weights, scales, routes, and BF16 inputs as split W4A16.
 
 Use torchrun to benchmark both real expert- and tensor-parallel communication:
 
-    torchrun --standalone --nproc-per-node=8 \\
+    torchrun --master-addr=127.0.0.1 --master-port=29500 --nproc-per-node=8 \\
         benchmarks/bench_cute_dsl_moe_distributed.py
+
+Compare split W4A16 with MegaMoE using CUPTI and CUDA graphs. Token counts
+are GLOBAL across the EP group, including empty ranks below eight tokens:
+
+    torchrun --master-addr=127.0.0.1 --master-port=29500 --nproc-per-node=8 \\
+        benchmarks/bench_cute_dsl_moe_distributed.py \\
+        --parallel-modes ep --variants w4a16,w4a16_megamoe \\
+        --timing cupti --cuda-graph --refcheck --no-fused-finalize
+
+With ``--no-fused-finalize``, both W4A16 paths cast FC2 results to BF16 before
+applying FP32 routing weights. Split EP rounds each rank's weighted partial
+sum to BF16 before combine; MegaMoE reduces all per-route BF16 results at the
+source rank. The refcheck keeps a fixed tolerance for this reduction difference.
+
+Both timers measure the full forward, including routing, input staging,
+communication, expert compute, and output handling. CUPTI measures the span
+from the first GPU activity's start to the last activity's end on each rank,
+then takes the maximum rank span per iteration and the median across
+iterations. This includes gaps and overlap; it is not a sum of kernel times.
+Weight preparation, compilation, autotuning, warmup, graph capture, and L2
+flushing are excluded. Nsight Systems' breakdown instead sums activity
+durations across ranks and must not be substituted for this latency metric.
 
 Run Nsight Systems mode directly to capture and report per-kernel breakdowns
 for all four topology/activation combinations:
@@ -21,10 +45,26 @@ for all four topology/activation combinations:
 Nsight Compute mode uses kernel replay to capture every local compute kernel
 with the full metric set and embeds correlated sources found recursively under
 the FlashInfer repository. It simulates the exact post-communication EP/TP
-shapes in one process; use Nsight Systems mode for real communication:
+shapes in one process, without replaying the distributed routing or autotuned
+tactics; use Nsight Systems mode to identify the real distributed kernels:
 
     python3 benchmarks/bench_cute_dsl_moe_distributed.py \\
         --mode profile_ncu --profile-iters 1
+
+MegaMoE NCU profiling instead launches all EP ranks under the profiler's
+shared-memory communicator, which coordinates mandatory concurrent kernels.
+It requires an NCU version supporting ``--communicator=shmem`` and an exact
+collective kernel filter supplied with ``--ncu-megamoe-kernel``. Isolated
+single-rank kernel replay is not valid for this backend.
+
+If NVSHMEM allocations prevent kernel-replay context save, use
+``--ncu-megamoe-replay application``. This starts one NCU instance per rank
+under torchrun and coordinates application replay over TCP. Each worker replay
+uses fresh process-group keys in the persistent torchrun store and bounds warp
+sampling to one pass so ranks cannot request different replay counts. It requires at
+least one input token on every rank because the synchronized MegaMoE NVTX
+range includes rank-local staging and final reduction. Use CUPTI for latency;
+profiler synchronization can substantially distort collective kernel duration.
 
 The workload stages remain available as NVTX ranges. Kernel attribution uses
 those ranges rather than matching kernel names.
@@ -34,14 +74,18 @@ import argparse
 import csv
 import gc
 import itertools
+import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 
 import numpy as np
@@ -65,11 +109,13 @@ _NSYS_GLOBAL_ID_PROCESS_MASK = -(1 << 24)
 class BenchVariant:
     name: str
     use_nvfp4_activations: bool
+    use_megamoe: bool = False
 
 
 BENCH_VARIANTS = (
     BenchVariant("w4a4", use_nvfp4_activations=True),
     BenchVariant("w4a16", use_nvfp4_activations=False),
+    BenchVariant("w4a16_megamoe", use_nvfp4_activations=False, use_megamoe=True),
 )
 
 
@@ -94,7 +140,26 @@ def _parse_profile_case(profile_case):
     variants = {variant.name: variant for variant in BENCH_VARIANTS}
     if mode not in ("ep", "tp") or variant_name not in variants:
         raise ValueError(f"Invalid {_PROFILE_CASE_ENV}: {profile_case}")
+    if mode == "tp" and variants[variant_name].use_megamoe:
+        raise ValueError("W4A16 MegaMoE supports expert parallelism only")
     return mode, variants[variant_name]
+
+
+def _selected_variants(args, mode):
+    variants = {variant.name: variant for variant in BENCH_VARIANTS}
+    return tuple(
+        variants[name]
+        for name in args.variants.split(",")
+        if mode == "ep" or not variants[name].use_megamoe
+    )
+
+
+def _profile_cases(args, token_counts):
+    for num_tokens, mode in itertools.product(
+        token_counts, args.parallel_modes.split(",")
+    ):
+        for variant in _selected_variants(args, mode):
+            yield num_tokens, mode, variant
 
 
 def _profile_worker_arguments(args, num_tokens):
@@ -113,7 +178,20 @@ def _profile_worker_arguments(args, num_tokens):
         args.mode,
         "--profile-iters",
         str(args.profile_iters),
+        "--variants",
+        args.variants,
+        "--parallel-modes",
+        args.parallel_modes,
     ]
+    if args.megamoe_knobs is not None:
+        arguments.extend(
+            (
+                "--megamoe-knobs",
+                args.megamoe_knobs
+                if args.megamoe_knobs == "auto"
+                else json.dumps(args.megamoe_knobs, sort_keys=True),
+            )
+        )
     if args.use_per_token_activation:
         arguments.append("--use-per-token-activation")
     if not args.use_fused_finalize:
@@ -122,6 +200,9 @@ def _profile_worker_arguments(args, num_tokens):
         arguments.append("--no-pdl")
     if args.verbose:
         arguments.append("--verbose")
+    if args.ncu_megamoe_kernel:
+        arguments.extend(("--ncu-megamoe-kernel", args.ncu_megamoe_kernel))
+    arguments.extend(("--ncu-megamoe-replay", args.ncu_megamoe_replay))
     return arguments
 
 
@@ -142,8 +223,25 @@ def _load_nsys_kernel_rows(nsys, report, verbose):
         print(completed.stderr, end="", file=sys.stderr)
 
     with sqlite3.connect(sqlite_report) as connection:
+        # CuTe DSL may launch through the driver API without a runtime API
+        # record. Older exports omit empty activity tables altogether.
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        launch_apis = " UNION ".join(
+            f"SELECT start, globalTid, correlationId FROM {table}"
+            for table in ("CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_DRIVER")
+            if table in tables
+        )
+        if not launch_apis:
+            raise RuntimeError(
+                f"Nsight Systems recorded no CUDA launch APIs in {report}"
+            )
         raw_rows = connection.execute(
-            """
+            f"""
             WITH stage_ranges AS (
                 SELECT
                     nvtx.start,
@@ -156,21 +254,21 @@ def _load_nsys_kernel_rows(nsys, report, verbose):
                     nvtx.end IS NOT NULL
                     AND COALESCE(nvtx.text, range_name.value) LIKE 'stage::%'
             ),
-            stage_kernel_launches AS (
-                SELECT
+            launch_apis AS (
+                {launch_apis}
+            ),
+            stage_kernels AS (
+                SELECT DISTINCT
                     stage_ranges.stage,
+                    stage_ranges.start AS stage_start,
+                    stage_ranges.end AS stage_end,
+                    stage_ranges.globalTid,
                     kernel.shortName,
                     kernel.start AS kernel_start,
                     kernel.end AS kernel_end,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY
-                            stage_ranges.start,
-                            stage_ranges.end,
-                            stage_ranges.globalTid
-                        ORDER BY kernel.start, kernel.gridId
-                    ) AS stage_launch
+                    kernel.gridId
                 FROM stage_ranges
-                JOIN CUPTI_ACTIVITY_KIND_RUNTIME AS runtime ON
+                JOIN launch_apis AS runtime ON
                     runtime.start >= stage_ranges.start
                     AND runtime.start <= stage_ranges.end
                     AND (runtime.globalTid & :process_mask) =
@@ -179,6 +277,13 @@ def _load_nsys_kernel_rows(nsys, report, verbose):
                     kernel.correlationId = runtime.correlationId
                     AND kernel.globalPid =
                         (runtime.globalTid & :process_mask)
+            ),
+            stage_kernel_launches AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY stage_start, stage_end, globalTid
+                    ORDER BY kernel_start, gridId
+                ) AS stage_launch
+                FROM stage_kernels
             )
             SELECT
                 stage_kernel_launches.stage,
@@ -281,6 +386,22 @@ def _print_nsys_kernel_breakdown(mode, variant, num_tokens, num_gpus, rows, repo
     print(f"Kernel CSV: {csv_report}")
 
 
+def _profile_torchrun_arguments(num_gpus):
+    # Static localhost rendezvous avoids advertising a container hostname
+    # that peers cannot resolve. Each sequential capture gets a free port.
+    with socket.socket() as rendezvous_socket:
+        rendezvous_socket.bind(("127.0.0.1", 0))
+        port = rendezvous_socket.getsockname()[1]
+    return [
+        "--nnodes=1",
+        "--node-rank=0",
+        "--rdzv-backend=static",
+        "--master-addr=127.0.0.1",
+        f"--master-port={port}",
+        f"--nproc-per-node={num_gpus}",
+    ]
+
+
 def _run_nsys_profiles(args, token_counts):
     nsys = shutil.which("nsys")
     torchrun = shutil.which("torchrun")
@@ -296,9 +417,7 @@ def _run_nsys_profiles(args, token_counts):
         output_dir.mkdir(parents=True, exist_ok=True)
 
     script = Path(__file__).resolve()
-    for num_tokens, mode, variant in itertools.product(
-        token_counts, ("ep", "tp"), BENCH_VARIANTS
-    ):
+    for num_tokens, mode, variant in _profile_cases(args, token_counts):
         profile_label = f"{mode}::{variant.name}"
         output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
         env = os.environ.copy()
@@ -309,14 +428,13 @@ def _run_nsys_profiles(args, token_counts):
             "--force-overwrite=true",
             "--sample=none",
             "--cpuctxsw=none",
-            "--trace=cuda,nvtx,nccl",
+            f"--trace={args.nsys_cuda_trace},nvtx,nccl",
             "--capture-range=cudaProfilerApi",
-            "--capture-range-end=stop",
+            f"--capture-range-end={args.nsys_capture_range_end}",
             f"--show-output={'true' if args.verbose else 'false'}",
             f"--output={output}",
             torchrun,
-            "--standalone",
-            f"--nproc-per-node={args.num_gpus}",
+            *_profile_torchrun_arguments(args.num_gpus),
             str(script),
             *_profile_worker_arguments(args, num_tokens),
         ]
@@ -348,6 +466,18 @@ def _run_ncu_profiles(args, token_counts):
     ncu = shutil.which("ncu")
     if ncu is None:
         raise RuntimeError("--mode profile_ncu requires Nsight Compute (ncu)")
+    if any(variant.use_megamoe for variant in _selected_variants(args, "ep")):
+        help_text = subprocess.run(
+            [ncu, "--help"], check=True, capture_output=True, text=True
+        ).stdout
+        communicator = "tcp" if args.ncu_megamoe_replay == "application" else "shmem"
+        if f"communicator-{communicator}-num-peers" not in help_text:
+            raise RuntimeError(
+                f"MegaMoE profiling requires an NCU version with the {communicator} "
+                "multi-process communicator; isolated-rank replay would hang"
+            )
+        if shutil.which("torchrun") is None:
+            raise RuntimeError("MegaMoE profiling requires torchrun")
 
     if args.ncu_output_dir is None:
         output_dir = Path(tempfile.mkdtemp(prefix="flashinfer-cute-dsl-moe-ncu-"))
@@ -358,9 +488,7 @@ def _run_ncu_profiles(args, token_counts):
     source_root = script.parents[1]
     lineinfo_cache = output_dir / "cute_dsl_lineinfo_cache"
     lineinfo_cache.mkdir(exist_ok=True)
-    for num_tokens, mode, variant in itertools.product(
-        token_counts, ("ep", "tp"), BENCH_VARIANTS
-    ):
+    for num_tokens, mode, variant in _profile_cases(args, token_counts):
         profile_label = f"{mode}::{variant.name}"
         output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
         log_file = output.with_suffix(".ncu.log")
@@ -368,36 +496,103 @@ def _run_ncu_profiles(args, token_counts):
         env[_PROFILE_CASE_ENV] = profile_label
         env["CUTE_DSL_CACHE_DIR"] = str(lineinfo_cache)
         env["CUTE_DSL_LINEINFO"] = "1"
+        outer_launcher = []
+        export_output = str(output)
+        application_replay = (
+            variant.use_megamoe and args.ncu_megamoe_replay == "application"
+        )
+        if variant.use_megamoe:
+            # NVIDIA's mandatory-concurrent-kernel workflow coordinates all
+            # participating ranks. Profiling only the fused collective avoids
+            # treating rank-dependent staging/routing launches as collectives.
+            # https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html
+            replay_arguments = [
+                "--communicator=shmem",
+                f"--communicator-shmem-num-peers={args.num_gpus}",
+                "--replay-mode=kernel",
+                "--kernel-name-base=demangled",
+                f"--kernel-name={args.ncu_megamoe_kernel}",
+            ]
+            launcher = [
+                shutil.which("torchrun"),
+                *_profile_torchrun_arguments(args.num_gpus),
+            ]
+            if application_replay:
+                # Every rank owns an NCU process so application replay restarts
+                # workers without restarting the parent rendezvous service.
+                with socket.socket() as communicator_socket:
+                    communicator_socket.bind(("127.0.0.1", 0))
+                    communicator_port = communicator_socket.getsockname()[1]
+                replay_arguments = [
+                    "--communicator=tcp",
+                    f"--communicator-tcp-num-peers={args.num_gpus}",
+                    "--communicator-tcp-hostname=127.0.0.1",
+                    f"--communicator-tcp-port={communicator_port}",
+                    "--replay-mode=application",
+                    "--app-replay-mode=strict",
+                    "--app-replay-match=grid",
+                    # Adaptive sampling may request an extra pass on one rank
+                    # after its collective peers have finished their reports.
+                    "--warp-sampling-max-passes=1",
+                    "--nvtx",
+                    "--lockstep-kernel-launch",
+                    "--lockstep-nvtx-include=stage::MegaMoE/",
+                    "--kernel-name-base=demangled",
+                    f"--kernel-name={args.ncu_megamoe_kernel}",
+                ]
+                outer_launcher = [*launcher, "--no-python"]
+                launcher = [sys.executable]
+                # NCU's documented environment macro avoids report collisions.
+                export_output += ".rank%q{RANK}"
+            description = "coordinated EP collective kernels"
+        else:
+            replay_arguments = [
+                "--replay-mode=kernel",
+                "--nvtx",
+                *(
+                    argument
+                    for stage in _NCU_PROFILE_STAGES
+                    for argument in ("--nvtx-include", f"stage::{stage}/")
+                ),
+            ]
+            launcher = [sys.executable]
+            description = "simulated post-communication kernels"
         command = [
+            *outer_launcher,
             ncu,
-            "--set=full",
-            "--target-processes=all",
-            "--replay-mode=kernel",
-            "--profile-from-start=off",
-            "--nvtx",
             *(
-                argument
-                for stage in _NCU_PROFILE_STAGES
-                for argument in ("--nvtx-include", f"stage::{stage}/")
+                [f"--metrics={args.ncu_metrics}"]
+                if args.ncu_metrics
+                else ["--set=full"]
             ),
+            "--target-processes=all",
+            *replay_arguments,
+            "--profile-from-start=off",
             "--import-source=yes",
             f"--source-folders={source_root}",
             "--print-summary=per-kernel",
             "--force-overwrite",
-            f"--log-file={log_file}",
-            f"--export={output}",
-            sys.executable,
+            f"--log-file={'stdout' if application_replay else log_file}",
+            f"--export={export_output}",
+            *launcher,
             str(script),
             *_profile_worker_arguments(args, num_tokens),
         ]
         print(
-            f"\nCapturing non-communication kernels for "
+            f"\nCapturing {description} for "
             f"{mode.upper()}{args.num_gpus} {variant.name.upper()} "
             f"at {num_tokens} tokens with Nsight Compute...",
             flush=True,
         )
         _verbose_print(args, "Command:", " ".join(command))
-        subprocess.run(command, check=True, env=env)
+        if application_replay:
+            # All ranks share this parent-owned log; reports remain per rank.
+            with log_file.open("w") as log:
+                subprocess.run(
+                    command, check=True, env=env, stdout=log, stderr=subprocess.STDOUT
+                )
+        else:
+            subprocess.run(command, check=True, env=env)
 
         reports = sorted(output_dir.glob(f"{output.name}*.ncu-rep"))
         if not reports:
@@ -482,6 +677,82 @@ def _create_distributed_weights(num_local_experts, intermediate_size, rank, devi
     return w13, w2
 
 
+def _create_shared_ep_weights(rank, world_size, device):
+    """Quantize once, then permute the same bytes into each backend's layout."""
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.fp4_quantization import block_scale_interleave, fp4_quantize
+    from flashinfer.fused_moe import MoEWeightPack
+    from flashinfer.fused_moe.prepare import _interleave_linear_and_gate
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+
+    num_local_experts = CFG.num_experts // world_size
+    hidden, intermediate = CFG.hidden_size, CFG.intermediate_size
+    w13, w2 = _create_distributed_weights(num_local_experts, intermediate, rank, device)
+    global_scale = torch.ones(1, dtype=torch.float32, device=device)
+
+    def quantize(weights):
+        rows, cols = weights.shape[-2:]
+        packed, scales = fp4_quantize(
+            weights.flatten(0, 1),
+            global_scale,
+            sf_vec_size=16,
+            sf_use_ue8m0=False,
+            is_sf_swizzled_layout=False,
+        )
+        return (
+            packed.view(num_local_experts, rows, cols // 2),
+            scales.view(torch.float8_e4m3fn).view(num_local_experts, rows, cols // 16),
+        )
+
+    w13_q, w13_sf = quantize(w13)
+    w2_q, w2_sf = quantize(w2)
+    del w13, w2
+    alpha = torch.ones(num_local_experts, dtype=torch.float32, device=device)
+    canonical = PrequantizedMoEWeights(
+        w13=w13_q,
+        w2=w2_q,
+        w13_scale=w13_sf,
+        w2_scale=w2_sf,
+        w13_global_scale=alpha,
+        w2_global_scale=alpha,
+    )
+
+    def split_scale(scales, rows, cols):
+        return convert_sf_to_mma_layout(
+            block_scale_interleave(scales.flatten(0, 1).contiguous()),
+            m=rows,
+            k=cols,
+            num_groups=num_local_experts,
+            sf_vec_size=16,
+        )
+
+    # MegaMoE's canonical halves are [gate, up]. The split W4A16 epilogue
+    # applies SiLU to the second half of each interleaved pair (up, gate),
+    # so exchange the halves before its 64-row interleave. These are byte
+    # permutations only: neither path rounds or re-quantizes the weights.
+    def up_gate(tensor):
+        return torch.cat((tensor[:, intermediate:], tensor[:, :intermediate]), dim=1)
+
+    w13_split = _interleave_linear_and_gate(up_gate(w13_q), group_size=64, dim=1)
+    w13_sf_split = _interleave_linear_and_gate(
+        up_gate(w13_sf.view(torch.uint8)), group_size=64, dim=1
+    )
+    split = MoEWeightPack()
+    split.prepare_for(
+        "cute_dsl",
+        {
+            "w1_weight": w13_split,
+            "w1_weight_sf": split_scale(w13_sf_split, 2 * intermediate, hidden),
+            "w1_alpha": alpha,
+            "w2_weight": w2_q,
+            "w2_weight_sf": split_scale(w2_sf.view(torch.uint8), hidden, intermediate),
+            "w2_alpha": alpha,
+            "fc2_input_scale": global_scale,
+        },
+    )
+    return split, canonical
+
+
 def _token_partition(num_tokens, rank, world_size):
     tokens_per_rank, remainder = divmod(num_tokens, world_size)
     local_num_tokens = tokens_per_rank + int(rank < remainder)
@@ -562,6 +833,7 @@ def _run_distributed_iterations(
     dist,
     device,
     profile_label,
+    num_tokens,
 ):
     for _ in range(args.warmup):
         run_once()
@@ -582,18 +854,76 @@ def _run_distributed_iterations(
         torch.cuda.cudart().cudaProfilerStop()
         return None
 
-    samples = []
-    for _ in range(args.iters):
-        l2_flush.zero_()
-        torch.cuda.synchronize()
-        dist.barrier()
-        e2e_start = torch.cuda.Event(enable_timing=True)
-        e2e_end = torch.cuda.Event(enable_timing=True)
-        e2e_start.record()
-        run_once()
-        e2e_end.record()
-        e2e_end.synchronize()
-        samples.append(_max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device))
+    if args.timing == "cupti":
+        from flashinfer.testing import bench_gpu_time
+
+        # The utility fixes iteration counts across ranks and reduces each
+        # activity span with MAX. Its flush is outside the measured region.
+        wall_start = time.perf_counter() if args.log_timing_samples else None
+        samples = bench_gpu_time(
+            run_once,
+            dry_run_iters=0,
+            repeat_iters=args.iters,
+            enable_cupti=True,
+            use_cuda_graph=args.cuda_graph,
+            cold_l2_cache=True,
+            aggregate_op=max,
+        )
+    else:
+        wall_start = time.perf_counter() if args.log_timing_samples else None
+        if args.cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_once()
+            run_once = graph.replay
+            torch.cuda.synchronize()
+            dist.barrier()
+
+        samples = []
+        for _ in range(args.iters):
+            l2_flush.zero_()
+            torch.cuda.synchronize()
+            dist.barrier()
+            e2e_start = torch.cuda.Event(enable_timing=True)
+            e2e_end = torch.cuda.Event(enable_timing=True)
+            e2e_start.record()
+            run_once()
+            e2e_end.record()
+            e2e_end.synchronize()
+            samples.append(
+                _max_rank_sample(e2e_start.elapsed_time(e2e_end), dist, device)
+            )
+    if args.log_timing_samples:
+        wall_seconds = time.perf_counter() - wall_start
+        if dist.get_rank() == 0:
+            print(
+                "DISTRIBUTED_TIMING_SAMPLES_JSON,"
+                + json.dumps(
+                    {
+                        "profile_label": profile_label,
+                        "global_tokens": num_tokens,
+                        "rank": 0,
+                        "world_size": dist.get_world_size(),
+                        "timer": args.timing,
+                        "warmup_iters": args.warmup,
+                        "repeat_iters": args.iters,
+                        "sample_count": len(samples),
+                        "cuda_graph": args.cuda_graph,
+                        "cold_l2_cache": True,
+                        "sample_aggregation": "per_iteration_rank_max",
+                        "samples_ms": [float(sample) for sample in samples],
+                        "wall_seconds": wall_seconds,
+                        "wall_scope": (
+                            "bench_gpu_time"
+                            if args.timing == "cupti"
+                            else "cuda_event_capture_and_sampling"
+                        ),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
     return float(np.median(samples))
 
 
@@ -605,6 +935,8 @@ def _benchmark_distributed_ep(
     rank,
     world_size,
     device,
+    prepared_weights=None,
+    reference_outputs=None,
 ):
     import torch.distributed as dist
 
@@ -644,6 +976,7 @@ def _benchmark_distributed_ep(
             max_tokens_per_rank_budget * world_size,
             rank,
             device,
+            prepared_weights=prepared_weights,
         ),
     )
     mapping = Mapping(
@@ -729,7 +1062,7 @@ def _benchmark_distributed_ep(
 
     def run_once():
         _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
-        combine(compute(*dispatch()))
+        return combine(compute(*dispatch()))
 
     profile_state = {}
 
@@ -794,6 +1127,13 @@ def _benchmark_distributed_ep(
 
     run_setup_phase("CuTe DSL tactic selection", tune_local_moe)
 
+    if reference_outputs is not None and variant.name == "w4a16":
+        reference_outputs["w4a16"] = (
+            run_once().reshape(-1, CFG.hidden_size)[:local_num_tokens].clone()
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+
     return _run_distributed_iterations(
         args,
         run_once,
@@ -802,7 +1142,154 @@ def _benchmark_distributed_ep(
         dist,
         device,
         f"ep::{variant.name}",
+        num_tokens,
     )
+
+
+def _check_megamoe_output(output, reference, dist, device, rank, num_tokens):
+    """Fail every rank together when the same-weight split comparison differs."""
+    if _max_rank_sample(float(output.shape != reference.shape), dist, device):
+        raise ValueError(
+            f"MegaMoE output shape {output.shape} differs from split {reference.shape}"
+        )
+    actual, expected = output.float(), reference.float()
+    error = (actual - expected).abs()
+    mismatch = (
+        ~torch.isfinite(actual)
+        | ~torch.isfinite(expected)
+        | (error > 1e-2 + 1e-2 * expected.abs())
+    )
+    maxima = torch.stack(
+        (
+            mismatch.any().float(),
+            error.max() if error.numel() else torch.zeros((), device=device),
+        )
+    )
+    sums = torch.stack(
+        (error.double().square().sum(), expected.double().square().sum())
+    )
+    dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
+    dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+    relative_l2 = (sums[0] / sums[1].clamp_min(1e-30)).sqrt().item()
+    if rank == 0:
+        print(
+            f"REFCHECK_CSV,w4a16_megamoe,{num_tokens},"
+            f"{maxima[1].item():.9g},{relative_l2:.9g},"
+            f"{'FAIL' if maxima[0].item() else 'PASS'}",
+            flush=True,
+        )
+    if maxima[0].item():
+        raise AssertionError(
+            "W4A16 MegaMoE differs from the same-weight split path at "
+            f"atol=rtol=1e-2 (max_abs={maxima[1].item()}, rel_l2={relative_l2})"
+        )
+
+
+def _benchmark_distributed_megamoe(
+    args, num_tokens, rank, world_size, device, weights, reference_outputs
+):
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.testing.utils import get_l2_cache_size
+
+    local_num_tokens, _ = _token_partition(num_tokens, rank, world_size)
+    capacity = (num_tokens + world_size - 1) // world_size
+    layer = MoEEpLayer(
+        bootstrap=BootstrapConfig(
+            world_size=world_size,
+            rank=rank,
+            device=device.index,
+            process_group=dist.group.WORLD,
+        ),
+        fleet_params=FleetParams(
+            num_experts=CFG.num_experts,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=CFG.hidden_size,
+        ),
+        weights=weights,
+        backend=MegaConfig(
+            megakernel=Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=CFG.intermediate_size,
+                top_k=CFG.top_k,
+                knobs=args.megamoe_knobs,
+            )
+        ),
+    )
+    hidden_states, router_logits, _, routing_bias = _create_distributed_inputs(
+        num_tokens, rank, world_size, device
+    )
+    topk_values = torch.empty(
+        local_num_tokens, CFG.top_k, dtype=torch.float32, device=device
+    )
+    topk_indices = torch.empty(
+        local_num_tokens, CFG.top_k, dtype=torch.int32, device=device
+    )
+    tensors = MoEEpTensors(
+        hidden_states=hidden_states, topk_ids=topk_indices, topk_weights=topk_values
+    )
+    l2_flush = torch.empty(2 * get_l2_cache_size(), dtype=torch.int8, device=device)
+
+    def route():
+        _route_tokens(router_logits, routing_bias, topk_values, topk_indices)
+
+    def run_once():
+        route()
+        return layer.forward(tensors)
+
+    def profile_once():
+        _run_profile_iteration(
+            (("routing", route), ("MegaMoE", lambda: layer.forward(tensors)))
+        )
+
+    try:
+        route()
+        layer.warmup(tensors)
+        if args.megamoe_knobs == "auto":
+            print(
+                "MEGAMOE_TACTIC_JSON,"
+                + json.dumps(
+                    {
+                        "variant": "w4a16_megamoe",
+                        "global_tokens": num_tokens,
+                        "local_tokens": local_num_tokens,
+                        "max_tokens_per_rank": capacity,
+                        "rank": rank,
+                        "knobs": layer._kernel._autotune_winner,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+        if reference_outputs is not None:
+            _check_megamoe_output(
+                layer.forward(tensors),
+                reference_outputs["w4a16"],
+                dist,
+                device,
+                rank,
+                num_tokens,
+            )
+        return _run_distributed_iterations(
+            args,
+            run_once,
+            profile_once,
+            l2_flush,
+            dist,
+            device,
+            "ep::w4a16_megamoe",
+            num_tokens,
+        )
+    finally:
+        layer.destroy()
 
 
 def _make_distributed_activation_pack(
@@ -864,6 +1351,7 @@ def _create_distributed_moe_layer(
     tune_max_num_tokens,
     rank,
     device,
+    prepared_weights=None,
 ):
     from flashinfer.fused_moe import CuteDslConfig, MoELayer, MoEWeightPack
 
@@ -875,6 +1363,8 @@ def _create_distributed_moe_layer(
         local_expert_offset,
         tune_max_num_tokens,
     )
+    if prepared_weights is not None:
+        return MoELayer(moe_config, device=device), prepared_weights
     w13, w2 = _create_distributed_weights(
         num_local_experts, intermediate_size, rank, device
     )
@@ -921,6 +1411,11 @@ def _run_ncu_compute_profile(args, num_tokens, mode, variant):
         rows,
         0,
         device,
+        prepared_weights=(
+            _create_shared_ep_weights(0, args.num_gpus, device)[0]
+            if mode == "ep" and "w4a16_megamoe" in args.variants.split(",")
+            else None
+        ),
     )
     hidden_states, _, router_logits, routing_bias = _create_distributed_inputs(
         rows, 0, 1, device
@@ -1141,6 +1636,7 @@ def _benchmark_distributed_tp(
             dist,
             device,
             f"tp::{variant.name}",
+            num_tokens,
         )
     finally:
         workspace.destroy()
@@ -1156,20 +1652,46 @@ def _run_parallel_mode(
     dist,
     selected_variant=None,
 ):
+    variants = _selected_variants(args, mode)
+    shared_weight_comparison = mode == "ep" and any(
+        variant.use_megamoe for variant in variants
+    )
+    if selected_variant is not None:
+        variants = tuple(v for v in variants if v.name == selected_variant)
+    if not variants:
+        return
+    if args.refcheck:
+        # Complete the split reference before checking MegaMoE, irrespective
+        # of the user's presentation order.
+        variants = tuple(sorted(variants, key=lambda v: v.use_megamoe))
+    default_comparison = tuple(v.name for v in variants) == ("w4a4", "w4a16")
     if rank == 0:
         is_profiling = args.mode in _PROFILE_MODES
         measurement = (
-            "profiling=NVTX stages" if is_profiling else "timing=max rank CUDA events"
+            "profiling=NVTX stages"
+            if is_profiling
+            else f"timing=max rank {args.timing}, cuda_graph={args.cuda_graph}"
         )
         print(f"\nMode: real {mode.upper()}{world_size}, {measurement}, cache=cold L2")
+        if any(variant.use_megamoe for variant in variants):
+            print(
+                "MEGAMOE_KNOBS_JSON,"
+                + json.dumps(
+                    args.megamoe_knobs or {}, sort_keys=True, separators=(",", ":")
+                ),
+                flush=True,
+            )
         if not is_profiling:
-            if selected_variant is None:
+            if default_comparison:
                 print(
                     "global tokens | W4A4 + activation quant (ms) | "
                     "W4A16 (ms) | W4A16 / W4A4"
                 )
             else:
-                print(f"global tokens | {selected_variant.upper()} (ms)")
+                print(
+                    "global tokens | "
+                    + " | ".join(f"{variant.name.upper()} (ms)" for variant in variants)
+                )
 
     max_tokens_per_rank_budget = None
     if mode == "ep":
@@ -1186,17 +1708,24 @@ def _run_parallel_mode(
     reported_backend = False
     for num_tokens in token_counts:
         row = {}
-        variants = (
-            BENCH_VARIANTS
-            if selected_variant is None
-            else tuple(
-                variant
-                for variant in BENCH_VARIANTS
-                if variant.name == selected_variant
-            )
+        shared_weights = (
+            _create_shared_ep_weights(rank, world_size, device)
+            if shared_weight_comparison
+            else None
         )
+        reference_outputs = {} if args.refcheck and mode == "ep" else None
         for variant in variants:
-            if mode == "ep":
+            if variant.use_megamoe:
+                result = _benchmark_distributed_megamoe(
+                    args,
+                    num_tokens,
+                    rank,
+                    world_size,
+                    device,
+                    shared_weights[1],
+                    reference_outputs,
+                )
+            elif mode == "ep":
                 result = _benchmark_distributed_ep(
                     args,
                     variant,
@@ -1205,6 +1734,8 @@ def _run_parallel_mode(
                     rank,
                     world_size,
                     device,
+                    prepared_weights=shared_weights[0] if shared_weights else None,
+                    reference_outputs=reference_outputs,
                 )
             else:
                 result = _benchmark_distributed_tp(
@@ -1229,15 +1760,36 @@ def _run_parallel_mode(
             gc.collect()
             torch.cuda.empty_cache()
 
-        if rank == 0 and len(row) == 2:
+        if rank == 0 and default_comparison and len(row) == 2:
             ratio = row["w4a16"] / row["w4a4"]
             print(
                 f"{num_tokens:>13} | {row['w4a4']:>28.3f} | "
                 f"{row['w4a16']:>10.3f} | {ratio:>13.3f}x"
             )
         elif rank == 0 and row:
-            value = row[selected_variant]
-            print(f"{num_tokens:>13} | {value:>11.3f}")
+            print(
+                f"{num_tokens:>13} | "
+                + " | ".join(f"{row[v.name]:>11.6f}" for v in variants)
+            )
+            if "w4a16" in row and "w4a16_megamoe" in row:
+                print(
+                    f"W4A16_SPEEDUP_CSV,{num_tokens},{world_size},"
+                    f"{row['w4a16'] / row['w4a16_megamoe']:.6f}"
+                )
+        del shared_weights, reference_outputs
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _ncu_application_replay_rendezvous():
+    """Give each relaunched rank fresh process-group keys in the agent store."""
+    import torch.distributed as dist
+
+    store, rank, world_size = next(dist.rendezvous("env://"))
+    # torchrun's TCPStore survives NCU application replay. Each rank advances
+    # once per worker incarnation; all ranks replay the same application.
+    epoch = store.add(f"flashinfer_ncu_replay_epoch_rank_{rank}", 1)
+    return dist.PrefixStore(f"flashinfer_ncu_replay_{epoch}", store), rank, world_size
 
 
 def _run_distributed_benchmark(args, token_counts):
@@ -1251,7 +1803,13 @@ def _run_distributed_benchmark(args, token_counts):
         args,
         f"[local rank {local_rank}] NCCL process-group initialization: start",
     )
-    dist.init_process_group("nccl", device_id=device)
+    if args.mode == "profile_ncu" and args.ncu_megamoe_replay == "application":
+        store, rank, world_size = _ncu_application_replay_rendezvous()
+        dist.init_process_group(
+            "nccl", store=store, rank=rank, world_size=world_size, device_id=device
+        )
+    else:
+        dist.init_process_group("nccl", device_id=device)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     _verbose_print(
@@ -1276,7 +1834,11 @@ def _run_distributed_benchmark(args, token_counts):
             selected_mode, selected_variant = _parse_profile_case(profile_case)
             selected_variant_name = selected_variant.name
 
-        modes = ("ep", "tp") if selected_mode is None else (selected_mode,)
+        modes = (
+            tuple(args.parallel_modes.split(","))
+            if selected_mode is None
+            else (selected_mode,)
+        )
         for mode in modes:
             _run_parallel_mode(
                 args,
@@ -1292,6 +1854,22 @@ def _run_distributed_benchmark(args, token_counts):
         return 0
     finally:
         dist.destroy_process_group()
+
+
+def _parse_megamoe_knobs(value):
+    if value == "auto":
+        return value
+    try:
+        knobs = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(
+            "--megamoe-knobs must be a JSON object or 'auto'"
+        ) from error
+    if not isinstance(knobs, dict):
+        raise argparse.ArgumentTypeError(
+            "--megamoe-knobs must be a JSON object or 'auto'"
+        )
+    return knobs
 
 
 def main():
@@ -1312,6 +1890,49 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--log-timing-samples",
+        action="store_true",
+        help=(
+            "Log rank-MAX samples and rank-zero timer wall time after each "
+            "benchmark measurement; does not change iterations or timing."
+        ),
+    )
+    parser.add_argument(
+        "--variants",
+        default="w4a4,w4a16",
+        help="Comma-separated variants: w4a4,w4a16,w4a16_megamoe (MegaMoE is EP only).",
+    )
+    parser.add_argument(
+        "--megamoe-knobs",
+        type=_parse_megamoe_knobs,
+        default=None,
+        help=(
+            "JSON object of W4A16 MegaMoE kernel knobs, or auto to collectively "
+            "tune during warmup. Recorded in benchmark output."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-modes",
+        default="ep,tp",
+        help="Comma-separated parallel modes: ep,tp.",
+    )
+    parser.add_argument(
+        "--timing",
+        choices=("cuda_event", "cupti"),
+        default="cuda_event",
+        help="Benchmark timer. cupti requires working CUPTI 13+; no fallback.",
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Measure CUDA graph replay in benchmark mode (profilers use NVTX stages).",
+    )
+    parser.add_argument(
+        "--refcheck",
+        action="store_true",
+        help="Check MegaMoE against split W4A16 at atol=rtol=1e-2 before timing.",
+    )
     parser.add_argument(
         "--num-gpus",
         type=int,
@@ -1336,13 +1957,13 @@ def main():
         "--no-fused-finalize",
         action="store_false",
         dest="use_fused_finalize",
-        help="Use deterministic two-stage finalize.",
+        help="Use deterministic two-stage finalize for the split W4A4/W4A16 variants.",
     )
     parser.add_argument(
         "--no-pdl",
         action="store_false",
         dest="enable_pdl",
-        help="Disable Programmatic Dependent Launch.",
+        help="Disable Programmatic Dependent Launch for the split variants.",
     )
     parser.add_argument(
         "--mode",
@@ -1363,10 +1984,50 @@ def main():
         help="Directory for Nsight Systems reports (default: a temporary directory).",
     )
     parser.add_argument(
+        "--nsys-cuda-trace",
+        choices=("cuda", "cuda-sw"),
+        default="cuda",
+        help=(
+            "Nsight CUDA trace mode; cuda-sw requests software tracing when "
+            "hardware tracing loses events (requires Nsight support)."
+        ),
+    )
+    parser.add_argument(
+        "--nsys-capture-range-end",
+        choices=("stop", "none"),
+        default="stop",
+        help=(
+            "Nsight capture range end; none keeps collecting after profiler "
+            "stop until the worker process tree exits."
+        ),
+    )
+    parser.add_argument(
         "--ncu-output-dir",
         type=str,
         default=None,
         help="Directory for Nsight Compute reports (default: a temporary directory).",
+    )
+    parser.add_argument(
+        "--ncu-metrics",
+        default=None,
+        help="Comma-separated NCU metrics; default captures the full metric set.",
+    )
+    parser.add_argument(
+        "--ncu-megamoe-replay",
+        choices=("kernel", "application"),
+        default="kernel",
+        help=(
+            "MegaMoE NCU replay: kernel uses one shmem communicator; application "
+            "uses one profiler per rank over TCP and requires nonempty source ranks."
+        ),
+    )
+    parser.add_argument(
+        "--ncu-megamoe-kernel",
+        default=None,
+        help=(
+            "NCU demangled kernel-name filter for the W4A16 fused EP collective "
+            "(exact name or regex:expression, required when profiling MegaMoE)."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -1375,6 +2036,33 @@ def main():
     )
     args = parser.parse_args()
 
+    variant_names = args.variants.split(",")
+    if not set(variant_names) <= {variant.name for variant in BENCH_VARIANTS} or len(
+        set(variant_names)
+    ) != len(variant_names):
+        parser.error("--variants must contain unique w4a4,w4a16,w4a16_megamoe values")
+    parallel_modes = args.parallel_modes.split(",")
+    if not set(parallel_modes) <= {"ep", "tp"} or len(set(parallel_modes)) != len(
+        parallel_modes
+    ):
+        parser.error("--parallel-modes must contain unique ep,tp values")
+    if variant_names == ["w4a16_megamoe"] and parallel_modes == ["tp"]:
+        parser.error("W4A16 MegaMoE supports expert parallelism only")
+    if args.megamoe_knobs is not None and "w4a16_megamoe" not in variant_names:
+        parser.error("--megamoe-knobs requires the w4a16_megamoe variant")
+    if args.refcheck and (
+        args.mode != "benchmark"
+        or "ep" not in parallel_modes
+        or not {"w4a16", "w4a16_megamoe"} <= set(variant_names)
+    ):
+        parser.error("--refcheck requires benchmark mode with EP w4a16,w4a16_megamoe")
+    if (
+        args.mode == "profile_ncu"
+        and "ep" in parallel_modes
+        and "w4a16_megamoe" in variant_names
+        and not args.ncu_megamoe_kernel
+    ):
+        parser.error("MegaMoE NCU capture requires --ncu-megamoe-kernel")
     if not 1 <= args.num_gpus <= 8:
         parser.error("--num-gpus must be between 1 and 8")
     if CFG.num_experts % args.num_gpus != 0:
@@ -1396,14 +2084,40 @@ def main():
         tokens = [32, 4096]
     else:
         tokens = DISTRIBUTED_TOKEN_COUNTS
+    if (
+        args.mode == "profile_ncu"
+        and "w4a16_megamoe" in variant_names
+        and args.ncu_megamoe_replay == "application"
+        and any(value < args.num_gpus for value in tokens)
+    ):
+        parser.error("MegaMoE NCU application replay requires nonempty source ranks")
+
+    if args.mode == "benchmark" and args.timing == "cupti":
+        try:
+            from cupti import cupti
+
+            cupti_version = version("cupti-python")
+            if int(cupti_version.split(".")[0]) < 13:
+                raise RuntimeError("CUPTI 13+ is required")
+            cupti.get_timestamp()  # Load and exercise the installed CUPTI library.
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                "--timing cupti requires working CUPTI 13+ bindings"
+            ) from error
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"CUPTI version: {cupti_version}; torch CUDA: {torch.version.cuda}")
 
     profile_case = os.environ.get(_PROFILE_CASE_ENV)
     if args.mode == "profile_ncu" and profile_case is not None:
+        mode, variant = _parse_profile_case(profile_case)
+        if variant.use_megamoe:
+            if "LOCAL_RANK" not in os.environ:
+                parser.error("MegaMoE NCU workers require all ranks under torchrun")
+            return _run_distributed_benchmark(args, tokens)
         if "LOCAL_RANK" in os.environ:
             parser.error("profile_ncu workers must run without torchrun")
         if len(tokens) != 1:
             parser.error("profile_ncu workers require exactly one token count")
-        mode, variant = _parse_profile_case(profile_case)
         return _run_ncu_compute_profile(args, tokens[0], mode, variant)
     if args.mode in _PROFILE_MODES and profile_case is None:
         if "LOCAL_RANK" in os.environ:

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from flashinfer.moe_ep import (
+    Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
 from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.config import (
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
 )
@@ -51,10 +55,15 @@ def test_bf16_backend_defaults_to_scale_free_contract():
     assert config.knobs is None
 
 
-def test_bf16_backend_accepts_collective_autotune():
-    assert (
-        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=64, top_k=1, knobs="auto"
-        ).knobs
-        == "auto"
-    )
+@pytest.mark.parametrize(
+    "config_type",
+    (
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    ),
+    ids=("bf16", "w4a4", "w4a16"),
+)
+@pytest.mark.parametrize("knobs", (None, {}, {"flag_batch": 4}, "auto"))
+def test_cutedsl_backend_accepts_public_tuning_modes(config_type, knobs):
+    assert config_type(intermediate_size=64, top_k=1, knobs=knobs).knobs == knobs
