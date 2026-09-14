@@ -7,7 +7,7 @@ and no shape autotuning. The existing CuTe implementation remains the default.
 Owner: @Micdiane. Tracking issue: [#5209](https://github.com/flashinfer-ai/flashinfer/issues/5209).
 Proposed graduation target: 0.7.1, with lifecycle review by 2026-10-12, subject
 to maintainer agreement. [RESULTS.md](RESULTS.md) separates prototype evidence
-from the adapted revision's pending GPU validation.
+from the adapted revision's completed SM120 validation and paired timings.
 
 ## Use
 
