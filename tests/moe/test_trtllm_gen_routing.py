@@ -547,6 +547,51 @@ def test_sqrt_softplus_dsv41_geometry_fixture():
     torch.testing.assert_close(w, ref_w, atol=WEIGHT_ATOL, rtol=WEIGHT_RTOL)
 
 
+def test_sqrt_softplus_enum_round_trips_through_binding():
+    """RoutingMethodType.SqrtSoftplus (11, appended after Unspecified=10) must
+    survive Python enum -> int -> FFI binding range check -> C++ enum -> runner
+    dispatch. One row separates every method family: sqrt-softplus + bias picks
+    expert 1, sigmoid + bias picks expert 2, bias-ignoring methods pick expert 0
+    (the raw argmax), so reaching any other branch is visible in the ids."""
+    num_experts = 16
+    logits = torch.full((1, num_experts), -30.0)
+    logits[0, :3] = torch.tensor([3.0, 0.0, -1.0])
+    bias = torch.zeros(num_experts)
+    bias[:3] = torch.tensor([0.0, 1.0, 1.25])  # exact in bf16
+    logits, bias = logits.cuda(), bias.to(torch.bfloat16).cuda()
+
+    def selected(method, **kwargs):
+        return int(trtllm_gen_routing(logits, bias, method, 1, **kwargs).topk_ids[0, 0])
+
+    # Python deserialization of the wire value, then through the binding.
+    method = RoutingMethodType(int(RoutingMethodType.SqrtSoftplus))
+    assert method is RoutingMethodType.SqrtSoftplus
+    assert method is not RoutingMethodType.Unspecified
+    assert selected(method) == 1
+    assert selected(11) == 1  # plain int, as a serialized config would carry it
+
+    # Every other concrete method lands elsewhere on this row.
+    assert selected(RoutingMethodType.DeepSeekV3, n_group=1, topk_group=1) == 2
+    assert selected(RoutingMethodType.MiniMax2) == 2
+    for bias_ignoring in (
+        RoutingMethodType.Default,
+        RoutingMethodType.Renormalize,
+        RoutingMethodType.RenormalizeNaive,
+        RoutingMethodType.TopK,
+        RoutingMethodType.SigmoidRenorm,
+        RoutingMethodType.Sigmoid,
+        RoutingMethodType.TopKSigmoid,
+        RoutingMethodType.Llama4,
+    ):
+        assert selected(bias_ignoring) == 0, bias_ignoring
+
+    # The sentinel itself is still rejected on both sides of the binding.
+    with pytest.raises(ValueError):
+        trtllm_gen_routing(logits, bias, RoutingMethodType.Unspecified, 1)
+    with pytest.raises(Exception, match="invalid routing_method_type"):
+        trtllm_gen_routing(logits, bias, RoutingMethodType.SqrtSoftplus + 1, 1)
+
+
 def test_sqrt_softplus_rejects_groups_and_fused_shared_experts():
     logits = make_logits(4, 16, torch.float32, 0)
     bias = make_bias(16, torch.bfloat16, 1)
