@@ -1700,6 +1700,121 @@ def test_trtllm_batch_decode_mla_preallocated_out(
             )
 
 
+@pytest.mark.arch_blackwell
+def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
+    """The prefill name preserves explicit TRTLLM-GEN output/LSE semantics."""
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc[0] != 10:
+        pytest.skip("trtllm-gen MLA requires SM100/SM103")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    layer_dim = supported_mla_layer_dimensions[-1]
+    head_dim = layer_dim.head_dimensions
+    batch_size = 1
+    q_len_per_request = 2
+    page_size = 32
+    max_seq_len = 64
+    num_pages = max_seq_len // page_size
+    head_dim_qk = head_dim.kv_lora_rank + head_dim.qk_rope_head_dim
+
+    query = torch.randn(
+        batch_size,
+        q_len_per_request,
+        layer_dim.num_heads,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        num_pages,
+        1,
+        page_size,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    block_tables = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages
+    )
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+
+    expected_out_shape = (
+        batch_size,
+        q_len_per_request,
+        layer_dim.num_heads,
+        head_dim.kv_lora_rank,
+    )
+    expected_lse_shape = (
+        batch_size * q_len_per_request,
+        layer_dim.num_heads,
+    )
+    decode_workspace = torch.zeros(workspace_size, dtype=torch.int8, device=device)
+    prefill_workspace = torch.zeros(workspace_size, dtype=torch.int8, device=device)
+    decode_out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=device)
+    prefill_out = torch.empty_like(decode_out)
+    decode_lse = torch.empty(expected_lse_shape, dtype=torch.float32, device=device)
+    prefill_lse = torch.empty_like(decode_lse)
+    tensor_only_workspace = torch.zeros(workspace_size, dtype=torch.int8, device=device)
+    tensor_only_out = torch.empty_like(decode_out)
+
+    common = {
+        "query": query,
+        "kv_cache": kv_cache,
+        "qk_nope_head_dim": head_dim.qk_nope_head_dim,
+        "kv_lora_rank": head_dim.kv_lora_rank,
+        "qk_rope_head_dim": head_dim.qk_rope_head_dim,
+        "block_tables": block_tables,
+        "seq_lens": seq_lens,
+        "max_seq_len": max_seq_len,
+        "bmm1_scale": 1.0
+        / ((head_dim.qk_nope_head_dim + head_dim.qk_rope_head_dim) ** 0.5),
+        "bmm2_scale": 1.0,
+        "backend": "trtllm-gen",
+        "return_lse": True,
+    }
+    decode_result = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        **common,
+        workspace_buffer=decode_workspace,
+        out=decode_out,
+        lse=decode_lse,
+    )
+    prefill_result = flashinfer.prefill.trtllm_prefill_with_kv_cache_mla(
+        **common,
+        workspace_buffer=prefill_workspace,
+        out=prefill_out,
+        lse=prefill_lse,
+    )
+
+    assert isinstance(decode_result, tuple) and len(decode_result) == 2
+    assert isinstance(prefill_result, tuple) and len(prefill_result) == 2
+    assert decode_result[0] is decode_out
+    assert prefill_result[0] is prefill_out
+    assert decode_result[1] is decode_lse
+    assert prefill_result[1] is prefill_lse
+    assert decode_out.shape == prefill_out.shape == expected_out_shape
+    assert decode_out.dtype == prefill_out.dtype == torch.bfloat16
+    assert decode_lse.shape == prefill_lse.shape == expected_lse_shape
+    assert decode_lse.dtype == prefill_lse.dtype == torch.float32
+    assert torch.isfinite(decode_out).all()
+    assert torch.isfinite(prefill_out).all()
+    assert torch.isfinite(decode_lse).all()
+    assert torch.isfinite(prefill_lse).all()
+    torch.testing.assert_close(decode_out, prefill_out, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(decode_lse, prefill_lse, rtol=1e-3, atol=1e-3)
+
+    tensor_only_result = flashinfer.prefill.trtllm_prefill_with_kv_cache_mla(
+        **{**common, "return_lse": False},
+        workspace_buffer=tensor_only_workspace,
+        out=tensor_only_out,
+    )
+    assert tensor_only_result is tensor_only_out
+    assert tensor_only_result.shape == expected_out_shape
+    assert tensor_only_result.dtype == torch.bfloat16
+    assert torch.isfinite(tensor_only_result).all()
+    torch.testing.assert_close(tensor_only_result, decode_out, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize(
     "layer_dimensions",
     supported_mla_layer_dimensions,

@@ -37,6 +37,9 @@ from .jit import (
     setup_cubin_loader,
 )
 from .jit.attention.utils import _is_nvfp4_kv_dtype
+from .mla import (
+    trtllm_prefill_with_kv_cache_mla as trtllm_prefill_with_kv_cache_mla,
+)
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
