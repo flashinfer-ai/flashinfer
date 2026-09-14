@@ -3463,6 +3463,140 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("page_block_size", [32])
+@pytest.mark.parametrize("num_tokens", [1, 128])
+def test_sparse_mla_sm120_dsv4_page32(page_block_size: int, num_tokens: int) -> None:
+    """DSv4 FP8 single-cache decode (T=1) and MG prefill (T=128) on the
+    page-32 instantiation (vLLM's DeepSeek page), dispatched alongside the
+    default page-64 kernels."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    topk = 192
+    num_heads = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    scratch = {}
+    if num_tokens <= 64:
+        mid_out, mid_lse = _make_decode_scratch(
+            num_tokens, num_heads, topk, d_v, device
+        )
+        scratch = {"mid_out": mid_out, "mid_lse": mid_lse}
+    sparse_mla_sm120_paged_attention(
+        q, kv_packed, indices, output, out_lse, sm_scale, d_v=d_v, **scratch
+    )
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("main_pbs,extra_pbs", [(32, 64), (32, 2)])
+@pytest.mark.parametrize("num_tokens", [1, 128])
+def test_sparse_mla_sm120_dsv4_page32_dual(
+    main_pbs: int, extra_pbs: int, num_tokens: int
+) -> None:
+    """DSv4 dual-cache with a page-32 main cache; extra_pbs=2 exercises the
+    XOR extra layout under the page-32 main instantiation."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    topk, extra_topk = 192, 64
+    num_heads = 64
+
+    main_num_blocks = 64
+    main_s_kv = main_num_blocks * main_pbs
+    extra_num_blocks = max((extra_topk + extra_pbs - 1) // extra_pbs * 2, 16)
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+    extra_dequant = dequantize_kv_dsv4(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+    main_idx[:, topk // 2 :] = -1
+    extra_idx[:, extra_topk // 2 :] = -1
+
+    sm_scale = d_qk**-0.5
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    extra_idx_shifted = torch.where(extra_idx < 0, extra_idx, extra_idx + main_s_kv)
+    virtual_idx = torch.cat([main_idx, extra_idx_shifted], dim=-1)
+    ref_out, ref_lse = _ref_sparse_attn(q, virtual_kv, virtual_idx, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    scratch = {}
+    if num_tokens <= 64:
+        mid_out, mid_lse = _make_decode_scratch(
+            num_tokens, num_heads, topk + extra_topk, d_v, device
+        )
+        scratch = {"mid_out": mid_out, "mid_lse": mid_lse}
+    sparse_mla_sm120_paged_attention(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        extra_kv_cache=extra_packed,
+        extra_indices=extra_idx,
+        **scratch,
+    )
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
 def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")

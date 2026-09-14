@@ -86,6 +86,12 @@ def format_info(model: int) -> Mapping[str, int]:
 
 
 @functools.cache
+def main_page_sizes(model: int) -> tuple[int, ...]:
+    """Instantiated main-cache page sizes; empty for runtime-page families."""
+    return tuple(query("main_page_sizes", model))
+
+
+@functools.cache
 def dsv4_nvfp4_format_info() -> Dsv4Nvfp4FormatInfo:
     facts = query("format_info", is_dsv4_nvfp4=True)
     return cast(

@@ -310,7 +310,9 @@ def test_supports_decode_rejects_mismatches() -> None:
     assert not dsv4.supports_decode(64, 0)  # topk below min_topk=1
     assert not dsv4.supports_decode(256, 256)  # num_heads past the runtime-H ceiling
     assert dsv4.supports_decode(48, 256)  # arbitrary H <= 128 rides runtime-H
-    assert not dsv4.supports_decode(64, 256, page_block_size=32)
+    assert dsv4.supports_decode(64, 256, page_block_size=32)  # instantiated page
+    assert not dsv4.supports_decode(64, 256, page_block_size=48)  # uninstantiated
+    assert not dsv4.supports_decode(64, 256, page_block_size=0)
     assert not dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS + 1)
     assert dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS)
     assert not decode_splitk_eligible(
@@ -374,20 +376,35 @@ def test_error_message_names_both_mismatches() -> None:
 
 
 def test_error_message_names_page_block_size_mismatch() -> None:
-    """An uninstantiated page size is named; valid pairs are not blamed."""
+    """An uninstantiated page size is named; valid pairs are not blamed.
+    dots3_swa has a single fixed page; dsv4 lists its instantiated set."""
+    msg = _decode_dispatch_error_message(
+        num_tokens=1,
+        num_heads=64,
+        topk=1024,
+        d_qk=1088,
+        page_block_size=32,
+        model_type=_MODEL_TYPE_DOTS3_SWA,
+        extra_topk=0,
+    )
+    assert "page_block_size=32 is unsupported" in msg
+    assert "instantiated only for page_block_size=64" in msg
+    # (num_heads=64, topk=1024) is inside the envelope, so the Mismatch
+    # reasons blame neither (the shape summary echo is expected).
+    assert "num_heads=64 exceeds" not in msg
+    assert "topk=1024 is below" not in msg
+
     msg = _decode_dispatch_error_message(
         num_tokens=1,
         num_heads=64,
         topk=256,
         d_qk=512,
-        page_block_size=32,
+        page_block_size=48,
         model_type=_MODEL_TYPE_DSV4,
         extra_topk=0,
     )
-    assert "page_block_size=32 is unsupported" in msg
-    assert "instantiated only for page_block_size=64" in msg
-    # (num_heads=64, topk=256) is inside the envelope, so the Mismatch
-    # reasons blame neither (the shape summary echo is expected).
+    assert "page_block_size=48 is unsupported" in msg
+    assert "instantiated only for page_block_size in (32, 64)" in msg
     assert "num_heads=64 exceeds" not in msg
     assert "topk=256 is below" not in msg
 

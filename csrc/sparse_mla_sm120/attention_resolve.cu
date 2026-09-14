@@ -107,8 +107,7 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
   const bool inline_scale = format.inline_scale;
   const bool dual = m.extra_topk > 0;
   const int bpt = bytes_per_token(mt);
-  TVM_FFI_ICHECK(m.page_size > 0 && (runtime_page(mt) || m.page_size == FixedPageSize))
-      << "unsupported sparse-MLA main page size";
+  TVM_FFI_ICHECK(main_page_supported(mt, m.page_size)) << "unsupported sparse-MLA main page size";
   TVM_FFI_ICHECK(m.row_stride_bytes >= bpt &&
                  (inline_scale ? m.row_stride_bytes % 16 == 0 : m.row_stride_bytes == bpt))
       << "invalid row stride";
@@ -334,6 +333,21 @@ ffi::Map<ffi::String, int64_t> format_info(int64_t model) {
                                                          : DecodeTileCfg<ModelType::DSV4>::BI}};
 }
 
+ffi::Array<int64_t> main_page_sizes(int64_t model) {
+  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1));
+  ffi::Array<int64_t> result;
+  const auto mt = static_cast<ModelType>(model);
+  if (runtime_page(mt)) return result;  // any positive page size
+  if (mt == ModelType::DSV4) {
+#define PAGE(P) result.push_back(P);
+    SPARSE_MLA_DSV4_MAIN_PAGES(PAGE)
+#undef PAGE
+    return result;
+  }
+  result.push_back(FixedPageSize);
+  return result;
+}
+
 int64_t resolve_format(int64_t query_dim, ffi::String scale) {
   for (int model = 0; model <= int(ModelType::DSV4_1); ++model) {
     const auto mt = static_cast<ModelType>(model);
@@ -357,6 +371,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(resolve_format,
                               flashinfer::sparse_mla_sm120::execution::resolve_format);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(candidates, flashinfer::sparse_mla_sm120::execution::candidates);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(format_info, flashinfer::sparse_mla_sm120::execution::format_info);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(main_page_sizes,
+                              flashinfer::sparse_mla_sm120::execution::main_page_sizes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(metadata_candidates,
                               flashinfer::sparse_mla_sm120::execution::metadata_candidates);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(resolve_attention,

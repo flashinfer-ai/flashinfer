@@ -15,6 +15,27 @@ constexpr int DecodeMaxHeads = 128;
 constexpr int FixedPageSize = 64;
 constexpr bool runtime_page(ModelType model) { return model == ModelType::DSV4_1; }
 
+// DSV4 main-cache page sizes with compiled instantiations: 64 (default) and
+// 32 (vLLM's DeepSeek page). The page size feeds only index arithmetic
+// (page stride, footer offset), never tile shapes, so both are the same
+// kernel template with full constant folding.
+#define SPARSE_MLA_DSV4_MAIN_PAGES(F) F(64) F(32)
+
+constexpr bool main_page_supported(ModelType model, int page) {
+  if (runtime_page(model)) return page > 0;
+  if (model == ModelType::DSV4) return page == FixedPageSize || page == 32;
+  return page == FixedPageSize;
+}
+
+template <typename F>
+PrefillLaunchResult visit_dsv4_main_page(int page, F&& call) {
+#define PAGE(P) \
+  if (page == P) return call(std::integral_constant<int, P>{});
+  SPARSE_MLA_DSV4_MAIN_PAGES(PAGE)
+#undef PAGE
+  return false;
+}
+
 template <ModelType MT, int Variant, typename F>
 PrefillLaunchResult visit_prefill_heads(int heads, F&& call) {
   constexpr bool inline_scale =
