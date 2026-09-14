@@ -129,8 +129,10 @@ def _case(
 
 
 def _assert_parity(actual, expected):
-    torch.testing.assert_close(actual[0].float(), expected[0], atol=ATOL, rtol=RTOL)
-    torch.testing.assert_close(actual[1].float(), expected[1], atol=ATOL, rtol=RTOL)
+    # Numeric comparison only: backends return (output, final_states) in the
+    # configured io/state dtypes, so normalize both sides to fp32.
+    torch.testing.assert_close(actual[0].float(), expected[0].float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(actual[1].float(), expected[1].float(), atol=ATOL, rtol=RTOL)
 
 
 def _cute_reference(constructor, tensors, arguments):
@@ -240,20 +242,25 @@ def test_vibecuda_ssd_combined_accepts_strided_input_views():
 
     constructor, tensors, arguments = _case(varlen=True)
     x, dt, A, B, C = tensors
-    tensors = (
+    strided_tensors = (
         sglang_projection_view(x),
         sglang_projection_view(dt),
         A,
         sglang_projection_view(B),
         sglang_projection_view(C),
     )
-    arguments = {
+    strided_arguments = {
         **arguments,
         "z": strided_last_dim(arguments["z"]),
         "initial_states": strided_last_dim(arguments["initial_states"]),
     }
+    # Only the vibecuda backend accepts strided views; feed the oracle the
+    # contiguous originals (identical values) so the candidate is still checked
+    # against the same reference on the same numbers.
     reference = _cute_reference(constructor, tensors, arguments)
-    actual = SSDCombined(**constructor, backend="vibecuda").run(*tensors, **arguments)
+    actual = SSDCombined(**constructor, backend="vibecuda").run(
+        *strided_tensors, **strided_arguments
+    )
     _assert_parity(actual, reference)
 
 

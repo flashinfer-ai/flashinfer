@@ -23,7 +23,7 @@
   "execution_error": null,
   "mode": "in-process",
   "report": {
-    "cake_ms": 0.047568,
+    "cake_ms": 0.0479365,
     "cake_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -59,7 +59,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "flashinfer_ms": 0.0578725,
+    "flashinfer_ms": 0.0571685,
     "full_write": {
       "fully_written": true,
       "out_numel": 131072,
@@ -101,7 +101,7 @@
       "sequence_lengths": null,
       "state_dtype": "float16"
     },
-    "speedup": 1.216626723847965,
+    "speedup": 1.1925881113556476,
     "timing_backend": "cupti",
     "truth_reference": "fp64_sequential_recurrence",
     "vibecuda_final_states": {
@@ -109,7 +109,7 @@
       "bitwise_equal": false,
       "max_abs": 0.00048828125,
       "max_rel": 11.409090995788574,
-      "mismatch_count": 9709,
+      "mismatch_count": 9706,
       "numel": 131072,
       "rtol": 0.01,
       "tolerance_passed": true
@@ -125,7 +125,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "vibecuda_speedup_vs_cake": 2.7027272727272726,
+    "vibecuda_speedup_vs_cake": 2.7236647727272727,
     "vibecuda_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -149,5 +149,5 @@
   },
   "row": "fp16_b_h8_g8",
   "validation_failures": [],
-  "wall_s": 2.891
+  "wall_s": 62.331
 }

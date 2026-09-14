@@ -27,7 +27,7 @@
   "execution_error": null,
   "mode": "in-process",
   "report": {
-    "cake_ms": 0.0745775,
+    "cake_ms": 0.07041700000000001,
     "cake_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -63,7 +63,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "flashinfer_ms": 0.073761,
+    "flashinfer_ms": 0.072145,
     "full_write": {
       "fully_written": true,
       "out_numel": 131072,
@@ -108,7 +108,7 @@
       ],
       "state_dtype": "bfloat16"
     },
-    "speedup": 0.9890516576715496,
+    "speedup": 1.024539528806964,
     "timing_backend": "cupti",
     "truth_reference": "fp64_sequential_recurrence",
     "vibecuda_final_states": {
@@ -116,23 +116,23 @@
       "bitwise_equal": false,
       "max_abs": 0.001953125,
       "max_rel": 0.3072625696659088,
-      "mismatch_count": 414,
+      "mismatch_count": 415,
       "numel": 131072,
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "vibecuda_ms": 0.0373125,
+    "vibecuda_ms": 0.037392499999999995,
     "vibecuda_out": {
       "atol": 0.01,
       "bitwise_equal": false,
-      "max_abs": 0.00048828125,
-      "max_rel": 0.01807228848338127,
-      "mismatch_count": 5,
+      "max_abs": 0.0078125,
+      "max_rel": 0.004464285913854837,
+      "mismatch_count": 2,
       "numel": 131072,
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "vibecuda_speedup_vs_cake": 1.9987269681742046,
+    "vibecuda_speedup_vs_cake": 1.88318513070803,
     "vibecuda_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -156,5 +156,5 @@
   },
   "row": "bf16_v_h8_g8_dvec",
   "validation_failures": [],
-  "wall_s": 3.606
+  "wall_s": 65.2
 }

@@ -1,10 +1,10 @@
 {
   "all_rows_passed": true,
-  "arithmetic_mean_speedup": 2.3384651510556513,
+  "arithmetic_mean_speedup": 2.3077231087953947,
   "candidate": "vibecuda",
   "contract_version": "pr4576-route-matrix-12-seed7-v2",
   "denominator": "cake (PR-4576 SSDCombined backend)",
-  "geometric_mean_speedup": 2.1076723787661553,
+  "geometric_mean_speedup": 2.0835428737077595,
   "matrix": [
     "bf16_b_h8_g8_dvec",
     "fp16_b_h8_g8",
@@ -19,8 +19,8 @@
     "b_h128_g8",
     "v_h128_g8_zero"
   ],
-  "max_speedup": 5.828701669595783,
-  "min_speedup": 1.129299881700441,
+  "max_speedup": 5.723759791122715,
+  "min_speedup": 1.1249429981195784,
   "mode": "in-process",
   "rows": [
     {
@@ -28,23 +28,23 @@
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.049584500000000004,
+      "cake_ms": 0.049825,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "bf16_b_h8_g8_dvec",
-      "speedup": 2.720835162423179,
-      "vibecuda_ms": 0.018223999999999997
+      "speedup": 2.746086860670194,
+      "vibecuda_ms": 0.018144
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.047568,
+      "cake_ms": 0.0479365,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "fp16_b_h8_g8",
-      "speedup": 2.7027272727272726,
+      "speedup": 2.7236647727272727,
       "vibecuda_ms": 0.0176
     },
     {
@@ -52,71 +52,71 @@
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.0745775,
+      "cake_ms": 0.07041700000000001,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "bf16_v_h8_g8_dvec",
-      "speedup": 1.9987269681742046,
-      "vibecuda_ms": 0.0373125
+      "speedup": 1.88318513070803,
+      "vibecuda_ms": 0.037392499999999995
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.0774885,
+      "cake_ms": 0.071649,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "fp16_v_i64_h8_g8",
-      "speedup": 2.091118847150259,
-      "vibecuda_ms": 0.037056
+      "speedup": 1.9335069421019255,
+      "vibecuda_ms": 0.0370565
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.106129,
+      "cake_ms": 0.1041295,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "bf16prep_b_h8_g8",
-      "speedup": 5.828701669595783,
-      "vibecuda_ms": 0.018208
+      "speedup": 5.723759791122715,
+      "vibecuda_ms": 0.0181925
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.032465,
+      "cake_ms": 0.0328,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h1_g1",
-      "speedup": 1.8787072133329474,
-      "vibecuda_ms": 0.0172805
+      "speedup": 1.96360153256705,
+      "vibecuda_ms": 0.016704
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.0548005,
+      "cake_ms": 0.052096,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h12_g3",
-      "speedup": 3.0580636160714287,
-      "vibecuda_ms": 0.01792
+      "speedup": 2.9174810293170554,
+      "vibecuda_ms": 0.0178565
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.046592,
+      "cake_ms": 0.047104,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h16_g4",
-      "speedup": 2.510344827586207,
+      "speedup": 2.537931034482759,
       "vibecuda_ms": 0.01856
     },
     {
@@ -124,35 +124,11 @@
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.0806405,
+      "cake_ms": 0.080225,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h128_g1",
-      "speedup": 1.385373270226857,
-      "vibecuda_ms": 0.058208499999999996
-    },
-    {
-      "cake_cute_parity": {
-        "final_states_tolerance_passed": true,
-        "out_tolerance_passed": true
-      },
-      "cake_ms": 0.083041,
-      "cute_parity_passed": true,
-      "full_write_passed": true,
-      "row": "b_h128_g128",
-      "speedup": 1.3869523825430494,
-      "vibecuda_ms": 0.059873
-    },
-    {
-      "cake_cute_parity": {
-        "final_states_tolerance_passed": true,
-        "out_tolerance_passed": false
-      },
-      "cake_ms": 0.079745,
-      "cute_parity_passed": true,
-      "full_write_passed": true,
-      "row": "b_h128_g8",
-      "speedup": 1.3707307011361878,
+      "speedup": 1.3789813843958953,
       "vibecuda_ms": 0.058177
     },
     {
@@ -160,12 +136,36 @@
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.11025750000000001,
+      "cake_ms": 0.082625,
+      "cute_parity_passed": true,
+      "full_write_passed": true,
+      "row": "b_h128_g128",
+      "speedup": 1.381862273696534,
+      "vibecuda_ms": 0.0597925
+    },
+    {
+      "cake_cute_parity": {
+        "final_states_tolerance_passed": true,
+        "out_tolerance_passed": false
+      },
+      "cake_ms": 0.080193,
+      "cute_parity_passed": true,
+      "full_write_passed": true,
+      "row": "b_h128_g8",
+      "speedup": 1.3776735556357265,
+      "vibecuda_ms": 0.058209
+    },
+    {
+      "cake_cute_parity": {
+        "final_states_tolerance_passed": true,
+        "out_tolerance_passed": true
+      },
+      "cake_ms": 0.109777,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "v_h128_g8_zero",
-      "speedup": 1.129299881700441,
-      "vibecuda_ms": 0.0976335
+      "speedup": 1.1249429981195784,
+      "vibecuda_ms": 0.0975845
     }
   ],
   "rows_completed": 12,

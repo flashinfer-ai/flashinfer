@@ -104,8 +104,9 @@ struct VT<fp16> {
 //   - SERVING=false is the long-standing checkpoint-free ladder and is bitwise
 //     frozen (softplus via log1p, __expf decays, RN folds on the x side).
 //   - SERVING=true tracks the CAKE mamba2_metadata oracle ladder bitwise
-//     (Triton chunk_cumsum softplus, ex2.approx decays, RZ segsum folds on the
-//     B side) and is only selected when serving metadata or selective
+//     (Triton chunk_cumsum softplus, ex2.approx decays, RN segsum folds on the
+//     B side — packed f32x2 ops default to RN) and is only selected when
+//     serving metadata or selective
 //     checkpoint outputs are attached to the call.
 __device__ __forceinline__ float softplus_stable(float x) { return x > 20.f ? x : log1p(expf(x)); }
 // Triton chunk_cumsum softplus: where(dt <= 20, log(exp(dt) + 1), dt),
@@ -162,11 +163,15 @@ __device__ __forceinline__ float softplus_v(float x) {
 }
 __device__ __forceinline__ float expn(float x) { return __expf(fmaxf(x, -80.f)); }
 // DSL-oracle ladder (ssd_kernel.py): cute.math.exp(fastmath=True) lowers to an
-// RN multiply by log2(e) followed by ex2.approx.ftz; the segsum exponent fold
-// uses the packed RZ multiply instead (mul.rz.ftz.f32x2), and the pairwise
-// folds/epilogue use fma.rz.ftz.f32x2. Scalar RZ intrinsics replicate the
-// packed ops bitwise (denormal-flush corner cases are outside the reachable
-// exponent ranges).
+// RN multiply by log2(e) followed by ex2.approx.ftz. CORRECTION (R52):
+// every cute.arch.{add,sub,mul,fma}_packed_f32x2 call in ssd_kernel.py passes
+// no rnd=/ftz= argument, and the NVVM ops default to round-to-nearest — the
+// packed f32x2 ladder is RN, NOT RZ (earlier rounds assumed RZ). The masks
+// below were flipped to RN and verified 14/14 against the oracle's staged
+// scaled-B bits (one-hot x probe, chunk-1 of the row-15 ladder inputs: the
+// only 14 candidate-vs-oracle bf16 mismatches out of 1,048,576 elements were
+// exactly the RZ-vs-RN truncation flips, and an RN rebuild reproduced the
+// oracle at every flip site).
 __device__ __forceinline__ float ex2_approx(float x) {
   float r;
   asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
@@ -176,33 +181,30 @@ __device__ __forceinline__ float ex2_approx(float x) {
 __device__ __forceinline__ float exp_dsl(float x) {
   return ex2_approx(__fmul_rn(x, 1.4426950408889634f));
 }
-// cute.math.exp2(mul.rz(x, LOG2E), fastmath=True)  (pre_intra_segsum fold)
-__device__ __forceinline__ float exp_dsl_rz(float x) {
-  return ex2_approx(__fmul_rz(x, 1.4426950408889634f));
-}
-__device__ __forceinline__ float fma_rz(float a, float b, float c) { return __fmaf_rz(a, b, c); }
-// DSL pre_inter_scale_bt_with_delta: (exp(last_col - dA_cs, fastmath) *rz
-// delta) *rz B, with the bf16 conversion applied once afterwards.
+// DSL pre_inter_scale_bt_with_delta: (exp(last_col - dA_cs, fastmath) *rn
+// delta) *rn B (packed muls default to RN), bf16 conversion applied once.
 __device__ __forceinline__ float fold_scaled_b(float last_col, float da_t, float dtp, float bv) {
-  return __fmul_rz(__fmul_rz(exp_dsl(last_col - da_t), dtp), bv);
+  return __fmul_rn(__fmul_rn(exp_dsl(last_col - da_t), dtp), bv);
 }
-// DSL pre_intra_segsum: exp2(mul.rz(dA_t - dA_s, LOG2E)) *rz delta *rz CB.
+// DSL pre_intra_segsum: exp2(mul.rn(dA_col - dA_row, LOG2E)) *rn delta *rn CB
+// (add/mul_packed all default to RN).
 __device__ __forceinline__ float fold_intra(float da_t, float da_s, float dtp_s, float cb) {
-  return __fmul_rz(__fmul_rz(exp_dsl_rz(__fsub_rz(da_t, da_s)), dtp_s), cb);
+  return __fmul_rn(__fmul_rn(exp_dsl(__fsub_rn(da_t, da_s)), dtp_s), cb);
 }
 template <bool SV>
 __device__ __forceinline__ float exp_v(float x) {
   return SV ? exp_dsl(x) : expn(x);
 }
-// state fold: v * dec + acc — RN on the frozen path, RZ on the serving path.
+// state fold: v * dec + acc — RN on both paths (the DSL's fma_packed_f32x2
+// defaults to RN; the frozen path was always RN).
 template <bool SV>
 __device__ __forceinline__ float fma_fold_v(float v, float dec, float acc) {
-  return SV ? __fmaf_rz(dec, v, acc) : fmaf(v, dec, acc);
+  return SV ? __fmaf_rn(dec, v, acc) : fmaf(v, dec, acc);
 }
-// plain fma: RN on the frozen path, RZ on the serving path.
+// plain fma: RN on both paths (the DSL epilogue fma_packed_f32x2 is RN).
 template <bool SV>
 __device__ __forceinline__ float fma_v(float a, float b, float c) {
-  return SV ? __fmaf_rz(a, b, c) : fmaf(a, b, c);
+  return SV ? __fmaf_rn(a, b, c) : fmaf(a, b, c);
 }
 __device__ __forceinline__ float2 cvt_bf2(uint u) {
   __nv_bfloat162 t = *reinterpret_cast<__nv_bfloat162*>(&u);

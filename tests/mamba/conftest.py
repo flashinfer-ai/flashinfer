@@ -1047,9 +1047,62 @@ def _triton_supports_current_arch() -> bool:
             err = (r.stderr or "") + (r.stdout or "")
             if "not defined for option 'gpu-name'" not in err:
                 return True
-        return False
+        # Arch-name guessing is inconclusive: Triton's nvidia backend can lower
+        # to a compatible family spelling (e.g. sm_103 hardware compiled
+        # through its CUDA-12.8 sm_100 gpu-name), so a negative name probe does
+        # not prove the compile aborts.  Fall back to a real subprocess compile.
+        return _triton_compile_check()
     except Exception:
         return True
+
+
+def _triton_compile_check() -> bool:
+    """Compile a trivial Triton kernel in a subprocess; True on success.
+
+    Ground-truth fallback for the ``ptxas --gpu-name`` probe above: when
+    Triton genuinely cannot target the device it ``abort()``s the whole
+    process during PTX emission, so the compile must run out-of-process and
+    any nonzero exit means the architecture is unsupported.  Defaults to True
+    on probe infrastructure failures so tests are skipped only on a
+    demonstrated compile abort.
+    """
+    import os
+    import sys
+    import tempfile
+
+    probe_src = (
+        "import triton, triton.language as tl, torch\n"
+        "@triton.jit\n"
+        "def _probe(x_ptr, BLOCK: tl.constexpr):\n"
+        "    off = tl.arange(0, BLOCK)\n"
+        "    tl.store(x_ptr + off, tl.load(x_ptr + off), mask=off < BLOCK)\n"
+        "x = torch.zeros(64, device='cuda')\n"
+        "_probe[(1,)](x, BLOCK=64)\n"
+        "torch.cuda.synchronize()\n"
+        "print('TRITON_PROBE_OK')\n"
+    )
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix="_triton_probe.py", delete=False
+        ) as f:
+            f.write(probe_src)
+            path = f.name
+        r = subprocess.run(
+            [sys.executable, path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return r.returncode == 0 and "TRITON_PROBE_OK" in (r.stdout or "")
+    except Exception:
+        return True
+    finally:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _module_uses_triton(fspath) -> bool:
