@@ -39,25 +39,31 @@
 #if FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR == 0
 extern "C" {
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_628747918c06460aa95f(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+kernel_cake_warp_decode_e7c996a7418120fdc59d(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_fc388c0e466eb56dcf98(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_de1fffa0c9722d6f3dc2(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_210a30d27bfc4c15c1bc(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_b8935d27ab092becf9a0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_a8d7177e7a4139aa180d(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_e570c9bd028c91db2255(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_c640747ebc0d0fd414fa(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_b9ce2c4ba5690e69450c(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_bd3965d11ab70909b209(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_a724c10c88752655df86(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_2943d5a4f443be1b5408(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_warp_decode_ac22f4a6ae1ebaae1276(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_warp_decode_bbea84bc0aa6f631c01e(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_warp_decode_571467f2fe1a078edd15(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(32, 1) void
-kernel_cake_warp_decode_699adb7859afe956aac3(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_670effeafbee07071ec6(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 __global__ __launch_bounds__(128, 1) void
-kernel_cake_warp_decode_62c6559a32973c5f111b(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_9021eadecd3078bf13c5(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 __global__ __launch_bounds__(128, 1) void
-kernel_cake_warp_decode_d642cb17eada2ff8629b(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_8851303d75b4e1cec033(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 }
 
 namespace flashinfer::warp_decode::generated {
@@ -68,7 +74,7 @@ inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
 inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 199040u;
-inline constexpr char kGeneratedSourceSha256[] = "0a855988a18242b6d76c86ee74b52f3803b1896ed26d77e8ce91c16524648469";
+inline constexpr char kGeneratedSourceSha256[] = "72c464f18b92af698001c62dcd595eedec3a3605b99a40978ea9811650705b6a";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {
@@ -84,18 +90,21 @@ struct KernelSpec {
   const char* grid[3];
 };
 inline constexpr KernelSpec kKernelSpecs[] = {
-  {"kernel_cake_warp_decode_628747918c06460aa95f", "route_pack_generic", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_fc388c0e466eb56dcf98", "fc1_swiglu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_210a30d27bfc4c15c1bc", "fc1_swiglu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a8d7177e7a4139aa180d", "fc1_swiglu_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_c640747ebc0d0fd414fa", "fc1_silu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_bd3965d11ab70909b209", "fc1_silu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a724c10c88752655df86", "fc2_sm100_source_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_699adb7859afe956aac3", "finalize_direct_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_62c6559a32973c5f111b", "finalize_direct_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_d642cb17eada2ff8629b", "finalize_packed_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_e7c996a7418120fdc59d", "route_pack_generic", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true, "none", {"1", "1", "1"}},
+  {"kernel_cake_warp_decode_de1fffa0c9722d6f3dc2", "fc1_swiglu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_b8935d27ab092becf9a0", "fc1_swiglu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_e570c9bd028c91db2255", "fc1_swiglu_oa_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_b9ce2c4ba5690e69450c", "fc1_swiglu_oa_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_93e7dae962e4d046b7b0", "fc1_swiglu_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_2943d5a4f443be1b5408", "fc1_silu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_ac22f4a6ae1ebaae1276", "fc1_silu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_bbea84bc0aa6f631c01e", "fc1_situ_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_571467f2fe1a078edd15", "fc2_sm100_source_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_670effeafbee07071ec6", "finalize_direct_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_9021eadecd3078bf13c5", "finalize_direct_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_8851303d75b4e1cec033", "finalize_packed_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
 };
-static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 10);
+static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 13);
 
 namespace detail {
 
@@ -548,6 +557,183 @@ inline bool EncodeTensorMap_6_A(CUtensorMap* out, const TensorLayout& tensor) {
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
   if (!(d1 > 0 && d2 > 0)) return false;
   const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  if (!(((d1 % 128)) == (0))) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
+  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_6_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
+  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
+  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
+  if (s3 <= 0) return false;
+  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
+  if (s4 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
+  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_6_C(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 2;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 4) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 4) / 8), static_cast<uint64_t>(((s2) * 4) / 8)};
+  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_7_A(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  if (!(((d1 % 128)) == (0))) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
+  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_7_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
+  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
+  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
+  if (s3 <= 0) return false;
+  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
+  if (s4 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
+  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_7_C(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 2;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 4) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 4) / 8), static_cast<uint64_t>(((s2) * 4) / 8)};
+  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_8_A(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  if (!(((d1 % 128)) == (0))) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
+  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_8_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
+  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
+  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
+  if (s3 <= 0) return false;
+  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
+  if (s4 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
+  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_8_C(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 2;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 4) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 4) / 8), static_cast<uint64_t>(((s2) * 4) / 8)};
+  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_9_A(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
   uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
   if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
@@ -559,7 +745,7 @@ inline bool EncodeTensorMap_6_A(CUtensorMap* out, const TensorLayout& tensor) {
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_6_B(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_9_B(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
@@ -576,7 +762,7 @@ inline bool EncodeTensorMap_6_B(CUtensorMap* out, const TensorLayout& tensor) {
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_6_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_9_SFA(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
@@ -600,7 +786,7 @@ inline bool EncodeTensorMap_6_SFA(CUtensorMap* out, const TensorLayout& tensor) 
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_6_SFB(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_9_SFB(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
@@ -617,7 +803,7 @@ inline bool EncodeTensorMap_6_SFB(CUtensorMap* out, const TensorLayout& tensor) 
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_6_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_9_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
@@ -652,7 +838,7 @@ struct KernelArgs_0 {
 };
 inline cudaError_t SubmitKernel_0(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_0*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_628747918c06460aa95f,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_e7c996a7418120fdc59d,
       args.route_experts,
       args.route_map,
       args.tile_expert,
@@ -724,7 +910,7 @@ struct KernelArgs_1 {
 };
 inline cudaError_t SubmitKernel_1(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_1*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_fc388c0e466eb56dcf98,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_de1fffa0c9722d6f3dc2,
       args.A,
       args.B,
       args.SFA,
@@ -762,9 +948,9 @@ inline bool PrepareKernel_1(const warp_decode::Invocation& inv,
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -808,7 +994,7 @@ struct KernelArgs_2 {
 };
 inline cudaError_t SubmitKernel_2(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_2*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_210a30d27bfc4c15c1bc,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_b8935d27ab092becf9a0,
       args.A,
       args.B,
       args.SFA,
@@ -850,9 +1036,9 @@ inline bool PrepareKernel_2(const warp_decode::Invocation& inv,
   args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -881,8 +1067,6 @@ struct KernelArgs_3 {
   int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
-  int* num_non_exiting_ctas;
-  int* work_counter;
   float* scale_c;
   float* scale_gate;
   float* clamp_limit;
@@ -896,7 +1080,7 @@ struct KernelArgs_3 {
 };
 inline cudaError_t SubmitKernel_3(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_3*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_a8d7177e7a4139aa180d,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_e570c9bd028c91db2255,
       args.A,
       args.B,
       args.SFA,
@@ -906,8 +1090,6 @@ inline cudaError_t SubmitKernel_3(const cudaLaunchConfig_t* config, const void* 
       args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
-      args.num_non_exiting_ctas,
-      args.work_counter,
       args.scale_c,
       args.scale_gate,
       args.clamp_limit,
@@ -934,13 +1116,11 @@ inline bool PrepareKernel_3(const warp_decode::Invocation& inv,
   args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
-  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
-  args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -969,6 +1149,8 @@ struct KernelArgs_4 {
   int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
   float* scale_c;
   float* scale_gate;
   float* clamp_limit;
@@ -982,7 +1164,7 @@ struct KernelArgs_4 {
 };
 inline cudaError_t SubmitKernel_4(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_4*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_c640747ebc0d0fd414fa,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_b9ce2c4ba5690e69450c,
       args.A,
       args.B,
       args.SFA,
@@ -992,6 +1174,8 @@ inline cudaError_t SubmitKernel_4(const cudaLaunchConfig_t* config, const void* 
       args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
+      args.num_non_exiting_ctas,
+      args.work_counter,
       args.scale_c,
       args.scale_gate,
       args.clamp_limit,
@@ -1018,11 +1202,13 @@ inline bool PrepareKernel_4(const warp_decode::Invocation& inv,
   args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -1066,7 +1252,7 @@ struct KernelArgs_5 {
 };
 inline cudaError_t SubmitKernel_5(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_5*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_bd3965d11ab70909b209,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_93e7dae962e4d046b7b0,
       args.A,
       args.B,
       args.SFA,
@@ -1108,9 +1294,9 @@ inline bool PrepareKernel_5(const warp_decode::Invocation& inv,
   args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -1131,6 +1317,261 @@ inline void VisitKernel_5(const KernelArgs_5& args, dim3 grid,
 }
 struct KernelArgs_6 {
   CUtensorMap A;
+  uint8_t* B;
+  CUtensorMap SFA;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
+  int* tile_expert;
+  int* tile_mn_limit;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+};
+inline cudaError_t SubmitKernel_6(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_6*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_2943d5a4f443be1b5408,
+      args.A,
+      args.B,
+      args.SFA,
+      args.SFB,
+      args.C,
+      args.SFC,
+      args.route_map,
+      args.tile_expert,
+      args.tile_mn_limit,
+      args.scale_c,
+      args.scale_gate,
+      args.clamp_limit,
+      args.act_alpha,
+      args.act_beta,
+      args.M_out,
+      args.K,
+      args.grid_m,
+      args.grid_n,
+      args.K_tiles);
+}
+inline bool PrepareKernel_6(const warp_decode::Invocation& inv,
+                         const warp_decode::Schedule& schedule,
+                         const WorkspaceView& ws, KernelArgs_6* prepared) {
+  if (prepared == nullptr) return false;
+  const auto& shape = inv.shape;
+  auto& args = *prepared;
+  if (!EncodeTensorMap_6_A(&args.A, DenseLayout(inv.gemm1_weights, {shape.num_experts, warp_decode::Gemm1WeightRows(shape, schedule), shape.hidden_size / 2}))) return false;
+  args.B = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q));
+  if (!EncodeTensorMap_6_SFA(&args.SFA, DenseLayout(inv.gemm1_weights_scale, {shape.num_experts * Fc1GridM(shape, schedule), shape.hidden_size / 64, 2, 256}))) return false;
+  args.SFB = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale));
+  if (!EncodeTensorMap_6_C(&args.C, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  args.SFC = reinterpret_cast<uint8_t*>(ws.intermediate_scale);
+  args.route_map = reinterpret_cast<int*>(ws.route_map);
+  args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
+  args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
+  args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
+  args.M_out = static_cast<int>(shape.intermediate_size);
+  args.K = static_cast<int>(shape.hidden_size);
+  args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
+  args.grid_n = static_cast<int>(ws.route_extent);
+  args.K_tiles = static_cast<int>(shape.hidden_size / 512);
+  return true;
+}
+inline void VisitKernel_6(const KernelArgs_6& args, dim3 grid,
+                         warp_decode::LaunchVisitor visitor, void* context) {
+  const auto& spec = kKernelSpecs[6];
+  warp_decode::KernelLaunch launch{
+      spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
+      dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
+      spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
+      NeedsNonPortableSmem(6), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_6, &args};
+  visitor(launch, context);
+}
+struct KernelArgs_7 {
+  CUtensorMap A;
+  uint8_t* B;
+  CUtensorMap SFA;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+};
+inline cudaError_t SubmitKernel_7(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_7*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_ac22f4a6ae1ebaae1276,
+      args.A,
+      args.B,
+      args.SFA,
+      args.SFB,
+      args.C,
+      args.SFC,
+      args.route_map,
+      args.tile_expert,
+      args.tile_mn_limit,
+      args.num_non_exiting_ctas,
+      args.work_counter,
+      args.scale_c,
+      args.scale_gate,
+      args.clamp_limit,
+      args.act_alpha,
+      args.act_beta,
+      args.M_out,
+      args.K,
+      args.grid_m,
+      args.grid_n,
+      args.K_tiles);
+}
+inline bool PrepareKernel_7(const warp_decode::Invocation& inv,
+                         const warp_decode::Schedule& schedule,
+                         const WorkspaceView& ws, KernelArgs_7* prepared) {
+  if (prepared == nullptr) return false;
+  const auto& shape = inv.shape;
+  auto& args = *prepared;
+  if (!EncodeTensorMap_7_A(&args.A, DenseLayout(inv.gemm1_weights, {shape.num_experts, warp_decode::Gemm1WeightRows(shape, schedule), shape.hidden_size / 2}))) return false;
+  args.B = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q));
+  if (!EncodeTensorMap_7_SFA(&args.SFA, DenseLayout(inv.gemm1_weights_scale, {shape.num_experts * Fc1GridM(shape, schedule), shape.hidden_size / 64, 2, 256}))) return false;
+  args.SFB = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale));
+  if (!EncodeTensorMap_7_C(&args.C, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  args.SFC = reinterpret_cast<uint8_t*>(ws.intermediate_scale);
+  args.route_map = reinterpret_cast<int*>(ws.route_map);
+  args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
+  args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
+  args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
+  args.M_out = static_cast<int>(shape.intermediate_size);
+  args.K = static_cast<int>(shape.hidden_size);
+  args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
+  args.grid_n = static_cast<int>(ws.route_extent);
+  args.K_tiles = static_cast<int>(shape.hidden_size / 512);
+  return true;
+}
+inline void VisitKernel_7(const KernelArgs_7& args, dim3 grid,
+                         warp_decode::LaunchVisitor visitor, void* context) {
+  const auto& spec = kKernelSpecs[7];
+  warp_decode::KernelLaunch launch{
+      spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
+      dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
+      spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
+      NeedsNonPortableSmem(7), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_7, &args};
+  visitor(launch, context);
+}
+struct KernelArgs_8 {
+  CUtensorMap A;
+  uint8_t* B;
+  CUtensorMap SFA;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
+  int* tile_expert;
+  int* tile_mn_limit;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+  int* total_tiles;
+};
+inline cudaError_t SubmitKernel_8(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_8*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_bbea84bc0aa6f631c01e,
+      args.A,
+      args.B,
+      args.SFA,
+      args.SFB,
+      args.C,
+      args.SFC,
+      args.route_map,
+      args.tile_expert,
+      args.tile_mn_limit,
+      args.scale_c,
+      args.scale_gate,
+      args.clamp_limit,
+      args.act_alpha,
+      args.act_beta,
+      args.M_out,
+      args.K,
+      args.grid_m,
+      args.grid_n,
+      args.K_tiles,
+      args.total_tiles);
+}
+inline bool PrepareKernel_8(const warp_decode::Invocation& inv,
+                         const warp_decode::Schedule& schedule,
+                         const WorkspaceView& ws, KernelArgs_8* prepared) {
+  if (prepared == nullptr) return false;
+  const auto& shape = inv.shape;
+  auto& args = *prepared;
+  if (!EncodeTensorMap_8_A(&args.A, DenseLayout(inv.gemm1_weights, {shape.num_experts, warp_decode::Gemm1WeightRows(shape, schedule), shape.hidden_size / 2}))) return false;
+  args.B = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q));
+  if (!EncodeTensorMap_8_SFA(&args.SFA, DenseLayout(inv.gemm1_weights_scale, {shape.num_experts * Fc1GridM(shape, schedule), shape.hidden_size / 64, 2, 256}))) return false;
+  args.SFB = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale));
+  if (!EncodeTensorMap_8_C(&args.C, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  args.SFC = reinterpret_cast<uint8_t*>(ws.intermediate_scale);
+  args.route_map = reinterpret_cast<int*>(ws.route_map);
+  args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
+  args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
+  args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
+  args.M_out = static_cast<int>(shape.intermediate_size);
+  args.K = static_cast<int>(shape.hidden_size);
+  args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
+  args.grid_n = static_cast<int>(ws.route_extent);
+  args.K_tiles = static_cast<int>(shape.hidden_size / 512);
+  args.total_tiles = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  return true;
+}
+inline void VisitKernel_8(const KernelArgs_8& args, dim3 grid,
+                         warp_decode::LaunchVisitor visitor, void* context) {
+  const auto& spec = kKernelSpecs[8];
+  warp_decode::KernelLaunch launch{
+      spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
+      dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
+      spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
+      NeedsNonPortableSmem(8), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_8, &args};
+  visitor(launch, context);
+}
+struct KernelArgs_9 {
+  CUtensorMap A;
   CUtensorMap B;
   CUtensorMap SFA;
   CUtensorMap SFB;
@@ -1147,9 +1588,9 @@ struct KernelArgs_6 {
   int grid_n;
   int K_tiles;
 };
-inline cudaError_t SubmitKernel_6(const cudaLaunchConfig_t* config, const void* opaque) {
-  const auto& args = *static_cast<const KernelArgs_6*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_a724c10c88752655df86,
+inline cudaError_t SubmitKernel_9(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_9*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_571467f2fe1a078edd15,
       args.A,
       args.B,
       args.SFA,
@@ -1167,17 +1608,17 @@ inline cudaError_t SubmitKernel_6(const cudaLaunchConfig_t* config, const void* 
       args.grid_n,
       args.K_tiles);
 }
-inline bool PrepareKernel_6(const warp_decode::Invocation& inv,
+inline bool PrepareKernel_9(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
-                         const WorkspaceView& ws, KernelArgs_6* prepared) {
+                         const WorkspaceView& ws, KernelArgs_9* prepared) {
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  if (!EncodeTensorMap_6_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_6_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_6_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
-  if (!EncodeTensorMap_6_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
-  if (!EncodeTensorMap_6_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
+  if (!EncodeTensorMap_9_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_9_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_9_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
+  if (!EncodeTensorMap_9_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
+  if (!EncodeTensorMap_9_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
   args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
@@ -1191,18 +1632,18 @@ inline bool PrepareKernel_6(const warp_decode::Invocation& inv,
   args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 256));
   return true;
 }
-inline void VisitKernel_6(const KernelArgs_6& args, dim3 grid,
+inline void VisitKernel_9(const KernelArgs_9& args, dim3 grid,
                          warp_decode::LaunchVisitor visitor, void* context) {
-  const auto& spec = kKernelSpecs[6];
+  const auto& spec = kKernelSpecs[9];
   warp_decode::KernelLaunch launch{
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(6), spec.cooperative, spec.spread_cluster,
-      &SubmitKernel_6, &args};
+      NeedsNonPortableSmem(9), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_9, &args};
   visitor(launch, context);
 }
-struct KernelArgs_7 {
+struct KernelArgs_10 {
   __nv_bfloat16* route_outputs;
   __nv_bfloat16* route_weights;
   int* route_slots;
@@ -1212,9 +1653,9 @@ struct KernelArgs_7 {
   int route_stride;
   int M;
 };
-inline cudaError_t SubmitKernel_7(const cudaLaunchConfig_t* config, const void* opaque) {
-  const auto& args = *static_cast<const KernelArgs_7*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_699adb7859afe956aac3,
+inline cudaError_t SubmitKernel_10(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_10*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_670effeafbee07071ec6,
       args.route_outputs,
       args.route_weights,
       args.route_slots,
@@ -1224,9 +1665,9 @@ inline cudaError_t SubmitKernel_7(const cudaLaunchConfig_t* config, const void* 
       args.route_stride,
       args.M);
 }
-inline bool PrepareKernel_7(const warp_decode::Invocation& inv,
+inline bool PrepareKernel_10(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
-                         const WorkspaceView& ws, KernelArgs_7* prepared) {
+                         const WorkspaceView& ws, KernelArgs_10* prepared) {
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
@@ -1240,18 +1681,18 @@ inline bool PrepareKernel_7(const warp_decode::Invocation& inv,
   args.M = static_cast<int>(shape.hidden_size);
   return true;
 }
-inline void VisitKernel_7(const KernelArgs_7& args, dim3 grid,
+inline void VisitKernel_10(const KernelArgs_10& args, dim3 grid,
                          warp_decode::LaunchVisitor visitor, void* context) {
-  const auto& spec = kKernelSpecs[7];
+  const auto& spec = kKernelSpecs[10];
   warp_decode::KernelLaunch launch{
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(7), spec.cooperative, spec.spread_cluster,
-      &SubmitKernel_7, &args};
+      NeedsNonPortableSmem(10), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_10, &args};
   visitor(launch, context);
 }
-struct KernelArgs_8 {
+struct KernelArgs_11 {
   __nv_bfloat16* route_outputs;
   __nv_bfloat16* route_weights;
   int* route_slots;
@@ -1261,9 +1702,9 @@ struct KernelArgs_8 {
   int route_stride;
   int M;
 };
-inline cudaError_t SubmitKernel_8(const cudaLaunchConfig_t* config, const void* opaque) {
-  const auto& args = *static_cast<const KernelArgs_8*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_62c6559a32973c5f111b,
+inline cudaError_t SubmitKernel_11(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_11*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_9021eadecd3078bf13c5,
       args.route_outputs,
       args.route_weights,
       args.route_slots,
@@ -1273,9 +1714,9 @@ inline cudaError_t SubmitKernel_8(const cudaLaunchConfig_t* config, const void* 
       args.route_stride,
       args.M);
 }
-inline bool PrepareKernel_8(const warp_decode::Invocation& inv,
+inline bool PrepareKernel_11(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
-                         const WorkspaceView& ws, KernelArgs_8* prepared) {
+                         const WorkspaceView& ws, KernelArgs_11* prepared) {
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
@@ -1289,18 +1730,18 @@ inline bool PrepareKernel_8(const warp_decode::Invocation& inv,
   args.M = static_cast<int>(shape.hidden_size);
   return true;
 }
-inline void VisitKernel_8(const KernelArgs_8& args, dim3 grid,
+inline void VisitKernel_11(const KernelArgs_11& args, dim3 grid,
                          warp_decode::LaunchVisitor visitor, void* context) {
-  const auto& spec = kKernelSpecs[8];
+  const auto& spec = kKernelSpecs[11];
   warp_decode::KernelLaunch launch{
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(8), spec.cooperative, spec.spread_cluster,
-      &SubmitKernel_8, &args};
+      NeedsNonPortableSmem(11), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_11, &args};
   visitor(launch, context);
 }
-struct KernelArgs_9 {
+struct KernelArgs_12 {
   __nv_bfloat16* route_outputs;
   __nv_bfloat16* route_weights;
   int* route_slots;
@@ -1310,9 +1751,9 @@ struct KernelArgs_9 {
   int route_stride;
   int M;
 };
-inline cudaError_t SubmitKernel_9(const cudaLaunchConfig_t* config, const void* opaque) {
-  const auto& args = *static_cast<const KernelArgs_9*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_d642cb17eada2ff8629b,
+inline cudaError_t SubmitKernel_12(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_12*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_8851303d75b4e1cec033,
       args.route_outputs,
       args.route_weights,
       args.route_slots,
@@ -1322,9 +1763,9 @@ inline cudaError_t SubmitKernel_9(const cudaLaunchConfig_t* config, const void* 
       args.route_stride,
       args.M);
 }
-inline bool PrepareKernel_9(const warp_decode::Invocation& inv,
+inline bool PrepareKernel_12(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
-                         const WorkspaceView& ws, KernelArgs_9* prepared) {
+                         const WorkspaceView& ws, KernelArgs_12* prepared) {
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
@@ -1338,15 +1779,15 @@ inline bool PrepareKernel_9(const warp_decode::Invocation& inv,
   args.M = static_cast<int>(shape.hidden_size);
   return true;
 }
-inline void VisitKernel_9(const KernelArgs_9& args, dim3 grid,
+inline void VisitKernel_12(const KernelArgs_12& args, dim3 grid,
                          warp_decode::LaunchVisitor visitor, void* context) {
-  const auto& spec = kKernelSpecs[9];
+  const auto& spec = kKernelSpecs[12];
   warp_decode::KernelLaunch launch{
       spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
       dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
-      NeedsNonPortableSmem(9), spec.cooperative, spec.spread_cluster,
-      &SubmitKernel_9, &args};
+      NeedsNonPortableSmem(12), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_12, &args};
   visitor(launch, context);
 }
 }  // namespace detail
@@ -1426,19 +1867,22 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
   int optin_max = 0;
   error = cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlockOptin");
-  const void* functions[10] = {
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_628747918c06460aa95f),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_fc388c0e466eb56dcf98),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_210a30d27bfc4c15c1bc),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_a8d7177e7a4139aa180d),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_c640747ebc0d0fd414fa),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_bd3965d11ab70909b209),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_a724c10c88752655df86),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_699adb7859afe956aac3),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_62c6559a32973c5f111b),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_d642cb17eada2ff8629b)
+  const void* functions[13] = {
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_e7c996a7418120fdc59d),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_de1fffa0c9722d6f3dc2),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_b8935d27ab092becf9a0),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_e570c9bd028c91db2255),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_b9ce2c4ba5690e69450c),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_93e7dae962e4d046b7b0),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_2943d5a4f443be1b5408),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_ac22f4a6ae1ebaae1276),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_bbea84bc0aa6f631c01e),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_571467f2fe1a078edd15),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_670effeafbee07071ec6),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_9021eadecd3078bf13c5),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_8851303d75b4e1cec033)
   };
-  for (int kernel = 0; kernel < 10; ++kernel) {
+  for (int kernel = 0; kernel < 13; ++kernel) {
     const size_t requested = kKernelSpecs[kernel].dynamic_smem_bytes;
     if (requested > static_cast<size_t>(optin_max))
       return detail::Invalid("EnsureDeviceReady shared memory exceeds opt-in ceiling");
@@ -1475,6 +1919,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   detail::KernelArgs_7 args7{};
   detail::KernelArgs_8 args8{};
   detail::KernelArgs_9 args9{};
+  detail::KernelArgs_10 args10{};
+  detail::KernelArgs_11 args11{};
+  detail::KernelArgs_12 args12{};
   auto prepare = [&](int kernel) {
     bool ok = false;
     switch (kernel) {
@@ -1488,6 +1935,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
     case 7: ok = detail::PrepareKernel_7(inv, schedule, ws, &args7); break;
     case 8: ok = detail::PrepareKernel_8(inv, schedule, ws, &args8); break;
     case 9: ok = detail::PrepareKernel_9(inv, schedule, ws, &args9); break;
+    case 10: ok = detail::PrepareKernel_10(inv, schedule, ws, &args10); break;
+    case 11: ok = detail::PrepareKernel_11(inv, schedule, ws, &args11); break;
+    case 12: ok = detail::PrepareKernel_12(inv, schedule, ws, &args12); break;
       default: break;
     }
     return ok;
@@ -1504,6 +1954,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
     case 7: detail::VisitKernel_7(args7, grid, visitor, context); break;
     case 8: detail::VisitKernel_8(args8, grid, visitor, context); break;
     case 9: detail::VisitKernel_9(args9, grid, visitor, context); break;
+    case 10: detail::VisitKernel_10(args10, grid, visitor, context); break;
+    case 11: detail::VisitKernel_11(args11, grid, visitor, context); break;
+    case 12: detail::VisitKernel_12(args12, grid, visitor, context); break;
       default: break;
     }
   };
@@ -1516,22 +1969,25 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
     if (!prepare(route_kernel)) return;
   }
   const bool silu = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiLU;
-  const int fc1_kernel = silu
-      ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 4 : 5)
+  const bool situ = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiTU;
+  const bool swiglu_oa = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSwiGLUParameterized;
+  const int fc1_kernel = situ ? 8 : silu
+      ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 6 : 7)
+      : swiglu_oa ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 3 : 4)
       : schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 1
-      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 3
+      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 5
       : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentPaddedScaleDeviceWorkfeed ? -1
       : 2;
   if (!prepare(fc1_kernel)) return;
   const int fc2_kernel = schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256
-      ? 6
+      ? 9
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512DeviceWorkfeed ? -1
       : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK768K96PaddedScale ? -1
       : -1;
   if (!prepare(fc2_kernel)) return;
   const int finalize_kernel = schedule.finalize_threads == 32
-      ? (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 7 : -1)
-      : (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 8 : 9);
+      ? (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 10 : -1)
+      : (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 11 : 12);
   if (!prepare(finalize_kernel)) return;
 
   if (route_kernel >= 0) visit(route_kernel, dim3(1, 1, 1));
@@ -1544,39 +2000,45 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
 #else
 extern "C" {
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_2f41e4ff99e834495fa7(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+kernel_cake_warp_decode_ee7526ffca9f2aa5aa46(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_564663b76745284e7a8d(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+kernel_cake_warp_decode_3b1c1adc59f3837a48a4(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(256) void
-kernel_cake_warp_decode_ab98d92be1746a4d098d(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
+kernel_cake_warp_decode_b47db4977f3026b27967(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_17caac4e9e3f4d24961b(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_a13d42e0deb96a0425d6(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_a310449091fa15daa2b0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_6d96f9ab40505e53392c(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_bb184b973d16d83bf044(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_984714a81b269a80840f(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_c685ed484e923bbf4945(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_3c56299743453bd348c8(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_05eeb4fae0e0bb547df0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_e52aff25ce5bcb1715e1(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_2b1cc06cd9069d7c882a(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_559fe3e0504c60b0a333(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_450a8e8be186fbc052cc(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_a55637f8e353e95081d0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_fe81c33d7c5f9b9751ed(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_4fda1bae9546ebf2f6ba(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_3120d1260c420d0d0a11(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_c085b285b57d4abcce4d(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ total_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_warp_decode_659627650e61d48e0223(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_warp_decode_b9a1d88b8a94f4f37426(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+__global__ __launch_bounds__(512, 1) void
+kernel_cake_warp_decode_3f5bc27d007af5687d63(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_warp_decode_36fc9a61f8b57722891f(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
+kernel_cake_warp_decode_7fc08d4a160ade893bda(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
 __global__ __launch_bounds__(32, 1) void
-kernel_cake_warp_decode_344b2efabee6538b991d(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_203bed24646ce93a33a3(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 __global__ __launch_bounds__(32, 1) void
-kernel_cake_warp_decode_59d63f5b1bec86a086cb(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_e2796e299356440aa3e4(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 __global__ __launch_bounds__(128, 1) void
-kernel_cake_warp_decode_719081f5ef4da6c57e95(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_c7113a73c61cc97c1593(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 __global__ __launch_bounds__(128, 1) void
-kernel_cake_warp_decode_432ccf353bf44819bac3(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
+kernel_cake_warp_decode_556f9752297212b1bcdc(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M);
 }
 
 namespace flashinfer::warp_decode::generated {
@@ -1587,7 +2049,7 @@ inline constexpr int32_t kMaximumLaunchCount = 4;
 inline constexpr size_t kWorkspaceAlignment = 256;
 inline constexpr size_t kDefaultDynamicSharedMemoryBytes = 48u * 1024u;
 inline constexpr size_t kMaximumAuthoredDynamicSharedMemoryBytes = 199040u;
-inline constexpr char kGeneratedSourceSha256[] = "0a855988a18242b6d76c86ee74b52f3803b1896ed26d77e8ce91c16524648469";
+inline constexpr char kGeneratedSourceSha256[] = "72c464f18b92af698001c62dcd595eedec3a3605b99a40978ea9811650705b6a";
 
 struct UInt3 { uint32_t x, y, z; };
 struct KernelSpec {
@@ -1603,25 +2065,28 @@ struct KernelSpec {
   const char* grid[3];
 };
 inline constexpr KernelSpec kKernelSpecs[] = {
-  {"kernel_cake_warp_decode_2f41e4ff99e834495fa7", "route_pack_generic", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_564663b76745284e7a8d", "route_pack_e64_scan1", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_ab98d92be1746a4d098d", "route_pack_e64_scan2", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true, "none", {"1", "1", "1"}},
-  {"kernel_cake_warp_decode_17caac4e9e3f4d24961b", "fc1_swiglu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_a310449091fa15daa2b0", "fc1_swiglu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_bb184b973d16d83bf044", "fc1_swiglu_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_c685ed484e923bbf4945", "fc1_swiglu_padded_sfc_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_05eeb4fae0e0bb547df0", "fc1_silu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_2b1cc06cd9069d7c882a", "fc1_silu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_450a8e8be186fbc052cc", "fc2_sm103_refined_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_fe81c33d7c5f9b9751ed", "fc2_sm103_k512_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_3120d1260c420d0d0a11", "fc2_sm103_k768_k96", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_36fc9a61f8b57722891f", "fc2_sm103_k768_k96_padded_sfb_cp", {384, 1, 1}, {1, 1, 1}, 196736u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
-  {"kernel_cake_warp_decode_344b2efabee6538b991d", "finalize_direct_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_59d63f5b1bec86a086cb", "finalize_packed_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_719081f5ef4da6c57e95", "finalize_direct_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
-  {"kernel_cake_warp_decode_432ccf353bf44819bac3", "finalize_packed_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_ee7526ffca9f2aa5aa46", "route_pack_generic", {256, 1, 1}, {1, 1, 1}, 6272u, false, false, true, "none", {"1", "1", "1"}},
+  {"kernel_cake_warp_decode_3b1c1adc59f3837a48a4", "route_pack_e64_scan1", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true, "none", {"1", "1", "1"}},
+  {"kernel_cake_warp_decode_b47db4977f3026b27967", "route_pack_e64_scan2", {256, 1, 1}, {1, 1, 1}, 896u, false, false, true, "none", {"1", "1", "1"}},
+  {"kernel_cake_warp_decode_a13d42e0deb96a0425d6", "fc1_swiglu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_6d96f9ab40505e53392c", "fc1_swiglu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_984714a81b269a80840f", "fc1_swiglu_oa_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_3c56299743453bd348c8", "fc1_swiglu_oa_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_e52aff25ce5bcb1715e1", "fc1_swiglu_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_559fe3e0504c60b0a333", "fc1_swiglu_padded_sfc_device_workfeed", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_a55637f8e353e95081d0", "fc1_silu_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_4fda1bae9546ebf2f6ba", "fc1_silu_persistent", {512, 1, 1}, {1, 1, 1}, 199040u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_c085b285b57d4abcce4d", "fc1_situ_static", {512, 1, 1}, {1, 1, 1}, 198912u, false, false, true, "grid_constant", {"Gemm1WeightRows / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_659627650e61d48e0223", "fc2_sm103_refined_k256", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_b9a1d88b8a94f4f37426", "fc2_sm103_k512_device_workfeed", {512, 1, 1}, {1, 1, 1}, 159872u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_3f5bc27d007af5687d63", "fc2_sm103_k768_k96", {512, 1, 1}, {1, 1, 1}, 179456u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_7fc08d4a160ade893bda", "fc2_sm103_k768_k96_padded_sfb_cp", {384, 1, 1}, {1, 1, 1}, 196736u, false, false, true, "grid_constant", {"hidden_size / 128", "route extent or workfeed", "1"}},
+  {"kernel_cake_warp_decode_203bed24646ce93a33a3", "finalize_direct_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_e2796e299356440aa3e4", "finalize_packed_t32", {32, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 32)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_c7113a73c61cc97c1593", "finalize_direct_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
+  {"kernel_cake_warp_decode_556f9752297212b1bcdc", "finalize_packed_t128", {128, 1, 1}, {1, 1, 1}, 0u, false, false, true, "none", {"ceil_div(hidden_size, 128)", "num_tokens", "1"}},
 };
-static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 17);
+static_assert(sizeof(kKernelSpecs) / sizeof(kKernelSpecs[0]) == 20);
 
 namespace detail {
 
@@ -2133,31 +2598,15 @@ inline bool EncodeTensorMap_9_A(CUtensorMap* out, const TensorLayout& tensor) {
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
   if (!(d1 > 0 && d2 > 0)) return false;
   const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
-  uint32_t box_dim[3] = {256u, 128u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
+  if (!(((d1 % 128)) == (0))) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
+  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_9_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(8u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
-  uint32_t box_dim[3] = {256u, 8u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
@@ -2176,47 +2625,30 @@ inline bool EncodeTensorMap_9_SFA(CUtensorMap* out, const TensorLayout& tensor) 
   if (s4 <= 0) return false;
   uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
   uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_9_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>((((d1 * d2)) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 4u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_9_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_9_C(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 2;
   if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  uint64_t global_dim[4] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
   if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 4) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 4) / 8), static_cast<uint64_t>(((s2) * 4) / 8)};
   uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline bool EncodeTensorMap_10_A(CUtensorMap* out, const TensorLayout& tensor) {
@@ -2225,31 +2657,15 @@ inline bool EncodeTensorMap_10_A(CUtensorMap* out, const TensorLayout& tensor) {
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
   if (!(d1 > 0 && d2 > 0)) return false;
   const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
-  uint32_t box_dim[3] = {256u, 128u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
+  if (!(((d1 % 128)) == (0))) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
+  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_10_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(8u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
-  uint32_t box_dim[3] = {256u, 8u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
@@ -2268,7 +2684,7 @@ inline bool EncodeTensorMap_10_SFA(CUtensorMap* out, const TensorLayout& tensor)
   if (s4 <= 0) return false;
   uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
   uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
   uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
@@ -2277,38 +2693,21 @@ inline bool EncodeTensorMap_10_SFA(CUtensorMap* out, const TensorLayout& tensor)
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_10_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>((((d1 * d2)) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 8u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_10_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_10_C(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 2;
   if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  uint64_t global_dim[4] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
   if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 4) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 4) / 8), static_cast<uint64_t>(((s2) * 4) / 8)};
   uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline bool EncodeTensorMap_11_A(CUtensorMap* out, const TensorLayout& tensor) {
@@ -2317,31 +2716,15 @@ inline bool EncodeTensorMap_11_A(CUtensorMap* out, const TensorLayout& tensor) {
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
   if (!(d1 > 0 && d2 > 0)) return false;
   const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
-  uint32_t box_dim[3] = {256u, 128u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
+  if (!(((d1 % 128)) == (0))) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(128), static_cast<uint64_t>(d2), static_cast<uint64_t>((d1 / 128)), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>(((128) * 8) / 8), static_cast<uint64_t>((((d2 * d1)) * 8) / 8)};
+  uint32_t box_dim[4] = {128u, 128u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_11_B(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(8u <= global_dim[1] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
-  uint32_t box_dim[3] = {256u, 8u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
@@ -2360,47 +2743,30 @@ inline bool EncodeTensorMap_11_SFA(CUtensorMap* out, const TensorLayout& tensor)
   if (s4 <= 0) return false;
   uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
-  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 8u <= global_dim[2] && 1u <= global_dim[3])) return false;
   uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_11_SFB(CUtensorMap* out, const TensorLayout& tensor) {
-  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
-  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
-  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
-  if (!(d1 > 0 && d2 > 0)) return false;
-  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
-  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
-  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
-  if (!(32u <= global_dim[0] && 1u <= global_dim[2])) return false;
-  uint64_t global_strides[2] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>((((d1 * d2)) * 8) / 8)};
-  uint32_t box_dim[3] = {32u, 12u, 1u};
-  uint32_t element_stride[3] = {1u, 1u, 1u};
-  const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return result == CUDA_SUCCESS;
-}
-inline bool EncodeTensorMap_11_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_11_C(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
-  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 2;
   if (s2 <= 0) return false;
-  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  uint64_t global_dim[4] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
   if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
-  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 4) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 4) / 8), static_cast<uint64_t>(((s2) * 4) / 8)};
   uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
-      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
-      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_32B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
 inline bool EncodeTensorMap_12_A(CUtensorMap* out, const TensorLayout& tensor) {
@@ -2454,7 +2820,7 @@ inline bool EncodeTensorMap_12_SFA(CUtensorMap* out, const TensorLayout& tensor)
   if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
   if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
   uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
-  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
+  uint32_t box_dim[4] = {256u, 2u, 4u, 1u};
   uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
   const CUresult result = cuTensorMapEncodeTiled(
       out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
@@ -2462,6 +2828,282 @@ inline bool EncodeTensorMap_12_SFA(CUtensorMap* out, const TensorLayout& tensor)
   return result == CUDA_SUCCESS;
 }
 inline bool EncodeTensorMap_12_SFB(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(32u <= global_dim[0] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>((((d1 * d2)) * 8) / 8)};
+  uint32_t box_dim[3] = {32u, 4u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_12_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_13_A(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
+  uint32_t box_dim[3] = {256u, 128u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_13_B(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(8u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
+  uint32_t box_dim[3] = {256u, 8u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_13_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
+  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
+  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
+  if (s3 <= 0) return false;
+  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
+  if (s4 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
+  uint32_t box_dim[4] = {256u, 2u, 8u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_13_SFB(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(32u <= global_dim[0] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>((((d1 * d2)) * 8) / 8)};
+  uint32_t box_dim[3] = {32u, 8u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_13_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_14_A(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
+  uint32_t box_dim[3] = {256u, 128u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_14_B(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(8u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
+  uint32_t box_dim[3] = {256u, 8u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_14_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
+  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
+  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
+  if (s3 <= 0) return false;
+  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
+  if (s4 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
+  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_14_SFB(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(32u <= global_dim[0] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>(((d1) * 8) / 8), static_cast<uint64_t>((((d1 * d2)) * 8) / 8)};
+  uint32_t box_dim[3] = {32u, 12u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_14_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  if (!(d1 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(8), static_cast<uint64_t>(2147483648), static_cast<uint64_t>(2147483648)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(64u <= global_dim[0] && 8u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 16) / 8), static_cast<uint64_t>((((34359738368 - s2)) * 16) / 8), static_cast<uint64_t>(((s2) * 16) / 8)};
+  uint32_t box_dim[4] = {64u, 8u, 1u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_15_A(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(128u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
+  uint32_t box_dim[3] = {256u, 128u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_15_B(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  if (!(d1 > 0 && d2 > 0)) return false;
+  const int64_t outer2 = static_cast<int64_t>(tensor.elements) / (d1 * d2);
+  uint64_t global_dim[3] = {static_cast<uint64_t>((2 * d1)), static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0)) return false;
+  if (!(8u <= global_dim[1] && 1u <= global_dim[2])) return false;
+  uint64_t global_strides[2] = {static_cast<uint64_t>((((2 * d1)) * 4) / 8), static_cast<uint64_t>((((d2 * (2 * d1))) * 4) / 8)};
+  uint32_t box_dim[3] = {256u, 8u, 1u};
+  uint32_t element_stride[3] = {1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B, 3, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_15_SFA(CUtensorMap* out, const TensorLayout& tensor) {
+  if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
+  const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
+  const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
+  const int64_t d3 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 3]);
+  const int64_t d4 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 4]);
+  if (!(d1 > 0 && d2 > 0 && d3 > 0 && d4 > 0)) return false;
+  const int64_t s2 = static_cast<int64_t>(tensor.strides[tensor.rank - 2]) * 1;
+  if (s2 <= 0) return false;
+  const int64_t s3 = static_cast<int64_t>(tensor.strides[tensor.rank - 3]) * 1;
+  if (s3 <= 0) return false;
+  const int64_t s4 = static_cast<int64_t>(tensor.strides[tensor.rank - 4]) * 1;
+  if (s4 <= 0) return false;
+  uint64_t global_dim[4] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2), static_cast<uint64_t>(d3), static_cast<uint64_t>(d4)};
+  if (!(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0)) return false;
+  if (!(256u <= global_dim[0] && 2u <= global_dim[1] && 1u <= global_dim[3])) return false;
+  uint64_t global_strides[3] = {static_cast<uint64_t>(((s2) * 8) / 8), static_cast<uint64_t>(((s3) * 8) / 8), static_cast<uint64_t>(((s4) * 8) / 8)};
+  uint32_t box_dim[4] = {256u, 2u, 12u, 1u};
+  uint32_t element_stride[4] = {1u, 1u, 1u, 1u};
+  const CUresult result = cuTensorMapEncodeTiled(
+      out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 4, const_cast<void*>(tensor.data), global_dim, global_strides,
+      box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS;
+}
+inline bool EncodeTensorMap_15_SFB(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 4) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   const int64_t d2 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 2]);
@@ -2485,7 +3127,7 @@ inline bool EncodeTensorMap_12_SFB(CUtensorMap* out, const TensorLayout& tensor)
       box_dim, element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return result == CUDA_SUCCESS;
 }
-inline bool EncodeTensorMap_12_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
+inline bool EncodeTensorMap_15_C_tma(CUtensorMap* out, const TensorLayout& tensor) {
   if (out == nullptr || tensor.data == nullptr || tensor.rank < 2) return false;
   const int64_t d1 = static_cast<int64_t>(tensor.dimensions[tensor.rank - 1]);
   if (!(d1 > 0)) return false;
@@ -2520,7 +3162,7 @@ struct KernelArgs_0 {
 };
 inline cudaError_t SubmitKernel_0(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_0*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_2f41e4ff99e834495fa7,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_ee7526ffca9f2aa5aa46,
       args.route_experts,
       args.route_map,
       args.tile_expert,
@@ -2587,7 +3229,7 @@ struct KernelArgs_1 {
 };
 inline cudaError_t SubmitKernel_1(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_1*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_564663b76745284e7a8d,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_3b1c1adc59f3837a48a4,
       args.route_experts,
       args.route_map,
       args.tile_expert,
@@ -2654,7 +3296,7 @@ struct KernelArgs_2 {
 };
 inline cudaError_t SubmitKernel_2(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_2*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_ab98d92be1746a4d098d,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_b47db4977f3026b27967,
       args.route_experts,
       args.route_map,
       args.tile_expert,
@@ -2726,7 +3368,7 @@ struct KernelArgs_3 {
 };
 inline cudaError_t SubmitKernel_3(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_3*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_17caac4e9e3f4d24961b,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_a13d42e0deb96a0425d6,
       args.A,
       args.B,
       args.SFA,
@@ -2764,9 +3406,9 @@ inline bool PrepareKernel_3(const warp_decode::Invocation& inv,
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -2810,7 +3452,7 @@ struct KernelArgs_4 {
 };
 inline cudaError_t SubmitKernel_4(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_4*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_a310449091fa15daa2b0,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_6d96f9ab40505e53392c,
       args.A,
       args.B,
       args.SFA,
@@ -2852,9 +3494,9 @@ inline bool PrepareKernel_4(const warp_decode::Invocation& inv,
   args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -2883,8 +3525,6 @@ struct KernelArgs_5 {
   int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
-  int* num_non_exiting_ctas;
-  int* work_counter;
   float* scale_c;
   float* scale_gate;
   float* clamp_limit;
@@ -2898,7 +3538,7 @@ struct KernelArgs_5 {
 };
 inline cudaError_t SubmitKernel_5(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_5*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_bb184b973d16d83bf044,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_984714a81b269a80840f,
       args.A,
       args.B,
       args.SFA,
@@ -2908,8 +3548,6 @@ inline cudaError_t SubmitKernel_5(const cudaLaunchConfig_t* config, const void* 
       args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
-      args.num_non_exiting_ctas,
-      args.work_counter,
       args.scale_c,
       args.scale_gate,
       args.clamp_limit,
@@ -2936,13 +3574,11 @@ inline bool PrepareKernel_5(const warp_decode::Invocation& inv,
   args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
-  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
-  args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -2986,7 +3622,7 @@ struct KernelArgs_6 {
 };
 inline cudaError_t SubmitKernel_6(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_6*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_c685ed484e923bbf4945,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_3c56299743453bd348c8,
       args.A,
       args.B,
       args.SFA,
@@ -3028,9 +3664,9 @@ inline bool PrepareKernel_6(const warp_decode::Invocation& inv,
   args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -3059,6 +3695,8 @@ struct KernelArgs_7 {
   int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
   float* scale_c;
   float* scale_gate;
   float* clamp_limit;
@@ -3072,7 +3710,7 @@ struct KernelArgs_7 {
 };
 inline cudaError_t SubmitKernel_7(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_7*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_05eeb4fae0e0bb547df0,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_e52aff25ce5bcb1715e1,
       args.A,
       args.B,
       args.SFA,
@@ -3082,6 +3720,8 @@ inline cudaError_t SubmitKernel_7(const cudaLaunchConfig_t* config, const void* 
       args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
+      args.num_non_exiting_ctas,
+      args.work_counter,
       args.scale_c,
       args.scale_gate,
       args.clamp_limit,
@@ -3108,11 +3748,13 @@ inline bool PrepareKernel_7(const warp_decode::Invocation& inv,
   args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -3156,7 +3798,7 @@ struct KernelArgs_8 {
 };
 inline cudaError_t SubmitKernel_8(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_8*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_2b1cc06cd9069d7c882a,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_559fe3e0504c60b0a333,
       args.A,
       args.B,
       args.SFA,
@@ -3198,9 +3840,9 @@ inline bool PrepareKernel_8(const warp_decode::Invocation& inv,
   args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
   args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
-  args.clamp_limit = reinterpret_cast<float*>(ws.clamp_limit);
-  args.act_alpha = reinterpret_cast<float*>(ws.act_alpha);
-  args.act_beta = reinterpret_cast<float*>(ws.act_beta);
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
   args.M_out = static_cast<int>(shape.intermediate_size);
   args.K = static_cast<int>(shape.hidden_size);
   args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
@@ -3221,17 +3863,20 @@ inline void VisitKernel_8(const KernelArgs_8& args, dim3 grid,
 }
 struct KernelArgs_9 {
   CUtensorMap A;
-  CUtensorMap B;
+  uint8_t* B;
   CUtensorMap SFA;
-  CUtensorMap SFB;
-  CUtensorMap C_tma;
-  __nv_bfloat16* C;
-  float* scale_c;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
-  int* num_non_exiting_ctas;
-  int* work_counter;
-  int M;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
   int K;
   int grid_m;
   int grid_n;
@@ -3239,19 +3884,22 @@ struct KernelArgs_9 {
 };
 inline cudaError_t SubmitKernel_9(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_9*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_450a8e8be186fbc052cc,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_a55637f8e353e95081d0,
       args.A,
       args.B,
       args.SFA,
       args.SFB,
-      args.C_tma,
       args.C,
-      args.scale_c,
+      args.SFC,
+      args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
-      args.num_non_exiting_ctas,
-      args.work_counter,
-      args.M,
+      args.scale_c,
+      args.scale_gate,
+      args.clamp_limit,
+      args.act_alpha,
+      args.act_beta,
+      args.M_out,
       args.K,
       args.grid_m,
       args.grid_n,
@@ -3263,22 +3911,25 @@ inline bool PrepareKernel_9(const warp_decode::Invocation& inv,
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  if (!EncodeTensorMap_9_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_9_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_9_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
-  if (!EncodeTensorMap_9_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
-  if (!EncodeTensorMap_9_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
-  args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
-  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  if (!EncodeTensorMap_9_A(&args.A, DenseLayout(inv.gemm1_weights, {shape.num_experts, warp_decode::Gemm1WeightRows(shape, schedule), shape.hidden_size / 2}))) return false;
+  args.B = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q));
+  if (!EncodeTensorMap_9_SFA(&args.SFA, DenseLayout(inv.gemm1_weights_scale, {shape.num_experts * Fc1GridM(shape, schedule), shape.hidden_size / 64, 2, 256}))) return false;
+  args.SFB = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale));
+  if (!EncodeTensorMap_9_C(&args.C, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  args.SFC = reinterpret_cast<uint8_t*>(ws.intermediate_scale);
+  args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
-  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
-  args.work_counter = reinterpret_cast<int*>(ws.fc2_work_counter);
-  args.M = static_cast<int>(shape.hidden_size);
-  args.K = static_cast<int>(shape.intermediate_size);
-  args.grid_m = static_cast<int>(Fc2GridM(shape));
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
+  args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
+  args.M_out = static_cast<int>(shape.intermediate_size);
+  args.K = static_cast<int>(shape.hidden_size);
+  args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
   args.grid_n = static_cast<int>(ws.route_extent);
-  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 256));
+  args.K_tiles = static_cast<int>(shape.hidden_size / 512);
   return true;
 }
 inline void VisitKernel_9(const KernelArgs_9& args, dim3 grid,
@@ -3294,17 +3945,22 @@ inline void VisitKernel_9(const KernelArgs_9& args, dim3 grid,
 }
 struct KernelArgs_10 {
   CUtensorMap A;
-  CUtensorMap B;
+  uint8_t* B;
   CUtensorMap SFA;
-  CUtensorMap SFB;
-  CUtensorMap C_tma;
-  __nv_bfloat16* C;
-  float* scale_c;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
   int* num_non_exiting_ctas;
   int* work_counter;
-  int M;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
   int K;
   int grid_m;
   int grid_n;
@@ -3312,19 +3968,24 @@ struct KernelArgs_10 {
 };
 inline cudaError_t SubmitKernel_10(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_10*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_fe81c33d7c5f9b9751ed,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_4fda1bae9546ebf2f6ba,
       args.A,
       args.B,
       args.SFA,
       args.SFB,
-      args.C_tma,
       args.C,
-      args.scale_c,
+      args.SFC,
+      args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
       args.num_non_exiting_ctas,
       args.work_counter,
-      args.M,
+      args.scale_c,
+      args.scale_gate,
+      args.clamp_limit,
+      args.act_alpha,
+      args.act_beta,
+      args.M_out,
       args.K,
       args.grid_m,
       args.grid_n,
@@ -3336,22 +3997,27 @@ inline bool PrepareKernel_10(const warp_decode::Invocation& inv,
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  if (!EncodeTensorMap_10_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_10_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_10_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
-  if (!EncodeTensorMap_10_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
-  if (!EncodeTensorMap_10_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
-  args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
-  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  if (!EncodeTensorMap_10_A(&args.A, DenseLayout(inv.gemm1_weights, {shape.num_experts, warp_decode::Gemm1WeightRows(shape, schedule), shape.hidden_size / 2}))) return false;
+  args.B = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q));
+  if (!EncodeTensorMap_10_SFA(&args.SFA, DenseLayout(inv.gemm1_weights_scale, {shape.num_experts * Fc1GridM(shape, schedule), shape.hidden_size / 64, 2, 256}))) return false;
+  args.SFB = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale));
+  if (!EncodeTensorMap_10_C(&args.C, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  args.SFC = reinterpret_cast<uint8_t*>(ws.intermediate_scale);
+  args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
   args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
-  args.work_counter = reinterpret_cast<int*>(ws.fc2_work_counter);
-  args.M = static_cast<int>(shape.hidden_size);
-  args.K = static_cast<int>(shape.intermediate_size);
-  args.grid_m = static_cast<int>(Fc2GridM(shape));
+  args.work_counter = reinterpret_cast<int*>(ws.fc1_work_counter);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
+  args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
+  args.M_out = static_cast<int>(shape.intermediate_size);
+  args.K = static_cast<int>(shape.hidden_size);
+  args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
   args.grid_n = static_cast<int>(ws.route_extent);
-  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 512));
+  args.K_tiles = static_cast<int>(shape.hidden_size / 512);
   return true;
 }
 inline void VisitKernel_10(const KernelArgs_10& args, dim3 grid,
@@ -3367,41 +4033,49 @@ inline void VisitKernel_10(const KernelArgs_10& args, dim3 grid,
 }
 struct KernelArgs_11 {
   CUtensorMap A;
-  CUtensorMap B;
+  uint8_t* B;
   CUtensorMap SFA;
-  CUtensorMap SFB;
-  CUtensorMap C_tma;
-  __nv_bfloat16* C;
-  float* scale_c;
+  uint8_t* SFB;
+  CUtensorMap C;
+  uint8_t* SFC;
+  int* route_map;
   int* tile_expert;
   int* tile_mn_limit;
-  int* num_non_exiting_ctas;
-  int* work_counter;
-  int M;
+  float* scale_c;
+  float* scale_gate;
+  float* clamp_limit;
+  float* act_alpha;
+  float* act_beta;
+  int M_out;
   int K;
   int grid_m;
   int grid_n;
   int K_tiles;
+  int* total_tiles;
 };
 inline cudaError_t SubmitKernel_11(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_11*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_3120d1260c420d0d0a11,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_c085b285b57d4abcce4d,
       args.A,
       args.B,
       args.SFA,
       args.SFB,
-      args.C_tma,
       args.C,
-      args.scale_c,
+      args.SFC,
+      args.route_map,
       args.tile_expert,
       args.tile_mn_limit,
-      args.num_non_exiting_ctas,
-      args.work_counter,
-      args.M,
+      args.scale_c,
+      args.scale_gate,
+      args.clamp_limit,
+      args.act_alpha,
+      args.act_beta,
+      args.M_out,
       args.K,
       args.grid_m,
       args.grid_n,
-      args.K_tiles);
+      args.K_tiles,
+      args.total_tiles);
 }
 inline bool PrepareKernel_11(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
@@ -3409,22 +4083,26 @@ inline bool PrepareKernel_11(const warp_decode::Invocation& inv,
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  if (!EncodeTensorMap_11_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_11_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
-  if (!EncodeTensorMap_11_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
-  if (!EncodeTensorMap_11_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
-  if (!EncodeTensorMap_11_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
-  args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
-  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  if (!EncodeTensorMap_11_A(&args.A, DenseLayout(inv.gemm1_weights, {shape.num_experts, warp_decode::Gemm1WeightRows(shape, schedule), shape.hidden_size / 2}))) return false;
+  args.B = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_q));
+  if (!EncodeTensorMap_11_SFA(&args.SFA, DenseLayout(inv.gemm1_weights_scale, {shape.num_experts * Fc1GridM(shape, schedule), shape.hidden_size / 64, 2, 256}))) return false;
+  args.SFB = reinterpret_cast<uint8_t*>(const_cast<void*>(inv.hidden_states_scale));
+  if (!EncodeTensorMap_11_C(&args.C, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  args.SFC = reinterpret_cast<uint8_t*>(ws.intermediate_scale);
+  args.route_map = reinterpret_cast<int*>(ws.route_map);
   args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
   args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
-  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
-  args.work_counter = reinterpret_cast<int*>(ws.fc2_work_counter);
-  args.M = static_cast<int>(shape.hidden_size);
-  args.K = static_cast<int>(shape.intermediate_size);
-  args.grid_m = static_cast<int>(Fc2GridM(shape));
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_scalar));
+  args.scale_gate = reinterpret_cast<float*>(const_cast<void*>(inv.output1_scale_gate_scalar));
+  args.clamp_limit = inv.gemm1_clamp_limit ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_clamp_limit)) : ws.clamp_limit;
+  args.act_alpha = inv.gemm1_alpha ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_alpha)) : ws.act_alpha;
+  args.act_beta = inv.gemm1_beta ? reinterpret_cast<float*>(const_cast<void*>(inv.gemm1_beta)) : ws.act_beta;
+  args.M_out = static_cast<int>(shape.intermediate_size);
+  args.K = static_cast<int>(shape.hidden_size);
+  args.grid_m = static_cast<int>(Fc1GridM(shape, schedule));
   args.grid_n = static_cast<int>(ws.route_extent);
-  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 768));
+  args.K_tiles = static_cast<int>(shape.hidden_size / 512);
+  args.total_tiles = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
   return true;
 }
 inline void VisitKernel_11(const KernelArgs_11& args, dim3 grid,
@@ -3458,7 +4136,7 @@ struct KernelArgs_12 {
 };
 inline cudaError_t SubmitKernel_12(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_12*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_36fc9a61f8b57722891f,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_659627650e61d48e0223,
       args.A,
       args.B,
       args.SFA,
@@ -3485,7 +4163,7 @@ inline bool PrepareKernel_12(const warp_decode::Invocation& inv,
   if (!EncodeTensorMap_12_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
   if (!EncodeTensorMap_12_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
   if (!EncodeTensorMap_12_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
-  if (!EncodeTensorMap_12_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 1, schedule.route_layout == warp_decode::RouteLayout::kGpuPacked ? 128 : 32}))) return false;
+  if (!EncodeTensorMap_12_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
   if (!EncodeTensorMap_12_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
   args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
   args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
@@ -3497,7 +4175,7 @@ inline bool PrepareKernel_12(const warp_decode::Invocation& inv,
   args.K = static_cast<int>(shape.intermediate_size);
   args.grid_m = static_cast<int>(Fc2GridM(shape));
   args.grid_n = static_cast<int>(ws.route_extent);
-  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 768));
+  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 256));
   return true;
 }
 inline void VisitKernel_12(const KernelArgs_12& args, dim3 grid,
@@ -3512,26 +4190,42 @@ inline void VisitKernel_12(const KernelArgs_12& args, dim3 grid,
   visitor(launch, context);
 }
 struct KernelArgs_13 {
-  __nv_bfloat16* route_outputs;
-  __nv_bfloat16* route_weights;
-  int* route_slots;
-  __nv_bfloat16* output;
-  int top_k;
-  int num_tokens;
-  int route_stride;
+  CUtensorMap A;
+  CUtensorMap B;
+  CUtensorMap SFA;
+  CUtensorMap SFB;
+  CUtensorMap C_tma;
+  __nv_bfloat16* C;
+  float* scale_c;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
   int M;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
 };
 inline cudaError_t SubmitKernel_13(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_13*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_344b2efabee6538b991d,
-      args.route_outputs,
-      args.route_weights,
-      args.route_slots,
-      args.output,
-      args.top_k,
-      args.num_tokens,
-      args.route_stride,
-      args.M);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_b9a1d88b8a94f4f37426,
+      args.A,
+      args.B,
+      args.SFA,
+      args.SFB,
+      args.C_tma,
+      args.C,
+      args.scale_c,
+      args.tile_expert,
+      args.tile_mn_limit,
+      args.num_non_exiting_ctas,
+      args.work_counter,
+      args.M,
+      args.K,
+      args.grid_m,
+      args.grid_n,
+      args.K_tiles);
 }
 inline bool PrepareKernel_13(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
@@ -3539,14 +4233,22 @@ inline bool PrepareKernel_13(const warp_decode::Invocation& inv,
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  args.route_outputs = reinterpret_cast<__nv_bfloat16*>(ws.partials);
-  args.route_weights = reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(inv.topk_weights));
-  args.route_slots = reinterpret_cast<int*>(ws.route_slots);
-  args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
-  args.top_k = static_cast<int>(shape.top_k);
-  args.num_tokens = static_cast<int>(shape.num_tokens);
-  args.route_stride = static_cast<int>(8 * shape.hidden_size);
+  if (!EncodeTensorMap_13_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_13_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_13_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
+  if (!EncodeTensorMap_13_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
+  if (!EncodeTensorMap_13_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
+  args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
+  args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  args.work_counter = reinterpret_cast<int*>(ws.fc2_work_counter);
   args.M = static_cast<int>(shape.hidden_size);
+  args.K = static_cast<int>(shape.intermediate_size);
+  args.grid_m = static_cast<int>(Fc2GridM(shape));
+  args.grid_n = static_cast<int>(ws.route_extent);
+  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 512));
   return true;
 }
 inline void VisitKernel_13(const KernelArgs_13& args, dim3 grid,
@@ -3561,26 +4263,42 @@ inline void VisitKernel_13(const KernelArgs_13& args, dim3 grid,
   visitor(launch, context);
 }
 struct KernelArgs_14 {
-  __nv_bfloat16* route_outputs;
-  __nv_bfloat16* route_weights;
-  int* route_slots;
-  __nv_bfloat16* output;
-  int top_k;
-  int num_tokens;
-  int route_stride;
+  CUtensorMap A;
+  CUtensorMap B;
+  CUtensorMap SFA;
+  CUtensorMap SFB;
+  CUtensorMap C_tma;
+  __nv_bfloat16* C;
+  float* scale_c;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
   int M;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
 };
 inline cudaError_t SubmitKernel_14(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_14*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_59d63f5b1bec86a086cb,
-      args.route_outputs,
-      args.route_weights,
-      args.route_slots,
-      args.output,
-      args.top_k,
-      args.num_tokens,
-      args.route_stride,
-      args.M);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_3f5bc27d007af5687d63,
+      args.A,
+      args.B,
+      args.SFA,
+      args.SFB,
+      args.C_tma,
+      args.C,
+      args.scale_c,
+      args.tile_expert,
+      args.tile_mn_limit,
+      args.num_non_exiting_ctas,
+      args.work_counter,
+      args.M,
+      args.K,
+      args.grid_m,
+      args.grid_n,
+      args.K_tiles);
 }
 inline bool PrepareKernel_14(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
@@ -3588,14 +4306,22 @@ inline bool PrepareKernel_14(const warp_decode::Invocation& inv,
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  args.route_outputs = reinterpret_cast<__nv_bfloat16*>(ws.partials);
-  args.route_weights = reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(inv.topk_weights));
-  args.route_slots = reinterpret_cast<int*>(ws.route_slots);
-  args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
-  args.top_k = static_cast<int>(shape.top_k);
-  args.num_tokens = static_cast<int>(shape.num_tokens);
-  args.route_stride = static_cast<int>(shape.hidden_size);
+  if (!EncodeTensorMap_14_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_14_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_14_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
+  if (!EncodeTensorMap_14_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 32}))) return false;
+  if (!EncodeTensorMap_14_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
+  args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
+  args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  args.work_counter = reinterpret_cast<int*>(ws.fc2_work_counter);
   args.M = static_cast<int>(shape.hidden_size);
+  args.K = static_cast<int>(shape.intermediate_size);
+  args.grid_m = static_cast<int>(Fc2GridM(shape));
+  args.grid_n = static_cast<int>(ws.route_extent);
+  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 768));
   return true;
 }
 inline void VisitKernel_14(const KernelArgs_14& args, dim3 grid,
@@ -3610,26 +4336,42 @@ inline void VisitKernel_14(const KernelArgs_14& args, dim3 grid,
   visitor(launch, context);
 }
 struct KernelArgs_15 {
-  __nv_bfloat16* route_outputs;
-  __nv_bfloat16* route_weights;
-  int* route_slots;
-  __nv_bfloat16* output;
-  int top_k;
-  int num_tokens;
-  int route_stride;
+  CUtensorMap A;
+  CUtensorMap B;
+  CUtensorMap SFA;
+  CUtensorMap SFB;
+  CUtensorMap C_tma;
+  __nv_bfloat16* C;
+  float* scale_c;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
   int M;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
 };
 inline cudaError_t SubmitKernel_15(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_15*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_719081f5ef4da6c57e95,
-      args.route_outputs,
-      args.route_weights,
-      args.route_slots,
-      args.output,
-      args.top_k,
-      args.num_tokens,
-      args.route_stride,
-      args.M);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_7fc08d4a160ade893bda,
+      args.A,
+      args.B,
+      args.SFA,
+      args.SFB,
+      args.C_tma,
+      args.C,
+      args.scale_c,
+      args.tile_expert,
+      args.tile_mn_limit,
+      args.num_non_exiting_ctas,
+      args.work_counter,
+      args.M,
+      args.K,
+      args.grid_m,
+      args.grid_n,
+      args.K_tiles);
 }
 inline bool PrepareKernel_15(const warp_decode::Invocation& inv,
                          const warp_decode::Schedule& schedule,
@@ -3637,14 +4379,22 @@ inline bool PrepareKernel_15(const warp_decode::Invocation& inv,
   if (prepared == nullptr) return false;
   const auto& shape = inv.shape;
   auto& args = *prepared;
-  args.route_outputs = reinterpret_cast<__nv_bfloat16*>(ws.partials);
-  args.route_weights = reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(inv.topk_weights));
-  args.route_slots = reinterpret_cast<int*>(ws.route_slots);
-  args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
-  args.top_k = static_cast<int>(shape.top_k);
-  args.num_tokens = static_cast<int>(shape.num_tokens);
-  args.route_stride = static_cast<int>(8 * shape.hidden_size);
+  if (!EncodeTensorMap_15_A(&args.A, DenseLayout(inv.gemm2_weights, {shape.num_experts, shape.hidden_size, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_15_B(&args.B, DenseLayout(ws.intermediate, {ws.route_extent, 8, shape.intermediate_size / 2}))) return false;
+  if (!EncodeTensorMap_15_SFA(&args.SFA, DenseLayout(inv.gemm2_weights_scale, {shape.num_experts * Fc2GridM(shape), shape.intermediate_size / 64, 2, 256}))) return false;
+  if (!EncodeTensorMap_15_SFB(&args.SFB, DenseLayout(ws.intermediate_scale, {ws.route_extent, shape.intermediate_size / 64, 1, schedule.route_layout == warp_decode::RouteLayout::kGpuPacked ? 128 : 32}))) return false;
+  if (!EncodeTensorMap_15_C_tma(&args.C_tma, DenseLayout(ws.partials, {ws.route_extent * 8, shape.hidden_size}))) return false;
+  args.C = reinterpret_cast<__nv_bfloat16*>(ws.partials);
+  args.scale_c = reinterpret_cast<float*>(const_cast<void*>(inv.output2_scale_scalar));
+  args.tile_expert = reinterpret_cast<int*>(TileExpert(inv, schedule, ws));
+  args.tile_mn_limit = reinterpret_cast<int*>(ws.tile_mn_limit);
+  args.num_non_exiting_ctas = reinterpret_cast<int*>(ws.num_non_exiting_ctas);
+  args.work_counter = reinterpret_cast<int*>(ws.fc2_work_counter);
   args.M = static_cast<int>(shape.hidden_size);
+  args.K = static_cast<int>(shape.intermediate_size);
+  args.grid_m = static_cast<int>(Fc2GridM(shape));
+  args.grid_n = static_cast<int>(ws.route_extent);
+  args.K_tiles = static_cast<int>(CeilDiv(shape.intermediate_size, 768));
   return true;
 }
 inline void VisitKernel_15(const KernelArgs_15& args, dim3 grid,
@@ -3670,7 +4420,7 @@ struct KernelArgs_16 {
 };
 inline cudaError_t SubmitKernel_16(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const KernelArgs_16*>(opaque);
-  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_432ccf353bf44819bac3,
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_203bed24646ce93a33a3,
       args.route_outputs,
       args.route_weights,
       args.route_slots,
@@ -3692,7 +4442,7 @@ inline bool PrepareKernel_16(const warp_decode::Invocation& inv,
   args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
   args.top_k = static_cast<int>(shape.top_k);
   args.num_tokens = static_cast<int>(shape.num_tokens);
-  args.route_stride = static_cast<int>(shape.hidden_size);
+  args.route_stride = static_cast<int>(8 * shape.hidden_size);
   args.M = static_cast<int>(shape.hidden_size);
   return true;
 }
@@ -3705,6 +4455,153 @@ inline void VisitKernel_16(const KernelArgs_16& args, dim3 grid,
       spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
       NeedsNonPortableSmem(16), spec.cooperative, spec.spread_cluster,
       &SubmitKernel_16, &args};
+  visitor(launch, context);
+}
+struct KernelArgs_17 {
+  __nv_bfloat16* route_outputs;
+  __nv_bfloat16* route_weights;
+  int* route_slots;
+  __nv_bfloat16* output;
+  int top_k;
+  int num_tokens;
+  int route_stride;
+  int M;
+};
+inline cudaError_t SubmitKernel_17(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_17*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_e2796e299356440aa3e4,
+      args.route_outputs,
+      args.route_weights,
+      args.route_slots,
+      args.output,
+      args.top_k,
+      args.num_tokens,
+      args.route_stride,
+      args.M);
+}
+inline bool PrepareKernel_17(const warp_decode::Invocation& inv,
+                         const warp_decode::Schedule& schedule,
+                         const WorkspaceView& ws, KernelArgs_17* prepared) {
+  if (prepared == nullptr) return false;
+  const auto& shape = inv.shape;
+  auto& args = *prepared;
+  args.route_outputs = reinterpret_cast<__nv_bfloat16*>(ws.partials);
+  args.route_weights = reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(inv.topk_weights));
+  args.route_slots = reinterpret_cast<int*>(ws.route_slots);
+  args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
+  args.top_k = static_cast<int>(shape.top_k);
+  args.num_tokens = static_cast<int>(shape.num_tokens);
+  args.route_stride = static_cast<int>(shape.hidden_size);
+  args.M = static_cast<int>(shape.hidden_size);
+  return true;
+}
+inline void VisitKernel_17(const KernelArgs_17& args, dim3 grid,
+                         warp_decode::LaunchVisitor visitor, void* context) {
+  const auto& spec = kKernelSpecs[17];
+  warp_decode::KernelLaunch launch{
+      spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
+      dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
+      spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
+      NeedsNonPortableSmem(17), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_17, &args};
+  visitor(launch, context);
+}
+struct KernelArgs_18 {
+  __nv_bfloat16* route_outputs;
+  __nv_bfloat16* route_weights;
+  int* route_slots;
+  __nv_bfloat16* output;
+  int top_k;
+  int num_tokens;
+  int route_stride;
+  int M;
+};
+inline cudaError_t SubmitKernel_18(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_18*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_c7113a73c61cc97c1593,
+      args.route_outputs,
+      args.route_weights,
+      args.route_slots,
+      args.output,
+      args.top_k,
+      args.num_tokens,
+      args.route_stride,
+      args.M);
+}
+inline bool PrepareKernel_18(const warp_decode::Invocation& inv,
+                         const warp_decode::Schedule& schedule,
+                         const WorkspaceView& ws, KernelArgs_18* prepared) {
+  if (prepared == nullptr) return false;
+  const auto& shape = inv.shape;
+  auto& args = *prepared;
+  args.route_outputs = reinterpret_cast<__nv_bfloat16*>(ws.partials);
+  args.route_weights = reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(inv.topk_weights));
+  args.route_slots = reinterpret_cast<int*>(ws.route_slots);
+  args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
+  args.top_k = static_cast<int>(shape.top_k);
+  args.num_tokens = static_cast<int>(shape.num_tokens);
+  args.route_stride = static_cast<int>(8 * shape.hidden_size);
+  args.M = static_cast<int>(shape.hidden_size);
+  return true;
+}
+inline void VisitKernel_18(const KernelArgs_18& args, dim3 grid,
+                         warp_decode::LaunchVisitor visitor, void* context) {
+  const auto& spec = kKernelSpecs[18];
+  warp_decode::KernelLaunch launch{
+      spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
+      dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
+      spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
+      NeedsNonPortableSmem(18), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_18, &args};
+  visitor(launch, context);
+}
+struct KernelArgs_19 {
+  __nv_bfloat16* route_outputs;
+  __nv_bfloat16* route_weights;
+  int* route_slots;
+  __nv_bfloat16* output;
+  int top_k;
+  int num_tokens;
+  int route_stride;
+  int M;
+};
+inline cudaError_t SubmitKernel_19(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const KernelArgs_19*>(opaque);
+  return warp_decode::SubmitExtendedKernel(config, kernel_cake_warp_decode_556f9752297212b1bcdc,
+      args.route_outputs,
+      args.route_weights,
+      args.route_slots,
+      args.output,
+      args.top_k,
+      args.num_tokens,
+      args.route_stride,
+      args.M);
+}
+inline bool PrepareKernel_19(const warp_decode::Invocation& inv,
+                         const warp_decode::Schedule& schedule,
+                         const WorkspaceView& ws, KernelArgs_19* prepared) {
+  if (prepared == nullptr) return false;
+  const auto& shape = inv.shape;
+  auto& args = *prepared;
+  args.route_outputs = reinterpret_cast<__nv_bfloat16*>(ws.partials);
+  args.route_weights = reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(inv.topk_weights));
+  args.route_slots = reinterpret_cast<int*>(ws.route_slots);
+  args.output = reinterpret_cast<__nv_bfloat16*>(inv.output);
+  args.top_k = static_cast<int>(shape.top_k);
+  args.num_tokens = static_cast<int>(shape.num_tokens);
+  args.route_stride = static_cast<int>(shape.hidden_size);
+  args.M = static_cast<int>(shape.hidden_size);
+  return true;
+}
+inline void VisitKernel_19(const KernelArgs_19& args, dim3 grid,
+                         warp_decode::LaunchVisitor visitor, void* context) {
+  const auto& spec = kKernelSpecs[19];
+  warp_decode::KernelLaunch launch{
+      spec.symbol, grid, dim3(spec.block.x, spec.block.y, spec.block.z),
+      dim3(spec.cluster.x, spec.cluster.y, spec.cluster.z),
+      spec.dynamic_smem_bytes, spec.programmatic_dependent_launch,
+      NeedsNonPortableSmem(19), spec.cooperative, spec.spread_cluster,
+      &SubmitKernel_19, &args};
   visitor(launch, context);
 }
 }  // namespace detail
@@ -3784,26 +4681,29 @@ inline warp_decode::ManifestStatus EnsureDeviceReady(int32_t device_id,
   int optin_max = 0;
   error = cudaDeviceGetAttribute(&optin_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id);
   if (error != cudaSuccess) return detail::Runtime(error, "MaxSharedMemoryPerBlockOptin");
-  const void* functions[17] = {
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_2f41e4ff99e834495fa7),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_564663b76745284e7a8d),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_ab98d92be1746a4d098d),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_17caac4e9e3f4d24961b),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_a310449091fa15daa2b0),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_bb184b973d16d83bf044),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_c685ed484e923bbf4945),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_05eeb4fae0e0bb547df0),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_2b1cc06cd9069d7c882a),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_450a8e8be186fbc052cc),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_fe81c33d7c5f9b9751ed),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_3120d1260c420d0d0a11),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_36fc9a61f8b57722891f),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_344b2efabee6538b991d),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_59d63f5b1bec86a086cb),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_719081f5ef4da6c57e95),
-      reinterpret_cast<const void*>(kernel_cake_warp_decode_432ccf353bf44819bac3)
+  const void* functions[20] = {
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_ee7526ffca9f2aa5aa46),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_3b1c1adc59f3837a48a4),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_b47db4977f3026b27967),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_a13d42e0deb96a0425d6),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_6d96f9ab40505e53392c),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_984714a81b269a80840f),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_3c56299743453bd348c8),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_e52aff25ce5bcb1715e1),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_559fe3e0504c60b0a333),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_a55637f8e353e95081d0),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_4fda1bae9546ebf2f6ba),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_c085b285b57d4abcce4d),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_659627650e61d48e0223),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_b9a1d88b8a94f4f37426),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_3f5bc27d007af5687d63),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_7fc08d4a160ade893bda),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_203bed24646ce93a33a3),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_e2796e299356440aa3e4),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_c7113a73c61cc97c1593),
+      reinterpret_cast<const void*>(kernel_cake_warp_decode_556f9752297212b1bcdc)
   };
-  for (int kernel = 0; kernel < 17; ++kernel) {
+  for (int kernel = 0; kernel < 20; ++kernel) {
     const size_t requested = kKernelSpecs[kernel].dynamic_smem_bytes;
     if (requested > static_cast<size_t>(optin_max))
       return detail::Invalid("EnsureDeviceReady shared memory exceeds opt-in ceiling");
@@ -3847,6 +4747,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
   detail::KernelArgs_14 args14{};
   detail::KernelArgs_15 args15{};
   detail::KernelArgs_16 args16{};
+  detail::KernelArgs_17 args17{};
+  detail::KernelArgs_18 args18{};
+  detail::KernelArgs_19 args19{};
   auto prepare = [&](int kernel) {
     bool ok = false;
     switch (kernel) {
@@ -3867,6 +4770,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
     case 14: ok = detail::PrepareKernel_14(inv, schedule, ws, &args14); break;
     case 15: ok = detail::PrepareKernel_15(inv, schedule, ws, &args15); break;
     case 16: ok = detail::PrepareKernel_16(inv, schedule, ws, &args16); break;
+    case 17: ok = detail::PrepareKernel_17(inv, schedule, ws, &args17); break;
+    case 18: ok = detail::PrepareKernel_18(inv, schedule, ws, &args18); break;
+    case 19: ok = detail::PrepareKernel_19(inv, schedule, ws, &args19); break;
       default: break;
     }
     return ok;
@@ -3890,6 +4796,9 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
     case 14: detail::VisitKernel_14(args14, grid, visitor, context); break;
     case 15: detail::VisitKernel_15(args15, grid, visitor, context); break;
     case 16: detail::VisitKernel_16(args16, grid, visitor, context); break;
+    case 17: detail::VisitKernel_17(args17, grid, visitor, context); break;
+    case 18: detail::VisitKernel_18(args18, grid, visitor, context); break;
+    case 19: detail::VisitKernel_19(args19, grid, visitor, context); break;
       default: break;
     }
   };
@@ -3902,22 +4811,25 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
     if (!prepare(route_kernel)) return;
   }
   const bool silu = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiLU;
-  const int fc1_kernel = silu
-      ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 7 : 8)
+  const bool situ = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSiTU;
+  const bool swiglu_oa = warp_decode::ActivationForGeometry(schedule.geometry) == warp_decode::Activation::kSwiGLUParameterized;
+  const int fc1_kernel = situ ? 11 : silu
+      ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 9 : 10)
+      : swiglu_oa ? (schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 5 : 6)
       : schedule.fc1 == warp_decode::Fc1Schedule::kStatic ? 3
-      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 5
-      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentPaddedScaleDeviceWorkfeed ? 6
+      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentDeviceWorkfeed ? 7
+      : schedule.fc1 == warp_decode::Fc1Schedule::kPersistentPaddedScaleDeviceWorkfeed ? 8
       : 4;
   if (!prepare(fc1_kernel)) return;
   const int fc2_kernel = schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256
-      ? 9
-      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512DeviceWorkfeed ? 10
-      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK768K96PaddedScale ? 12
-      : 11;
+      ? 12
+      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK512DeviceWorkfeed ? 13
+      : schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK768K96PaddedScale ? 15
+      : 14;
   if (!prepare(fc2_kernel)) return;
   const int finalize_kernel = schedule.finalize_threads == 32
-      ? (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 13 : 14)
-      : (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 15 : 16);
+      ? (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 16 : 17)
+      : (schedule.route_layout == warp_decode::RouteLayout::kDirect ? 18 : 19);
   if (!prepare(finalize_kernel)) return;
 
   if (route_kernel >= 0) visit(route_kernel, dim3(1, 1, 1));
