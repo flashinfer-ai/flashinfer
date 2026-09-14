@@ -69,9 +69,6 @@ from .cake_fmha import (
     plan_cake_fmha_request_ordered_paged_decode as plan_cake_fmha_request_ordered_paged_decode,
 )
 from .decode import (
-    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
-)
-from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
 )
 from .decode import (
