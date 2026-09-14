@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
+import logging
 import functools
 import math
 from enum import Enum
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from functools import lru_cache
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
@@ -26,7 +29,13 @@ from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 import inspect
 
+from .api_logging import (
+    experimental_auto_backends_allowed,
+    warn_experimental_backend_once,
+)
 from .jit.spdlog import gen_spdlog_module
+
+logger = logging.getLogger(__name__)
 
 
 class PosEncodingMode(Enum):
@@ -219,18 +228,22 @@ def get_alibi_slopes(
 SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+_cache_buf_retired: List[torch.Tensor] = []
 
 
 def _get_cache_buf(
-    name: str, bytes: int, device: torch.device, zero_init: bool = False
+    name: str, num_bytes: int, device: torch.device, zero_init: bool = False
 ) -> torch.Tensor:
+    """Return the process-wide ``name`` scratch buffer, grown to ``num_bytes``."""
     key = (name, device)
     buf = _cache_buf.get(key)
-    if buf is None or buf.size(0) < bytes:
+    if buf is None or buf.size(0) < num_bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
         if zero_init:
-            buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
+            buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
         else:
-            buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+            buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
 
@@ -273,10 +286,33 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
 
 
 @functools.cache
+def get_device_properties(device: torch.device):
+    return torch.cuda.get_device_properties(device)
+
+
+@functools.cache
 def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
-    return torch.cuda.get_device_capability(device.index)
+    properties = get_device_properties(device)
+    return properties.major, properties.minor
+
+
+# trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
+# public FMHA packs contain zero of either for sm100a/sm100f/sm103a. Requesting one on another
+# architecture cannot be served, and without this check it surfaces late as a "Missing
+# TRTLLM-GEN kernel" from the launcher rather than as a clear error at the call site.
+def check_trtllm_gen_sm107_only_feature(
+    enabled: Optional[bool], feature_name: str, device: torch.device
+) -> None:
+    if not enabled:
+        return
+    major, minor = get_compute_capability(device)
+    if (major, minor) != (10, 7):
+        raise ValueError(
+            f"{feature_name} is only supported on SM107 (Rubin); the current device is "
+            f"sm{major}{minor}. trtllm-gen exports those cubin variants for SM107 only."
+        )
 
 
 @functools.cache
@@ -321,7 +357,7 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
 
 @functools.cache
 def get_shared_bytes_per_block_optin(device: torch.device) -> int:
-    cap = torch.cuda.get_device_properties(device.index)
+    cap = get_device_properties(device)
     return cap.shared_memory_per_block_optin
 
 
@@ -492,6 +528,28 @@ def is_cutlass_backend_supported(
     return True
 
 
+def _should_use_fmha_v2_sm120(
+    device: torch.device,
+    pos_encoding_mode: int,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """Check if fmha_v2 HMMA kernels should be used for SM12x attention.
+
+    SM12x supports Ampere-compatible HMMA tensor core instructions (sm_mma=80).
+    The fmha_v2 library has SM120 kernel variants that use these instructions
+    and outperform generic FA2 on SM12x.
+    """
+    return (
+        (is_sm120a_supported(device) or is_sm121a_supported(device))
+        and not use_custom_mask
+        and pos_encoding_mode == PosEncodingMode.NONE.value
+        and dtype_q in {torch.float16, torch.bfloat16}
+        and dtype_kv in {torch.float16, torch.bfloat16}
+    )
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -636,14 +694,20 @@ def is_sm12x_supported(device: torch.device) -> bool:
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    This is a non-forward-compatible SM100a feature — not all SM >= 100 have it.
-    In particular, SM120 (Blackwell lite) does NOT support it.
+    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
+    Blackwell) — both must return False, else the kernels silently compile the
+    ~12-instruction software-emulation fallback and stochastic rounding runs
+    ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
+    Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
+    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
     """
     if device is None:
         device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
-    # SM100a and SM110a support cvt.rs; SM120 does not.
-    return major in (10, 11)
+    # Match the CUDA guard exactly: only the arches where cvt.rs actually
+    # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
+    # (major 11) has no `.rs` feature.
+    return get_compute_capability(device) in ((10, 0), (10, 3))
 
 
 def determine_mla_backend(device: torch.device) -> str:
@@ -653,6 +717,9 @@ def determine_mla_backend(device: torch.device) -> str:
 def _check_block_tables_shape(
     block_tables: torch.Tensor,
     uses_shared_paged_kv_idx: bool,
+    block_sparse: bool = False,
+    num_kv_heads: Optional[int] = None,
+    batch_size: Optional[int] = None,
 ) -> None:
     """Validate ``block_tables`` rank against the paged KV index layout.
 
@@ -660,7 +727,35 @@ def _check_block_tables_shape(
     ``[batch_size, max_num_pages_per_seq]``.  Separate layout expects a 3-D
     tensor ``[batch_size, 2, max_num_pages_per_seq]`` where dim1 distinguishes
     K (0) and V (1) page indices.
+
+    Block-sparse attention (``block_sparse=True``) uses per-KV-head page
+    tables and expects a 3-D tensor ``[num_kv_heads, batch_size,
+    max_num_pages_per_seq]`` with the shared layout; the selected sparse
+    pages must be packed densely at the front of each row.
     """
+    if block_sparse:
+        if not uses_shared_paged_kv_idx:
+            raise ValueError(
+                "block-sparse attention currently requires the shared paged-KV "
+                "index layout (uses_shared_paged_kv_idx=True)"
+            )
+        if block_tables.ndim != 3:
+            raise ValueError(
+                f"block_tables must be 3D [num_kv_heads, batch_size, "
+                f"max_num_pages_per_seq] for block-sparse attention, "
+                f"got ndim={block_tables.ndim}"
+            )
+        if num_kv_heads is not None and block_tables.shape[0] != num_kv_heads:
+            raise ValueError(
+                f"block_tables must have shape[0]==num_kv_heads ({num_kv_heads}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        if batch_size is not None and block_tables.shape[1] != batch_size:
+            raise ValueError(
+                f"block_tables must have shape[1]==batch_size ({batch_size}) "
+                f"for block-sparse attention, got shape={block_tables.shape}"
+            )
+        return
     expected_ndim = 2 if uses_shared_paged_kv_idx else 3
     if block_tables.ndim != expected_ndim:
         layout = "shared" if uses_shared_paged_kv_idx else "separate"
@@ -766,7 +861,17 @@ def round_up(x: int, y: int) -> int:
 
 @functools.cache
 def get_device_sm_count(device: torch.device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    return get_device_properties(device).multi_processor_count
+
+
+@functools.cache
+def get_device_name(device: torch.device) -> str:
+    return get_device_properties(device).name
+
+
+def get_device_index(device: torch.device) -> int:
+    """Concrete CUDA device index for *device* (bare "cuda" -> current device)."""
+    return device.index if device.index is not None else torch.cuda.current_device()
 
 
 def get_trtllm_gen_multi_ctas_kv_counter_bytes(
@@ -795,6 +900,37 @@ def _get_trtllm_gen_multi_ctas_kv_counter_buffer(
         batch_size, num_qo_heads, sm_count
     )
     return torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
+
+
+def _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+    counter_buffer: Optional[torch.Tensor],
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate or validate a trtllm-gen multi-CTA KV counter buffer."""
+    required_counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if counter_buffer is None:
+        return _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, sm_count, device
+        )
+    if counter_buffer.device != device:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer must be on the same device as query"
+        )
+    if not counter_buffer.is_contiguous():
+        raise ValueError("multi_ctas_kv_counter_buffer must be contiguous")
+    _check_workspace_buffer_alignment(counter_buffer, "multi_ctas_kv_counter_buffer")
+    counter_buffer_bytes = counter_buffer.numel() * counter_buffer.element_size()
+    if counter_buffer_bytes < required_counter_bytes:
+        raise ValueError(
+            "multi_ctas_kv_counter_buffer is too small: got "
+            f"{counter_buffer_bytes} bytes, need {required_counter_bytes} bytes"
+        )
+    return counter_buffer
 
 
 class FP4Tensor:
@@ -1050,6 +1186,39 @@ def supported_compute_capability(supported_ccs: Iterable[int]) -> Callable:
     return decorator
 
 
+def experimental_backend(checker: Callable) -> Callable:
+    """Mark a ``@backend_requirement`` checker as belonging to an experimental backend.
+
+    Stacks with :func:`supported_compute_capability`. Inside
+    :func:`backend_requirement` the marker has three effects:
+
+    - ``backend="auto"`` skips the backend unless
+      ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. Autotuning is covered
+      by the same filter, because it tunes over the candidate list this
+      produces (``<api>.suitable_auto_backends``).
+    - Explicit ``backend="<name>"`` always works -- naming the backend *is* the
+      opt-in -- and emits an ``ExperimentalWarning`` once per (API, backend).
+    - The backend is listed in ``<api>.experimental_backends``.
+
+    A checker whose module lives under ``flashinfer.experimental`` must carry
+    this marker: ``backend_requirement`` raises ``ValueError`` at decoration
+    time otherwise, so a forgotten marker fails at import rather than by
+    silently entering automatic selection.
+
+    See ``flashinfer/experimental/README.md`` for the policy and a full
+    worked example.
+
+    Examples
+    --------
+    >>> @experimental_backend
+    ... @supported_compute_capability([120, 121])
+    ... def check_sm12x_cute(a, b, out=None, backend="auto"):
+    ...     return a.dtype == torch.bfloat16 and a.shape[-1] % 64 == 0
+    """
+    checker.is_experimental = True  # type: ignore[attr-defined]
+    return checker
+
+
 def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
@@ -1090,6 +1259,15 @@ def backend_requirement(
     decorator : callable
         A decorator function that wraps the target function with validation logic, and inserts
         the "skip_check" keyword argument to the function.
+
+    Experimental backends
+    ---------------------
+    Checkers marked with :func:`experimental_backend` are excluded from
+    ``backend="auto"`` selection (and therefore from autotuning) unless
+    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. Selecting one explicitly
+    with ``backend="<name>"`` always works and emits an ``ExperimentalWarning``
+    once per (API, backend). Their names are exposed as
+    ``<api>.experimental_backends``.
 
     Attributes Added to Decorated Function
     ---------------------------------------
@@ -1161,6 +1339,27 @@ def backend_requirement(
         # Get the function signature once for reuse
         sig = inspect.signature(func)
 
+        # Backends whose checker carries @experimental_backend. Placement is the
+        # backstop: a checker defined under flashinfer.experimental without the
+        # marker is a policy violation, caught here at import time rather than
+        # by silently entering automatic selection.
+        experimental_backends = frozenset(
+            name
+            for name, checker in backend_checks.items()
+            if getattr(checker, "is_experimental", False)
+        )
+        for name, checker in backend_checks.items():
+            module = getattr(checker, "__module__", "") or ""
+            if (
+                module.startswith("flashinfer.experimental")
+                and name not in experimental_backends
+            ):
+                raise ValueError(
+                    f"@backend_requirement on {func.__name__}: checker for backend "
+                    f"'{name}' is defined under flashinfer.experimental but is not "
+                    f"marked @experimental_backend"
+                )
+
         def is_backend_supported(backend, cc=None):
             # No backend-specific checks
             if not has_backend_choices():
@@ -1225,6 +1424,12 @@ def backend_requirement(
             return backend in backend_checks
 
         def suitable_auto_backends(cc, *args, **kwargs):
+            # Cleared up front rather than only on the path that computes it: the
+            # "no suitable auto backends" hint reads this attribute after a failed
+            # call, and the common_check early return below would otherwise leave
+            # the previous call's value in place -- reporting a problem-size
+            # failure as an experimental-backend exclusion.
+            wrapper.dropped_experimental_backends = []
             if common_check is not None and not common_check(*args, **kwargs):
                 return False
             suitable_backends = []
@@ -1238,11 +1443,25 @@ def backend_requirement(
                         suitable_backends.append(backend)
                 except ValueError:
                     continue
+            # Experimental backends enter automatic selection only with the
+            # explicit opt-in. Autotuning tunes over this same list, so the
+            # filter covers it too. Remember what was dropped for the error hint.
+            dropped = [b for b in suitable_backends if b in experimental_backends]
+            if dropped and not experimental_auto_backends_allowed():
+                suitable_backends = [
+                    b for b in suitable_backends if b not in experimental_backends
+                ]
+            else:
+                dropped = []
+            wrapper.dropped_experimental_backends = dropped
             # If a heuristic function is provided, filter the suitable backends based on the heuristic function
             assert heuristic_func is not None, "Heuristic function must be provided"
             suitable_backends = heuristic_func(suitable_backends, *args, **kwargs)
             if not suitable_backends:
                 return False
+            for b in suitable_backends:
+                if b in experimental_backends:
+                    warn_experimental_backend_once(func.__name__, b, automatic=True)
             wrapper.suitable_auto_backends = suitable_backends
             return True
 
@@ -1293,8 +1512,17 @@ def backend_requirement(
                         if not suitable_auto_backends(
                             capability, **kwargs_with_defaults
                         ):
+                            dropped = wrapper.dropped_experimental_backends
+                            hint = (
+                                f" (experimental backend(s) {sorted(dropped)} were "
+                                f"excluded from automatic selection; set "
+                                f"FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1 to "
+                                f"include them, or pass backend= explicitly)"
+                                if dropped
+                                else ""
+                            )
                             raise BackendSupportedError(
-                                f"No suitable auto backends found for {func.__name__}"
+                                f"No suitable auto backends found for {func.__name__}{hint}"
                             )
                     else:
                         if not is_backend_supported(backend, capability):
@@ -1308,6 +1536,9 @@ def backend_requirement(
                             raise ValueError(
                                 f"Problem size is not supported for {func.__name__}"
                             )
+                        if backend in experimental_backends:
+                            # Explicit selection is the opt-in; just make it visible.
+                            warn_experimental_backend_once(func.__name__, backend)
                 else:
                     # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
@@ -1318,11 +1549,14 @@ def backend_requirement(
                         raise ValueError(
                             f"Problem size is not supported for {func.__name__}"
                         )
-            elif skip_check and heuristic_func is not None:
-                if kwargs.get("backend") == "auto":
+            elif skip_check:
+                backend = kwargs.get("backend")
+                if backend == "auto" and heuristic_func is not None:
                     # This needs to be called for heuristic function
                     capability = _get_capability(*args, **kwargs)
                     suitable_auto_backends(capability, *args, **kwargs)
+                elif backend in experimental_backends:
+                    warn_experimental_backend_once(func.__name__, backend)
 
             return func(*args, **kwargs)
 
@@ -1330,6 +1564,8 @@ def backend_requirement(
         wrapper.is_compute_capability_supported = is_compute_capability_supported
         wrapper.has_backend = has_backend
         wrapper.has_backend_choices = has_backend_choices
+        wrapper.experimental_backends = experimental_backends
+        wrapper.dropped_experimental_backends = []
         return wrapper
 
     return decorator
@@ -1367,3 +1603,69 @@ def prepare_jit_additional_args(
             result.append(None)
     result.extend(user_args_list)
     return result
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``FLASHINFER_CONFIDENTIAL_COMPUTE=1/0``.
+    """
+    forced = os.environ.get("FLASHINFER_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        if forced not in ("0", "1"):
+            raise ValueError(
+                f"FLASHINFER_CONFIDENTIAL_COMPUTE must be '0' or '1', got {forced!r}"
+            )
+        return forced == "1"
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools).
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("[Flashinfer]: Confidential-compute detection failed: %r", e)
+        return False
+
+
+@lru_cache(maxsize=1)
+def get_globaltimer_kernel():
+    """Lazily JIT-build the %globaltimer kernel."""
+
+    _GLOBALTIMER_KERNEL_CU = r"""
+    #include <torch/extension.h>
+    #include <ATen/cuda/CUDAContext.h>
+    __global__ void _get_globaltimer_timestamp(uint64_t* timestamp) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(*timestamp));
+    }
+    void get_globaltimer_timestamp(torch::Tensor timestamp) {
+        _get_globaltimer_timestamp<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<uint64_t*>(timestamp.data_ptr<int64_t>()));
+    }
+    """
+
+    try:
+        from torch.utils.cpp_extension import load_inline
+
+        mod = load_inline(
+            name="flashinfer_globaltimer",
+            cpp_sources="void get_globaltimer_timestamp(torch::Tensor);",
+            cuda_sources=_GLOBALTIMER_KERNEL_CU,
+            functions=["get_globaltimer_timestamp"],
+            verbose=False,
+        )
+        return mod.get_globaltimer_timestamp
+    except Exception as e:
+        logger.warning(
+            f"[Flashinfer]: %globaltimer stamp kernel build failed ({e}); "
+            f"falling back to cudaEvent timing."
+        )
+    return None

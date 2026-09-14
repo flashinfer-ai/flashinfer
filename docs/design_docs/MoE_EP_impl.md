@@ -18,6 +18,9 @@ lives in dispatch/combine).
 | `BootstrapConfig(world_size, rank, stream, nccl_comm)` | transport bootstrap |
 | `FleetParams(num_experts, max_tokens_per_rank, token_hidden_size, dtype_bytes, algorithm, layout)` | EP geometry |
 | `EpAlgorithm.{LOW_LATENCY, HIGH_THROUGHPUT}`, `EpLayout.{EXPERT_MAJOR, RANK_MAJOR, FLAT}` | algorithm / receive layout |
+| `FleetAlgoKnobFaultTolerance(enabled, timeout_ms, reconcile_timeout_s, coordinator_takeover_s)` | opt-in rank masking (LL only) |
+| `supports_fault_tolerance(backend)` | can this host serve the FT API? |
+| `Fleet.{query_fault, query_active_mask, set_active_mask, reconcile_active_mask, clear_faults, active_mask_epoch}` | FT runtime API — mask is `int32[world]`, `1 = active` |
 | `weights: MoEWeightPack` (layer arg) + `SplitConfig(kernel=FusedMoeKernelConfig(moe_config: MoEConfig))` | the expert GEMM (config from `flashinfer.fused_moe.api`) |
 
 `create_fleet(...)` raises `MoEEpNotBuiltError` (with rebuild hint) if the backend extension

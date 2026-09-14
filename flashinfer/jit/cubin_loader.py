@@ -243,7 +243,7 @@ def ensure_symlink(
     """Create or update a symlink, removing any stale file/directory at *link*.
 
     This is used to map C++ include paths (e.g.
-    ``CUBIN_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
+    ``GEN_SRC_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
     canonical artifact directory where ``get_artifact()`` stores downloaded files.
     """
     link = pathlib.Path(link)

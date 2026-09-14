@@ -1753,7 +1753,7 @@ def top_p_renorm_probs(
     probs: torch.Tensor
         Probabilities, shape ``(batch_size, num_classes)``.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-p threshold for for
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-p threshold for
         re-normalizing probabilities, should be in ``(0, 1)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
@@ -1840,7 +1840,7 @@ def top_k_renorm_probs(
         Probabilities, shape ``(batch_size, num_classes)``.
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for for
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for
         for re-normalizing probabilities, should be in ``(0, num_classes)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
@@ -1916,7 +1916,7 @@ def top_k_mask_logits(
         Logits before softmax, shape ``(batch_size, num_classes)``.
         Supported dtypes: ``float32``, ``float16``, ``bfloat16``.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for for
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the top-k threshold for
         for masking logits, should be in ``(0, num_classes)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.

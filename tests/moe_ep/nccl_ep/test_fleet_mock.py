@@ -236,3 +236,248 @@ def test_resolve_comm_mirrors_bootstrap_process_group(fake_nccl_ep):
 
     assert fake_nccl_ep._log["comm_from_group"] == [sentinel]
     assert fake_nccl_ep._core.Communicator.instances == []
+
+
+# ------------------------------------------------------------ fault tolerance
+
+
+class _RecordingFfi:
+    """Stand-in for the ctypes shim; records the exact calls the Fleet makes."""
+
+    available = True
+    missing: tuple = ()
+
+    def __init__(self):
+        self.calls: list = []
+
+    def mask_query(self, group, dev_ptr, stream):
+        self.calls.append(("query", dev_ptr, stream))
+
+    def mask_update(self, group, host_ptr, stream):
+        self.calls.append(("update", host_ptr, stream))
+
+    def mask_clean(self, group, stream):
+        self.calls.append(("clean", stream))
+
+    def get_async_error(self, group):
+        self.calls.append(("get_async_error",))
+        return True
+
+    def error_clear(self, group):
+        self.calls.append(("error_clear",))
+
+
+@pytest.fixture
+def recording_ffi(monkeypatch):
+    ffi = _RecordingFfi()
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet.mask_ffi", lambda: ffi
+    )
+    return ffi
+
+
+def _ft_fleet(**knob_kwargs):
+    from flashinfer.moe_ep.algo_knobs import FleetAlgoKnobFaultTolerance
+    from flashinfer.moe_ep.config import BootstrapConfig
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    return NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0),
+        _fleet_params(),
+        [FleetAlgoKnobFaultTolerance(**knob_kwargs)],
+    )
+
+
+def test_ft_knob_sets_enable_mask_and_timeout(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    _ft_fleet(timeout_ms=5000)
+    cfg = fake_nccl_ep._log["groups"][0].config
+    assert cfg.enable_mask is True
+    assert cfg.timeout_ns == 5000 * 1_000_000  # ms -> ns
+
+
+def test_no_ft_knob_leaves_mask_fields_unset(fake_nccl_ep, bypass_build_checks):
+    from flashinfer.moe_ep.config import BootstrapConfig
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    fleet = NcclEpFleet(BootstrapConfig(world_size=4, rank=0), _fleet_params())
+    cfg = fake_nccl_ep._log["groups"][0].config
+    assert "enable_mask" not in cfg.kwargs
+    assert "timeout_ns" not in cfg.kwargs
+    assert fleet.supports_fault_tolerance is False
+
+
+def test_zero_timeout_leaves_transport_default(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    _ft_fleet(timeout_ms=0)
+    cfg = fake_nccl_ep._log["groups"][0].config
+    assert cfg.enable_mask is True
+    assert "timeout_ns" not in cfg.kwargs  # 0 = library default (~100 s)
+
+
+def test_disabled_knob_is_inert(fake_nccl_ep, bypass_build_checks):
+    fleet = _ft_fleet(enabled=False)
+    cfg = fake_nccl_ep._log["groups"][0].config
+    assert "enable_mask" not in cfg.kwargs
+    assert fleet.supports_fault_tolerance is False
+
+
+def test_unavailable_ffi_fails_at_construction(
+    fake_nccl_ep, bypass_build_checks, monkeypatch
+):
+    """Better to fail when the Fleet is built than at the first real fault."""
+    from flashinfer.moe_ep.errors import MoEEpFaultToleranceUnsupportedError
+
+    class _Unavailable:
+        available = False
+        missing = ("ncclEpMaskQuery",)
+
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet.mask_ffi",
+        lambda: _Unavailable(),
+    )
+    with pytest.raises(MoEEpFaultToleranceUnsupportedError, match="ncclEpMaskQuery"):
+        _ft_fleet()
+
+
+def test_query_uses_device_buffer(fake_nccl_ep, bypass_build_checks, recording_ffi):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for the staging buffers")
+    fleet = _ft_fleet()
+    out = fleet.query_active_mask()
+    assert out.dtype == torch.int32 and out.numel() == 4 and out.is_cuda
+    kind, ptr, _ = recording_ffi.calls[-1]
+    assert kind == "query" and ptr == out.data_ptr()
+
+
+def test_update_uses_pinned_host_buffer_and_reuses_it(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """ncclEpMaskUpdate is stream-ordered, so the host source must be pinned
+    and Fleet-owned; a fresh pageable buffer each call would be a
+    use-after-write race."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for the staging buffers")
+    fleet = _ft_fleet()
+    fleet.set_active_mask([1, 1, 0, 1])
+    fleet.set_active_mask([1, 0, 0, 1])
+    ptrs = [c[1] for c in recording_ffi.calls if c[0] == "update"]
+    assert len(ptrs) == 2 and ptrs[0] == ptrs[1]  # same buffer reused
+    _, host = fleet._ft_bufs()
+    assert host.is_pinned() and not host.is_cuda
+    assert host.tolist() == [1, 0, 0, 1]
+    assert fleet.active_mask_epoch == 2
+
+
+def test_set_active_mask_rejects_masking_self(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for the staging buffers")
+    fleet = _ft_fleet()
+    with pytest.raises(ValueError, match="cannot mask itself"):
+        fleet.set_active_mask([0, 1, 1, 1])  # rank 0 masking rank 0
+
+
+def test_query_fault_reads_host_flag(fake_nccl_ep, bypass_build_checks, recording_ffi):
+    assert _ft_fleet().query_fault() is True
+    assert ("get_async_error",) in recording_ffi.calls
+
+
+def test_clear_faults_without_readmit_only_clears_the_flag(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    fleet = _ft_fleet()
+    fleet.clear_faults()
+    assert recording_ffi.calls == [("error_clear",)]
+
+
+def test_clear_faults_readmit_requires_a_handle(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """ncclEpMaskClean asserts on the LL buffer the first handle allocates;
+    without this guard the process would SIGABRT from C."""
+    fleet = _ft_fleet()
+    with pytest.raises(RuntimeError, match="at least one handle"):
+        fleet.clear_faults(readmit=True)
+
+
+def test_clear_faults_readmit_cleans_then_clears(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """Order matters: MaskClean does NOT clear the async flag."""
+    import torch
+
+    from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobTopKWeights
+    from flashinfer.moe_ep.config import EpLayout, HandleParams
+
+    fleet = _ft_fleet()
+    fleet.create_handle(
+        HandleParams(topk_ids=torch.zeros(4, 2, dtype=torch.int32)),
+        [HandleAlgoKnobTopKWeights(weights=torch.ones(4, 2))],
+    )
+    assert fleet.params.layout is EpLayout.EXPERT_MAJOR
+    with pytest.warns(RuntimeWarning, match="RANK_MAJOR"):
+        fleet.clear_faults(readmit=True)
+    kinds = [c[0] for c in recording_ffi.calls]
+    assert kinds[-2:] == ["clean", "error_clear"]
+
+
+def test_ft_buffers_resize_on_update_topology(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA for the staging buffers")
+    from flashinfer.moe_ep.config import BootstrapConfig
+
+    fleet = _ft_fleet()
+    assert fleet.query_active_mask().numel() == 4
+    fleet.update_topology(BootstrapConfig(world_size=8, rank=0))
+    assert fleet.query_active_mask().numel() == 8
+
+
+def test_query_fault_rejects_graph_capture(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """query_fault() is a HOST read, so capture cannot record it at all.
+
+    Called inside a capture region it would return the capture-time answer and
+    freeze the branch taken on it into the graph forever -- a graph that
+    ignores faults because none had happened when it was recorded. That is
+    quieter than the stream-ordered calls, hence the guard.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    fleet = _ft_fleet()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g), pytest.raises(RuntimeError, match="host-side read"):
+        fleet.query_fault()
+
+
+def test_capture_guard_reason_is_per_operation(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    """The rationale differs per call; a single blanket message was wrong."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    fleet = _ft_fleet()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        with pytest.raises(RuntimeError, match="baked into the captured"):
+            fleet.set_active_mask([1, 1, 0, 1])
+        with pytest.raises(RuntimeError, match="consumed on the host"):
+            fleet.query_active_mask()

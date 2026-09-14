@@ -81,6 +81,7 @@ COMBINE_PARAMS = [
     # Coverage for popular model specifications
     (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
     (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (4, 16, 4096, 6, torch.bfloat16, True),  # DeepSeek-V4-Flash
     (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
     (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
     (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B
@@ -168,6 +169,72 @@ def _compute_sf_size(
         raise ValueError(f"Unsupported sf_layout: {sf_layout}")
 
 
+@pytest.mark.parametrize(
+    "invalid_kind,error_match",
+    [
+        ("cpu", "CUDA tensor"),
+        ("noncontiguous", "contiguous"),
+        ("dtype", "Tensor type"),
+        ("packed_dtype", "packed fp4"),
+        ("extent", "extent"),
+    ],
+)
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform",
+)
+def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
+    num_tokens = 8
+    hidden_size = 64
+    payload = make_payload(num_tokens, hidden_size, torch.bfloat16)
+    routes = torch.zeros((num_tokens, 1), dtype=torch.int32, device="cuda")
+    received, workspaces, metainfo, combine_offsets = dispatch_from_single_rank(
+        [payload], routes, 1, 1, num_tokens, hidden_state_index=0
+    )
+    combine_payload = received[0][0].clone()
+    scale_extent = _compute_sf_size(
+        CombineQuantMode.MXFP8,
+        num_tokens,
+        hidden_size,
+        SfLayout.layout_linear,
+    )
+    output_scales = torch.empty(scale_extent, dtype=torch.uint8, device="cuda")
+    sf_layout = SfLayout.layout_linear
+    output_dtype = torch.float8_e4m3fn
+    output_width = hidden_size
+    if invalid_kind == "cpu":
+        output_scales = output_scales.cpu()
+    elif invalid_kind == "noncontiguous":
+        output_scales = torch.empty(scale_extent * 2, dtype=torch.uint8, device="cuda")[
+            ::2
+        ]
+    elif invalid_kind == "dtype":
+        output_scales = output_scales.to(torch.float32)
+    elif invalid_kind == "packed_dtype":
+        output_scales = output_scales.to(torch.float16)
+        output_dtype = torch.uint8
+        output_width //= 2
+    elif invalid_kind == "extent":
+        output_scales = torch.empty(scale_extent + 1, dtype=torch.uint8, device="cuda")
+    output = torch.empty((num_tokens, output_width), dtype=output_dtype, device="cuda")
+    with pytest.raises(Exception, match=error_match):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            combine_payload,
+            num_tokens,
+            workspaces,
+            metainfo[0],
+            num_tokens,
+            ep_rank=0,
+            ep_size=1,
+            top_k=1,
+            combine_payload_offset=combine_offsets[0],
+            output_dtype=output_dtype,
+            output_scales=output_scales,
+            sf_layout=sf_layout,
+            output=output,
+        )
+
+
 # This is a hack to ensure we get forward progress when running multiple kernels on a single GPU
 def check_sufficient_sm_count(num_tokens, world_size):
     if (
@@ -250,7 +317,7 @@ def test_moe_a2a_combine_rejects_noncontiguous_output_before_jit(monkeypatch):
 @pytest.mark.parametrize("use_output_buffer", [False, True])
 @pytest.mark.skipif(
     not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+    reason="Mnnvl memory is not supported on this platform",
 )
 def test_moe_alltoall_single_gpu(
     num_tokens,
@@ -348,6 +415,7 @@ def dispatch_from_single_rank(
     num_experts,
     num_tokens,
     hidden_state_index=None,
+    enable_pdl=True,
 ):
     payloads = input_tensors
     total_payload_size_per_element = [x[0].numel() * x.itemsize for x in payloads]
@@ -398,7 +466,7 @@ def dispatch_from_single_rank(
             rank_token_selected_experts = token_selected_experts[
                 rank * num_tokens : (rank + 1) * num_tokens
             ]
-            output, offset = trtllm_moe_alltoall.moe_a2a_dispatch(
+            output, offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
                 rank_token_selected_experts,
                 rank_payloads,
                 all_workspaces,
@@ -408,6 +476,7 @@ def dispatch_from_single_rank(
                 ep_size=world_size,
                 top_k=rank_token_selected_experts.shape[-1],
                 num_experts=num_experts,
+                enable_pdl=enable_pdl,
             )
             output_tensors.append(output)
             combine_payload_offsets.append(offset)
@@ -427,6 +496,7 @@ def sanitize_expert_ids_from_single_rank(
     metainfo,
     world_size,
     invalid_expert_id,
+    enable_pdl=True,
 ):
     for rank in range(world_size):
         trtllm_moe_alltoall.moe_a2a_sanitize_expert_ids(
@@ -435,6 +505,7 @@ def sanitize_expert_ids_from_single_rank(
             metainfo[rank],
             rank,
             invalid_expert_id,
+            enable_pdl=enable_pdl,
         )
     return output_tensors
 
@@ -452,36 +523,55 @@ def combine_from_single_rank(
     output_scales_list=None,
     output_scalar_scale=1.0,
     sf_layout=SfLayout.layout_linear,
+    use_low_precision=False,
+    enable_pdl=True,
 ):
-    combine_results = []
-
     torch.cuda.synchronize()
 
+    result_dtype = (
+        output_dtype
+        if output_dtype is not None
+        else (torch.bfloat16 if use_low_precision else combine_payload[0].dtype)
+    )
+    result_width = combine_payload[0].shape[-1]
+    if result_dtype == torch.uint8:
+        result_width //= 2
+    # A single-GPU multi-rank simulation must complete every allocation before
+    # the first rank enters the peer publication wait.  Otherwise a cold
+    # allocator can synchronize after rank 0 launches but before rank 1 does.
+    combine_results = [
+        torch.empty(
+            (num_tokens, result_width),
+            dtype=result_dtype,
+            device=rank_payload.device,
+        )
+        for rank_payload in combine_payload
+    ]
     cuda_streams_all_ranks = [torch.cuda.Stream() for _ in range(world_size)]
     for rank in range(world_size):
         with torch.cuda.stream(cuda_streams_all_ranks[rank]):
-            combine_results.append(
-                trtllm_moe_alltoall.moe_a2a_combine(
-                    combine_payload[rank],
-                    num_tokens,
-                    all_workspaces,
-                    metainfo[rank],
-                    num_tokens,
-                    ep_rank=rank,
-                    ep_size=world_size,
-                    top_k=top_k,
-                    combine_payload_offset=combine_payload_offsets[rank],
-                    payload_in_workspace=payload_in_workspace,
-                    output_dtype=output_dtype,
-                    output_scales=(
-                        output_scales_list[rank]
-                        if output_scales_list is not None
-                        else None
-                    ),
-                    output_scalar_scale=output_scalar_scale,
-                    sf_layout=sf_layout,
-                )
+            result = trtllm_moe_alltoall.moe_a2a_combine(
+                combine_payload[rank],
+                num_tokens,
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=top_k,
+                combine_payload_offset=combine_payload_offsets[rank],
+                payload_in_workspace=payload_in_workspace,
+                output_dtype=output_dtype,
+                output_scales=(
+                    output_scales_list[rank] if output_scales_list is not None else None
+                ),
+                output_scalar_scale=output_scalar_scale,
+                sf_layout=sf_layout,
+                output=combine_results[rank],
+                use_low_precision=use_low_precision,
+                enable_pdl=enable_pdl,
             )
+            assert result is combine_results[rank]
 
     for rank in range(world_size):
         cuda_streams_all_ranks[rank].synchronize()
@@ -489,6 +579,121 @@ def combine_from_single_rank(
     torch.cuda.synchronize()
 
     return combine_results
+
+
+@pytest.mark.parametrize(
+    "dtype,scalar_values",
+    (
+        (
+            torch.bfloat16,
+            (2.6423308e-14, 0.0046081543, -5.2354346e16, 5.2354346e16),
+        ),
+        (torch.float16, (-0.0001411438, -1310.0, -836.0, 609.5)),
+    ),
+)
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform",
+)
+def test_moe_combine_k4_matches_source_reduction_tree(dtype, scalar_values):
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 1
+    vector_dim = 8
+    top_k = 4
+    token_selected_experts = torch.arange(
+        top_k, dtype=torch.int32, device="cuda"
+    ).repeat(world_size, 1)
+    hidden_states = torch.zeros(
+        (world_size * num_tokens, vector_dim), dtype=dtype, device="cuda"
+    )
+    _, all_workspaces, metainfo, combine_payload_offsets = dispatch_from_single_rank(
+        [hidden_states],
+        token_selected_experts,
+        world_size,
+        world_size,
+        num_tokens,
+        hidden_state_index=0,
+        enable_pdl=False,
+    )
+
+    physical = torch.tensor(scalar_values, dtype=dtype, device="cuda")
+    combine_payload = []
+    for rank in range(world_size):
+        payload = trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+            all_workspaces[rank, :],
+            [world_size, num_tokens],
+            combine_payload_offsets[rank],
+            combine_payload_offsets[rank]
+            + world_size * num_tokens * vector_dim * dtype.itemsize,
+            dtype,
+        )
+        payload.fill_(physical[rank])
+        combine_payload.append(payload)
+
+    expected = (
+        (physical[0].float() + physical[1].float())
+        + (physical[2].float() + physical[3].float())
+    ).to(dtype)
+    sequential = (
+        ((physical[0].float() + physical[1].float()) + physical[2].float())
+        + physical[3].float()
+    ).to(dtype)
+    assert not torch.equal(expected, sequential)
+
+    outputs = combine_from_single_rank(
+        combine_payload,
+        num_tokens,
+        top_k,
+        all_workspaces,
+        metainfo,
+        world_size,
+        combine_payload_offsets,
+        payload_in_workspace=True,
+        output_dtype=dtype,
+        enable_pdl=False,
+    )
+    for output in outputs:
+        torch.testing.assert_close(
+            output,
+            expected.expand_as(output),
+            atol=0,
+            rtol=0,
+        )
+
+
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform",
+)
+def test_moe_combine_rejects_unsupported_top_k():
+    torch.cuda.set_device(0)
+    num_tokens = 1
+    top_k = 3
+    hidden_states = torch.zeros((num_tokens, 8), dtype=torch.bfloat16, device="cuda")
+    routes = torch.zeros((num_tokens, 1), dtype=torch.int32, device="cuda")
+    received, workspace, metainfo, combine_offsets = dispatch_from_single_rank(
+        [hidden_states],
+        routes,
+        world_size=1,
+        num_experts=1,
+        num_tokens=num_tokens,
+        hidden_state_index=0,
+        enable_pdl=False,
+    )
+    with pytest.raises(Exception, match="[Uu]nsupported top_k"):
+        trtllm_moe_alltoall.moe_a2a_combine(
+            received[0][0].clone(),
+            num_tokens,
+            workspace,
+            metainfo[0],
+            num_tokens,
+            ep_rank=0,
+            ep_size=1,
+            top_k=top_k,
+            combine_payload_offset=combine_offsets[0],
+            enable_pdl=False,
+        )
 
 
 @pytest.mark.parametrize("world_size,num_tokens,vector_dim", MULTI_RANK_PARAMS)
@@ -530,10 +735,441 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             # Select the tensors that arent all zeros
             actual = actual.flatten(end_dim=1)
             actual = actual[actual.any(dim=1)]
-            ref = ref[token_selected_experts_indices].squeeze()
+            ref = ref[token_selected_experts_indices].squeeze(1)
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+
+def compute_expert_target_rank(expert_id, num_experts, ep_size):
+    """Python mirror of compute_target_rank_id() in moeAlltoAllKernels.cu: contiguous
+    ceil/floor expert-to-rank partitioning that supports num_experts % ep_size != 0.
+    Ranks [0, remainder) own (base + 1) experts each; the rest own base experts."""
+    base = num_experts // ep_size
+    remainder = num_experts % ep_size
+    if remainder == 0:
+        return expert_id // base
+    split = remainder * (base + 1)
+    if expert_id < split:
+        return expert_id // (base + 1)
+    return remainder + (expert_id - split) // base
+
+
+# (world_size, num_tokens, vector_dim, num_experts), all with num_experts % world_size != 0
+NON_DIVISIBLE_EP_PARAMS = [
+    (4, 16, 32, 6),  # base=1, remainder=2: ranks 0-1 own 2 experts, ranks 2-3 own 1
+    (5, 16, 64, 8),  # base=1, remainder=3: ranks 0-2 own 2 experts, ranks 3-4 own 1
+    (3, 16, 16, 10),  # base=3, remainder=1: rank 0 owns 4 experts, ranks 1-2 own 3
+]
+
+
+@pytest.mark.parametrize(
+    "world_size,num_tokens,vector_dim,num_experts", NON_DIVISIBLE_EP_PARAMS
+)
+def test_moe_alltoall_non_divisible_ep_single_gpu(
+    world_size, num_tokens, vector_dim, num_experts
+):
+    """Dispatch routing correctness when num_experts is not divisible by ep_size,
+    exercising the ceil/floor contiguous expert-to-rank partitioning."""
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+    assert num_experts % world_size != 0, "this test targets the non-divisible case"
+
+    input_tensors = [make_payload(num_tokens * world_size, vector_dim, torch.bfloat16)]
+
+    token_selected_experts = make_random_topk_ids(
+        num_experts=num_experts,
+        num_tokens=world_size * num_tokens,
+        top_k=1,
+        device=torch.device("cuda"),
+    )
+
+    output_tensors, _, _, _ = dispatch_from_single_rank(
+        input_tensors, token_selected_experts, world_size, num_experts, num_tokens
+    )
+
+    expert_target_rank = torch.tensor(
+        [
+            compute_expert_target_rank(expert_id, num_experts, world_size)
+            for expert_id in range(num_experts)
+        ],
+        device=torch.device("cuda"),
+    )
+    token_target_rank = expert_target_rank[token_selected_experts.flatten()]
+
+    for rank in range(world_size):
+        token_indices = (token_target_rank == rank).nonzero(as_tuple=False)
+
+        for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
+            # Select the tensors that arent all zeros
+            actual = actual.flatten(end_dim=1)
+            actual = actual[actual.any(dim=1)]
+            ref = ref[token_indices].squeeze(1)
+            actual, _ = torch.sort(actual, dim=0)
+            ref, _ = torch.sort(ref, dim=0)
+            torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+
+ACTIVE_RANK_MASK_PARAMS = [
+    # (world_size, num_tokens, vector_dim, dead_rank)
+    (4, 16, 32, 2),
+    (5, 16, 64, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "world_size,num_tokens,vector_dim,dead_rank", ACTIVE_RANK_MASK_PARAMS
+)
+def test_moe_alltoall_active_rank_mask_single_gpu(
+    world_size, num_tokens, vector_dim, dead_rank
+):
+    """A rank excluded from active_rank_mask never participates: peers must not hang
+    waiting on its completion flags, tokens routed to it must be dropped (not delivered),
+    and combine must treat its would-be contribution as zero rather than stalling."""
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    num_experts = world_size  # top_k=1, one expert per rank: expert_id == target rank
+    active_ranks = [r for r in range(world_size) if r != dead_rank]
+    active_mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(active_ranks, world_size)
+
+    total_tokens = num_tokens * world_size
+    token_selected_experts = make_random_topk_ids(
+        num_experts=num_experts, num_tokens=total_tokens, top_k=1, device="cuda"
+    )
+    payload = make_payload(total_tokens, vector_dim, torch.bfloat16)
+
+    total_payload_size = payload[0].numel() * payload.itemsize
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size, total_tokens, total_payload_size, vector_dim * payload.itemsize
+    )
+    all_workspaces = torch.zeros(
+        world_size, workspace_size, dtype=torch.uint8, device="cuda"
+    )
+
+    # dead_rank's own moe_a2a_initialize/dispatch/combine calls are never issued, simulating
+    # a crashed rank; only active_ranks participate.
+    metainfo = {}
+    for rank in active_ranks:
+        metainfo[rank] = trtllm_moe_alltoall.moe_a2a_initialize(
+            all_workspaces, rank, world_size, total_tokens
+        )
+    torch.cuda.synchronize()
+
+    streams = {rank: torch.cuda.Stream() for rank in active_ranks}
+    output_tensors = {}
+    combine_offsets = {}
+    for rank in active_ranks:
+        with torch.cuda.stream(streams[rank]):
+            rank_payload = payload[rank * num_tokens : (rank + 1) * num_tokens]
+            rank_experts = token_selected_experts[
+                rank * num_tokens : (rank + 1) * num_tokens
+            ]
+            out, offset, _ = trtllm_moe_alltoall.moe_a2a_dispatch(
+                rank_experts,
+                [rank_payload],
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=1,
+                num_experts=num_experts,
+                enable_rank_mask=True,
+                active_rank_mask=active_mask,
+            )
+            output_tensors[rank] = out
+            combine_offsets[rank] = offset
+    for rank in active_ranks:
+        streams[rank].synchronize()
+    torch.cuda.synchronize()  # dispatch must not hang waiting on the dead rank's flags
+
+    # Tokens dispatched from a live rank and targeting the dead rank must be dropped: they
+    # never show up in any live rank's recv buffer.
+    active_token_mask = torch.zeros(total_tokens, dtype=torch.bool, device="cuda")
+    for rank in active_ranks:
+        active_token_mask[rank * num_tokens : (rank + 1) * num_tokens] = True
+    targets_dead = (token_selected_experts.flatten() == dead_rank) & active_token_mask
+    expected_received = int(active_token_mask.sum()) - int(targets_dead.sum())
+    received = sum(
+        int(output_tensors[rank][0].flatten(end_dim=1).any(dim=1).sum())
+        for rank in active_ranks
+    )
+    assert received == expected_received
+
+    # Combine: feed the dispatch output straight back (identity fake_moe) and verify it
+    # completes without hanging and zeroes out tokens whose only target was the dead rank.
+    combine_results = {}
+    for rank in active_ranks:
+        with torch.cuda.stream(streams[rank]):
+            combine_payload = torch.zeros(
+                world_size, num_tokens, vector_dim, dtype=torch.bfloat16, device="cuda"
+            )
+            combine_payload.copy_(output_tensors[rank][0])
+            combine_results[rank] = trtllm_moe_alltoall.moe_a2a_combine(
+                combine_payload,
+                num_tokens,
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=1,
+                combine_payload_offset=combine_offsets[rank],
+                payload_in_workspace=False,
+                enable_rank_mask=True,
+                active_rank_mask=active_mask,
+            )
+    for rank in active_ranks:
+        streams[rank].synchronize()
+    torch.cuda.synchronize()  # combine must not hang waiting on the dead rank's flags
+
+    zero_row = torch.zeros(vector_dim, dtype=torch.bfloat16, device="cuda")
+    for rank in active_ranks:
+        rank_experts = token_selected_experts[
+            rank * num_tokens : (rank + 1) * num_tokens
+        ].flatten()
+        expected = torch.where(
+            (rank_experts == dead_rank).unsqueeze(-1),
+            zero_row,
+            payload[rank * num_tokens : (rank + 1) * num_tokens],
+        )
+        torch.testing.assert_close(combine_results[rank], expected, atol=0, rtol=0)
+
+
+def test_moe_alltoall_active_rank_mask_rejects_self_inactive():
+    """The local ep_rank must always be marked active in its own active_rank_mask; otherwise
+    the op should raise immediately rather than launch a kernel that could hang or corrupt
+    state."""
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 8
+    local_rank = 2
+    mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(
+        [r for r in range(world_size) if r != local_rank], world_size
+    )
+
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size, num_tokens * world_size, 4 * 2, 0
+    )
+    ws = torch.zeros(world_size, workspace_size, dtype=torch.uint8, device="cuda")
+    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(
+        ws, local_rank, world_size, num_tokens * world_size
+    )
+    experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
+    payload = torch.randn(num_tokens, 4, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(Exception, match="active_rank_mask"):
+        trtllm_moe_alltoall.moe_a2a_dispatch(
+            experts,
+            [payload],
+            ws,
+            metainfo,
+            num_tokens,
+            ep_rank=local_rank,
+            ep_size=world_size,
+            top_k=1,
+            num_experts=world_size,
+            enable_rank_mask=True,
+            active_rank_mask=mask,
+        )
+
+
+def test_moe_alltoall_active_rank_mask_requires_enable_rank_mask():
+    """active_rank_mask is only meaningful (and only accepted) when enable_rank_mask=True;
+    passing a mask without opting in should raise rather than silently no-op."""
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 8
+    local_rank = 0
+    mask = trtllm_moe_alltoall.moe_a2a_active_rank_mask(range(world_size), world_size)
+
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size, num_tokens * world_size, 4 * 2, 0
+    )
+    ws = torch.zeros(world_size, workspace_size, dtype=torch.uint8, device="cuda")
+    metainfo = trtllm_moe_alltoall.moe_a2a_initialize(
+        ws, local_rank, world_size, num_tokens * world_size
+    )
+    experts = torch.zeros(num_tokens, 1, dtype=torch.int32, device="cuda")
+    payload = torch.randn(num_tokens, 4, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(Exception, match="enable_rank_mask"):
+        trtllm_moe_alltoall.moe_a2a_dispatch(
+            experts,
+            [payload],
+            ws,
+            metainfo,
+            num_tokens,
+            ep_rank=local_rank,
+            ep_size=world_size,
+            top_k=1,
+            num_experts=world_size,
+            enable_rank_mask=False,
+            active_rank_mask=mask,
+        )
+
+    # enable_rank_mask=True without a mask should also raise (no silent all-active default).
+    with pytest.raises(Exception, match="active_rank_mask"):
+        trtllm_moe_alltoall.moe_a2a_dispatch(
+            experts,
+            [payload],
+            ws,
+            metainfo,
+            num_tokens,
+            ep_rank=local_rank,
+            ep_size=world_size,
+            top_k=1,
+            num_experts=world_size,
+            enable_rank_mask=True,
+            active_rank_mask=None,
+        )
+
+
+EPLB_PARAMS = [
+    (2, 5, 8, 32),  # 2 ranks
+    (4, 16, 16, 32),  # 4 ranks
+    (8, 8, 8, 64),  # 8 ranks
+]
+
+
+@pytest.mark.parametrize("world_size,num_tokens,vector_dim,num_experts", EPLB_PARAMS)
+def test_moe_alltoall_eplb_stats_single_gpu(
+    world_size, num_tokens, vector_dim, num_experts
+):
+    """EPLB stats are all-gathered during dispatch: each rank's gathered_stats[r]
+    must equal rank r's local stats."""
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    # Reserve EPLB stats for half of the experts (matches the upstream test).
+    eplb_stats_num_experts = num_experts // 2
+
+    payload = make_payload(num_tokens * world_size, vector_dim, torch.bfloat16)
+    token_selected_experts = make_random_topk_ids(
+        num_experts=num_experts,
+        num_tokens=world_size * num_tokens,
+        top_k=2,
+        device=torch.device("cuda"),
+    )
+
+    # Per-rank local stats: rank-distinct so the all-gather is unambiguous.
+    eplb_local_stats = [
+        torch.arange(eplb_stats_num_experts, dtype=torch.int32, device="cuda")
+        + rank * 1000
+        for rank in range(world_size)
+    ]
+
+    total_payload_size_per_element = payload[0].numel() * payload.itemsize
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        world_size,
+        num_tokens * world_size,
+        total_payload_size_per_element,
+        0,
+        eplb_stats_num_experts=eplb_stats_num_experts,
+    )
+    all_workspaces = torch.zeros(
+        world_size, workspace_size, dtype=torch.uint8, device=torch.device("cuda")
+    )
+
+    metainfo = []
+    for rank in range(world_size):
+        metainfo.append(
+            trtllm_moe_alltoall.moe_a2a_initialize(
+                all_workspaces,
+                rank,
+                world_size,
+                num_tokens * world_size,
+                eplb_stats_num_experts,
+            )
+        )
+    torch.cuda.synchronize()
+
+    cuda_streams = [torch.cuda.Stream() for _ in range(world_size)]
+    gathered_stats = [None] * world_size
+    for rank in range(world_size):
+        with torch.cuda.stream(cuda_streams[rank]):
+            rank_payload = payload[rank * num_tokens : (rank + 1) * num_tokens]
+            rank_experts = token_selected_experts[
+                rank * num_tokens : (rank + 1) * num_tokens
+            ]
+            _, _, eplb_gathered = trtllm_moe_alltoall.moe_a2a_dispatch(
+                rank_experts,
+                [rank_payload],
+                all_workspaces,
+                metainfo[rank],
+                num_tokens,
+                ep_rank=rank,
+                ep_size=world_size,
+                top_k=rank_experts.shape[-1],
+                num_experts=num_experts,
+                eplb_local_stats=eplb_local_stats[rank],
+            )
+            # Clone out of the shared workspace before the next round reuses it.
+            gathered_stats[rank] = eplb_gathered.clone()
+
+    for rank in range(world_size):
+        cuda_streams[rank].synchronize()
+    torch.cuda.synchronize()
+
+    expected = torch.stack(
+        eplb_local_stats, dim=0
+    )  # [world_size, eplb_stats_num_experts]
+    for rank in range(world_size):
+        assert gathered_stats[rank] is not None
+        assert gathered_stats[rank].shape == (world_size, eplb_stats_num_experts)
+        torch.testing.assert_close(gathered_stats[rank], expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("top_k", [6, 8, 10, 16, 22])
+def test_moe_alltoall_compact_ep4_dispatch(top_k):
+    """Test the compact EP4 dispatch path with repeated destination ranks."""
+    torch.cuda.set_device(0)
+    world_size = 4
+    num_tokens = 4
+    num_experts = 64
+    total_tokens = world_size * num_tokens
+    num_experts_per_rank = num_experts // world_size
+
+    input_tensors = [
+        make_payload(total_tokens, 256, torch.int32),  # 1024 bytes per token
+        make_payload(total_tokens, 128, torch.uint8),
+        make_payload(total_tokens, 22, torch.int32),
+        make_payload(total_tokens, 22, torch.int32),
+    ]
+
+    # Rotate through experts so each token has repeated destinations and the set
+    # of destination ranks varies with both the token and top-k width.
+    expert_ids = torch.arange(
+        total_tokens * top_k, dtype=torch.int32, device=torch.device("cuda")
+    ).reshape(total_tokens, top_k)
+    token_selected_experts = (
+        expert_ids * 7
+        + torch.arange(
+            total_tokens, dtype=torch.int32, device=torch.device("cuda")
+        ).unsqueeze(1)
+    ).remainder(num_experts)
+
+    output_tensors, _, _, _ = dispatch_from_single_rank(
+        input_tensors,
+        token_selected_experts,
+        world_size,
+        num_experts,
+        num_tokens,
+    )
+    target_ranks = token_selected_experts.div(
+        num_experts_per_rank, rounding_mode="floor"
+    )
+
+    for rank in range(world_size):
+        expected_token_mask = (target_ranks == rank).any(dim=1)
+        for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
+            actual = actual.flatten(end_dim=1)
+            actual = actual[actual.any(dim=1)]
+            expected = ref[expected_token_mask]
+            actual, _ = torch.sort(actual, dim=0)
+            expected, _ = torch.sort(expected, dim=0)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -583,7 +1219,7 @@ def test_moe_alltoall_dispatch_larger_payloads_single_gpu(
         for actual, ref in zip(output_tensors[rank], input_tensors, strict=True):
             actual = actual.flatten(end_dim=1)
             actual = actual[actual.any(dim=1)]
-            ref = ref[token_selected_experts_indices].squeeze()
+            ref = ref[token_selected_experts_indices].squeeze(1)
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
@@ -695,6 +1331,7 @@ def fake_moe(
     return processed_states.view(target_shape)
 
 
+@pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize(
     "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout,use_lora",
     [(*x, *y, False) for x, y in itertools.product(COMBINE_PARAMS, QUANT_PARAMS)]
@@ -710,6 +1347,7 @@ def test_moe_combine_multi_rank_single_gpu(
     quant_mode,
     sf_layout,
     use_lora,
+    enable_pdl,
 ):
     torch.cuda.set_device(0)
     compute_capability = get_compute_capability(torch.device("cuda"))
@@ -774,6 +1412,7 @@ def test_moe_combine_multi_rank_single_gpu(
             num_experts,
             num_tokens,
             hidden_state_index,
+            enable_pdl=enable_pdl,
         )
     )
 
@@ -785,6 +1424,7 @@ def test_moe_combine_multi_rank_single_gpu(
         metainfo,
         world_size,
         -1,
+        enable_pdl=enable_pdl,
     )
 
     inplace_combine_tensors = []
@@ -879,6 +1519,7 @@ def test_moe_combine_multi_rank_single_gpu(
         output_scales_list=output_scales_list,
         sf_layout=sf_layout,
         output_scalar_scale=output_scalar_scale,
+        enable_pdl=enable_pdl,
     )
 
     if quant_mode == CombineQuantMode.NONE:
@@ -959,9 +1600,136 @@ def test_moe_combine_multi_rank_single_gpu(
         raise ValueError(f"Unsupported quant_mode: {quant_mode}")
 
 
+# FP8 combine: use_low_precision=True quantizes the BF16 payload to FP8 in the recv buffer,
+# then accumulates FP8 values and writes BF16 output.  Tolerance is looser to account for
+# the BF16→FP8→BF16 round-trip (FP8 e4m3 has ~3-bit mantissa).
+FP8_COMBINE_PARAMS = [
+    (4, 16, 4096, 2, torch.bfloat16, True),  # payload in workspace (in-place FP8)
+    (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3 scale
+    (8, 16, 4096, 8, torch.bfloat16, False),  # payload not in workspace (external copy)
+]
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability(0) < (8, 9),
+    reason="FP8 (e4m3) requires SM>=89 (Ada Lovelace or newer)",
+)
+@pytest.mark.parametrize(
+    "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace",
+    FP8_COMBINE_PARAMS,
+)
+def test_moe_combine_fp8(
+    world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace
+):
+    """Test FP8 combine path (use_low_precision=True).
+
+    Dispatches BF16 hidden states, then combine quantizes to FP8 in the recv buffer
+    before accumulating and writing BF16 output.  Validates both workspace-backed
+    (in-place quantization) and external-payload (copy+quantize) paths.
+    """
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    num_experts = world_size * top_k
+    token_selected_experts_index = 0
+    hidden_state_index = 1
+
+    token_selected_experts = torch.empty(
+        num_tokens * world_size, top_k, dtype=torch.int32, device=torch.device("cuda")
+    )
+    for i in range(num_tokens * world_size):
+        token_selected_experts[i] = torch.randperm(
+            num_experts, dtype=torch.int32, device=torch.device("cuda")
+        )[:top_k]
+    token_selected_experts = token_selected_experts.contiguous()
+
+    # Scale inputs to FP8 e4m3 representable range (max ~448); randn values are O(1).
+    reference_tensor = make_payload(num_tokens * world_size, vector_dim, dtype)
+    input_tensors = [
+        token_selected_experts,
+        reference_tensor,
+        make_payload(num_tokens * world_size, 1, torch.uint8),
+    ]
+
+    output_tensors, all_workspaces, metainfo, combine_payload_offsets = (
+        dispatch_from_single_rank(
+            input_tensors,
+            token_selected_experts,
+            world_size,
+            num_experts,
+            num_tokens,
+            hidden_state_index,
+        )
+    )
+    output_tensors = sanitize_expert_ids_from_single_rank(
+        output_tensors,
+        token_selected_experts_index,
+        all_workspaces,
+        metainfo,
+        world_size,
+        -1,
+    )
+
+    inplace_combine_tensors = []
+    for rank in range(world_size):
+        if payload_in_workspace:
+            inplace_combine_tensors.append(
+                trtllm_moe_alltoall.moe_a2a_wrap_payload_tensor_in_workspace(
+                    all_workspaces[rank, :],
+                    [world_size, num_tokens],
+                    combine_payload_offsets[rank],
+                    combine_payload_offsets[rank]
+                    + world_size * num_tokens * vector_dim * dtype.itemsize,
+                    dtype,
+                )
+            )
+        else:
+            inplace_combine_tensors.append(
+                torch.empty(
+                    world_size, num_tokens, vector_dim, dtype=dtype, device="cuda"
+                )
+            )
+        inplace_combine_tensors[rank].copy_(
+            fake_moe(
+                output_tensors[rank][hidden_state_index],
+                output_tensors[rank][token_selected_experts_index],
+                num_experts,
+                is_ep=True,
+                ep_rank=rank,
+                num_experts_per_rank=num_experts // world_size,
+            )
+        )
+
+    combine_results = combine_from_single_rank(
+        inplace_combine_tensors,
+        num_tokens,
+        top_k,
+        all_workspaces,
+        metainfo,
+        world_size,
+        combine_payload_offsets,
+        payload_in_workspace=payload_in_workspace,
+        use_low_precision=True,
+    )
+
+    # Reference computed in float32 (same as fake_moe internals), cast to bf16 for comparison.
+    reference_result = fake_moe(
+        input_tensors[hidden_state_index], token_selected_experts, num_experts
+    )
+
+    for rank in range(world_size):
+        # FP8 e4m3 has ~3 mantissa bits; tolerate quantization error in each accumulated value.
+        torch.testing.assert_close(
+            combine_results[rank],
+            reference_result[rank * num_tokens : (rank + 1) * num_tokens],
+            atol=0.5,
+            rtol=0.2,
+        )
+
+
 @pytest.mark.skipif(
     not mnnvl_available(),
-    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+    reason="Mnnvl memory is not supported on this platform",
 )
 def test_moe_workspace_size_per_rank():
     """Test the workspace size per rank for the MoeAlltoAll operation."""

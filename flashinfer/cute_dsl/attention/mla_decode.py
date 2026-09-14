@@ -52,6 +52,7 @@ from .compat import (
     setmaxregister_decrease as _setmaxregister_decrease,
     setmaxregister_increase as _setmaxregister_increase,
     get_max_tmem_alloc_cols as _get_max_tmem_alloc_cols,
+    get_current_arch as _get_current_arch,
 )
 
 
@@ -78,6 +79,7 @@ class BlackwellMultiLatentAttentionForward:
             self.softmax_exchange_sync_bar,
             self.epilogue_exchange_sync_bar,
         ) = self.schedule.make_named_barriers()
+        self.arch = _get_current_arch()
 
     @cute.jit
     def __call__(
@@ -374,6 +376,7 @@ class BlackwellMultiLatentAttentionForward:
             allocator_warp_id=self.schedule.mma_warp_id,
             is_two_cta=self.config.use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch=self.arch,
         )
 
         pipes = self._create_pipelines(storage, cta_layout_vmnk)
@@ -508,7 +511,7 @@ class BlackwellMultiLatentAttentionForward:
         # /////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.mma_warp_id:
             _setmaxregister_decrease(self.schedule.other_reg_num)
-            tmem.allocate(_get_max_tmem_alloc_cols("sm_100"))
+            tmem.allocate(_get_max_tmem_alloc_cols(self.arch))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.config.acc_dtype)
 

@@ -27,22 +27,16 @@ HIDDEN = 8192
 INTERMEDIATE = 2048
 RTOL = 3e-2
 ATOL = 3e-2
+# EP-vs-torch-oracle band: looser than EP-vs-kernel because the oracle runs
+# dense fp32 GEMMs against the kernel's bf16 accumulation on |y|~O(1).
+ORACLE_RTOL = 5e-2
+ORACLE_ATOL = 5e-2
 
-
-def _block_major_k(w):
-    import torch
-
-    from flashinfer import shuffle_matrix_a
-    from flashinfer.fused_moe.core import convert_to_block_layout
-
-    epilogue_tile_m = 64
-    block_k = 128
-    shuffled = []
-    for i in range(w.shape[0]):
-        s = shuffle_matrix_a(w[i].view(torch.uint8), epilogue_tile_m)
-        s = convert_to_block_layout(s, block_k)
-        shuffled.append(s)
-    return torch.stack(shuffled).view(torch.bfloat16)
+W4A8_NUM_EXPERTS = 8
+W4A8_TOP_K = 2
+W4A8_TOKENS_PER_RANK = 64
+W4A8_HIDDEN = 4096
+W4A8_INTERMEDIATE = 512
 
 
 def _build_bf16_moe_config(*, offset, local_num_experts, max_tokens):
@@ -52,14 +46,14 @@ def _build_bf16_moe_config(*, offset, local_num_experts, max_tokens):
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=NUM_EXPERTS, top_k=TOP_K),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=offset,
@@ -71,17 +65,16 @@ def _build_bf16_moe_config(*, offset, local_num_experts, max_tokens):
 
 
 def _build_fused_moe_weights(w1_local, w2_local):
-    from flashinfer.fused_moe.api import MoEWeightPack
-
-    wp = MoEWeightPack()
-    wp.prepare_for(
-        "trtllm_bf16_routed",
-        {
-            "gemm1_weights": _block_major_k(w1_local),
-            "gemm2_weights": _block_major_k(w2_local),
-        },
+    # Same weight prep as the EP layer (gated-act reorder + shuffle + BlockMajorK).
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
     )
-    return wp
+
+    cfg = _build_bf16_moe_config(
+        offset=0, local_num_experts=w1_local.shape[0], max_tokens=1
+    )
+    return materialize_fused_moe_weights(MoEWeightPack(w13=w1_local, w2=w2_local), cfg)
 
 
 def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
@@ -98,19 +91,21 @@ def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
     act = MoEActivationPack(
         hidden_states_q=x,
         hidden_states_scale=torch.empty(0, device=x.device),
-        selected_experts=topk_ids.to(torch.int32),
-        final_scales=topk_weights.to(torch.float32),
+        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=topk_weights.to(torch.float32),
     )
     return MoELayer(cfg)(act, wp)
 
 
 def _torch_dense_reference(x, w1, w2, topk_ids, topk_weights):
-    """Textbook dense MoE in fp32 (diagnostic only — convention-sensitive).
+    """Textbook dense MoE in fp32 (asserted torch oracle).
 
-    Mirrors ``tests/moe/test_cute_dsl_fused_moe.py::compute_reference_moe_fp4``
-    (bf16 path): gemm1 → split [linear | gate] → ``silu(gate) * linear`` → gemm2.
-    Used to cross-check the kernel against textbook MoE; NOT the primary assertion
-    (the trtllm-gen gate/up convention may differ from this split).
+    Mirrors the asserted ``tests/moe`` trtllm-gen reference
+    (``run_moe_dequant``): gemm1 → split ``[x1 | x2]`` → ``silu(x2) * x1`` →
+    gemm2 → topk-weighted sum — the same split used here (``linear`` = first
+    half, ``gate`` = second half).  Single-GPU per-dtype oracles live in
+    ``test_split_fused_moe_kernel_vs_reference.py``; this one additionally
+    pins the full EP path against textbook MoE math.
     """
     import os
 
@@ -266,6 +261,9 @@ def _run_one_layout(layout_str):
     # Primary correctness: EP must reproduce the non-EP kernel MoE exactly
     # (immune to kernel-convention quirks; tests dispatch/compute/combine).
     torch.testing.assert_close(yf, kf, rtol=RTOL, atol=ATOL)
+    # Oracle correctness: EP must also match textbook torch MoE math, so a
+    # bug shared by the EP and non-EP kernel paths cannot pass silently.
+    torch.testing.assert_close(yf, tf, rtol=ORACLE_RTOL, atol=ORACLE_ATOL)
     layer.destroy()
     return rank, ep_vs_kernel, kernel_vs_torch, ep_vs_torch
 
@@ -295,6 +293,136 @@ def test_moe_ep_compute_matches_dense_reference(layout):
         f"rank {rank}: {layout} EP==kernel OK "
         f"(EP-vs-kernel={ep_vs_kernel:.4f}, kernel-vs-torch={kernel_vs_torch:.4f})"
     )
+
+
+def _run_w4a8_dispatch(layout_str, *, mxfp8_dispatch):
+    import torch
+    import torch.distributed as dist
+
+    import flashinfer.fused_moe as fm
+    import flashinfer.moe_ep as ep
+
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    local_num_experts = W4A8_NUM_EXPERTS // world_size
+    offset = rank * local_num_experts
+
+    gw = torch.Generator(device="cuda").manual_seed(2026)
+    w1 = (
+        torch.randn(
+            (W4A8_NUM_EXPERTS, 2 * W4A8_INTERMEDIATE, W4A8_HIDDEN),
+            device="cuda",
+            generator=gw,
+        )
+        .mul_(W4A8_HIDDEN**-0.5)
+        .to(torch.bfloat16)
+    )
+    w2 = (
+        torch.randn(
+            (W4A8_NUM_EXPERTS, W4A8_HIDDEN, W4A8_INTERMEDIATE),
+            device="cuda",
+            generator=gw,
+        )
+        .mul_(W4A8_INTERMEDIATE**-0.5)
+        .to(torch.bfloat16)
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(3000 + rank)
+    x = torch.randn(
+        W4A8_TOKENS_PER_RANK,
+        W4A8_HIDDEN,
+        device="cuda",
+        generator=g,
+    ).to(torch.bfloat16)
+    scores = torch.randn(
+        W4A8_TOKENS_PER_RANK,
+        W4A8_NUM_EXPERTS,
+        device="cuda",
+        generator=g,
+    )
+    topk_ids = scores.topk(W4A8_TOP_K, dim=-1).indices.to(torch.int64)
+    topk_weights = torch.softmax(
+        torch.randn(
+            W4A8_TOKENS_PER_RANK,
+            W4A8_TOP_K,
+            device="cuda",
+            generator=g,
+        ),
+        dim=-1,
+    )
+
+    layout = ep.EpLayout[layout_str.upper()]
+    max_tokens = W4A8_TOKENS_PER_RANK * world_size
+    if layout is ep.EpLayout.EXPERT_MAJOR:
+        max_tokens *= local_num_experts
+    moe = fm.MoEConfig(
+        routing=fm.RoutingConfig(num_experts=W4A8_NUM_EXPERTS, top_k=W4A8_TOP_K),
+        quant=fm.QuantConfig(
+            weight=fm.QuantFormat.MXFP4, activation=fm.QuantFormat.MXFP8
+        ),
+        experts=fm.ExpertConfig(
+            intermediate_size=W4A8_INTERMEDIATE,
+            local_expert_offset=offset,
+            local_num_experts=local_num_experts,
+        ),
+        backend=fm.BackendOptions(candidates=(fm.CuteDslConfig(),)),
+        execution=fm.ExecutionConfig(enable_pdl=False, tune_max_num_tokens=max_tokens),
+    )
+    layer = ep.MoEEpLayer(
+        ep.BootstrapConfig(
+            world_size=world_size,
+            rank=rank,
+            stream=torch.cuda.current_stream().cuda_stream,
+        ),
+        ep.FleetParams(
+            num_experts=W4A8_NUM_EXPERTS,
+            max_tokens_per_rank=W4A8_TOKENS_PER_RANK,
+            token_hidden_size=W4A8_HIDDEN,
+            algorithm=ep.EpAlgorithm.LOW_LATENCY,
+            layout=layout,
+        ),
+        weights=ep.MoEWeightPack(
+            w13=w1[offset : offset + local_num_experts].contiguous(),
+            w2=w2[offset : offset + local_num_experts].contiguous(),
+        ),
+        backend=ep.SplitConfig(
+            comm=ep.NcclEpConfig(),
+            kernel=ep.FusedMoeKernelConfig(
+                moe_config=moe,
+                mxfp8_dispatch=mxfp8_dispatch,
+            ),
+        ),
+    )
+    y = layer(ep.MoEEpTensors(x, topk_ids, topk_weights))
+    torch.cuda.synchronize()
+    layer.destroy()
+    return y
+
+
+@pytest.mark.nvep
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_w4a8_packed_dispatch_matches_bf16_dispatch(layout):
+    import torch
+    import torch.distributed as dist
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("CuTe-DSL W4A8 requires SM100 or SM103")
+    from flashinfer.cute_dsl import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("CuTeDSL is not available")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", timeout=_PG_TIMEOUT)
+    if W4A8_NUM_EXPERTS % dist.get_world_size():
+        pytest.skip("expert count must be divisible by world size")
+
+    expected = _run_w4a8_dispatch(layout, mxfp8_dispatch=False)
+    dist.barrier()
+    actual = _run_w4a8_dispatch(layout, mxfp8_dispatch=True)
+    dist.barrier()
+    assert torch.equal(actual, expected)
 
 
 def _main():

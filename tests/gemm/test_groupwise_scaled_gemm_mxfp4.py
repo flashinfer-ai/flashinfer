@@ -257,7 +257,7 @@ def test_mxfp8_mxfp4_groupwise_group_gemm(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10, 12]:
         pytest.skip(
-            "gemm_mxfp4_nt_groupwise is only supported on SM100, SM103, and SM120/121 GPUs."
+            "gemm_mxfp4_nt_groupwise is only supported on SM100, SM103, SM107, and SM120/121 GPUs."
         )
     torch.random.manual_seed(0)
     tile_size = 32

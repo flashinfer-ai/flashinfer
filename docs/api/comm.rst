@@ -33,6 +33,35 @@ Mapping Utilities
 
     Mapping
 
+All-Gather Matmul
+-----------------
+
+``all_gather_matmul`` keeps its architecture-based default routing when
+``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
+the source-built fused backend for contiguous bfloat16 or float16 inputs with
+``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
+memory backend, and a two- or four-rank NCCL process group. The local input may
+be an ordinary contiguous CUDA tensor because Cake uses internal symmetric
+scratch and flags for remote access and synchronization. Unsupported explicit
+Cake requests raise instead of silently falling back.
+The packaged manifest carries the exact dynamic shared-memory requirement
+resolved for every generated main route; the loader validates that value
+against the packaged CUDA source before compiling the host launcher.
+
+``prepare_all_gather_matmul`` prepares the source-built packed-QKV route for
+SM103, bfloat16, four-rank NCCL groups, contiguous ``[M, 8192]`` inputs, and a
+contiguous ``[8192, 2560]`` weight, where ``M`` is a positive multiple of 128.
+It binds the weight and process group once and returns a callable that accepts
+a contiguous input with the same shape, dtype, and device. Both
+``backend="auto"`` and ``backend="cake"`` select this prepared route.
+Unsupported configurations raise during preparation instead of falling back.
+
+.. autosummary::
+    :toctree: ../generated
+
+    all_gather_matmul
+    prepare_all_gather_matmul
+
 TensorRT-LLM AllReduce
 ----------------------
 
@@ -89,8 +118,6 @@ Unified AllReduce Fusion API
     allreduce_fusion
     create_allreduce_fusion_workspace
     AllReduceFusionWorkspace
-    TRTLLMAllReduceFusionWorkspace
-    MNNVLAllReduceFusionWorkspace
 
 All-reduce workspaces backed by ``SymmDeviceMemory`` preserve their CUDA
 virtual addresses across process checkpoint/restore.  After quiescing all
@@ -109,13 +136,27 @@ exception occurs after detach or reattach begins, do not retry or reuse the
 workspace; restart the affected rank.  Workspaces backed by torch symmetric
 memory do not support this lifecycle.
 
+.. autoclass:: TRTLLMAllReduceFusionWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+.. autoclass:: MNNVLAllReduceFusionWorkspace
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+FP8 Quantized AllReduce
+-----------------------
+
+.. currentmodule:: flashinfer.comm
+
 .. autosummary::
     :toctree: ../generated
 
-    TRTLLMAllReduceFusionWorkspace.checkpoint_prepare
-    TRTLLMAllReduceFusionWorkspace.checkpoint_restore
-    MNNVLAllReduceFusionWorkspace.checkpoint_prepare
-    MNNVLAllReduceFusionWorkspace.checkpoint_restore
+    quantized_all_reduce
 
 vLLM AllReduce
 --------------
@@ -130,6 +171,223 @@ vLLM AllReduce
     vllm_register_graph_buffers
     vllm_get_graph_buffer_ipc_meta
     vllm_meta_size
+
+PCIe IPC AllReduce
+------------------
+
+Custom all-reduce for intra-node PCIe machines without NVLink. Admission is a
+capability check — world size, dtype, workspace capacity, and enough payload
+for every rank to own a share — and shapes it rejects fall back to the caller's
+own collective.
+
+.. code-block:: python
+
+    import flashinfer.comm as comm
+
+    # Collective: every rank builds the workspace with identical arguments.
+    # Size max_numel to the real workload -- an oversized one costs latency.
+    ws = comm.PcieIpcAllReduceWorkspace(group=group, max_numel=128 * 6144)
+
+    for x in activations:                     # same shapes, same order, all ranks
+        if ws.supports(x):
+            y = ws.all_reduce(x)              # out-of-place
+        else:
+            y = x.clone()
+            dist.all_reduce(y, group=group)   # unsupported shape: fall back
+
+    ws.destroy()                              # collective; all ranks together
+
+``supports()`` is a pure function of shape and dtype, so every rank reaches the
+same answer without agreeing on one at runtime. It says nothing about speed: a
+supported shape runs a seed launch configuration — one crossover keyed on the
+payload in bytes, no per-machine constants — and warns once per workspace until
+:meth:`~PcieIpcAllReduceWorkspace.tune` has measured the real one and persisted
+it, since the crossovers depend on the fabric.
+:func:`get_pcie_ipc_launch_config` exposes that seed for a
+``(world_size, numel, elem_size)`` triple, and returns ``None`` only for shapes
+the kernels cannot run.
+
+The kernels spin on peer flags with no timeout, so ranks that disagree on
+shape, dtype or call order hang rather than raise. One workspace serves one
+CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
+ordering the two if a move is genuinely needed.
+
+Two data planes
+~~~~~~~~~~~~~~~
+
+Above roughly a megabyte the workspace can move the payload with the copy
+engines instead of with SM load/store. The reason is not that the copy engine
+is faster per hop — in isolation the two are comparable — but that it keeps
+its throughput when every rank transfers at once, where SM peer traffic loses
+bandwidth to the concurrency. So the gap widens with world size, which is what
+makes a second plane worth having at these payload sizes.
+
+It is a second protocol rather than a flag on the existing kernels. The SM path
+encodes readiness in the payload — ``+0.0`` means "not yet written" — which a
+copy engine can neither produce nor observe, so the ring synchronises through
+monotonic flags on side streams instead. Nothing about the SM kernels changes.
+
+Both planes are ordinary tuner candidates, so nothing needs to be declared at
+the call site and there is no notion of a prefill or decode "phase": the
+configuration follows the payload in bytes.
+:class:`PcieIpcVariant` gains ``COPY_ENGINE_RING``, a flat neighbour ring, and
+``COPY_ENGINE_ISLAND``, a 4+4 decomposition offered only at world size 8 and
+only on ``rootcplx-noswitch``, where a ring's two socket-crossing hops would
+otherwise set the pace. On that variant ``blocks`` carries the ring's sub-chunk
+depth rather than a grid size.
+
+.. warning::
+
+    Tuning covers the batch sizes it is given, and shapes above the largest one
+    are served by whatever was measured there. Leave ``tune_batches`` unset and
+    the ladder is derived from ``max_numel``, which covers everything the
+    workspace admits; pass it explicitly and the top of the range is yours to
+    get right. :meth:`~PcieIpcAllReduceWorkspace.tune` warns when an explicit
+    list leaves a gap, and refuses to persist results measured below the
+    default sample counts, since a table that is quietly wrong is worse than
+    one that is missing.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PcieIpcAllReduceWorkspace
+    PcieIpcLaunchConfig
+    PcieIpcVariant
+    get_pcie_ipc_launch_config
+    probe_pcie_ipc_rank_topology
+    resolve_pcie_ipc_profile
+
+Ulysses Context-Parallel All-to-All
+-----------------------------------
+
+.. currentmodule:: flashinfer.comm
+
+Communication for Ulysses context parallelism over the 4-D layout
+``[B, S, H, D]``. Two layout transforms are provided; a typical attention
+layer makes four collective calls (q/k/v through ``scatter_heads``, the
+output through ``gather_heads``):
+
+- ``scatter_heads``: ``[B, S_local, H, D] -> [B, S_global, H_local, D]`` —
+  each rank keeps head slice ``[rank * H_local, (rank+1) * H_local)`` of the
+  *full* sequence;
+- ``gather_heads``: ``[B, S_global, H_local, D] -> [B, S_local, H, D]`` —
+  the inverse, returning all heads of this rank's sequence shard,
+
+with ``H_local = H // world_size`` and ``S_global = S_local * world_size``.
+Both backends produce bit-identical results.
+
+**Backend policy.** :class:`UlyssesCommunicator` selects its backend in the
+constructor, strictly before any IPC allocation or JIT compilation:
+
+============== ==================================================================
+``backend=``   behavior
+============== ==================================================================
+``"auto"``     fused-transpose NVLink-P2P kernel when the group is a verified
+               single-node all-pairs NVLink mesh with a supported world size
+               (2/4/6/8); NCCL otherwise. The instance exposes ``.backend``
+               (effective), ``.fallback_reason`` and ``.decision`` /
+               ``.topology_decision``.
+``"nvlink"``   force the fused kernel; raises on every rank (before IPC/JIT for
+               topology failures) when it cannot be used.
+``"nccl"``     force ``dist.all_to_all_single`` + permute; skips the
+               topology/NVML probe and all IPC/JIT (the constructor still
+               resolves/guards the CUDA device and performs CUDA-backed
+               metadata collectives); any world size.
+============== ==================================================================
+
+Typical fallback reasons reported by ``.fallback_reason`` (all conservative —
+anything unknown or unverifiable selects NCCL): unsupported world size (only
+2/4/6/8 have fused-kernel instantiations; ``world_size == 1`` is a no-copy
+passthrough), ranks spanning multiple hosts, missing pair-wise P2P or NVLink
+between any two concrete GPUs (verified per pair via NVML, not "some active
+link"), duplicate or unknown physical GPU identity, a topology probe error,
+inconsistent per-rank decisions, or a runtime NVLink initialization failure
+after a positive topology decision.
+
+**Constraints.** The constructor is always collective (all ranks together);
+:meth:`UlyssesCommunicator.close` is collective only when the NVLink backend
+was armed — for the pure NCCL backend, ``world_size == 1``, or an auto
+fallback whose NVLink cleanup already completed, ``close`` is local and
+idempotent. Rank-local failures inside the NVLink initialization or a
+collective ``close`` are exchanged as group outcomes so all ranks jointly
+clean up and raise (or fall back) instead of deadlocking, and a failed
+``close`` may be retried. All ranks must request the same ``backend`` and
+agree on ``max_elems`` and ``dtype``; each rank may bind a different CUDA
+device (``device`` accepts ``torch.device``, ``str`` or an ``int`` ordinal,
+e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL backend (forced or
+fallen back to) requires ``group`` to support CUDA all-to-all (an NCCL
+process group), checked at construction. Operands must be contiguous 4-D
+CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
+only) on the construction device, every dim positive, at most ``max_elems``
+(≤ 2^31 − 1) elements; ``scatter_heads`` requires ``H % world_size == 0``
+and ``gather_heads`` requires ``S_global % world_size == 0``. Collectives
+run on the current CUDA stream; all ranks must issue the same call sequence
+with consistent shapes, one collective in flight per communicator at a
+time.
+
+**Known limitations.**
+
+- PyTorch builds without ``torch.cuda.get_device_properties(...).uuid``
+  cannot establish physical GPU identity: ``auto`` conservatively falls back
+  to NCCL (the reason names the missing attribute).
+- When each process can only see its own GPU (e.g. one
+  ``CUDA_VISIBLE_DEVICES`` entry per rank), peers are invisible to the P2P
+  probe and ``auto`` falls back to NCCL.
+- Out-of-range CUDA ordinals passed as *strings or ints* are rejected at
+  construction; a pre-built ``torch.device`` object wraps its index into a
+  signed byte before FlashInfer can see it (``torch.device("cuda:256")`` is
+  already ``cuda:0``), so only the surviving index can be range-checked.
+- Teardown metadata exchanges run bound to the communicator device; an
+  extreme failure in the guard *restore* path after a completed collective
+  can still desynchronize ranks (never observed in tests; tracked as a
+  hardening note).
+
+**Example** (Wan2.1-style attention; see the
+`wan example <https://github.com/flashinfer-ai/flashinfer/tree/main/examples/pytorch/wan>`_
+for the full integration)::
+
+    with UlyssesCommunicator(group, max_elems=B * S_local * H * D,
+                             dtype=torch.bfloat16) as comm:
+        q_ = comm.scatter_heads(q)   # [B,S_local,H,D] -> [B,S_global,H_local,D]
+        k_ = comm.scatter_heads(k)
+        v_ = comm.scatter_heads(v)
+        o_ = attention(q_, k_, v_)
+        o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
+
+.. autoclass:: UlyssesCommunicator
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+Topology Probing and Backend Selection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autosummary::
+    :toctree: ../generated
+
+    UlyssesBackendDecision
+    UlyssesRankTopology
+    UlyssesBackendError
+
+.. autofunction:: resolve_ulysses_backend
+
+.. autofunction:: decide_ulysses_backend
+
+.. autofunction:: probe_ulysses_rank_topology
+
+Raw Kernel Entry Points (advanced)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Prefer :class:`UlyssesCommunicator`; these assume the caller has already
+verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
+
+.. autosummary::
+    :toctree: ../generated
+
+    init_ulysses_a2a
+    dispose_ulysses_a2a
+    ulysses_a2a
 
 MNNVL (Multi-Node NVLink)
 -------------------------

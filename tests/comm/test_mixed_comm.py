@@ -1,8 +1,6 @@
 import math
 import multiprocessing as mp
-import sys
 from itertools import product
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,11 +13,6 @@ from flashinfer.comm.mixed_comm import (
     MixedCommOp,
     run_mixed_comm,
 )
-
-
-_project_root = Path(__file__).parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.append(str(_project_root))
 
 
 def prepare_data(max_local_bs, hidden_size, world_size, dtype, device):

@@ -180,7 +180,18 @@ struct Data {
   int32_t const* totalNumPaddedTokens;
   int32_t const* ctaIdxXyToMnLimit;
   int32_t const* numNonExitingCtas;
-  int32_t tileTokensDim;
+  int32_t tileTokensDim{0};
+
+  // Optional per-local-expert SwiGLU OAI controls, [localNumExperts] each. Null means the
+  // neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to plain SwiGLU.
+  // The trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation
+  // kernel below (DeepSeek FP8) has to apply them itself.
+  float const* gatedActAlphaPtr = nullptr;
+  float const* gatedActBetaPtr = nullptr;
+  float const* gatedActClampLimitPtr = nullptr;
+  // Maps a permuted-token tile to its local expert, i.e. the batch index of the FC1 GEMM.
+  // Only read when one of the pointers above is set.
+  int32_t const* ctaIdxXyToBatchIdx = nullptr;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -203,7 +214,12 @@ struct KernelParams {
   int32_t const* totalNumPaddedTokens;
   int32_t const* ctaIdxXyToMnLimit;
   int32_t const* numNonExitingCtas;
-  int32_t tileTokensDim;
+  int32_t tileTokensDim{0};
+
+  float const* gatedActAlphaPtr = nullptr;
+  float const* gatedActBetaPtr = nullptr;
+  float const* gatedActClampLimitPtr = nullptr;
+  int32_t const* ctaIdxXyToBatchIdx = nullptr;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -222,6 +238,11 @@ struct KernelParams {
     params.ctaIdxXyToMnLimit = data.ctaIdxXyToMnLimit;
     params.numNonExitingCtas = data.numNonExitingCtas;
     params.tileTokensDim = data.tileTokensDim;
+
+    params.gatedActAlphaPtr = data.gatedActAlphaPtr;
+    params.gatedActBetaPtr = data.gatedActBetaPtr;
+    params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
+    params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
 
     return params;
   }
@@ -375,9 +396,9 @@ struct Data {
   int32_t numTokens;
   int32_t numExperts;
   int32_t topK;
-  // Hidden dimension output of MoE block. It is not padded.
+  // Final output row width of the MoE block.
   int32_t hiddenDim;
-  // Hidden dimension output of FC2. It might be padded.
+  // Hidden dimension output stride of FC2.
   int32_t hiddenDimPadded;
   int32_t const* totalNumPaddedTokens;
 };

@@ -1,7 +1,7 @@
 # Test for unified AllReduce API with multiple backends
 # Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
 import traceback
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pytest
 import torch
@@ -20,6 +20,7 @@ from flashinfer.comm import (
 
 # Use flashinfer.norm.rmsnorm as reference implementation.
 from flashinfer.norm import rmsnorm
+from flashinfer.utils import is_confidential_compute
 
 # Test helpers
 from tests.test_helpers.comm import (
@@ -38,8 +39,13 @@ def run_allreduce_fusion_test(
     fusion: bool,
     reference_output: tuple[torch.Tensor, ...],
     workspace: AllReduceFusionWorkspace,
+    use_oneshot: Optional[bool] = None,
 ):
-    """Test function using the unified API (create_allreduce_fusion_workspace + allreduce_fusion)."""
+    """Test function using the unified API (create_allreduce_fusion_workspace + allreduce_fusion).
+
+    ``use_oneshot`` forces the one-shot (True) or two-shot (False) kernel; None
+    lets the token-count heuristic decide.
+    """
     MPI.COMM_WORLD.barrier()
 
     def func(
@@ -72,6 +78,7 @@ def run_allreduce_fusion_test(
                 residual_in=residual.view(-1, shape[-1]),
                 rms_gamma=norm_weight,
                 rms_eps=eps,
+                use_oneshot=use_oneshot,
             )
 
             return norm_out.view(shape), residual_out.view(shape)
@@ -86,6 +93,7 @@ def run_allreduce_fusion_test(
                 pattern=AllReduceFusionPattern.kAllReduce,
                 launch_with_pdl=use_pdl,
                 output=output,
+                use_oneshot=use_oneshot,
             )
             return (output.view(shape),)
 
@@ -171,6 +179,7 @@ def run_allreduce_test(
     dtype: torch.dtype,
     hidden_size: int,
     backend: str,
+    use_oneshot: Optional[bool] = None,
 ):
     """Core test logic for AllReduce operations using the unified API.
 
@@ -248,6 +257,7 @@ def run_allreduce_test(
                 fusion,
                 reference_output,
                 workspace,
+                use_oneshot=use_oneshot,
             )
 
             # Synchronize before next test
@@ -302,3 +312,67 @@ def test_allreduce_unified(
     Run with: mpirun -np <num_gpus> pytest tests/comm/test_allreduce_unified_api.py -vv -s
     """
     run_allreduce_test(monkeypatch, seq_lens, fusion, dtype, hidden_size, backend)
+
+
+@pytest.mark.parametrize("seq_len", [64, 256])
+@pytest.mark.parametrize("use_oneshot", [True, False])
+@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_allreduce_trtllm_multicast_free(
+    monkeypatch,
+    seq_len: int,
+    use_oneshot: bool,
+    fusion: bool,
+    dtype: torch.dtype,
+):
+    """Multicast-free TRT-LLM AR fusion (the Confidential Computing path).
+
+    Under CC the trtllm workspace is allocated multicast-free (IPC) instead of
+    symmetric device memory; the fusion kernels are themselves multicast-free,
+    so both strategies must run on it. We force CC via
+    FLASHINFER_CONFIDENTIAL_COMPUTE=1 so the workspace auto-selects IPC on
+    ordinary hardware, and ``use_oneshot`` forces each kernel:
+      - use_oneshot=True  -> allreduce_fusion_kernel_oneshot_lamport
+      - use_oneshot=False -> allreduce_fusion_kernel_twoshot_sync
+
+    Run with:
+        mpirun -np 2 pytest tests/comm/test_allreduce_unified_api.py \\
+            -k multicast_free -vv -s
+    """
+    monkeypatch.setenv("FLASHINFER_CONFIDENTIAL_COMPUTE", "1")
+    is_confidential_compute.cache_clear()
+    try:
+        run_allreduce_test(
+            monkeypatch,
+            [seq_len],
+            fusion,
+            dtype,
+            hidden_size=4096,
+            backend="trtllm",
+            use_oneshot=use_oneshot,
+        )
+    finally:
+        is_confidential_compute.cache_clear()
+
+
+def test_mnnvl_raises_under_cc(monkeypatch):
+    """Under CC, requesting the mnnvl backend must raise: it needs NVLink
+    multicast, which is unavailable under Confidential Computing."""
+    if MPI.COMM_WORLD.Get_size() < 2:
+        pytest.skip("This test requires at least 2 MPI ranks")
+    rank = MPI.COMM_WORLD.Get_rank()
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    monkeypatch.setenv("FLASHINFER_CONFIDENTIAL_COMPUTE", "1")
+    is_confidential_compute.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="multicast"):
+            create_allreduce_fusion_workspace(
+                backend="mnnvl",
+                world_size=MPI.COMM_WORLD.Get_size(),
+                rank=rank,
+                max_token_num=8,
+                hidden_dim=4096,
+                dtype=torch.bfloat16,
+            )
+    finally:
+        is_confidential_compute.cache_clear()

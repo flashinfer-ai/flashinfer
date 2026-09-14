@@ -160,7 +160,7 @@ template <typename InputType, typename TopKScaleType, int32_t kThreadsPerBlock>
 __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* output,
                                    int32_t const* expanded_idx_to_permuted_idx,
                                    TopKScaleType const* topk_scales, int32_t const hidden_size,
-                                   int32_t const top_k) {
+                                   int32_t const top_k, bool const input_is_expanded) {
   using AccumType = float;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
   // Need int64_t to prevent overflow when computing pointer offsets.
@@ -181,14 +181,16 @@ __global__ void moeUnpermuteKernel(InputType const* permuted_input, InputType* o
       rmemAccum[j] = 0;
     }
     for (int32_t k = 0; k < top_k; k++) {
-      int32_t const permuted_idx = expanded_idx_to_permuted_idx[token_idx * top_k + k];
+      int32_t const expanded_idx = token_idx * top_k + k;
+      int32_t const permuted_idx = expanded_idx_to_permuted_idx[expanded_idx];
       if (permuted_idx < 0) {
         continue;
       }
+      int32_t const input_idx = input_is_expanded ? expanded_idx : permuted_idx;
       auto const* src_ptr =
-          reinterpret_cast<ElemCopyType const*>(permuted_input) + permuted_idx * kCopyPerToken;
+          reinterpret_cast<ElemCopyType const*>(permuted_input) + input_idx * kCopyPerToken;
       *reinterpret_cast<ElemCopyType*>(rmem) = src_ptr[i];
-      TopKScaleType const scale = topk_scales[token_idx * top_k + k];
+      TopKScaleType const scale = topk_scales[expanded_idx];
 
 #pragma unroll
       for (int32_t j = 0; j < kElemPerCopy; j++) {
@@ -211,7 +213,7 @@ template <typename InputType, typename TopKScaleType>
 void moeUnpermute(InputType const* permuted_input, InputType* output,
                   int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales,
                   int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
-                  bool enable_pdl, cudaStream_t stream) {
+                  bool input_is_expanded, bool enable_pdl, cudaStream_t stream) {
   int32_t constexpr kThreadsPerBlock = 256;
   int32_t constexpr kElemPerCopy = elemPerCopy<InputType>();
   TLLM_CHECK_WITH_INFO(hidden_size % kElemPerCopy == 0, "hidden_size must be divisible by %d.",
@@ -233,15 +235,15 @@ void moeUnpermute(InputType const* permuted_input, InputType* output,
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(&config, kernel, permuted_input, output, expanded_idx_to_permuted_idx,
-                     topk_scales, hidden_size, top_k);
+                     topk_scales, hidden_size, top_k, input_is_expanded);
 }
 
-#define INSTANTIATE_MOE_UNPERMUTE(InputType, TopKScaleType)                                  \
-  template void moeUnpermute<InputType>(InputType const* permuted_input, InputType* output,  \
-                                        int32_t const* expanded_idx_to_permuted_idx,         \
-                                        TopKScaleType const* topk_scales,                    \
-                                        int32_t const num_tokens, int32_t const hidden_size, \
-                                        int32_t const top_k, bool enable_pdl, cudaStream_t stream)
+#define INSTANTIATE_MOE_UNPERMUTE(InputType, TopKScaleType)                          \
+  template void moeUnpermute<InputType>(                                             \
+      InputType const* permuted_input, InputType* output,                            \
+      int32_t const* expanded_idx_to_permuted_idx, TopKScaleType const* topk_scales, \
+      int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,      \
+      bool input_is_expanded, bool enable_pdl, cudaStream_t stream)
 
 INSTANTIATE_MOE_UNPERMUTE(half, float);
 INSTANTIATE_MOE_UNPERMUTE(half, half);
