@@ -57,6 +57,12 @@ family's envelope so callers can validate a configuration at init time.
 Decode-eligible is not required: shapes outside the decode envelope are
 served by prefill.
 
+DSv4 FP8 decode accepts any positive main-cache page size with aligned cache
+blocks. Other decode families, and every prefill variant, require 64-token
+main-cache pages -- so on a cache with a different page size the fallback
+above does not apply: only decode-eligible shapes are served, and a shape
+that would route to prefill reports a dispatch miss instead.
+
 Prefill kernels likewise take ``topk`` (the indices row width) as a runtime
 argument: any ``topk >= 1`` with ``topk % 64 == 0`` is served (whole 64-wide
 index tiles; the tail tile is not masked), with ``topk >= 513`` for
@@ -136,8 +142,7 @@ logger = logging.getLogger(__name__)
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
 _KV_CACHE_FORMATS = frozenset({"fp8", "nvfp4"})
 
-# Page block size the decode kernels are instantiated for (same constant for
-# both families; every instantiated kernel is pbs=64).
+# Default decode page sizes. DSv4 FP8 also has a runtime-page-size fallback.
 _DECODE_DSV4_PAGE_BLOCK_SIZE = 64
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
@@ -160,7 +165,8 @@ class SparseMLASm120DecodeConfig:
         GLM53_NOPE, ``576`` for DSv3.2 / GLM-NSA, ``1088`` for the
         DOTS3_SWA sliding-window family, whose ``d_v`` is then 1024).
     page_block_size : int
-        The only KV page block size the decode kernels are instantiated for.
+        Default KV page block size. This is the only supported size unless
+        ``page_block_size_is_runtime`` is true.
     max_num_tokens : int
         Largest ``num_tokens`` routed to the decode kernels (inclusive).
     topks : frozenset[int]
@@ -189,6 +195,10 @@ class SparseMLASm120DecodeConfig:
     extra_page_block_sizes : frozenset[int]
         Exact page sizes accepted by the optional secondary cache when the
         family has a finite set exposed here. Empty means unspecified.
+    page_block_size_is_runtime : bool
+        Whether any positive main-cache page size is accepted. The cache
+        origin and block stride must still be 16-byte aligned; odd DSv4
+        page sizes require padding between blocks to meet that constraint.
     """
 
     d_qk: int
@@ -202,6 +212,7 @@ class SparseMLASm120DecodeConfig:
     head_counts: Optional[frozenset[int]] = None
     topk_is_runtime: bool = True
     extra_page_block_sizes: frozenset[int] = frozenset()
+    page_block_size_is_runtime: bool = False
 
     def supported_num_heads(self) -> tuple[int, ...]:
         """Sorted instantiated head counts, including any runtime-H envelope."""
@@ -248,7 +259,11 @@ class SparseMLASm120DecodeConfig:
         )
         return (
             num_tokens <= self.max_num_tokens
-            and page_block_size == self.page_block_size
+            and (
+                page_block_size > 0
+                if self.page_block_size_is_runtime
+                else page_block_size == self.page_block_size
+            )
             and head_supported
             and topk_supported
         )
@@ -282,6 +297,8 @@ def supported_sparse_mla_sm120_configs(
     >>> import flashinfer
     >>> configs = flashinfer.mla.supported_sparse_mla_sm120_configs()
     >>> configs["dsv4"].supports_decode(num_heads=64, topk=256)
+    True
+    >>> configs["dsv4"].supports_decode(num_heads=8, topk=1152, page_block_size=32)
     True
     >>> nvfp4 = flashinfer.mla.supported_sparse_mla_sm120_configs(
     ...     kv_cache_format="nvfp4"
@@ -328,6 +345,7 @@ def supported_sparse_mla_sm120_configs(
             min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
             bytes_per_token=_BPT_DSV4,
+            page_block_size_is_runtime=True,
         ),
         "dsv3_2": dsv3_2,
         "glm_nsa": dsv3_2,
@@ -373,7 +391,12 @@ def _decode_dispatch_error_message(
             f"d_qk={d_qk} does not match the {family} decode family "
             f"(requires d_qk={config.d_qk})"
         )
-    if page_block_size != config.page_block_size:
+    if config.page_block_size_is_runtime and page_block_size <= 0:
+        reasons.append(f"page_block_size={page_block_size} must be positive")
+    elif (
+        not config.page_block_size_is_runtime
+        and page_block_size != config.page_block_size
+    ):
         reasons.append(
             f"page_block_size={page_block_size} is unsupported; decode kernels "
             f"are instantiated only for page_block_size={config.page_block_size}"
@@ -1530,6 +1553,9 @@ def sparse_mla_sm120_decode_dsv4(
         ``d_qk == 1088`` (DOTS3_SWA; d_v is then 1024).
     kv_cache : torch.Tensor
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
+        DSv4 accepts any positive page block size; DOTS3_SWA requires 64.
+        Cache origins and block strides must be 16-byte aligned. Odd DSv4
+        page sizes need padding between blocks, with token rows kept packed.
     indices : torch.Tensor
         ``[T, topk]`` int32. Any ``topk >= 1`` for DSV4 (any ``topk >= 513``
         for DOTS3_SWA: the 513-token sliding-window floor; tiled 32-wide, so

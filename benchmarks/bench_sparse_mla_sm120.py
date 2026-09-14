@@ -31,6 +31,7 @@
 Sweeps representative shapes:
 
 * DSv4   (d_qk=512, page_block_size=64, 584 B/token)
+* DSv4 main-cache page geometry (64-token specialization vs runtime pages)
 * DSv4 dual cache (fixed main cache + secondary cache)
 * DSv3.2 (d_qk=576, page_block_size=64, 656 B/token)
 
@@ -50,6 +51,7 @@ from flashinfer.utils import is_sm120a_supported
 
 _BPT_DSV4 = 584
 _PAGE_BLOCK_SIZE_DSV4 = 64
+_POOL_SLOTS = 1 << 20
 _D_QK_DSV4 = 512
 _D_V = 512
 _WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -135,15 +137,31 @@ def quantize_kv_dsv3_2(kv_bf16: torch.Tensor) -> torch.Tensor:
 # ── Benchmark one config ─────────────────────────────────────────────────────
 
 
-def bench_sparse_mla_sm120(num_heads, topk, num_tokens, with_sink=False, seed=0):
-    """Returns (median_us, kv_bw_gbps, attn_tflops)."""
+def bench_sparse_mla_sm120(
+    num_heads, topk, num_tokens, with_sink=False, seed=0, page_block_size=None
+):
+    """Returns (median_us, kv_bw_gbps, attn_tflops).
+
+    ``page_block_size`` defaults to the 64-token layout compiled into the
+    decode kernel. Any other even value exercises the runtime-page
+    instantiation on the same pool footprint, so the two are comparable;
+    odd sizes are excluded because 584 B/token leaves their packed blocks
+    only 8B-aligned, which the caller would have to pad.
+    """
     torch.manual_seed(seed)
     device = torch.device("cuda")
     d_qk, d_v = _D_QK_DSV4, _D_V
-    page_block_size = _PAGE_BLOCK_SIZE_DSV4
+    if page_block_size is None:
+        page_block_size = _PAGE_BLOCK_SIZE_DSV4
+    if page_block_size % 2:
+        raise ValueError(
+            f"page_block_size={page_block_size} leaves blocks 8B-aligned; "
+            "the benchmark does not pad between blocks"
+        )
     # Pool ≫ L2 (~96 MB on SM120) so random topk indices land in DRAM.
-    # 16384 × 64 × 584 B ≈ 612 MB.
-    num_blocks = 16384
+    # Slot count is held at 1 M across page sizes (≈ 612 MB) so latency
+    # differences are the page arithmetic, not a different DRAM footprint.
+    num_blocks = _POOL_SLOTS // page_block_size
     s_kv = num_blocks * page_block_size  # = 1 M slots
 
     kv_bf16 = (
@@ -501,6 +519,32 @@ if __name__ == "__main__":
         print(
             f"{h:>10}  {k_extra:>10}  {t:>11}  {extra_pbs:>9}  "
             f"{extra_len_label:>9}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
+        )
+
+    # Main-cache page geometry. The 64-token rows run the compiled-in
+    # specialization, every other page size the runtime-page instantiation;
+    # the KV pool holds 1 M slots either way, so a row-to-row difference is
+    # the page arithmetic alone. topk=1152 is the DeepSeek-V4.1-Flash width
+    # (2 * index_topk + the 128-token window).
+    page_geometry_configs = [
+        (h, k, t, pbs)
+        for h, k, t in ((8, 1152, 16), (8, 1152, 64), (64, 512, 16), (128, 256, 16))
+        for pbs in (64, 32, 16)
+    ]
+    page_header = (
+        f"{'num_heads':>10}  {'topk':>6}  {'num_tokens':>11}  {'page':>6}  "
+        f"{'lat (us)':>10}  {'kv BW (GB/s)':>13}  {'attn TFLOPs':>12}"
+    )
+
+    print()
+    print("DSv4 decode-dsv4 main-cache page geometry (page=64 is compiled in):")
+    print(page_header)
+    print("-" * len(page_header))
+    for h, k, t, pbs in page_geometry_configs:
+        lat_us, kvbw, tfl = bench_sparse_mla_sm120(h, k, t, page_block_size=pbs)
+        print(
+            f"{h:>10}  {k:>6}  {t:>11}  {pbs:>6}  {lat_us:>10.1f}  "
+            f"{kvbw:>13.1f}  {tfl:>12.2f}"
         )
 
     # DSv3.2 decode-dsv3_2: topk fixed at 2048, page_block_size=1, 656 B/token.
