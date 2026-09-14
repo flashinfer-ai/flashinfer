@@ -160,6 +160,34 @@ def _verify_modules(root: Path, modules: list[dict[str, Any]]) -> set[str]:
     return names
 
 
+_B1_Q6_S76_BINDING: dict[str, Any] = {
+    "name": "b1_q6_s76",
+    "batch_size": 1,
+    "q_len": 6,
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "num_kv_splits": 76,
+    "write_lse": False,
+    "ordered": True,
+    "grid": [76, 2, 1],
+    "workspace_parts": 76,
+    "total_tiles": 1,
+    "scratch_layout": {
+        "schema": "peer_split_major_padded128_pair_stats_v21",
+        "partial_o_elements_per_batch": 4980736,
+        "partial_stats_elements_per_batch": 38912,
+        "kv_groups": 2,
+        "splits": 76,
+        "padded_rows": 128,
+        "live_rows": 96,
+        "head_dim": 256,
+        "stats_fields": ["raw_max", "sum"],
+        "partial_o_dtype": "bfloat16",
+        "partial_stats_dtype": "float32",
+    },
+}
+
+
 @functools.cache
 def get_cake_fmha_request_ordered_manifest(
     num_q_heads: int = 8, num_kv_heads: int = 1
@@ -174,7 +202,13 @@ def get_cake_fmha_request_ordered_manifest(
     _require(payload.get("schema") == _SCHEMA, "schema")
     _require(payload.get("target") == "sm_103a", "target")
     _require(payload.get("shape_count") == 43, "shape_count")
-    _require(payload.get("module_count") == 13, "module_count")
+    supplemental = payload.get("supplemental_bindings", [])
+    _require(isinstance(supplemental, list), "supplemental_bindings")
+    _require(
+        len(supplemental) in ((0, 1) if suffix else (0,)), "supplemental_bindings count"
+    )
+    module_count = 13 + len(supplemental)
+    _require(payload.get("module_count") == module_count, "module_count")
     expected_contract = dict(
         _CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
     )
@@ -185,9 +219,17 @@ def get_cake_fmha_request_ordered_manifest(
     _require(payload.get("contract") == expected_contract, "contract")
     modules = payload.get("modules")
     routes = payload.get("routes")
-    _require(isinstance(modules, list) and len(modules) == 13, "modules")
+    _require(isinstance(modules, list) and len(modules) == module_count, "modules")
     _require(isinstance(routes, list) and len(routes) == 43, "routes")
     names = _verify_modules(root, modules)
+    for binding in supplemental:
+        _require(isinstance(binding, dict), "supplemental binding")
+        _require(binding.get("module_name") in names, "supplemental module_name")
+        _require(
+            {key: value for key, value in binding.items() if key != "module_name"}
+            == _B1_Q6_S76_BINDING,
+            "supplemental B1/Q6/S76 binding",
+        )
     route_names: set[str] = set()
     for index, route in enumerate(routes):
         _require(isinstance(route, dict), f"routes[{index}]")

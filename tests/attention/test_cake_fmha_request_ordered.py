@@ -409,6 +409,53 @@ def test_request_ordered_explicit_split_graph_permutations(
     )
 
 
+def test_b1_q6_s76_plan_and_exact_scratch() -> None:
+    kwargs = dict(num_q_heads=32, num_kv_heads=2)
+    default = cake_api.plan_cake_fmha_request_ordered_paged_decode(
+        (136193,), 6, **kwargs
+    )
+    assert default.workspace_parts == 1
+    wide = cake_api.plan_cake_fmha_request_ordered_paged_decode(
+        (136193,), 6, num_kv_splits=6, **kwargs
+    )
+    assert wide.module_name.endswith("6c47e3e71cb98a8c1ee1")
+    plan = cake_api.plan_cake_fmha_request_ordered_paged_decode(
+        (136193,), 6, num_kv_splits=76, **kwargs
+    )
+    assert plan.grid == (76, 2, 1) and plan.total_tiles == 1
+    assert plan.write_lse is False and cake_api._is_authenticated_request_ordered_plan(
+        plan
+    )
+    partial_o_bytes, partial_stats_bytes = (
+        cake_api._request_ordered_partial_workspace_bytes(plan)
+    )
+    assert (partial_o_bytes, partial_stats_bytes) == (9961472, 155648)
+    assert (32 << 20) + partial_o_bytes + partial_stats_bytes == 43671552
+    with pytest.raises(ValueError, match="split"):
+        cake_api.plan_cake_fmha_request_ordered_paged_decode(
+            (136193,), 6, num_kv_splits=76, write_lse=True, **kwargs
+        )
+    with pytest.raises(ValueError, match="split"):
+        cake_api.plan_cake_fmha_request_ordered_paged_decode(
+            (136193, 136193), 6, num_kv_splits=76, **kwargs
+        )
+
+
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", (True, False))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_b1_q6_s76_exact_scratch_graph(uses_shared_paged_kv_idx: bool) -> None:
+    _check_request_ordered_graph_permutations(
+        uses_shared_paged_kv_idx,
+        6,
+        32,
+        2,
+        batch_size=1,
+        num_kv_splits=76,
+        write_lse=False,
+        candidate_workspace_bytes=43671552,
+    )
+
+
 def _check_request_ordered_graph_permutations(
     uses_shared_paged_kv_idx: bool,
     q_len: int,
@@ -418,6 +465,7 @@ def _check_request_ordered_graph_permutations(
     batch_size: int = 4,
     num_kv_splits: int | None = None,
     write_lse: bool = True,
+    candidate_workspace_bytes: int | None = None,
 ) -> None:
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("request-ordered Cake FMHA requires SM103")
@@ -472,7 +520,11 @@ def _check_request_ordered_graph_permutations(
     )
     bmm2_scale = torch.ones(1, dtype=torch.float32, device=device)
     reference_workspace = torch.empty(64 << 20, dtype=torch.uint8, device=device)
-    candidate_workspace = torch.empty_like(reference_workspace)
+    candidate_workspace = (
+        torch.empty_like(reference_workspace)
+        if candidate_workspace_bytes is None
+        else torch.empty(candidate_workspace_bytes, dtype=torch.uint8, device=device)
+    )
     reference_out = torch.empty_like(query)
     reference_lse = torch.empty(query.shape[:-1], dtype=torch.float32, device=device)
     candidate_out = torch.empty_like(query)

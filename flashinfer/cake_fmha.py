@@ -198,6 +198,65 @@ def _dynamic_fused_q6_cake_fmha_request_ordered_plan(
     )
 
 
+def _supplemental_b1_q6_cake_fmha_request_ordered_plan(
+    *,
+    batch_size: int,
+    q_len: int,
+    num_kv_splits: int,
+    write_lse: bool,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> CakeFmhaRequestOrderedDecodePlan | None:
+    if (batch_size, q_len, num_kv_splits, num_q_heads, num_kv_heads) != (
+        1,
+        6,
+        76,
+        32,
+        2,
+    ) or write_lse:
+        return None
+    manifest = get_cake_fmha_request_ordered_manifest(32, 2)
+    bindings = manifest.get("supplemental_bindings", [])
+    if not bindings:
+        return None
+    binding = bindings[0]
+    return CakeFmhaRequestOrderedDecodePlan(
+        module_name=binding["module_name"],
+        batch_size=1,
+        q_len=6,
+        workspace_parts=binding["workspace_parts"],
+        grid=tuple(binding["grid"]),
+        total_tiles=binding["total_tiles"],
+        write_lse=False,
+        num_q_heads=32,
+        num_kv_heads=2,
+    )
+
+
+def _request_ordered_partial_workspace_bytes(
+    plan: CakeFmhaRequestOrderedDecodePlan,
+) -> tuple[int, int]:
+    """Resolve partial storage from the authenticated module's scratch schema."""
+    if (
+        plan.batch_size,
+        plan.q_len,
+        plan.workspace_parts,
+        plan.num_q_heads,
+        plan.num_kv_heads,
+    ) == (1, 6, 76, 32, 2):
+        for binding in get_cake_fmha_request_ordered_manifest(32, 2).get(
+            "supplemental_bindings", []
+        ):
+            if binding["module_name"] == plan.module_name:
+                scratch = binding["scratch_layout"]
+                return (
+                    scratch["partial_o_elements_per_batch"] * 2,
+                    scratch["partial_stats_elements_per_batch"] * 4,
+                )
+    rows = plan.batch_size * plan.q_len * plan.num_q_heads * plan.workspace_parts
+    return rows * 256 * 2, rows * 4
+
+
 def _dynamic_split_cake_fmha_request_ordered_plan(
     *,
     batch_size: int,
@@ -208,6 +267,16 @@ def _dynamic_split_cake_fmha_request_ordered_plan(
     num_kv_heads: int,
 ) -> CakeFmhaRequestOrderedDecodePlan | None:
     """Bind an exported split schedule using its own launch topology."""
+    supplemental = _supplemental_b1_q6_cake_fmha_request_ordered_plan(
+        batch_size=batch_size,
+        q_len=q_len,
+        num_kv_splits=num_kv_splits,
+        write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+    if supplemental is not None:
+        return supplemental
     matches = []
     for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
         "routes"
@@ -652,9 +721,9 @@ def _run_cake_fmha_request_ordered_paged_decode(
                 "int32/uint32 multi_ctas_kv_counter_buffer with batch*q_len*(num_q_heads/8) elements"
             )
         completion = completion_buffer[:completion_elems].view(torch.uint32)
-        rows = batch_size * q_len * plan.num_q_heads * plan.workspace_parts
-        partial_o_bytes = rows * 256 * 2
-        partial_lse_bytes = rows * 4
+        partial_o_bytes, partial_lse_bytes = _request_ordered_partial_workspace_bytes(
+            plan
+        )
         cursor = 32 * 1024 * 1024
         required = cursor + partial_o_bytes + partial_lse_bytes
         if workspace_buffer.numel() < required:

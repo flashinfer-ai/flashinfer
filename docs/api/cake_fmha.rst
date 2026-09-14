@@ -94,3 +94,12 @@ The same implementation can also be selected on the existing APIs with
         max_kv_len,
         backend="cake",
     )
+
+Single-request six-query split route
+------------------------------------
+
+For one request with six query tokens, 32 query heads, two KV heads,
+head dimension 256 and page size 64, explicitly setting ``num_kv_splits=76``
+selects the O-only split route. This route requires at least 43,671,552 bytes
+in ``workspace_buffer`` and the existing separate 24-element completion buffer.
+The default route and LSE-returning routes are unchanged.

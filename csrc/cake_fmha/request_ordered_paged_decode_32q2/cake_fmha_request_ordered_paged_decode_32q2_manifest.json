@@ -21,7 +21,7 @@
     "request_order": "optional_device_int32",
     "softmax_accumulation_dtype": "float32"
   },
-  "module_count": 13,
+  "module_count": 14,
   "modules": [
     {
       "arch": "sm_103a",
@@ -242,6 +242,23 @@
       "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_edb71cb601b1282bd14a",
       "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_edb71cb601b1282bd14a_sm_103a",
       "name": "cake_fmha_request_ordered_paged_decode_32q2_edb71cb601b1282bd14a",
+      "tma_workspace_bytes": 384
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_32q2_00be11bfbf2ea504e0aa",
+      "arch": "sm_103a",
+      "closure_sha256": "070c97371943903651dc878c70ae907b59756521299523d6ab43ebd2d93f3d35",
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_00be11bfbf2ea504e0aa_kernel.cu",
+      "device_sha256": "4ce7e5dae7d334399316ab3adc698db328af34918593bb4a44cc5512a2c01fda",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_00be11bfbf2ea504e0aa_binding.cpp",
+      "binding_sha256": "b80ebec7fe774dbb7e8c5efc9505af5a74d96f954ed9c04ab9c3af9047cd6861",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_00be11bfbf2ea504e0aa_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_00be11bfbf2ea504e0aa",
+      "ffi_entry": "run",
+      "compile_options": [
+        "--use_fast_math"
+      ],
       "tma_workspace_bytes": 384
     }
   ],
@@ -12806,5 +12823,41 @@
   ],
   "schema": "flashinfer.cake_fmha_request_ordered_paged_decode.v1",
   "shape_count": 43,
-  "target": "sm_103a"
+  "target": "sm_103a",
+  "supplemental_bindings": [
+    {
+      "name": "b1_q6_s76",
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_00be11bfbf2ea504e0aa",
+      "batch_size": 1,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "num_kv_splits": 76,
+      "write_lse": false,
+      "ordered": true,
+      "grid": [
+        76,
+        2,
+        1
+      ],
+      "workspace_parts": 76,
+      "total_tiles": 1,
+      "scratch_layout": {
+        "schema": "peer_split_major_padded128_pair_stats_v21",
+        "partial_o_elements_per_batch": 4980736,
+        "partial_stats_elements_per_batch": 38912,
+        "kv_groups": 2,
+        "splits": 76,
+        "padded_rows": 128,
+        "live_rows": 96,
+        "head_dim": 256,
+        "stats_fields": [
+          "raw_max",
+          "sum"
+        ],
+        "partial_o_dtype": "bfloat16",
+        "partial_stats_dtype": "float32"
+      }
+    }
+  ]
 }
