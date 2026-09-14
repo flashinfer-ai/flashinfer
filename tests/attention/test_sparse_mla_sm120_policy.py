@@ -142,6 +142,18 @@ def recorded_candidates(
     return frozenset(ORDINARY_CANDIDATES[model, heads, topk, page, dual])
 
 
+def test_wrapper_construction_does_not_load_module(monkeypatch):
+    """Constructing the wrapper must not build or load the JIT module."""
+    block_module_loading(monkeypatch)
+    from flashinfer.mla._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
+
+    _SparseMLAPagedAttentionRunner()
+    _SparseMLAPagedAttentionRunner(kv_cache_format="nvfp4")
+    _SparseMLAPagedAttentionRunner(
+        kv_scale_format="ue8m0_g32", extra_kv_fp4=True, compute_precision="bf16"
+    )
+
+
 def test_supported_configs_families() -> None:
     """The query API mirrors the decode dispatch envelopes exactly."""
     configs = supported_sparse_mla_sm120_configs()
