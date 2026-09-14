@@ -164,7 +164,7 @@ class Mapping(object):
             )
 
         if auto_parallel:
-            if tp_size != 1 or pp_size != 1 or tp_size != 1:
+            if tp_size != 1 or pp_size != 1 or cp_size != 1:
                 raise ValueError(
                     f"When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, but got {tp_size}, {pp_size}, {cp_size}."
                 )
