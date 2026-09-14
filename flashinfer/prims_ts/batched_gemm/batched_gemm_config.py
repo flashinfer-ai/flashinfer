@@ -1460,8 +1460,9 @@ class BatchedGemmConfig:
         ``epi_tile_n`` stripe in its C scratch stage before issuing TMA. A
         swizzled TMA box may span at most 128 contiguous bytes, so a wider
         stripe is emitted as multiple stores sized for the output element
-        width. Other schedules retain the conservative single-fragment
-        staging width.
+        width. Other schedules retain the conservative staging width unless
+        one T2R fragment is wider, in which case the row and TMA box must cover
+        the complete fragment.
         """
         if (
             self.use_tile256_tmem_overlap
@@ -1470,7 +1471,8 @@ class BatchedGemmConfig:
         ):
             max_swizzled_cols = 128 * 8 // self.dtype_c_bits
             return min(self.epi_tile_n, max_swizzled_cols)
-        return min(16, max(8, self.tile_n))
+        fragment_cols = max(1, self.epi_tile_n // 4)
+        return max(fragment_cols, min(16, max(8, self.tile_n)))
 
     @property
     def non_swap_tmem_load_num_regs(self) -> int:
