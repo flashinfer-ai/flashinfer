@@ -26,6 +26,7 @@ configuration.  They group related tensors for ergonomics (no more counting
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 import math
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
@@ -1733,28 +1734,18 @@ class MoEConfig:
 def _tensor_summary(value: Any) -> str:
     """Shape/dtype/device summary of a tensor; ``repr`` for anything else.
 
-    The packs define ``__repr__`` in terms of this instead of inheriting the
-    dataclass default, which would call ``repr()`` on each tensor field. Tensor
-    ``repr`` prints *values*, which forces a device-to-host copy.
-
-    That matters because the packs are the arguments of ``MoELayer.__call__``,
-    which is decorated with ``@flashinfer_api``. The API-logging helpers
-    deliberately avoid ``str``/``repr`` on tensor-bearing containers -- see the
-    comment above the ``list``/``tuple``/``dict`` branches of
-    ``_serialize_value`` in ``flashinfer/api_logging.py``: "Do not call
-    str()/repr() on containers that may hold CUDA tensors. Tensor repr can read
-    device data and invalidate CUDA graph capture." Those guards are keyed on
-    the concrete container types, so a *dataclass* holding CUDA tensors falls
-    through to the generic ``repr`` fallback in both ``_format_value`` (level 3+
-    logging) and ``_serialize_value`` (level-10 dump metadata). Giving the packs
-    a metadata-only ``__repr__`` closes that hole at the source, for every
-    consumer, rather than special-casing two pack types inside the shared
-    logger.
+    The packs define ``__repr__`` in terms of this rather than inheriting the
+    dataclass default, which would call ``repr()`` on each tensor field and so
+    read device memory. That matters because the packs are the arguments of
+    ``MoELayer.__call__``, which is decorated with ``@flashinfer_api``; see
+    ``_serialize_value`` in ``flashinfer/api_logging.py`` for why tensor-bearing
+    containers must not be stringified, and the Release Gates section of
+    ``docs/design_docs/flashinfer_moe_api.md`` for the decision to fix it here
+    rather than special-case the pack types inside the shared logger.
 
     Non-tensor values are rendered with ``repr`` rather than assumed to have
-    ``.shape``: ``MoEWeightPack.prepare_for`` is public and its views are
-    caller-built, and a ``__repr__`` that raises turns an unrelated pytest
-    assertion or debugger inspection into a confusing ``AttributeError``.
+    ``.shape``: a ``__repr__`` that raises turns an unrelated pytest assertion
+    or debugger inspection into a confusing ``AttributeError``.
     """
     if value is None:
         return "None"
@@ -1998,10 +1989,17 @@ class MoEWeightPack:
         return self.native_views[backend_key]
 
     def __repr__(self) -> str:
+        def _view_summary(view: Any) -> str:
+            # ``prepare_for`` stores whatever it is handed and ``native_views``
+            # is public, so a view is not guaranteed to be a mapping. Fall back
+            # rather than raise: a ``__repr__`` that throws turns an unrelated
+            # debugger inspection or pytest assertion into an AttributeError.
+            if not isinstance(view, Mapping):
+                return _tensor_summary(view)
+            inner = ", ".join(f"{n}: {_tensor_summary(t)}" for n, t in view.items())
+            return "{" + inner + "}"
+
         views = ", ".join(
-            f"{key!r}: {{"
-            + ", ".join(f"{n}: {_tensor_summary(t)}" for n, t in view.items())
-            + "}"
-            for key, view in self.native_views.items()
+            f"{key!r}: {_view_summary(view)}" for key, view in self.native_views.items()
         )
         return f"MoEWeightPack(native_views={{{views}}})"

@@ -352,7 +352,6 @@ class TestAPILogging:
             with open(log_file, "r") as f:
                 log_contents = f.read()
 
-            assert "Wrapper" not in "MoELayer"  # guards the premise of this test
             assert "MoELayer.__call__" in log_contents
             assert "NotOnTheAllowList.__call__" not in log_contents
         finally:
