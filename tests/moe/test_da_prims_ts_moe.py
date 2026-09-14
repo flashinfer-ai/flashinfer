@@ -9,15 +9,22 @@ import torch
 from benchmarks.bench_moe_da import (
     BenchmarkShape,
     _benchmark_precision,
+    _canonical_inputs,
     _matching_diagnostic,
     _prepare_precision,
     _realization,
     _temporary_environment,
 )
 from flashinfer.autotuner import autotune
+from flashinfer.fused_moe import (
+    TrtllmFp8PerTensorConfig,
+    trtllm_fp8_per_tensor_scale_moe,
+)
 from flashinfer.fused_moe.da_tuner import RoutingRealizationFactory
 from flashinfer.fused_moe.da_runtime import _stable_runner_identity
+from flashinfer.prims_ts.moe import runner as runner_module
 from flashinfer.prims_ts.utils import is_prims_ts_available
+from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 
@@ -44,6 +51,132 @@ def test_da_runner_identity_excludes_process_local_module_repr():
 
     assert first == second
     assert json.loads(first)["fields"]["moe_op"].endswith("._ProcessLocalModule")
+
+
+@pytest.mark.parametrize("backend", ("trtllm", "prims_ts"))
+def test_from_logits_da_rejects_mismatched_token_counts(monkeypatch, backend):
+    """Both public DA backends reject logits and activations with different M."""
+    if not torch.cuda.is_available():
+        pytest.skip("FromLogits DA requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("This FromLogits DA test requires SM100 or SM103")
+    if backend == "prims_ts" and not is_prims_ts_available():
+        pytest.skip("PrimsTS dependencies are unavailable")
+
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
+    shape = BenchmarkShape(
+        num_tokens=8,
+        num_experts=32,
+        local_num_experts=32,
+        local_expert_offset=0,
+        top_k=4,
+        hidden_size=1024,
+        intermediate_size=1024,
+        n_group=1,
+        topk_group=1,
+        tune_max_num_tokens=8,
+    )
+    if backend == "prims_ts":
+        prepared = _prepare_precision(
+            "nvfp4", shape, backend=backend, routing_input_mode="logits"
+        )
+        assert prepared.routing_logits is not None
+        prepared.routing_logits.resize_(shape.num_tokens + 1, shape.num_experts)
+        invoke = prepared.invoke
+    else:
+        hidden, w1, w2, _, _ = _canonical_inputs(shape)
+        input_scale = torch.tensor(1.0, device=hidden.device)
+        intermediate_scale = torch.tensor(1.0, device=hidden.device)
+        hidden_q, _ = TrtllmFp8PerTensorConfig.prepare_activations(
+            hidden, hidden_states_scale_global=input_scale
+        )
+        view = TrtllmFp8PerTensorConfig.prepare_weights(
+            w1,
+            w2,
+            hidden_states_scale_global=input_scale,
+            intermediate_scale_global=intermediate_scale,
+            num_local_experts=shape.local_num_experts,
+            hidden_size=shape.hidden_size,
+            intermediate_size=shape.intermediate_size,
+            device=hidden.device,
+        )
+        routing_logits = torch.empty(
+            shape.num_tokens + 1,
+            shape.num_experts,
+            device=hidden.device,
+            dtype=torch.bfloat16,
+        )
+
+        def invoke():
+            return trtllm_fp8_per_tensor_scale_moe(
+                routing_logits=routing_logits,
+                routing_bias=None,
+                hidden_states=hidden_q,
+                gemm1_weights=view["gemm1_weights"],
+                output1_scales_scalar=view["output1_scales_scalar"],
+                output1_scales_gate_scalar=view["output1_scales_gate_scalar"],
+                gemm2_weights=view["gemm2_weights"],
+                output2_scales_scalar=view["output2_scales_scalar"],
+                num_experts=shape.num_experts,
+                top_k=shape.top_k,
+                n_group=None,
+                topk_group=None,
+                intermediate_size=shape.intermediate_size,
+                local_expert_offset=shape.local_expert_offset,
+                local_num_experts=shape.local_num_experts,
+                routed_scaling_factor=1.0,
+                use_routing_scales_on_input=False,
+                routing_method_type=RoutingMethodType.Renormalize.value,
+                output=torch.empty_like(hidden),
+                tune_max_num_tokens=shape.tune_max_num_tokens,
+            )
+
+    with pytest.raises(ValueError, match="same number of tokens"):
+        invoke()
+
+
+def test_ordinary_mxfp8_pads_hidden_scale_once(monkeypatch):
+    """Ordinary MXFP8 reuses the scale buffer populated during routing."""
+    if not torch.cuda.is_available():
+        pytest.skip("PrimsTS MXFP8 requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("This PrimsTS MXFP8 test requires SM100 or SM103")
+    if not is_prims_ts_available():
+        pytest.skip("PrimsTS dependencies are unavailable")
+
+    shape = BenchmarkShape(
+        num_tokens=32,
+        num_experts=32,
+        local_num_experts=32,
+        local_expert_offset=0,
+        top_k=4,
+        hidden_size=1024,
+        intermediate_size=1024,
+        n_group=1,
+        topk_group=1,
+        tune_max_num_tokens=32,
+    )
+    prepared = _prepare_precision("mxfp8", shape, backend="prims_ts")
+    expert_ids, routing_weights = _realization(
+        RoutingRealizationFactory(), shape, "uniform"
+    )
+    prepared.stage(expert_ids, routing_weights)
+    original = runner_module._pad_mxfp8_linear_scale_for_prims
+    call_count = 0
+
+    def count_padding(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        runner_module, "_pad_mxfp8_linear_scale_for_prims", count_padding
+    )
+    monkeypatch.setenv("FLASHINFER_DIST_AWARE_AUTOTUNE", "0")
+    prepared.invoke()
+    torch.cuda.synchronize()
+
+    assert call_count == 1
 
 
 @pytest.mark.parametrize("routing_input_mode", ("routed", "logits"))

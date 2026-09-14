@@ -353,7 +353,7 @@ def _pad_mxfp8_linear_scale_for_prims(
             "MXFP8 hidden_states_scale is too small: "
             f"need at least {sf_cols} scale bytes per token, got {src.shape[1]}"
         )
-    if src.shape[1] == padded_cols and src.is_contiguous():
+    if output is None and src.shape[1] == padded_cols and src.is_contiguous():
         return src
 
     padded = output
@@ -361,6 +361,13 @@ def _pad_mxfp8_linear_scale_for_prims(
         padded = torch.empty(
             (int(num_tokens), padded_cols), dtype=torch.uint8, device=scale.device
         )
+    elif tuple(padded.shape) != (int(num_tokens), padded_cols):
+        raise ValueError(
+            "MXFP8 padded scale output has the wrong shape: "
+            f"expected {(int(num_tokens), padded_cols)}, got {tuple(padded.shape)}"
+        )
+    if padded.data_ptr() == src.data_ptr():
+        return padded
     padded.fill_(0x7F)
     padded[:, :sf_cols].copy_(src[:, :sf_cols])
     return padded
@@ -544,6 +551,7 @@ class _PrimsTsMoERunnerMixin(Generic[BodyWorkspaceT]):
         )
 
     def set_cache_key_static_extras(self, **kwargs: Any) -> None:
+        """Freeze keyword-derived properties that partition this runner's cache."""
         fc1_per_channel_weight_scale, fc2_per_channel_weight_scale = (
             _split_per_channel_weight_scale_from_kwargs(kwargs)
         )
@@ -3032,10 +3040,18 @@ class PrimsTsFp8BlockScaleMoERunner(
                     gemm2_output,
                 )
             else:
+                padded_output = None
+                if do_preparation:
+                    padded_output = torch.empty(
+                        (num_tokens, round_up(self.hidden_size // 32, 16)),
+                        dtype=torch.uint8,
+                        device=moe_inputs.hidden_states_scale.device,
+                    )
                 padded_scale = _pad_mxfp8_linear_scale_for_prims(
                     moe_inputs.hidden_states_scale,
                     num_tokens=num_tokens,
                     hidden_size=self.hidden_size,
+                    output=padded_output,
                 )
                 workspace = PrimsTsMxfp8BodyWorkspace(
                     gemm1_output,
@@ -3087,12 +3103,14 @@ class PrimsTsFp8BlockScaleMoERunner(
         fc2_cfg = pair.fc2.cfg.build()
         hidden_states_scale_for_gemm = moe_inputs.hidden_states_scale
         if self.fp8_quantization_type == Fp8QuantizationType.MxFp8:
-            hidden_states_scale_for_gemm = _pad_mxfp8_linear_scale_for_prims(
-                moe_inputs.hidden_states_scale,
-                num_tokens=num_tokens,
-                hidden_size=self.hidden_size,
-                output=body_workspace.hidden_states_scale_padded,
-            )
+            hidden_states_scale_for_gemm = body_workspace.hidden_states_scale_padded
+            if body_source.preallocated:
+                hidden_states_scale_for_gemm = _pad_mxfp8_linear_scale_for_prims(
+                    moe_inputs.hidden_states_scale,
+                    num_tokens=num_tokens,
+                    hidden_size=self.hidden_size,
+                    output=hidden_states_scale_for_gemm,
+                )
             activation_output = gemm1_output
             activation_output_scale = gemm1_output_scale
         if do_preparation:

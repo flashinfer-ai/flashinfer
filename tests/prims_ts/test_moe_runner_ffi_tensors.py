@@ -15,6 +15,7 @@
 import ast
 import inspect
 
+import pytest
 import torch
 import tvm_ffi
 
@@ -27,9 +28,46 @@ from flashinfer.prims_ts.moe.runner import (
     PrimsTsBf16MoERunner,
     PrimsTsMxfp4Mxfp8MoERunner,
     _moe_topk_ids_init_for_routing,
+    _pad_mxfp8_linear_scale_for_prims,
     _routed_token_capacity,
     _torch_views_of_ffi_tensors,
 )
+
+
+def test_mxfp8_padding_honors_explicit_output_for_already_padded_input():
+    source = torch.arange(32, dtype=torch.uint8).view(2, 16)
+    output = torch.empty_like(source)
+
+    actual = _pad_mxfp8_linear_scale_for_prims(
+        source, num_tokens=2, hidden_size=512, output=output
+    )
+
+    assert actual is output
+    assert actual.data_ptr() != source.data_ptr()
+    torch.testing.assert_close(actual, source)
+
+    source.add_(1)
+    _pad_mxfp8_linear_scale_for_prims(
+        source, num_tokens=2, hidden_size=512, output=output
+    )
+    torch.testing.assert_close(output, source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_mxfp8_padding_replay_refreshes_caller_owned_output():
+    source = torch.arange(32, device="cuda", dtype=torch.uint8).view(2, 16)
+    output = torch.empty_like(source)
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        _pad_mxfp8_linear_scale_for_prims(
+            source, num_tokens=2, hidden_size=512, output=output
+        )
+
+    source.add_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, source)
 
 
 def test_cache_key_extras_are_invariant_to_synthesized_placeholders():

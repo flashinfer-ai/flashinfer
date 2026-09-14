@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 from collections.abc import Callable
 from dataclasses import replace
@@ -50,6 +51,10 @@ from tests.moe.da_acceptance_utils import (
     require_sm100,
     run_matched_public_graphs,
 )
+
+
+_CUDA_SUCCESS = 0
+_CUDA_GRAPH_NODE_TYPE_KERNEL = 0
 
 
 # Shared-plan capture ownership
@@ -124,19 +129,39 @@ def _assert_routing_metadata_slots_bit_exact(actual, expected) -> None:
     )
 
 
-def _minimum_average_cuda_time_ms(invoke, *, iterations: int = 100) -> float:
-    """Return the least-contended average CUDA-event time across five trials."""
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    samples = []
-    for _ in range(5):
-        start.record()
-        for _ in range(iterations):
-            invoke()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) / iterations)
-    return min(samples)
+def _capture_kernel_node_count(invoke) -> int:
+    """Capture one invocation and count kernel nodes without timing it."""
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        invoke()
+
+    raw_graph = getattr(graph, "raw_cuda_graph", None)
+    if raw_graph is None:
+        pytest.skip("This PyTorch build does not expose raw CUDA Graph handles")
+    graph_handle = ctypes.c_void_p(int(raw_graph()))
+    cudart = ctypes.CDLL("libcudart.so")
+    get_nodes = cudart.cudaGraphGetNodes
+    get_nodes.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    get_nodes.restype = ctypes.c_int
+    get_node_type = cudart.cudaGraphNodeGetType
+    get_node_type.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+    get_node_type.restype = ctypes.c_int
+
+    node_count = ctypes.c_size_t()
+    assert get_nodes(graph_handle, None, ctypes.byref(node_count)) == _CUDA_SUCCESS
+    nodes = (ctypes.c_void_p * node_count.value)()
+    assert get_nodes(graph_handle, nodes, ctypes.byref(node_count)) == _CUDA_SUCCESS
+    kernel_count = 0
+    for node in nodes:
+        node_type = ctypes.c_int()
+        assert get_node_type(node, ctypes.byref(node_type)) == _CUDA_SUCCESS
+        kernel_count += node_type.value == _CUDA_GRAPH_NODE_TYPE_KERNEL
+    graph.reset()
+    return kernel_count
 
 
 # Fused routing capacity and exactness
@@ -219,10 +244,41 @@ def test_fused_multi_tile_routing_matches_independent_tiles_at_capacity_boundari
         _assert_routing_metadata_slots_bit_exact(actual, expected)
 
 
-def test_fused_multi_tile_routing_beats_independent_launches(
-    record_property,
-) -> None:
-    """One exported fused population call must beat three independent tile launches."""
+def test_long_multi_tile_routing_handles_local_and_nonlocal_experts() -> None:
+    """The extended-capacity permutation pass must ignore a nonlocal route."""
+    require_sm100()
+    num_tokens = 2049
+    local_expert_offset = 112
+    num_local_experts = 56
+    expert_ids = torch.empty((num_tokens, 2), device="cuda", dtype=torch.int32)
+    expert_ids[:, 0] = local_expert_offset
+    expert_ids[:, 1] = 0
+    routing_weights = torch.full(
+        (num_tokens, 2), 0.5, device="cuda", dtype=torch.bfloat16
+    )
+
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        expert_ids,
+        num_experts=256,
+        top_k=2,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+        tile_ns=(8,),
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        topk_weights=routing_weights,
+    )
+    populate_trtllm_moe_routing_metadata_(metadata, expert_ids, routing_weights)
+    torch.cuda.synchronize()
+
+    expanded = metadata.slots[0].expanded_idx_to_permuted_idx.view(num_tokens, 2)
+    assert torch.all(expanded[:, 0] >= 0)
+    assert torch.all(expanded[:, 1] == -1)
+    assert metadata.slots[0].num_tokens_per_expert[local_expert_offset] == num_tokens
+    assert metadata.slots[0].num_tokens_per_expert[0] == 0
+
+
+def test_fused_multi_tile_routing_uses_one_kernel_node() -> None:
+    """Fused population captures one kernel instead of one kernel per tile."""
     require_sm100()
     num_tokens = 8192
     num_experts = 256
@@ -240,7 +296,7 @@ def test_fused_multi_tile_routing_beats_independent_launches(
         weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
     )
 
-    # Allocate graph-stable outputs once so the measurement contains only the exported fused
+    # Allocate graph-stable outputs once so capture contains only the exported fused
     # population kernel or its matched three-launch decomposition.
     fused = trtllm_moe_allocate_routing_metadata_multi_tile(
         packed,
@@ -273,17 +329,11 @@ def test_fused_multi_tile_routing_beats_independent_launches(
         for metadata in independent:
             populate_trtllm_moe_routing_metadata_(metadata, packed)
 
-    # Warm both paths before measuring their best-of-five CUDA-event averages on one stream.
-    for _ in range(5):
-        populate_fused()
-        populate_independent()
+    populate_fused()
+    populate_independent()
     torch.cuda.synchronize()
-    fused_ms = _minimum_average_cuda_time_ms(populate_fused)
-    independent_ms = _minimum_average_cuda_time_ms(populate_independent)
-    record_property("fused_multi_tile_routing_ms", fused_ms)
-    record_property("independent_routing_ms", independent_ms)
-    record_property("fused_speedup", independent_ms / fused_ms)
-    assert fused_ms < independent_ms
+    assert _capture_kernel_node_count(populate_fused) == 1
+    assert _capture_kernel_node_count(populate_independent) == len(tile_ns)
 
 
 def test_same_shape_layers_share_one_serial_workspace_lane() -> None:

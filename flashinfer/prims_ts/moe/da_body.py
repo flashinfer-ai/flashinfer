@@ -10,7 +10,6 @@ from typing import (
     Generic,
     Mapping,
     Protocol,
-    Self,
     Sequence,
     TYPE_CHECKING,
     TypeVar,
@@ -316,7 +315,7 @@ class PrimsTsBodyWorkspace(Protocol):
     """Define the typed workspace record contract shared by PrimsTS runners."""
 
     @classmethod
-    def from_sequence(cls, tensors: Sequence[torch.Tensor]) -> Self:
+    def from_sequence(cls, tensors: Sequence[torch.Tensor]) -> PrimsTsBodyWorkspace:
         """Decode one dtype-specific workspace from its public tensor ABI."""
         ...
 

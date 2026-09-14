@@ -410,6 +410,9 @@ def prims_ts_fp4_block_scale_moe(
 
     from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
 
+    # DA requires finalization because the runtime-selected tactic may change the
+    # intermediate output format. The finalize kernel captured in the CUDA Graph
+    # normalizes that format.
     da_eligible = (
         do_finalize
         and not num_fused_shared_experts

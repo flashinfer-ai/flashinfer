@@ -18,6 +18,10 @@ from flashinfer.fused_moe.shared.tuning import (
     make_moe_tuning_config,
     moe_topk_ids_init,
 )
+from flashinfer.fused_moe.tactic_search import (
+    FactorizedTactic,
+    FactorizedTacticSpace,
+)
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -968,6 +972,152 @@ class TileTacticDummyRunner(TunableRunner):
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         return inputs[0]
+
+
+class FactorizedDummyRunner(TileTacticDummyRunner):
+    use_factorized_moe_tactic_search = True
+
+    def get_factorized_tactic_space(self, inputs):
+        del inputs
+        tactics = []
+        anchors = {}
+        for tile in self.supported_tiles:
+            anchors[tile] = (tile, 0)
+            for config in range(self.num_tactics_per_tile):
+                tactics.append(
+                    FactorizedTactic(
+                        tactic=(tile, config),
+                        tile_n=tile,
+                        fc1=config // 2,
+                        fc2=config % 2,
+                        public_tactic=[tile, config],
+                    )
+                )
+        return FactorizedTacticSpace(tactics, anchors)
+
+
+def test_factorized_search_skips_failed_coordinate(monkeypatch):
+    tuner = reset_autotuner()
+    runner = FactorizedDummyRunner((8,), num_tactics_per_tile=4)
+    inputs = [torch.empty((3, 4), dtype=torch.float32)]
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        del self, runner_obj, prof_inputs, tuning_config, kwargs
+        if tactic == [8, 0]:
+            raise RuntimeError("unsupported coordinate")
+        return {1: 3.0, 2: 1.0, 3: 2.0}[tactic[1]]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one(
+            "factorized_failed_coordinate", [runner], TuningConfig(), inputs
+        )
+
+    assert tactic == [8, 2]
+    assert tuner.stats.failed_tactics[
+        "factorized_failed_coordinate::FactorizedDummyRunner"
+    ] == {(8, 0)}
+
+
+def test_factorized_search_fails_only_when_all_coordinates_fail(monkeypatch):
+    tuner = reset_autotuner()
+    runner = FactorizedDummyRunner((8,), num_tactics_per_tile=4)
+    inputs = [torch.empty((3, 4), dtype=torch.float32)]
+
+    def fail_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        del self, runner_obj, prof_inputs, tactic, tuning_config, kwargs
+        raise RuntimeError("unsupported coordinate")
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fail_profile)
+    with (
+        autotune(tune_mode=True),
+        pytest.raises(RuntimeError, match="no finite tactics"),
+    ):
+        tuner.choose_one("factorized_all_failed", [runner], TuningConfig(), inputs)
+
+
+def test_factorized_search_recovers_when_one_pinned_slice_fails(monkeypatch):
+    tuner = reset_autotuner()
+    runner = FactorizedDummyRunner((8,), num_tactics_per_tile=4)
+    inputs = [torch.empty((3, 4), dtype=torch.float32)]
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        del self, runner_obj, prof_inputs, tuning_config, kwargs
+        if tactic[1] in (0, 2):
+            raise RuntimeError("unsupported pinned slice")
+        return {1: 1.0, 3: 2.0}[tactic[1]]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one(
+            "factorized_failed_pinned_slice", [runner], TuningConfig(), inputs
+        )
+
+    assert tactic == [8, 1]
+
+
+def test_factorized_cache_maps_non_idempotent_profile_once(monkeypatch):
+    tuner = reset_autotuner()
+    runner = FactorizedDummyRunner((8,), num_tactics_per_tile=4)
+    inputs = [torch.empty((3, 4), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(4,),
+                map_to_tuning_buckets=lambda value: value + 1,
+            ),
+        ),
+        constraint_specs=(
+            ConstraintSpec(
+                input_idx=0,
+                dim_idx=1,
+                infer_shape=lambda shapes: shapes[0][0] * 2,
+            ),
+        ),
+    )
+
+    def fake_profile(
+        self, runner_obj, prof_inputs, tactic, tuning_config=None, **kwargs
+    ):
+        del self, runner_obj, prof_inputs, tuning_config, kwargs
+        return float(tactic[1] + 1)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one(
+            "factorized_non_idempotent_mapper", [runner], config, inputs
+        )
+        profiled_count = tuner.stats.profiled_tactic_count[
+            "factorized_non_idempotent_mapper"
+        ]
+        _, repeated_tactic = tuner.choose_one(
+            "factorized_non_idempotent_mapper", [runner], config, inputs
+        )
+        assert (
+            tuner.stats.profiled_tactic_count["factorized_non_idempotent_mapper"]
+            == profiled_count
+        )
+        ranked = tuner.rank_tactics(
+            "factorized_non_idempotent_mapper", [runner], config, inputs, k=2
+        )
+
+    assert tactic == [8, 0]
+    assert repeated_tactic == tactic
+    assert ranked == [[8, 0], [8, 1]]
+    assert (
+        tuner.get_factorized_search_result(
+            "factorized_non_idempotent_mapper", runner, config, inputs
+        )
+        is not None
+    )
 
 
 def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(

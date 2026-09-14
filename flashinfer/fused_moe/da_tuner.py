@@ -283,13 +283,15 @@ class FullOpMeasurementCache:
         first_before = float(first_measure())
         second_observations = (float(second_measure()), float(second_measure()))
         first_observations = (first_before, float(first_measure()))
+        means: dict[tuple[Any, ...], float] = {}
         for key, observations in (
             (first_key, first_observations),
             (second_key, second_observations),
         ):
             if not all(math.isfinite(value) for value in observations):
                 raise RuntimeError(f"Non-finite full MoE timing for {key!r}")
-            self._timings[key] = sum(observations) / len(observations)
+            means[key] = sum(observations) / len(observations)
+        self._timings.update(means)
         return self._timings[first_key], self._timings[second_key]
 
 

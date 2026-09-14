@@ -592,8 +592,10 @@ __device__ void routingPermutation(KernelParams params,
     for (int32_t expandedIdx = static_cast<int32_t>(clusterThreadIdx);
          expandedIdx < expandedIdxSize; expandedIdx += NumThreadsPerCluster) {
       auto const expertIdx = static_cast<int32_t>(loadScoreIdx(expandedIdx).idx);
-      auto const blockLocalOffset = params.mPtrExpandedIdxToPermutedIdx[expandedIdx] +
-                                    smemWarpExpertState[warpIdx][expertIdx];
+      auto blockLocalOffset = params.mPtrExpandedIdxToPermutedIdx[expandedIdx];
+      if (blockLocalOffset >= 0) {
+        blockLocalOffset += smemWarpExpertState[warpIdx][expertIdx];
+      }
       writePermutation(expandedIdx, expertIdx, blockLocalOffset);
     }
   } else {
