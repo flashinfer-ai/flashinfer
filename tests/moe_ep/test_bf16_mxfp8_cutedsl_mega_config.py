@@ -8,9 +8,9 @@ import pytest
 
 from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
 
-cuda_13_2_required = pytest.mark.skipif(
+cuda_13_required = pytest.mark.skipif(
     not is_bf16_mxfp8_cutedsl_supported(),
-    reason="bf16_mxfp8 requires CUDA 13.2+",
+    reason="bf16_mxfp8 requires CUDA 13+",
 )
 
 from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -59,7 +59,7 @@ def _impl_key(knobs):
     )
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_knobs_and_candidates():
     knobs = default_knobs(256, dtype="bf16_mxfp8")
     assert is_valid_bf16_mxfp8(knobs)
@@ -106,7 +106,7 @@ def test_mixed_knobs_and_candidates():
     assert frontend.config == _config()
 
 
-@cuda_13_2_required
+@cuda_13_required
 @pytest.mark.parametrize(
     ("mma_tiler_mnk", "transform_buffer", "accumulator_overlap", "transform_k_tile"),
     sorted(_LEGAL_IMPLS),
@@ -123,7 +123,7 @@ def test_mixed_config_accepts_supported_implementation(
     assert config.num_experts_per_rank == 8
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_config_rejects_unsupported_implementation_and_token_back():
     with pytest.raises(ValueError, match="implementation tuple"):
         _config(mma_tiler_mnk=(256, 256, 128))
@@ -131,14 +131,14 @@ def test_mixed_config_rejects_unsupported_implementation_and_token_back():
         _config(token_back_mode="standalone_warps")  # type: ignore[arg-type]
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_frontend_rejects_unsupported_knobs():
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     with pytest.raises(ValueError, match="unsupported mixed MegaMoE knobs"):
         frontend.apply_knobs({"mma_tiler_mnk": (256, 256, 128)})
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
@@ -169,7 +169,7 @@ def test_mixed_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
         buf.destroy()
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
     """An ikr + dispatch-warp session must still accept pinned perf knobs."""
     import torch
@@ -210,7 +210,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
         buf.destroy()
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
@@ -235,7 +235,7 @@ def test_mixed_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
         )
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_frontend_rejects_unpermitted_ikr_knobs():
     with pytest.raises(ValueError, match="unsupported mixed MegaMoE knobs"):
         MegaMoEBf16Mxfp8Frontend(_config()).apply_knobs({"in_kernel_fc2_reduce": True})
@@ -245,7 +245,7 @@ def test_mixed_frontend_rejects_unpermitted_ikr_knobs():
     assert permitted.config.in_kernel_fc2_reduce is True
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
 
@@ -278,7 +278,7 @@ def test_mixed_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
     assert "in_kernel_fc2_reduce=True is not permitted" in str(excinfo.value)
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_backend_is_registered():
     backend = create_mega_kernel(
         Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
@@ -289,7 +289,7 @@ def test_mixed_backend_is_registered():
     assert backend.kernel_name() == "sm100_bf16_mxfp8_bf16_cutedsl"
 
 
-@cuda_13_2_required
+@cuda_13_required
 def test_mixed_config_inherits_bf16_options():
     config = Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,

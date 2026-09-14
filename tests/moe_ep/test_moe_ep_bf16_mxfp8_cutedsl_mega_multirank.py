@@ -12,9 +12,9 @@ import pytest
 
 from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
 
-cuda_13_2_required = pytest.mark.skipif(
+cuda_13_required = pytest.mark.skipif(
     not is_bf16_mxfp8_cutedsl_supported(),
-    reason="bf16_mxfp8 requires CUDA 13.2+",
+    reason="bf16_mxfp8 requires CUDA 13+",
 )
 
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
@@ -446,7 +446,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         finalize_moe_ep_runtime(runtime)
 
 
-@cuda_13_2_required
+@cuda_13_required
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_matches_reference():
@@ -458,7 +458,7 @@ def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_matches_reference():
     print(f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega layer matches reference")
 
 
-@cuda_13_2_required
+@cuda_13_required
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
@@ -473,7 +473,7 @@ def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     )
 
 
-@cuda_13_2_required
+@cuda_13_required
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])

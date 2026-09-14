@@ -6,9 +6,9 @@ import pytest
 
 from flashinfer.moe_ep.core.validation.common import is_bf16_mxfp8_cutedsl_supported
 
-cuda_13_2_required = pytest.mark.skipif(
+cuda_13_required = pytest.mark.skipif(
     not is_bf16_mxfp8_cutedsl_supported(),
-    reason="bf16_mxfp8 requires CUDA 13.2+",
+    reason="bf16_mxfp8 requires CUDA 13+",
 )
 
 
@@ -23,7 +23,7 @@ def _require_cuda():
         pytest.skip("PyTorch lacks E8M0 support required by the mixed reference")
 
 
-@cuda_13_2_required
+@cuda_13_required
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("kind", "weight_dtype_name"),
@@ -150,7 +150,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
         symm_buffer.destroy()
 
 
-@cuda_13_2_required
+@cuda_13_required
 @pytest.mark.arch_blackwell
 def test_bf16_mxfp8_preprocesses_canonical_prequantized_weights():
     _require_cuda()
