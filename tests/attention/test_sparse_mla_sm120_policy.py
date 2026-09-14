@@ -914,8 +914,10 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
 
 
 def test_resolve_model_type_dsv4_1_explicit_only() -> None:
-    """DSV4_1 shares d_qk=512 with DSV4 and its 528B payload with GLM53_NOPE,
-    so it is reachable only through the explicit ue8m0_g32 scale format."""
+    """DSV4_1 and GLM53_NOPE share a 528B size, not a scale format;
+    the same compact cache is too short for DSV4, DSV3_2, and GLM_NSA."""
+    from flashinfer.mla._sparse_mla_sm120 import _packed_kv_page_block_size
+
     assert _resolve_model_type(512, "auto") == _MODEL_TYPE_DSV4
     assert _resolve_model_type(512, "arbitrary_fp32") == _MODEL_TYPE_GLM53_NOPE
     assert _resolve_model_type(512, "ue8m0_g32") == _MODEL_TYPE_DSV4_1
@@ -924,6 +926,18 @@ def test_resolve_model_type_dsv4_1_explicit_only() -> None:
         _resolve_model_type(576, "ue8m0_g32")
     with pytest.raises(ValueError, match="kv_scale_format"):
         _resolve_model_type(1088, "ue8m0_g32")
+
+    compact = torch.empty((2, 64, 1, 528), dtype=torch.uint8)
+    for model_type in (_MODEL_TYPE_GLM53_NOPE, _MODEL_TYPE_DSV4_1):
+        assert (
+            _packed_kv_page_block_size(compact, model_type=model_type, name="kv_cache")
+            == 64
+        )
+    for model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        with pytest.raises(
+            ValueError, match=r"kv_cache last dim must be >= \d+, got 528"
+        ):
+            _packed_kv_page_block_size(compact, model_type=model_type, name="kv_cache")
 
 
 def test_plan_dsv4_1_dual_isolates_single_cache_calibration(

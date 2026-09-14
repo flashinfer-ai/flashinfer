@@ -1204,6 +1204,7 @@ def _apply_unit(
     overrides: dict,
     prefixes: tuple[str, ...],
     profiles: dict | None = None,
+    profile_buckets: dict | None = None,
 ) -> None:
     dev = devices.setdefault(dev_key, {})
     if prefixes:
@@ -1220,7 +1221,13 @@ def _apply_unit(
     ):
         dev.setdefault(section, {}).update(entries)
     if profiles:
-        dev.setdefault("profiles", {}).update(profiles)
+        stored = dev.setdefault("profiles", {})
+        for key, profile in profiles.items():
+            if profile_buckets and key in profile_buckets and key in stored:
+                for tokens, entry in profile_buckets[key].items():
+                    stored[key]["buckets"].setdefault(tokens, entry)
+            else:
+                stored[key] = json.loads(json.dumps(profile))
 
 
 def _replay_unit(devices: dict, unit) -> None:
@@ -1229,10 +1236,28 @@ def _replay_unit(devices: dict, unit) -> None:
     A conditional unit (recorded by replace_family_if_absent) is destructive
     only while the family is still absent; once any publisher has landed the
     family's constants, the unit merges instead of discarding entries."""
-    dev_key, constants, crossover, overrides, prefixes, profiles, conditional = unit
+    (
+        dev_key,
+        constants,
+        crossover,
+        overrides,
+        prefixes,
+        profiles,
+        profile_buckets,
+        conditional,
+    ) = unit
     if conditional and any(f in devices.get(dev_key, {}) for f in conditional):
         prefixes = ()
-    _apply_unit(devices, dev_key, constants, crossover, overrides, prefixes, profiles)
+    _apply_unit(
+        devices,
+        dev_key,
+        constants,
+        crossover,
+        overrides,
+        prefixes,
+        profiles,
+        profile_buckets,
+    )
 
 
 def _materialize_store(state: dict) -> None:
@@ -1307,13 +1332,19 @@ def publish_calibration(
     replace_family: bool = False,
     replace_family_if_absent: bool = False,
     profiles: dict | None = None,
+    profile_buckets: dict | None = None,
 ) -> bool:
     """Publish one measured unit; write failures retain a scope-local overlay.
 
     ``replace_family`` discards the family's stale crossover/override entries
     unconditionally (force re-measurement). ``replace_family_if_absent`` does
     so only when the family is still absent under the publish lock; when a
-    concurrent publisher landed in between, entries merge instead."""
+    concurrent publisher landed in between, entries merge instead.
+
+    ``profiles`` replaces complete profiles. Refinement supplies
+    ``profile_buckets`` to insert only newly measured buckets into an existing
+    profile; its complete profile is used only if no profile remains on disk.
+    The same incremental intent is retained when replaying a failed write."""
     with _store_lock:
         refresh_store()
         path, state = _activate_store()
@@ -1330,10 +1361,11 @@ def publish_calibration(
             overrides or {},
             prefixes,
             profiles,
+            profile_buckets,
             aliases if (replace_family_if_absent and not replace_family) else (),
         )
         candidate: dict = {}
-        _apply_unit(candidate, *unit[:6])
+        _apply_unit(candidate, *unit[:7])
         _parse_payload_devices(candidate)
         persisted = False
         tmp = None
@@ -1873,16 +1905,22 @@ def refine_dsv41(
     if not 1 <= tokens <= _PROFILE_T[-1]:
         return None
     request.validate()
+    profile = get_profile(request.key, device)
+    if profile is None or str(tokens) in profile["buckets"]:
+        return None
+    ctx = _dsv41_measure_context(request, device)
+    entry = _measure_dsv41_bucket(request, ctx, tokens)
+    entry["provenance"] = "refined"
     with _store_lock:
         profile = get_profile(request.key, device)
         if profile is None or str(tokens) in profile["buckets"]:
             return None
-        ctx = _dsv41_measure_context(request, device)
-        entry = _measure_dsv41_bucket(request, ctx, tokens)
-        entry["provenance"] = "refined"
         profile["buckets"][str(tokens)] = entry
         persisted = publish_calibration(
-            device, "dsv4_1", profiles={request.key: profile}
+            device,
+            "dsv4_1",
+            profiles={request.key: profile},
+            profile_buckets={request.key: {str(tokens): entry}},
         )
     return {**entry, "persisted": persisted}
 

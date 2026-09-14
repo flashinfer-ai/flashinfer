@@ -501,7 +501,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
         extra_lengths=extra_segment.lengths if extra_segment is not None else None,
         lse=out_lse_arg,
         kv_scale_format=kv_scale_format,
-        is_dsv4_nvfp4=kv_cache_format == "nvfp4",
+        is_dsv4_nvfp4=(kv_cache_format == "nvfp4"),
         extra_fp4=kv_cache_format == "fp8_dsv41_fp4_ca",
     )
 

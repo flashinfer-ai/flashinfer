@@ -1575,12 +1575,10 @@ def test_sparse_mla_sm120_prefill_glm53_nope_swapab(num_heads: int) -> None:
 def test_sparse_mla_sm120_glm53_nope_compact_rows(
     num_tokens: int, num_heads: int
 ) -> None:
-    """GLM53_NOPE reads only the 528B payload; the gmem row advance is runtime.
+    """Compact and strided 528B rows match poisoned 656B rows, including replay.
 
-    A legacy 656B pool, a packed 528B cache, and a 528B slice of the 656B
-    pool (row stride 656, non-contiguous) must produce bitwise-identical
-    outputs. Shapes cover decode (T=4), prefill MG (T=65, H=32) and prefill
-    swapAB (T=128, H=64).
+    Shapes cover decode (T=4), prefill MG (T=65, H=32) and prefill swapAB
+    (T=128, H=64), with variable lengths and the final cache slot selected.
     """
     torch.manual_seed(5)
     device = torch.device("cuda")
@@ -1596,6 +1594,7 @@ def test_sparse_mla_sm120_glm53_nope_compact_rows(
     ).clamp(-1, 1)
     packed_656 = quantize_kv_glm53_nope(kv_bf16)  # [nb, pbs, 1, 656]
     packed_528 = packed_656[..., :528].contiguous()
+    packed_656[..., 528:].fill_(0xFF)
     sliced_528 = packed_656[..., :528]  # 528-wide view, row stride stays 656
 
     q = (
@@ -1605,36 +1604,64 @@ def test_sparse_mla_sm120_glm53_nope_compact_rows(
     indices = torch.randint(
         0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
     )
-    indices[:, topk // 2 :] = -1
+    indices[:, 0] = s_kv - 1
+    counts = torch.arange(num_tokens, device=device, dtype=torch.int32) % 3
+    lengths = torch.where(counts == 0, 1, torch.where(counts == 1, 70, topk)).to(
+        torch.int32
+    )
+    indices.masked_fill_(
+        torch.arange(topk, device=device)[None, :] >= lengths[:, None], -1
+    )
     sm_scale = d_qk**-0.5
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    caches = {
+        "padded-656": packed_656,
+        "packed-528": packed_528,
+        "sliced-528": sliced_528,
+    }
+    results = {
+        name: (
+            torch.empty_like(q),
+            torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device),
+        )
+        for name in caches
+    }
 
-    def run(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        output = torch.zeros(
-            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
-        )
-        out_lse = torch.zeros(
-            (num_tokens, num_heads), dtype=torch.float32, device=device
-        )
-        mid = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    def run(name: str) -> None:
+        output, out_lse = results[name]
         sparse_mla_sm120_paged_attention(
             q,
-            kv_cache,
+            caches[name],
             indices,
             output,
             out_lse,
             sm_scale,
             d_v=d_v,
             kv_scale_format="arbitrary_fp32",
-            mid_out=mid[0],
-            mid_lse=mid[1],
+            topk_length=lengths,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
         )
-        return output, out_lse
 
-    ref_out, ref_lse = run(packed_656)
-    for name, kv in (("packed-528", packed_528), ("sliced-528", sliced_528)):
-        out, lse = run(kv)
-        assert torch.equal(out, ref_out), f"{name} output diverged from the 656B pool"
-        assert torch.equal(lse, ref_lse), f"{name} LSE diverged from the 656B pool"
+    for name in caches:
+        run(name)
+    ref_out, ref_lse = results["padded-656"]
+    for name in ("packed-528", "sliced-528"):
+        out, lse = results[name]
+        torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+        torch.testing.assert_close(lse, ref_lse, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run("packed-528")
+        run("sliced-528")
+    q.mul_(0.75)
+    graph.replay()
+    run("padded-656")
+    for name in ("packed-528", "sliced-528"):
+        out, lse = results[name]
+        torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+        torch.testing.assert_close(lse, ref_lse, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("num_tokens,num_heads", [(4, 32), (65, 32), (128, 64)])

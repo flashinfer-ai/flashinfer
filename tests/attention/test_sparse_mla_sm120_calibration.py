@@ -1915,6 +1915,173 @@ def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
     assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
 
 
+@pytest.fixture(params=["dsv4_1", "dsv4_nvfp4"])
+def refined_profile(request, store, monkeypatch):
+    family = request.param
+    if family == "dsv4_1":
+        req = cpb_mod._Dsv41Request(16, 128)
+        key = req.key
+        module = cpb_mod
+        context_name = "_dsv41_measure_context"
+        measure_name = "_measure_dsv41_bucket"
+        refine = lambda: cpb_mod.refine_dsv41(req, store, 5)
+        variant = 0
+    else:
+        fields = dict(
+            num_heads=16,
+            topk=128,
+            primary_page_size=64,
+            extra_topk=0,
+            extra_page_size=0,
+            has_topk_length=False,
+            has_extra_topk_length=False,
+            has_attn_sink=False,
+        )
+        key = native._request_key(**fields)
+        module = native
+        context_name = "_nvfp4_measure_context"
+        measure_name = "_measure_nvfp4_bucket"
+        refine = lambda: native.refine_nvfp4(store, tokens=5, **fields)
+        variant = "decode_splitk"
+    entry = {"variant": variant, "cpb": 2, "decode_s": 1e-5, "prefill_s": 2e-5}
+    profile = {
+        "request": json.loads(key),
+        "buckets": {str(t): {**entry, "cpb": 1} for t in cpb_mod._PROFILE_T},
+    }
+    assert cpb_mod.publish_calibration(store, family, profiles={key: profile})
+    monkeypatch.setattr(module, context_name, lambda *args: object())
+    monkeypatch.setattr(module, measure_name, lambda *args, **kwargs: dict(entry))
+    return SimpleNamespace(
+        family=family,
+        key=key,
+        module=module,
+        context_name=context_name,
+        measure_name=measure_name,
+        refine=refine,
+        entry=entry,
+        profile=profile,
+    )
+
+
+@pytest.mark.parametrize("tokens", [(5, 6, 8), (8, 6, 5)])
+def test_nvfp4_memo_distinguishes_refined_token_counts(store, monkeypatch, tokens):
+    fields = dict(
+        num_heads=16,
+        topk=128,
+        primary_page_size=64,
+        extra_topk=0,
+        extra_page_size=0,
+        has_topk_length=False,
+        has_extra_topk_length=False,
+        has_attn_sink=False,
+    )
+    key = native._request_key(**fields)
+    buckets = {
+        str(t): {"variant": "decode_splitk", "cpb": 1} for t in cpb_mod._PROFILE_T
+    }
+    buckets["5"] = {"variant": "prefill_streaming", "cpb": 2}
+    buckets["6"] = {"variant": "decode_splitk", "cpb": 3}
+    cpb_mod.publish_calibration(
+        store,
+        "dsv4_nvfp4",
+        profiles={key: {"request": json.loads(key), "buckets": buckets}},
+    )
+    monkeypatch.setattr(native, "_eligible", lambda *args: (True, True))
+    monkeypatch.setattr(native, "_plan_memo", {})
+    monkeypatch.setattr(
+        native.AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=False)
+    )
+    for t in tokens:
+        selected = native.plan_nvfp4_sparse_mla_sm120(t, device=store, **fields)
+        assert selected.variant.value == buckets[str(t)]["variant"]
+        assert selected.cpb == (0 if t == 5 else buckets[str(t)]["cpb"])
+
+
+def test_refine_measurement_releases_store_lock(refined_profile, monkeypatch):
+    case = refined_profile
+
+    def probe_lock():
+        acquired = cpb_mod._store_lock.acquire(blocking=False)
+        if acquired:
+            cpb_mod._store_lock.release()
+        return acquired
+
+    def check_unlocked(*args, **kwargs):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(probe_lock).result(timeout=5)
+        return dict(case.entry)
+
+    monkeypatch.setattr(case.module, case.context_name, check_unlocked)
+    monkeypatch.setattr(case.module, case.measure_name, check_unlocked)
+    assert case.refine()["persisted"]
+
+
+def test_refine_rechecks_entry_after_measurement(store, refined_profile, monkeypatch):
+    case = refined_profile
+
+    def measure(*args, **kwargs):
+        current = cpb_mod.get_profile(case.key, store)
+        current["buckets"]["5"] = {**case.entry, "cpb": 4}
+        cpb_mod.publish_calibration(store, case.family, profiles={case.key: current})
+        return dict(case.entry)
+
+    monkeypatch.setattr(case.module, case.measure_name, measure)
+    assert case.refine() is None
+    assert cpb_mod.get_profile(case.key, store)["buckets"]["5"]["cpb"] == 4
+
+
+def test_refine_merges_buckets_under_file_lock(store, refined_profile, monkeypatch):
+    case = refined_profile
+    real_lock = cpb_mod.FileLock
+
+    @contextmanager
+    def concurrent_publish(path):
+        with real_lock(path):
+            cache = cpb_mod.default_cache_path()
+            payload = json.loads(cache.read_text())
+            profile = payload["devices"][str(store)]["profiles"][case.key]
+            profile["buckets"]["6"] = {**case.entry, "cpb": 4}
+            profile["buckets"]["8"]["cpb"] = 7
+            profile["sample_kind"] = "concurrent"
+            cache.write_text(json.dumps(payload))
+            yield
+
+    monkeypatch.setattr(cpb_mod, "FileLock", concurrent_publish)
+    assert case.refine()["persisted"]
+    stored = cpb_mod.get_profile(case.key, store)
+    assert stored["buckets"]["5"]["cpb"] == 2
+    assert stored["buckets"]["6"]["cpb"] == 4
+    assert stored["buckets"]["8"]["cpb"] == 7
+    assert stored["sample_kind"] == "concurrent"
+
+
+def test_refined_overlay_merges_then_full_profile_replaces(
+    store, refined_profile, monkeypatch
+):
+    case = refined_profile
+    with monkeypatch.context() as patch:
+        patch.setattr(cpb_mod.os, "replace", Mock(side_effect=OSError("read only")))
+        assert not case.refine()["persisted"]
+    path = cpb_mod.default_cache_path()
+    payload = json.loads(path.read_text())
+    profile = payload["devices"][str(store)]["profiles"][case.key]
+    profile["buckets"]["6"] = {**case.entry, "cpb": 4}
+    profile["buckets"]["8"]["cpb"] = 7
+    path.write_text(json.dumps(payload))
+    assert cpb_mod.get_profile(case.key, store)["buckets"]["6"]["cpb"] == 4
+    assert cpb_mod.save_constants(store, "dsv4", _C)
+    cpb_mod._store_states.clear()
+    cpb_mod._active_scope = None
+    stored = cpb_mod.get_profile(case.key, store)
+    assert stored["buckets"]["5"]["cpb"] == 2
+    assert stored["buckets"]["6"]["cpb"] == 4
+    assert stored["buckets"]["8"]["cpb"] == 7
+    assert cpb_mod.publish_calibration(
+        store, case.family, profiles={case.key: case.profile}
+    )
+    assert cpb_mod.get_profile(case.key, store) == case.profile
+
+
 def test_dsv41_fallback_does_not_start_legacy_measurement(store, monkeypatch):
     from types import SimpleNamespace
     from flashinfer.mla import _sparse_mla_sm120_policy as policy

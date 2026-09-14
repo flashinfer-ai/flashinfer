@@ -29,6 +29,7 @@ ExecutionPlan resolve_dsv4_nvfp4(int tokens, int heads, int topk, int extra_topk
         extra_page_stride_bytes >= size_t(extra_page_size) * Dsv4Nvfp4Layout::BYTES_PER_TOKEN &&
         extra_page_stride_bytes % 16 == 0)))
       << "unsupported NVFP4 extra page layout";
+  TVM_FFI_ICHECK_LE(extra_topk, MaxExtraTopK) << "NVFP4 extra_topk exceeds integer chunk range";
   TVM_FFI_ICHECK_GT(sm_count, 0) << "SM count must be positive";
   TVM_FFI_ICHECK(!prefill || !stage1_only) << "stage1_only is decode-only";
   const int chunks = (topk + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW +
@@ -96,8 +97,8 @@ ffi::Module resolve_dsv4_nvfp4_descriptor(ffi::Array<int64_t> values, int64_t nu
       << "invalid DSV4 NVFP4 resolver capabilities/route";
   TVM_FFI_ICHECK(m.model == int(ModelType::DSV4) &&
                  m.row_stride_bytes == Dsv4Nvfp4Layout::BYTES_PER_TOKEN && !m.extra_fp4 &&
-                 (m.variant == 0 || m.variant == 1) && m.extra_topk <= INT_MAX - 576 &&
-                 (!m.has_extra_lengths || m.extra_topk > 0) && m.indices_stride == size_t(m.topk) &&
+                 (m.variant == 0 || m.variant == 1) && (!m.has_extra_lengths || m.extra_topk > 0) &&
+                 m.indices_stride == size_t(m.topk) &&
                  m.extra_indices_stride == size_t(m.extra_topk) && m.lse_stride == size_t(m.heads))
       << "DSV4 NVFP4 attention metadata mismatch";
   auto p = resolve_dsv4_nvfp4(m.tokens, m.heads, m.topk, m.extra_topk, m.page_size,
@@ -122,8 +123,8 @@ ffi::Module resolve_dsv4_nvfp4_query(int64_t tokens, int64_t heads, int64_t topk
 bool supports_attention(int64_t heads, int64_t topk, int64_t page, int64_t extra_topk,
                         int64_t extra_page) {
   if (heads < 1 || heads > INT_MAX || topk < 1 || topk > INT_MAX || page < 1 || page > INT_MAX ||
-      extra_topk < 0 || extra_topk > INT_MAX - 576 || extra_page < 0 || extra_page > INT_MAX ||
-      (!extra_topk && extra_page))
+      extra_topk < 0 || extra_topk > nvfp4::MaxExtraTopK || extra_page < 0 ||
+      extra_page > INT_MAX || (!extra_topk && extra_page))
     return false;
   try {
     resolve_dsv4_nvfp4(1, heads, topk, extra_topk, page, extra_page,
