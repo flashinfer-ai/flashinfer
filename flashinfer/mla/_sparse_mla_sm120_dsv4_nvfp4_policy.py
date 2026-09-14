@@ -17,17 +17,19 @@
 The shared decode-token cutoff is policy, not a kernel capability.
 Inside that policy range, a separately keyed NVFP4
 calibration compares split-K decode (including merge) with streaming prefill
-and records the measured phase plus the best decode CPB for each probe bucket.
-Per-bucket phase records preserve GPU wave-boundary non-monotonicity that a
-single threshold cannot express.  The dispatch policy and persistence
-primitives are shared with the existing FP8 planner; FP8 measurements are
-never reused for NVFP4.
+and records the measured variant plus the best decode CPB for each probe
+bucket, persisted as a per-configuration profile (the same record shape the
+DSV4.1 planner uses).  Per-bucket records preserve GPU wave-boundary
+non-monotonicity that a single threshold cannot express.  The dispatch
+policy and persistence primitives are shared with the existing FP8 planner;
+FP8 measurements are never reused for NVFP4.
 """
 
 from __future__ import annotations
 
 import enum
 import functools
+import json
 import logging
 import threading
 from dataclasses import dataclass
@@ -43,8 +45,9 @@ from ._sparse_mla_sm120_execution import dsv4_nvfp4_format_info
 
 logger = logging.getLogger(__name__)
 
-_PLAN_VERSION = 1
-_FAMILY_PREFIX = f"dsv4_nvfp4_v{_PLAN_VERSION}"
+# Publish family for NVFP4 profile records; the JSON request key carries the
+# exact cache configuration.
+_FAMILY = "dsv4_nvfp4"
 _AUTOTUNE_OP = "sparse_mla_sm120_nvfp4"
 
 
@@ -114,7 +117,7 @@ class NVFP4CalibrationReport:
 _plan_memo: dict[tuple, NVFP4KernelVariant] = {}
 _plan_epoch = -1
 _calibration_lock = threading.RLock()
-_calibrating: set[tuple[str | None, str, str, int, int]] = set()
+_calibrating: set[tuple[str | None, str, str]] = set()
 
 
 def _token_bucket(num_tokens: int) -> int:
@@ -124,8 +127,10 @@ def _token_bucket(num_tokens: int) -> int:
     return _CROSSOVER_PROBED_T[-1]
 
 
-def _family_key(
+def _request_key(
     *,
+    num_heads: int,
+    topk: int,
     primary_page_size: int,
     extra_topk: int,
     extra_page_size: int,
@@ -133,45 +138,22 @@ def _family_key(
     has_extra_topk_length: bool,
     has_attn_sink: bool,
 ) -> str:
-    """Build a format- and ABI-specific calibration namespace."""
-    return (
-        f"{_FAMILY_PREFIX}_p{primary_page_size}_e{extra_topk}"
-        f"p{extra_page_size}_l{int(has_topk_length)}"
-        f"x{int(has_extra_topk_length)}_s{int(has_attn_sink)}"
+    """Profile key for one exact NVFP4 cache configuration."""
+    return json.dumps(
+        {
+            "family": _FAMILY,
+            "strategy": "queued_rotation_v1",
+            "heads": num_heads,
+            "topk": topk,
+            "primary_page_size": primary_page_size,
+            "extra_topk": extra_topk,
+            "extra_page_size": extra_page_size,
+            "has_topk_length": bool(has_topk_length),
+            "has_extra_topk_length": bool(has_extra_topk_length),
+            "has_attn_sink": bool(has_attn_sink),
+        },
+        sort_keys=True,
     )
-
-
-def _phase_family(family: str, token_bucket: int) -> str:
-    """Namespace one measured phase decision without assuming monotonicity."""
-    return f"{family}_t{token_bucket}"
-
-
-def _phase_grid_complete(
-    device: torch.device, family: str, num_heads: int, topk: int
-) -> bool:
-    return all(
-        _cpb.get_decode_max_tokens(
-            device, _phase_family(family, token_bucket), num_heads, topk
-        )
-        is not None
-        for token_bucket in _CROSSOVER_PROBED_T
-    )
-
-
-def _monotonic_decode_max_tokens(
-    decode_by_token_bucket: dict[int, bool],
-) -> Optional[int]:
-    """Return a threshold only when measured phase choices form a prefix."""
-    decode_max_tokens = 0
-    saw_prefill = False
-    for token_bucket in sorted(decode_by_token_bucket):
-        if decode_by_token_bucket[token_bucket]:
-            if saw_prefill:
-                return None
-            decode_max_tokens = token_bucket
-        else:
-            saw_prefill = True
-    return decode_max_tokens
 
 
 def _eligible(
@@ -197,7 +179,7 @@ def _autotune_skipped() -> bool:
 def _maybe_calibrate(
     *,
     device: torch.device,
-    family: str,
+    key: str,
     num_heads: int,
     topk: int,
     primary_page_size: int,
@@ -212,20 +194,20 @@ def _maybe_calibrate(
         not tuner.is_tuning_mode
         or _autotune_skipped()
         or _cpb._target_capturing(device)
-        or _cpb.is_crossover_failed(device, family)
+        or _cpb.is_calibration_failed(device, key)
     ):
         return
 
     with _cpb._store_lock:
         _cpb.refresh_store()
         scope = _cpb._active_scope
-    key = (scope, _cpb._device_key(device), family, num_heads, topk)
+    guard_key = (scope, _cpb._device_key(device), key)
     with _calibration_lock:
-        if _phase_grid_complete(device, family, num_heads, topk):
+        if _cpb.get_profile(key, device) is not None:
             return
-        if key in _calibrating:
+        if guard_key in _calibrating:
             return
-        _calibrating.add(key)
+        _calibrating.add(guard_key)
         try:
             calibrate_nvfp4_sparse_mla_sm120(
                 device,
@@ -250,9 +232,9 @@ def _maybe_calibrate(
                 extra_page_size,
                 e,
             )
-            _cpb.mark_crossover_failed(device, family)
+            _cpb.mark_calibration_failed(device, key)
         finally:
-            _calibrating.discard(key)
+            _calibrating.discard(guard_key)
 
 
 def plan_nvfp4_sparse_mla_sm120(
@@ -283,7 +265,9 @@ def plan_nvfp4_sparse_mla_sm120(
     if not decode_ok and not prefill_ok:
         return None
 
-    family = _family_key(
+    key = _request_key(
+        num_heads=num_heads,
+        topk=topk,
         primary_page_size=primary_page_size,
         extra_topk=extra_topk,
         extra_page_size=extra_page_size,
@@ -291,19 +275,13 @@ def plan_nvfp4_sparse_mla_sm120(
         has_extra_topk_length=has_extra_topk_length,
         has_attn_sink=has_attn_sink,
     )
-    token_bucket = _token_bucket(num_tokens)
-    phase_family = _phase_family(family, token_bucket)
-    # This family's decode_max_tokens record is an encoded bucket phase,
-    # not a threshold for other token buckets.
     with _cpb._store_lock:
-        encoded_bucket_phase = _cpb.get_decode_max_tokens(
-            device, phase_family, num_heads, topk
-        )
+        profile = _cpb.get_profile(key, device)
         scope_epoch = _cpb._constants_version
-    if decode_ok and encoded_bucket_phase is None:
+    if decode_ok and profile is None:
         _maybe_calibrate(
             device=device,
-            family=family,
+            key=key,
             num_heads=num_heads,
             topk=topk,
             primary_page_size=primary_page_size,
@@ -314,17 +292,21 @@ def plan_nvfp4_sparse_mla_sm120(
             has_attn_sink=has_attn_sink,
         )
         with _cpb._store_lock:
-            encoded_bucket_phase = _cpb.get_decode_max_tokens(
-                device, phase_family, num_heads, topk
-            )
+            profile = _cpb.get_profile(key, device)
             scope_epoch = _cpb._constants_version
 
-    t_bucket = token_bucket if num_tokens <= _DECODE_MAX_TOKENS else -1
+    # Each bucket stores its own selection.  The shared selector consumes the
+    # decision directly, so NVFP4 does not inherit FP8's monotonic crossover
+    # assumption; a missing profile keeps the decode-first fallback.
+    bucket = (
+        None
+        if profile is None or num_tokens > _DECODE_MAX_TOKENS
+        else _cpb._profile_bucket(profile, num_tokens)
+    )
+    t_bucket = _token_bucket(num_tokens) if num_tokens <= _DECODE_MAX_TOKENS else -1
     memo_key = (
         scope_epoch,
-        family,
-        num_heads,
-        topk,
+        key,
         t_bucket,
         _cpb._device_key(device),
     )
@@ -340,11 +322,10 @@ def plan_nvfp4_sparse_mla_sm120(
             prefill_variant=(
                 NVFP4KernelVariant.PREFILL_STREAMING if prefill_ok else None
             ),
-            # Each bucket stores its own phase.  The shared selector consumes
-            # the decision directly, so NVFP4 does not inherit FP8's
-            # monotonic crossover assumption.
             decode_preferred=(
-                None if encoded_bucket_phase is None else encoded_bucket_phase > 0
+                None
+                if bucket is None
+                else bucket["variant"] == NVFP4KernelVariant.DECODE_SPLITK.value
             ),
         )
         if variant is None:
@@ -353,10 +334,7 @@ def plan_nvfp4_sparse_mla_sm120(
 
     if variant is NVFP4KernelVariant.PREFILL_STREAMING:
         return NVFP4PlannedCall(variant, 0)
-    cpb = _cpb.get_cpb_override(
-        device, family, num_heads, topk, _token_bucket(num_tokens)
-    )
-    return NVFP4PlannedCall(variant, 0 if cpb is None else cpb)
+    return NVFP4PlannedCall(variant, 0 if bucket is None else bucket["cpb"])
 
 
 def _allocate_cache_pool(
@@ -639,7 +617,9 @@ def calibrate_nvfp4_sparse_mla_sm120(
     if has_extra_topk_length and extra_topk == 0:
         raise ValueError("has_extra_topk_length requires extra_topk > 0")
 
-    family = _family_key(
+    key = _request_key(
+        num_heads=num_heads,
+        topk=topk,
         primary_page_size=primary_page_size,
         extra_topk=extra_topk,
         extra_page_size=extra_page_size,
@@ -647,41 +627,29 @@ def calibrate_nvfp4_sparse_mla_sm120(
         has_extra_topk_length=has_extra_topk_length,
         has_attn_sink=has_attn_sink,
     )
-    existing_phase = {
-        token_bucket: _cpb.get_decode_max_tokens(
-            device,
-            _phase_family(family, token_bucket),
-            num_heads,
-            topk,
-        )
-        for token_bucket in _CROSSOVER_PROBED_T
-    }
-    if all(value is not None for value in existing_phase.values()) and not force:
-        cpbs = {
-            t: cpb
+    existing = _cpb.get_profile(key, device)
+    if existing is not None and not force:
+        buckets = existing["buckets"]
+        reused_decode_by_t = {
+            t: buckets[str(t)]["variant"] == NVFP4KernelVariant.DECODE_SPLITK.value
             for t in _CROSSOVER_PROBED_T
-            if (cpb := _cpb.get_cpb_override(device, family, num_heads, topk, t))
-            is not None
         }
         return NVFP4CalibrationReport(
-            family,
+            key,
             num_heads,
             topk,
             extra_topk,
             extra_page_size,
-            _monotonic_decode_max_tokens(
-                {
-                    token_bucket: bool(value)
-                    for token_bucket, value in existing_phase.items()
-                }
+            max(
+                (t for t, decode in reused_decode_by_t.items() if decode), default=None
             ),
             {
-                token_bucket: "decode" if value else "prefill"
-                for token_bucket, value in existing_phase.items()
+                t: "decode" if decode else "prefill"
+                for t, decode in reused_decode_by_t.items()
             },
-            cpbs,
-            {},
-            {},
+            {t: buckets[str(t)]["cpb"] for t in _CROSSOVER_PROBED_T},
+            {t: buckets[str(t)]["decode_s"] * 1e6 for t in _CROSSOVER_PROBED_T},
+            {t: buckets[str(t)]["prefill_s"] * 1e6 for t in _CROSSOVER_PROBED_T},
             not _cpb._activate_store()[1]["overlay"],
         )
 
@@ -744,22 +712,26 @@ def calibrate_nvfp4_sparse_mla_sm120(
             best_decode_us <= _CROSSOVER_MARGIN * measured_prefill_us
         )
 
-    # The persisted decode_max_tokens field encodes one bucket's phase here,
-    # not a monotonic threshold: positive means decode, zero means prefill.
-    encoded_bucket_phases = {
-        f"{_phase_family(family, token_bucket)}|{num_heads}|{topk}": (
-            token_bucket if use_decode else 0
-        )
-        for token_bucket, use_decode in decode_by_t.items()
-    }
-    persisted = _cpb.publish_calibration(
-        device,
-        family,
-        crossover=encoded_bucket_phases,
-        overrides={
-            f"{family}|{num_heads}|{topk}|{t}": cpb for t, cpb in cpb_by_t.items()
+    profile = {
+        "request": json.loads(key),
+        "sample_kind": "full_capacity_canonical_layout",
+        "buckets": {
+            str(t): {
+                "variant": (
+                    NVFP4KernelVariant.DECODE_SPLITK.value
+                    if decode_by_t[t]
+                    else NVFP4KernelVariant.PREFILL_STREAMING.value
+                ),
+                "cpb": cpb_by_t[t],
+                "decode_s": decode_us[t] / 1e6,
+                "prefill_s": prefill_us[t] / 1e6,
+            }
+            for t in _CROSSOVER_PROBED_T
         },
-    )
+    }
+    persisted = _cpb.publish_calibration(device, _FAMILY, profiles={key: profile})
+    failed = _cpb._store_projection(_FAMILY, "failed")
+    failed.discard((_cpb._device_key(device), key))
     phase_by_t = {
         token_bucket: "decode" if use_decode else "prefill"
         for token_bucket, use_decode in decode_by_t.items()
@@ -775,12 +747,12 @@ def calibrate_nvfp4_sparse_mla_sm120(
         cpb_by_t,
     )
     return NVFP4CalibrationReport(
-        family,
+        key,
         num_heads,
         topk,
         extra_topk,
         extra_page_size,
-        _monotonic_decode_max_tokens(decode_by_t),
+        max((t for t, decode in decode_by_t.items() if decode), default=None),
         phase_by_t,
         cpb_by_t,
         decode_us,

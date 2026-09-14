@@ -50,7 +50,7 @@ family, and non-zero values poisoned the latency-regime picks).
 The same tuning-mode pass also measures the decode/prefill crossover per
 decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
 and persists it as ``decode_max_tokens`` in the same JSON document (schema
-version 2; only current-schema files load — files at any other version count
+version 3; only current-schema files load — files at any other version count
 as absent, so their families recalibrate on the next tuning-mode pass). The
 runtime decode/prefill routing in :mod:`._sparse_mla_sm120` consults it;
 absent entries keep the historical decode-first policy.
@@ -88,9 +88,10 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 2
-# GLM NoPE's canonical payload changed from 656B to 528B. Old constants and
-# measured picks must not retain that footprint; stale schemas recalibrate.
+_SCHEMA_VERSION = 3
+# v3: NVFP4 selections moved from phase-encoded crossover/override entries to
+# per-bucket profile records, and DSV4.1 profiles may carry refined exact-T
+# entries. Only current-schema files load; stale families recalibrate.
 
 _CALIBRATION_MODELS = {
     family: model for model, family in MODEL_FAMILIES.items() if family != "glm_nsa"
@@ -1102,11 +1103,19 @@ def _parse_payload_devices(devices: dict) -> tuple[dict, dict, dict]:
             continue
         for family, raw in families.items():
             if family == "profiles":
+                canonical = {str(t) for t in _PROFILE_T}
                 for profile in raw.values():
-                    if set(profile["buckets"]) != {str(t) for t in _PROFILE_T}:
+                    buckets = profile["buckets"]
+                    # Refined exact-T entries extend the canonical grid.
+                    if not canonical <= set(buckets):
                         raise ValueError("incomplete calibration profile")
-                    for bucket in profile["buckets"].values():
-                        if bucket["variant"] not in (0, 1) or bucket["cpb"] < 1:
+                    variants = (
+                        ("decode_splitk", "prefill_streaming")
+                        if profile.get("request", {}).get("family") == "dsv4_nvfp4"
+                        else (0, 1)
+                    )
+                    for bucket in buckets.values():
+                        if bucket["variant"] not in variants or bucket["cpb"] < 1:
                             raise ValueError("invalid profile selection")
                         for name in ("decode_s", "prefill_s"):
                             latency = bucket.get(name)
@@ -1308,8 +1317,6 @@ def publish_calibration(
         )
         replace = replace_family or replace_family_if_absent
         prefixes = tuple(f + "|" for f in aliases) if replace else ()
-        if replace and family.startswith("dsv4_nvfp4"):
-            prefixes += (family + "_t",)
         unit = (
             dev_key,
             {family: asdict(constants)} if constants is not None else {},
@@ -1539,16 +1546,25 @@ class _Dsv41Request:
 
 
 def _profile_bucket(profile: dict, tokens: int) -> dict | None:
+    """Exact refined entry first, else the nearest-up canonical bucket."""
+    buckets = profile["buckets"]
+    exact = buckets.get(str(tokens))
+    if exact is not None:
+        return exact
     bucket = next((t for t in _PROFILE_T if tokens <= t), None)
-    return None if bucket is None else profile["buckets"][str(bucket)]
+    return None if bucket is None else buckets[str(bucket)]
 
 
-def get_dsv41_profile(request: _Dsv41Request, device: torch.device) -> dict | None:
+def get_profile(key: str, device: torch.device) -> dict | None:
     with _store_lock:
         refresh_store()
         _, state = _activate_store()
-        value = state.get("profiles", {}).get(_device_key(device), {}).get(request.key)
+        value = state.get("profiles", {}).get(_device_key(device), {}).get(key)
         return None if value is None else json.loads(json.dumps(value))
+
+
+def get_dsv41_profile(request: _Dsv41Request, device: torch.device) -> dict | None:
+    return get_profile(request.key, device)
 
 
 def _profile_pool(
@@ -1595,19 +1611,27 @@ def _profile_pool(
             torch.cuda.empty_cache()
 
 
-@_target_calibration
-def _measure_dsv41(request: _Dsv41Request, device: torch.device) -> dict:
-    from ._sparse_mla_sm120_execution import (
-        AttentionMetadata,
-        metadata_candidates,
-        resolve_attention,
-        get_sparse_mla_sm120_module,
-    )
+@dataclass(frozen=True)
+class _Dsv41MeasureContext:
+    """Device-resident pools and capabilities shared across profile buckets."""
 
-    request.validate()
+    device: torch.device
+    main: torch.Tensor
+    slots: int
+    extra: torch.Tensor | None
+    extra_slots: int
+    caps: tuple[int, int]
+    l2: int
+    module: Any
+
+
+def _dsv41_measure_context(
+    request: _Dsv41Request, device: torch.device
+) -> _Dsv41MeasureContext:
+    from ._sparse_mla_sm120_execution import get_sparse_mla_sm120_module
+
     props = torch.cuda.get_device_properties(device)
     caps = (props.multi_processor_count, props.shared_memory_per_block_optin)
-    l2 = _device_l2(device)
     facts = format_info(5)
     main_bytes = request.topk * facts["bytes_per_token"]
     extra_bpt = (
@@ -1638,158 +1662,223 @@ def _measure_dsv41(request: _Dsv41Request, device: torch.device) -> dict:
             ),
             request.extra_kv_fp4,
         )
-    module = get_sparse_mla_sm120_module()
-    buckets = {}
-    for tokens in _PROFILE_T:
-        generator = torch.Generator(device=device).manual_seed(3)
-        q = (
-            torch.randn(
-                (tokens, request.heads, facts["query_dim"]),
-                device=device,
-                generator=generator,
-            )
-            .mul_(0.1)
-            .clamp_(-1, 1)
-            .to(torch.bfloat16)
+    return _Dsv41MeasureContext(
+        device=device,
+        main=main,
+        slots=slots,
+        extra=extra,
+        extra_slots=extra_slots,
+        caps=caps,
+        l2=_device_l2(device),
+        module=get_sparse_mla_sm120_module(),
+    )
+
+
+def _measure_dsv41_bucket(
+    request: _Dsv41Request, ctx: _Dsv41MeasureContext, tokens: int
+) -> dict:
+    from ._sparse_mla_sm120_execution import (
+        AttentionMetadata,
+        metadata_candidates,
+        resolve_attention,
+    )
+
+    device = ctx.device
+    facts = format_info(5)
+    main_bytes = request.topk * facts["bytes_per_token"]
+    extra_bpt = (
+        facts["fp4_bytes_per_token"]
+        if request.extra_kv_fp4
+        else facts["bytes_per_token"]
+    )
+    extra_bytes = request.extra_topk * extra_bpt
+    generator = torch.Generator(device=device).manual_seed(3)
+    q = (
+        torch.randn(
+            (tokens, request.heads, facts["query_dim"]),
+            device=device,
+            generator=generator,
         )
-        output = torch.empty_like(q)
-        lse = torch.empty((tokens, request.heads), device=device)
-        lengths = (
-            torch.full((tokens,), request.topk, dtype=torch.int32, device=device)
-            if request.has_topk_length
-            else None
-        )
-        extra_lengths = (
-            torch.full((tokens,), request.extra_topk, dtype=torch.int32, device=device)
-            if request.has_extra_topk_length
-            else None
-        )
-        sink = (
-            torch.zeros((request.heads,), device=device)
-            if request.has_attn_sink
-            else None
-        )
-        metadata = AttentionMetadata(
-            5,
-            tokens,
-            request.heads,
-            request.topk,
-            request.extra_topk,
-            request.primary_page_size,
-            request.extra_page_size,
-            main.stride(0),
-            0 if extra is None else extra.stride(0),
-            facts["bytes_per_token"],
-            request.topk,
-            request.extra_topk,
-            request.heads,
-            lengths is not None,
-            extra_lengths is not None,
-            sink is not None,
-            request.extra_kv_fp4,
-            0,
-        )
-        legal = metadata_candidates(
-            metadata, request.effective["compute_precision"], *caps
-        )
-        if 0 not in legal:
-            raise CalibrationError("no legal DSV4.1 decode candidate for profile")
-        footprint = tokens * (main_bytes + extra_bytes)
-        count = max(_MIN_BATCH_CALLS, 4 * l2 // footprint + 2)
-        index_bytes = count * tokens * (request.topk + request.extra_topk) * 4
-        if index_bytes > 64 << 20:
-            raise CalibrationError(
-                "profile rotation exceeds bounded 64 MiB index budget"
-            )
-        indices = torch.randint(
-            slots,
-            (count, tokens, request.topk),
+        .mul_(0.1)
+        .clamp_(-1, 1)
+        .to(torch.bfloat16)
+    )
+    output = torch.empty_like(q)
+    lse = torch.empty((tokens, request.heads), device=device)
+    lengths = (
+        torch.full((tokens,), request.topk, dtype=torch.int32, device=device)
+        if request.has_topk_length
+        else None
+    )
+    extra_lengths = (
+        torch.full((tokens,), request.extra_topk, dtype=torch.int32, device=device)
+        if request.has_extra_topk_length
+        else None
+    )
+    sink = (
+        torch.zeros((request.heads,), device=device) if request.has_attn_sink else None
+    )
+    metadata = AttentionMetadata(
+        5,
+        tokens,
+        request.heads,
+        request.topk,
+        request.extra_topk,
+        request.primary_page_size,
+        request.extra_page_size,
+        ctx.main.stride(0),
+        0 if ctx.extra is None else ctx.extra.stride(0),
+        facts["bytes_per_token"],
+        request.topk,
+        request.extra_topk,
+        request.heads,
+        lengths is not None,
+        extra_lengths is not None,
+        sink is not None,
+        request.extra_kv_fp4,
+        0,
+    )
+    legal = metadata_candidates(
+        metadata, request.effective["compute_precision"], *ctx.caps
+    )
+    if 0 not in legal:
+        raise CalibrationError("no legal DSV4.1 decode candidate for profile")
+    footprint = tokens * (main_bytes + extra_bytes)
+    count = max(_MIN_BATCH_CALLS, 4 * ctx.l2 // footprint + 2)
+    index_bytes = count * tokens * (request.topk + request.extra_topk) * 4
+    if index_bytes > 64 << 20:
+        raise CalibrationError("profile rotation exceeds bounded 64 MiB index budget")
+    indices = torch.randint(
+        ctx.slots,
+        (count, tokens, request.topk),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
+    )
+    extra_indices = (
+        torch.randint(
+            ctx.extra_slots,
+            (count, tokens, request.extra_topk),
             device=device,
             dtype=torch.int32,
             generator=generator,
         )
-        extra_indices = (
-            torch.randint(
-                extra_slots,
-                (count, tokens, request.extra_topk),
-                device=device,
-                dtype=torch.int32,
-                generator=generator,
-            )
-            if extra is not None
-            else None
+        if ctx.extra is not None
+        else None
+    )
+    distinct = torch.unique(indices).numel() * facts["bytes_per_token"]
+    if extra_indices is not None:
+        distinct += torch.unique(extra_indices).numel() * extra_bpt
+    if distinct - footprint <= 2 * ctx.l2:
+        raise CalibrationError(
+            "profile distinct rotation footprint does not exceed 2xL2"
         )
-        distinct = torch.unique(indices).numel() * facts["bytes_per_token"]
-        if extra_indices is not None:
-            distinct += torch.unique(extra_indices).numel() * extra_bpt
-        if distinct - footprint <= 2 * l2:
-            raise CalibrationError(
-                "profile distinct rotation footprint does not exceed 2xL2"
-            )
-        arguments = [
-            (indices[i], None if extra_indices is None else extra_indices[i])
-            for i in range(count)
+    arguments = [
+        (indices[i], None if extra_indices is None else extra_indices[i])
+        for i in range(count)
+    ]
+
+    def timed(variant: int, cpb: int) -> float:
+        plan = resolve_attention(
+            **metadata._replace(variant=variant)._asdict(),
+            precision=request.effective["compute_precision"],
+            cpb=cpb,
+            sm_count=ctx.caps[0],
+            max_shared_bytes=ctx.caps[1],
+        )
+        workspace = [
+            torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), device=device)
+            for shape, dtype, _, _ in plan.workspace()
         ]
 
-        def timed(variant: int, cpb: int) -> float:
-            plan = resolve_attention(
-                **metadata._replace(variant=variant)._asdict(),
-                precision=request.effective["compute_precision"],
-                cpb=cpb,
-                sm_count=caps[0],
-                max_shared_bytes=caps[1],
+        def call(ix, ex):
+            ctx.module.execute_attention(
+                plan,
+                q,
+                ctx.main,
+                ix,
+                workspace[0],
+                workspace[1],
+                output,
+                lse,
+                facts["query_dim"] ** -0.5,
+                lengths,
+                sink,
+                ctx.extra,
+                ex,
+                extra_lengths,
             )
-            workspace = [
-                torch.empty(
-                    tuple(shape), dtype=getattr(torch, str(dtype)), device=device
-                )
-                for shape, dtype, _, _ in plan.workspace()
-            ]
 
-            def call(ix, ex):
-                module.execute_attention(
-                    plan,
-                    q,
-                    main,
-                    ix,
-                    workspace[0],
-                    workspace[1],
-                    output,
-                    lse,
-                    facts["query_dim"] ** -0.5,
-                    lengths,
-                    sink,
-                    extra,
-                    ex,
-                    extra_lengths,
-                )
+        return time_calibration_calls(call, arguments, device)
 
-            return time_calibration_calls(call, arguments, device)
+    decoded = {cpb: timed(0, cpb) for cpb in range(1, legal[0] + 1)}
+    best = min(decoded, key=lambda cpb: (decoded[cpb], -cpb))
+    prefill = timed(1, 1) if 1 in legal else None
+    variant = (
+        0 if prefill is None or decoded[best] <= _CROSSOVER_MARGIN * prefill else 1
+    )
+    return {
+        "variant": variant,
+        "cpb": best,
+        "decode_s": decoded[best],
+        "prefill_s": prefill,
+        "decode_candidates_s": decoded,
+        "prefill_absent": None if prefill is not None else "metadata_ineligible",
+        "rotation_calls": count,
+        "index_bytes": index_bytes,
+        "distinct_rotation_bytes": distinct,
+    }
 
-        decoded = {cpb: timed(0, cpb) for cpb in range(1, legal[0] + 1)}
-        best = min(decoded, key=lambda cpb: (decoded[cpb], -cpb))
-        prefill = timed(1, 1) if 1 in legal else None
-        variant = (
-            0 if prefill is None or decoded[best] <= _CROSSOVER_MARGIN * prefill else 1
-        )
-        buckets[str(tokens)] = {
-            "variant": variant,
-            "cpb": best,
-            "decode_s": decoded[best],
-            "prefill_s": prefill,
-            "decode_candidates_s": decoded,
-            "prefill_absent": None if prefill is not None else "metadata_ineligible",
-            "rotation_calls": count,
-            "index_bytes": index_bytes,
-            "distinct_rotation_bytes": distinct,
-        }
+
+@_target_calibration
+def _measure_dsv41(request: _Dsv41Request, device: torch.device) -> dict:
+    request.validate()
+    ctx = _dsv41_measure_context(request, device)
+    buckets = {
+        str(tokens): _measure_dsv41_bucket(request, ctx, tokens)
+        for tokens in _PROFILE_T
+    }
     return {
         "request": request.effective,
         "sample_kind": "full_capacity_canonical_layout",
-        "caps": {"sm_count": caps[0], "shared_bytes": caps[1], "l2_bytes": l2},
-        "pool_bytes": [main.numel(), 0 if extra is None else extra.numel()],
+        "caps": {
+            "sm_count": ctx.caps[0],
+            "shared_bytes": ctx.caps[1],
+            "l2_bytes": ctx.l2,
+        },
+        "pool_bytes": [
+            ctx.main.numel(),
+            0 if ctx.extra is None else ctx.extra.numel(),
+        ],
         "buckets": buckets,
     }
+
+
+@_target_calibration
+def refine_dsv41(
+    request: _Dsv41Request, device: torch.device, tokens: int
+) -> dict | None:
+    """Measure one exact token count and merge it into the stored profile.
+
+    Returns the refined bucket entry, or ``None`` when refinement does not
+    apply (outside the profiled range, no stored profile, or the exact entry
+    already measured).
+    """
+    if not 1 <= tokens <= _PROFILE_T[-1]:
+        return None
+    request.validate()
+    with _store_lock:
+        profile = get_profile(request.key, device)
+        if profile is None or str(tokens) in profile["buckets"]:
+            return None
+        ctx = _dsv41_measure_context(request, device)
+        entry = _measure_dsv41_bucket(request, ctx, tokens)
+        entry["provenance"] = "refined"
+        profile["buckets"][str(tokens)] = entry
+        persisted = publish_calibration(
+            device, "dsv4_1", profiles={request.key: profile}
+        )
+    return {**entry, "persisted": persisted}
 
 
 def _calibrate_dsv41(request: _Dsv41Request, device: torch.device, force: bool) -> dict:

@@ -1135,29 +1135,19 @@ def planner_state(monkeypatch):
     monkeypatch.setattr(
         native_policy, "_supports", lambda *args: DSV4_NVFP4_SUPPORT[args]
     )
-    crossover: dict[str, int] = {}
-    cpb: dict[str, int] = {}
+    profiles: dict[str, dict] = {}
     monkeypatch.setattr(cpb_mod, "_device_key", lambda _device: "0:Fake SM120")
     monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
-    monkeypatch.setattr(
-        cpb_mod,
-        "get_decode_max_tokens",
-        lambda _device, family, heads, topk: crossover.get(f"{family}|{heads}|{topk}"),
-    )
-    monkeypatch.setattr(
-        cpb_mod,
-        "get_cpb_override",
-        lambda _device, family, heads, topk, tokens: cpb.get(
-            f"{family}|{heads}|{topk}|{tokens}"
-        ),
-    )
+    monkeypatch.setattr(cpb_mod, "get_profile", lambda key, _device: profiles.get(key))
     monkeypatch.setattr(native_policy, "_maybe_calibrate", lambda **_kwargs: None)
     monkeypatch.setattr(native_policy, "_plan_memo", {})
-    return crossover, cpb
+    return profiles
 
 
-def _family(**kwargs) -> str:
+def _profile_key(**kwargs) -> str:
     defaults = dict(
+        num_heads=64,
+        topk=128,
         primary_page_size=64,
         extra_topk=0,
         extra_page_size=0,
@@ -1166,7 +1156,28 @@ def _family(**kwargs) -> str:
         has_attn_sink=False,
     )
     defaults.update(kwargs)
-    return native_policy._family_key(**defaults)
+    return native_policy._request_key(**defaults)
+
+
+def _profile(phases: dict[int, str], cpbs: dict[int, int] | None = None) -> dict:
+    """Full-grid profile record; unlisted buckets default to decode at cpb 1."""
+    cpbs = cpbs or {}
+    return {
+        "request": {"family": "dsv4_nvfp4"},
+        "buckets": {
+            str(t): {
+                "variant": (
+                    "decode_splitk"
+                    if phases.get(t, "decode") == "decode"
+                    else "prefill_streaming"
+                ),
+                "cpb": cpbs.get(t, 1),
+                "decode_s": 1e-5,
+                "prefill_s": 1e-5,
+            }
+            for t in native_policy._CROSSOVER_PROBED_T
+        },
+    }
 
 
 def _plan(tokens: int, **kwargs):
@@ -1182,11 +1193,7 @@ def _plan(tokens: int, **kwargs):
     return native_policy.plan_nvfp4_sparse_mla_sm120(**defaults)
 
 
-def _phase_key(family: str, tokens: int, *, heads: int = 64, topk: int = 128) -> str:
-    return f"{native_policy._phase_family(family, tokens)}|{heads}|{topk}"
-
-
-def test_nvfp4_unknown_crossover_keeps_safe_decode_fallback(planner_state) -> None:
+def test_nvfp4_missing_profile_keeps_safe_decode_fallback(planner_state) -> None:
     planned = _plan(32)
     assert planned is not None
     assert planned.variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
@@ -1194,11 +1201,7 @@ def test_nvfp4_unknown_crossover_keeps_safe_decode_fallback(planner_state) -> No
 
 
 def test_nvfp4_calibrated_crossover_replaces_fixed_64_policy(planner_state) -> None:
-    crossover, cpb = planner_state
-    family = _family()
-    crossover[_phase_key(family, 8)] = 8
-    crossover[_phase_key(family, 16)] = 0
-    cpb[f"{family}|64|128|8"] = 2
+    planner_state[_profile_key()] = _profile({16: "prefill"}, {8: 2})
     native_policy._plan_memo.clear()
     at_crossover = _plan(8)
     above_crossover = _plan(9)
@@ -1210,10 +1213,7 @@ def test_nvfp4_calibrated_crossover_replaces_fixed_64_policy(planner_state) -> N
 
 
 def test_nvfp4_decode_cpb_uses_calibrated_token_bucket(planner_state) -> None:
-    crossover, cpb = planner_state
-    family = _family()
-    crossover[_phase_key(family, 16)] = 16
-    cpb[f"{family}|64|128|16"] = 3
+    planner_state[_profile_key()] = _profile({}, {16: 3})
     native_policy._plan_memo.clear()
     planned = _plan(9)
     assert planned is not None
@@ -1222,37 +1222,34 @@ def test_nvfp4_decode_cpb_uses_calibrated_token_bucket(planner_state) -> None:
 
 
 def test_nvfp4_64_is_only_decode_envelope(planner_state) -> None:
-    crossover, _ = planner_state
-    family = _family()
-    crossover[_phase_key(family, 64)] = 64
+    planner_state[_profile_key()] = _profile({})
     native_policy._plan_memo.clear()
     assert _plan(64).variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
     assert _plan(65).variant is native_policy.NVFP4KernelVariant.PREFILL_STREAMING
     assert _plan(8192).variant is native_policy.NVFP4KernelVariant.PREFILL_STREAMING
 
 
-def test_nvfp4_phase_table_preserves_non_monotonic_wave_boundaries(
+def test_nvfp4_bucket_table_preserves_non_monotonic_wave_boundaries(
     planner_state,
 ) -> None:
-    crossover, cpb = planner_state
-    family = _family()
-    crossover[_phase_key(family, 48)] = 0
-    crossover[_phase_key(family, 64)] = 64
-    cpb[f"{family}|64|128|64"] = 7
+    planner_state[_profile_key()] = _profile({48: "prefill"}, {64: 7})
     native_policy._plan_memo.clear()
     at_48 = _plan(48)
     at_64 = _plan(64)
     assert at_48.variant is native_policy.NVFP4KernelVariant.PREFILL_STREAMING
     assert at_64.variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
     assert at_64.cpb == 7
-    assert native_policy._monotonic_decode_max_tokens({48: False, 64: True}) is None
 
 
 def test_nvfp4_calibration_namespace_is_format_and_shape_specific() -> None:
-    main = _family()
-    dual_p2 = _family(extra_topk=512, extra_page_size=2, has_extra_topk_length=True)
-    dual_p64 = _family(extra_topk=512, extra_page_size=64, has_extra_topk_length=True)
-    with_sink = _family(has_attn_sink=True)
+    main = _profile_key()
+    dual_p2 = _profile_key(
+        extra_topk=512, extra_page_size=2, has_extra_topk_length=True
+    )
+    dual_p64 = _profile_key(
+        extra_topk=512, extra_page_size=64, has_extra_topk_length=True
+    )
+    with_sink = _profile_key(has_attn_sink=True)
     assert len({main, dual_p2, dual_p64, with_sink}) == 4
     assert main != "dsv4"
 
@@ -1269,14 +1266,11 @@ def test_nvfp4_planner_rejects_shapes_outside_both_envelopes(planner_state) -> N
 def test_nvfp4_plan_rechecks_lookup_after_lazy_calibration(
     planner_state, monkeypatch
 ) -> None:
-    crossover, cpb = planner_state
-    family = _family()
     calls = []
 
     def inject(**kwargs) -> None:
         calls.append(kwargs)
-        crossover[_phase_key(family, 16)] = 16
-        cpb[f"{family}|64|128|16"] = 4
+        planner_state[kwargs["key"]] = _profile({}, {16: 4})
 
     monkeypatch.setattr(native_policy, "_maybe_calibrate", inject)
     planned = _plan(12)
