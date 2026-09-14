@@ -1908,6 +1908,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             for inputs in input_batches:
                 self._prepare_workspace(inputs, identity, **kwargs)
 
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple[Any, ...]:
+            """Separate persistent tactics across MoE expert geometry."""
+            return (
+                self.num_experts,
+                self.num_local_experts,
+                self.top_k,
+                self.num_fused_shared_experts,
+            )
+
         def forward(
             self,
             inputs: list[Any],
