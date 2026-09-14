@@ -1260,6 +1260,54 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     assert ragged["inputs"]["max_q_len"]["shape"] is None
 
 
+def test_trtllm_mla_prefill_fi_trace_only_changes_public_api_tag():
+    import flashinfer.mla
+    import flashinfer.prefill
+
+    kwargs = {
+        "query": torch.empty(2, 3, 128, 576, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(4, 64, 576, dtype=torch.bfloat16),
+        "workspace_buffer": torch.empty(1024, dtype=torch.int8),
+        "qk_nope_head_dim": 512,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "block_tables": torch.zeros(2, 1, dtype=torch.int32),
+        "seq_lens": torch.full((2,), 64, dtype=torch.int32),
+        "max_seq_len": 64,
+    }
+    decode_api = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+    prefill_api = flashinfer.prefill.trtllm_prefill_with_kv_cache_mla
+
+    assert callable(decode_api.fi_trace)
+    assert callable(prefill_api.fi_trace)
+    decode_tag = "fi_api:flashinfer.mla._core.trtllm_batch_decode_with_kv_cache_mla"
+    prefill_tag = "fi_api:flashinfer.mla._core.trtllm_prefill_with_kv_cache_mla"
+    cases = [
+        kwargs,
+        {
+            **kwargs,
+            "query": torch.empty(5, 128, 576, dtype=torch.bfloat16),
+            "cum_seq_lens_q": torch.tensor([0, 2, 5], dtype=torch.int32),
+            "max_q_len": 3,
+        },
+    ]
+
+    for case in cases:
+        decode = decode_api.fi_trace(**case)
+        prefill = prefill_api.fi_trace(**case)
+
+        assert decode_tag in decode["tags"]
+        assert prefill_tag in prefill["tags"]
+
+        prefill_with_decode_tag = {
+            **prefill,
+            "tags": [
+                decode_tag if tag == prefill_tag else tag for tag in prefill["tags"]
+            ],
+        }
+        assert prefill_with_decode_tag == decode
+
+
 # ---------------------------------------------------------------------------
 # JSON file output
 # ---------------------------------------------------------------------------

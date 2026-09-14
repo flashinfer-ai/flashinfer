@@ -254,6 +254,7 @@ def gen_pcie_ipc_comm_debug_module(
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
+        extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
             f"-DFLASHINFER_PCIE_IPC_DEBUG_CROSS_STALL_NS={stall_ns}",
             f"-DFLASHINFER_PCIE_IPC_DEBUG_STALL_ISLAND={stall_island}",
@@ -274,6 +275,7 @@ def gen_pcie_ipc_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
+        extra_ldflags=["-lcuda"],
     )
 
 
