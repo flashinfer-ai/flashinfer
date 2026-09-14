@@ -997,7 +997,7 @@ def bmm_bf16(
         return bmm_bf16_cutile(A, B, out)
 
     if backend == "cake":
-        get_blackwell_bf16_bmm_module(A.device).run(A, B, out)
+        get_blackwell_bf16_bmm_module(A.device, backend="cake").run(A, B, out)
         return out
 
     workspace_buffer = _get_cache_buf(
@@ -1018,15 +1018,21 @@ def _get_blackwell_bf16_bmm_module(target: Literal["sm100a", "sm103a"]):
     return gen_blackwell_bf16_bmm_module(target).build_and_load()
 
 
-def get_blackwell_bf16_bmm_module(device: Optional[torch.device] = None):
+def get_blackwell_bf16_bmm_module(
+    device: Optional[torch.device] = None,
+    *,
+    backend: Literal["cake"] = "cake",
+):
     if device is None:
         device = torch.device("cuda")
     compute_capability = get_compute_capability(device)
-    target_by_compute_capability: dict[tuple[int, int], Literal["sm100a", "sm103a"]] = {
-        (10, 0): "sm100a",
-        (10, 3): "sm103a",
+    target_by_backend_and_compute_capability: dict[
+        tuple[str, int, int], Literal["sm100a", "sm103a"]
+    ] = {
+        ("cake", 10, 0): "sm100a",
+        ("cake", 10, 3): "sm103a",
     }
-    target = target_by_compute_capability.get(compute_capability)
+    target = target_by_backend_and_compute_capability.get((backend, *compute_capability))
     if target is None:
         raise ValueError(
             "CAKE BF16 BMM requires SM100 or SM103; "
