@@ -59,6 +59,7 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_index_tensor,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -1718,23 +1719,27 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         qo_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
+            should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D, contiguous, and on the
+            same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         paged_kv_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_indptr`` array, the size of this
-            buffer should be ``[batch_size + 1]``.
+            buffer should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D, contiguous, and
+            on the same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         paged_kv_indices_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_indices`` array, should be large
             enough to store the maximum possible size of the ``paged_kv_indices`` array during
-            the lifetime of the wrapper. This argument is only effective when ``use_cuda_graph``
-            is ``True``.
+            the lifetime of the wrapper. Must be ``torch.int32``, 1D, contiguous, and on the
+            same device as ``float_workspace_buffer``. This argument is only effective when
+            ``use_cuda_graph`` is ``True``.
 
         paged_kv_last_page_len_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_last_page_len`` array, the size of
-            the buffer should be ``[batch_size]``.
+            the buffer should be ``[batch_size]``. Must be ``torch.int32``, 1D, contiguous, and
+            on the same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         custom_mask_buf : Optional[torch.Tensor]
@@ -1745,7 +1750,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         mask_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``mask_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
+            should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D, contiguous, and on the
+            same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True`` and the custom
             mask will be used in attention computation.
 
@@ -1868,16 +1874,41 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise ValueError(
                     "paged_kv_last_page_len_buf should be a torch.Tensor in CUDA graph mode"
                 )
+            # Graph replays read these buffers by address; pin dtype, rank,
+            # device and layout once.
+            _check_index_tensor(
+                qo_indptr_buf, "qo_indptr_buf", device=self.device, contiguous=True
+            )
             self._fixed_batch_size = len(qo_indptr_buf) - 1
-            if len(paged_kv_indptr_buf) != self._fixed_batch_size + 1:
-                raise ValueError(
-                    "The length of paged_kv_indptr_buf should be batch_size + 1."
+            _check_index_tensor(
+                paged_kv_indptr_buf,
+                "paged_kv_indptr_buf",
+                expected_len=self._fixed_batch_size + 1,
+                device=self.device,
+                contiguous=True,
+            )
+            _check_index_tensor(
+                paged_kv_indices_buf,
+                "paged_kv_indices_buf",
+                device=self.device,
+                contiguous=True,
+            )
+            _check_index_tensor(
+                paged_kv_last_page_len_buf,
+                "paged_kv_last_page_len_buf",
+                expected_len=self._fixed_batch_size,
+                device=self.device,
+                contiguous=True,
+            )
+            # custom_mask_buf holds packed mask bits, not indices.
+            if mask_indptr_buf is not None:
+                _check_index_tensor(
+                    mask_indptr_buf,
+                    "mask_indptr_buf",
+                    expected_len=self._fixed_batch_size + 1,
+                    device=self.device,
+                    contiguous=True,
                 )
-            if len(paged_kv_last_page_len_buf) != self._fixed_batch_size:
-                raise ValueError(
-                    "The length of paged_kv_last_page_len_buf should be batch_size."
-                )
-            # NOTE(Zihao): do not check custom_mask_buf and mask_indptr_buf here, as they are optional
         else:
             self._fixed_batch_size = 0
 
@@ -2253,16 +2284,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
         Parameters
         ----------
         qo_indptr : torch.Tensor
-            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``, dtype
+            ``torch.int32``.
             For the ``cudnn`` backend this is interpreted in **element units**
             (``cumsum(seq_lens_q) * num_qo_heads * head_dim_qk``), not token units.
         paged_kv_indptr : torch.Tensor
-            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``, dtype
+            ``torch.int32``.
         paged_kv_indices : torch.Tensor
-            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``.
+            The page indices of the paged kv-cache, shape: ``[paged_kv_indptr[-1]]``, dtype
+            ``torch.int32``.
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
-            kv-cache, shape: ``[batch_size]``.
+            kv-cache, shape: ``[batch_size]``, dtype ``torch.int32``.
         num_qo_heads : int
             The number of query/output heads.
         num_kv_heads : int
@@ -2392,7 +2426,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
+        _check_index_tensor(qo_indptr, "qo_indptr")
         batch_size = len(qo_indptr) - 1
+        _check_index_tensor(
+            paged_kv_indptr, "paged_kv_indptr", expected_len=batch_size + 1
+        )
+        _check_index_tensor(paged_kv_indices, "paged_kv_indices")
+        _check_index_tensor(
+            paged_kv_last_page_len, "paged_kv_last_page_len", expected_len=batch_size
+        )
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
@@ -2507,14 +2549,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
-            self._paged_kv_indptr_buf = paged_kv_indptr.to(
+            # .to() leaves a strided same-device tensor strided; the kernel needs
+            # contiguous memory.
+            self._qo_indptr_buf = qo_indptr.contiguous().to(
                 self.device, non_blocking=non_blocking
             )
-            self._paged_kv_indices_buf = paged_kv_indices.to(
+            self._paged_kv_indptr_buf = paged_kv_indptr.contiguous().to(
                 self.device, non_blocking=non_blocking
             )
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
+            self._paged_kv_indices_buf = paged_kv_indices.contiguous().to(
+                self.device, non_blocking=non_blocking
+            )
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.contiguous().to(
                 self.device, non_blocking=non_blocking
             )
             if packed_custom_mask is not None:
@@ -3507,12 +3553,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         qo_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``qo_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
+            should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D, contiguous, and on the
+            same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         kv_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``kv_indptr`` array, the size of the buffer
-            should be ``[batch_size + 1]``.
+            should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D, contiguous, and on the
+            same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         custom_mask_buf : Optional[torch.Tensor]
@@ -3523,7 +3571,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         mask_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``mask_indptr`` array, the size of the buffer
-            should be ``[batch_size]``.
+            should be ``[batch_size + 1]``. Must be ``torch.int32``, 1D, contiguous, and on the
+            same device as ``float_workspace_buffer``.
             This argument is only effective when ``use_cuda_graph`` is ``True`` and custom mask
             will be used in attention computation.
 
@@ -3634,15 +3683,26 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise ValueError(
                     "kv_indptr_buf should be a torch.Tensor in cuda graph mode"
                 )
+            _check_index_tensor(
+                qo_indptr_buf, "qo_indptr_buf", device=self.device, contiguous=True
+            )
             self._fixed_batch_size = len(qo_indptr_buf) - 1
-            if len(kv_indptr_buf) != self._fixed_batch_size + 1:
-                raise ValueError(
-                    "The length of kv_indptr_buf ({}) should be the same as qo_indptr_buf ({}).".format(
-                        len(kv_indptr_buf), self._fixed_batch_size
-                    )
+            _check_index_tensor(
+                kv_indptr_buf,
+                "kv_indptr_buf",
+                expected_len=self._fixed_batch_size + 1,
+                device=self.device,
+                contiguous=True,
+            )
+            # custom_mask_buf holds packed mask bits, not indices.
+            if mask_indptr_buf is not None:
+                _check_index_tensor(
+                    mask_indptr_buf,
+                    "mask_indptr_buf",
+                    expected_len=self._fixed_batch_size + 1,
+                    device=self.device,
+                    contiguous=True,
                 )
-            # NOTE(Zihao): do not check custom_mask_buf and mask_indptr_buf here,
-            # as they may not be used.
 
         self._qo_indptr_buf = qo_indptr_buf
         self._kv_indptr_buf = kv_indptr_buf
@@ -3721,13 +3781,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         Parameters
         ----------
         qo_indptr : torch.Tensor
-            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``, dtype
+            ``torch.int32``.
             For the ``cudnn`` backend the ``qo_indptr`` and ``kv_indptr`` are
             interpreted in **element units** (``cumsum(seq_lens) * num_heads *
             head_dim_qk``), not token units. The ``cudnn`` backend also requires
             ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
-            The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
+            The indptr of the key/value tensor, shape: ``[batch_size + 1]``, dtype
+            ``torch.int32``.
         num_qo_heads : int
             The number of query/output heads.
         num_kv_heads : int
@@ -3852,11 +3914,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
+        _check_index_tensor(qo_indptr, "qo_indptr")
         batch_size = len(qo_indptr) - 1
-        if len(kv_indptr) != batch_size + 1:
-            raise ValueError(
-                "The kv_indptr length should be equal to mask_indptr length."
-            )
+        _check_index_tensor(kv_indptr, "kv_indptr", expected_len=batch_size + 1)
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
         if packed_custom_mask is None and custom_mask is not None:
@@ -3910,8 +3970,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
-            self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=non_blocking)
+            # .to() leaves a strided same-device tensor strided; the kernel needs
+            # contiguous memory.
+            self._qo_indptr_buf = qo_indptr.contiguous().to(
+                self.device, non_blocking=non_blocking
+            )
+            self._kv_indptr_buf = kv_indptr.contiguous().to(
+                self.device, non_blocking=non_blocking
+            )
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(
                     self.device, non_blocking=non_blocking

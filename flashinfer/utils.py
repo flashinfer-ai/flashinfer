@@ -791,6 +791,37 @@ def check_shape_dtype_device(
         )
 
 
+def _check_index_tensor(
+    x: torch.Tensor,
+    name: str,
+    *,
+    expected_len: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    contiguous: bool = False,
+) -> None:
+    """Validate an index tensor (indptr, indices, last_page_len) for a wrapper.
+
+    The kernels read these buffers as the compiled ``IdType`` (int32 for every
+    module the wrappers build) whatever the tensor's dtype says, so they must be
+    1-D ``torch.int32``. ``expected_len`` cross-checks a
+    companion tensor; ``device`` and ``contiguous`` are for CUDA-graph buffers,
+    which the captured kernels read by address for the wrapper's lifetime.
+    """
+    if x.dtype != torch.int32:
+        raise ValueError(f"{name} must be torch.int32, got {x.dtype}")
+    if x.ndim != 1:
+        raise ValueError(f"{name} must be a 1D tensor, got ndim={x.ndim}")
+    if expected_len is not None and x.shape[0] != expected_len:
+        raise ValueError(f"{name} must have length {expected_len}, got {x.shape[0]}")
+    if contiguous and not x.is_contiguous():
+        raise ValueError(
+            f"{name} must be contiguous, got shape={tuple(x.shape)} "
+            f"strides={x.stride()}"
+        )
+    if device is not None and x.device != device:
+        raise ValueError(f"{name} must be on device {device}, got {x.device}")
+
+
 def _check_workspace_buffer_alignment(
     x: torch.Tensor, name: str, alignment: int = 16
 ) -> None:

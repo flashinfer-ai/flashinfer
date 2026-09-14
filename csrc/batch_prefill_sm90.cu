@@ -49,6 +49,12 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
     int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
     bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
     int64_t window_left) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(kv_indptr, dl_dtype_for<IdType>());
+  // kv_len_arr may be the documented uint32 seq_lens; only its width must match IdType.
+  TVM_FFI_ICHECK(kv_len_arr.dtype().bits == 8 * sizeof(IdType) && kv_len_arr.dtype().lanes == 1 &&
+                 (kv_len_arr.dtype().code == kDLInt || kv_len_arr.dtype().code == kDLUInt))
+      << "kv_len_arr must be a " << 8 * sizeof(IdType) << "-bit integer tensor";
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -80,6 +86,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
     ffi::TensorView qo_indptr, ffi::TensorView kv_indptr, ffi::TensorView o,
     Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(kv_indptr, dl_dtype_for<IdType>());
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
@@ -170,6 +178,11 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     ffi::TensorView paged_kv_indices, ffi::TensorView paged_kv_last_page_len, ffi::TensorView o,
     Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left, bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+  CHECK_INPUT_TYPE(qo_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(paged_kv_indptr, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(paged_kv_indices, dl_dtype_for<IdType>());
+  CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_dtype_for<IdType>());
+
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
 
