@@ -49,6 +49,19 @@ weight / activation formats and the layer output format as ``QuantFormat`` axes.
     MoEActivationPack
     MoEWeightPack
 
+``MoELayer`` is the official entry point of this API: both its constructor and
+its call operator are decorated with ``@flashinfer_api``, so they participate in
+``FLASHINFER_LOGLEVEL`` logging and ``FLASHINFER_DUMP_*`` capture. The lower-level
+per-backend functions above remain official in their own right — the two layers
+are designed to co-exist, and neither supersedes the other.
+
+.. autoclass:: MoELayer
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+    .. automethod:: __call__
+
 Utility Functions
 -----------------
 

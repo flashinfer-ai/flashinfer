@@ -29,7 +29,7 @@ import dataclasses
 import math
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -1716,6 +1716,39 @@ class MoEConfig:
 # backend-specific layout logic out of the dispatch hot-path.
 
 
+def _tensor_summary(value: Any) -> str:
+    """Shape/dtype/device summary of a tensor; ``repr`` for anything else.
+
+    The packs define ``__repr__`` in terms of this instead of inheriting the
+    dataclass default, which would call ``repr()`` on each tensor field. Tensor
+    ``repr`` prints *values*, which forces a device-to-host copy.
+
+    That matters because the packs are the arguments of ``MoELayer.__call__``,
+    which is decorated with ``@flashinfer_api``. The API-logging helpers
+    deliberately avoid ``str``/``repr`` on tensor-bearing containers -- see the
+    comment above the ``list``/``tuple``/``dict`` branches of
+    ``_serialize_value`` in ``flashinfer/api_logging.py``: "Do not call
+    str()/repr() on containers that may hold CUDA tensors. Tensor repr can read
+    device data and invalidate CUDA graph capture." Those guards are keyed on
+    the concrete container types, so a *dataclass* holding CUDA tensors falls
+    through to the generic ``repr`` fallback in both ``_format_value`` (level 3+
+    logging) and ``_serialize_value`` (level-10 dump metadata). Giving the packs
+    a metadata-only ``__repr__`` closes that hole at the source, for every
+    consumer, rather than special-casing two pack types inside the shared
+    logger.
+
+    Non-tensor values are rendered with ``repr`` rather than assumed to have
+    ``.shape``: ``MoEWeightPack.prepare_for`` is public and its views are
+    caller-built, and a ``__repr__`` that raises turns an unrelated pytest
+    assertion or debugger inspection into a confusing ``AttributeError``.
+    """
+    if value is None:
+        return "None"
+    if not isinstance(value, Tensor):
+        return repr(value)
+    return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
+
+
 @dataclass
 class MoEActivationPack:
     """Per-call backend-native activations plus routing inputs.
@@ -1901,6 +1934,25 @@ class MoEActivationPack:
     def num_tokens(self) -> int:
         return self.hidden_states_q.shape[0]
 
+    def __repr__(self) -> str:
+        """Metadata-only repr -- never reads device memory.
+
+        Driven off ``dataclasses.fields`` rather than a hand-written field list
+        so a tensor field added later is summarized automatically instead of
+        silently vanishing from the log. The two required fields are always
+        shown (``hidden_states_scale=None`` is meaningful -- it is how BF16 and
+        TRT-LLM FP8 packs are distinguished); optional fields left at ``None``
+        are omitted to keep the line readable.
+        """
+        required = ("hidden_states_q", "hidden_states_scale")
+        parts = []
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if value is None and f.name not in required:
+                continue
+            parts.append(f"{f.name}={_tensor_summary(value)}")
+        return f"MoEActivationPack({', '.join(parts)})"
+
 
 @dataclass
 class MoEWeightPack:
@@ -1930,3 +1982,12 @@ class MoEWeightPack:
                 f"Available: {list(self.native_views)}"
             )
         return self.native_views[backend_key]
+
+    def __repr__(self) -> str:
+        views = ", ".join(
+            f"{key!r}: {{"
+            + ", ".join(f"{n}: {_tensor_summary(t)}" for n, t in view.items())
+            + "}"
+            for key, view in self.native_views.items()
+        )
+        return f"MoEWeightPack(native_views={{{views}}})"

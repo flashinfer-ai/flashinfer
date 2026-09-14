@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
@@ -143,6 +144,7 @@ class MoELayer:
     >>> out = layer(act_pack, weight_pack)
     """
 
+    @flashinfer_api
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
         self.config = config
         self.device = device or torch.device("cuda", torch.cuda.current_device())
@@ -230,6 +232,7 @@ class MoELayer:
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
+    @flashinfer_api
     def __call__(
         self,
         act_pack: MoEActivationPack,
