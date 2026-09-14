@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import hashlib
+import json
 import re
 
 import pytest
@@ -42,44 +43,58 @@ def test_blackwell_bf16_bmm_jit_spec_and_frozen_source(
     spec = blackwell_bf16_bmm.gen_blackwell_bf16_bmm_module(target)
 
     assert spec.name == f"blackwell_bf16_bmm_cake_{target}"
-    assert [source.name for source in spec.sources] == [
-        "blackwell_bf16_bmm.cu",
-        "blackwell_bf16_bmm_kernels.cu",
-    ]
+    closure = blackwell_bf16_bmm._CAKE_GENERATED_CLOSURES[target]
+    source_root = spec.sources[0].parents[1]
+    repo_root = source_root.parent
+    assert [source.relative_to(source_root).as_posix() for source in spec.sources] == (
+        closure["sources"]
+    )
+    assert spec.sources[0] == repo_root / closure["binding"]
+    assert spec.sources[0].name == f"cake_bf16_bmm_binding_{target}.cu"
+    assert len(spec.sources) > 1
+    assert len(set(spec.sources)) == len(spec.sources)
     assert all(source.is_file() for source in spec.sources)
     assert [
         flag for flag in spec.extra_cuda_cflags if flag.startswith("-gencode=")
     ] == [expected_gencode]
     assert expected_target_define in spec.extra_cuda_cflags
     assert "--use_fast_math" in spec.extra_cuda_cflags
+    assert all(flag in spec.extra_cuda_cflags for flag in closure["compile_flags"])
 
-    generated_text = spec.sources[1].read_text()
-    assert (
-        hashlib.sha256(generated_text.encode()).hexdigest()
-        == "5b83ea431ce0398d31f73e01d63a91b48a1299bf6d907e15e9cf18324d40284b"
-    )
-    assert "Source commit: 850c3b728d731c9f201c5dc5aad5d1ee51156f57" in (generated_text)
-    assert "typedef unsigned long long uint64_t" not in generated_text
-    assert "LoomTensorMap" not in generated_text
-    assert "typedef struct __align__(64)" not in generated_text
-    assert (
-        generated_text.count("#include <flashinfer/gemm/blackwell_bf16_bmm.cuh>") == 1
-    )
+    declarations_path = repo_root / closure["header"]
+    declarations = declarations_path.read_text()
+    binding_text = spec.sources[0].read_text()
+    assert binding_text.count(f'#include "{declarations_path.name}"') == 1
 
-    repo_root = spec.sources[0].parents[1]
-    declarations = (
-        repo_root / "include/flashinfer/gemm/blackwell_bf16_bmm.cuh"
-    ).read_text()
-    symbol_pattern = (
-        r"kernel_flashinfer_blackwell_bf16_bmm_goal_dispatcher_v1_[A-Za-z0-9_]+"
-    )
-    symbols = re.findall(symbol_pattern, declarations)
-    assert len(symbols) == 13
-    assert len(set(symbols)) == 13
-    for symbol in symbols:
-        exact_symbol = rf"\b{re.escape(symbol)}\b"
-        assert len(re.findall(exact_symbol, declarations)) == 1
-        assert len(re.findall(exact_symbol, generated_text)) == 1
+    # Verify the committed closure against every actual source and header;
+    # the former single-file snapshot no longer describes the native build.
+    identity_inputs = {
+        path.relative_to(repo_root).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in [*spec.sources, declarations_path]
+    }
+    assert hashlib.sha256(
+        json.dumps(identity_inputs, sort_keys=True).encode()
+    ).hexdigest() == closure["identity"]
+
+    symbol_pattern = r"\bkernel_cake_bf16_bmm_[0-9a-f]+\b"
+    declared_symbols = re.findall(symbol_pattern, declarations)
+    assert declared_symbols
+    assert len(set(declared_symbols)) == len(declared_symbols)
+    defined_symbols = []
+    for source in spec.sources[1:]:
+        generated_text = source.read_text()
+        # The canonical prelude distinguishes NVRTC and native CUDA types and
+        # retains compiler-enforced integer/tensor-map ABI size checks.
+        assert "static_assert(sizeof(uint64_t) == 8," in generated_text
+        assert "static_assert(sizeof(CUtensorMap) == 128," in generated_text
+        assert "typedef struct __align__(64)" not in generated_text
+        symbols = re.findall(symbol_pattern, generated_text)
+        assert len(symbols) == 1
+        defined_symbols.extend(symbols)
+    assert sorted(defined_symbols) == sorted(declared_symbols)
+    assert set(re.findall(symbol_pattern, binding_text)) == set(declared_symbols)
 
 
 def test_blackwell_bf16_bmm_jit_rejects_unsupported_target():
