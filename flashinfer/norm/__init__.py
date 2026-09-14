@@ -226,7 +226,7 @@ def supports_gated_residual_next_rmsnorm(
     *,
     post_weight: Optional[torch.Tensor] = None,
 ) -> bool:
-    """Return whether tensors satisfy the SM103 two-norm kernel contract."""
+    """Return whether tensors satisfy the SM100/SM103 two-norm kernel contract."""
     tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, alpha, beta)
     if post_weight is not None:
         tensors += (post_weight,)
@@ -257,7 +257,8 @@ def supports_gated_residual_next_rmsnorm(
             and _is_aligned(tensor, _DUAL_NORM_ALIGNMENT)
             for tensor in tensors
         )
-        and torch.cuda.get_device_capability(branch.device) == (10, 3)
+        and torch.cuda.get_device_capability(branch.device)
+        in _GATED_RESIDUAL_COMPUTE_CAPABILITIES
     )
 
 
@@ -285,7 +286,7 @@ def gated_residual_next_rmsnorm(
     When ``post_weight`` is supplied, ``branch`` is multiplied by
     ``post_weight + post_gain_center`` in FP32 before its RMSNorm.
     The optimized implementation supports contiguous hidden-size-8192 tensors
-    on SM103 GPUs.
+    on SM100 and SM103 GPUs.
 
     Parameters
     ----------

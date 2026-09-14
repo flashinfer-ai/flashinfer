@@ -62,7 +62,7 @@ def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
     torch.manual_seed(1000 + rows)
     inputs = _inputs(rows)
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
     kwargs = {}
     if post_gain_center is not None:
         kwargs = {
@@ -75,7 +75,7 @@ def test_gated_residual_next_rmsnorm_matches_reference(rows, post_gain_center):
 def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
     inputs = list(_inputs(17))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
     inputs[1].mul_(64.0)
     residual_out, ffn_input = _call(inputs)
     expected_residual, expected_ffn = _reference(inputs)
@@ -94,7 +94,7 @@ def test_gated_residual_next_rmsnorm_keeps_intermediate_fp32():
 def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
     inputs = list(_inputs(1))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
     strided_weight = torch.empty(2 * HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")[
         ::2
     ]
@@ -134,7 +134,7 @@ def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
 def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(post_input_scale):
     inputs = list(_inputs(17))
     if not supports_gated_residual_next_rmsnorm(*inputs):
-        pytest.skip("gated residual next RMSNorm requires SM103")
+        pytest.skip("gated residual next RMSNorm requires SM100 or SM103")
     kwargs = {}
     if post_input_scale:
         kwargs = {
