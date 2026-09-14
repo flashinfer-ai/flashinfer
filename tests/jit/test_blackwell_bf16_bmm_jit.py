@@ -74,9 +74,10 @@ def test_blackwell_bf16_bmm_jit_spec_and_frozen_source(
         ).hexdigest()
         for path in [*spec.sources, declarations_path]
     }
-    assert hashlib.sha256(
-        json.dumps(identity_inputs, sort_keys=True).encode()
-    ).hexdigest() == closure["identity"]
+    assert (
+        hashlib.sha256(json.dumps(identity_inputs, sort_keys=True).encode()).hexdigest()
+        == closure["identity"]
+    )
 
     symbol_pattern = r"\bkernel_cake_bf16_bmm_[0-9a-f]+\b"
     declared_symbols = re.findall(symbol_pattern, declarations)

@@ -1684,7 +1684,9 @@ def get_blackwell_bf16_bmm_module(
         ("cake", 10, 0): "sm100a",
         ("cake", 10, 3): "sm103a",
     }
-    target = target_by_backend_and_compute_capability.get((backend, *compute_capability))
+    target = target_by_backend_and_compute_capability.get(
+        (backend, *compute_capability)
+    )
     if target is None:
         raise ValueError(
             "CAKE BF16 BMM requires SM100 or SM103; "
