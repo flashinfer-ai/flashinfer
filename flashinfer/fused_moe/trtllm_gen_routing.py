@@ -235,7 +235,7 @@ def trtllm_gen_routing(
         ``bfloat16``.
     routing_bias : Optional[torch.Tensor]
         Per-expert routing bias of shape ``(num_experts,)``, ``float32`` or
-        ``bfloat16`` (used by DeepSeekV3/MiniMax2-style methods).
+        ``bfloat16`` (used by DeepSeekV3/MiniMax2/SqrtSoftplus-style methods).
     routing_method : RoutingMethodType
         The routing method to run (all methods except ``Unspecified``).
     top_k : int
@@ -249,13 +249,14 @@ def trtllm_gen_routing(
         Expert-parallel shard description. ``local_num_experts`` defaults to
         ``num_experts``.
     routed_scaling_factor : float
-        Output weight scale (DeepSeekV3/MiniMax2-style methods).
+        Output weight scale (DeepSeekV3/MiniMax2/SqrtSoftplus-style methods).
     tile_tokens_dim : int
         Token-tile size the downstream grouped GEMM would use; must be a power
         of two. The permutation/padding outputs depend on it.
     norm_topk_prob : bool
-        Whether SigmoidRenorm renormalizes the selected probabilities. Only
-        consulted for ``RoutingMethodType.SigmoidRenorm``.
+        Whether the selected scores are renormalized by their sum. Consulted
+        for ``RoutingMethodType.SigmoidRenorm`` and
+        ``RoutingMethodType.SqrtSoftplus``.
     enable_pdl : Optional[bool]
         Whether to launch with programmatic dependent launch. Defaults to
         auto-detection.

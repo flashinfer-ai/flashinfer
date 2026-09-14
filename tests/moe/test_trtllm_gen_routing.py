@@ -33,6 +33,7 @@ Notes on test construction:
   than element-wise equality.
 """
 
+import math
 import zlib
 
 import pytest
@@ -49,6 +50,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     routing_reference_renormalize,
     routing_reference_renormalize_naive,
     routing_reference_sigmoid_renorm,
+    routing_reference_sqrt_softplus,
     routing_reference_topk,
 )
 
@@ -308,6 +310,254 @@ def test_minimax2_routing(
         routing_bias=bias,
         routed_scaling_factor=1.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# SqrtSoftplus (DeepSeek-V4 family): sqrt(softplus(logit)) + bias -> ungrouped
+# top-k -> renormalize the un-biased scores -> routed_scaling_factor.
+#
+# The token counts below cross every routingCustom kernel path for E=384/K=6:
+# <=4 static block, <=16 dyn-block, 17..256 single-cluster split top-k
+# (block-per-token scores), >256 large-batch histogram kernels.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 16, 17, 150, 256, 257, 1025])
+@pytest.mark.parametrize(
+    "num_experts,top_k",
+    [
+        (64, 4),
+        (256, 6),  # DeepSeek-V4-Flash
+        (384, 6),  # DeepSeek-V4.1-Flash / V4-Pro
+    ],
+)
+@pytest.mark.parametrize("tile_tokens_dim", [8, 32])
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+def test_sqrt_softplus_routing(
+    num_tokens,
+    num_experts,
+    top_k,
+    tile_tokens_dim,
+    logits_dtype,
+    bias_dtype,
+    norm_topk_prob,
+):
+    if num_experts > 256 and logits_dtype == torch.bfloat16:
+        pytest.skip("tie-free logits construction needs float32 beyond 256 experts")
+    if num_tokens > 256 and (tile_tokens_dim == 32 or bias_dtype == torch.float32):
+        pytest.skip("large-batch kernels: keep one representative per shape")
+    routed_scaling = 1.5  # DeepSeek-V4.1-Flash
+    seed = stable_seed("sqrtsoftplus", num_tokens, num_experts, top_k, norm_topk_prob)
+    logits = make_logits(num_tokens, num_experts, logits_dtype, seed)
+    bias = make_bias(num_experts, bias_dtype, seed + 1)
+    run_and_check(
+        RoutingMethodType.SqrtSoftplus,
+        lambda: routing_reference_sqrt_softplus(
+            logits,
+            bias,
+            top_k,
+            num_experts,
+            tile_tokens_dim,
+            routed_scaling,
+            norm_topk_prob=norm_topk_prob,
+        ),
+        logits,
+        top_k,
+        tile_tokens_dim,
+        routing_bias=bias,
+        routed_scaling_factor=routed_scaling,
+        norm_topk_prob=norm_topk_prob,
+    )
+
+
+def _sqrt_softplus(x):
+    return math.sqrt(math.log1p(math.exp(x)))
+
+
+def _softplus_inv(y):
+    """x with softplus(x) == y."""
+    return math.log(math.exp(y) - 1.0)
+
+
+def _run_sqrt_softplus_vector(
+    logits_row, bias_row, top_k, routed_scaling, norm_topk_prob=True
+):
+    """Route one adversarial row (padded to 16 experts) and return (ids, weights) by id."""
+    num_experts = 16
+    logits = torch.full((1, num_experts), -30.0)
+    logits[0, : len(logits_row)] = torch.tensor(logits_row)
+    bias = torch.zeros(num_experts)
+    bias[: len(bias_row)] = torch.tensor(bias_row)
+    result = trtllm_gen_routing(
+        logits.cuda(),
+        bias.cuda(),
+        RoutingMethodType.SqrtSoftplus,
+        top_k,
+        routed_scaling_factor=routed_scaling,
+        norm_topk_prob=norm_topk_prob,
+    )
+    ids = result.topk_ids[0].long().cpu()
+    order = torch.argsort(ids)
+    return ids[order].tolist(), result.topk_weights[0].float().cpu()[order]
+
+
+def test_sqrt_softplus_adversarial_vectors():
+    """Hand-built rows where sigmoid / softmax / biased-weight / wrong-order
+    semantics select different experts or weights than the DeepSeek-V4 contract.
+    Expected values are the analytic sqrt-softplus numbers (bf16 output)."""
+    tol = dict(atol=1e-2, rtol=2e-2)
+
+    # A. sqrt-softplus vs sigmoid: sqrtsoftplus(3)-sqrtsoftplus(0)=0.913 but
+    #    sigmoid(3)-sigmoid(0)=0.453, so a +0.7 bias on expert 1 flips the winner
+    #    only under sigmoid scoring (which would pick expert 1).
+    ids, w = _run_sqrt_softplus_vector(
+        [3.0, 0.0], [0.0, 0.7], top_k=1, routed_scaling=1.0
+    )
+    assert ids == [0]
+    torch.testing.assert_close(w, torch.tensor([1.0]), **tol)
+
+    # B. sqrt-softplus vs softmax: softmax scoring picks {0, 2} here, DSV4 {0, 1}.
+    ids, w = _run_sqrt_softplus_vector(
+        [2.0, 1.0, 0.0, -1.0], [0.0, 0.0, 0.25, 0.0], top_k=2, routed_scaling=1.0
+    )
+    assert ids == [0, 1]
+    a, b = _sqrt_softplus(2.0), _sqrt_softplus(1.0)
+    torch.testing.assert_close(w, torch.tensor([a / (a + b), b / (a + b)]), **tol)
+
+    # C. the correction bias changes which expert enters the top-k (0,1 -> 0,2 -> 0,3).
+    ids, _ = _run_sqrt_softplus_vector(
+        [1.0, 0.9, 0.8, -2.0], [0.0] * 4, top_k=2, routed_scaling=1.0
+    )
+    assert ids == [0, 1]
+    gap = (
+        _sqrt_softplus(0.9)
+        - _sqrt_softplus(0.8)
+        + _sqrt_softplus(1.0)
+        - _sqrt_softplus(0.8)
+    ) / 2
+    ids, _ = _run_sqrt_softplus_vector(
+        [1.0, 0.9, 0.8, -2.0], [0.0, 0.0, gap, 0.0], top_k=2, routed_scaling=1.0
+    )
+    assert ids == [0, 2]
+    ids, _ = _run_sqrt_softplus_vector(
+        [1.0, 0.9, 0.8, -2.0], [0.0, 0.0, 0.0, 10.0], top_k=2, routed_scaling=1.0
+    )
+    assert ids == [0, 3]
+
+    # D. final weights ignore the bias: equal logits, +5 bias on expert 0 -> equal
+    #    weights (0.75 each at x1.5). A bias leak would give [1.1667, 0.3333].
+    x2 = _softplus_inv(4.0)  # sqrt-softplus score 2.0
+    ids, w = _run_sqrt_softplus_vector(
+        [x2, x2], [5.0, 0.0], top_k=2, routed_scaling=1.5
+    )
+    assert ids == [0, 1]
+    torch.testing.assert_close(w, torch.tensor([0.75, 0.75]), **tol)
+
+    # D2. selection needs the bias but the weight is the tiny un-biased score:
+    #     sqrt-softplus(-30) ~ 9.7e-7 must survive (key - bias would round it away).
+    ids, w = _run_sqrt_softplus_vector(
+        [-30.0, 0.0, -1.0, -2.0],
+        [12.0, 0.0, 0.0, 0.0],
+        top_k=2,
+        routed_scaling=1.0,
+        norm_topk_prob=False,
+    )
+    assert ids == [0, 1]
+    assert 0 < w[0].item() < 2e-6
+    torch.testing.assert_close(w[1], torch.tensor(_sqrt_softplus(0.0)), **tol)
+
+    # E. renormalization with exact numbers: scores (2, 1) -> (2/3, 1/3).
+    x1 = _softplus_inv(1.0)
+    ids, w = _run_sqrt_softplus_vector(
+        [x2, x1], [0.0, 0.0], top_k=2, routed_scaling=1.0
+    )
+    assert ids == [0, 1]
+    torch.testing.assert_close(w, torch.tensor([2 / 3, 1 / 3]), **tol)
+
+    # F. routed_scaling_factor=1.5 applies AFTER renormalization: (1.0, 0.5), sum 1.5.
+    #    Scaling before renormalization would cancel (sum 1.0).
+    ids, w = _run_sqrt_softplus_vector(
+        [x2, x1], [0.0, 0.0], top_k=2, routed_scaling=1.5
+    )
+    torch.testing.assert_close(w, torch.tensor([1.0, 0.5]), **tol)
+    #    norm_topk_prob=False keeps the raw scores: (2, 1) * 1.5.
+    ids, w = _run_sqrt_softplus_vector(
+        [x2, x1], [0.0, 0.0], top_k=2, routed_scaling=1.5, norm_topk_prob=False
+    )
+    torch.testing.assert_close(w, torch.tensor([3.0, 1.5]), **tol)
+
+    # Numerics: a large positive logit must not overflow (naive log(1+exp(100)) is
+    # inf) and a very negative logit pulled in by the bias must yield a finite ~0
+    # weight rather than NaN.
+    ids, w = _run_sqrt_softplus_vector(
+        [100.0, 60.0, -100.0],
+        [0.0, 0.0, 50.0],
+        top_k=3,
+        routed_scaling=1.0,
+        norm_topk_prob=False,
+    )
+    assert ids == [0, 1, 2]
+    torch.testing.assert_close(w[:2], torch.tensor([10.0, math.sqrt(60.0)]), **tol)
+    assert torch.isfinite(w).all() and 0.0 <= w[2].item() < 1e-6
+
+
+def test_sqrt_softplus_dsv41_geometry_fixture():
+    """DeepSeek-V4.1-Flash geometry (E=384, K=6, x1.5) against a seeded fixture.
+
+    The fixture pins the CPU oracle's expert ids (crc32) and the first rows so a
+    future regression in either the oracle or the kernel is visible."""
+    gen = torch.Generator().manual_seed(0x5190)
+    T, E, K = 64, 384, 6
+    logits = (torch.randn(T, E, generator=gen) * 2.0).cuda()
+    bias = (torch.randn(E, generator=gen) * 0.5).to(torch.bfloat16).cuda()
+    result = trtllm_gen_routing(
+        logits, bias, RoutingMethodType.SqrtSoftplus, K, routed_scaling_factor=1.5
+    )
+    ids, order = torch.sort(result.topk_ids.long(), dim=1)
+    w = result.topk_weights.float().gather(1, order)
+    assert zlib.crc32(ids.to(torch.int32).cpu().numpy().tobytes()) == 2895044175
+    assert ids[:4].tolist() == [
+        [22, 138, 203, 226, 301, 302],
+        [0, 57, 74, 138, 286, 333],
+        [188, 196, 215, 287, 312, 313],
+        [28, 42, 52, 65, 242, 244],
+    ]
+    torch.testing.assert_close(
+        w[:4],
+        torch.tensor(
+            [
+                [0.2312814, 0.2577158, 0.2590204, 0.3113003, 0.244737, 0.1959451],
+                [0.2358731, 0.2165189, 0.2240225, 0.2810181, 0.2579508, 0.2846167],
+                [0.2962734, 0.212483, 0.2642444, 0.2143541, 0.2315651, 0.28108],
+                [0.2400168, 0.2203155, 0.2650456, 0.3130441, 0.2499551, 0.2116229],
+            ],
+            device=w.device,
+        ),
+        atol=WEIGHT_ATOL,
+        rtol=WEIGHT_RTOL,
+    )
+    torch.testing.assert_close(
+        w.sum(dim=1), torch.full((T,), 1.5, device=w.device), atol=2e-2, rtol=0.0
+    )
+    # Cross-check the whole batch against the host oracle.
+    _, ref_scores = routing_reference_sqrt_softplus(
+        logits.cpu(), bias.cpu(), K, E, 8, 1.5
+    )
+    ref_w = ref_scores.cuda().float().gather(1, ids)
+    torch.testing.assert_close(w, ref_w, atol=WEIGHT_ATOL, rtol=WEIGHT_RTOL)
+
+
+def test_sqrt_softplus_rejects_groups_and_fused_shared_experts():
+    logits = make_logits(4, 16, torch.float32, 0)
+    bias = make_bias(16, torch.bfloat16, 1)
+    with pytest.raises(Exception, match="n_group <= 1"):
+        trtllm_gen_routing(
+            logits, bias, RoutingMethodType.SqrtSoftplus, 4, n_group=8, topk_group=4
+        )
+    with pytest.raises(Exception, match="fusing shared expert"):
+        trtllm_gen_routing(
+            logits, bias, RoutingMethodType.SqrtSoftplus, 4, num_fused_shared_experts=1
+        )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 150])
