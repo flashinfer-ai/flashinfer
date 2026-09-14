@@ -22,6 +22,56 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
+### Unified decode entry points
+
+`batch_decode_with_paged_kv_cache` and `batch_mla_decode_with_paged_kv_cache`
+support both convenience and explicit caller-workspace execution. Existing
+calls retain their validated convenience behavior, including FMHA's
+length-specialized policies. For allocation-free, synchronization-free
+steady-state launches, provide `workspace_buffer`, `max_kv_len`, `out`,
+and `validate=False`. Packed Q additionally requires `max_seq_len_q`
+(FMHA also accepts its non-default `seq_len_q` alias).
+Only static Python/tensor attributes are used to select the existing cached
+kernel; no wrapper is constructed or planned on this path.
+
+Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
+capture. FMHA scratch must be zero-initialized and re-zeroed when any workspace
+layout input (including batch size) changes. Scratch and output must not
+overlap any live input or each other; each concurrent launch/graph needs its
+own scratch. Warm up the exact topology before capture, retain stable storage,
+and update metadata only between completed replays. Validation is enabled by
+default and reads metadata values on the host; `validate=False` transfers
+all shape, dtype, stride, capacity, active page-ID, packed-offset, and lifetime
+obligations to the caller. The required decode control resets are unchanged.
+
+For example, given validated FMHA Q/cache/metadata and a correctly sized,
+zero-initialized `workspace`:
+
+```python
+import torch
+from flashinfer.attention.prims_ts import batch_decode_with_paged_kv_cache
+
+def decode():
+    return batch_decode_with_paged_kv_cache(
+        q, paged_kv_cache, block_tables, seq_lens,
+        workspace_buffer=workspace, max_kv_len=max_kv_len,
+        out=out, validate=False,
+    )
+
+decode()  # Warm up outside capture.
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    decode()
+graph.replay()
+```
+
+The `prims_ts_batch_decode_with_kv_cache` and
+`prims_ts_batch_mla_decode_with_kv_cache` names remain compatibility shims
+over the shared launch implementation. Their positional arguments and
+structural-only validation (no metadata readback) remain unchanged. New
+callers can use the canonical names above; reusable plan/run wrappers and
+all existing lazy imports remain available.
+
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
 capacity, shape, dtype, and storage-mode specialization without retaining
