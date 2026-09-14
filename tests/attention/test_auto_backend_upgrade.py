@@ -69,6 +69,33 @@ requires_cudnn_upgrade = pytest.mark.skipif(
 BLACKWELL_DEFAULT = "cudnn" if _cudnn_upgrade_available() else "cutlass"
 
 
+def _expected_auto_backend(d_qk, d_vo):
+    """What `auto` should resolve to for this shape on this machine.
+
+    Mirrors ``flashinfer.prefill``'s per-shape preference so these tests assert
+    the *selection policy* rather than a frozen backend name: the order is a
+    measured property (CUTLASS wins 128-head d192/128 on B200, cuDNN wins the
+    d128/d256 cells), and it is expected to change as hardware is measured.
+    """
+    from flashinfer.prefill import _blackwell_ragged_auto_order
+
+    cudnn_ok = _cudnn_upgrade_available()
+    for backend in _blackwell_ragged_auto_order(d_qk, d_vo):
+        if (
+            backend == "cudnn"
+            and cudnn_ok
+            and (d_qk, d_vo) in {(128, 128), (192, 128), (256, 256)}
+        ):
+            return "cudnn"
+        if (
+            backend == "cutlass"
+            and _cutlass_upgrade_arch()
+            and ((d_qk == 128 and d_vo == 128) or d_qk == 192)
+        ):
+            return "cutlass"
+    return "fa2"
+
+
 def _inputs(batch, s_q, s_kv, h_qo, h_kv, d_qk, d_vo, seed=1234):
     """Seeded so two backends can be compared over byte-identical inputs."""
     dev = torch.device("cuda")
@@ -156,10 +183,12 @@ def test_auto_upgrades_on_blackwell(h_qo, h_kv, d_qk, d_vo):
     """On SM100a/SM110a, ``auto`` must leave FA2: cuDNN where it can take token
     indptrs directly, CUTLASS otherwise."""
     resolved = _plan_only("auto", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
-    assert resolved == BLACKWELL_DEFAULT, (
-        f"auto resolved to {resolved!r}; expected {BLACKWELL_DEFAULT!r} for "
+    expected = _expected_auto_backend(d_qk, d_vo)
+    assert resolved == expected, (
+        f"auto resolved to {resolved!r}; expected {expected!r} for "
         f"h_qo={h_qo} h_kv={h_kv} d_qk={d_qk} d_vo={d_vo}"
     )
+    assert resolved != "fa2", "auto must leave FA2 on Blackwell for this shape"
 
 
 # ---------------------------------------------------------------------------
@@ -221,9 +250,7 @@ def test_auto_matches_fa2_numerically(h_qo, h_kv, d_qk, d_vo):
     """
     resolved, out_auto = _plan_and_run("auto", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
     _, out_fa2 = _plan_and_run("fa2", 4, 1024, 1024, h_qo, h_kv, d_qk, d_vo)
-    assert resolved == BLACKWELL_DEFAULT, (
-        "precondition: this shape should have upgraded"
-    )
+    assert resolved != "fa2", "precondition: this shape should have upgraded"
 
     diff = (out_auto.float() - out_fa2.float()).abs()
     denom = out_fa2.float().abs().max().clamp_min(1e-6)
@@ -324,7 +351,8 @@ def _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, tag):
     "h_qo,h_kv,d_qk,d_vo",
     [
         (64, 8, 128, 128),
-        (128, 128, 192, 128),
+        # (128, 128, 192, 128) is deliberately absent: CUTLASS measures ~10%
+        # faster there on B200, so the per-shape table orders it CUTLASS-first.
         (32, 8, 256, 256),  # CUTLASS declines d256; only cuDNN serves it
     ],
 )
@@ -334,9 +362,7 @@ def test_auto_prefers_cudnn_on_sm100a(h_qo, h_kv, d_qk, d_vo):
 
 
 @requires_cudnn_upgrade
-@pytest.mark.parametrize(
-    "h_qo,h_kv,d_qk,d_vo", [(64, 8, 128, 128), (128, 128, 192, 128), (32, 8, 256, 256)]
-)
+@pytest.mark.parametrize("h_qo,h_kv,d_qk,d_vo", [(64, 8, 128, 128), (32, 8, 256, 256)])
 def test_auto_cudnn_matches_fa2_varlen_with_lse(h_qo, h_kv, d_qk, d_vo):
     """Same token-unit indptrs to both backends; output AND packed base-2 LSE
     must agree. Random lengths exercise the cu_seq_len-driven padding mask."""

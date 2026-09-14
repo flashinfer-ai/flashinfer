@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+import os
 import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
@@ -1680,13 +1681,56 @@ def _build_block_tables_from_paged_kv_indices(
 
 
 # Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
-# Measured on B200 (bf16, causal): cuDNN 1.1-2.2x faster than CUTLASS at d128
-# (tie at 128-head d192/128 MHA) and the only backend serving d256; CUTLASS
-# 1.7-2.5x faster than FA2 where cuDNN is unavailable.
+#
+# NOTE this is an order over *capability*, not a cost model: the walk returns the
+# first backend whose kernel serves the problem, so a backend listed earlier wins
+# even where a later one is measurably faster. That is why the order is per-shape
+# below rather than a single global tuple.
+#
+# Measured on B200 (bf16, causal, 20 iters after 5 warmup, medians):
+#   d128 square    cuDNN 1.09-1.45x faster than CUTLASS -> cuDNN first
+#   d256 square    CUTLASS declines the shape entirely  -> cuDNN only
+#   d192/128 MHA   CUTLASS 1.09-1.12x faster than cuDNN -> CUTLASS first
 _BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
+
+# Shapes whose measured winner is not the global default. Keyed on
+# (head_dim_qk, head_dim_vo); anything absent uses the default order above.
+#
+# (192, 128): 128-head MHA on B200 -- CUTLASS 14.16 ms vs cuDNN 15.62 ms in the
+# sweep, and 14.11/14.88/14.71 vs 15.65/16.16/16.43 over three further 50-iter
+# runs. A consistent ~9-12% against ~0.5 ms run-to-run spread, so ordering
+# CUTLASS first here is a measurement, not a coin flip.
+_BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM = {
+    (192, 128): ("cutlass", "cudnn"),
+}
+
+# Escape hatch: a comma-separated order (e.g. "cutlass,cudnn", or "cudnn" to pin
+# one backend) overrides both tables. Intended for benchmarking and regression
+# bisection on hardware whose ranking differs from the B200 numbers above --
+# eligibility is still enforced, so an unusable backend is skipped rather than
+# forced. Mirrors FLASHINFER_TOPK_ALGO's role for the top-k dispatcher.
+_RAGGED_AUTO_ORDER_ENV = "FLASHINFER_RAGGED_AUTO_BACKEND_ORDER"
 
 # (head_dim_qk, head_dim_vo) pairs validated against FA2 on the cuDNN path.
 _CUDNN_RAGGED_AUTO_HEAD_DIMS = frozenset({(128, 128), (192, 128), (256, 256)})
+
+
+def _blackwell_ragged_auto_order(head_dim_qk: int, head_dim_vo: int) -> Tuple[str, ...]:
+    """Backend preference order for this shape.
+
+    Resolution order: the ``FLASHINFER_RAGGED_AUTO_BACKEND_ORDER`` override, then
+    the per-shape table, then the global default. Read per call rather than
+    cached at import so a test or a sweep can change it without a fresh
+    interpreter.
+    """
+    override = os.environ.get(_RAGGED_AUTO_ORDER_ENV)
+    if override:
+        parsed = tuple(name.strip() for name in override.split(",") if name.strip())
+        if parsed:
+            return parsed
+    return _BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM.get(
+        (head_dim_qk, head_dim_vo), _BLACKWELL_RAGGED_AUTO_PREFERENCE
+    )
 
 
 def _blackwell_ragged_auto_upgrade(
@@ -1705,8 +1749,11 @@ def _blackwell_ragged_auto_upgrade(
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
-    Walks :data:`_BLACKWELL_RAGGED_AUTO_PREFERENCE` and returns the first backend
-    whose kernel serves the problem exactly, or ``None`` to stay on FA2.
+    Walks the order from :func:`_blackwell_ragged_auto_order` (per-shape table,
+    or the ``FLASHINFER_RAGGED_AUTO_BACKEND_ORDER`` override) and returns the
+    first backend whose kernel serves the problem exactly, or ``None`` to stay
+    on FA2. The walk tests *capability*, so the order decides the winner
+    wherever both candidates are eligible.
 
     Both candidates' run paths receive only ``causal`` and the scales, so any
     request for RoPE, a custom mask, a sliding window, a logits soft cap or the
@@ -1729,7 +1776,7 @@ def _blackwell_ragged_auto_upgrade(
         or has_multi_item_scoring
     ):
         return None
-    for backend in _BLACKWELL_RAGGED_AUTO_PREFERENCE:
+    for backend in _blackwell_ragged_auto_order(head_dim_qk, head_dim_vo):
         if backend == "cudnn":
             if (
                 is_sm100a_supported(device)
