@@ -6268,33 +6268,25 @@ Array<Tensor> trtllm_moe_allocate_canonical_routing(TensorView routing_logits, i
 }
 
 /** Launch the real TRTLLM router once and retain both conventional and replay outputs. */
-void trtllm_moe_canonicalize_routing(
-    TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
-    Array<Tensor> canonical, int64_t top_k, Optional<int64_t> n_group, Optional<int64_t> topk_group,
-    int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
-    int64_t routing_method_type, bool use_routing_scales_on_input, bool use_deep_seek_fp8,
-    bool norm_topk_prob, bool enable_pdl, int64_t tile_tokens_dim) {
+void trtllm_moe_canonicalize_routing(TensorView routing_logits, Optional<TensorView> routing_bias,
+                                     int64_t dtype_act, Array<Tensor> canonical, int64_t top_k,
+                                     Optional<int64_t> n_group, Optional<int64_t> topk_group,
+                                     int64_t local_expert_offset, int64_t local_num_experts,
+                                     Optional<double> routed_scaling_factor,
+                                     int64_t routing_method_type, bool use_routing_scales_on_input,
+                                     bool use_deep_seek_fp8, bool norm_topk_prob, bool enable_pdl,
+                                     int64_t tile_tokens_dim) {
   // Decode the public tensor array once and retain named fields through routing.
   ffi::CUDADeviceGuard device_guard(routing_logits.device().device_id);
   CanonicalRoutingBuffers const buffers = CanonicalRoutingBuffers::from_ffi(canonical);
   int64_t const num_tokens = routing_logits.size(0);
   int64_t const num_experts = routing_logits.size(1);
-  TVM_FFI_ICHECK_EQ(hidden_states.size(0), num_tokens)
-      << "hidden_states and routing_logits must have the same token count.";
   TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset + local_num_experts <= num_experts)
       << "the local expert range must lie within routing_logits.";
 
-  btg::Dtype dtype_elt;
-  if (hidden_states.dtype() == dl_float16) {
-    dtype_elt = btg::Dtype::Fp16;
-  } else if (hidden_states.dtype() == dl_bfloat16) {
-    dtype_elt = btg::Dtype::Bfloat16;
-  } else if (hidden_states.dtype() == dl_float8_e4m3fn) {
-    dtype_elt = btg::Dtype::E4m3;
-  } else {
-    TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "Unsupported activation dtype for canonical routing.";
-  }
+  // Logical block-scaled activation types cannot be recovered from their uint8 storage. The
+  // ordinary backend therefore passes the exact Dtype enum already used by its routed body.
+  btg::Dtype const dtype_elt = static_cast<btg::Dtype>(dtype_act);
   btg::Dtype const routing_bias_dtype =
       routing_bias.has_value() && routing_bias.value().dtype() == dl_float32 ? btg::Dtype::Fp32
                                                                              : btg::Dtype::Bfloat16;

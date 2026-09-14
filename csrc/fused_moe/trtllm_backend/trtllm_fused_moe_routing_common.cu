@@ -233,11 +233,12 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1)
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
   }
-  // Preserve the ordinary routing permutation implementation within each independent tile slice.
+  // Request extended capacity from the existing device routine; ordinary callers retain its
+  // default cluster-sized capacity and generated implementation.
   routingPermutation<KernelParams, OutputT, KernelParams::MaxNumExperts,
                      KernelParams::MaxNumExperts / WarpSize, KernelParams::MaxNumTopExperts,
-                     /*LoadExpertIdxFromGlobal=*/true, ExpertId>(params, nullptr, warpIdx,
-                                                                 clusterBlockRank, args.expertIds);
+                     /*LoadExpertIdxFromGlobal=*/true, ExpertId, kMaxTokensMultiTileCluster>(
+      params, nullptr, warpIdx, clusterBlockRank, args.expertIds);
 }
 #else
 __global__ void routingIndicesMultiTileClusterKernel(MultiTileKernelArgs<KernelParams, ExpertId>) {
@@ -338,9 +339,11 @@ void launchMultiTileCluster(Data* data, int32_t numTiles, int32_t numBlocks, int
 
 }  // namespace
 
-/// Return the token bound implied by the eight-block cluster and expert-count specialization.
+/// Return the graph-stable token capacity implemented by the two-phase cluster decomposition.
 int32_t maxTokensMultiTileCluster(int32_t numExperts) {
-  return NumBlocksPerCluster * getMaxNumExpertsTier(numExperts);
+  FLASHINFER_CHECK(getMaxNumExpertsTier(numExperts) > 0,
+                   "fused multi-tile routing requires numExperts <= ", kExpertTier512);
+  return kMaxTokensMultiTileCluster;
 }
 
 /// Validate the common precomputed-routing shape and launch every tile as one fused kernel.
@@ -353,11 +356,13 @@ void runMultiTileCluster(Data* data, int32_t numTiles, void* stream) {
   Data const& first = data[0];
   int32_t const maxTokens = maxTokensMultiTileCluster(first.mNumExperts);
   FLASHINFER_CHECK(first.mNumTokens <= maxTokens, "runMultiTileCluster supports up to ", maxTokens,
-                   " tokens (NumBlocksPerCluster * MaxNumExperts), got ", first.mNumTokens);
+                   " tokens, got ", first.mNumTokens);
   FLASHINFER_CHECK(first.mPtrTopKPacked != nullptr || first.mPtrPrecomputedExpertIds != nullptr,
                    "runMultiTileCluster requires precomputed top-k ids");
   FLASHINFER_CHECK(first.mPtrPermutedIdxSize != nullptr,
                    "runMultiTileCluster requires routing metadata output buffers");
+  FLASHINFER_CHECK(first.mPtrExpandedIdxToPermutedIdx != nullptr,
+                   "runMultiTileCluster requires expanded-index scratch/output storage");
   FLASHINFER_CHECK(first.mTileTokensDim > 0,
                    "multi-tile routing entries must have positive tile sizes");
 
