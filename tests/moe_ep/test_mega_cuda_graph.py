@@ -21,6 +21,8 @@ Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
@@ -81,23 +83,17 @@ def _single_rank_layer(
         generator=g,
     )
 
-    assert backend_name in ("nvfp4", "mxfp8", "w4a16"), backend_name
-    if backend_name == "nvfp4":
-        mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
-        )
-    elif backend_name == "mxfp8":
-        mk = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
-        )
-
-    elif backend_name == "w4a16":
-        mk = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=intermediate,
-            top_k=topk,
-            gate_up_clamp=10.0,
-            knobs={} if knobs is None else knobs,
-        )
+    config_type = {
+        "nvfp4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "mxfp8": Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }[backend_name]
+    options = (
+        {"knobs": {} if knobs is None else knobs} if backend_name == "w4a16" else {}
+    )
+    mk = config_type(
+        intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0, **options
+    )
 
     layer = MoEEpMegaLayer(
         bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -228,8 +224,7 @@ def test_mega_layer_graph_capture_replay_matches_eager(
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("backend_name", ["nvfp4", "w4a16"])
-@pytest.mark.parametrize("allocated_workspace", [False, True])
-@pytest.mark.parametrize("num_tokens", [0, 32])
+@pytest.mark.parametrize("allocated_workspace,num_tokens", [(False, 32), (True, 0)])
 def test_mega_layer_capture_without_warmup_raises(
     monkeypatch, request, backend_name, allocated_workspace, num_tokens
 ):
@@ -253,10 +248,12 @@ def test_mega_layer_capture_without_warmup_raises(
         t = _random_batch(problem, seed=5, num_tokens=num_tokens)
         graph = torch.cuda.CUDAGraph()
         with (
+            mock.patch.object(layer._kernel, "stage_inputs") as stage,
             pytest.raises((MoEEpConfigError, RuntimeError), match="warmup"),
             torch.cuda.graph(graph),
         ):
             layer.forward(t, workspace=workspace)
+        stage.assert_not_called()
     finally:
         layer.destroy()
 

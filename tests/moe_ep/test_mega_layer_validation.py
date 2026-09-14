@@ -149,8 +149,9 @@ def test_layer_global_weight_scale_support(backend_name, scale_field):
         "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     }
-    backend = "nccl_ep"
-    if backend_name in config_types:
+    if backend_name == "split":
+        backend = "nccl_ep"
+    else:
         backend = MegaConfig(
             megakernel=config_types[backend_name](intermediate_size=128, top_k=2),
             preprocess_weights=False,

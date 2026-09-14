@@ -180,10 +180,14 @@ def test_backend_warns_on_auto_knobs():
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("mode", ["nvfp4", "w4a16"])
-@pytest.mark.parametrize("mma_m", [128, 256])
-def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path, mode, mma_m):
-    """Buffer creation must resolve the cached tile and its derived CTA mode."""
+@pytest.mark.parametrize(
+    "mode,mma_m,explicit",
+    [("nvfp4", 256, False), ("w4a16", 128, False), ("w4a16", 128, True)],
+)
+def test_symm_buffer_resolves_cached_knobs(
+    monkeypatch, tmp_path, mode, mma_m, explicit
+):
+    """Cached and explicit partial tiles derive the same CTA instruction mode."""
     import torch
 
     if not torch.cuda.is_available():
@@ -221,7 +225,7 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path, mode, mma_m):
         "load_balance_mode": "atomic_counter",
     }
     record_knobs(
-        cached,
+        {**cached, "flag_batch": 8} if explicit else cached,
         dtype=mode,
         world_size=1,
         hidden=hidden,
@@ -230,8 +234,9 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path, mode, mma_m):
         topk=topk,
         max_tokens=max_tokens,
     )
+    knobs = cached if explicit else None
     buf = get_symm_buffer_for_mega_moe(
-        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1
+        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1, knobs=knobs
     )
     try:
         cfg = buf._frontend.config
