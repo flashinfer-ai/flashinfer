@@ -376,11 +376,48 @@ def test_request_ordered_runtime_q_graph_permutations(
     )
 
 
+@pytest.mark.parametrize("uses_shared_paged_kv_idx", (True, False))
+@pytest.mark.parametrize(
+    ("batch_size", "q_len", "num_kv_splits", "write_lse"),
+    (
+        pytest.param(1, 1, 4, True, id="b1-q1-s4"),
+        pytest.param(8, 1, 4, True, id="b8-q1-s4"),
+        pytest.param(1, 6, 2, True, id="b1-q6-s2"),
+        pytest.param(8, 6, 2, True, id="b8-q6-s2"),
+        pytest.param(1, 6, 6, False, id="b1-q6-fused-s6"),
+        pytest.param(8, 6, 6, False, id="b8-q6-fused-s6"),
+        pytest.param(32, 6, 6, False, id="b32-q6-fused-s6"),
+    ),
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_request_ordered_explicit_split_graph_permutations(
+    uses_shared_paged_kv_idx: bool,
+    batch_size: int,
+    q_len: int,
+    num_kv_splits: int,
+    write_lse: bool,
+) -> None:
+    """Native split/combine follows live producer Q and device metadata."""
+    _check_request_ordered_graph_permutations(
+        uses_shared_paged_kv_idx,
+        q_len,
+        32,
+        2,
+        batch_size=batch_size,
+        num_kv_splits=num_kv_splits,
+        write_lse=write_lse,
+    )
+
+
 def _check_request_ordered_graph_permutations(
     uses_shared_paged_kv_idx: bool,
     q_len: int,
     num_q_heads: int,
     num_kv_heads: int,
+    *,
+    batch_size: int = 4,
+    num_kv_splits: int | None = None,
+    write_lse: bool = True,
 ) -> None:
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("request-ordered Cake FMHA requires SM103")
@@ -388,8 +425,14 @@ def _check_request_ordered_graph_permutations(
         pytest.skip("request-ordered Cake FMHA requires a 152-SM device")
 
     device = torch.device("cuda")
-    batch_size, page_slots = 4, 8
-    seq_lens_host = (65, 129, 257, 385)
+    if num_kv_splits is None:
+        seq_lens_host = (65, 129, 257, 385)
+    elif batch_size == 1:
+        seq_lens_host = (1537,)
+    else:
+        length_pattern = (65, 129, 257, 385, 513, 769, 1025, 1537)
+        seq_lens_host = tuple(length_pattern[i % 8] for i in range(batch_size))
+    page_slots = 4 * math.ceil(max(seq_lens_host) / 256)
     num_pages = batch_size * page_slots
     generator = torch.Generator(device=device).manual_seed(4832 + q_len)
     query = torch.randn(
@@ -416,7 +459,11 @@ def _check_request_ordered_graph_permutations(
     if uses_shared_paged_kv_idx:
         block_tables = shared_tables
     else:
-        value_tables = shared_tables.flip(0).contiguous()
+        value_tables = (
+            shared_tables.roll(1, dims=-1)
+            if batch_size == 1
+            else shared_tables.flip(0).contiguous()
+        )
         block_tables = torch.stack((shared_tables, value_tables), dim=1)
     seq_lens = torch.tensor(seq_lens_host, dtype=torch.int32, device=device)
     bmm1_scale = 1.0 / math.sqrt(256)
@@ -456,32 +503,72 @@ def _check_request_ordered_graph_permutations(
     plan = flashinfer.plan_cake_fmha_request_ordered_paged_decode(
         seq_lens_host,
         q_len,
-        write_lse=True,
+        write_lse=write_lse,
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
+        num_kv_splits=num_kv_splits,
     )
     request_order = torch.arange(batch_size, dtype=torch.int32, device=device)
+    candidate_counter = (
+        torch.zeros(
+            batch_size * q_len * (num_q_heads // 8),
+            dtype=torch.int32,
+            device=device,
+        )
+        if num_kv_splits is not None
+        else None
+    )
 
-    def run_candidate() -> None:
+    def run_candidate(candidate_query=query, preparation=None) -> None:
+        candidate_common = dict(common, query=candidate_query, return_lse=write_lse)
         flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             workspace_buffer=candidate_workspace,
             out=candidate_out,
-            lse=candidate_lse,
+            lse=candidate_lse if write_lse else None,
             backend="cake",
             request_order=request_order,
             request_order_plan=plan,
-            **common,
+            request_order_capture=preparation,
+            multi_ctas_kv_counter_buffer=candidate_counter,
+            **candidate_common,
         )
 
     run_candidate()
     torch.cuda.synchronize()
     torch.testing.assert_close(candidate_out, reference_out, atol=0.1, rtol=0.1)
-    torch.testing.assert_close(candidate_lse, reference_lse, atol=1e-2, rtol=1e-2)
+    if write_lse:
+        torch.testing.assert_close(candidate_lse, reference_lse, atol=1e-2, rtol=1e-2)
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run_candidate()
+    if num_kv_splits is None:
+        with torch.cuda.graph(graph):
+            run_candidate()
+        permutations = ((3, 1, 0, 2), (1, 3, 2, 0))
+    else:
+        preparation = cake_api.CakeFmhaRequestOrderedCapture([plan])
+        try:
+            with torch.cuda.graph(graph):
+                produced_query = query * 1.0
+                run_candidate(produced_query, preparation)
+            preparation.finalize()
+        except BaseException:
+            preparation.discard()
+            raise
+        permutations = (
+            tuple(reversed(range(batch_size))),
+            tuple((3 * i + 1) % batch_size for i in range(batch_size)),
+        )
 
-    for permutation in ((3, 1, 0, 2), (1, 3, 2, 0)):
+    for replay_index, permutation in enumerate(permutations):
+        if num_kv_splits is not None:
+            query.mul_(0.875)
+            seq_lens.copy_(
+                torch.tensor(
+                    [length - 1 - 16 * replay_index for length in seq_lens_host],
+                    dtype=torch.int32,
+                    device=device,
+                )
+            )
+            block_tables.copy_(block_tables.roll(1, dims=-1))
         physical_order = torch.tensor(permutation, dtype=torch.int64, device=device)
         inverse_order = torch.argsort(physical_order)
         physical_inputs = dict(common)
@@ -516,12 +603,13 @@ def _check_request_ordered_graph_permutations(
             atol=0.1,
             rtol=0.1,
         )
-        torch.testing.assert_close(
-            candidate_lse,
-            expected_lse,
-            atol=1e-2,
-            rtol=1e-2,
-        )
+        if write_lse:
+            torch.testing.assert_close(
+                candidate_lse,
+                expected_lse,
+                atol=1e-2,
+                rtol=1e-2,
+            )
 
 
 @pytest.mark.parametrize("q_len", (2, 8, 17, 257))

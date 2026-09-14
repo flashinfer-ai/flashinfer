@@ -149,6 +149,109 @@ def _fallback_cake_fmha_request_ordered_plan(
     )
 
 
+def _dynamic_fused_q6_cake_fmha_request_ordered_plan(
+    *,
+    batch_size: int,
+    num_kv_splits: int,
+    write_lse: bool,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> CakeFmhaRequestOrderedDecodePlan | None:
+    """Bind the exported six-query/six-split schedule to runtime B."""
+    if num_kv_splits != 6 or write_lse or (num_q_heads, num_kv_heads) != (32, 2):
+        return None
+    names = set()
+    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
+        "routes"
+    ]:
+        build = route["build_plan"]
+        if (
+            build["fused_q6"] is True
+            and build["q_len"] == 6
+            and build["num_split"] == 6
+            and build["workspace_parts"] == 6
+            and build["ordered"] is True
+            and build["write_lse"] is False
+            and build["uniform_kv_len"] == 0
+            and build["total_tiles"] == 1
+            and tuple(build["grid"][:2]) == (6, 4)
+            and not build["segmented_clc"]
+            and not build["static_one_tile"]
+            and not build["low_q1_cga_ctas"]
+            and not build["high_batch_two_wave"]
+            and not build["two_cta_reducer"]
+        ):
+            names.add(route["module_name"])
+    if len(names) != 1:
+        return None
+    return CakeFmhaRequestOrderedDecodePlan(
+        module_name=names.pop(),
+        batch_size=batch_size,
+        q_len=6,
+        workspace_parts=6,
+        grid=(6, 4, batch_size),
+        total_tiles=1,
+        write_lse=False,
+        num_q_heads=32,
+        num_kv_heads=2,
+    )
+
+
+def _dynamic_split_cake_fmha_request_ordered_plan(
+    *,
+    batch_size: int,
+    q_len: int,
+    num_kv_splits: int,
+    write_lse: bool,
+    num_q_heads: int,
+    num_kv_heads: int,
+) -> CakeFmhaRequestOrderedDecodePlan | None:
+    """Bind an exported split schedule using its own launch topology."""
+    matches = []
+    for route in get_cake_fmha_request_ordered_manifest(num_q_heads, num_kv_heads)[
+        "routes"
+    ]:
+        build = route["build_plan"]
+        if (
+            build["q_len"] == q_len
+            and build["num_split"] == num_kv_splits
+            and build["workspace_parts"] == num_kv_splits
+            and build["ordered"] is True
+            and build["write_lse"] is write_lse
+            and build["uniform_kv_len"] == 0
+            and not build["segmented_clc"]
+            and not build["static_one_tile"]
+            and not build["low_q1_cga_ctas"]
+            and not build["fused_q6"]
+            and not build["high_batch_two_wave"]
+            and not build["two_cta_reducer"]
+        ):
+            matches.append(route)
+    names = {route["module_name"] for route in matches}
+    if not names and q_len == 6:
+        return _dynamic_fused_q6_cake_fmha_request_ordered_plan(
+            batch_size=batch_size,
+            num_kv_splits=num_kv_splits,
+            write_lse=write_lse,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+        )
+    if len(names) != 1:
+        return None
+    head_groups = num_q_heads // 8
+    return CakeFmhaRequestOrderedDecodePlan(
+        module_name=names.pop(),
+        batch_size=batch_size,
+        q_len=q_len,
+        workspace_parts=num_kv_splits,
+        grid=(q_len, head_groups * num_kv_splits, batch_size),
+        total_tiles=batch_size * q_len * head_groups * num_kv_splits,
+        write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+
+
 def plan_cake_fmha_request_ordered_paged_decode(
     kv_lens: Sequence[int],
     q_len: int,
@@ -158,12 +261,14 @@ def plan_cake_fmha_request_ordered_paged_decode(
     write_lse: bool = False,
     num_q_heads: int = 8,
     num_kv_heads: int = 1,
+    num_kv_splits: int | None = None,
 ) -> CakeFmhaRequestOrderedDecodePlan:
     """Select an exported schedule from host-visible immutable metadata.
 
     The returned plan contains no device data.  Call this before CUDA Graph
     capture, then update the contents of the device ``request_order`` tensor
-    in place between replays.
+    in place between replays. An explicit num_kv_splits selects an exported
+    split schedule; unavailable split/LSE combinations raise ValueError.
     """
 
     lengths = tuple(int(value) for value in kv_lens)
@@ -175,6 +280,29 @@ def plan_cake_fmha_request_ordered_paged_decode(
     logical_batch = batch_size if real_batch_size is None else int(real_batch_size)
     if not 0 < logical_batch <= batch_size:
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
+
+    if num_kv_splits is not None:
+        if (
+            not isinstance(num_kv_splits, int)
+            or isinstance(num_kv_splits, bool)
+            or num_kv_splits <= 1
+        ):
+            raise ValueError(
+                "explicit num_kv_splits must be an integer greater than one"
+            )
+        split = _dynamic_split_cake_fmha_request_ordered_plan(
+            batch_size=batch_size,
+            q_len=q_len,
+            num_kv_splits=num_kv_splits,
+            write_lse=write_lse,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+        )
+        if split is None:
+            raise ValueError(
+                "no exported dynamic request-order schedule for this split/LSE combination"
+            )
+        return split
 
     if q_len not in (1, 6):
         return _fallback_cake_fmha_request_ordered_plan(
@@ -232,6 +360,17 @@ def _is_authenticated_request_ordered_plan(
     )
     if plan == fallback:
         return True
+    if plan.workspace_parts > 1:
+        split = _dynamic_split_cake_fmha_request_ordered_plan(
+            batch_size=plan.batch_size,
+            q_len=plan.q_len,
+            num_kv_splits=plan.workspace_parts,
+            write_lse=plan.write_lse,
+            num_q_heads=plan.num_q_heads,
+            num_kv_heads=plan.num_kv_heads,
+        )
+        if plan == split:
+            return True
     for route in get_cake_fmha_request_ordered_manifest(
         plan.num_q_heads, plan.num_kv_heads
     )["routes"]:

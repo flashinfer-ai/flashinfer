@@ -90,7 +90,7 @@ static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap ali
 #define HEAD_DIM 256
 #define HEAD_DIM_HALF 128
 #define TILE_Q 8
-#define Q_GROUPS_PER_KV 2
+#define Q_GROUPS_PER_KV 1
 #define PAGE_SIZE 64
 #define NUM_RAW_KV_STAGES 4
 #define NUM_TRANSFORMED_KV_STAGES 2
@@ -495,7 +495,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTensorMap const* Qt, CakeTensorMap const* K, CakeTensorMap const* V, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_LSE, unsigned int* __restrict__ split_completion, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ request_order, int max_pages_per_seq, int page_table_v_offset, float softmax_scale_log2, float output_scale, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int num_q_heads, int num_kv_heads, int batch_size, unsigned int total_tiles)
+kernel_cake_fmha_request_ordered_paged_decode_442eac115b56031eb8f9(CakeTensorMap const* Qt, CakeTensorMap const* K, CakeTensorMap const* V, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_LSE, unsigned int* __restrict__ split_completion, __nv_bfloat16* __restrict__ O, float* __restrict__ LSE, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, int* __restrict__ request_order, int max_pages_per_seq, int page_table_v_offset, float softmax_scale_log2, float output_scale, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int num_q_heads, int num_kv_heads, int batch_size, unsigned int total_tiles)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1827,9 +1827,11 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                 mbarrier_arrive(corr_empty_0_addr + (corr_cons_stage) * 8);
                 corr_cons_stage += 1;
                 if (corr_cons_stage == 2) { corr_cons_stage = 0; corr_cons_phase ^= 1; }
-                mbarrier_wait(o_full_addr, _phase_o_full_0);
-                _phase_o_full_0 ^= 1;
-                asm volatile("tcgen05.fence::after_thread_sync;");
+                if (num_pairs_1 * 2 > 0) {
+                    mbarrier_wait(o_full_addr, _phase_o_full_0);
+                    _phase_o_full_0 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                }
                 float reduced_sum_pair[2];
                 #pragma unroll
                 for (int c_8 = 0; c_8 < 2; c_8++) {
@@ -1891,16 +1893,38 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     float _shfl_5 = __shfl_sync(0xFFFFFFFF, _tmem_load_3[3], cp_1);
                     total_max[cp_1 * 2 + 1] = _shfl_5;
                 }
-                float _tmem_load_4[8];
-                tmem_ld_x8(&_tmem_load_4[0], taddr + 32 + (unsigned int)corr_row);
-                float _tmem_load_5[8];
-                tmem_ld_x8(&_tmem_load_5[0], taddr + 40 + (unsigned int)corr_row);
+                float split_o_hi_epi[8];
+                float split_o_lo_epi[8];
+                split_o_hi_epi[0] = 0.0f;
+                split_o_hi_epi[1] = 0.0f;
+                split_o_hi_epi[2] = 0.0f;
+                split_o_hi_epi[3] = 0.0f;
+                split_o_hi_epi[4] = 0.0f;
+                split_o_hi_epi[5] = 0.0f;
+                split_o_hi_epi[6] = 0.0f;
+                split_o_hi_epi[7] = 0.0f;
+                split_o_lo_epi[0] = 0.0f;
+                split_o_lo_epi[1] = 0.0f;
+                split_o_lo_epi[2] = 0.0f;
+                split_o_lo_epi[3] = 0.0f;
+                split_o_lo_epi[4] = 0.0f;
+                split_o_lo_epi[5] = 0.0f;
+                split_o_lo_epi[6] = 0.0f;
+                split_o_lo_epi[7] = 0.0f;
+                if (num_pairs_1 * 2 > 0) {
+                    tmem_ld_x8(&split_o_hi_epi[0], taddr + 32 + (unsigned int)corr_row);
+                    tmem_ld_x8(&split_o_lo_epi[0], taddr + 40 + (unsigned int)corr_row);
+                }
                 #pragma unroll
                 for (int h_2 = 0; h_2 < 8; h_2++) {
-                    float _rcp_0 = approx_rcp(total_sum[h_2]);
-                    float inv_total = _rcp_0;
-                    float final_o_hi = _tmem_load_4[h_2] * inv_total * bmm2_scale_c;
-                    float final_o_lo = _tmem_load_5[h_2] * inv_total * bmm2_scale_c;
+                    float final_o_hi = 0.0f;
+                    float final_o_lo = 0.0f;
+                    if (num_pairs_1 * 2 > 0) {
+                        float _rcp_0 = approx_rcp(total_sum[h_2]);
+                        float inv_total = _rcp_0;
+                        final_o_hi = split_o_hi_epi[h_2] * inv_total * bmm2_scale_c;
+                        final_o_lo = split_o_lo_epi[h_2] * inv_total * bmm2_scale_c;
+                    }
                     if (group_ratio_rt > h_2) {
                         int q_head = kv_head_idx_c * group_ratio_rt + h_2;
                         int output_row = (batch_idx_c * Q_LEN + q_row_idx_c) * num_q_heads + q_head;
@@ -1920,7 +1944,9 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                         }
                     }
                 }
-                mbarrier_arrive(o_empty_addr);
+                if (num_pairs_1 * 2 > 0) {
+                    mbarrier_arrive(o_empty_addr);
+                }
                 if (USE_SEGMENTED_CLC != 0 && part_count_c > 1) {
                     int base_tile_idx_seg = (batch_idx_c * Q_LEN + q_row_idx_c) * (num_kv_heads * Q_GROUPS_PER_KV) + kv_head_idx_c;
                     __threadfence();
@@ -2853,12 +2879,13 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     uint32_t _mbar_token_0 = mbarrier_try_wait(q_full_addr, q_phase_m);
                     mbarrier_wait_token(q_full_addr, q_phase_m, _mbar_token_0);
                     q_phase_m ^= 1;
-                    mbarrier_wait(s_empty_0_addr + (sm_stage_1) * 8, sm_empty_phase_m);
-                    uint32_t _mbar_token_1 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                    mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_1);
-                    int _mma_a_lo_0 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
-                    int _mma_b_lo_0 = make_warp_uniform(((smem_qt_hi_addr) >> 4) & 0x3FFF);
-                    asm volatile(
+                    if (num_pairs_2 * 2 > 0) {
+                        mbarrier_wait(s_empty_0_addr + (sm_stage_1) * 8, sm_empty_phase_m);
+                        uint32_t _mbar_token_1 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_1);
+                        int _mma_a_lo_0 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
+                        int _mma_b_lo_0 = make_warp_uniform(((smem_qt_hi_addr) >> 4) & 0x3FFF);
+                        asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -2912,14 +2939,14 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_tmem_s0 + (sm_stage_1 * 8))), "r"(0));
-                    elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                    transformed_stage += 1;
-                    if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                    uint32_t _mbar_token_2 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                    mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_2);
-                    int _mma_a_lo_1 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
-                    int _mma_b_lo_1 = make_warp_uniform(((smem_qt_lo_addr) >> 4) & 0x3FFF);
-                    asm volatile(
+                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                        transformed_stage += 1;
+                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                        uint32_t _mbar_token_2 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_2);
+                        int _mma_a_lo_1 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
+                        int _mma_b_lo_1 = make_warp_uniform(((smem_qt_lo_addr) >> 4) & 0x3FFF);
+                        asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -2973,20 +3000,20 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_tmem_s0 + (sm_stage_1 * 8))), "r"(1));
-                    elect_commit(s_full_0_addr + (sm_stage_1) * 8);
-                    elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                    transformed_stage += 1;
-                    if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                    sm_stage_1 += 1;
-                    if (sm_stage_1 == 2) { sm_stage_1 = 0; sm_empty_phase_m ^= 1; }
-                    #pragma unroll 1
-                    for (int _body_n_m = 0; _body_n_m < num_pairs_2 * 2 - 1; _body_n_m++) {
-                        mbarrier_wait(s_empty_0_addr + (sm_stage_1) * 8, sm_empty_phase_m);
-                        uint32_t _mbar_token_3 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_3);
-                        int _mma_a_lo_2 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
-                        int _mma_b_lo_2 = make_warp_uniform(((smem_qt_hi_addr) >> 4) & 0x3FFF);
-                        asm volatile(
+                        elect_commit(s_full_0_addr + (sm_stage_1) * 8);
+                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                        transformed_stage += 1;
+                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                        sm_stage_1 += 1;
+                        if (sm_stage_1 == 2) { sm_stage_1 = 0; sm_empty_phase_m ^= 1; }
+                        #pragma unroll 1
+                        for (int _body_n_m = 0; _body_n_m < num_pairs_2 * 2 - 1; _body_n_m++) {
+                            mbarrier_wait(s_empty_0_addr + (sm_stage_1) * 8, sm_empty_phase_m);
+                            uint32_t _mbar_token_3 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                            mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_3);
+                            int _mma_a_lo_2 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
+                            int _mma_b_lo_2 = make_warp_uniform(((smem_qt_hi_addr) >> 4) & 0x3FFF);
+                            asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -3040,14 +3067,14 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_tmem_s0 + (sm_stage_1 * 8))), "r"(0));
-                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                        transformed_stage += 1;
-                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                        uint32_t _mbar_token_4 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_4);
-                        int _mma_a_lo_3 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
-                        int _mma_b_lo_3 = make_warp_uniform(((smem_qt_lo_addr) >> 4) & 0x3FFF);
-                        asm volatile(
+                            elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                            transformed_stage += 1;
+                            if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                            uint32_t _mbar_token_4 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                            mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_4);
+                            int _mma_a_lo_3 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (transformed_stage) * 2048);
+                            int _mma_b_lo_3 = make_warp_uniform(((smem_qt_lo_addr) >> 4) & 0x3FFF);
+                            asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -3101,22 +3128,22 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_3), "r"((tmem_tmem_s0 + (sm_stage_1 * 8))), "r"(1));
-                        elect_commit(s_full_0_addr + (sm_stage_1) * 8);
-                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                        transformed_stage += 1;
-                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                        sm_stage_1 += 1;
-                        if (sm_stage_1 == 2) { sm_stage_1 = 0; sm_empty_phase_m ^= 1; }
-                        mbarrier_wait(p_full_0_addr + (p_stage_m) * 8, p_phase_m);
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-                        mbarrier_wait(o_empty_addr, _phase_o_empty_0);
-                        _phase_o_empty_0 ^= 1;
-                        int first_pv_flag = first_pv;
-                        uint32_t _mbar_token_5 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_5);
-                        int _mma_a_lo_4 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
-                        int _mma_b_lo_4 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
-                        asm volatile(
+                            elect_commit(s_full_0_addr + (sm_stage_1) * 8);
+                            elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                            transformed_stage += 1;
+                            if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                            sm_stage_1 += 1;
+                            if (sm_stage_1 == 2) { sm_stage_1 = 0; sm_empty_phase_m ^= 1; }
+                            mbarrier_wait(p_full_0_addr + (p_stage_m) * 8, p_phase_m);
+                            asm volatile("tcgen05.fence::after_thread_sync;");
+                            mbarrier_wait(o_empty_addr, _phase_o_empty_0);
+                            _phase_o_empty_0 ^= 1;
+                            int first_pv_flag = first_pv;
+                            uint32_t _mbar_token_5 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                            mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_5);
+                            int _mma_a_lo_4 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
+                            int _mma_b_lo_4 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
+                            asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -3170,14 +3197,14 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_tmem_o_hi), "r"(((first_pv_flag) ? 0 : 1)));
-                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                        transformed_stage += 1;
-                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                        uint32_t _mbar_token_6 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_6);
-                        int _mma_a_lo_5 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
-                        int _mma_b_lo_5 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
-                        asm volatile(
+                            elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                            transformed_stage += 1;
+                            if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                            uint32_t _mbar_token_6 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                            mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_6);
+                            int _mma_a_lo_5 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
+                            int _mma_b_lo_5 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
+                            asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -3231,27 +3258,27 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_5), "r"(_mma_b_lo_5), "r"(tmem_tmem_o_lo), "r"(((first_pv_flag) ? 0 : 1)));
-                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                        transformed_stage += 1;
-                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                        elect_commit(o_full_addr);
-                        first_pv = 0;
-                        p_stage_m += 1;
-                        if (p_stage_m == 2) { p_stage_m = 0; p_phase_m ^= 1; }
-                    }
-                    mbarrier_wait(s_empty_0_addr + (sm_stage_1) * 8, sm_empty_phase_m);
-                    mbarrier_wait(s_empty_0_addr + (sm_stage_1 + 1) * 8, sm_empty_phase_m);
-                    elect_commit(q_empty_addr);
-                    mbarrier_wait(p_full_0_addr + (p_stage_m) * 8, p_phase_m);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    mbarrier_wait(o_empty_addr, _phase_o_empty_0);
-                    _phase_o_empty_0 ^= 1;
-                    int last_pv_init = first_pv;
-                    uint32_t _mbar_token_7 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                    mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_7);
-                    int _mma_a_lo_6 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
-                    int _mma_b_lo_6 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
-                    asm volatile(
+                            elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                            transformed_stage += 1;
+                            if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                            elect_commit(o_full_addr);
+                            first_pv = 0;
+                            p_stage_m += 1;
+                            if (p_stage_m == 2) { p_stage_m = 0; p_phase_m ^= 1; }
+                        }
+                        mbarrier_wait(s_empty_0_addr + (sm_stage_1) * 8, sm_empty_phase_m);
+                        mbarrier_wait(s_empty_0_addr + (sm_stage_1 + 1) * 8, sm_empty_phase_m);
+                        elect_commit(q_empty_addr);
+                        mbarrier_wait(p_full_0_addr + (p_stage_m) * 8, p_phase_m);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+                        mbarrier_wait(o_empty_addr, _phase_o_empty_0);
+                        _phase_o_empty_0 ^= 1;
+                        int last_pv_init = first_pv;
+                        uint32_t _mbar_token_7 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_7);
+                        int _mma_a_lo_6 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
+                        int _mma_b_lo_6 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
+                        asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -3305,14 +3332,14 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"(tmem_tmem_o_hi), "r"(((last_pv_init) ? 0 : 1)));
-                    elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                    transformed_stage += 1;
-                    if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                    uint32_t _mbar_token_8 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
-                    mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_8);
-                    int _mma_a_lo_7 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
-                    int _mma_b_lo_7 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
-                    asm volatile(
+                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                        transformed_stage += 1;
+                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                        uint32_t _mbar_token_8 = mbarrier_try_wait(kv_full_addr + (transformed_stage) * 8, transformed_phase);
+                        mbarrier_wait_token(kv_full_addr + (transformed_stage) * 8, transformed_phase, _mbar_token_8);
+                        int _mma_a_lo_7 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (transformed_stage) * 2048);
+                        int _mma_b_lo_7 = make_warp_uniform(((((smem_p_addr) >> 4) & 0x3FFF) | 0x400000) + (p_stage_m) * 128);
+                        asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
                     ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
@@ -3366,12 +3393,15 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_7), "r"(tmem_tmem_o_lo), "r"(((last_pv_init) ? 0 : 1)));
-                    elect_commit(kv_empty_addr + (transformed_stage) * 8);
-                    transformed_stage += 1;
-                    if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
-                    elect_commit(o_full_addr);
-                    p_stage_m += 1;
-                    if (p_stage_m == 2) { p_stage_m = 0; p_phase_m ^= 1; }
+                        elect_commit(kv_empty_addr + (transformed_stage) * 8);
+                        transformed_stage += 1;
+                        if (transformed_stage == 2) { transformed_stage = 0; transformed_phase ^= 1; }
+                        elect_commit(o_full_addr);
+                        p_stage_m += 1;
+                        if (p_stage_m == 2) { p_stage_m = 0; p_phase_m ^= 1; }
+                    } else {
+                        elect_commit(q_empty_addr);
+                    }
                 }
                 int has_local_2 = 0;
                 {
@@ -4964,41 +4994,20 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                     tma_3d_gmem2smem(smem_qt_lo_addr, Qt, 0, off_qt, 2, q_full_addr);
                     {
                         {
-                            mbarrier_wait(page_offsets_full_addr + (page_cons_stage) * 8, page_cons_phase);
-                            int page_smem_base = page_cons_stage * 4;
-                            #pragma unroll
-                            for (int dim_half = 0; dim_half < 2; dim_half++) {
-                                mbarrier_wait(raw_kv_empty_addr + (raw_stage) * 8, raw_phase);
-                                mbarrier_arrive_expect_tx(raw_kv_full_addr + (raw_stage) * 8, BLOCK_N * HEAD_DIM_HALF);
-                                int raw_dst = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
-                                #pragma unroll
-                                for (int page_in_block = 0; page_in_block < 2; page_in_block++) {
-                                    int physical_page = smem_page_offsets[page_smem_base + page_in_block];
-                                    int page_dst = raw_dst + page_in_block * PAGE_SIZE * HEAD_DIM_HALF;
-                                    {
-                                        tma_5d_gmem2smem(page_dst, K, 0, 0, dim_half, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page, raw_kv_full_addr + (raw_stage) * 8);
-                                    }
-                                }
-                                raw_stage += 1;
-                                if (raw_stage == 4) { raw_stage = 0; raw_phase ^= 1; }
-                            }
-                            page_cons_stage += 1;
-                            if (page_cons_stage == 6) { page_cons_stage = 0; page_cons_phase ^= 1; }
-                            #pragma unroll 1
-                            for (int _body_n_l = 0; _body_n_l < num_pairs_4 * 2 - 1; _body_n_l++) {
+                            if (num_pairs_4 * 2 > 0) {
                                 mbarrier_wait(page_offsets_full_addr + (page_cons_stage) * 8, page_cons_phase);
-                                int page_smem_base_0 = page_cons_stage * 4;
+                                int page_smem_base = page_cons_stage * 4;
                                 #pragma unroll
-                                for (int dim_half_1 = 0; dim_half_1 < 2; dim_half_1++) {
+                                for (int dim_half = 0; dim_half < 2; dim_half++) {
                                     mbarrier_wait(raw_kv_empty_addr + (raw_stage) * 8, raw_phase);
                                     mbarrier_arrive_expect_tx(raw_kv_full_addr + (raw_stage) * 8, BLOCK_N * HEAD_DIM_HALF);
-                                    int raw_dst_1 = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
+                                    int raw_dst = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
                                     #pragma unroll
-                                    for (int page_in_block_1 = 0; page_in_block_1 < 2; page_in_block_1++) {
-                                        int physical_page_1 = smem_page_offsets[page_smem_base_0 + page_in_block_1];
-                                        int page_dst_1 = raw_dst_1 + page_in_block_1 * PAGE_SIZE * HEAD_DIM_HALF;
+                                    for (int page_in_block = 0; page_in_block < 2; page_in_block++) {
+                                        int physical_page = smem_page_offsets[page_smem_base + page_in_block];
+                                        int page_dst = raw_dst + page_in_block * PAGE_SIZE * HEAD_DIM_HALF;
                                         {
-                                            tma_5d_gmem2smem(page_dst_1, K, 0, 0, dim_half_1, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page_1, raw_kv_full_addr + (raw_stage) * 8);
+                                            tma_5d_gmem2smem(page_dst, K, 0, 0, dim_half, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page, raw_kv_full_addr + (raw_stage) * 8);
                                         }
                                     }
                                     raw_stage += 1;
@@ -5006,18 +5015,61 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                                 }
                                 page_cons_stage += 1;
                                 if (page_cons_stage == 6) { page_cons_stage = 0; page_cons_phase ^= 1; }
-                                int page_smem_base_1 = page_release_stage * 4;
+                                #pragma unroll 1
+                                for (int _body_n_l = 0; _body_n_l < num_pairs_4 * 2 - 1; _body_n_l++) {
+                                    mbarrier_wait(page_offsets_full_addr + (page_cons_stage) * 8, page_cons_phase);
+                                    int page_smem_base_0 = page_cons_stage * 4;
+                                    #pragma unroll
+                                    for (int dim_half_1 = 0; dim_half_1 < 2; dim_half_1++) {
+                                        mbarrier_wait(raw_kv_empty_addr + (raw_stage) * 8, raw_phase);
+                                        mbarrier_arrive_expect_tx(raw_kv_full_addr + (raw_stage) * 8, BLOCK_N * HEAD_DIM_HALF);
+                                        int raw_dst_1 = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
+                                        #pragma unroll
+                                        for (int page_in_block_1 = 0; page_in_block_1 < 2; page_in_block_1++) {
+                                            int physical_page_1 = smem_page_offsets[page_smem_base_0 + page_in_block_1];
+                                            int page_dst_1 = raw_dst_1 + page_in_block_1 * PAGE_SIZE * HEAD_DIM_HALF;
+                                            {
+                                                tma_5d_gmem2smem(page_dst_1, K, 0, 0, dim_half_1, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page_1, raw_kv_full_addr + (raw_stage) * 8);
+                                            }
+                                        }
+                                        raw_stage += 1;
+                                        if (raw_stage == 4) { raw_stage = 0; raw_phase ^= 1; }
+                                    }
+                                    page_cons_stage += 1;
+                                    if (page_cons_stage == 6) { page_cons_stage = 0; page_cons_phase ^= 1; }
+                                    int page_smem_base_1 = page_release_stage * 4;
+                                    #pragma unroll
+                                    for (int dim_half_2 = 0; dim_half_2 < 2; dim_half_2++) {
+                                        mbarrier_wait(raw_kv_empty_addr + (raw_stage) * 8, raw_phase);
+                                        mbarrier_arrive_expect_tx(raw_kv_full_addr + (raw_stage) * 8, BLOCK_N * HEAD_DIM_HALF);
+                                        int raw_dst_2 = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
+                                        #pragma unroll
+                                        for (int page_in_block_2 = 0; page_in_block_2 < 2; page_in_block_2++) {
+                                            int physical_page_2 = smem_page_offsets[page_smem_base_1 + 2 + page_in_block_2];
+                                            int page_dst_2 = raw_dst_2 + page_in_block_2 * PAGE_SIZE * HEAD_DIM_HALF;
+                                            {
+                                                tma_5d_gmem2smem(page_dst_2, V, 0, 0, dim_half_2, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page_2, raw_kv_full_addr + (raw_stage) * 8);
+                                            }
+                                        }
+                                        raw_stage += 1;
+                                        if (raw_stage == 4) { raw_stage = 0; raw_phase ^= 1; }
+                                    }
+                                    mbarrier_arrive(page_offsets_empty_addr + (page_release_stage) * 8);
+                                    page_release_stage += 1;
+                                    if (page_release_stage == 6) { page_release_stage = 0; page_release_phase ^= 1; }
+                                }
+                                int page_smem_base_0_1 = page_release_stage * 4;
                                 #pragma unroll
-                                for (int dim_half_2 = 0; dim_half_2 < 2; dim_half_2++) {
+                                for (int dim_half_3 = 0; dim_half_3 < 2; dim_half_3++) {
                                     mbarrier_wait(raw_kv_empty_addr + (raw_stage) * 8, raw_phase);
                                     mbarrier_arrive_expect_tx(raw_kv_full_addr + (raw_stage) * 8, BLOCK_N * HEAD_DIM_HALF);
-                                    int raw_dst_2 = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
+                                    int raw_dst_3 = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
                                     #pragma unroll
-                                    for (int page_in_block_2 = 0; page_in_block_2 < 2; page_in_block_2++) {
-                                        int physical_page_2 = smem_page_offsets[page_smem_base_1 + 2 + page_in_block_2];
-                                        int page_dst_2 = raw_dst_2 + page_in_block_2 * PAGE_SIZE * HEAD_DIM_HALF;
+                                    for (int page_in_block_3 = 0; page_in_block_3 < 2; page_in_block_3++) {
+                                        int physical_page_3 = smem_page_offsets[page_smem_base_0_1 + 2 + page_in_block_3];
+                                        int page_dst_3 = raw_dst_3 + page_in_block_3 * PAGE_SIZE * HEAD_DIM_HALF;
                                         {
-                                            tma_5d_gmem2smem(page_dst_2, V, 0, 0, dim_half_2, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page_2, raw_kv_full_addr + (raw_stage) * 8);
+                                            tma_5d_gmem2smem(page_dst_3, V, 0, 0, dim_half_3, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page_3, raw_kv_full_addr + (raw_stage) * 8);
                                         }
                                     }
                                     raw_stage += 1;
@@ -5027,26 +5079,6 @@ kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b(CakeTens
                                 page_release_stage += 1;
                                 if (page_release_stage == 6) { page_release_stage = 0; page_release_phase ^= 1; }
                             }
-                            int page_smem_base_0_1 = page_release_stage * 4;
-                            #pragma unroll
-                            for (int dim_half_3 = 0; dim_half_3 < 2; dim_half_3++) {
-                                mbarrier_wait(raw_kv_empty_addr + (raw_stage) * 8, raw_phase);
-                                mbarrier_arrive_expect_tx(raw_kv_full_addr + (raw_stage) * 8, BLOCK_N * HEAD_DIM_HALF);
-                                int raw_dst_3 = smem_kv_fp8_addr + (unsigned int)(raw_stage * 16384);
-                                #pragma unroll
-                                for (int page_in_block_3 = 0; page_in_block_3 < 2; page_in_block_3++) {
-                                    int physical_page_3 = smem_page_offsets[page_smem_base_0_1 + 2 + page_in_block_3];
-                                    int page_dst_3 = raw_dst_3 + page_in_block_3 * PAGE_SIZE * HEAD_DIM_HALF;
-                                    {
-                                        tma_5d_gmem2smem(page_dst_3, V, 0, 0, dim_half_3, kv_head_idx_2_1 / Q_GROUPS_PER_KV, physical_page_3, raw_kv_full_addr + (raw_stage) * 8);
-                                    }
-                                }
-                                raw_stage += 1;
-                                if (raw_stage == 4) { raw_stage = 0; raw_phase ^= 1; }
-                            }
-                            mbarrier_arrive(page_offsets_empty_addr + (page_release_stage) * 8);
-                            page_release_stage += 1;
-                            if (page_release_stage == 6) { page_release_stage = 0; page_release_phase ^= 1; }
                         }
                     }
                 }

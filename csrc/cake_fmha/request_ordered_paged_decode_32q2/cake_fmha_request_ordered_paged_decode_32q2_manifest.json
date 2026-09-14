@@ -20,23 +20,6 @@
     {
       "arch": "sm_103a",
       "binding_mode": "embedded_cubin",
-      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_071ddc99353eb30e680e_binding.cpp",
-      "binding_sha256": "d447db03b458e1013553a285ccce8529ad9d7c91e58b7ca305e229255bd54676",
-      "closure_sha256": "76f308c23c523b8012ed5245cc96ed57460c8c67b7a3cf3eb80f7b45b6694767",
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_071ddc99353eb30e680e_kernel.cu",
-      "device_sha256": "98d92012d785b32fbdee48798666a39d4fc77ae91c3c2f1a135575b551e770f7",
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_071ddc99353eb30e680e",
-      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_071ddc99353eb30e680e_sm_103a",
-      "name": "cake_fmha_request_ordered_paged_decode_32q2_071ddc99353eb30e680e",
-      "tma_workspace_bytes": 384
-    },
-    {
-      "arch": "sm_103a",
-      "binding_mode": "embedded_cubin",
       "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_08c729179be02d019eac_binding.cpp",
       "binding_sha256": "b6dfecd80b6a92aa8629596fa9f52819fc5b0bf80cc61a8d0c2aad4beafafead",
       "closure_sha256": "b8b1c55ac7f9fe05c047a74735d7c31d36cc9e4fb6151253603f47eab81dbf43",
@@ -52,20 +35,20 @@
       "tma_workspace_bytes": 384
     },
     {
+      "name": "cake_fmha_request_ordered_paged_decode_32q2_19383e5804f4ad8241cf",
       "arch": "sm_103a",
+      "closure_sha256": "63dd7ad415df79c8ac69d352da699016c082aac56c4a0432e9fdfd30500df4ec",
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_19383e5804f4ad8241cf_kernel.cu",
+      "device_sha256": "45c1a06cdfe16ec4ea62d99796be8c8d103adaaa3422f35266b2c2bfd38c6d0b",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_19383e5804f4ad8241cf_binding.cpp",
+      "binding_sha256": "2b165aea549f6f72b67ba6b89ed4eb3e0816bc9e286e07815362cbc8fc49c567",
       "binding_mode": "embedded_cubin",
-      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_1009cd9ad75281ff31e9_binding.cpp",
-      "binding_sha256": "47f5555efdd4394e7138b91a46a0569e32b082b1a51f8f8961eacfd7edfd38f8",
-      "closure_sha256": "12a188ce5c5d528285b7c7ff95e46579b1e41cb479f0f60a9293900ac0aea36e",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_19383e5804f4ad8241cf_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_19383e5804f4ad8241cf",
+      "ffi_entry": "run",
       "compile_options": [
         "--use_fast_math"
       ],
-      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_1009cd9ad75281ff31e9_kernel.cu",
-      "device_sha256": "6c739f0821f51eb309d5f5b19557b30062ab9f12a75cbaa3052e67dad1ea6e81",
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_1009cd9ad75281ff31e9",
-      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_1009cd9ad75281ff31e9_sm_103a",
-      "name": "cake_fmha_request_ordered_paged_decode_32q2_1009cd9ad75281ff31e9",
       "tma_workspace_bytes": 384
     },
     {
@@ -83,6 +66,23 @@
       "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_36dd0482b4214ff3101c",
       "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_36dd0482b4214ff3101c_sm_103a",
       "name": "cake_fmha_request_ordered_paged_decode_32q2_36dd0482b4214ff3101c",
+      "tma_workspace_bytes": 384
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_32q2_3c49d265ab08202e8b50",
+      "arch": "sm_103a",
+      "closure_sha256": "1d085332452c0e305978f83aaba6380243234fa41129a27e36462a8fb453a845",
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_3c49d265ab08202e8b50_kernel.cu",
+      "device_sha256": "3238d1bdd76496c8a42664684c30fb7eee3d7593e7c87aad96a49854b6d6294f",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_3c49d265ab08202e8b50_binding.cpp",
+      "binding_sha256": "aec204e521d142c8a8f4b92711d5f7d28b0f707e6a78c18f70454ad2e218533c",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_3c49d265ab08202e8b50_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_3c49d265ab08202e8b50",
+      "ffi_entry": "run",
+      "compile_options": [
+        "--use_fast_math"
+      ],
       "tma_workspace_bytes": 384
     },
     {
@@ -171,20 +171,20 @@
       "tma_workspace_bytes": 384
     },
     {
+      "name": "cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa",
       "arch": "sm_103a",
+      "closure_sha256": "fabc797c53e97304b87a5b88739cbb4dbc017db59f63839913b6137bae11fb73",
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa_kernel.cu",
+      "device_sha256": "a6774da55ac92b30c60b06aada96b7ec0ca2e1184d13555d6f330dd2c3377cbf",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa_binding.cpp",
+      "binding_sha256": "1e0ab5d669a6ad93c8c9fc70efb32574c722cbd1fdb306668b8a40c226bc154f",
       "binding_mode": "embedded_cubin",
-      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b_binding.cpp",
-      "binding_sha256": "72735dfc860a28293e61c29050e042e4dd5db078948276dae67cd965c1b7b3bb",
-      "closure_sha256": "288bc37e0ab41ebc3c89aa8c4ce62caf97754a2f3f352c4b89422987e947f479",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa",
+      "ffi_entry": "run",
       "compile_options": [
         "--use_fast_math"
       ],
-      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b_kernel.cu",
-      "device_sha256": "6741fb7bc0d4e2623c0b5bff7ed89a9f82f732f1584b46d8d5c2e2d7b1424008",
-      "ffi_entry": "run",
-      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b",
-      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b_sm_103a",
-      "name": "cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b",
       "tma_workspace_bytes": 384
     },
     {
@@ -1650,7 +1650,7 @@
         "workspace_parts": 4,
         "write_lse": true
       },
-      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_071ddc99353eb30e680e",
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_3c49d265ab08202e8b50",
       "shape": "correctness_split4_reducer_separate_q1"
     },
     {
@@ -1737,7 +1737,7 @@
         "workspace_parts": 2,
         "write_lse": true
       },
-      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_1009cd9ad75281ff31e9",
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_19383e5804f4ad8241cf",
       "shape": "correctness_split2_reducer_shared_q6"
     },
     {
@@ -5388,7 +5388,7 @@
         "workspace_parts": 16,
         "write_lse": false
       },
-      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b",
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa",
       "shape": "perf_ragged_b160_q1"
     },
     {
@@ -7017,7 +7017,7 @@
         "workspace_parts": 16,
         "write_lse": false
       },
-      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b",
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa",
       "shape": "perf_ragged_b192_q1"
     },
     {
@@ -8902,7 +8902,7 @@
         "workspace_parts": 16,
         "write_lse": false
       },
-      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_cd1f6550f8e24ba6ae0b",
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_ac39b022c8fa1c311caa",
       "shape": "perf_ragged_b224_q1"
     },
     {
