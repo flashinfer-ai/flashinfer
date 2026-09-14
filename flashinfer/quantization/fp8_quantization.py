@@ -187,6 +187,8 @@ def mxfp8_quantize(
     ----------
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
+        The ``"cute-dsl"`` backend additionally supports fp32 input; the
+        ``"cuda"`` backend does not.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.

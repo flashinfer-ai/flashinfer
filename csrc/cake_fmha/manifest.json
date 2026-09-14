@@ -1,0 +1,4946 @@
+{
+  "add_ons": {
+    "cake_fmha_dcp_spec": {
+      "installed": true,
+      "manifest": {
+        "architectures": [
+          "sm_100a",
+          "sm_103a"
+        ],
+        "descriptor_abi": {
+          "alignment_bytes": 128,
+          "ownership": "caller-owned immutable device descriptor",
+          "size_bytes": 128,
+          "type": "CakeFmhaTensorMap"
+        },
+        "dispatch": {
+          "base_capability_inflation": false,
+          "ordinary_calls_profile": "conventional",
+          "profile": "dcp_spec",
+          "requires_non_null": "causal_seqlens_kv_global"
+        },
+        "families": {
+          "dcp_spec_bf16_fp8": {
+            "binding_sha256": "9f4366bae2304215b57551cddb85186ddcb21286ab056daa6d20122835d0ff9d",
+            "binding_source": "bindings/cake_fmha_dcp_spec_bf16_fp8_binding.cu",
+            "dynamic_shared_memory_bytes": 208896,
+            "launch_binding": "cake_fmha_launch_dcp_spec_bf16_fp8",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Qt"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "partial_O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_LSE_ptr"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "split_completion"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "seq_lens_kv"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_local_seq_len"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "output_scale"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_rank"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              }
+            ],
+            "parametric_macros": [
+              "BATCH_SIZE",
+              "NUM_Q_HEADS",
+              "NUM_KV_HEADS",
+              "Q_LEN",
+              "CP_WORLD"
+            ],
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8",
+            "source_family": [
+              {
+                "selector": {
+                  "num_split": 1,
+                  "retain_kv_l2": 0
+                },
+                "sha256": {
+                  "sm_100a": "268d2a6888d25de5d4f3c39d4849981a44e98c1ee91f93ec6edc1dc69f970c02",
+                  "sm_103a": "268d2a6888d25de5d4f3c39d4849981a44e98c1ee91f93ec6edc1dc69f970c02"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 1,
+                  "retain_kv_l2": 1
+                },
+                "sha256": {
+                  "sm_100a": "5fbe5225af33014ca0c0a1b5416674be1fc91ab6ee6180180f127f03197e8fbb",
+                  "sm_103a": "5fbe5225af33014ca0c0a1b5416674be1fc91ab6ee6180180f127f03197e8fbb"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l21.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l21.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 2,
+                  "retain_kv_l2": 0
+                },
+                "sha256": {
+                  "sm_100a": "5858e0e4299c9aba89fd86142dff37c2711d11ca671af2fb0841ea2d11a3423d",
+                  "sm_103a": "5858e0e4299c9aba89fd86142dff37c2711d11ca671af2fb0841ea2d11a3423d"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split2_retain_kv_l20.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split2_retain_kv_l20.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 2,
+                  "retain_kv_l2": 1
+                },
+                "sha256": {
+                  "sm_100a": "8494e9b4f90919e87cea5b1a751b6fd3eda26ff669d3f92782c88579282c82f2",
+                  "sm_103a": "8494e9b4f90919e87cea5b1a751b6fd3eda26ff669d3f92782c88579282c82f2"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split2_retain_kv_l21.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split2_retain_kv_l21.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 3,
+                  "retain_kv_l2": 0
+                },
+                "sha256": {
+                  "sm_100a": "cc3b671eaee3e5d356abb19ca9775a18de29a16089431755d332d5649a5b964a",
+                  "sm_103a": "cc3b671eaee3e5d356abb19ca9775a18de29a16089431755d332d5649a5b964a"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split3_retain_kv_l20.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split3_retain_kv_l20.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 3,
+                  "retain_kv_l2": 1
+                },
+                "sha256": {
+                  "sm_100a": "e6601c554de8614cd525b2707dfd7e7f45db2b493bb3130f451166c5b56faa50",
+                  "sm_103a": "e6601c554de8614cd525b2707dfd7e7f45db2b493bb3130f451166c5b56faa50"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split3_retain_kv_l21.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split3_retain_kv_l21.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 4,
+                  "retain_kv_l2": 0
+                },
+                "sha256": {
+                  "sm_100a": "f5f82d9c12caa4f48a8b3d0372f139974d1f969dbc06ba167e2a539dbc029659",
+                  "sm_103a": "f5f82d9c12caa4f48a8b3d0372f139974d1f969dbc06ba167e2a539dbc029659"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l20.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l20.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 4,
+                  "retain_kv_l2": 1
+                },
+                "sha256": {
+                  "sm_100a": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91",
+                  "sm_103a": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l21.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l21.cu"
+                }
+              }
+            ],
+            "threads": 512
+          },
+          "dcp_spec_bf16_v1": {
+            "binding_sha256": "48472f3684b0b307094f734e2d07970185d35e09d4e876c09fe90770fcd5acc6",
+            "binding_source": "bindings/cake_fmha_dcp_spec_bf16_binding.cu",
+            "dynamic_shared_memory_bytes": 145408,
+            "launch_binding": "cake_fmha_launch_dcp_spec_bf16",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Qt"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_local_seq_len"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_rank"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              }
+            ],
+            "parametric_macros": [
+              "BATCH_SIZE",
+              "NUM_Q_HEADS",
+              "NUM_KV_HEADS",
+              "Q_LEN",
+              "CP_WORLD"
+            ],
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16",
+            "source_family": [
+              {
+                "selector": {
+                  "retain_kv_l2": 0
+                },
+                "sha256": {
+                  "sm_100a": "a482028a7caca598fedd1fbdce1c9a7eaaff63ca816535a6efb6643f58a44cce",
+                  "sm_103a": "a482028a7caca598fedd1fbdce1c9a7eaaff63ca816535a6efb6643f58a44cce"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu"
+                }
+              },
+              {
+                "selector": {
+                  "retain_kv_l2": 1
+                },
+                "sha256": {
+                  "sm_100a": "53d5d789014c439a6c41ce406f153a286da1f72da529d650c5da55d51e6de203",
+                  "sm_103a": "53d5d789014c439a6c41ce406f153a286da1f72da529d650c5da55d51e6de203"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l21.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l21.cu"
+                }
+              }
+            ],
+            "threads": 512
+          },
+          "dcp_spec_bf16_v4": {
+            "binding_sha256": "67d4ad3e1ceb1f8d5b91aba130e756f0dfb236f91b53d5f62b6d11a3a51f070f",
+            "binding_source": "bindings/cake_fmha_dcp_spec_bf16_v4_binding.cu",
+            "dynamic_shared_memory_bytes": 145408,
+            "launch_binding": "cake_fmha_launch_dcp_spec_bf16_v4",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Qt"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "partial_O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_LSE_ptr"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "split_completion"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_local_seq_len"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_rank"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              }
+            ],
+            "parametric_macros": [
+              "BATCH_SIZE",
+              "NUM_Q_HEADS",
+              "NUM_KV_HEADS",
+              "Q_LEN",
+              "CP_WORLD"
+            ],
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_v4",
+            "source_family": [
+              {
+                "selector": {
+                  "num_split": 2
+                },
+                "sha256": {
+                  "sm_100a": "54c9ee09214520880631f6f5f2ce109941ed82cc23970126073f82cc2b377f5a",
+                  "sm_103a": "54c9ee09214520880631f6f5f2ce109941ed82cc23970126073f82cc2b377f5a"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split2.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split2.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 3
+                },
+                "sha256": {
+                  "sm_100a": "979467b489ae74e16411da60f5e172876170367aabfa8623b17f1d737fc6bf23",
+                  "sm_103a": "979467b489ae74e16411da60f5e172876170367aabfa8623b17f1d737fc6bf23"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split3.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split3.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 4
+                },
+                "sha256": {
+                  "sm_100a": "4b5729c1b24f90024b273805ca808d4cf4615f316651f6ef2b6581c11dd1c6e9",
+                  "sm_103a": "4b5729c1b24f90024b273805ca808d4cf4615f316651f6ef2b6581c11dd1c6e9"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split4.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split4.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 5
+                },
+                "sha256": {
+                  "sm_100a": "1b708b1bc98749d5d5a7aaaee1b0049cff7febc9d7503a4758f520ecbca87dee",
+                  "sm_103a": "1b708b1bc98749d5d5a7aaaee1b0049cff7febc9d7503a4758f520ecbca87dee"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split5.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split5.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 6
+                },
+                "sha256": {
+                  "sm_100a": "efe7d4df0ff2cace1153e71abcaea02bb1cbcdbe476d5b6e96c9901fad8298f0",
+                  "sm_103a": "efe7d4df0ff2cace1153e71abcaea02bb1cbcdbe476d5b6e96c9901fad8298f0"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split6.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split6.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 7
+                },
+                "sha256": {
+                  "sm_100a": "04b7a61eb5dd7947680040c25dd69f11ffb626a668b20320d153ed7a9380eb11",
+                  "sm_103a": "04b7a61eb5dd7947680040c25dd69f11ffb626a668b20320d153ed7a9380eb11"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split7.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split7.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 8
+                },
+                "sha256": {
+                  "sm_100a": "8dbdc887862b9bf5c85ebdf14a3b652c62cb0788fe60935a7222f6778c4fe78d",
+                  "sm_103a": "8dbdc887862b9bf5c85ebdf14a3b652c62cb0788fe60935a7222f6778c4fe78d"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split8.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split8.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 9
+                },
+                "sha256": {
+                  "sm_100a": "026fb02787b8dbaa1552278248e836acadc3d1023858d7794480b6af4c6ae53c",
+                  "sm_103a": "026fb02787b8dbaa1552278248e836acadc3d1023858d7794480b6af4c6ae53c"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split9.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split9.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 10
+                },
+                "sha256": {
+                  "sm_100a": "611d34c0103a69cf9e716f1f8031247625b0fff95a449171567050ff9538a84f",
+                  "sm_103a": "611d34c0103a69cf9e716f1f8031247625b0fff95a449171567050ff9538a84f"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split10.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split10.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 11
+                },
+                "sha256": {
+                  "sm_100a": "2f3fbd12ab9becbcca74573f35a8b80979ff5d50ca40dcbb1ac5f7abb0fe835b",
+                  "sm_103a": "2f3fbd12ab9becbcca74573f35a8b80979ff5d50ca40dcbb1ac5f7abb0fe835b"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split11.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split11.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 12
+                },
+                "sha256": {
+                  "sm_100a": "866bd374b3b0f126bc80f72959831f594b085e4528ef4e0326c0d64e85d7e65a",
+                  "sm_103a": "866bd374b3b0f126bc80f72959831f594b085e4528ef4e0326c0d64e85d7e65a"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split12.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split12.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 13
+                },
+                "sha256": {
+                  "sm_100a": "09416e6a87788e593ce44be7eb45ffa8f1ca54c045a82cd899726a40e783329d",
+                  "sm_103a": "09416e6a87788e593ce44be7eb45ffa8f1ca54c045a82cd899726a40e783329d"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split13.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split13.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 14
+                },
+                "sha256": {
+                  "sm_100a": "b9fdbb2efb6683b90c29b9c9b1571a8c1b146f747410ba272f3f76fad4b430ad",
+                  "sm_103a": "b9fdbb2efb6683b90c29b9c9b1571a8c1b146f747410ba272f3f76fad4b430ad"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split14.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split14.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 15
+                },
+                "sha256": {
+                  "sm_100a": "ab721f8755e3637f798a5f01b0086af43085a5d3ae89deda8167a4dbc17a8010",
+                  "sm_103a": "ab721f8755e3637f798a5f01b0086af43085a5d3ae89deda8167a4dbc17a8010"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split15.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split15.cu"
+                }
+              },
+              {
+                "selector": {
+                  "num_split": 16
+                },
+                "sha256": {
+                  "sm_100a": "9b38951ccc82cb12992e6fd10dd5e123a95d54388df43726bc1158e02f2f4fd8",
+                  "sm_103a": "9b38951ccc82cb12992e6fd10dd5e123a95d54388df43726bc1158e02f2f4fd8"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split16.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_v4/num_split16.cu"
+                }
+              }
+            ],
+            "threads": 512
+          }
+        },
+        "format_version": 1,
+        "minimum_arch": "sm_100a",
+        "name": "cake_fmha_dcp_spec",
+        "source_manifests": {
+          "bf16": {
+            "fixed": {
+              "causal": true,
+              "dtype": "bfloat16",
+              "head_dim": 128,
+              "kv_layout": "HND",
+              "lse": "float32_base2",
+              "page_size": 16
+            },
+            "sha256": "4cc84e573479f849c66ed38b00b4d912563068ba27ece4019bec50f01a278675",
+            "specialization_domain": {
+              "batch_size": "positive integer",
+              "cp_rank": "0 <= cp_rank < cp_world",
+              "cp_world": [
+                1,
+                2,
+                4,
+                8
+              ],
+              "head_group_ratio": "integer in [1, 8]",
+              "q_len": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                8
+              ],
+              "v1_retain_kv_l2": [
+                0,
+                1
+              ],
+              "v4_num_split": [
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16
+              ]
+            }
+          },
+          "bf16_fp8": {
+            "fixed": {
+              "causal": true,
+              "head_dim": 128,
+              "k_scale": "per_tensor_folded_into_bmm1",
+              "kv_dtype": "float8_e4m3fn",
+              "kv_layout": "HND",
+              "lse": "float32_base2",
+              "o_dtype": "bfloat16",
+              "page_size": 64,
+              "q_dtype": "bfloat16",
+              "v_scale": "per_tensor_folded_into_output"
+            },
+            "sha256": "a9c5c8899f7907f3ddfd0351e1371829d035308b6201ad51e7507eb057cd08e7",
+            "specialization_domain": {
+              "batch_size": "positive integer",
+              "cp_rank": "0 <= cp_rank < cp_world",
+              "cp_world": [
+                1,
+                2,
+                4,
+                8
+              ],
+              "head_group_ratio": "integer in [1, 8]",
+              "num_split": [
+                1,
+                2,
+                3,
+                4
+              ],
+              "q_len": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                8
+              ],
+              "retain_kv_l2": [
+                0,
+                1
+              ]
+            }
+          }
+        },
+        "source_package_file_count": 30,
+        "source_package_sha256": "b702f0173a3d49274b60db3cc649f475f78d40c465c05301d888d122f6624624"
+      },
+      "selection_key": "causal_seqlens_kv_global"
+    }
+  },
+  "architectures": [
+    "sm_100a",
+    "sm_103a"
+  ],
+  "artifacts": {
+    "bindings/cake_fmha_compat_v1_binding.cu": {
+      "bytes": 6754,
+      "sha256": "5d46b6f3d55019fe9f3db896b7d26ddb6cc005bc6561d698cce7b166265690f9"
+    },
+    "bindings/cake_fmha_context_bf16_binding.cu": {
+      "bytes": 2706,
+      "sha256": "4067cb0dfa0e3072406a7227abca8837b5c940d7d4ebe8b369120347842f2877"
+    },
+    "bindings/cake_fmha_context_fp16_hd256_binding.cu": {
+      "bytes": 2298,
+      "sha256": "45831414fb8b03cc675a997b51b0d6ea7a4931a62903282d60f3089e0ae71945"
+    },
+    "bindings/cake_fmha_context_fp8_binding.cu": {
+      "bytes": 2805,
+      "sha256": "63f555accb96dc249cf4a4363c9aacacfc1e1265d9de02d01010b3a376971921"
+    },
+    "bindings/cake_fmha_context_fp8_hd256_binding.cu": {
+      "bytes": 2413,
+      "sha256": "9c3e587ea480e8150589f1e41ac0fc98fb6e23f15e563c49949e48a6020685cb"
+    },
+    "bindings/cake_fmha_context_nvfp4_binding.cu": {
+      "bytes": 3077,
+      "sha256": "43fc1d963f7fc1904920ad935384aa74a94663933d5671a7d22472c2f8c48d9c"
+    },
+    "bindings/cake_fmha_dcp_spec_bf16_binding.cu": {
+      "bytes": 2532,
+      "sha256": "48472f3684b0b307094f734e2d07970185d35e09d4e876c09fe90770fcd5acc6"
+    },
+    "bindings/cake_fmha_dcp_spec_bf16_fp8_binding.cu": {
+      "bytes": 3170,
+      "sha256": "9f4366bae2304215b57551cddb85186ddcb21286ab056daa6d20122835d0ff9d"
+    },
+    "bindings/cake_fmha_dcp_spec_bf16_v4_binding.cu": {
+      "bytes": 2937,
+      "sha256": "67d4ad3e1ceb1f8d5b91aba130e756f0dfb236f91b53d5f62b6d11a3a51f070f"
+    },
+    "bindings/cake_fmha_decode_native_bf16_b4_exact_cga_binding.cu": {
+      "bytes": 3224,
+      "sha256": "d09d25e1062b4bb4baee9ac352c02465aa277a48cdc80bd01b6635a6c4441d37"
+    },
+    "bindings/cake_fmha_decode_native_bf16_binding.cu": {
+      "bytes": 2799,
+      "sha256": "146f21656b704383a205b04c7da6d4165e5b8c1101d0228a63af49e26c62d2fc"
+    },
+    "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_100a_binding.cu": {
+      "bytes": 3393,
+      "sha256": "2410ae1852da176d610b2f8d6cb29394f8355511b97d1a8fb0ae51a70e554b8c"
+    },
+    "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_103a_binding.cu": {
+      "bytes": 3393,
+      "sha256": "78f5918ee5dd89bb00be61677625c868db10754405184b640f9c5a934c4d4741"
+    },
+    "bindings/cake_fmha_decode_native_fp16_hd512_binding.cu": {
+      "bytes": 2699,
+      "sha256": "13c8dca732d386c35292aca6e9f0ee6a1419c857b8ba6af2c2a1bd642b0397f1"
+    },
+    "bindings/cake_fmha_decode_native_fp16_nhd_binding.cu": {
+      "bytes": 2801,
+      "sha256": "a1e7ad7b3d27699c15d5882e7f1ccafb54fc8cba2aab6f2760bf9a1f6dea8420"
+    },
+    "bindings/cake_fmha_decode_quant_bf16q_binding.cu": {
+      "bytes": 2726,
+      "sha256": "8aae32ba5ee38410b96c472752a9466a5fb159fea3d5b2b471a5bdc0f2f92431"
+    },
+    "bindings/cake_fmha_decode_quant_fp8_binding.cu": {
+      "bytes": 2727,
+      "sha256": "643825cf495f5d83ef57dd71d8ec80ff66f0b755db232b66209d7adc21d100f4"
+    },
+    "bindings/cake_fmha_decode_quant_fp8_reduce_binding.cu": {
+      "bytes": 1556,
+      "sha256": "3aa08a8f113939f095693e6fa4c15cc388f7f4f04e53797ace921db0b2a561d9"
+    },
+    "bindings/cake_fmha_decode_quant_nvfp4_binding.cu": {
+      "bytes": 2997,
+      "sha256": "8b2efef24ac88e4c37004ef0a2c9196b38037c38794a5c74d39052c3516b7c56"
+    },
+    "cuda/compat_v1/cake_fmha_compat_v1.cu": {
+      "bytes": 11341,
+      "sha256": "e7e44abcd26b483e202cb1113f51af8025f04340682a7d109b59db3881d34a6f"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle1_num_m_blocks11_num_q_heads10_pack_g5_page_size32_return_lse0_single_mask_loop1_tok_per_stage25.cu": {
+      "bytes": 161013,
+      "sha256": "1b2765ff55a14d6b1dd18025ae254231709186d8b9685ee0fc8a9aaaae20b44b"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle8_num_m_blocks6_num_q_heads10_pack_g5_page_size1024_return_lse0_single_mask_loop1_tok_per_stage25.cu": {
+      "bytes": 161014,
+      "sha256": "585026cb59a9eb9eedafda7e55f6a04bb502455bc0e092faa7b9f472651265d2"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink0_is_causal0_return_lse0.cu": {
+      "bytes": 160809,
+      "sha256": "e0da7886279bf91feb63ae68edc86abad9a743e72ee45cd77953be8edc4036cc"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink0_is_causal0_return_lse1.cu": {
+      "bytes": 161345,
+      "sha256": "457b3126387b4daff12a0e3077588fb2db15598380418c8805a39207afdb8e0a"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink0_is_causal1_return_lse0.cu": {
+      "bytes": 165088,
+      "sha256": "7a5f556649f32d95a660c34000fe7466badce81fa993e4b7153804262fdd49d6"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink0_is_causal1_return_lse1.cu": {
+      "bytes": 165624,
+      "sha256": "c7ae33b4590de7b979cdccbbd15ee52f6e2b76b372896b9cabd5f9e97867d23e"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink1_is_causal0_return_lse0.cu": {
+      "bytes": 161208,
+      "sha256": "7be79db3dc39dec27a95619c8c666b3c8392f48247898b4c3d08339c23f30deb"
+    },
+    "cuda/context_bf16/sm_100a/enable_sink1_is_causal1_return_lse0.cu": {
+      "bytes": 165487,
+      "sha256": "3433ffc020e1004afa567cd95e66b2c7d3c86b9ffcb9674bb562b3a14043317f"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle1_num_m_blocks11_num_q_heads10_pack_g5_page_size32_return_lse0_single_mask_loop1_tok_per_stage25.cu": {
+      "bytes": 158875,
+      "sha256": "7fb98ffea037ecb3e7692c4550eb44534bfd881fe10950c4b760f5200f047fbb"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle8_num_m_blocks6_num_q_heads10_pack_g5_page_size1024_return_lse0_single_mask_loop1_tok_per_stage25.cu": {
+      "bytes": 157978,
+      "sha256": "fd53827ae2c02dd07fddd6e052a5db2fb087d831429003d7fd2cac46b1b06d76"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink0_is_causal0_return_lse0.cu": {
+      "bytes": 157592,
+      "sha256": "56c1d3f5f0c8e03c5c71a412f4311d26f3c5cf2c89843fa185cde1f0a875c2fd"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink0_is_causal0_return_lse1.cu": {
+      "bytes": 158128,
+      "sha256": "2ecca610c0960bcb8e9f362ebce3a5bd9cd961cffc442f545cb53084f27d692d"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink0_is_causal1_return_lse0.cu": {
+      "bytes": 161871,
+      "sha256": "c794027b3512787554a1b5b1f9bf4e6ee40ba884a4cdb1ab5c942b533535eecc"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink0_is_causal1_return_lse1.cu": {
+      "bytes": 162407,
+      "sha256": "654cbaf8e4bc0a9a9dbd50ee87904dcc57e37bbecc29ca29a9c1ae50616f8208"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink1_is_causal0_return_lse0.cu": {
+      "bytes": 157991,
+      "sha256": "a62149694a9a83482fb9479700936b82589a373605fa6ad0b91fc8724826b028"
+    },
+    "cuda/context_bf16/sm_103a/enable_sink1_is_causal1_return_lse0.cu": {
+      "bytes": 162270,
+      "sha256": "c59e28e95f18df09cbb546f9f2e5e0709d08b5d1beae6b9afad9df8a7ae7ee2a"
+    },
+    "cuda/context_fp16_hd256/is_causal0.cu": {
+      "bytes": 175081,
+      "sha256": "2c435247fc40a03fd2b93289e40e5d07fd85deacc80da20178e8d3635475fb39"
+    },
+    "cuda/context_fp8/enable_sink0_is_causal0_return_lse0.cu": {
+      "bytes": 199730,
+      "sha256": "d7cdaf4f01dfe13ced4006e6a2baa4a8e463beaa6b679c158215c923e2a60af5"
+    },
+    "cuda/context_fp8/enable_sink0_is_causal0_return_lse1.cu": {
+      "bytes": 200279,
+      "sha256": "0c5ded9293651e3f8d3f3c299b9fa764af30a0e2dd8d66143c45aea112203d87"
+    },
+    "cuda/context_fp8/enable_sink0_is_causal1_return_lse0.cu": {
+      "bytes": 204009,
+      "sha256": "50d6eb66c222a7da4114cd0ffba9201f2c9256997de6cc147293027369a722a7"
+    },
+    "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu": {
+      "bytes": 204558,
+      "sha256": "571d7d0b2be4fecdaf2bcfaa4c55e73f26475ef28ef12b0e1d83627630cc6998"
+    },
+    "cuda/context_fp8/enable_sink1_is_causal0_return_lse0.cu": {
+      "bytes": 200129,
+      "sha256": "c4947470f24bdecda4fbf1d98257d08dc168705ed911305540d866794d4d0707"
+    },
+    "cuda/context_fp8/enable_sink1_is_causal0_return_lse1.cu": {
+      "bytes": 200678,
+      "sha256": "33dd5aab795eecd6d45bd7975e538604250f84897e0da72adafd75d2b5d74833"
+    },
+    "cuda/context_fp8/enable_sink1_is_causal1_return_lse0.cu": {
+      "bytes": 204408,
+      "sha256": "c262eac64c030f74a958dc7b32a77e47b575ed7e36acaf0da6cdb74f1e5a70d4"
+    },
+    "cuda/context_fp8/enable_sink1_is_causal1_return_lse1.cu": {
+      "bytes": 204957,
+      "sha256": "a3a42907eee5a19483f55b298ff0b19b5f9783187f8138eba37ee1acfe1ffb48"
+    },
+    "cuda/context_fp8_hd256/is_causal1_output_bf161.cu": {
+      "bytes": 198185,
+      "sha256": "e1478be2e959e38a947b82e3d04acd7390f61afb3ed447249fb312a01c097f8d"
+    },
+    "cuda/context_hd256_support/cake_fmha_hd256_support.cu": {
+      "bytes": 11013,
+      "sha256": "fa57bb2345968da4f635cd50ea0313258a11f89d3cfe345b13198c23eca4320a"
+    },
+    "cuda/context_nvfp4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu": {
+      "bytes": 234748,
+      "sha256": "7a0f4c5c587f2ca4fa3e9272cdcd9e0d39777bc0f6763feba45cd4d84a628723"
+    },
+    "cuda/context_nvfp4/native_qmul4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu": {
+      "bytes": 238377,
+      "sha256": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu": {
+      "bytes": 116857,
+      "sha256": "268d2a6888d25de5d4f3c39d4849981a44e98c1ee91f93ec6edc1dc69f970c02"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l21.cu": {
+      "bytes": 117980,
+      "sha256": "5fbe5225af33014ca0c0a1b5416674be1fc91ab6ee6180180f127f03197e8fbb"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split2_retain_kv_l20.cu": {
+      "bytes": 124798,
+      "sha256": "5858e0e4299c9aba89fd86142dff37c2711d11ca671af2fb0841ea2d11a3423d"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split2_retain_kv_l21.cu": {
+      "bytes": 125921,
+      "sha256": "8494e9b4f90919e87cea5b1a751b6fd3eda26ff669d3f92782c88579282c82f2"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split3_retain_kv_l20.cu": {
+      "bytes": 125971,
+      "sha256": "cc3b671eaee3e5d356abb19ca9775a18de29a16089431755d332d5649a5b964a"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split3_retain_kv_l21.cu": {
+      "bytes": 127094,
+      "sha256": "e6601c554de8614cd525b2707dfd7e7f45db2b493bb3130f451166c5b56faa50"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l20.cu": {
+      "bytes": 125971,
+      "sha256": "f5f82d9c12caa4f48a8b3d0372f139974d1f969dbc06ba167e2a539dbc029659"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l21.cu": {
+      "bytes": 127094,
+      "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu": {
+      "bytes": 95503,
+      "sha256": "a482028a7caca598fedd1fbdce1c9a7eaaff63ca816535a6efb6643f58a44cce"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l21.cu": {
+      "bytes": 97803,
+      "sha256": "53d5d789014c439a6c41ce406f153a286da1f72da529d650c5da55d51e6de203"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split10.cu": {
+      "bytes": 111061,
+      "sha256": "611d34c0103a69cf9e716f1f8031247625b0fff95a449171567050ff9538a84f"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split11.cu": {
+      "bytes": 111061,
+      "sha256": "2f3fbd12ab9becbcca74573f35a8b80979ff5d50ca40dcbb1ac5f7abb0fe835b"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split12.cu": {
+      "bytes": 111061,
+      "sha256": "866bd374b3b0f126bc80f72959831f594b085e4528ef4e0326c0d64e85d7e65a"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split13.cu": {
+      "bytes": 111061,
+      "sha256": "09416e6a87788e593ce44be7eb45ffa8f1ca54c045a82cd899726a40e783329d"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split14.cu": {
+      "bytes": 111061,
+      "sha256": "b9fdbb2efb6683b90c29b9c9b1571a8c1b146f747410ba272f3f76fad4b430ad"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split15.cu": {
+      "bytes": 111061,
+      "sha256": "ab721f8755e3637f798a5f01b0086af43085a5d3ae89deda8167a4dbc17a8010"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split16.cu": {
+      "bytes": 111061,
+      "sha256": "9b38951ccc82cb12992e6fd10dd5e123a95d54388df43726bc1158e02f2f4fd8"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split2.cu": {
+      "bytes": 109943,
+      "sha256": "54c9ee09214520880631f6f5f2ce109941ed82cc23970126073f82cc2b377f5a"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split3.cu": {
+      "bytes": 111060,
+      "sha256": "979467b489ae74e16411da60f5e172876170367aabfa8623b17f1d737fc6bf23"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split4.cu": {
+      "bytes": 111060,
+      "sha256": "4b5729c1b24f90024b273805ca808d4cf4615f316651f6ef2b6581c11dd1c6e9"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split5.cu": {
+      "bytes": 111060,
+      "sha256": "1b708b1bc98749d5d5a7aaaee1b0049cff7febc9d7503a4758f520ecbca87dee"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split6.cu": {
+      "bytes": 111060,
+      "sha256": "efe7d4df0ff2cace1153e71abcaea02bb1cbcdbe476d5b6e96c9901fad8298f0"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split7.cu": {
+      "bytes": 111060,
+      "sha256": "04b7a61eb5dd7947680040c25dd69f11ffb626a668b20320d153ed7a9380eb11"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split8.cu": {
+      "bytes": 111060,
+      "sha256": "8dbdc887862b9bf5c85ebdf14a3b652c62cb0788fe60935a7222f6778c4fe78d"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_v4/num_split9.cu": {
+      "bytes": 111060,
+      "sha256": "026fb02787b8dbaa1552278248e836acadc3d1023858d7794480b6af4c6ae53c"
+    },
+    "cuda/decode_native_bf16/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 101897,
+      "sha256": "e657b8176852850c0f5c5afac655ad3ea670f55034018afe41e782cf8a2e9718"
+    },
+    "cuda/decode_native_bf16/batch_size4_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 112498,
+      "sha256": "131772c4fc55932ecb3c3a51aa60abf45b604824be5297c9eb2c1037faf87222"
+    },
+    "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 102633,
+      "sha256": "85aef2ab82dcea182e3e6e8ab3a0abc1003bf942919d2c76038f301c8c1e1e8c"
+    },
+    "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 102785,
+      "sha256": "43b6e5320ecd06c262b447c6af03b71d9dc51fe59a5dad23e4138a1e508bc7e0"
+    },
+    "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 105657,
+      "sha256": "7f12640f113fabb26ab9171fdf8fa10b784b9d7b209978c344f20062751b934c"
+    },
+    "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 105809,
+      "sha256": "c57643e67420d7775954e6757f87c4dd247fcf7ae4da5cbffd655e94c704f2d6"
+    },
+    "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 105190,
+      "sha256": "c72754dbc033a17248422bcf71f4ffe34a2bd165198e14997c8395a52da987fa"
+    },
+    "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 108214,
+      "sha256": "fe298e7a174a46ed869ad1f67e866d979b9c2f48d52213d3106e533bc765e3d9"
+    },
+    "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 103719,
+      "sha256": "665e014e8040ee0990a0fe7d3dc431986a98d1281861ca1bc67012de14d19bb7"
+    },
+    "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 106591,
+      "sha256": "207ec46df37dd8253890a1160ce39165508448af7e8ded99c49fe8f7aff3f538"
+    },
+    "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 106743,
+      "sha256": "6d4038eedb838bc701f1c10b1a514e1cde07c92c27a1f1f19604899dfc6e5f1a"
+    },
+    "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 106124,
+      "sha256": "cdbc683dee670e1a7664a2afa126cbd2e72fde8005ce674f13d7717afcbbd6c2"
+    },
+    "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 109148,
+      "sha256": "7ba8f2b0d38b83b08ab9afa11f3fe0c262bcd4a5d1d5eb5f10a05c50c30fcd82"
+    },
+    "cuda/decode_native_bf16/sm_100a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 102049,
+      "sha256": "fd8135704bb9a9db94298040ac8002ad9e331ef87a977927bf4329ee863cd6fb"
+    },
+    "cuda/decode_native_bf16/sm_100a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 112348,
+      "sha256": "c053d42e7a374d6e6c40d896be7c75e344507b0dc7fb5337f6ab01ead21981da"
+    },
+    "cuda/decode_native_bf16/sm_100a/batch_size256_has_sink1_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 149297,
+      "sha256": "624ef77edbbac4c50af4107eecda242c16027eb89952762bea0167064f11d038"
+    },
+    "cuda/decode_native_bf16/sm_103a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 109476,
+      "sha256": "646b6515bc7eaf3567f4d3a3ffad268ea955457bd7ded47ba756fddc0aefbba3"
+    },
+    "cuda/decode_native_bf16/sm_103a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 135884,
+      "sha256": "806291f638ce176d938862ab2e4f91d1a59100096476be9ab28053c8f4f10332"
+    },
+    "cuda/decode_native_bf16/sm_103a/batch_size256_has_sink1_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 149404,
+      "sha256": "84f1be6fd2eea536358c014b8721885c2d5a58b66e97d4088eb26198ad6ba20b"
+    },
+    "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 204916,
+      "sha256": "7d1dc07aeef4903ddcdc8d578a2b14f3bac0081c083a1b0f948aeb7fc34c3338"
+    },
+    "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 205068,
+      "sha256": "bdf50252377c1abf831518effc0934a63178fef8ca5c1d8c73004c499d691107"
+    },
+    "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 227060,
+      "sha256": "56a45f89585f737f465df91e19427008987460daeee86d7ee853043f4adb6acf"
+    },
+    "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 227212,
+      "sha256": "53cdaa48d42154a26531976ecf72c67d8f94ffab86d3ff8e08ad784a14a271fa"
+    },
+    "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 207473,
+      "sha256": "d1b3dec1ed8520e0e31a57e71191c6bfc9844ae9268ba80e423535dd1c69230e"
+    },
+    "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 207625,
+      "sha256": "e2fc382b906e3e981cd6304b04623d99140273ff305d107463115153ae33ac37"
+    },
+    "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 229617,
+      "sha256": "0536cf17507f45ee025c4ca1edd853134315fd6bfc525d6eb1cf996833453732"
+    },
+    "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 229769,
+      "sha256": "0ecd65b43c4ccc3453417e172e182a97af79f71f19f1202e4f43e8ddd9afaf43"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 102905,
+      "sha256": "13cf2ab738d4f5662a458d1a9a53eecaab1a699e2582462644f689a843011e29"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 103057,
+      "sha256": "9ca9bc26109607ae20efea4e561dff4fc1d1ff1de8daf08af5dafdfc3a46f3b5"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 105929,
+      "sha256": "a16169776c487c5ecb19352473f888a20599da12e363e1159120ca3db6fe1683"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 106081,
+      "sha256": "7659aca9b75c3463eacbe2995cf1b3e7fc858217d8776533027b02651a9c2678"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 105462,
+      "sha256": "cb57f72dc1cfda24303dfc62e13338592308f8948ba69ffa6c9bd7def45e2bc0"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 105614,
+      "sha256": "197b73353ed9a5fb5068c15afca87f287c4f89c1e7dbe1ce64c367bfc9959835"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 108486,
+      "sha256": "b03da904196fb22d48bb3fc1e03f3f247a1cd521edd850d97286bbec9d928925"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 108638,
+      "sha256": "d23fa6c258c22bfce6f37ed01e3acc21dcb3aa4470b568d0d6322e7498ca5aa3"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 103839,
+      "sha256": "c95e87c12f9f96425f2376bb9a3d1d8074258e1e46fcc60d68e85e5f8923d82f"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 103991,
+      "sha256": "d32967a26a78a728b2f4939bc29c448ddf321f641fdc99d6dd040ab20e1d247b"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 106863,
+      "sha256": "80e6423ecf39c5f1c86998c191f5111081359c327e0987c2d746f265f9c758e8"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 107015,
+      "sha256": "2e8b560c2ce45bdba1c260ad6713fd0bc411e15e143c63566438ce6044d0209b"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu": {
+      "bytes": 106396,
+      "sha256": "22fd5d6fae3f4ba8ac7153a52d8f9e8e8f72ee4c923b68c7555fcce9c2655d2a"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu": {
+      "bytes": 106548,
+      "sha256": "11aee365e7353d0bca8c548c3bbfbc642b41dbf984320d9d318d918b7c886b7b"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu": {
+      "bytes": 109420,
+      "sha256": "b36de8622d0534356eaec221a5bb56bd96f3857b986cb892b5aba8d54396ff90"
+    },
+    "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu": {
+      "bytes": 109572,
+      "sha256": "2c1180cb9d57e711e538744d1fad9d9086620421245a897e2d116b25485c935f"
+    },
+    "cuda/decode_quant_bf16q/page_size16.cu": {
+      "bytes": 137507,
+      "sha256": "67300980d52804f1a2b98cb1c129df391fca90cd10936e67b4cdc732df455e2c"
+    },
+    "cuda/decode_quant_bf16q/page_size32.cu": {
+      "bytes": 136139,
+      "sha256": "c246e2f908e67bd7344553d9834cbc9f2880445c4af1350b0b511ebe3a91ef8d"
+    },
+    "cuda/decode_quant_bf16q/page_size64.cu": {
+      "bytes": 136139,
+      "sha256": "95f5097af777c40b4a14b0c6d3a798c484c9361f743cc8d29025e7602efee3e2"
+    },
+    "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size16.cu": {
+      "bytes": 131110,
+      "sha256": "2b8a683ba646083057c34dcbe154c29e8b6edd320094d1a8e46bcdaed6034715"
+    },
+    "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size32.cu": {
+      "bytes": 129813,
+      "sha256": "38ee9b4bdd301dbfa48c2a839d91be0920632652521afa05a9f384573dfdfd99"
+    },
+    "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size64.cu": {
+      "bytes": 129813,
+      "sha256": "b5122194482873ac18a957ac6ac88c081de971de9eb0e66e7c8efda79d38ff25"
+    },
+    "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size16.cu": {
+      "bytes": 129826,
+      "sha256": "7de90a48d99b62fa05ff7f956bfaa2c286519bd45db42f7b9330657859788c4c"
+    },
+    "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size32.cu": {
+      "bytes": 128529,
+      "sha256": "20bdb4c768dbe5056de1bfdfb836ad8bee1ff70c72d3b18065938d3fde9e9536"
+    },
+    "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size64.cu": {
+      "bytes": 128529,
+      "sha256": "ab687ed6cb1de2fae1006c42d77acb109c22da5c61f908eb6f57cd540917b580"
+    },
+    "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size16.cu": {
+      "bytes": 143923,
+      "sha256": "73b015425d978440c6acd191ce6f08b691a0cf24775d4a354b569314ddf84cfd"
+    },
+    "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size32.cu": {
+      "bytes": 142626,
+      "sha256": "dc8878320910a3c02a005b1f8bfb2840a2b00927ebc132afdde88beaa04f8b8a"
+    },
+    "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size64.cu": {
+      "bytes": 142626,
+      "sha256": "1e79e83b5a6505464c805289a727617a9115ad66385c4d2aad2c9e9b3620cc8f"
+    },
+    "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size16.cu": {
+      "bytes": 142639,
+      "sha256": "5c528f0d1c25748d3b16915acfa623a18af9d658dc36aa888da2feea165bb405"
+    },
+    "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size32.cu": {
+      "bytes": 141342,
+      "sha256": "613918ca0ee45e3eb96eb980beb384e28ab537b08779ab39bb4b3f54d80bca2f"
+    },
+    "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size64.cu": {
+      "bytes": 141342,
+      "sha256": "0a4ce4814b3f5df52eed564a330523a218293072ce00e0aa4291fe409bd45c00"
+    },
+    "cuda/decode_quant_fp8_reduce/default.cu": {
+      "bytes": 5416,
+      "sha256": "cad2197dfea1a64cc74dc10cbb3e3453555ade043d17fd4265543c29daf7184c"
+    },
+    "cuda/decode_quant_nvfp4/native_qmul4/page_size16.cu": {
+      "bytes": 132353,
+      "sha256": "4196ba81ccf4dd02395bb366c6bb52dff5c60afc2d8d70a1fa0d7ec6f6c8b0e7"
+    },
+    "cuda/decode_quant_nvfp4/native_qmul4/page_size32.cu": {
+      "bytes": 131904,
+      "sha256": "1abe8ef05e2cd4d72202e9b4d2d04156923b49adb292ce7a184ce3479e0c8ce5"
+    },
+    "cuda/decode_quant_nvfp4/native_qmul4/page_size64.cu": {
+      "bytes": 131904,
+      "sha256": "81f5b7aecf2da4273ede36b35985f91182741bbcdf0cff71d013205b731624af"
+    },
+    "cuda/decode_quant_nvfp4/page_size16.cu": {
+      "bytes": 131602,
+      "sha256": "358d94c1f9f1abe52fe91d819d44d8e27c7ba8b1107b2bad7d5c3adcc1f5f80d"
+    },
+    "cuda/decode_quant_nvfp4/page_size32.cu": {
+      "bytes": 131153,
+      "sha256": "a7ce444b76bb23f3cf1a5c8a1e28b215b3a849e8fb0c513490e5da03dd6facfa"
+    },
+    "cuda/decode_quant_nvfp4/page_size64.cu": {
+      "bytes": 131153,
+      "sha256": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72"
+    },
+    "include/cake_fmha.h": {
+      "bytes": 9918,
+      "sha256": "e3f2ad83416ad5f310a56e6b16a35c1506173b9f85d0ca40c3f6f27d7beac955"
+    },
+    "include/cake_fmha_hd256_support.h": {
+      "bytes": 1964,
+      "sha256": "e10d3a3be5780df920dba990cca503065d095845259828c4accfe3e5ccb61692"
+    },
+    "runtime/__init__.py": {
+      "bytes": 145,
+      "sha256": "eb14046099958a747438e49fd4e927e6b082201391695b21106ded802dc5e24e"
+    },
+    "runtime/cake_fmha_qmul4.py": {
+      "bytes": 6848,
+      "sha256": "335c456d48c400fc29a5c223528fd138d667027478bc9cee899c42c5d5d3f2d1"
+    }
+  },
+  "capability": {
+    "audit_skipped": false,
+    "cake_coverage_ratio": 1.0,
+    "cake_covered_cases": 57280,
+    "complete": true,
+    "flashinfer_revision": "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b",
+    "gap_counts": {},
+    "raw_cases": 80768,
+    "route_counts": {
+      "cake_fmha_compat_v1": 55482,
+      "ctx_bf16_hnd_hd128_hgpack_03df_v2": 640,
+      "ctx_fp16_nhd_hd256_stage16_v1": 40,
+      "ctx_fp8_bf16_nhd_hd256_stage16_v1": 40,
+      "ctx_fp8_hnd_hd128_hgpack_48b5_v1": 640,
+      "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": 6,
+      "decode_native_bf16_v1_bece": 120,
+      "decode_native_fp16_nhd_v1_f32d": 240,
+      "decode_quantized_bf16q_9d8b_v1": 48,
+      "decode_quantized_nvfp4_8e5b_v1": 24
+    },
+    "upstream_valid_cases": 57280
+  },
+  "components": {
+    "compat_v1": {
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "binding_sha256": "5d46b6f3d55019fe9f3db896b7d26ddb6cc005bc6561d698cce7b166265690f9",
+      "binding_source": "bindings/cake_fmha_compat_v1_binding.cu",
+      "dynamic_shared_memory_bytes": 0,
+      "kind": "static_cuda_compatibility",
+      "launch_binding": "cake_fmha_launch_compat_v1",
+      "minimum_arch": "sm_80",
+      "parameters": [
+        {
+          "ctype": "const void*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const void*",
+          "kind": "pointer",
+          "name": "k"
+        },
+        {
+          "ctype": "const void*",
+          "kind": "pointer",
+          "name": "v"
+        },
+        {
+          "ctype": "const void*",
+          "kind": "pointer",
+          "name": "k_scales"
+        },
+        {
+          "ctype": "const void*",
+          "kind": "pointer",
+          "name": "v_scales"
+        },
+        {
+          "ctype": "void*",
+          "kind": "pointer",
+          "name": "o"
+        },
+        {
+          "ctype": "void*",
+          "kind": "pointer",
+          "name": "o_scales"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "lse"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "page_table_k"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "page_table_v"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "q_indptr"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "const float*",
+          "kind": "pointer",
+          "name": "sinks"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "head_dim"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "page_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "kv_layout"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_dtype"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "kv_dtype"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "o_dtype"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "causal"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "window_left"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "enable_sink"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "return_lse"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "q_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "k_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "v_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "o_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "sm_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "o_sf_scale"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "o_sf_start"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "o_sf_columns"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "q_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "q_s1"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "k_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "k_s1"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "k_s2"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "k_s3"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "v_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "v_s1"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "v_s2"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "v_s3"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "ksf_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "ksf_s1"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "ksf_s2"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "ksf_s3"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "vsf_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "vsf_s1"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "vsf_s2"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "vsf_s3"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "table_k_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "table_v_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "o_s0"
+        },
+        {
+          "ctype": "long long",
+          "kind": "value",
+          "name": "o_s1"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_compat_v1",
+      "role": "complete valid-domain correctness fallback after optimized routes",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "e7e44abcd26b483e202cb1113f51af8025f04340682a7d109b59db3881d34a6f",
+            "sm_103a": "e7e44abcd26b483e202cb1113f51af8025f04340682a7d109b59db3881d34a6f"
+          },
+          "sources": {
+            "sm_100a": "cuda/compat_v1/cake_fmha_compat_v1.cu",
+            "sm_103a": "cuda/compat_v1/cake_fmha_compat_v1.cu"
+          }
+        }
+      ],
+      "threads": 256
+    },
+    "context_bf16": {
+      "binding_sha256": "4067cb0dfa0e3072406a7227abca8837b5c940d7d4ebe8b369120347842f2877",
+      "binding_source": "bindings/cake_fmha_context_bf16_binding.cu",
+      "dynamic_shared_memory_bytes": 168448,
+      "launch_binding": "cake_fmha_launch_context_bf16",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "LSE_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "sinks"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table_k"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table_v"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_q"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "cu_seq_lens_q"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "total_bh"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "page_row_stride"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_ctas"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "dynamic_counter"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "ceil(max_q_len / (2 * TOK_PER_STAGE))",
+          "defaults": {
+            "NUM_M_BLOCKS": 2
+          },
+          "macros": [
+            "NUM_M_BLOCKS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer dividing NUM_Q_HEADS",
+          "defaults": {
+            "HEADS_PER_GROUP": 4
+          },
+          "macros": [
+            "HEADS_PER_GROUP"
+          ]
+        },
+        {
+          "constraint": "TOK_PER_STAGE == 128 // PACK_G and PACK_G divides NUM_Q_HEADS",
+          "defaults": {
+            "PACK_G": 1,
+            "TOK_PER_STAGE": 128
+          },
+          "macros": [
+            "PACK_G",
+            "TOK_PER_STAGE"
+          ]
+        },
+        {
+          "constraint": "1 or 8",
+          "defaults": {
+            "L2_SWIZZLE": 8
+          },
+          "macros": [
+            "L2_SWIZZLE"
+          ]
+        },
+        {
+          "constraint": "one of 16,32,64,128,256,512,1024",
+          "defaults": {
+            "PAGE_SIZE": 16
+          },
+          "macros": [
+            "PAGE_SIZE"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_context_bf16",
+      "source_family": [
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "e0da7886279bf91feb63ae68edc86abad9a743e72ee45cd77953be8edc4036cc",
+            "sm_103a": "56c1d3f5f0c8e03c5c71a412f4311d26f3c5cf2c89843fa185cde1f0a875c2fd"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal0_return_lse0.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal0_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 1,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "7be79db3dc39dec27a95619c8c666b3c8392f48247898b4c3d08339c23f30deb",
+            "sm_103a": "a62149694a9a83482fb9479700936b82589a373605fa6ad0b91fc8724826b028"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink1_is_causal0_return_lse0.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink1_is_causal0_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 1
+          },
+          "sha256": {
+            "sm_100a": "457b3126387b4daff12a0e3077588fb2db15598380418c8805a39207afdb8e0a",
+            "sm_103a": "2ecca610c0960bcb8e9f362ebce3a5bd9cd961cffc442f545cb53084f27d692d"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal0_return_lse1.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal0_return_lse1.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "7a5f556649f32d95a660c34000fe7466badce81fa993e4b7153804262fdd49d6",
+            "sm_103a": "c794027b3512787554a1b5b1f9bf4e6ee40ba884a4cdb1ab5c942b533535eecc"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal1_return_lse0.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal1_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 1,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "3433ffc020e1004afa567cd95e66b2c7d3c86b9ffcb9674bb562b3a14043317f",
+            "sm_103a": "c59e28e95f18df09cbb546f9f2e5e0709d08b5d1beae6b9afad9df8a7ae7ee2a"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink1_is_causal1_return_lse0.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink1_is_causal1_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 1
+          },
+          "sha256": {
+            "sm_100a": "c7ae33b4590de7b979cdccbbd15ee52f6e2b76b372896b9cabd5f9e97867d23e",
+            "sm_103a": "654cbaf8e4bc0a9a9dbd50ee87904dcc57e37bbecc29ca29a9c1ae50616f8208"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_is_causal1_return_lse1.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_is_causal1_return_lse1.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "HEADS_PER_GROUP": 5,
+            "IS_CAUSAL": 1,
+            "L2_SWIZZLE": 1,
+            "NUM_M_BLOCKS": 11,
+            "NUM_Q_HEADS": 10,
+            "PACK_G": 5,
+            "PAGE_SIZE": 32,
+            "RETURN_LSE": 0,
+            "SINGLE_MASK_LOOP": 1,
+            "TOK_PER_STAGE": 25
+          },
+          "sha256": {
+            "sm_100a": "1b2765ff55a14d6b1dd18025ae254231709186d8b9685ee0fc8a9aaaae20b44b",
+            "sm_103a": "7fb98ffea037ecb3e7692c4550eb44534bfd881fe10950c4b760f5200f047fbb"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle1_num_m_blocks11_num_q_heads10_pack_g5_page_size32_return_lse0_single_mask_loop1_tok_per_stage25.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle1_num_m_blocks11_num_q_heads10_pack_g5_page_size32_return_lse0_single_mask_loop1_tok_per_stage25.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "HEADS_PER_GROUP": 5,
+            "IS_CAUSAL": 1,
+            "L2_SWIZZLE": 8,
+            "NUM_M_BLOCKS": 6,
+            "NUM_Q_HEADS": 10,
+            "PACK_G": 5,
+            "PAGE_SIZE": 1024,
+            "RETURN_LSE": 0,
+            "SINGLE_MASK_LOOP": 1,
+            "TOK_PER_STAGE": 25
+          },
+          "sha256": {
+            "sm_100a": "585026cb59a9eb9eedafda7e55f6a04bb502455bc0e092faa7b9f472651265d2",
+            "sm_103a": "fd53827ae2c02dd07fddd6e052a5db2fb087d831429003d7fd2cac46b1b06d76"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_bf16/sm_100a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle8_num_m_blocks6_num_q_heads10_pack_g5_page_size1024_return_lse0_single_mask_loop1_tok_per_stage25.cu",
+            "sm_103a": "cuda/context_bf16/sm_103a/enable_sink0_heads_per_group5_is_causal1_l2_swizzle8_num_m_blocks6_num_q_heads10_pack_g5_page_size1024_return_lse0_single_mask_loop1_tok_per_stage25.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "context_fp16_hd256": {
+      "binding_sha256": "45831414fb8b03cc675a997b51b0d6ea7a4931a62903282d60f3089e0ae71945",
+      "binding_source": "bindings/cake_fmha_context_fp16_hd256_binding.cu",
+      "dynamic_shared_memory_bytes": 200960,
+      "launch_binding": "cake_fmha_launch_context_fp16_hd256",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_q"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "cu_seq_lens_q"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "total_bh"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "dynamic_counter"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "ceil(max_q_len / 128)",
+          "defaults": {
+            "NUM_M_BLOCKS": 1
+          },
+          "macros": [
+            "NUM_M_BLOCKS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "HEADS_PER_GROUP": 5
+          },
+          "macros": [
+            "HEADS_PER_GROUP"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_context_fp16_hd256",
+      "source_family": [
+        {
+          "selector": {
+            "IS_CAUSAL": 0
+          },
+          "sha256": {
+            "sm_100a": "2c435247fc40a03fd2b93289e40e5d07fd85deacc80da20178e8d3635475fb39",
+            "sm_103a": "2c435247fc40a03fd2b93289e40e5d07fd85deacc80da20178e8d3635475fb39"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp16_hd256/is_causal0.cu",
+            "sm_103a": "cuda/context_fp16_hd256/is_causal0.cu"
+          }
+        }
+      ],
+      "threads": 384
+    },
+    "context_fp8": {
+      "binding_sha256": "63f555accb96dc249cf4a4363c9aacacfc1e1265d9de02d01010b3a376971921",
+      "binding_source": "bindings/cake_fmha_context_fp8_binding.cu",
+      "dynamic_shared_memory_bytes": 86528,
+      "launch_binding": "cake_fmha_launch_context_fp8",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "uint8_t*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "LSE_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "sinks"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table_k"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table_v"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_q"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "cu_seq_lens_q"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "output_scale"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "total_bh"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "page_row_stride"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_ctas"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "dynamic_counter"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "ceil(max_q_len / (2 * TOK_PER_STAGE))",
+          "defaults": {
+            "NUM_M_BLOCKS": 2
+          },
+          "macros": [
+            "NUM_M_BLOCKS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer dividing NUM_Q_HEADS",
+          "defaults": {
+            "HEADS_PER_GROUP": 4
+          },
+          "macros": [
+            "HEADS_PER_GROUP"
+          ]
+        },
+        {
+          "constraint": "TOK_PER_STAGE == 128 // PACK_G and PACK_G divides NUM_Q_HEADS",
+          "defaults": {
+            "PACK_G": 1,
+            "TOK_PER_STAGE": 128
+          },
+          "macros": [
+            "PACK_G",
+            "TOK_PER_STAGE"
+          ]
+        },
+        {
+          "constraint": "1 or 8",
+          "defaults": {
+            "L2_SWIZZLE": 8
+          },
+          "macros": [
+            "L2_SWIZZLE"
+          ]
+        },
+        {
+          "constraint": "one of 16,32,64,128,256,512,1024",
+          "defaults": {
+            "PAGE_SIZE": 16
+          },
+          "macros": [
+            "PAGE_SIZE"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_context_fp8",
+      "source_family": [
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "d7cdaf4f01dfe13ced4006e6a2baa4a8e463beaa6b679c158215c923e2a60af5",
+            "sm_103a": "d7cdaf4f01dfe13ced4006e6a2baa4a8e463beaa6b679c158215c923e2a60af5"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse0.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 1,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "c4947470f24bdecda4fbf1d98257d08dc168705ed911305540d866794d4d0707",
+            "sm_103a": "c4947470f24bdecda4fbf1d98257d08dc168705ed911305540d866794d4d0707"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse0.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 1
+          },
+          "sha256": {
+            "sm_100a": "0c5ded9293651e3f8d3f3c299b9fa764af30a0e2dd8d66143c45aea112203d87",
+            "sm_103a": "0c5ded9293651e3f8d3f3c299b9fa764af30a0e2dd8d66143c45aea112203d87"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse1.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal0_return_lse1.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 1,
+            "IS_CAUSAL": 0,
+            "RETURN_LSE": 1
+          },
+          "sha256": {
+            "sm_100a": "33dd5aab795eecd6d45bd7975e538604250f84897e0da72adafd75d2b5d74833",
+            "sm_103a": "33dd5aab795eecd6d45bd7975e538604250f84897e0da72adafd75d2b5d74833"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse1.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse1.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "50d6eb66c222a7da4114cd0ffba9201f2c9256997de6cc147293027369a722a7",
+            "sm_103a": "50d6eb66c222a7da4114cd0ffba9201f2c9256997de6cc147293027369a722a7"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse0.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 1,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 0
+          },
+          "sha256": {
+            "sm_100a": "c262eac64c030f74a958dc7b32a77e47b575ed7e36acaf0da6cdb74f1e5a70d4",
+            "sm_103a": "c262eac64c030f74a958dc7b32a77e47b575ed7e36acaf0da6cdb74f1e5a70d4"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse0.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse0.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 1
+          },
+          "sha256": {
+            "sm_100a": "571d7d0b2be4fecdaf2bcfaa4c55e73f26475ef28ef12b0e1d83627630cc6998",
+            "sm_103a": "571d7d0b2be4fecdaf2bcfaa4c55e73f26475ef28ef12b0e1d83627630cc6998"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu"
+          }
+        },
+        {
+          "selector": {
+            "ENABLE_SINK": 1,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 1
+          },
+          "sha256": {
+            "sm_100a": "a3a42907eee5a19483f55b298ff0b19b5f9783187f8138eba37ee1acfe1ffb48",
+            "sm_103a": "a3a42907eee5a19483f55b298ff0b19b5f9783187f8138eba37ee1acfe1ffb48"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse1.cu",
+            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse1.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "context_fp8_hd256": {
+      "binding_sha256": "9c3e587ea480e8150589f1e41ac0fc98fb6e23f15e563c49949e48a6020685cb",
+      "binding_source": "bindings/cake_fmha_context_fp8_hd256_binding.cu",
+      "dynamic_shared_memory_bytes": 168192,
+      "launch_binding": "cake_fmha_launch_context_fp8_hd256",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "uint8_t*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_q"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "cu_seq_lens_q"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "output_scale"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "total_bh"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "dynamic_counter"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "ceil(max_q_len / 128)",
+          "defaults": {
+            "NUM_M_BLOCKS": 1
+          },
+          "macros": [
+            "NUM_M_BLOCKS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "HEADS_PER_GROUP": 5
+          },
+          "macros": [
+            "HEADS_PER_GROUP"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_context_fp8_hd256",
+      "source_family": [
+        {
+          "selector": {
+            "IS_CAUSAL": 1,
+            "OUTPUT_BF16": 1
+          },
+          "sha256": {
+            "sm_100a": "e1478be2e959e38a947b82e3d04acd7390f61afb3ed447249fb312a01c097f8d",
+            "sm_103a": "e1478be2e959e38a947b82e3d04acd7390f61afb3ed447249fb312a01c097f8d"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_fp8_hd256/is_causal1_output_bf161.cu",
+            "sm_103a": "cuda/context_fp8_hd256/is_causal1_output_bf161.cu"
+          }
+        }
+      ],
+      "threads": 384
+    },
+    "context_hd256_support": {
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "dynamic_shared_memory_bytes": 0,
+      "grid_x": {
+        "prepare_metadata": "ceil(max(batch_size*num_q_heads,batch_size*num_kv_heads*max_micro_pages)/256)",
+        "scatter_o": "ceil(batch_size*num_q_heads*padded_q*head_dim_bytes/256)",
+        "stage_kv": "ceil(batch_size*num_kv_heads*max_micro_pages*16*head_dim_bytes/256)",
+        "stage_q": "ceil(batch_size*num_q_heads*padded_q*head_dim_bytes/256)"
+      },
+      "header": "include/cake_fmha_hd256_support.h",
+      "header_sha256": "e10d3a3be5780df920dba990cca503065d095845259828c4accfe3e5ccb61692",
+      "kind": "static_cuda_support",
+      "launch_bindings": [
+        "cake_fmha_launch_hd256_stage_q",
+        "cake_fmha_launch_hd256_stage_kv",
+        "cake_fmha_launch_hd256_prepare_metadata",
+        "cake_fmha_launch_hd256_scatter_o"
+      ],
+      "operations": [
+        "stage_q",
+        "stage_kv",
+        "prepare_metadata",
+        "scatter_o"
+      ],
+      "public_symbols": [
+        "kernel_cake_fmha_hd256_stage_q",
+        "kernel_cake_fmha_hd256_stage_kv",
+        "kernel_cake_fmha_hd256_prepare_metadata",
+        "kernel_cake_fmha_hd256_scatter_o"
+      ],
+      "source": "cuda/context_hd256_support/cake_fmha_hd256_support.cu",
+      "source_sha256": "fa57bb2345968da4f635cd50ea0313258a11f89d3cfe345b13198c23eca4320a",
+      "threads": 256
+    },
+    "context_nvfp4": {
+      "binding_sha256": "43fc1d963f7fc1904920ad935384aa74a94663933d5671a7d22472c2f8c48d9c",
+      "binding_source": "bindings/cake_fmha_context_nvfp4_binding.cu",
+      "dynamic_shared_memory_bytes": 104960,
+      "launch_binding": "cake_fmha_launch_context_nvfp4",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Kp"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Vp"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Ksf"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Vsf"
+        },
+        {
+          "ctype": "uint8_t*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "LSE_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "sinks"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table_k"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table_v"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_q"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "cu_seq_lens_q"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "output_scale"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "total_bh"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "page_row_stride"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_ctas"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "dynamic_counter"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "ceil(max_q_len / (2 * TOK_PER_STAGE))",
+          "defaults": {
+            "NUM_M_BLOCKS": 2
+          },
+          "macros": [
+            "NUM_M_BLOCKS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer dividing NUM_Q_HEADS",
+          "defaults": {
+            "HEADS_PER_GROUP": 4
+          },
+          "macros": [
+            "HEADS_PER_GROUP"
+          ]
+        },
+        {
+          "constraint": "TOK_PER_STAGE == 128 // PACK_G and PACK_G divides NUM_Q_HEADS",
+          "defaults": {
+            "PACK_G": 1,
+            "TOK_PER_STAGE": 128
+          },
+          "macros": [
+            "PACK_G",
+            "TOK_PER_STAGE"
+          ]
+        },
+        {
+          "constraint": "1 or 8",
+          "defaults": {
+            "L2_SWIZZLE": 8
+          },
+          "macros": [
+            "L2_SWIZZLE"
+          ]
+        },
+        {
+          "constraint": "one of 16,32,64,128,256,512,1024",
+          "defaults": {
+            "PAGE_SIZE": 16
+          },
+          "macros": [
+            "PAGE_SIZE"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_context_nvfp4",
+      "qmul4_implementations": {
+        "default": "portable_public_ptx",
+        "native": "cubin_patch_v1",
+        "native_source_family_members": 1,
+        "patch_module": "runtime/cake_fmha_qmul4.py",
+        "unpatched_native_load_allowed": false
+      },
+      "source_family": [
+        {
+          "native_qmul4": {
+            "expected_marker_counts": {
+              "sm_100a": {
+                "5": 12,
+                "6": 12
+              },
+              "sm_103a": {
+                "5": 12,
+                "6": 12
+              }
+            },
+            "patch_module": "runtime/cake_fmha_qmul4.py",
+            "protocol": "cubin_patch_v1",
+            "sha256": {
+              "sm_100a": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7",
+              "sm_103a": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
+            },
+            "sources": {
+              "sm_100a": "cuda/context_nvfp4/native_qmul4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
+              "sm_103a": "cuda/context_nvfp4/native_qmul4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu"
+            }
+          },
+          "selector": {
+            "ENABLE_SINK": 0,
+            "IS_CAUSAL": 1,
+            "RETURN_LSE": 0,
+            "STATIC_ONE_TILE": 1
+          },
+          "sha256": {
+            "sm_100a": "7a0f4c5c587f2ca4fa3e9272cdcd9e0d39777bc0f6763feba45cd4d84a628723",
+            "sm_103a": "7a0f4c5c587f2ca4fa3e9272cdcd9e0d39777bc0f6763feba45cd4d84a628723"
+          },
+          "sources": {
+            "sm_100a": "cuda/context_nvfp4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
+            "sm_103a": "cuda/context_nvfp4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_native_bf16": {
+      "binding_sha256": "146f21656b704383a205b04c7da6d4165e5b8c1101d0228a63af49e26c62d2fc",
+      "binding_source": "bindings/cake_fmha_decode_native_bf16_binding.cu",
+      "dynamic_shared_memory_bytes": 145408,
+      "launch_binding": "cake_fmha_launch_decode_native_bf16",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "LSE_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "causal_seqlens_kv_global"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "scale_log2_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "sinks_ptr"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_local_seq_len"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "window_left"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "BATCH_SIZE": 4
+          },
+          "macros": [
+            "BATCH_SIZE"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer and divides NUM_Q_HEADS",
+          "defaults": {
+            "NUM_KV_HEADS": 2
+          },
+          "macros": [
+            "NUM_KV_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "Q_LEN": 1
+          },
+          "macros": [
+            "Q_LEN"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_decode_native_bf16",
+      "source_family": [
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "85aef2ab82dcea182e3e6e8ab3a0abc1003bf942919d2c76038f301c8c1e1e8c",
+            "sm_103a": "85aef2ab82dcea182e3e6e8ab3a0abc1003bf942919d2c76038f301c8c1e1e8c"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "7f12640f113fabb26ab9171fdf8fa10b784b9d7b209978c344f20062751b934c",
+            "sm_103a": "7f12640f113fabb26ab9171fdf8fa10b784b9d7b209978c344f20062751b934c"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "43b6e5320ecd06c262b447c6af03b71d9dc51fe59a5dad23e4138a1e508bc7e0",
+            "sm_103a": "43b6e5320ecd06c262b447c6af03b71d9dc51fe59a5dad23e4138a1e508bc7e0"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "c57643e67420d7775954e6757f87c4dd247fcf7ae4da5cbffd655e94c704f2d6",
+            "sm_103a": "c57643e67420d7775954e6757f87c4dd247fcf7ae4da5cbffd655e94c704f2d6"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "c72754dbc033a17248422bcf71f4ffe34a2bd165198e14997c8395a52da987fa",
+            "sm_103a": "c72754dbc033a17248422bcf71f4ffe34a2bd165198e14997c8395a52da987fa"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "fe298e7a174a46ed869ad1f67e866d979b9c2f48d52213d3106e533bc765e3d9",
+            "sm_103a": "fe298e7a174a46ed869ad1f67e866d979b9c2f48d52213d3106e533bc765e3d9"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "207ec46df37dd8253890a1160ce39165508448af7e8ded99c49fe8f7aff3f538",
+            "sm_103a": "207ec46df37dd8253890a1160ce39165508448af7e8ded99c49fe8f7aff3f538"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "665e014e8040ee0990a0fe7d3dc431986a98d1281861ca1bc67012de14d19bb7",
+            "sm_103a": "665e014e8040ee0990a0fe7d3dc431986a98d1281861ca1bc67012de14d19bb7"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "6d4038eedb838bc701f1c10b1a514e1cde07c92c27a1f1f19604899dfc6e5f1a",
+            "sm_103a": "6d4038eedb838bc701f1c10b1a514e1cde07c92c27a1f1f19604899dfc6e5f1a"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "cdbc683dee670e1a7664a2afa126cbd2e72fde8005ce674f13d7717afcbbd6c2",
+            "sm_103a": "cdbc683dee670e1a7664a2afa126cbd2e72fde8005ce674f13d7717afcbbd6c2"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "7ba8f2b0d38b83b08ab9afa11f3fe0c262bcd4a5d1d5eb5f10a05c50c30fcd82",
+            "sm_103a": "7ba8f2b0d38b83b08ab9afa11f3fe0c262bcd4a5d1d5eb5f10a05c50c30fcd82"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "launch_override": {
+            "binding_sha256": "d09d25e1062b4bb4baee9ac352c02465aa277a48cdc80bd01b6635a6c4441d37",
+            "binding_source": "bindings/cake_fmha_decode_native_bf16_b4_exact_cga_binding.cu",
+            "cluster_dims": [
+              2,
+              1,
+              1
+            ],
+            "dynamic_shared_memory_bytes": 175360,
+            "launch_binding": "cake_fmha_launch_decode_native_bf16",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Qt"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "scale_log2_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "sinks_ptr"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_local_seq_len"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "window_left"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              }
+            ],
+            "public_symbol": "kernel_cake_fmha_decode_native_bf16",
+            "threads": 512
+          },
+          "selector": {
+            "BATCH_SIZE": 4,
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "NUM_KV_HEADS": 4,
+            "NUM_Q_HEADS": 32,
+            "Q_LEN": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "131772c4fc55932ecb3c3a51aa60abf45b604824be5297c9eb2c1037faf87222",
+            "sm_103a": "131772c4fc55932ecb3c3a51aa60abf45b604824be5297c9eb2c1037faf87222"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/batch_size4_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/batch_size4_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "BATCH_SIZE": 128,
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "NUM_KV_HEADS": 4,
+            "NUM_Q_HEADS": 32,
+            "Q_LEN": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "c053d42e7a374d6e6c40d896be7c75e344507b0dc7fb5337f6ab01ead21981da",
+            "sm_103a": "806291f638ce176d938862ab2e4f91d1a59100096476be9ab28053c8f4f10332"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/sm_100a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/sm_103a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "BATCH_SIZE": 128,
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "NUM_KV_HEADS": 4,
+            "NUM_Q_HEADS": 32,
+            "Q_LEN": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "e657b8176852850c0f5c5afac655ad3ea670f55034018afe41e782cf8a2e9718",
+            "sm_103a": "e657b8176852850c0f5c5afac655ad3ea670f55034018afe41e782cf8a2e9718"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "BATCH_SIZE": 128,
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "NUM_KV_HEADS": 4,
+            "NUM_Q_HEADS": 32,
+            "Q_LEN": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "fd8135704bb9a9db94298040ac8002ad9e331ef87a977927bf4329ee863cd6fb",
+            "sm_103a": "646b6515bc7eaf3567f4d3a3ffad268ea955457bd7ded47ba756fddc0aefbba3"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/sm_100a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_bf16/sm_103a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "launch_override": {
+            "by_arch": {
+              "sm_100a": {
+                "binding_sha256": "2410ae1852da176d610b2f8d6cb29394f8355511b97d1a8fb0ae51a70e554b8c",
+                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_100a_binding.cu",
+                "dynamic_shared_memory_bytes": 178176
+              },
+              "sm_103a": {
+                "binding_sha256": "78f5918ee5dd89bb00be61677625c868db10754405184b640f9c5a934c4d4741",
+                "binding_source": "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_sm_103a_binding.cu",
+                "dynamic_shared_memory_bytes": 210944
+              }
+            },
+            "cluster_dims": [
+              1,
+              1,
+              1
+            ],
+            "grid": [
+              "Q_LEN",
+              "NUM_KV_HEADS",
+              "BATCH_SIZE"
+            ],
+            "launch_binding": "cake_fmha_launch_decode_native_bf16",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Qt"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "scale_log2_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "sinks_ptr"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_local_seq_len"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "window_left"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              }
+            ],
+            "public_symbol": "kernel_cake_fmha_decode_native_bf16",
+            "threads": 512,
+            "use_pdl": true
+          },
+          "selector": {
+            "BATCH_SIZE": 256,
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "NUM_KV_HEADS": 4,
+            "NUM_Q_HEADS": 32,
+            "Q_LEN": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "624ef77edbbac4c50af4107eecda242c16027eb89952762bea0167064f11d038",
+            "sm_103a": "84f1be6fd2eea536358c014b8721885c2d5a58b66e97d4088eb26198ad6ba20b"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_bf16/sm_100a/batch_size256_has_sink1_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_bf16/sm_103a/batch_size256_has_sink1_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_native_fp16_hd512": {
+      "binding_sha256": "13c8dca732d386c35292aca6e9f0ee6a1419c857b8ba6af2c2a1bd642b0397f1",
+      "binding_source": "bindings/cake_fmha_decode_native_fp16_hd512_binding.cu",
+      "dynamic_shared_memory_bytes": 149504,
+      "launch_binding": "cake_fmha_launch_decode_native_fp16_hd512",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "LSE_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "causal_seqlens_kv_global"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "scale_log2_ptr"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_local_seq_len"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "window_left"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "BATCH_SIZE": 4
+          },
+          "macros": [
+            "BATCH_SIZE"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer and divides NUM_Q_HEADS",
+          "defaults": {
+            "NUM_KV_HEADS": 2
+          },
+          "macros": [
+            "NUM_KV_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "Q_LEN": 1
+          },
+          "macros": [
+            "Q_LEN"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_decode_native_fp16_hd512",
+      "source_family": [
+        {
+          "selector": {
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "7d1dc07aeef4903ddcdc8d578a2b14f3bac0081c083a1b0f948aeb7fc34c3338",
+            "sm_103a": "7d1dc07aeef4903ddcdc8d578a2b14f3bac0081c083a1b0f948aeb7fc34c3338"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "56a45f89585f737f465df91e19427008987460daeee86d7ee853043f4adb6acf",
+            "sm_103a": "56a45f89585f737f465df91e19427008987460daeee86d7ee853043f4adb6acf"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "bdf50252377c1abf831518effc0934a63178fef8ca5c1d8c73004c499d691107",
+            "sm_103a": "bdf50252377c1abf831518effc0934a63178fef8ca5c1d8c73004c499d691107"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "53cdaa48d42154a26531976ecf72c67d8f94ffab86d3ff8e08ad784a14a271fa",
+            "sm_103a": "53cdaa48d42154a26531976ecf72c67d8f94ffab86d3ff8e08ad784a14a271fa"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "d1b3dec1ed8520e0e31a57e71191c6bfc9844ae9268ba80e423535dd1c69230e",
+            "sm_103a": "d1b3dec1ed8520e0e31a57e71191c6bfc9844ae9268ba80e423535dd1c69230e"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "0536cf17507f45ee025c4ca1edd853134315fd6bfc525d6eb1cf996833453732",
+            "sm_103a": "0536cf17507f45ee025c4ca1edd853134315fd6bfc525d6eb1cf996833453732"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "e2fc382b906e3e981cd6304b04623d99140273ff305d107463115153ae33ac37",
+            "sm_103a": "e2fc382b906e3e981cd6304b04623d99140273ff305d107463115153ae33ac37"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "0ecd65b43c4ccc3453417e172e182a97af79f71f19f1202e4f43e8ddd9afaf43",
+            "sm_103a": "0ecd65b43c4ccc3453417e172e182a97af79f71f19f1202e4f43e8ddd9afaf43"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_hd512/has_window1_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_native_fp16_nhd": {
+      "binding_sha256": "a1e7ad7b3d27699c15d5882e7f1ccafb54fc8cba2aab6f2760bf9a1f6dea8420",
+      "binding_source": "bindings/cake_fmha_decode_native_fp16_nhd_binding.cu",
+      "dynamic_shared_memory_bytes": 145408,
+      "launch_binding": "cake_fmha_launch_decode_native_fp16_nhd",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "LSE_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "causal_seqlens_kv_global"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "scale_log2_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "sinks_ptr"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_local_seq_len"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "window_left"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "BATCH_SIZE": 4
+          },
+          "macros": [
+            "BATCH_SIZE"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer and divides NUM_Q_HEADS",
+          "defaults": {
+            "NUM_KV_HEADS": 2
+          },
+          "macros": [
+            "NUM_KV_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "Q_LEN": 1
+          },
+          "macros": [
+            "Q_LEN"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_decode_native_fp16_nhd",
+      "source_family": [
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "13cf2ab738d4f5662a458d1a9a53eecaab1a699e2582462644f689a843011e29",
+            "sm_103a": "13cf2ab738d4f5662a458d1a9a53eecaab1a699e2582462644f689a843011e29"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "a16169776c487c5ecb19352473f888a20599da12e363e1159120ca3db6fe1683",
+            "sm_103a": "a16169776c487c5ecb19352473f888a20599da12e363e1159120ca3db6fe1683"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "9ca9bc26109607ae20efea4e561dff4fc1d1ff1de8daf08af5dafdfc3a46f3b5",
+            "sm_103a": "9ca9bc26109607ae20efea4e561dff4fc1d1ff1de8daf08af5dafdfc3a46f3b5"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "7659aca9b75c3463eacbe2995cf1b3e7fc858217d8776533027b02651a9c2678",
+            "sm_103a": "7659aca9b75c3463eacbe2995cf1b3e7fc858217d8776533027b02651a9c2678"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "cb57f72dc1cfda24303dfc62e13338592308f8948ba69ffa6c9bd7def45e2bc0",
+            "sm_103a": "cb57f72dc1cfda24303dfc62e13338592308f8948ba69ffa6c9bd7def45e2bc0"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "b03da904196fb22d48bb3fc1e03f3f247a1cd521edd850d97286bbec9d928925",
+            "sm_103a": "b03da904196fb22d48bb3fc1e03f3f247a1cd521edd850d97286bbec9d928925"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "197b73353ed9a5fb5068c15afca87f287c4f89c1e7dbe1ce64c367bfc9959835",
+            "sm_103a": "197b73353ed9a5fb5068c15afca87f287c4f89c1e7dbe1ce64c367bfc9959835"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "d23fa6c258c22bfce6f37ed01e3acc21dcb3aa4470b568d0d6322e7498ca5aa3",
+            "sm_103a": "d23fa6c258c22bfce6f37ed01e3acc21dcb3aa4470b568d0d6322e7498ca5aa3"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink0_has_window1_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "c95e87c12f9f96425f2376bb9a3d1d8074258e1e46fcc60d68e85e5f8923d82f",
+            "sm_103a": "c95e87c12f9f96425f2376bb9a3d1d8074258e1e46fcc60d68e85e5f8923d82f"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "80e6423ecf39c5f1c86998c191f5111081359c327e0987c2d746f265f9c758e8",
+            "sm_103a": "80e6423ecf39c5f1c86998c191f5111081359c327e0987c2d746f265f9c758e8"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "d32967a26a78a728b2f4939bc29c448ddf321f641fdc99d6dd040ab20e1d247b",
+            "sm_103a": "d32967a26a78a728b2f4939bc29c448ddf321f641fdc99d6dd040ab20e1d247b"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "2e8b560c2ce45bdba1c260ad6713fd0bc411e15e143c63566438ce6044d0209b",
+            "sm_103a": "2e8b560c2ce45bdba1c260ad6713fd0bc411e15e143c63566438ce6044d0209b"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window0_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "22fd5d6fae3f4ba8ac7153a52d8f9e8e8f72ee4c923b68c7555fcce9c2655d2a",
+            "sm_103a": "22fd5d6fae3f4ba8ac7153a52d8f9e8e8f72ee4c923b68c7555fcce9c2655d2a"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0
+          },
+          "sha256": {
+            "sm_100a": "b36de8622d0534356eaec221a5bb56bd96f3857b986cb892b5aba8d54396ff90",
+            "sm_103a": "b36de8622d0534356eaec221a5bb56bd96f3857b986cb892b5aba8d54396ff90"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr0.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 0,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "11aee365e7353d0bca8c548c3bbfbc642b41dbf984320d9d318d918b7c886b7b",
+            "sm_103a": "11aee365e7353d0bca8c548c3bbfbc642b41dbf984320d9d318d918b7c886b7b"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l20_use_scale_ptr1.cu"
+          }
+        },
+        {
+          "selector": {
+            "HAS_SINK": 1,
+            "HAS_WINDOW": 1,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 1
+          },
+          "sha256": {
+            "sm_100a": "2c1180cb9d57e711e538744d1fad9d9086620421245a897e2d116b25485c935f",
+            "sm_103a": "2c1180cb9d57e711e538744d1fad9d9086620421245a897e2d116b25485c935f"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu",
+            "sm_103a": "cuda/decode_native_fp16_nhd/has_sink1_has_window1_retain_kv_l21_use_scale_ptr1.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_quant_bf16q": {
+      "binding_sha256": "8aae32ba5ee38410b96c472752a9466a5fb159fea3d5b2b471a5bdc0f2f92431",
+      "binding_source": "bindings/cake_fmha_decode_quant_bf16q_binding.cu",
+      "dynamic_shared_memory_bytes": 139904,
+      "launch_binding": "cake_fmha_launch_decode_quant_bf16q",
+      "parameters": [
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "Q_ptr"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm1_scale_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm2_scale_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_O"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_max"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_sum"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "pt_batch_stride"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "pt_v_offset"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "bmm1_is_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_splits"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "blocks_per_split"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "BATCH_SIZE": 4
+          },
+          "macros": [
+            "BATCH_SIZE"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer and divides NUM_Q_HEADS",
+          "defaults": {
+            "NUM_KV_HEADS": 2
+          },
+          "macros": [
+            "NUM_KV_HEADS"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_decode_quant_bf16q",
+      "source_family": [
+        {
+          "selector": {
+            "PAGE_SIZE": 16
+          },
+          "sha256": {
+            "sm_100a": "67300980d52804f1a2b98cb1c129df391fca90cd10936e67b4cdc732df455e2c",
+            "sm_103a": "67300980d52804f1a2b98cb1c129df391fca90cd10936e67b4cdc732df455e2c"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_bf16q/page_size16.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/page_size16.cu"
+          }
+        },
+        {
+          "selector": {
+            "PAGE_SIZE": 32
+          },
+          "sha256": {
+            "sm_100a": "c246e2f908e67bd7344553d9834cbc9f2880445c4af1350b0b511ebe3a91ef8d",
+            "sm_103a": "c246e2f908e67bd7344553d9834cbc9f2880445c4af1350b0b511ebe3a91ef8d"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_bf16q/page_size32.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/page_size32.cu"
+          }
+        },
+        {
+          "selector": {
+            "PAGE_SIZE": 64
+          },
+          "sha256": {
+            "sm_100a": "95f5097af777c40b4a14b0c6d3a798c484c9361f743cc8d29025e7602efee3e2",
+            "sm_103a": "95f5097af777c40b4a14b0c6d3a798c484c9361f743cc8d29025e7602efee3e2"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_bf16q/page_size64.cu",
+            "sm_103a": "cuda/decode_quant_bf16q/page_size64.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_quant_fp8": {
+      "binding_sha256": "643825cf495f5d83ef57dd71d8ec80ff66f0b755db232b66209d7adc21d100f4",
+      "binding_source": "bindings/cake_fmha_decode_quant_fp8_binding.cu",
+      "dynamic_shared_memory_bytes": 157952,
+      "launch_binding": "cake_fmha_launch_decode_quant_fp8",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "uint8_t*",
+          "kind": "pointer",
+          "name": "O"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm1_scale_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm2_scale_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_O"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_max"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_sum"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "pt_batch_stride"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "pt_v_offset"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "bmm1_is_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_splits"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "blocks_per_split"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "BATCH_SIZE": 4
+          },
+          "macros": [
+            "BATCH_SIZE"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer and divides NUM_Q_HEADS",
+          "defaults": {
+            "NUM_KV_HEADS": 2
+          },
+          "macros": [
+            "NUM_KV_HEADS"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_decode_quant_fp8",
+      "source_family": [
+        {
+          "selector": {
+            "FULL_BLOCKS": 0,
+            "PAGE_SIZE": 16
+          },
+          "sha256": {
+            "sm_100a": "2b8a683ba646083057c34dcbe154c29e8b6edd320094d1a8e46bcdaed6034715",
+            "sm_103a": "73b015425d978440c6acd191ce6f08b691a0cf24775d4a354b569314ddf84cfd"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size16.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size16.cu"
+          }
+        },
+        {
+          "selector": {
+            "FULL_BLOCKS": 1,
+            "PAGE_SIZE": 16
+          },
+          "sha256": {
+            "sm_100a": "7de90a48d99b62fa05ff7f956bfaa2c286519bd45db42f7b9330657859788c4c",
+            "sm_103a": "5c528f0d1c25748d3b16915acfa623a18af9d658dc36aa888da2feea165bb405"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size16.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size16.cu"
+          }
+        },
+        {
+          "selector": {
+            "FULL_BLOCKS": 0,
+            "PAGE_SIZE": 32
+          },
+          "sha256": {
+            "sm_100a": "38ee9b4bdd301dbfa48c2a839d91be0920632652521afa05a9f384573dfdfd99",
+            "sm_103a": "dc8878320910a3c02a005b1f8bfb2840a2b00927ebc132afdde88beaa04f8b8a"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size32.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size32.cu"
+          }
+        },
+        {
+          "selector": {
+            "FULL_BLOCKS": 1,
+            "PAGE_SIZE": 32
+          },
+          "sha256": {
+            "sm_100a": "20bdb4c768dbe5056de1bfdfb836ad8bee1ff70c72d3b18065938d3fde9e9536",
+            "sm_103a": "613918ca0ee45e3eb96eb980beb384e28ab537b08779ab39bb4b3f54d80bca2f"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size32.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size32.cu"
+          }
+        },
+        {
+          "selector": {
+            "FULL_BLOCKS": 0,
+            "PAGE_SIZE": 64
+          },
+          "sha256": {
+            "sm_100a": "b5122194482873ac18a957ac6ac88c081de971de9eb0e66e7c8efda79d38ff25",
+            "sm_103a": "1e79e83b5a6505464c805289a727617a9115ad66385c4d2aad2c9e9b3620cc8f"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size64.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size64.cu"
+          }
+        },
+        {
+          "selector": {
+            "FULL_BLOCKS": 1,
+            "PAGE_SIZE": 64
+          },
+          "sha256": {
+            "sm_100a": "ab687ed6cb1de2fae1006c42d77acb109c22da5c61f908eb6f57cd540917b580",
+            "sm_103a": "0a4ce4814b3f5df52eed564a330523a218293072ce00e0aa4291fe409bd45c00"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size64.cu",
+            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size64.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_quant_fp8_reduce": {
+      "binding_sha256": "3aa08a8f113939f095693e6fa4c15cc388f7f4f04e53797ace921db0b2a561d9",
+      "binding_source": "bindings/cake_fmha_decode_quant_fp8_reduce_binding.cu",
+      "dynamic_shared_memory_bytes": 0,
+      "launch_binding": "cake_fmha_launch_decode_quant_fp8_reduce",
+      "parameters": [
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_O"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_max"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_sum"
+        },
+        {
+          "ctype": "uint8_t*",
+          "kind": "pointer",
+          "name": "O"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm2_scale_ptr"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_split"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_quant_fp8_reduce",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "cad2197dfea1a64cc74dc10cbb3e3453555ade043d17fd4265543c29daf7184c",
+            "sm_103a": "cad2197dfea1a64cc74dc10cbb3e3453555ade043d17fd4265543c29daf7184c"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_fp8_reduce/default.cu",
+            "sm_103a": "cuda/decode_quant_fp8_reduce/default.cu"
+          }
+        }
+      ],
+      "threads": 32
+    },
+    "decode_quant_nvfp4": {
+      "binding_sha256": "8b2efef24ac88e4c37004ef0a2c9196b38037c38794a5c74d39052c3516b7c56",
+      "binding_source": "bindings/cake_fmha_decode_quant_nvfp4_binding.cu",
+      "dynamic_shared_memory_bytes": 147456,
+      "launch_binding": "cake_fmha_launch_decode_quant_nvfp4",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Kp"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Vp"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Ksf"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Vsf"
+        },
+        {
+          "ctype": "uint8_t*",
+          "kind": "pointer",
+          "name": "O"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm1_scale_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "bmm2_scale_ptr"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_O"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_max"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_sum"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "pt_batch_stride"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "pt_v_offset"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "bmm1_is_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_splits"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "blocks_per_split"
+        }
+      ],
+      "parametric_axes": [
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "BATCH_SIZE": 4
+          },
+          "macros": [
+            "BATCH_SIZE"
+          ]
+        },
+        {
+          "constraint": "positive integer",
+          "defaults": {
+            "NUM_Q_HEADS": 8
+          },
+          "macros": [
+            "NUM_Q_HEADS"
+          ]
+        },
+        {
+          "constraint": "positive integer and divides NUM_Q_HEADS",
+          "defaults": {
+            "NUM_KV_HEADS": 2
+          },
+          "macros": [
+            "NUM_KV_HEADS"
+          ]
+        }
+      ],
+      "public_symbol": "kernel_cake_fmha_decode_quant_nvfp4",
+      "qmul4_implementations": {
+        "default": "portable_public_ptx",
+        "native": "cubin_patch_v1",
+        "native_source_family_members": 3,
+        "patch_module": "runtime/cake_fmha_qmul4.py",
+        "unpatched_native_load_allowed": false
+      },
+      "source_family": [
+        {
+          "native_qmul4": {
+            "expected_marker_counts": {
+              "sm_100a": {
+                "0": 2,
+                "1": 2,
+                "2": 2,
+                "3": 2,
+                "4": 2
+              },
+              "sm_103a": {
+                "0": 2,
+                "1": 2,
+                "2": 2,
+                "3": 2,
+                "4": 2
+              }
+            },
+            "patch_module": "runtime/cake_fmha_qmul4.py",
+            "protocol": "cubin_patch_v1",
+            "sha256": {
+              "sm_100a": "4196ba81ccf4dd02395bb366c6bb52dff5c60afc2d8d70a1fa0d7ec6f6c8b0e7",
+              "sm_103a": "4196ba81ccf4dd02395bb366c6bb52dff5c60afc2d8d70a1fa0d7ec6f6c8b0e7"
+            },
+            "sources": {
+              "sm_100a": "cuda/decode_quant_nvfp4/native_qmul4/page_size16.cu",
+              "sm_103a": "cuda/decode_quant_nvfp4/native_qmul4/page_size16.cu"
+            }
+          },
+          "selector": {
+            "PAGE_SIZE": 16
+          },
+          "sha256": {
+            "sm_100a": "358d94c1f9f1abe52fe91d819d44d8e27c7ba8b1107b2bad7d5c3adcc1f5f80d",
+            "sm_103a": "358d94c1f9f1abe52fe91d819d44d8e27c7ba8b1107b2bad7d5c3adcc1f5f80d"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_nvfp4/page_size16.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/page_size16.cu"
+          }
+        },
+        {
+          "native_qmul4": {
+            "expected_marker_counts": {
+              "sm_100a": {
+                "0": 2,
+                "1": 2,
+                "2": 2,
+                "3": 2,
+                "4": 2
+              },
+              "sm_103a": {
+                "0": 2,
+                "1": 2,
+                "2": 2,
+                "3": 2,
+                "4": 2
+              }
+            },
+            "patch_module": "runtime/cake_fmha_qmul4.py",
+            "protocol": "cubin_patch_v1",
+            "sha256": {
+              "sm_100a": "1abe8ef05e2cd4d72202e9b4d2d04156923b49adb292ce7a184ce3479e0c8ce5",
+              "sm_103a": "1abe8ef05e2cd4d72202e9b4d2d04156923b49adb292ce7a184ce3479e0c8ce5"
+            },
+            "sources": {
+              "sm_100a": "cuda/decode_quant_nvfp4/native_qmul4/page_size32.cu",
+              "sm_103a": "cuda/decode_quant_nvfp4/native_qmul4/page_size32.cu"
+            }
+          },
+          "selector": {
+            "PAGE_SIZE": 32
+          },
+          "sha256": {
+            "sm_100a": "a7ce444b76bb23f3cf1a5c8a1e28b215b3a849e8fb0c513490e5da03dd6facfa",
+            "sm_103a": "a7ce444b76bb23f3cf1a5c8a1e28b215b3a849e8fb0c513490e5da03dd6facfa"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_nvfp4/page_size32.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/page_size32.cu"
+          }
+        },
+        {
+          "native_qmul4": {
+            "expected_marker_counts": {
+              "sm_100a": {
+                "0": 2,
+                "1": 2,
+                "2": 2,
+                "3": 2,
+                "4": 2
+              },
+              "sm_103a": {
+                "0": 2,
+                "1": 2,
+                "2": 2,
+                "3": 2,
+                "4": 2
+              }
+            },
+            "patch_module": "runtime/cake_fmha_qmul4.py",
+            "protocol": "cubin_patch_v1",
+            "sha256": {
+              "sm_100a": "81f5b7aecf2da4273ede36b35985f91182741bbcdf0cff71d013205b731624af",
+              "sm_103a": "81f5b7aecf2da4273ede36b35985f91182741bbcdf0cff71d013205b731624af"
+            },
+            "sources": {
+              "sm_100a": "cuda/decode_quant_nvfp4/native_qmul4/page_size64.cu",
+              "sm_103a": "cuda/decode_quant_nvfp4/native_qmul4/page_size64.cu"
+            }
+          },
+          "selector": {
+            "PAGE_SIZE": 64
+          },
+          "sha256": {
+            "sm_100a": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72",
+            "sm_103a": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_quant_nvfp4/page_size64.cu",
+            "sm_103a": "cuda/decode_quant_nvfp4/page_size64.cu"
+          }
+        }
+      ],
+      "threads": 512
+    }
+  },
+  "flashinfer_matrix_revision": "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b",
+  "format_version": 1,
+  "minimum_arch": "sm_100a",
+  "product": "cake_fmha",
+  "profile": "conventional",
+  "publication": {
+    "fail_closed": true,
+    "promotion_ready": true,
+    "reason": "all publication gates satisfied"
+  },
+  "route_probes": [
+    {
+      "label": "correctness_decode_bf16_hnd_lse",
+      "profile": "conventional",
+      "selected_route": "decode_native_bf16_v1_bece"
+    },
+    {
+      "label": "correctness_decode_fp16_nhd_spec",
+      "profile": "conventional",
+      "selected_route": "decode_native_fp16_nhd_v1_f32d"
+    },
+    {
+      "label": "correctness_decode_sink_window",
+      "profile": "conventional",
+      "selected_route": "decode_native_bf16_v1_bece"
+    },
+    {
+      "label": "correctness_compat_decode_fp8_nhd_separate_group5",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_fp8_hnd_shared_group8_partial",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_decode_fp8_hnd_shared_group8_full_blocks",
+      "profile": "conventional",
+      "selected_route": "decode_quantized_fp8_8e5b_v1"
+    },
+    {
+      "label": "correctness_decode_nvfp4_kv",
+      "profile": "conventional",
+      "selected_route": "decode_quantized_nvfp4_8e5b_v1"
+    },
+    {
+      "label": "correctness_decode_head512",
+      "profile": "conventional",
+      "selected_route": "decode_native_fp16_hd512_v1_66b1"
+    },
+    {
+      "label": "correctness_context_bf16_varlen_lse",
+      "profile": "conventional",
+      "selected_route": "ctx_bf16_hnd_hd128_hgpack_03df_v2"
+    },
+    {
+      "label": "correctness_context_fp16_dense_nhd",
+      "profile": "conventional",
+      "selected_route": "ctx_fp16_nhd_hd256_stage16_v1"
+    },
+    {
+      "label": "correctness_context_sink",
+      "profile": "conventional",
+      "selected_route": "ctx_bf16_hnd_hd128_hgpack_03df_v2"
+    },
+    {
+      "label": "correctness_context_fp8_dynamic_page",
+      "profile": "conventional",
+      "selected_route": "ctx_fp8_bf16_nhd_hd256_stage16_v1"
+    },
+    {
+      "label": "correctness_context_bf16_nhd_dense_skip",
+      "profile": "conventional",
+      "selected_route": "ctx_bf16_hnd_hd128_hgpack_03df_v2"
+    },
+    {
+      "label": "correctness_context_fp8_nhd_dense_skip",
+      "profile": "conventional",
+      "selected_route": "ctx_fp8_hnd_hd128_hgpack_48b5_v1"
+    },
+    {
+      "label": "correctness_decode_log2_override_bf16",
+      "profile": "conventional",
+      "selected_route": "decode_native_bf16_v1_bece"
+    },
+    {
+      "label": "correctness_decode_log2_override_fp8_precedence",
+      "profile": "conventional",
+      "selected_route": "decode_quantized_bf16q_9d8b_v1"
+    },
+    {
+      "label": "correctness_compat_decode_bf16_hd256_window_sink",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_fp16_hnd",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_bf16_fp8_to_fp8",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_fp16_fp8_hd256",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_fp8_to_bf16_hd256",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_nvfp4_nhd_hd256",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_context_fp16_nhd_dense_sink",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_context_fp8_to_bf16_hd256",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_context_fp8_to_fp16_nhd",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_context_nvfp4_hnd_hd256",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_context_fp16_hd256_lse",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_decode_fp8_to_nvfp4",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    },
+    {
+      "label": "correctness_compat_context_fp8_to_nvfp4_hd256",
+      "profile": "conventional",
+      "selected_route": "cake_fmha_compat_v1"
+    }
+  ],
+  "routes": {
+    "cake_fmha_compat_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "compat_v1",
+          "condition": "optimized routes declined the valid request"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "ctx_bf16_hnd_hd128_hgpack_03df_v2": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "context_bf16",
+          "condition": "always"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "ctx_fp16_nhd_hd256_stage16_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "context_hd256_support",
+          "condition": "stage Q/KV and prepare metadata"
+        },
+        {
+          "component": "context_fp16_hd256",
+          "condition": "after NHD-to-P16 staging"
+        },
+        {
+          "component": "context_hd256_support",
+          "condition": "scatter caller-owned O"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "ctx_fp8_bf16_nhd_hd256_stage16_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "context_hd256_support",
+          "condition": "stage Q/KV and prepare metadata"
+        },
+        {
+          "component": "context_fp8_hd256",
+          "condition": "after NHD-to-P16 staging"
+        },
+        {
+          "component": "context_hd256_support",
+          "condition": "scatter caller-owned O"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "ctx_fp8_hnd_hd128_hgpack_48b5_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "context_fp8",
+          "condition": "always"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "context_nvfp4",
+          "condition": "fused portable/native QMUL4 context"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_native_bf16_v1_bece": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_native_bf16",
+          "condition": "always"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_native_fp16_hd512_v1_66b1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_native_fp16_hd512",
+          "condition": "always"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_native_fp16_nhd_v1_f32d": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_native_fp16_nhd",
+          "condition": "always"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_quantized_bf16q_9d8b_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_quant_bf16q",
+          "condition": "always"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_quantized_fp8_8e5b_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_quant_fp8",
+          "condition": "always"
+        },
+        {
+          "component": "decode_quant_fp8_reduce",
+          "condition": "num_splits > 1"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_quantized_nvfp4_8e5b_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_quant_nvfp4",
+          "condition": "always"
+        },
+        {
+          "component": "decode_quant_fp8_reduce",
+          "condition": "num_splits > 1"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    }
+  }
+}

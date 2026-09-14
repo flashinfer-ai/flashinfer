@@ -23,6 +23,48 @@ import torch
 
 from flashinfer.utils import is_sm100a_supported
 
+
+_SM107_UNSUPPORTED_KERNEL_TESTS = frozenset(
+    {
+        "test_block_table_width_contract",
+        "test_context_lens_must_be_rank_1",
+        "test_empty_batch_returns_without_launching",
+        "test_empty_batch_still_validates_out",
+        "test_fp4_head_dim_num_heads_validation",
+        "test_fp4_is_kv_sf_interleaved_guard",
+        "test_fp4_next_n4_rejected",
+        "test_fp4_out_and_schedule_meta_paths",
+        "test_fp4_paged_mqa_logits",
+        "test_fp4_paged_mqa_logits_sf_interleaved",
+        "test_fp4_sf_vec_size_contract",
+        "test_fp8_input_validation",
+        "test_fp8_out_and_schedule_meta_paths",
+        "test_fp8_paged_mqa_logits",
+        "test_fp8_paged_mqa_logits_fp16",
+        "test_fp8_paged_mqa_logits_head_dim64",
+        "test_fp8_paged_mqa_logits_next_n4",
+        "test_fp8_paged_mqa_logits_small_num_heads",
+        "test_max_context_len_bound",
+        "test_next_n_and_weights_contract",
+        "test_num_epi_subtiles_guard",
+        "test_oversized_out_returns_exact_rows",
+        "test_precompile_variants",
+        "test_relu_is_applied_per_head_before_weighting",
+        "test_schedule_meta_graph_replay_across_split_boundary",
+        "test_stale_schedule_meta_detected",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_sm107_unsupported_kernel_tests(request):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        return
+    test_name = getattr(request.node, "originalname", request.node.name)
+    if test_name in _SM107_UNSUPPORTED_KERNEL_TESTS:
+        pytest.skip("paged MQA logits kernels support SM100 and SM103, not SM107")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers: FP8
 # ──────────────────────────────────────────────────────────────────────────────

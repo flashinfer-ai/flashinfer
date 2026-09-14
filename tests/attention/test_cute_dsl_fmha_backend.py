@@ -26,15 +26,27 @@ import torch
 import torch.nn.functional as F
 
 import flashinfer
-from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.cute_dsl.utils import (
+    is_cute_dsl_arch_supported,
+    is_cute_dsl_available,
+)
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 if not is_cute_dsl_available():
     pytest.skip("CuTe DSL not available", allow_module_level=True)
 
+
+def _is_fmha_arch_supported() -> bool:
+    device = torch.device("cuda")
+    compute_capability = get_compute_capability(device)
+    if compute_capability == (10, 7):
+        return is_cute_dsl_arch_supported(*compute_capability, native_only=True)
+    return is_sm100a_supported(device)
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-    reason="CuTe DSL FMHA requires Blackwell (SM100a+)",
+    not torch.cuda.is_available() or not _is_fmha_arch_supported(),
+    reason="CuTe DSL FMHA requires a compiler with native GPU support",
 )
 
 DEVICE = "cuda"
@@ -154,7 +166,12 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, scale_bmm1, scale_bmm2, caus
     w.plan(qo, kv, Hq, Hk, D, causal=causal, q_data_type=dtype_qk)
     o = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2)
     ref = _ragged_ref(qr, kr, vr, qo, kv, sm * scale_bmm1, causal=causal) * scale_bmm2
-    atol = 4.5e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
+    low_precision = min(dtype_qk.itemsize, dtype_vo.itemsize) == 1
+    atol = 4.5e-2 if low_precision else 6e-3
+    if low_precision and get_compute_capability(torch.device(DEVICE)) == (10, 7):
+        # SM107 accumulates a rare FP8 tail outlier (one element in ~2M in the
+        # CI cases); keep the tighter envelope everywhere else.
+        atol = 8e-2
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
 
     # Check whether the caller provided out and returned out match
