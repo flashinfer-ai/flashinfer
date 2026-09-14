@@ -137,7 +137,18 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         enable_pdl,
         out_dtype,
     ) = cache_key
-    tma = "x" if use_tma_store is None else int(use_tma_store)
+    # On SM107 the use_tma_store slot is repurposed to carry the Rubin kernel
+    # shape (inst_m, inst_n, inst_k, tiler_k, prefetch_dist), so render it as a
+    # symbol-safe joined string; a bare int() would raise on the tuple.
+    if use_tma_store is None:
+        tma = "x"
+    elif isinstance(use_tma_store, tuple):
+        # prefetch_dist is enumerated as (0, 2, None) - None means "auto" and
+        # compiles differently from 0, so render it as its own symbol rather
+        # than letting int(None) raise.
+        tma = "s" + "s".join("x" if v is None else str(int(v)) for v in use_tma_store)
+    else:
+        tma = int(use_tma_store)
     dtype = str(out_dtype).removeprefix("torch.")
     return (
         f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
@@ -226,6 +237,26 @@ def _make_blockscaled_gemm_compile_fn(
         )
 
     return compile_kernel
+
+
+_CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
+
+
+def _prepare_alpha_for_launch(alpha_tensor, device):
+    """Prepare alpha as a 1-dim float32 device tensor with shape [1].
+
+    When *alpha_tensor* is ``None``, returns a cached ``tensor([1.0])``
+    on *device* (allocated once, reused forever).
+    """
+    if alpha_tensor is None:
+        cached = _CUTE_DSL_ALPHA_ONE_CACHE.get(device)
+        if cached is None:
+            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
+            _CUTE_DSL_ALPHA_ONE_CACHE[device] = cached
+        return cached
+    if alpha_tensor.dim() == 0:
+        return alpha_tensor.unsqueeze(0)
+    return alpha_tensor.reshape(1)
 
 
 def _mm_fp4_precompile_worker(payload):

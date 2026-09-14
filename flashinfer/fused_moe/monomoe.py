@@ -95,6 +95,17 @@ def alloc_scratchpad(device: torch.device) -> torch.Tensor:
     see docs/design_docs/monomoe_kernel.md §2/§4); afterwards the kernel
     self-maintains them, so allocate once and reuse the same tensor for every
     :func:`mono_moe` invocation.
+
+    Parameters
+    ----------
+    device : torch.device
+        The CUDA device on which to allocate the scratchpad.
+
+    Returns
+    -------
+    torch.Tensor
+        A zero-initialized 1-D ``uint8`` tensor containing
+        :func:`get_scratchpad_size_bytes` bytes on ``device``.
     """
     nbytes = get_scratchpad_size_bytes()
     return torch.zeros(nbytes, dtype=torch.uint8, device=device)

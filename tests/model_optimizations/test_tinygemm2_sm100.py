@@ -45,18 +45,21 @@ def _make_case(batch_size, output_features, input_features, seed=0):
 
 
 # Shape axes: batch sweeps across the TILE_N=8 boundary (1..7 exercises the
-# out-of-bounds TMA box on the batch axis), K sweeps both sides of the
-# stage4/stage8 selection point (K <= 1024 selects the shallow ring), and the
-# large-M row exercises the grid-size arm of the same selection.
+# out-of-bounds TMA box on the batch axis), K sweeps the ring-depth selection
+# tiers (K <= 1024 selects the shallow ring; single-wave K >= 4608 selects the
+# 16-deep ring), and the large-M rows exercise the grid-size arm of the same
+# selection.
 PARITY_SHAPES = [
     (1, 128, 720),
     (2, 16, 256),
     (4, 2880, 2880),
     (7, 128, 4096),
     (8, 1024, 1024),
+    (8, 128, 7168),
     (13, 1024, 2048),
     (16, 2880, 2880),
     (64, 4096, 3072),
+    (1, 128, 14336),
 ]
 
 
@@ -104,6 +107,8 @@ def test_tinygemm2_sm100_bitwise_parity(
         ("stage8_pdl_op", "deep ring + PDL"),
         ("stage4_op", "shallow ring"),
         ("stage4_pdl_op", "shallow ring + PDL"),
+        ("stage16_op", "deepest ring"),
+        ("stage16_pdl_op", "deepest ring + PDL"),
     ],
 )
 def test_tinygemm2_sm100_each_variant(variant_op, smem_note):
@@ -114,7 +119,11 @@ def test_tinygemm2_sm100_each_variant(variant_op, smem_note):
     module = gen_tinygemm2_sm100_module().build_and_load()
     op = getattr(module, variant_op)
 
-    for batch_size, output_features, input_features in [(1, 128, 720), (8, 1024, 2048)]:
+    for batch_size, output_features, input_features in [
+        (1, 128, 720),
+        (8, 1024, 2048),
+        (8, 128, 7168),
+    ]:
         input, weight, bias = _make_case(batch_size, output_features, input_features)
         out = torch.zeros(
             batch_size, output_features, device="cuda", dtype=torch.bfloat16

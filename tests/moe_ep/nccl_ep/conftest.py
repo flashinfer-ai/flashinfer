@@ -3,7 +3,7 @@
 ``fake_nccl_ep`` injects a recording stand-in for the whole ``nccl`` package
 tree (``nccl.ep``, ``nccl.core``, ``nccl.ep.interop.torch``) into
 ``sys.modules`` so fleet/handle marshaling and the host-path caching layer can
-be exercised without a GPU, RDMA fabric, or the nccl4py wheel.
+be exercised without a GPU, RDMA fabric, or the nccl-extensions wheel.
 """
 
 from __future__ import annotations
@@ -80,6 +80,11 @@ def _make_fake_nccl_ep():
             self.topk_idx = topk_idx
             self.create_kwargs = kw
             self.calls: list = []
+
+        def update(self, topk_idx, **kw):
+            # Mirrors ncclEpUpdateHandle: rebinds routing, never reallocates.
+            self.topk_idx = topk_idx
+            self.calls.append(("update", topk_idx, kw))
 
         def dispatch(self, inputs, outputs, **kw):
             self.calls.append(("dispatch", inputs, outputs, kw))

@@ -21,10 +21,12 @@ from .roles.softmax import SoftmaxRole
 from .roles.correction import CorrectionRole
 from .roles.epilogue import EpilogueRole
 from .roles.loader_tma import LoaderRole
+from .roles.pt_loader import PageTableLoaderRole
 from .roles.mma import MmaRole
 from .compat import get_current_arch as _get_current_arch
 
 import warnings
+from dataclasses import replace
 
 warnings.filterwarnings(
     "ignore",
@@ -64,6 +66,20 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             self.schedule = PREFILL_SCHEDULE
 
+        if config.page_size is not None:
+            # Paged-only rebalance: one setmaxnreg quantum (8 registers)
+            # from correction to the mma/load/epi group.  The paged
+            # loader adds the per-page id-load/copy loop to the ragged
+            # loader's work; at the default budgets the build is still
+            # spill-free but measures ~1-2% slower at ps16/32 than with
+            # this headroom.  The schedule is a shared frozen dataclass
+            # (PREFILL_SCHEDULE), so modify a copy.
+            self.schedule = replace(
+                self.schedule,
+                num_regs_correction=self.schedule.num_regs_correction - 8,
+                num_regs_other=self.schedule.num_regs_other + 8,
+            )
+
         self.mainloop = make_prefill_mainloop_spec(
             config,
             self.schedule,
@@ -89,17 +105,24 @@ class BlackwellFusedMultiHeadAttentionForward:
         window_right: Int32,
         params_in: cute.Tensor | None,
         lse_in: cute.Tensor | None,
+        kv_page_table: cute.Tensor | None,
+        kv_page_indptr: cute.Tensor | None,
         stream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
         :param q_in: The query tensor (NHD layout)
-        :param k_in: The key tensor (NHD layout)
-        :param v_in: The value tensor (NHD layout)
+        :param k_in: The key tensor (NHD layout), or the paged K cache
+            ``(num_pages, page_size, h_k, d)`` when ``config.page_size`` is set
+        :param v_in: The value tensor (NHD layout), or the paged V cache
+            ``(num_pages, page_size, h_k, d)`` when ``config.page_size`` is set
         :param o_in: The output tensor (NHD layout, with padding before data pointer)
         :param problem_size: ``(b, s_q, s_k, h_q, h_k, d)``
         :param cum_seqlen_q: Cumulative query sequence lengths, or None
-        :param cum_seqlen_k: Cumulative KV sequence lengths, or None
+        :param cum_seqlen_k: Cumulative KV sequence lengths, or None.  For
+            paged KV these are cumulative *logical token* counts (not page
+            counts) — the consumer roles derive per-item seqlen_k from them
+            exactly as on the ragged path.
         :param scale_softmax_log2: ``log2(e) * sm_scale``
         :param scale_output: Output scaling factor
         :param window_left: runtime lookback bound (read only when the
@@ -107,6 +130,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param window_right: runtime lookahead bound (read only when the
             compile-time ``MaskSpec.has_window_right`` is set)
         :param params_in: Variant runtime data tensor, or None
+        :param kv_page_table: Flat int32 physical page ids
+            (``paged_kv_indices``), or None for ragged KV
+        :param kv_page_indptr: int32 ``[B+1]`` page-count cumsums locating each
+            batch item's slice of ``kv_page_table``, or None for ragged KV
         :param stream: CUDA stream
         """
         b, s_q, s_k, h_q, h_k, d = problem_size
@@ -126,18 +153,48 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(d * h_r * h_k, 1, ((d, d * h_r), stride_b_q)),
         )
         q = cute.make_tensor(q_in.iterator, q_layout)
-        # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        k_layout = cute.make_layout(
-            (s_k_all, d, ((h_r, h_k), b_kv)),
-            stride=(d * h_k, 1, ((0, d), stride_b_kv)),
-        )
-        k = cute.make_tensor(k_in.iterator, k_layout)
-        # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        v_layout = cute.make_layout(
-            (d, s_k_all, ((h_r, h_k), b_kv)),
-            stride=(1, d * h_k, ((0, d), stride_b_kv)),
-        )
-        v = cute.make_tensor(v_in.iterator, v_layout)
+        if cutlass.const_expr(self.config.page_size is not None):
+            # Paged KV: the loader indexes the trailing page mode with a
+            # runtime page id per TMA copy, so item boundaries need no
+            # domain shift.  Consumer roles still derive seqlen_k from
+            # cum_seqlen_k, which is therefore required.
+            if cutlass.const_expr(cum_seqlen_k is None):
+                raise ValueError("paged KV requires cum_seqlen_k (varlen mode)")
+            if cutlass.const_expr(kv_page_table is None or kv_page_indptr is None):
+                raise ValueError("paged KV requires kv_page_table and kv_page_indptr")
+            page_size = self.config.page_size
+            num_pages = k_in.shape[0]
+            # Strides come from the incoming (num_pages, page_size, h_k, d)
+            # views, not from compact math: the wrapper compiles with
+            # symbolic outer strides (batch_decode.py precedent) so one
+            # kernel serves NHD-compact caches, combined-cache slices
+            # (2x page stride), and HND-transposed views alike.  Only the
+            # head_dim stride is pinned to 1 (TMA contiguity).
+            # (page, d, ((h_r, h_k), num_pages)), 0-stride h_r broadcast
+            k_layout = cute.make_layout(
+                (page_size, d, ((h_r, h_k), num_pages)),
+                stride=(k_in.stride[1], 1, ((0, k_in.stride[2]), k_in.stride[0])),
+            )
+            k = cute.make_tensor(k_in.iterator, k_layout)
+            # (d, page, ((h_r, h_k), num_pages)), 0-stride h_r broadcast
+            v_layout = cute.make_layout(
+                (d, page_size, ((h_r, h_k), num_pages)),
+                stride=(1, v_in.stride[1], ((0, v_in.stride[2]), v_in.stride[0])),
+            )
+            v = cute.make_tensor(v_in.iterator, v_layout)
+        else:
+            # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
+            k_layout = cute.make_layout(
+                (s_k_all, d, ((h_r, h_k), b_kv)),
+                stride=(d * h_k, 1, ((0, d), stride_b_kv)),
+            )
+            k = cute.make_tensor(k_in.iterator, k_layout)
+            # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
+            v_layout = cute.make_layout(
+                (d, s_k_all, ((h_r, h_k), b_kv)),
+                stride=(1, d * h_k, ((0, d), stride_b_kv)),
+            )
+            v = cute.make_tensor(v_in.iterator, v_layout)
         # (s, d, ((h_r, h_k), b))
         o_layout = cute.make_layout(
             (s_q, d, ((h_r, h_k), b_o)),
@@ -221,6 +278,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
         self.epilogue_role = EpilogueRole(self.config)
         self.loader_role = LoaderRole(self.config)
+        self.pt_loader_role = (
+            PageTableLoaderRole(self.config)
+            if self.config.load_pt_stages is not None
+            else None
+        )
         self.mma_role = MmaRole(
             self.config,
             tmem_alloc_cols=self.tmem.alloc_cols,
@@ -273,7 +335,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         # V's byte count (None means uniform: plain acquires).
         self.loader_role.set_v_tx_bytes(
             lp.tma_copy_v_bytes if self.k_dtype.width != self.v_dtype.width else None,
-            self.mainloop.kv_stages,
         )
 
         if cutlass.const_expr(not self.has_logits_transform):
@@ -306,6 +367,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             lp.v_smem_layout_staged,
             lp.o_smem_layout_staged,
             self.tile_sched_params,
+            lp.k_smem_layout_for_tma,
+            lp.v_smem_layout_for_tma,
+            kv_page_table,
+            kv_page_indptr,
         ).launch(
             grid=grid,
             block=[self.schedule.threads_per_cta, 1, 1],
@@ -415,6 +480,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         v_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams,
+        k_smem_layout_for_tma: cute.ComposedLayout | None,
+        v_smem_layout_for_tma: cute.ComposedLayout | None,
+        kv_page_table: cute.Tensor | None,
+        kv_page_indptr: cute.Tensor | None,
     ):
         """FMHA device kernel: warp-specialized attention with pipelined TMA loads."""
 
@@ -437,6 +506,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_s1_producer, mma_s1_consumer = pipes["mma_s1"]
         s0_s1_sequence_producer, s0_s1_sequence_consumer = pipes["s0_s1_sequence"]
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
+
+        # Page-table ring (empty-warp pt producer -> loader)
+        load_pt_producer = load_pt_consumer = None
+        if cutlass.const_expr(self.config.load_pt_stages is not None):
+            load_pt_producer, load_pt_consumer = pipes["load_pt"]
 
         # Standard path pipelines (correction warp)
         s0_corr_producer = s0_corr_consumer = None
@@ -481,7 +555,28 @@ class BlackwellFusedMultiHeadAttentionForward:
         sO = storage.sO.get_tensor(
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
-
+        # Paged-only views of the same K/V smem ring, divided into per-page
+        # TMA boxes (the MLA decode kc/vc_smem_layout_for_tma pairing).
+        sK_tma = None
+        sV_tma = None
+        if cutlass.const_expr(k_smem_layout_for_tma is not None):
+            sK_tma = storage.sK.get_tensor(
+                k_smem_layout_for_tma.outer, swizzle=k_smem_layout_for_tma.inner
+            )
+            sV_tma = cute.make_tensor(
+                cute.recast_ptr(
+                    cute.recast_ptr(sK.iterator, dtype=self.v_dtype),
+                    v_smem_layout_for_tma.inner,
+                ),
+                v_smem_layout_for_tma.outer,
+            )
+        sPT = None
+        if cutlass.const_expr(self.config.load_pt_stages is not None):
+            sPT = storage.smem_page_table.get_tensor(
+                cute.make_layout(
+                    (self.config.pages_per_kv_tile, self.config.load_pt_stages)
+                )
+            )
         (
             qk_thr_mma,
             pv_thr_mma,
@@ -509,10 +604,24 @@ class BlackwellFusedMultiHeadAttentionForward:
             number_of_threads=self.schedule.threads_per_cta,
         )
         # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
+        #  EMPTY (page-table producer when the pt ring is enabled)
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.schedule.empty_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_empty)
+            if cutlass.const_expr(self.config.load_pt_stages is not None):
+                self.pt_loader_role.run(
+                    mQ_qdl.shape[0],
+                    mK_kdl.shape[0],
+                    cum_seqlen_q,
+                    cum_seqlen_k,
+                    window_left,
+                    window_right,
+                    load_pt_producer,
+                    kv_page_table,
+                    kv_page_indptr,
+                    sPT,
+                    tile_sched_params,
+                )
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -538,7 +647,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                 load_q_producer,
                 load_kv_producer,
                 tile_sched_params,
-                storage.load_kv_mbar_ptr.data_ptr(),
+                sK_tma,
+                sV_tma,
+                kv_page_table,
+                kv_page_indptr,
+                load_pt_consumer,
+                sPT,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////

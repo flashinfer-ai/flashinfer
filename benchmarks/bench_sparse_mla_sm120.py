@@ -96,7 +96,9 @@ def quantize_kv_model1(kv_bf16: torch.Tensor) -> torch.Tensor:
     for tok in range(bs):
         rope_off = tok * data_stride + d_nope
         result_flat[:, rope_off : rope_off + d_rope * 2] = rope[:, tok]
-    return result_flat.view(nb, bs, 1, bpt)
+    # The public DSV4 API defaults to HND. Keep the packed page dimension in
+    # axis 2 so the benchmark exercises the same layout as serving.
+    return result_flat.view(nb, 1, bs, bpt)
 
 
 # ── DSv3.2 INLINE pack (656 B/token) ─────────────────────────────────────────
@@ -305,11 +307,15 @@ def bench_sparse_mla_sm120_dsv4_dual(
     return ms * 1e3, kv_bw_gbps, tflops
 
 
-def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0):
+def bench_sparse_mla_sm120_dsv3_2(
+    num_heads, num_tokens, with_sink=False, seed=0, kv_scale_format="arbitrary_fp32"
+):
     """Returns (median_us, kv_bw_gbps, attn_tflops) for DSv3.2.
 
     Fixed: topk=2048, page_block_size=64 (= _DECODE_DSV3_2_PAGE_BLOCK_SIZE),
-    d_qk=576, d_v=512.
+    d_qk=576, d_v=512. ``kv_scale_format`` picks the power-of-2 inline-scale
+    path (``"auto"``) or the GLM arbitrary-FP32 path (software fold with
+    dual-limb weights).
     """
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -349,7 +355,7 @@ def bench_sparse_mla_sm120_dsv3_2(num_heads, num_tokens, with_sink=False, seed=0
     runner = _SparseMLAPagedAttentionRunner(
         max_num_tokens=num_tokens,
         max_num_heads=num_heads,
-        kv_scale_format="arbitrary_fp32",
+        kv_scale_format=kv_scale_format,
         device=device,
     )
 
@@ -385,35 +391,71 @@ if __name__ == "__main__":
     decode_configs = [
         (16, 128, 1),
         (16, 128, 16),
+        (16, 192, 16),
+        (16, 256, 16),
         (16, 512, 16),
         (32, 128, 1),
         (32, 128, 16),
+        (32, 192, 16),
+        (32, 256, 16),
         (32, 512, 16),
         (64, 128, 1),
         (64, 128, 16),
+        (64, 192, 16),
+        (64, 256, 16),
         (64, 512, 16),
         (64, 1024, 16),
         (128, 128, 1),
         (128, 128, 16),
+        (128, 192, 16),
+        (128, 256, 16),
         (128, 512, 16),
         (128, 1024, 16),
         (128, 128, 32),
+        (128, 192, 32),
+        (128, 256, 32),
         (128, 512, 32),
     ]
     prefill_configs = [
+        (8, 128, 128),
+        (16, 128, 128),
+        (8, 192, 128),
+        (16, 192, 128),
+        (8, 256, 128),
+        (16, 256, 128),
+        (8, 512, 128),
+        (16, 512, 128),
         (64, 128, 128),
+        (64, 192, 128),
+        (64, 256, 128),
         (64, 512, 128),
         (128, 128, 128),
+        (128, 192, 128),
+        (128, 256, 128),
         (128, 512, 128),
+        (8, 192, 512),
+        (16, 192, 512),
+        (8, 256, 512),
+        (16, 256, 512),
         (64, 128, 512),
+        (64, 192, 512),
+        (64, 256, 512),
         (64, 512, 512),
         (128, 128, 512),
+        (128, 192, 512),
+        (128, 256, 512),
         (128, 512, 512),
         (128, 128, 1024),
+        (128, 192, 1024),
+        (128, 256, 1024),
         (128, 512, 1024),
     ]
     dual_prefill_configs = [
         # (num_heads, extra_topk, num_tokens, extra_page_block_size, extra_topk_length)
+        (8, 512, 256, 64, None),
+        (16, 512, 256, 64, None),
+        (8, 512, 256, 2, None),
+        (16, 512, 256, 2, None),
         (64, 512, 256, 64, None),
         (128, 512, 512, 64, None),
         (128, 512, 512, 2, None),
@@ -475,3 +517,18 @@ if __name__ == "__main__":
         print(
             f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
         )
+
+    # DSv3.2 prefill: topk fixed at 2048, num_tokens > 64. Sweep is num_heads x
+    # num_tokens x kv_scale_format; 64/128 heads run the swapAB kernel.
+    dsv3_2_prefill_configs = [(h, t) for t in (128, 512) for h in (64, 128)]
+
+    for fmt in ("auto", "arbitrary_fp32"):
+        print()
+        print(f"DSv3.2 prefill path (num_tokens > 64, kv_scale_format={fmt}):")
+        print(header)
+        print("-" * len(header))
+        for h, t in dsv3_2_prefill_configs:
+            lat_us, kvbw, tfl = bench_sparse_mla_sm120_dsv3_2(h, t, kv_scale_format=fmt)
+            print(
+                f"{h:>10}  {2048:>6}  {t:>11}  {lat_us:>10.1f}  {kvbw:>13.1f}  {tfl:>12.2f}"
+            )

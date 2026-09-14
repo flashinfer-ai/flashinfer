@@ -22,6 +22,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 
+from moe_nvfp4_swapab.epilogue import SwapABSwigluFp4Epilogue, _TmemTranspose16x32Core
 from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
     BlockPhase,
@@ -30,9 +31,11 @@ from moe_nvfp4_swapab.fc1_fc2_fuse_sched import (
 from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
 from common.megamoe_constants import (
     Mxfp8BlockSize,
+    Nvfp4BlockSize,
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
+from common.host_utils import get_cutedsl_target_arch
 from moe_nvfp4_swapab.moe_utils import spin_wait
 
 
@@ -84,7 +87,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         scenario: Literal["2Dx3D"] = "2Dx3D",
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_by_dispatch: bool = False,
-        epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        epi_flag_batch: Tuple[int, int] = (1, 1),
         gate_up_clamp: Optional[float] = None,
         apply_topk_in_fc1: bool = False,
         generate_c: bool = False,
@@ -162,7 +165,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
 
         self.sf_vec_size = sf_vec_size
         self.scenario = scenario
-        self.arch = "sm_100"
+        self.arch = get_cutedsl_target_arch()
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
@@ -209,7 +212,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
@@ -517,8 +520,8 @@ class Sm100SwigluMxfp8Fc12Kernel:
         smem_capacity: int,
         occupancy: int,
         num_sched_stages: int,
-    ) -> Tuple[int, int, int]:
-        """Compute stage counts for ACC, AB+SF, and scheduler."""
+    ) -> Tuple[int, int, int, int]:
+        """Compute stage counts for ACC, A, B, and scheduler."""
         num_acc_stage = 2
 
         a_smem_layout_staged_one = sm100_utils.make_smem_layout_a(
@@ -569,14 +572,6 @@ class Sm100SwigluMxfp8Fc12Kernel:
         if unused_smem > b_bytes_per_stage:
             num_b_stage = num_b_stage + 1
             unused_smem = unused_smem - b_bytes_per_stage
-        print(
-            f"[fc12 stages] num_ab_stage={num_a_stage, num_b_stage} "
-            f"num_acc_stage={num_acc_stage} "
-            f"misc_budget={self._smem_misc_budget_bytes()} "
-            f"c_bytes_total={c_bytes_total} "
-            f"smem_cap={smem_capacity} "
-            f"unused_smem={unused_smem}"
-        )
 
         return num_acc_stage, num_a_stage, num_b_stage, num_sched_stages
 
@@ -1478,6 +1473,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch=self.arch,
         )
 
         # Sched
@@ -1764,41 +1760,6 @@ class Sm100SwigluMxfp8Fc12Kernel:
                     )
                     cute.arch.fence_proxy("async")
                     cute.arch.fence_proxy("async.global")
-
-                    # DEBUG: print counter slot/value after spin exits for first hidden N-tile only.
-                    # Using tidx == tma_a_warp_id*32 since tidx==0 never fires in warp 5.
-                    if tidx == cutlass.Int32(
-                        32 * self.tma_a_warp_id
-                    ) and work_tile_info.tile_n_idx == cutlass.Int32(0):
-                        counter_val_post = cute.arch.load(
-                            counter_ptr, counter_ptr.dtype, cop="cg"
-                        )
-                        # Also load first Int32 from fc1_output for this tile to
-                        # check if TMA S2G stores are visible (non-zero = stored).
-                        fc1_byte_offset = (
-                            work_tile_info.cumulative_data_physical_row
-                            + work_tile_info.tile_m_idx
-                            // cutlass.Int32(self.epilogue._atom_thr_size)
-                            * cutlass.Int32(self.epilogue._cta_tile_m)
-                        ) * fc1_output_gemm.stride[0]
-                        fc1_probe_ptr = cute.make_ptr(
-                            cutlass.Int32,
-                            fc1_output_gemm.iterator.toint() + fc1_byte_offset,
-                            cute.AddressSpace.gmem,
-                        )
-                        fc1_first_i32 = cute.arch.load(
-                            fc1_probe_ptr, cutlass.Int32, cop="cg"
-                        )
-                        # cute.printf(
-                        #     "[fc2_spin_exit] slot=%d counter=%d thresh=%d "
-                        #     "tile_m=%d cumul=%d fc1_first_i32=0x%08x",
-                        #     counter_slot,
-                        #     counter_val_post,
-                        #     fc2_spin_threshold,
-                        #     work_tile_info.tile_m_idx,
-                        #     work_tile_info.cumulative_token_block_count,
-                        #     fc1_first_i32,
-                        # )
 
                     k_tile_cnt = k_tile_cnt_fc2
                     real_a, desc_ptr_a = ext.get_gmem_tensor(

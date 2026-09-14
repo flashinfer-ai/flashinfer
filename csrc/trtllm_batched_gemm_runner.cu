@@ -197,9 +197,6 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
       if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
-        // Skip cubins with clusterZ > 1 due to correctness issues described in
-        // https://github.com/flashinfer-ai/flashinfer/issues/3197
-        if (options.mClusterDimZ > 1) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
@@ -240,6 +237,13 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mPerTokenSfDtype: " << tg::dtypeToString(mOptions.perTokenSfDtype)
             << ", mUsePerChannelScaling: " << mOptions.usePerChannelScaling;
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
+}
+
+batchedGemm::trtllm::gen::SfLayout TrtllmGenBatchedGemmRunner::getSfLayoutB(
+    int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
+  auto const configs = BatchedGemmInterface().getBatchedGemmConfigs();
+  return configs[configIndex].mOptions.mSfLayoutB;
 }
 
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
@@ -283,7 +287,7 @@ void TrtllmGenBatchedGemmRunner::run(
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-    int32_t configIndex, bool enable_pdl) {
+    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
@@ -374,6 +378,23 @@ void TrtllmGenBatchedGemmRunner::run(
 
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+
+  // Resolve valid dimensions in the caller's logical m/n/k space, then remap M/N into the
+  // internal coordinate space used above when transposeMmaOutput swaps m and n.
+  int32_t const logicalValidM = (validM >= 0) ? validM : m;
+  int32_t const logicalValidN = (validN >= 0) ? validN : n;
+  int32_t const logicalValidK = (validK >= 0) ? validK : k;
+
+  FLASHINFER_CHECK(logicalValidM >= 0 && logicalValidM <= m, "validM (", logicalValidM,
+                   ") must be in [0, m=", m, "]");
+  FLASHINFER_CHECK(logicalValidN >= 0 && logicalValidN <= n, "validN (", logicalValidN,
+                   ") must be in [0, n=", n, "]");
+  FLASHINFER_CHECK(logicalValidK >= 0 && logicalValidK <= k, "validK (", logicalValidK,
+                   ") must be in [0, k=", k, "]");
+
+  gemmData.mProblemDimensions.mValidM = mOptions.transposeMmaOutput ? logicalValidN : logicalValidM;
+  gemmData.mProblemDimensions.mValidN = mOptions.transposeMmaOutput ? logicalValidM : logicalValidN;
+  gemmData.mProblemDimensions.mValidK = logicalValidK;
 
   // FIXME once we start using all-reduce in the epilogue of the bmm this can be moved elsewhere
   bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));

@@ -101,6 +101,7 @@ class MegaMoENvfp4Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     non_ubulk_fc2_store: bool = True
     in_kernel_fc2_reduce: bool = False
+    defer_topk_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -168,6 +169,15 @@ class MegaMoENvfp4Config:
                 "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; the REDG "
                 "path can only atomic-add terms whose topk score was already "
                 "absorbed before fc2."
+            )
+        if self.defer_topk_reduce and (
+            self.in_kernel_fc2_reduce
+            or self.combine_dtype != "bf16"
+            or not self.apply_topk_in_fc1
+        ):
+            raise ValueError(
+                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
+                "combine_dtype='bf16', and apply_topk_in_fc1=True."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -313,6 +323,11 @@ class MegaMoENvfp4Frontend:
         a validated-once fast path: validation and cute-tensor construction
         run only when the launch cache misses.
         """
+        if self.config.defer_topk_reduce:
+            raise RuntimeError(
+                "run() cannot return an unreduced output when "
+                "defer_topk_reduce=True; use the terminal adapter"
+            )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
         if resolved == 0:
             return None
@@ -388,6 +403,29 @@ class MegaMoENvfp4Frontend:
 
         return thunk
 
+    def deferred_topk_reduce_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return a zero-copy combine view and its canonical root descriptor."""
+        if not self.config.defer_topk_reduce:
+            raise RuntimeError("deferred TopK-reduce mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "deferred TopK-reduce workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.deferred_topk_reduce_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
+
     @staticmethod
     def _launch_cache_key(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> tuple:
         # Keyed on the RAW (pre-slice) input pointers + the resolved token
@@ -437,6 +475,7 @@ class MegaMoENvfp4Frontend:
             c.epi_flag_batch,
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
+            c.defer_topk_reduce,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
@@ -497,6 +536,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
+            defer_topk_reduce=c.defer_topk_reduce,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
@@ -774,7 +814,11 @@ class MegaMoENvfp4Frontend:
 
     @staticmethod
     def _to_cute(
-        tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False
+        tensor: torch.Tensor,
+        assumed_align: int = 16,
+        *,
+        static_layout: bool = False,
+        dynamic_compact_shape_modes: tuple[int, ...] = (),
     ):
         import cutlass.torch as cutlass_torch
 
@@ -782,7 +826,13 @@ class MegaMoENvfp4Frontend:
         if static_layout:
             return cute_tensor
         leading_dim = cutlass_torch.get_leading_dim(tensor)
-        return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        for mode in dynamic_compact_shape_modes:
+            cute_tensor = cute_tensor.mark_compact_shape_dynamic(
+                mode=mode,
+                stride_order=tensor.dim_order(),
+            )
+        return cute_tensor
 
     def _build_mega_runtime_kwargs(
         self,
@@ -806,15 +856,22 @@ class MegaMoENvfp4Frontend:
             rank_idx=c.rank,
             num_max_ranks=c.world_size,
         )
+        dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 
         return dict(
             activation=self._to_cute(inputs.activation),
             activation_sf=self._to_cute(inputs.activation_sf),
             topk_idx=self._to_cute(inputs.topk_idx),
             topk_weights=self._to_cute(inputs.topk_weights),
-            fc1_weight=self._to_cute(inputs.fc1_weight),
+            fc1_weight=self._to_cute(
+                inputs.fc1_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             fc1_weight_sf=self._to_cute(inputs.fc1_weight_sf),
-            fc2_weight=self._to_cute(inputs.fc2_weight),
+            fc2_weight=self._to_cute(
+                inputs.fc2_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             fc2_weight_sf=self._to_cute(inputs.fc2_weight_sf),
             fc1_alpha=self._to_cute(inputs.fc1_alpha, assumed_align=4),
             fc2_alpha=self._to_cute(inputs.fc2_alpha, assumed_align=4),
@@ -990,6 +1047,7 @@ def get_symm_buffer_for_mega_moe(
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
     in_kernel_fc2_reduce: bool = False,
+    defer_topk_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1080,6 +1138,7 @@ def get_symm_buffer_for_mega_moe(
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        defer_topk_reduce=defer_topk_reduce,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
@@ -1210,8 +1269,27 @@ def nvfp4_mega_moe(
         raise ValueError(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
-    if n == 0 and symm_buffer._frontend.config.fc2_reduces_topk:
-        return symm_buffer.output_activation[:0] if y is None else None
+    # n == 0 used to shortcut here without ever calling frontend.run() below.
+    # That's unsafe for in_kernel_fc2_reduce (fc2_reduces_topk): this
+    # session's EP peers rely on every rank physically launching the kernel
+    # every round (its persistent CTA grid -- get_grid_shape() -- is sized
+    # from hardware occupancy, not num_tokens, so even a 0-token round still
+    # runs the warp-specialized dispatch / token-back / tail-cleanup logic
+    # peers' cross-rank REDG combine depends on -- see the MXFP8 shim's
+    # mxfp8_mega_moe() for the identical bug, root cause, and fix, verified
+    # end-to-end against a real SGLang server). A rank that takes this
+    # shortcut instead silently skips that round's participation,
+    # desynchronizing the session's cross-rank bookkeeping -- peers'
+    # subsequent launches then wait on a signal this rank never posts,
+    # deadlocking within tens of rounds under real (unsynchronized,
+    # per-rank-independent) traffic.
+    #
+    # n == 0 needs no special case at all: it's just the degenerate instance
+    # of the padding scheme every other n already uses below (staging
+    # already marks unrouted rows as "no work" when num_tokens=0, exactly
+    # like it pads the tail for any other n), so falling through to the same
+    # full-buffer frontend.run() call every nonzero n takes is correct, not
+    # just safe.
     if y is not None:
         if y.shape != (n, symm_buffer.hidden):
             raise ValueError(

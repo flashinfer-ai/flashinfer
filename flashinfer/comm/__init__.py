@@ -38,6 +38,24 @@ from .vllm_ar import init_custom_ar as vllm_init_custom_ar
 from .vllm_ar import meta_size as vllm_meta_size
 from .vllm_ar import register_buffer as vllm_register_buffer
 from .vllm_ar import register_graph_buffers as vllm_register_graph_buffers
+from .pcie_ipc_ar import (
+    PcieIpcAllReduceWorkspace as PcieIpcAllReduceWorkspace,
+)
+from .pcie_ipc_ar import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
+from .pcie_ipc_ar import get_pcie_ipc_comm_module as get_pcie_ipc_comm_module
+from .pcie_ipc_policy import IpcLaunchConfig as PcieIpcLaunchConfig
+from .pcie_ipc_policy import IpcVariant as PcieIpcVariant
+from .pcie_ipc_tuning import PCIE_IPC_CUSTOM_OP as PCIE_IPC_CUSTOM_OP
+from .pcie_ipc_tuning import default_cache_path as pcie_ipc_default_cache_path
+from .pcie_ipc_policy import (
+    get_pcie_ipc_launch_config as get_pcie_ipc_launch_config,
+)
+from .pcie_ipc_topology import (
+    probe_pcie_ipc_rank_topology as probe_pcie_ipc_rank_topology,
+)
+from .pcie_ipc_topology import (
+    resolve_pcie_ipc_profile as resolve_pcie_ipc_profile,
+)
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
 from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
 from .ulysses import gen_ulysses_a2a_module as gen_ulysses_a2a_module
@@ -91,12 +109,13 @@ from .dcp_alltoall import decode_cp_a2a_workspace_size as decode_cp_a2a_workspac
 
 # from .mnnvl import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 
+from .all_gather_matmul import all_gather_matmul as all_gather_matmul
+from .all_gather_matmul import (
+    prepare_all_gather_matmul as prepare_all_gather_matmul,
+)
+
 
 def __getattr__(name: str):
-    if name == "all_gather_matmul":
-        from .all_gather_matmul import all_gather_matmul
-
-        return all_gather_matmul
     if name == "quantized_all_reduce":
         from .quantized_allreduce import quantized_all_reduce
 
