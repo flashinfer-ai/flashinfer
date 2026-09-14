@@ -964,6 +964,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         group_size,
         q_dtype,
         kv_dtype,
+        kv_dtype,
         out_dtype,
         "HND",
         "causal",

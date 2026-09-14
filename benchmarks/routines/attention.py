@@ -42,6 +42,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    to_float8,
 )
 
 TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
@@ -700,6 +701,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         return res
     kv_init_dtype = torch.float16 if kv_dtype == torch.float16 else torch.bfloat16
 
+    v_dtype = dtype_str_to_torch_dtype(args.v_dtype) if args.v_dtype else kv_dtype
+
     o_data_type = (
         dtype_str_to_torch_dtype(args.out_dtype) if args.out_dtype else q_dtype
     )
@@ -797,6 +800,18 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             _drop_backend(backends, "prims-ts", "does not support NVFP4 K/V")
         elif q_dtype != kv_dtype:
             _drop_backend(backends, "prims-ts", "requires matching Q and K/V dtypes")
+        elif v_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+            _drop_backend(
+                backends, "prims-ts", "supports only FP16, BF16, or FP8-E4M3 V"
+            )
+        elif v_dtype != kv_dtype and not (
+            kv_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+        ):
+            _drop_backend(
+                backends,
+                "prims-ts",
+                "requires matching K/V dtypes, except QK-BF16/PV-FP8",
+            )
         elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 256):
             _drop_backend(
                 backends,
@@ -1074,20 +1089,38 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     prims_ts_kv_cache = None
     prims_ts_out = None
+    prims_ts_bmm2_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_mask_type = (
             "causal" if not speculative_decode or effective_causal else "dense"
         )
-        # The common fixture intentionally exposes nonstandard outer strides;
-        # PrimTS accepts compact HND pages, so preserve the logical values in a
-        # backend-specific compact cache.
-        prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_q_shape = (
             (batch_size, num_qo_heads, head_dim_qk)
             if s_qo == 1
             else (batch_size, s_qo, num_qo_heads, head_dim_qk)
         )
+        # The common fixture intentionally exposes nonstandard outer strides;
+        # PrimTS accepts compact HND pages, so preserve the logical values in a
+        # backend-specific compact cache. Matching K/V dtypes keep the combined
+        # cache so both operands stay in one allocation.
+        if v_dtype != kv_dtype:
+            prims_ts_k_cache = kv_cache[:, 0].contiguous()
+            prims_ts_v_cache, prims_ts_v_scale_t = to_float8(
+                kv_cache[:, 1].contiguous(), v_dtype
+            )
+            prims_ts_v_scale = prims_ts_v_scale_t.item()
+            prims_ts_kv_cache = (prims_ts_k_cache, prims_ts_v_cache)
+            # Write the FP8-rounded V back into the caches every other backend
+            # reads so --refcheck compares the same V across backends.
+            v_dequant = prims_ts_v_cache.to(torch.float32) * prims_ts_v_scale
+            kv_cache[:, 1].copy_(v_dequant)
+            if "trtllm-gen" in backends:
+                kv_cache_for_trt[:, 1].copy_(v_dequant)
+        else:
+            prims_ts_v_scale = v_scale
+            prims_ts_kv_cache = kv_cache.contiguous()
+        prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
@@ -1101,7 +1134,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             max_seq_len_q=s_qo,
             packed_query=False,
             q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
+            k_data_type=kv_dtype,
+            v_data_type=v_dtype,
             o_data_type=o_data_type,
             mask_type=prims_ts_mask_type,
             seq_lens=actual_seq_lens_kv.flatten().tolist(),
@@ -1194,7 +1228,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=1.0 if v_scale is None else v_scale,
+                bmm2_scale=prims_ts_bmm2_scale,
                 out=out,
                 validate=False,
             )
@@ -1286,7 +1320,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=1.0 if v_scale is None else v_scale,
+                bmm2_scale=prims_ts_bmm2_scale,
                 out=prims_ts_out,
                 validate=False,
             ),
@@ -1351,7 +1385,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 median_time,
                 q_dtype=q_dtype,
                 k_dtype=kv_dtype,
-                v_dtype=kv_dtype,
+                v_dtype=v_dtype if backend == "prims-ts" else kv_dtype,
                 o_dtype=o_data_type,
             )
             resolved_backend = resolved_backends.get(backend, backend)
@@ -1389,6 +1423,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["causal"] = effective_causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
+                cur_res["v_dtype"] = v_dtype if backend == "prims-ts" else kv_dtype
                 cur_res["out_dtype"] = o_data_type
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
@@ -1763,15 +1798,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[VVERBOSE] {kv_indices.shape = }")
         print(f"[VVERBOSE] {kv_last_page_len.shape = }")
         print(f"[VVERBOSE] {scale = }")
-
-    # Helper function to convert to FP8 (matches test_trtllm_gen_attention_decode.py approach)
-    def to_float8(x, dtype=torch.float8_e4m3fn):
-        finfo = torch.finfo(dtype)
-        min_val, max_val = x.aminmax()
-        amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-        scale = finfo.max / amax * 0.1
-        x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
-        return x_scl_sat.to(dtype), scale.float().reciprocal()
 
     # Compute scales and convert to FP8 if needed (before creating wrappers)
     q_scale, k_scale, v_scale = None, None, None
