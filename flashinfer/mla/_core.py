@@ -340,8 +340,8 @@ def _nvfp4_sparse_mla_workspace(
             f"{workspace_bytes}"
         )
 
-    from ._sparse_mla_sm120_execution import dsv4_nvfp4_format_info, resolve_dsv4_nvfp4
-    from ._sparse_mla_sm120_prepared import device_caps, _workspace_tensor_view
+    from ._sparse_mla_sm120._execution import dsv4_nvfp4_format_info, resolve_dsv4_nvfp4
+    from ._sparse_mla_sm120._prepared import device_caps, _workspace_tensor_view
 
     info = dsv4_nvfp4_format_info()
     page = info["page_size"]
@@ -481,7 +481,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
             )
         return out
 
-    from ._sparse_mla_sm120_prepared import functional_run
+    from ._sparse_mla_sm120._prepared import functional_run
 
     if return_lse and out_lse_arg is None:
         out_lse_arg = torch.empty(

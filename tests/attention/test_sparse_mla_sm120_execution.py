@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from flashinfer.mla._sparse_mla_sm120_execution import (
+from flashinfer.mla._sparse_mla_sm120._execution import (
     resolve_dsv4_nvfp4,
     resolve_attention,
 )
@@ -321,7 +321,7 @@ def test_dual_resolved_execution_and_optional_mismatch(model, variant, extra_fp4
 
 @pytest.mark.parametrize("operand", ["indices", "extra_indices"])
 def test_nvfp4_legacy_rejects_width_before_narrowing(operand, sm12x):
-    from flashinfer.mla._sparse_mla_sm120_execution import (
+    from flashinfer.mla._sparse_mla_sm120._execution import (
         get_sparse_mla_dsv4_nvfp4_module,
     )
 
@@ -368,7 +368,7 @@ def test_nvfp4_legacy_rejects_width_before_narrowing(operand, sm12x):
 
 
 def test_nvfp4_resolver_extra_width_boundary(sm12x):
-    from flashinfer.mla._sparse_mla_sm120_execution import (
+    from flashinfer.mla._sparse_mla_sm120._execution import (
         get_sparse_mla_dsv4_nvfp4_module,
     )
 
@@ -561,7 +561,7 @@ def test_wrapper_prepared_resolves_once_and_capture(
         SparseMLASm120Wrapper,
         nvfp4_quantize_pack_sparse_mla_cache,
     )
-    from flashinfer.mla import _sparse_mla_sm120_prepared as prepared
+    from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
     from tests.attention.sparse_mla_test_utils import quantize_kv_dsv4_1
 
     q = torch.randn(4, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -620,7 +620,7 @@ def test_wrapper_prepared_resolves_once_and_capture(
 def test_hot_model_pick_refines_in_tuning_and_capture_does_not_fail(monkeypatch):
     import torch
     from types import SimpleNamespace
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
     c = object()
     state = {"tuning": False, "capture": False, "override": None, "refines": 0}
@@ -708,8 +708,8 @@ def test_prepared_profile_update_and_invalid_extra_order(monkeypatch):
     if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("requires SM12x")
     from flashinfer.mla import SparseMLASm120Wrapper
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
-    from flashinfer.mla import _sparse_mla_sm120_prepared as prepared
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+    from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
     from tests.attention.sparse_mla_test_utils import quantize_kv_dsv4
 
     q = torch.randn(4, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1

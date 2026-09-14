@@ -38,13 +38,13 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4_policy as native
+from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as native
 
 import pytest
 import torch
 
-from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
-from flashinfer.mla._sparse_mla_sm120_calibration import (
+from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
+from flashinfer.mla._sparse_mla_sm120._calibration import (
     CpbConstants,
     predict_time_s,
     select_cpb,
@@ -451,7 +451,7 @@ def test_model_path_dual_cache_wiring(monkeypatch, tmp_path) -> None:
     num_splits spanning both index sets."""
     from types import SimpleNamespace
 
-    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla._sparse_mla_sm120 import _api as sm
 
     device = torch.device("cuda")
     num_tokens, num_heads = 2, 16
@@ -536,7 +536,7 @@ def test_glm_nsa_decode_uses_dsv3_2_cpb_family(clean_cpb_state, monkeypatch) -> 
     from types import SimpleNamespace
 
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla._sparse_mla_sm120 import _api as sm
     from flashinfer.mla._sparse_mla_sm120 import _MODEL_TYPE_GLM_NSA
 
     device = torch.device("cuda")
@@ -666,7 +666,7 @@ def test_public_calibrate_offgrid_shape_idempotent_force(clean_cpb_state) -> Non
     import json
 
     import flashinfer.mla
-    from flashinfer.mla import _sparse_mla_sm120_policy as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _policy as plan_mod
 
     device = torch.device("cuda")
     calibrate = flashinfer.mla.calibrate_sparse_mla_sm120
@@ -750,7 +750,7 @@ def test_public_calibrate_report_type_is_public(clean_cpb_state) -> None:
 
     assert "calibrate_sparse_mla_sm120" in dir(flashinfer.mla)
     assert "SparseMLASm120CalibrationReport" in dir(flashinfer.mla)
-    from flashinfer.mla._sparse_mla_sm120_calibration import (
+    from flashinfer.mla._sparse_mla_sm120._calibration import (
         SparseMLASm120CalibrationReport,
     )
 
@@ -765,7 +765,7 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
     """autotune(skip_ops={"sparse_mla_sm120"}) opts out of the lazy
     calibration passes, not only of choose_one."""
     from flashinfer.autotuner import autotune
-    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla._sparse_mla_sm120 import _api as sm
 
     device = torch.device("cuda")
     num_tokens, num_heads, topk = 2, 64, 512
@@ -826,7 +826,7 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
 
 
 def test_single_cache_override_does_not_leak_into_dual(monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_policy as plan
+    from flashinfer.mla._sparse_mla_sm120 import _policy as plan
 
     constants = cpb_mod.CpbConstants(
         inv_bw=1e-12,
@@ -986,7 +986,7 @@ def test_all_calibration_entries_reject_target_capture_before_work(monkeypatch):
             call()
         assert state == [0]
 
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
     tuner = SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: [])
     monkeypatch.setattr(policy.AutoTuner, "get", lambda: tuner)
@@ -1150,7 +1150,7 @@ def test_native_index_sets_preserve_global_rng(monkeypatch):
 def test_crossover_distinguishes_ineligible_prefill_from_launch_failure(
     monkeypatch, eligible
 ):
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
     failure = RuntimeError("prefill launch failed")
 
@@ -1346,7 +1346,7 @@ def test_write_failure_overlay_does_not_cross_path(store, monkeypatch, tmp_path)
 
 
 def test_public_force_keeps_old_unit_on_measurement_failure(store, monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_execution as execution
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     cpb_mod.publish_calibration(
         store, "dsv4", constants=_C, crossover={"dsv4|16|128": 8}
@@ -1380,8 +1380,8 @@ def test_public_force_keeps_old_unit_on_measurement_failure(store, monkeypatch):
 
 
 def test_native_profile_publishes_once(store, monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4_policy as native
-    from flashinfer.mla import _sparse_mla_sm120_execution as execution
+    from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as native
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(native, "_eligible", lambda *args: (True, True))
@@ -1475,7 +1475,7 @@ def test_cpb_override_persistence_round_trip(clean_cpb_state, monkeypatch) -> No
 
 
 def test_crossover_grid_complete_gates_full_sweep(clean_cpb_state) -> None:
-    from flashinfer.mla._sparse_mla_sm120_policy import (
+    from flashinfer.mla._sparse_mla_sm120._policy import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
     )
@@ -1651,7 +1651,7 @@ def test_public_profile_reuse_force_and_failure(store, monkeypatch):
 
 
 def test_public_preflight_and_default_six_families(store, monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_execution as execution
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     with pytest.raises(ValueError, match="DSV4.1"):
         cpb_mod.calibrate_sparse_mla_sm120(
@@ -1694,8 +1694,8 @@ def test_public_preflight_and_default_six_families(store, monkeypatch):
 
 
 def test_runtime_exact_lookup_unknown_persistence_and_precision(store, monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
-    from flashinfer.mla._sparse_mla_sm120_execution import AttentionMetadata
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+    from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
 
     request = cpb_mod._Dsv41Request(16, 128)
     profile = {
@@ -1792,7 +1792,7 @@ def test_refine_dsv41_merges_exact_token_entry(store, monkeypatch):
 
 
 def test_refine_nvfp4_merges_exact_token_entry(store, monkeypatch):
-    from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4_policy as native
+    from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as native
 
     fields = dict(
         num_heads=64,
@@ -1852,8 +1852,8 @@ def test_refine_nvfp4_merges_exact_token_entry(store, monkeypatch):
 
 def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
     from types import SimpleNamespace
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
-    from flashinfer.mla._sparse_mla_sm120_execution import AttentionMetadata
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+    from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
 
     request = cpb_mod._Dsv41Request(16, 128)
     profile = {
@@ -2084,8 +2084,8 @@ def test_refined_overlay_merges_then_full_profile_replaces(
 
 def test_dsv41_fallback_does_not_start_legacy_measurement(store, monkeypatch):
     from types import SimpleNamespace
-    from flashinfer.mla import _sparse_mla_sm120_policy as policy
-    from flashinfer.mla import _sparse_mla_sm120_execution as execution
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     monkeypatch.setattr(execution, "get_sparse_mla_sm120_module", lambda: object())
     monkeypatch.setattr(

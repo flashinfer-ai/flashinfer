@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
-from flashinfer.mla._sparse_mla_sm120_dsv4_nvfp4 import (
+from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
     get_sparse_mla_nvfp4_sm120_module,
 )
 from flashinfer.mla import nvfp4_quantize_pack_sparse_mla_cache
@@ -377,7 +377,7 @@ def test_dsv41_writer_pitched_footer_pack_append_graph(sm12x):
 
 
 def test_dsv4_nvfp4_final_helper_rejects_stage1_only(monkeypatch, sm12x):
-    from flashinfer.mla import _sparse_mla_sm120_dsv4_nvfp4 as dsv4_nvfp4
+    from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4 as dsv4_nvfp4
 
     q = torch.zeros(1, 16, 512, device="cuda", dtype=torch.bfloat16)
     cache = nvfp4_quantize_pack_sparse_mla_cache(

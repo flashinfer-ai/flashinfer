@@ -37,11 +37,11 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from ..autotuner import AutoTuner
-from . import _sparse_mla_sm120_calibration as _cpb
-from ._sparse_mla_sm120_calibration import CalibrationError
-from ._sparse_mla_sm120_policy import _select_calibrated_variant, _DECODE_MAX_TOKENS
-from ._sparse_mla_sm120_execution import dsv4_nvfp4_format_info
+from ...autotuner import AutoTuner
+from . import _calibration as _cpb
+from ._calibration import CalibrationError
+from ._policy import _select_calibrated_variant, _DECODE_MAX_TOKENS
+from ._execution import dsv4_nvfp4_format_info
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ _AUTOTUNE_OP = "sparse_mla_sm120_nvfp4"
 def _supports(
     heads: int, topk: int, page: int, extra_topk: int, extra_page: int
 ) -> bool:
-    from ._sparse_mla_sm120_execution import query
+    from ._execution import query
 
     return query(
         "supports_attention",
@@ -363,7 +363,7 @@ def plan_nvfp4_sparse_mla_sm120(
 def _allocate_cache_pool(
     page_size: int, pool_bytes: int, device: torch.device
 ) -> tuple[torch.Tensor, int]:
-    from ._sparse_mla_sm120_dsv4_nvfp4 import nvfp4_quantize_pack_sparse_mla_cache
+    from ._dsv4_nvfp4 import nvfp4_quantize_pack_sparse_mla_cache
 
     facts = dsv4_nvfp4_format_info()
     page_bytes = page_size * facts["bytes_per_token"]
@@ -616,7 +616,7 @@ def _nvfp4_measure_context(
     extra_topk: int,
     extra_page_size: int,
 ) -> _Nvfp4MeasureContext:
-    from ._sparse_mla_sm120_execution import get_sparse_mla_dsv4_nvfp4_module
+    from ._execution import get_sparse_mla_dsv4_nvfp4_module
 
     primary_cache, primary_slots, extra_cache, extra_slots = (
         _allocate_calibration_pools(

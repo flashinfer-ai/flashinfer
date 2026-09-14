@@ -333,6 +333,29 @@ ffi::Map<ffi::String, int64_t> format_info(int64_t model) {
                                                          : DecodeTileCfg<ModelType::DSV4>::BI}};
 }
 
+ffi::Array<int64_t> decode_head_counts(int64_t model) {
+  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1));
+  ffi::Array<int64_t> result;
+  for (int heads = 1; heads <= DecodeMaxHeads; ++heads) {
+    int specialized = 0;
+#define MODEL(M)                                                                          \
+  case ModelType::M:                                                                      \
+    specialized = visit_decode_heads<ModelType::M>(heads, [](auto h) { return int(h); }); \
+    break
+    switch (static_cast<ModelType>(model)) {
+      MODEL(DSV3_2);
+      MODEL(DSV4);
+      MODEL(GLM_NSA);
+      MODEL(GLM53_NOPE);
+      MODEL(DOTS3_SWA);
+      MODEL(DSV4_1);
+    }
+#undef MODEL
+    if (specialized != 0) result.push_back(specialized);
+  }
+  return result;
+}
+
 ffi::Array<int64_t> main_page_sizes(int64_t model) {
   TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1));
   ffi::Array<int64_t> result;
@@ -371,6 +394,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(resolve_format,
                               flashinfer::sparse_mla_sm120::execution::resolve_format);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(candidates, flashinfer::sparse_mla_sm120::execution::candidates);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(format_info, flashinfer::sparse_mla_sm120::execution::format_info);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(decode_head_counts,
+                              flashinfer::sparse_mla_sm120::execution::decode_head_counts);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(main_page_sizes,
                               flashinfer::sparse_mla_sm120::execution::main_page_sizes);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(metadata_candidates,

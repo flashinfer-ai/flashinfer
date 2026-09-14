@@ -14,7 +14,7 @@
 
 """DSV4 NVFP4 cache operations and attention facades on SM120.
 
-Prepared execution uses the raw module owner in _sparse_mla_sm120_execution;
+Prepared execution uses the raw module owner in :mod:`._execution`;
 the legacy paged-attention custom-op adapter remains available separately.
 """
 
@@ -25,15 +25,15 @@ from types import SimpleNamespace
 
 import torch
 
-from ..api_logging import flashinfer_api
-from ..utils import (
+from ...api_logging import flashinfer_api
+from ...utils import (
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
 )
 
 
-from ._sparse_mla_sm120_execution import (
+from ._execution import (
     dsv4_nvfp4_format_info,
     get_sparse_mla_dsv4_nvfp4_module,
 )

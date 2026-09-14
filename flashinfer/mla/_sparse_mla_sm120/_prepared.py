@@ -7,10 +7,10 @@ from typing import Optional, Tuple
 
 import torch
 
-from ..autotuner import AutoTuner
-from . import _sparse_mla_sm120_calibration as calibration
-from . import _sparse_mla_sm120_policy as policy
-from ._sparse_mla_sm120_execution import (
+from ...autotuner import AutoTuner
+from . import _calibration as calibration
+from . import _policy as policy
+from ._execution import (
     AttentionMetadata,
     ExecutionPlan,
     get_sparse_mla_sm120_module,
@@ -66,7 +66,7 @@ def tensor_signature(tensor: torch.Tensor | None) -> tuple | None:
 def validate_metadata(
     *tensors, model: int, is_dsv4_nvfp4: bool, extra_fp4: bool, value_dim: int = 0
 ) -> AttentionMetadata:
-    from ._sparse_mla_sm120_execution import query
+    from ._execution import query
 
     try:
         values = query(
@@ -91,7 +91,7 @@ def resolve_execution(
 ) -> ExecutionPlan:
     m = metadata
     if is_dsv4_nvfp4:
-        from ._sparse_mla_sm120_dsv4_nvfp4_policy import (
+        from ._dsv4_nvfp4_policy import (
             plan_nvfp4_sparse_mla_sm120,
             NVFP4KernelVariant,
         )
@@ -277,7 +277,7 @@ def wrapper_run(
     prefill_impl=None,
     return_lse=False,
 ):
-    from ._sparse_mla_sm120_execution import resolve_model_type as _resolve_model_type
+    from ._execution import resolve_model_type as _resolve_model_type
 
     is_dsv4_nvfp4 = wrapper._kv_cache_format == "nvfp4"
     q = q.squeeze(1) if q.ndim == 4 and q.shape[1] == 1 else q
@@ -404,7 +404,7 @@ def functional_run(
     is_dsv4_nvfp4=False,
     extra_fp4=False,
 ):
-    from ._sparse_mla_sm120_execution import resolve_model_type as _resolve_model_type
+    from ._execution import resolve_model_type as _resolve_model_type
 
     model = 1 if is_dsv4_nvfp4 else _resolve_model_type(q.shape[-1], kv_scale_format)
     tensors = (

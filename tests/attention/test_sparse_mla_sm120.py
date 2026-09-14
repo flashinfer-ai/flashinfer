@@ -2199,7 +2199,7 @@ def test_sparse_mla_sm120_decode_dsv4_fp4_extra_requires_dsv4_1() -> None:
 
 def test_sparse_mla_sm120_decode_dsv4_1_dual_fp4_extra(monkeypatch) -> None:
     """Mixed-cache decode against the dequantized-cache reference."""
-    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla._sparse_mla_sm120 import _api as sm
 
     def unexpected_cpb(*args, **kwargs):
         raise AssertionError("mixed decode reused FP8 calibration")
@@ -4319,7 +4319,7 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
     """Injected crossover (decode_max_tokens=8): T=8 routes to the decode
     kernel, T=16 routes to prefill; both match the reference."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
-    from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -4345,7 +4345,7 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
     monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|64|512": 8})
     monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
 
-    from flashinfer.mla import _sparse_mla_sm120_prepared as prepared
+    from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
 
     real_execute = prepared.PreparedCall.execute
     calls = {"decode": 0}
@@ -4385,7 +4385,7 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
     T=32 capture bakes in prefill; both replay correctly on fresh data. A T=8
     capture without crossover constants pins the uncalibrated decode default."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
-    from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -4409,7 +4409,7 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
     dev_key = cpb_mod._device_key(device)
     monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
 
-    from flashinfer.mla import _sparse_mla_sm120_prepared as prepared
+    from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
 
     real_execute = prepared.PreparedCall.execute
     calls = {"decode": 0}
@@ -4515,7 +4515,7 @@ def test_sparse_mla_sm120_runner_scratch_follows_routing(monkeypatch) -> None:
     the scratch untouched, T=4/T=8 decode calls allocate and grow it, and a
     smaller repeat call reuses the grown buffers."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
-    from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -4586,7 +4586,7 @@ def test_sparse_mla_sm120_runner_internal_scratch_cuda_graph(monkeypatch) -> Non
     itself performs no scratch allocation, and replay on fresh data matches
     the eager reference."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
-    from flashinfer.mla import _sparse_mla_sm120_calibration as cpb_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -4751,7 +4751,7 @@ def test_sparse_mla_sm120_envelope_consistency(
 ) -> None:
     """For each probed boundary point, the C++ variant dispatch accepts iff
     the Python envelope predicate claims eligibility."""
-    from flashinfer.mla import _sparse_mla_sm120_policy as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _policy as plan_mod
     from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
 
     device = torch.device("cuda")
@@ -4761,7 +4761,7 @@ def test_sparse_mla_sm120_envelope_consistency(
         model_type, num_heads, topk, page_block_size, has_extra
     )
 
-    from flashinfer.mla._sparse_mla_sm120_execution import format_info
+    from flashinfer.mla._sparse_mla_sm120._execution import format_info
 
     info = format_info(model_type)
     d_qk = info["query_dim"]

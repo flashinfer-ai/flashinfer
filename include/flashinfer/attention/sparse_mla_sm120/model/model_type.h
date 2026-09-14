@@ -54,7 +54,7 @@
 enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1 };
 
 // Prefill kernel variants selected by the Python dispatch planner
-// (flashinfer/mla/_sparse_mla_sm120_policy.py, KernelVariant; the values must
+// (flashinfer/mla/_sparse_mla_sm120/_policy.py, KernelVariant; the values must
 // match). The C++ dispatch is policy-free: it launches the named variant and
 // re-checks the variant's envelope defensively. DECODE_SPLITK=0 never crosses
 // this boundary (decode goes through the standalone decode entry points).

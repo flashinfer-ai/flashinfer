@@ -24,8 +24,8 @@ from flashinfer.mla import (
     nvfp4_quantize_pack_sparse_mla_cache,
 )
 from flashinfer.mla._core import _nvfp4_sparse_mla_workspace
-from flashinfer.mla._sparse_mla_sm120_prepared import _workspace_tensor_view
-from flashinfer.mla._sparse_mla_sm120_dsv4_nvfp4 import (
+from flashinfer.mla._sparse_mla_sm120._prepared import _workspace_tensor_view
+from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
     _nvfp4_sparse_mla_decode,
     _nvfp4_sparse_mla_prefill,
     _nvfp4_sparse_mla_m16n8k64_candidate_major,
@@ -406,7 +406,7 @@ def test_nvfp4_sparse_mla_candidate_major_pv_tile_matches_reference(iterations):
 
 def test_nvfp4_sparse_mla_decode_workspace_has_no_global_vt(monkeypatch) -> None:
     """Decode scratch contains only split outputs/LSE, not materialized V^T."""
-    from flashinfer.mla import _sparse_mla_sm120_execution as execution
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     def unexpected_module():
         pytest.fail("legacy workspace precondition reached the compiled module")
@@ -433,8 +433,8 @@ def test_nvfp4_sparse_mla_decode_workspace_has_no_global_vt(monkeypatch) -> None
                 )
     _require_sm120()
     num_tokens, num_heads, topk, extra_topk = 2, 128, 128, 128
-    from flashinfer.mla._sparse_mla_sm120_execution import resolve_dsv4_nvfp4
-    from flashinfer.mla._sparse_mla_sm120_prepared import device_caps
+    from flashinfer.mla._sparse_mla_sm120._execution import resolve_dsv4_nvfp4
+    from flashinfer.mla._sparse_mla_sm120._prepared import device_caps
 
     sm_count, shared = device_caps(torch.device("cuda"))
     resolved = resolve_dsv4_nvfp4(

@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from flashinfer.mla import SparseMLASm120Wrapper
-from flashinfer.mla import _sparse_mla_sm120_policy as planner
+from flashinfer.mla._sparse_mla_sm120 import _policy as planner
 from tests.attention.sparse_mla_test_utils import (
     inputs,
     _ref_sparse_attn,

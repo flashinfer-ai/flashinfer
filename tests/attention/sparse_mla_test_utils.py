@@ -382,7 +382,7 @@ def _make_decode_scratch(
     num_splits = (topk + bi - 1) // bi + (extra_topk + bi - 1) // bi
     # The runtime-H decode kernels HPB-align the scratch head dim (the
     # dedicated num_heads=8 instantiation keeps the true count).
-    from flashinfer.mla._sparse_mla_sm120_policy import _decode_scratch_heads
+    from flashinfer.mla._sparse_mla_sm120._policy import _decode_scratch_heads
 
     scratch_heads = _decode_scratch_heads(num_heads)
     return (

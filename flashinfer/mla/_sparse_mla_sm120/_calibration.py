@@ -52,7 +52,7 @@ decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
 and persists it as ``decode_max_tokens`` in the same JSON document (schema
 version 3; only current-schema files load — files at any other version count
 as absent, so their families recalibrate on the next tuning-mode pass). The
-runtime decode/prefill routing in :mod:`._sparse_mla_sm120` consults it;
+runtime decode/prefill routing in :mod:`._policy` consults it;
 absent entries keep the historical decode-first policy.
 
 Finally, tuning-mode decode-form calls refine the model's cpb pick for the
@@ -87,7 +87,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 import torch
 from filelock import FileLock
-from ._sparse_mla_sm120_execution import MODEL_FAMILIES, FormatValues, format_info
+from ._execution import MODEL_FAMILIES, FormatValues, format_info
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ _REFINE_WINDOW = 6
 def _model_type_for_family(family: str) -> int:
     """FFI model_type for one calibration family (the decode-dsv4 FFI needs the
     explicit selector: DSV4_1 shares d_qk=512 with DSV4)."""
-    from ._sparse_mla_sm120_policy import (
+    from ._policy import (
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
         _MODEL_TYPE_DSV4_1,
@@ -589,7 +589,7 @@ def _make_decode_call_builder(
     d_v = _D_V[family]
     bi = _CHUNK_WIDTH[family]
     sm_scale = d_qk**-0.5
-    from ._sparse_mla_sm120_policy import _decode_scratch_heads
+    from ._policy import _decode_scratch_heads
 
     def build(
         num_tokens: int, num_heads: int, topk: int, model_type: int, cpb: int
@@ -859,7 +859,7 @@ def calibrate_crossover(
     table: the largest probed T with ``decode_time <= 0.95 * prefill_time``,
     ``0`` when decode never wins, ``64`` when it wins everywhere probed.
     """
-    from ._sparse_mla_sm120_policy import (
+    from ._policy import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
         _DECODE_DSV4_1_CALIBRATION_GRID,
@@ -1060,7 +1060,7 @@ def default_cache_path() -> pathlib.Path:
     if override:
         base = pathlib.Path(override)
     else:
-        from ..jit.env import FLASHINFER_WORKSPACE_DIR
+        from ...jit.env import FLASHINFER_WORKSPACE_DIR
 
         base = FLASHINFER_WORKSPACE_DIR / "autotune"
     return base / "sparse_mla_sm120_cpb.json"
@@ -1468,7 +1468,7 @@ def crossover_grid_complete(device: torch.device, family: str) -> bool:
     ``dsv3_2``). Targeted off-grid calibrations do not count, so a one-off
     ``calibrate_sparse_mla_sm120(heads=..., topks=...)`` cannot suppress the
     full tuning-mode sweep."""
-    from ._sparse_mla_sm120_policy import (
+    from ._policy import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
         _DECODE_DSV4_1_CALIBRATION_GRID,
@@ -1608,7 +1608,7 @@ def get_dsv41_profile(request: _Dsv41Request, device: torch.device) -> dict | No
 def _profile_pool(
     request: _Dsv41Request, device: torch.device, page: int, pool_bytes: int, fp4: bool
 ) -> tuple[torch.Tensor, int]:
-    from ._sparse_mla_sm120 import dsv41_fp4_quantize_pack_sparse_mla_cache
+    from ._api import dsv41_fp4_quantize_pack_sparse_mla_cache
 
     facts = format_info(5)
     bpt = facts["fp4_bytes_per_token"] if fp4 else facts["bytes_per_token"]
@@ -1666,7 +1666,7 @@ class _Dsv41MeasureContext:
 def _dsv41_measure_context(
     request: _Dsv41Request, device: torch.device
 ) -> _Dsv41MeasureContext:
-    from ._sparse_mla_sm120_execution import get_sparse_mla_sm120_module
+    from ._execution import get_sparse_mla_sm120_module
 
     props = torch.cuda.get_device_properties(device)
     caps = (props.multi_processor_count, props.shared_memory_per_block_optin)
@@ -1715,7 +1715,7 @@ def _dsv41_measure_context(
 def _measure_dsv41_bucket(
     request: _Dsv41Request, ctx: _Dsv41MeasureContext, tokens: int
 ) -> dict:
-    from ._sparse_mla_sm120_execution import (
+    from ._execution import (
         AttentionMetadata,
         metadata_candidates,
         resolve_attention,
@@ -1959,7 +1959,7 @@ def _calibrate_dsv41(request: _Dsv41Request, device: torch.device, force: bool) 
 
 # ("<grid heads>", "<grid topks>", min_topk)
 def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
-    from ._sparse_mla_sm120_policy import (
+    from ._policy import (
         _CALIBRATION_HEADS,
         _DECODE_DSV3_2_TOPKS,
         _DECODE_DSV4_TOPKS,
@@ -2118,10 +2118,10 @@ def calibrate_sparse_mla_sm120(
         envelope (e.g. dots3_swa topk < 513); all invalid combinations are
         listed.
     """
-    from ._sparse_mla_sm120_execution import (
+    from ._execution import (
         get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
     )
-    from ._sparse_mla_sm120_policy import _CPB_FAMILY_ALIAS
+    from ._policy import _CPB_FAMILY_ALIAS
 
     t0 = time.monotonic()
     if device is None:
