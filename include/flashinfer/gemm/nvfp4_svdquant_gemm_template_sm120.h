@@ -32,7 +32,6 @@
 
 #include <array>
 #include <cstddef>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -45,12 +44,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/gemm.h"
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_collective_sm120.h"
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_epilogue_sm120.h"
-#endif
-#if defined(SVDQ_SM120_BIAS_COALESCED)
-#include "flashinfer/gemm/nvfp4_svdquant_gemm_bias_sm120.h"
-#endif
 
 namespace flashinfer {
 namespace gemm {
@@ -75,30 +69,10 @@ using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 using ClusterShape = Shape<_1, _1, _1>;  // SM120: fixed, no multicast.
 inline constexpr size_t kInlineDownWorkspaceBytes = 256;
 
-#if defined(SVDQ_SM120_ROW80_STAGES) && SVDQ_SM120_ROW80_STAGES != 4 && SVDQ_SM120_ROW80_STAGES != 5
-#error "SVDQ_SM120_ROW80_STAGES must be 4 or 5"
-#endif
-
-// Historical diagnostic paths are build-wide. The production side-slot is different: its
-// macro is resolved per config below so only row80 changes and every other TU retains the
-// byte-exact path.
-#if defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT) && \
-    (defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER))
-#error "the row80 LoRA side slot cannot combine with another pipeline-owning path"
-#elif defined(SVDQ_SM120_LORA_DEDICATED) && defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER)
-#error \
-    "SVDQ_SM120_LORA_DEDICATED and SVDQ_SM120_LORA_NEUTRAL_BARRIER select conflicting LoRA data paths"
-#endif
-#if defined(SVDQ_SM120_LORA_DEDICATED)
-inline constexpr cutlass::gemm::collective::Sm120LoRaPath kBuildWideLoRaPathSm120 =
-    cutlass::gemm::collective::Sm120LoRaPath::kDedicatedTma;
-#elif defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER)
-inline constexpr cutlass::gemm::collective::Sm120LoRaPath kBuildWideLoRaPathSm120 =
-    cutlass::gemm::collective::Sm120LoRaPath::kSmemNeutralBarrier;
-#else
+// Row80 uses an independent LoRA side slot; all other configurations reuse a
+// residual stage with byte-exact TMA transfers.
 inline constexpr cutlass::gemm::collective::Sm120LoRaPath kBuildWideLoRaPathSm120 =
     cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop;
-#endif
 
 // The LoRA rank this module was compiled for. One module serves one rank, the way
 // the upstream cute-dsl path compiles a specialization per rank; a different rank
@@ -124,14 +98,6 @@ using FusionOperationPerCol =
 using FusionOperationPerRow =
     cutlass::epilogue::fusion::LinCombPerRowBias<OutElementType, float, OutElementType, ElementC,
                                                  float>;
-#if defined(SVDQ_SM120_BIAS_COALESCED)
-// Same bias semantics, but the swapped path's column-broadcast visitor stages the bias
-// vector through shared memory with a cooperative coalesced load instead of per-thread
-// scalar gmem loads (values and output bit-identical; see the staged-bias header).
-using FusionOperationPerRowStaged =
-    cutlass::epilogue::fusion::LinCombPerRowBiasStaged<OutElementType, float, OutElementType,
-                                                       ElementC, float>;
-#endif
 
 template <class MmaTileShape_, bool SwapAB_, class TileSchedulerTag_>
 struct SvdquantGemmConfigSm120 {
@@ -151,17 +117,13 @@ struct SvdquantGemmConfigSm120 {
       SmallM && SwapAB && cute::size<1>(MmaTileShape{}) == 32 &&
       cute::size<2>(MmaTileShape{}) == 256 &&
       cute::is_same_v<TileSchedulerTag, cutlass::gemm::StaticPersistentScheduler>;
-#if defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
   static constexpr bool IsRow80SideSlot = IsRow80;
-#else
-  static constexpr bool IsRow80SideSlot = false;
-#endif
   static constexpr cutlass::gemm::collective::Sm120LoRaPath LoRaPathSm120 =
       IsRow80SideSlot ? cutlass::gemm::collective::Sm120LoRaPath::kDedicatedTma
                       : kBuildWideLoRaPathSm120;
 
-  // LoRA rank this config can stage. The byte-exact and neutral-barrier paths
-  // overlay the rank tile on a residual stage, and one stage spans TileK/4 bf16
+  // LoRA rank this config can stage. The byte-exact path overlays the rank
+  // tile on a residual stage, and one stage spans TileK/4 bf16
   // columns -- 32 for a K128 tile, 64 for K256, where columns 32..63 are TMA
   // zero-filled today precisely because the rank is only 32.
   //
@@ -175,48 +137,23 @@ struct SvdquantGemmConfigSm120 {
   static constexpr int LoRaRank =
       kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ? kSvdqSm120ModuleLoRaRank : 32;
   static_assert(!IsRow80SideSlot || IsRow80, "the production side slot is row80-only");
-#if defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
   static_assert(IsRow80 ||
                     LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop,
                 "non-row80 configs must retain the byte-exact LoRA path");
-#endif
-#if defined(SVDQ_SM120_LORA_EVERY_SPLIT) || ((defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) ||  \
-                                              defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)) && \
-                                             !defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY))
-  // Fault-injection and cost-decomposition builds preserve their original
-  // row80 codegen so production tuning cannot contaminate those diagnostics.
-  static constexpr bool IsProductionRow80 = false;
-#else
   static constexpr bool IsProductionRow80 =
       IsRow80 && (LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop ||
                   IsRow80SideSlot);
-#endif
-#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) || defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT)
   static_assert(!IsRow80 || IsProductionRow80, "the row80 diagnostic lost its production traits");
-#endif
   static_assert(!SmallM || IsProvenSmallM || IsRow80, "unsupported 64-row SM120 SVDQuant tile");
 
   using LayoutC =
       cute::conditional_t<SwapAB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
-#if defined(SVDQ_SM120_BIAS_COALESCED)
-  // Staged bias only on swapped tiles at or below 128x128: the 256-row swap TUs run 384
-  // threads against a full 64K register file with ptxas spills pinned exactly, so they
-  // keep the upstream visitor (byte-identical codegen), mirroring the epilogue-overlap
-  // restriction below.
-  static constexpr bool UseStagedBias =
-      SwapAB && cute::size<0>(MmaTileShape{}) * cute::size<1>(MmaTileShape{}) <= 128 * 128;
-  using FusionOperation = cute::conditional_t<
-      UseStagedBias, FusionOperationPerRowStaged,
-      cute::conditional_t<SwapAB, FusionOperationPerRow, FusionOperationPerCol>>;
-#else
   using FusionOperation = cute::conditional_t<SwapAB, FusionOperationPerRow, FusionOperationPerCol>;
-#endif
 
   using CollectiveEpilogueBase = typename cutlass::epilogue::collective::CollectiveBuilder<
       Arch, cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape, EpilogueTileType,
       ElementAccumulator, ElementCompute, ElementC, LayoutC, AlignC, OutElementType, LayoutC,
       AlignC, cutlass::epilogue::TmaWarpSpecialized, FusionOperation>::CollectiveOp;
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
   // Hook-enabled copy of the builder's epilogue so the rank-32 LoRA tail folds into
   // each epilogue subtile's accumulator MMA blocks inside the store loop. Storage,
   // params, and every non-store path are verbatim. RESTRICTED to tiles at or below
@@ -231,16 +168,12 @@ struct SvdquantGemmConfigSm120 {
       cute::conditional_t<UseLoRaEpiOverlap,
                           typename MakeSm120LoRaOverlapEpilogue<CollectiveEpilogueBase>::Type,
                           CollectiveEpilogueBase>;
-#else
-  using CollectiveEpilogue = CollectiveEpilogueBase;
-#endif
 
   // Shared-memory carveout the residual stage builder must not touch, on top of the
   // epilogue storage. Byte-exact policy: zero, D/L1 overlay the residual A/B stage buffers.
   // Dedicated policy: the true rank-32 bf16 D[M,32]/L1[N,32] staging buffers plus the
   // one-slot LoRA pipeline barriers, rounded to 128 like the builder's own per-stage
-  // pipeline allowance. Smem-neutral policy: the 128-byte pipeline-barrier allowance ONLY -
-  // D/L1 land at the borrow stage base inside the residual A/B buffers. Keep this bound
+  // pipeline allowance. Keep this bound
   // tight: over-counting drops a residual stage (K256 tiles sit directly on the Stages >= 2
   // floor), under-counting over-allocates the smem capacity (checked by the static_assert
   // below).
@@ -253,8 +186,7 @@ struct SvdquantGemmConfigSm120 {
                              (IsRow80SideSlot ? Row80SideSlotStorageK : 32) *
                              sizeof(cutlass::bfloat16_t)) +
                 128
-          : (LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kSmemNeutralBarrier ? 128
-                                                                                            : 0);
+          : 0;
 
   // Build the standard SM120 block-scaled mainloop, then re-instantiate the LoRA collective
   // with the builder's extracted template arguments and this config's LoRA path policy.
@@ -272,20 +204,12 @@ struct SvdquantGemmConfigSm120 {
 
   using AutoMainloopStageCount = cutlass::gemm::collective::StageCountAutoCarveout<
       static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage)) + LoRaSmemCarveoutBytes>;
-#if defined(SVDQ_SM120_ROW80_STAGES)
-  // Keep the diagnostic stage override row80-only: every other config retains
-  // the builder's capacity-aware automatic stage policy.
-  using MainloopStageCount =
-      cute::conditional_t<IsRow80, cutlass::gemm::collective::StageCount<SVDQ_SM120_ROW80_STAGES>,
-                          AutoMainloopStageCount>;
-#else
   // NCU exposed pipeline-wait headroom in the three-stage row80 donor. Four
   // stages won the strict-CUPTI comparison without changing CTA residency and
   // use less shared memory than the statistically tied five-stage candidate.
   using MainloopStageCount =
       cute::conditional_t<IsProductionRow80, cutlass::gemm::collective::StageCount<4>,
                           AutoMainloopStageCount>;
-#endif
 
   using CollectiveMainloopBase = typename cutlass::gemm::collective::CollectiveBuilder<
       Arch, cutlass::arch::OpClassBlockScaledTensorOp, cute::tuple<ElementType, SFType>, LayoutA,
@@ -350,32 +274,8 @@ struct SvdquantGemmConfigSm120 {
                 "inline-down codegen selection must not change shared storage sizing");
 };
 
-#if defined(SVDQ_SM120_STATIC_SCHED)
-// Persistent tactics run on the static tile scheduler (PersistentTileSchedulerSm90,
-// the scheduler the stock SM120 library kernels use): tile coordinates derive from
-// blockIdx by divmod, there is no scheduler-response pipeline and no CLC query warp.
-// Only the tile->CTA assignment mechanism changes; per-tile work is identical.
-using PersistentTag = cutlass::gemm::StaticPersistentScheduler;
-#else
 using PersistentTag = cutlass::gemm::PersistentScheduler;
-#endif
 using StreamKTag = cutlass::gemm::StreamKScheduler;
-
-// Test hook shared by every host-side entry (workspace sizing, feasibility, launch):
-// forcing the Stream-K decomposition must be visible to all three, otherwise the
-// forced launch would out-grow the workspace sized under the default heuristic.
-template <class Config, class SchedulerArgs>
-inline void apply_streamk_test_overrides(SchedulerArgs& scheduler_args) {
-  if constexpr (cute::is_same_v<typename Config::TileSchedulerTag, StreamKTag>) {
-    if (char const* forced = std::getenv("SVDQ_SM120_STREAMK_FORCE_SPLITS")) {
-      int const splits = std::atoi(forced);
-      if (splits > 1) {
-        scheduler_args.splits = splits;
-        scheduler_args.decomposition_mode = decltype(scheduler_args.decomposition_mode)::SplitK;
-      }
-    }
-  }
-}
 
 // 16 legacy kernels: shape-major, then swap_ab, then scheduler. IDs are stable.
 using Tactic128x128x128Config =
@@ -445,15 +345,6 @@ using Tactic64x128x256Config =
 // assignment (no scheduler-response pipeline, no CLC query warp); many-wave
 // problems lose the dynamic load balancing, so the host side exposes these rows
 // only inside the one-wave envelope of their own tile grid.
-#if defined(SVDQ_SM120_STATIC_SCHED)
-// Under the global static-scheduler build every persistent config already runs
-// the static scheduler, so these collapse into their base configs (same type);
-// their translation units then compile out the explicit instantiation to keep
-// exactly one definition per specialization.
-using Tactic128x64x256SwapStaticConfig = Tactic128x64x256SwapConfig;
-using Tactic128x32x128SwapStaticConfig = Tactic128x32x128SwapConfig;
-using Tactic64x128x128StaticConfig = Tactic64x128x128Config;
-#else
 using Tactic128x64x256SwapStaticConfig =
     SvdquantGemmConfigSm120<Shape<_128, _64, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
 using Tactic128x32x128SwapStaticConfig =
@@ -461,7 +352,6 @@ using Tactic128x32x128SwapStaticConfig =
 using Tactic64x128x128StaticConfig =
     SvdquantGemmConfigSm120<Shape<_64, _128, _128>, false,
                             cutlass::gemm::StaticPersistentScheduler>;
-#endif
 
 // Fill-geometry kernel (id 26): the 32-column swap tile with K256 steps -
 // kernel 19's grid fill (48 CTAs at M=64 on 3072-column problems) combined
@@ -473,12 +363,8 @@ using Tactic128x32x256SwapConfig =
 // Kernel id 27: static-scheduler sibling of the fill-geometry kernel. The
 // host exposes it only for one-wave grids; keeping the dynamic config as id 26
 // preserves the existing row 78 and the multi-wave fallback.
-#if defined(SVDQ_SM120_STATIC_SCHED)
-using Tactic128x32x256SwapStaticConfig = Tactic128x32x256SwapConfig;
-#else
 using Tactic128x32x256SwapStaticConfig =
     SvdquantGemmConfigSm120<Shape<_128, _32, _256>, true, cutlass::gemm::StaticPersistentScheduler>;
-#endif
 
 // Kernel id 28: production row80 combines the proven 64-row single-consumer
 // driver with the 32-column K256 donor. At M=64,N=3072 the swapped grid grows
@@ -490,13 +376,9 @@ using Tactic64x32x256SwapStaticConfig =
 // 105-tile M537,N5376 grid. It fits a 110-SM part in one wave, where the
 // static scheduler avoids the persistent scheduler-response protocol.
 // Profitability is restricted to the two measured K shapes by Python.
-#if defined(SVDQ_SM120_STATIC_SCHED)
-using Tactic256x128x128SwapStaticConfig = Tactic256x128x128SwapConfig;
-#else
 using Tactic256x128x128SwapStaticConfig =
     SvdquantGemmConfigSm120<Shape<_256, _128, _128>, true,
                             cutlass::gemm::StaticPersistentScheduler>;
-#endif
 
 // Row 82: the six-wave case-9 winner. Its 651 nearly full CTA slots make the
 // static scheduler profitable despite the multi-wave grid, while the 64-column
@@ -738,7 +620,6 @@ inline void apply_runtime_scheduler_args(RuntimeTacticSm120 const& rt,
       scheduler_args.decomposition_mode = decltype(scheduler_args.decomposition_mode)::SplitK;
     }
   }
-  apply_streamk_test_overrides<Config>(scheduler_args);
 }
 
 template <class Config>
@@ -993,12 +874,8 @@ SVDQ_SM120_NO_INLINE_DOWN_CONFIG_LIST(SVDQ_SM120_DECLARE_NO_INLINE_DOWN)
 // The per-shape static-scheduler configs alias their base configs under the global
 // static-scheduler build; their translation units must then define nothing (the
 // base config's TU already holds the one definition per specialization).
-#if defined(SVDQ_SM120_STATIC_SCHED)
-#define INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_STATIC_TACTIC(Config)
-#else
 #define INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_STATIC_TACTIC(Config) \
   INSTANTIATE_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Config)
-#endif
 
 #define EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Config)                                           \
   extern template size_t shared_storage_size_for_tactic<Config>();                                \
@@ -1045,7 +922,6 @@ EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x32x128SwapConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic64x128x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic64x128x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x64x256SwapSkConfig)
-#if !defined(SVDQ_SM120_STATIC_SCHED)
 // Under the global static-scheduler build these names alias configs already
 // declared above; re-declaring the same specializations is redundant.
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x64x256SwapStaticConfig)
@@ -1053,7 +929,6 @@ EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x32x128SwapStaticConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic64x128x128StaticConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x32x256SwapStaticConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic256x128x128SwapStaticConfig)
-#endif
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic128x32x256SwapConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic64x32x256SwapStaticConfig)
 EXTERN_NVFP4_SVDQUANT_GEMM_SM120_TACTIC(Tactic256x64x128SwapStaticConfig)
