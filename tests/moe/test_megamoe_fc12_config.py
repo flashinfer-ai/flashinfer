@@ -56,9 +56,7 @@ def test_non_bf16_family_is_not_silently_prepared():
         prepare_megamoe_fc12_weights(
             w13,
             w2,
-            quant=QuantConfig(
-                weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8
-            ),
+            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
             num_local_experts=1,
             hidden_size=32,
             intermediate_size=64,
