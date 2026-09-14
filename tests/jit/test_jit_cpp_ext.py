@@ -58,6 +58,110 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
+def _ldflags_block(ninja: str) -> str:
+    """Return the multiline ``ldflags = ...`` assignment from a ninja file."""
+    lines = ninja.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("ldflags ="))
+    end = start + 1
+    while end < len(lines) and lines[end].startswith("    "):
+        end += 1
+    return "\n".join(lines[start:end])
+
+
+def test_generate_ninja_supports_pip_cuda_wheel_lib_layout(monkeypatch, tmp_path):
+    # pip nvidia-cuda-* cu13 wheels ship lib/ only with versioned sonames (#5064).
+    cuda_home = tmp_path / "pip_cuda"
+    (cuda_home / "lib").mkdir(parents=True)
+    (cuda_home / "lib" / "libcudart.so.13").touch()
+    (cuda_home / "lib" / "libnvrtc.so.13").touch()
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(cuda_home))
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+    ldflags = _ldflags_block(ninja)
+
+    assert "name = test_module" in ninja
+    assert "-L$cuda_home/lib" in ldflags
+    assert "-L$cuda_home/lib64" not in ldflags
+    assert "-l:libcudart.so.13" in ldflags
+    assert "-lcudart" not in ldflags.replace("-l:libcudart.so.13", "")
+
+
+def test_generate_ninja_keeps_system_lib64_and_stubs(monkeypatch, tmp_path):
+    cuda_home = tmp_path / "system_cuda"
+    (cuda_home / "lib64" / "stubs").mkdir(parents=True)
+    (cuda_home / "lib64" / "libcudart.so").touch()
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(cuda_home))
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+    ldflags = _ldflags_block(ninja)
+
+    assert "-L$cuda_home/lib64" in ldflags
+    assert "-L$cuda_home/lib64/stubs" in ldflags
+    assert "-lcudart" in ldflags
+    assert "-l:libcudart" not in ldflags
+
+
+def test_generate_ninja_rewrites_versioned_nvrtc_from_extra_ldflags(
+    monkeypatch, tmp_path
+):
+    cuda_home = tmp_path / "pip_cuda"
+    (cuda_home / "lib").mkdir(parents=True)
+    (cuda_home / "lib" / "libcudart.so.13").touch()
+    (cuda_home / "lib" / "libnvrtc.so.13").touch()
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(cuda_home))
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=["-lnvrtc"],
+        extra_include_dirs=None,
+    )
+    ldflags = _ldflags_block(ninja)
+
+    assert "-l:libnvrtc.so.13" in ldflags
+    assert "-lnvrtc" not in ldflags.replace("-l:libnvrtc.so.13", "")
+
+
+def test_generate_ninja_errors_when_cuda_lib_dirs_missing(monkeypatch, tmp_path):
+    cuda_home = tmp_path / "empty_cuda"
+    cuda_home.mkdir(parents=True)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(cuda_home))
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+
+    with pytest.raises(RuntimeError, match="No CUDA library directory"):
+        cpp_ext.generate_ninja_build_for_op(
+            name="test_module",
+            sources=[tmp_path / "generated" / "kernel.cu"],
+            extra_cflags=None,
+            extra_cuda_cflags=None,
+            extra_ldflags=None,
+            extra_include_dirs=None,
+        )
+
+
 def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
