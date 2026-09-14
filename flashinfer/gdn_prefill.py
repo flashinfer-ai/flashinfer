@@ -446,6 +446,16 @@ def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
 
 
+def get_cp_max_seqlen(
+    total_seq_len: int, num_seqs: int, max_seqlen: Optional[int]
+) -> int:
+    """Return the caller-provided CP sequence bound or its balanced fallback."""
+    if max_seqlen is not None:
+        return max_seqlen
+    cp_num_seqs = 1 if num_seqs == 0 else num_seqs
+    return (total_seq_len + cp_num_seqs - 1) // cp_num_seqs
+
+
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
@@ -913,11 +923,7 @@ def chunk_gated_delta_rule(
                 if _arch_major in (9, 10, 12)
                 else {}
             )
-            cp_max_seqlen = (
-                max_seqlen
-                if max_seqlen is not None
-                else (total_seq_len + num_seqs - 1) // num_seqs
-            )
+            cp_max_seqlen = get_cp_max_seqlen(total_seq_len, num_seqs, max_seqlen)
             cp_delta_rule_dsl(
                 output,
                 output_state,
