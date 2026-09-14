@@ -413,18 +413,20 @@ inline PrefillLaunchResult dispatch_dsv4_single(
     const bf16* Q, const uint8_t* KV, const int32_t* indices, const float* attn_sink, bf16* output,
     float* out_lse, float sm_scale, int num_tokens, size_t page_stride_bytes,
     size_t out_lse_stride_elems, const int* topk_length_ptr, cudaStream_t stream) {
-  if (page_block_size != execution::FixedPageSize) return false;
-  return execution::visit_prefill_heads<ModelType::DSV4, 2>(num_heads, [&](auto head) {
-    constexpr int H = decltype(head)::value;
-    constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
-    if (plan.numeric == execution::NumericRoute::QkBF16PvFP8)
-      return launch_prefill_mg<ModelType::DSV4, QkComputeMode::BF16, H, 64, groups>(
+  auto page = [&](auto pbs) {
+    return execution::visit_prefill_heads<ModelType::DSV4, 2>(num_heads, [&](auto head) {
+      constexpr int H = decltype(head)::value, P = decltype(pbs)::value;
+      constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
+      if (plan.numeric == execution::NumericRoute::QkBF16PvFP8)
+        return launch_prefill_mg<ModelType::DSV4, QkComputeMode::BF16, H, P, groups>(
+            Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk,
+            page_stride_bytes, out_lse_stride_elems, topk_length_ptr, stream);
+      return launch_prefill_mg<ModelType::DSV4, QkComputeMode::FP8, H, P, groups>(
           Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
           out_lse_stride_elems, topk_length_ptr, stream);
-    return launch_prefill_mg<ModelType::DSV4, QkComputeMode::FP8, H, 64, groups>(
-        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
-        out_lse_stride_elems, topk_length_ptr, stream);
-  });
+    });
+  };
+  return execution::visit_dsv4_main_page(page_block_size, page);
 }
 
 inline PrefillLaunchResult dispatch_dsv4_dual(
@@ -434,23 +436,26 @@ inline PrefillLaunchResult dispatch_dsv4_dual(
     const float* attn_sink, bf16* output, float* out_lse, float sm_scale, int num_tokens,
     size_t page_stride_bytes, size_t extra_page_stride_bytes, size_t out_lse_stride_elems,
     const int* topk_length_ptr, const int* topk_length_extra_ptr, cudaStream_t stream) {
-  if (page_block_size != execution::FixedPageSize) return false;
-  auto page = [&](auto pbs) {
-    return execution::visit_prefill_heads<ModelType::DSV4, 3>(num_heads, [&](auto head) {
-      constexpr int H = decltype(head)::value, P = decltype(pbs)::value;
-      constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
-      if (plan.implementation == execution::Implementation::FullTile)
-        return launch_prefill_mg_dual_fulltile<ModelType::DSV4, H, 64, P, groups>(
+  auto main_page = [&](auto mpbs) {
+    auto page = [&](auto pbs) {
+      return execution::visit_prefill_heads<ModelType::DSV4, 3>(num_heads, [&](auto head) {
+        constexpr int H = decltype(head)::value, P = decltype(pbs)::value,
+                      MP = decltype(mpbs)::value;
+        constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
+        if (plan.implementation == execution::Implementation::FullTile)
+          return launch_prefill_mg_dual_fulltile<ModelType::DSV4, H, MP, P, groups>(
+              Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,
+              topk, topk_extra, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
+              stream);
+        return launch_prefill_mg_dual<ModelType::DSV4, QkComputeMode::BF16, H, MP, P, groups>(
             Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,
             topk, topk_extra, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
-            stream);
-      return launch_prefill_mg_dual<ModelType::DSV4, QkComputeMode::BF16, H, 64, P, groups>(
-          Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,
-          topk, topk_extra, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
-          topk_length_ptr, topk_length_extra_ptr, stream);
-    });
+            topk_length_ptr, topk_length_extra_ptr, stream);
+      });
+    };
+    return execution::visit_extra_page(extra_page_block_size, page);
   };
-  return execution::visit_extra_page(extra_page_block_size, page);
+  return execution::visit_dsv4_main_page(page_block_size, main_page);
 }
 
 }  // namespace

@@ -134,7 +134,11 @@ class SparseMLASm120DecodeConfig:
         GLM53_NOPE, ``576`` for DSv3.2 / GLM-NSA, ``1088`` for the
         DOTS3_SWA sliding-window family, whose ``d_v`` is then 1024).
     page_block_size : int
-        Default page size; the required size unless ``page_block_size_is_runtime``.
+        Default page size; the required size unless ``page_block_sizes`` lists
+        further instantiated sizes or ``page_block_size_is_runtime`` is set.
+    page_block_sizes : frozenset[int]
+        Exact instantiated main page sizes. Empty means only
+        ``page_block_size`` (ignored when ``page_block_size_is_runtime``).
     page_block_size_is_runtime : bool
         Accept independent positive page sizes instead of a fixed main page size.
     max_num_tokens : int
@@ -178,6 +182,7 @@ class SparseMLASm120DecodeConfig:
     head_counts: Optional[frozenset[int]] = None
     topk_is_runtime: bool = True
     extra_page_block_sizes: frozenset[int] = frozenset()
+    page_block_sizes: frozenset[int] = frozenset()
     page_block_size_is_runtime: bool = False
 
     def supported_num_heads(self) -> tuple[int, ...]:
@@ -223,12 +228,13 @@ class SparseMLASm120DecodeConfig:
         topk_supported = (
             topk >= self.min_topk if self.topk_is_runtime else topk in self.topks
         )
+        page_sizes = self.page_block_sizes or frozenset({self.page_block_size})
         return (
             num_tokens <= self.max_num_tokens
             and (
                 page_block_size > 0
                 if self.page_block_size_is_runtime
-                else page_block_size == self.page_block_size
+                else page_block_size in page_sizes
             )
             and head_supported
             and topk_supported
@@ -294,7 +300,7 @@ def supported_sparse_mla_sm120_configs(
             )
         }
 
-    from ._sparse_mla_sm120_execution import format_info
+    from ._sparse_mla_sm120_execution import format_info, main_page_sizes
 
     probes = (
         _DECODE_DSV3_2_TOPKS,
@@ -315,6 +321,7 @@ def supported_sparse_mla_sm120_configs(
             min_topk=info["min_topk"],
             max_num_heads=info["max_heads"],
             bytes_per_token=info["bytes_per_token"],
+            page_block_sizes=frozenset(main_page_sizes(model)),
             page_block_size_is_runtime=bool(info["runtime_page"]),
         )
     result["glm_nsa"] = result["dsv3_2"]
@@ -342,14 +349,19 @@ def _decode_dispatch_error_message(
         )
     if page_block_size <= 0:
         reasons.append("page_block_size must be positive")
-    elif (
-        not config.page_block_size_is_runtime
-        and page_block_size != config.page_block_size
-    ):
-        reasons.append(
-            f"page_block_size={page_block_size} is unsupported; decode kernels "
-            f"are instantiated only for page_block_size={config.page_block_size}"
-        )
+    elif not config.page_block_size_is_runtime:
+        page_sizes = config.page_block_sizes or frozenset({config.page_block_size})
+        if page_block_size not in page_sizes:
+            sizes = tuple(sorted(page_sizes))
+            reasons.append(
+                f"page_block_size={page_block_size} is unsupported; decode kernels "
+                "are instantiated only for "
+                + (
+                    f"page_block_size={config.page_block_size}"
+                    if len(sizes) == 1
+                    else f"page_block_size in {sizes}"
+                )
+            )
     if topk < config.min_topk:
         reasons.append(
             f"topk={topk} is below the {family} decode minimum "
