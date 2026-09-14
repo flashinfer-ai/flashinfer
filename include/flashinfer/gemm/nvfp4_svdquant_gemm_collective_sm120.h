@@ -1,3 +1,36 @@
+/***************************************************************************************************
+ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+
+// SVDQuant modifications are covered by the following Apache-2.0 notice.
 /*
  * Copyright (c) 2026 by FlashInfer team.
  *
@@ -68,11 +101,9 @@
 #include "cutlass/trace.h"
 #include "cutlass/workspace.h"
 
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
 // Hook-enabled epilogue copy + the subtile-hook helpers the kernel below threads
 // through the store loop.
 #include "flashinfer/gemm/nvfp4_svdquant_gemm_epilogue_sm120.h"
-#endif
 
 namespace cutlass::gemm::collective {
 using namespace cute;
@@ -110,71 +141,7 @@ struct MaybeLoRaSmemSwizzle<true, Layout> {
 //     exactly match the armed residual budget (stage-buffer overlays, dummy SFA/SFB reloads);
 //   - kDedicatedTma: a one-slot pipeline with its own carveout, barriers, and transaction
 //     budget; the residual pipeline's byte accounting and state are never touched.
-//   - kSmemNeutralBarrier: the dedicated policy's true-rank TMAs and one-slot pipeline, but
-//     the destination is the borrow stage - the residual stage the mainloop producer would
-//     fill NEXT (its 1024B-aligned base inside smem_A/smem_B). No carveout, no padded
-//     boxes, no dummy SF reloads, and the mainloop runs exactly its K residual steps; the
-//     mainloop pipeline's byte accounting and state are never touched.
-enum class Sm120LoRaPath { kByteExactMainloop, kDedicatedTma, kSmemNeutralBarrier };
-
-// Measurement-only build rungs for costing the byte-exact LoRA path. Each compiles a module
-// whose OUTPUT LACKS THE LoRA TERM; they exist solely so a fixed-tactic A/B can decompose the
-// LoRA fixed cost into transfer protocol (transfer-only minus residual-only) and serialized
-// bf16 tail (full minus transfer-only). They are separate whole-module variants, never
-// reachable from dispatch; production-parity rungs also support row80's independent slot.
-#if defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) && defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)
-#error "LoRA ladder rungs are mutually exclusive: pick residual-only or transfer-only"
-#endif
-#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) &&    \
-    !defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) && \
-    !defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)
-#error "row80 production parity is defined only for a LoRA ladder rung"
-#endif
-#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) &&                                        \
-    (!defined(SVDQ_SM120_LORA_EPI_OVERLAP) || !defined(SVDQ_SM120_LORA_TRUE_RANK_TAIL) || \
-     defined(SVDQ_SM120_ROW80_STAGES) || defined(SVDQ_SM120_STATIC_SCHED) ||              \
-     defined(SVDQ_SM120_BIAS_COALESCED) || defined(SVDQ_SM120_LORA_SMEM_SWIZZLE) ||       \
-     defined(SVDQ_SM120_STOCK_PARITY_KSTEP))
-#error "row80 production parity requires the production tuning defaults"
-#endif
-#if defined(SVDQ_SM120_ROW80_LORA_SIDE_SLOT) &&                                           \
-    (!defined(SVDQ_SM120_LORA_EPI_OVERLAP) || !defined(SVDQ_SM120_LORA_TRUE_RANK_TAIL) || \
-     defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER) ||    \
-     defined(SVDQ_SM120_LORA_EVERY_SPLIT) ||                                              \
-     ((defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) ||                                   \
-       defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)) &&                                  \
-      !defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY)) ||                                    \
-     defined(SVDQ_SM120_LORA_SMEM_SWIZZLE) || defined(SVDQ_SM120_ROW80_STAGES) ||         \
-     defined(SVDQ_SM120_STATIC_SCHED) || defined(SVDQ_SM120_BIAS_COALESCED) ||            \
-     defined(SVDQ_SM120_STOCK_PARITY_KSTEP))
-#error "the row80 LoRA side slot requires the production tuning defaults"
-#endif
-#if (defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) ||                              \
-     defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)) &&                             \
-    (defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_EVERY_SPLIT) || \
-     defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER))
-#error "LoRA ladder rungs measure the byte-exact path only and cannot combine with other variants"
-#endif
-#if defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER) && \
-    (defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_EVERY_SPLIT))
-#error "the smem-neutral LoRA barrier cannot combine with the dedicated or every-split variants"
-#endif
-// The epilogue-overlap fold composes with the byte-exact AND smem-neutral data paths (both
-// stage D/L1 register fragments out of residual-stage overlays); it does not compose with
-// the study/fault variants.
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP) &&                                        \
-    (defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_EVERY_SPLIT) || \
-     ((defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) ||                            \
-       defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)) &&                           \
-      !defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY)))
-#error "the epilogue-overlap variant applies to the byte-exact and smem-neutral paths only"
-#endif
-#if defined(SVDQ_SM120_LORA_SMEM_SWIZZLE) &&                                                      \
-    (defined(SVDQ_SM120_LORA_DEDICATED) || defined(SVDQ_SM120_LORA_EVERY_SPLIT) ||                \
-     defined(SVDQ_SM120_LORA_NEUTRAL_BARRIER) || defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY) || \
-     defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY))
-#error "the LoRA smem swizzle variant applies to the byte-exact path only"
-#endif
+enum class Sm120LoRaPath { kByteExactMainloop, kDedicatedTma };
 
 template <class DispatchPolicy_, class TileShape_, class ElementPairA_, class StridePairA_,
           class ElementPairB_, class StridePairB_, class TiledMma_, class GmemTiledCopyPairA_,
@@ -255,10 +222,7 @@ struct CollectiveMmaLoRaSm120 {
 
   static constexpr Sm120LoRaPath LoRaPath = LoRaPath_;
   static constexpr bool UseDedicatedLoRaTma = (LoRaPath == Sm120LoRaPath::kDedicatedTma);
-  static constexpr bool UseNeutralLoRaBarrier = (LoRaPath == Sm120LoRaPath::kSmemNeutralBarrier);
-  // Policies that own the one-slot LoRA pipeline and the true-rank D/L1 descriptors; they
-  // differ only in where the TMAs land (dedicated carveout vs. borrow stage base).
-  static constexpr bool UseLoRaPipeline = UseDedicatedLoRaTma || UseNeutralLoRaBarrier;
+  static constexpr bool UseLoRaPipeline = UseDedicatedLoRaTma;
   static constexpr bool CompileInlineDown = CompileInlineDown_;
 
   static constexpr int ThreadCount = size(TiledMma{});
@@ -435,11 +399,7 @@ struct CollectiveMmaLoRaSm120 {
       make_shape(shape<1>(TileShape{}), Int<LoRaStorageK>{}, Int<DispatchPolicy::Stages>{}),
       make_stride(Int<LoRaStorageK>{}, Int<1>{}, Int<BStageBf16Elems>{})));
 
-#if defined(SVDQ_SM120_LORA_SMEM_SWIZZLE)
-  static constexpr bool EnableLoRaSmemSwizzle = true;
-#else
   static constexpr bool EnableLoRaSmemSwizzle = Row80ProductionTraits_;
-#endif
   static constexpr bool UseRow80SideSlot = UseDedicatedLoRaTma && Row80ProductionTraits_;
   static constexpr bool UseLoRaSmemSwizzle =
       EnableLoRaSmemSwizzle &&
@@ -502,7 +462,6 @@ struct CollectiveMmaLoRaSm120 {
                     cosize_v<SmemLayoutL1> * sizeof(ElementL1),
                 "L1 TMA recast must preserve the overlay byte size");
 
-#if defined(SVDQ_SM120_LORA_TRUE_RANK_TAIL)
   // Consumer-side overlay view: only the rank-32 payload columns are staged into
   // registers and folded by the tail MMAs; the TMA zero-filled tail columns of
   // K256 stages contribute exact zeros to the accumulator and are skipped. The
@@ -526,10 +485,6 @@ struct CollectiveMmaLoRaSm120 {
       }
     }
   }
-#else
-  using SmemLayoutDConsume = SmemLayoutD;
-  using SmemLayoutL1Consume = SmemLayoutL1;
-#endif
 
   // Pipeline byte protocol (byte-exact, matching the proven SM100 scheme): every
   // producer_acquire arms the full residual budget. The LoRA step arrives exactly that
@@ -655,33 +610,15 @@ struct CollectiveMmaLoRaSm120 {
     alignas(16) PipelineStorage pipeline_storage;
   };
 
-  // Smem-neutral storage: the byte-exact tensor arrays (true-rank D/L1 tiles land at a
-  // residual stage base, no carveout) plus the one-slot LoRA pipeline barriers.
-  struct SharedStorageNeutralBarrier {
-    struct TensorStorage : cute::aligned_struct<128, _0> {
-      alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
-      alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-      alignas(16) cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
-      alignas(16) cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
-    } tensors;
-    struct PipelineStorage : cute::aligned_struct<16, _0> {
-      alignas(16) typename MainloopPipeline::SharedStorage mainloop;
-      alignas(16) typename LoRaPipeline::SharedStorage lora;
-    };
-    alignas(16) PipelineStorage pipeline_storage;
-  };
-
   using SharedStorage =
-      cute::conditional_t<UseDedicatedLoRaTma, SharedStorageDedicatedTma,
-                          cute::conditional_t<UseNeutralLoRaBarrier, SharedStorageNeutralBarrier,
-                                              SharedStorageByteExact>>;
+      cute::conditional_t<UseDedicatedLoRaTma, SharedStorageDedicatedTma, SharedStorageByteExact>;
 
   // The rank-32 overlays must live inside the residual arrays.
   static_assert(cosize_v<SmemLayoutD> <= cosize_v<SmemLayoutA>,
                 "D overlay must end at or before the end of smem_A");
   static_assert(cosize_v<SmemLayoutL1> <= cosize_v<SmemLayoutB>,
                 "L1 overlay must end at or before the end of smem_B");
-  // ... and the smem-neutral true-rank tiles must fit inside one residual stage.
+  // Each true-rank tile must fit inside one residual stage.
   static_assert(size<0>(TileShape{}) * LoRaK <= AStageBf16Elems,
                 "the true-rank D tile must fit at a residual A stage base");
   static_assert(size<1>(TileShape{}) * LoRaK <= BStageBf16Elems,
@@ -703,8 +640,7 @@ struct CollectiveMmaLoRaSm120 {
 
   CUTLASS_DEVICE static typename LoRaPipeline::SharedStorage& lora_pipeline_storage(
       PipelineStorage& storage) {
-    static_assert(UseLoRaPipeline,
-                  "only the dedicated and smem-neutral policies own a LoRA pipeline");
+    static_assert(UseLoRaPipeline, "only the dedicated policy owns a LoRA pipeline");
     return storage.lora;
   }
 
@@ -806,9 +742,8 @@ struct CollectiveMmaLoRaSm120 {
     TMA_SFB tma_load_sfb;
     TMA_D tma_load_d;
     TMA_L1 tma_load_l1;
-    // Carries the true-rank descriptors only under the pipeline-owning policies (dedicated
-    // and smem-neutral share them; only the smem base differs, resolved at copy time) so
-    // the byte-exact Params footprint stays unchanged.
+    // Only the dedicated policy carries side-slot descriptors, preserving the
+    // byte-exact Params footprint.
     cute::conditional_t<UseLoRaPipeline, LoRaDedicatedTma, LoRaDedicatedTmaNone> lora_dedicated;
     LayoutSFA layout_SFA;
     LayoutSFB layout_SFB;
@@ -1333,17 +1268,6 @@ struct CollectiveMmaLoRaSm120 {
         ++smem_pipe_write;
       }
 
-      // The production-parity residual rung keeps the admitted row80 bias prefetch even
-      // though it intentionally removes the extra D/L1 producer step.
-#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) && defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY)
-      if constexpr (UseRow80BiasPrefetch) {
-        if (params.ptr_bias != nullptr) {
-          auto const* bias_tile = params.ptr_bias + int(m_coord) * int(size<0>(TileShape{}));
-          asm volatile("prefetch.global.L1 [%0];" ::"l"(bias_tile));
-        }
-      }
-#endif
-
       // One extra producer step: D + L1 into the next freed stage (epilogue owner only).
       // SFA/SFB are dummy-reloaded (k-tile 0) so the arrived bytes exactly match the
       // armed A+B+SF budget; the D/L1 boxes are byte-exact stage overlays.
@@ -1376,24 +1300,12 @@ struct CollectiveMmaLoRaSm120 {
     __syncwarp();
   }
 
-  /// Producer perspective, pipeline-owning LoRA policies (dedicated and smem-neutral). The
+  /// Producer perspective for the dedicated LoRA policy. The
   /// residual K-loop is unchanged and its pipeline state never accounts for LoRA. For the
   /// epilogue-owning work unit the producer acquires the one-slot LoRA pipeline and issues
   /// exactly two true-rank TMAs (D, then L1) against its full barrier.
-  ///   - kDedicatedTma lands them in the dedicated carveout; the slot is acquired AFTER the
-  ///     residual enqueues so a still-busy slot never blocks this unit's residual prefetch.
-  ///   - kSmemNeutralBarrier lands them at the borrow stage base (the residual stage this
-  ///     producer would fill next; smem_pipe_write already points at it and is NOT advanced
-  ///     for the borrow). Two guards order the aliasing:
-  ///       H1: before the D/L1 TMAs, spin on that stage's mainloop EMPTY barrier without
-  ///           producer_acquire (acquire would arm the residual byte budget on a stage that
-  ///           arrives LoRA bytes against the LoRA barrier, wedging the byte accounting) -
-  ///           the consumer must have drained the stage's previous residual fill.
-  ///       H2: at TILE START, gate on the LoRA slot's empty barrier - the previous unit's
-  ///           borrow sits in exactly the stage this unit's FIRST residual TMA overwrites,
-  ///           and nothing in the mainloop protocol orders that TMA after the borrow's
-  ///           consumption. Owner units gate via producer_acquire (which also arms);
-  ///           non-owner units spin without arming.
+  /// The slot is acquired after the residual enqueues so a still-busy slot never
+  /// blocks this unit's residual prefetch.
   template <class TensorA, class TensorB, class TensorSFA, class TensorSFB, class TensorD,
             class TensorL1, class KTileIterator, class BlockCoord>
   CUTLASS_DEVICE void load(
@@ -1405,23 +1317,6 @@ struct CollectiveMmaLoRaSm120 {
     int lane_predicate = cute::elect_one_sync();
 
     if (lane_predicate) {
-      // H2 (smem-neutral only): the previous work unit's borrow may still sit in the stage
-      // this unit's first residual TMA targets; gate on the LoRA slot's empty barrier
-      // before ANY residual enqueue. producer_try_acquire observes the barrier phase
-      // without arming, so a non-owner unit passes through without touching the slot's
-      // byte accounting; after the borrow is consumed once, re-observing the same phase
-      // costs one try_wait.
-      if constexpr (UseNeutralLoRaBarrier) {
-        if (do_lora) {
-          lora_pipeline.producer_acquire(lora_pipe_write);
-        } else {
-          auto lora_empty = lora_pipeline.producer_try_acquire(lora_pipe_write);
-          while (lora_empty != cutlass::BarrierStatus::WaitDone) {
-            lora_empty = lora_pipeline.producer_try_acquire(lora_pipe_write);
-          }
-        }
-      }
-
       Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
       Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
       Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
@@ -1496,18 +1391,6 @@ struct CollectiveMmaLoRaSm120 {
         ++smem_pipe_write;
       }
 
-      // Match the full side-slot kernel's producer schedule when the measurement rung
-      // intentionally omits D/L1. Bias prefetch is a row80 production trait, not part of
-      // the transfer protocol being subtracted.
-#if defined(SVDQ_SM120_ROW80_PRODUCTION_PARITY) && defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY)
-      if constexpr (UseRow80BiasPrefetch) {
-        if (params.ptr_bias != nullptr) {
-          auto const* bias_tile = params.ptr_bias + int(m_coord) * int(size<0>(TileShape{}));
-          asm volatile("prefetch.global.L1 [%0];" ::"l"(bias_tile));
-        }
-      }
-#endif
-
       // Owner work unit only: exactly two TMAs against the LoRA full barrier, whose
       // producer_acquire armed exactly LoRaDedicatedTmaBytes. No dummy SF reloads and no
       // main-pipeline step exist on these policies.
@@ -1521,41 +1404,7 @@ struct CollectiveMmaLoRaSm120 {
             asm volatile("prefetch.global.L1 [%0];" ::"l"(bias_tile));
           }
         }
-        if constexpr (UseNeutralLoRaBarrier) {
-          // The slot was acquired (and armed) at tile start - see H2 above.
-          // H1: smem_pipe_write points at the borrow stage; its previous residual fill
-          // must be fully drained before D/L1 overwrite it. Observe the mainloop empty
-          // barrier without producer_acquire: acquire would arm the residual byte budget
-          // on a stage whose bytes arrive against the LoRA barrier instead.
-          auto stage_empty = pipeline.producer_try_acquire(smem_pipe_write);
-          while (stage_empty != cutlass::BarrierStatus::WaitDone) {
-            stage_empty = pipeline.producer_try_acquire(smem_pipe_write);
-          }
-
-          using LoRaBarrierType = typename LoRaPipeline::ProducerBarrierType;
-          LoRaBarrierType* lora_barrier = lora_pipeline.producer_get_barrier(lora_pipe_write);
-
-          // True-rank tiles at the borrow stage's 1024-byte-aligned base inside the
-          // residual arrays; same descriptors as the dedicated policy, different smem base.
-          int write_stage = smem_pipe_write.index();
-          Tensor sD = make_tensor(
-              make_smem_ptr(
-                  recast_ptr<LoRaDedicatedTmaInternalElement>(shared_tensors.smem_A.begin()) +
-                  write_stage * AStageBf16Elems * sizeof(cutlass::bfloat16_t) /
-                      sizeof(LoRaDedicatedTmaInternalElement)),
-              SmemLayoutDDedicatedTma{});
-          Tensor sL1 = make_tensor(
-              make_smem_ptr(
-                  recast_ptr<LoRaDedicatedTmaInternalElement>(shared_tensors.smem_B.begin()) +
-                  write_stage * BStageBf16Elems * sizeof(cutlass::bfloat16_t) /
-                      sizeof(LoRaDedicatedTmaInternalElement)),
-              SmemLayoutL1DedicatedTma{});
-          Tensor tDsD = block_tma_d.partition_D(sD);
-          Tensor tL1sL1 = block_tma_l1.partition_D(sL1);
-
-          copy(params.lora_dedicated.tma_load_d_dedicated.with(*lora_barrier), tDgD, tDsD);
-          copy(params.lora_dedicated.tma_load_l1_dedicated.with(*lora_barrier), tL1gL1, tL1sL1);
-        } else {
+        {
           lora_pipeline.producer_acquire(lora_pipe_write);
 
           using LoRaBarrierType = typename LoRaPipeline::ProducerBarrierType;
@@ -1700,31 +1549,6 @@ struct CollectiveMmaLoRaSm120 {
     auto tCsSFB_stage = tCsSFB(_, _, _, read_stage);
 
     auto copy_kblock = [&](auto k_block) {
-#if defined(SVDQ_SM120_STOCK_PARITY_KSTEP) && SVDQ_SM120_STOCK_PARITY_KSTEP == 1
-      // Scheduling perturbation arm 1 (measurement-only): the SF copies are
-      // independent of the operand shifts; issuing them first changes the
-      // ptxas scheduling window without changing any value or operation.
-      copy(tCsSFA_stage(_, _, k_block), tCrSFA_copy_view(_, _, k_block));
-      copy(tCsSFB_stage(_, _, k_block), tCrSFB_copy_view(_, _, k_block));
-
-      copy(smem_tiled_copy_A, tCsA_stage(_, _, k_block), tCrA_copy_view(_, _, k_block));
-      copy(smem_tiled_copy_B, tCsB_stage(_, _, k_block), tCrB_copy_view(_, _, k_block));
-
-      using MMAOp = typename TiledMma::MMA_Op;
-      fp4_shift_A(MMAOp{}, tCrA_copy_view(_, _, k_block));
-      fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
-#elif defined(SVDQ_SM120_STOCK_PARITY_KSTEP) && SVDQ_SM120_STOCK_PARITY_KSTEP == 3
-      // Scheduling perturbation arm 3 (measurement-only): interleave the A/SF
-      // and B/SF copy pairs; same operations and values, different issue order.
-      copy(smem_tiled_copy_A, tCsA_stage(_, _, k_block), tCrA_copy_view(_, _, k_block));
-      copy(tCsSFA_stage(_, _, k_block), tCrSFA_copy_view(_, _, k_block));
-      copy(smem_tiled_copy_B, tCsB_stage(_, _, k_block), tCrB_copy_view(_, _, k_block));
-      copy(tCsSFB_stage(_, _, k_block), tCrSFB_copy_view(_, _, k_block));
-
-      using MMAOp = typename TiledMma::MMA_Op;
-      fp4_shift_A(MMAOp{}, tCrA_copy_view(_, _, k_block));
-      fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
-#else
       copy(smem_tiled_copy_A, tCsA_stage(_, _, k_block), tCrA_copy_view(_, _, k_block));
       copy(smem_tiled_copy_B, tCsB_stage(_, _, k_block), tCrB_copy_view(_, _, k_block));
 
@@ -1734,7 +1558,6 @@ struct CollectiveMmaLoRaSm120 {
 
       copy(tCsSFA_stage(_, _, k_block), tCrSFA_copy_view(_, _, k_block));
       copy(tCsSFB_stage(_, _, k_block), tCrSFB_copy_view(_, _, k_block));
-#endif
     };
 
     auto gemm_kblock = [&](auto k_block) {
@@ -1763,16 +1586,8 @@ struct CollectiveMmaLoRaSm120 {
           pipeline.consumer_wait(smem_pipe_read);
         }
 
-#if defined(SVDQ_SM120_STOCK_PARITY_KSTEP) && SVDQ_SM120_STOCK_PARITY_KSTEP == 2
-        // Scheduling perturbation arm 2 (measurement-only): issue the MMA
-        // before the next k-block's copies; the two statements are
-        // independent (copy targets k+1 registers, gemm reads k registers).
-        gemm_kblock(k_block);
-        copy_kblock(k_block_next);
-#else
         copy_kblock(k_block_next);
         gemm_kblock(k_block);
-#endif
       });
     }  // k_tile_count
 
@@ -1802,17 +1617,6 @@ struct CollectiveMmaLoRaSm120 {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
-
-#if defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)
-    // Measurement rung: the transfer protocol is fully exercised (stage produced, waited on,
-    // and released) but the serialized smem->rmem copies and bf16 tail MMAs are compiled
-    // out, so a fixed-tactic full-minus-this delta isolates the serialized tail cost.
-    pipeline.consumer_wait(smem_pipe_read);
-    cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
-                                      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-    pipeline.consumer_release(smem_pipe_read);
-    return;
-#endif
 
     Tensor sD =
         make_tensor(make_smem_ptr(recast_ptr<cutlass::bfloat16_t>(shared_tensors.smem_A.begin())),
@@ -1853,16 +1657,13 @@ struct CollectiveMmaLoRaSm120 {
     for_each(make_int_sequence<LORA_K_BLOCK_MAX>{}, [&](auto k_block) {
       cute::gemm(lora_mma, tCrD(_, _, k_block), tCrL1(_, _, k_block), accum);
     });
-#if defined(SVDQ_SM120_LORA_TRUE_RANK_TAIL)
     canonicalize_lora_tail_zeros(accum);
-#endif
 
     cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
                                       cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
     pipeline.consumer_release(smem_pipe_read);
   }
 
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
   /// Epilogue-overlapped consumption of the byte-exact LoRA stage, split into two phases:
   ///   begin    - wait for the stage the producer's extra step filled, stage the FULL
   ///              per-thread D/L1 fragments into registers with the same vectorized
@@ -1940,13 +1741,10 @@ struct CollectiveMmaLoRaSm120 {
         for_each(make_int_sequence<LORA_K_BLOCK_MAX>{}, [&](auto k_block) {
           cute::gemm(lora_mma, tCrD(_, m, k_block), tCrL1(_, n, k_block), accum(_, m, n));
         });
-#if defined(SVDQ_SM120_LORA_TRUE_RANK_TAIL)
         canonicalize_lora_tail_zeros(accum(_, m, n));
-#endif
       }
     }
   }
-#endif  // SVDQ_SM120_LORA_EPI_OVERLAP
 
   /// Consume the dedicated LoRA slot: rank-32 bf16 D@L1^T added into the SAME accumulator
   /// fragment, called at the same points as the byte-exact mma_lora above. The slot is
@@ -1958,16 +1756,6 @@ struct CollectiveMmaLoRaSm120 {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
-
-#if defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)
-    // Production-parity side-slot rung: keep the one-slot wait/release protocol but
-    // compile out smem->rmem copies and bf16 MMAs.
-    lora_pipeline.consumer_wait(lora_pipe_read);
-    cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
-                                      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-    lora_pipeline.consumer_release(lora_pipe_read);
-    return;
-#endif
 
     Tensor sD =
         make_tensor(make_smem_ptr(shared_tensors.smem_D.begin()), SmemLayoutDDedicatedConsume{});
@@ -2016,73 +1804,6 @@ struct CollectiveMmaLoRaSm120 {
     });
   }
 
-  /// Smem-neutral policy: consume the one-slot LoRA barrier, staging D/L1 from the borrow
-  /// stage base. After the residual K steps smem_pipe_read points at exactly the stage the
-  /// producer borrowed (neither side advances the mainloop state for the borrow), so the
-  /// stage index comes from the mainloop consumer state while readiness and release ride
-  /// the LoRA pipeline alone. The slot is released as soon as every MMA thread holds its
-  /// fragments in registers, BEFORE the bf16 MMAs.
-  template <class FrgTensorC>
-  CUTLASS_DEVICE void mma_lora(LoRaPipeline lora_pipeline, LoRaPipelineState lora_pipe_read,
-                               PipelineState smem_pipe_read, FrgTensorC& accum, int thread_idx,
-                               TensorStorage& shared_tensors) {
-    using namespace cute;
-
-    static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
-
-    // True-rank tiles at the borrow stage's base inside the residual arrays: same layouts
-    // and per-thread partitioning as the dedicated policy, different smem base.
-    int read_stage = smem_pipe_read.index();
-    Tensor sD =
-        make_tensor(make_smem_ptr(recast_ptr<cutlass::bfloat16_t>(shared_tensors.smem_A.begin()) +
-                                  read_stage * AStageBf16Elems),
-                    SmemLayoutDDedicatedConsume{});
-    Tensor sL1 =
-        make_tensor(make_smem_ptr(recast_ptr<cutlass::bfloat16_t>(shared_tensors.smem_B.begin()) +
-                                  read_stage * BStageBf16Elems),
-                    SmemLayoutL1DedicatedConsume{});
-
-    LoRaMma lora_mma;
-    auto thread_lora = lora_mma.get_thread_slice(thread_idx);
-
-    Tensor tCrD = thread_lora.partition_fragment_A(sD);    // (MMA,MMA_M,MMA_K)
-    Tensor tCrL1 = thread_lora.partition_fragment_B(sL1);  // (MMA,MMA_N,MMA_K)
-
-    auto smem_tiled_copy_D = make_tiled_copy_A(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
-    auto smem_thr_copy_D = smem_tiled_copy_D.get_thread_slice(thread_idx);
-    Tensor tCsD = smem_thr_copy_D.partition_S(sD);
-    Tensor tCrD_copy_view = smem_thr_copy_D.retile_D(tCrD);
-
-    auto smem_tiled_copy_L1 = make_tiled_copy_B(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
-    auto smem_thr_copy_L1 = smem_tiled_copy_L1.get_thread_slice(thread_idx);
-    Tensor tCsL1 = smem_thr_copy_L1.partition_S(sL1);
-    Tensor tCrL1_copy_view = smem_thr_copy_L1.retile_D(tCrL1);
-
-    CUTE_STATIC_ASSERT_V(size<1>(tCrD) == size<1>(accum));   // MMA_M
-    CUTE_STATIC_ASSERT_V(size<1>(tCrL1) == size<2>(accum));  // MMA_N
-
-    lora_pipeline.consumer_wait(lora_pipe_read);
-
-    copy(smem_tiled_copy_D, tCsD, tCrD_copy_view);
-    copy(smem_tiled_copy_L1, tCsL1, tCrL1_copy_view);
-
-    // Every MMA thread must finish its smem reads before ANY thread releases the one-slot
-    // barrier back to the producer; the release also un-gates the next work unit's FIRST
-    // residual TMA into this stage (producer H2 guard).
-    cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
-                                      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-    lora_pipeline.consumer_release(lora_pipe_read);
-
-    // mma.sync accumulates C += A*B; the residual product is already in `accum`.
-    auto LORA_K_BLOCK_MAX = size<2>(tCrD);
-    for_each(make_int_sequence<LORA_K_BLOCK_MAX>{}, [&](auto k_block) {
-      cute::gemm(lora_mma, tCrD(_, _, k_block), tCrL1(_, _, k_block), accum);
-    });
-  }
-
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
   /// Side-slot flavor of mma_lora_begin: stage the independent slot's rank-32
   /// payload into registers, release the one-slot pipeline, and let the epilogue
   /// hook fold the fragments per output subtile.
@@ -2126,60 +1847,6 @@ struct CollectiveMmaLoRaSm120 {
 
     return cute::make_tuple(tCrD, tCrL1);
   }
-
-  /// Smem-neutral flavor of mma_lora_begin: identical register staging and release-early
-  /// contract, but the fragments come from the borrow stage base against the one-slot LoRA
-  /// pipeline (the mainloop consumer state supplies the stage index and is NOT advanced).
-  /// The returned true-rank fragments carry only the rank-32 k-blocks, so the subtile hook
-  /// folds exactly half the k-blocks of the byte-exact overlay on K256 tiles.
-  CUTLASS_DEVICE auto mma_lora_begin(LoRaPipeline lora_pipeline, LoRaPipelineState lora_pipe_read,
-                                     PipelineState smem_pipe_read, int thread_idx,
-                                     TensorStorage& shared_tensors) {
-    using namespace cute;
-
-    int read_stage = smem_pipe_read.index();
-    Tensor sD =
-        make_tensor(make_smem_ptr(recast_ptr<cutlass::bfloat16_t>(shared_tensors.smem_A.begin()) +
-                                  read_stage * AStageBf16Elems),
-                    SmemLayoutDDedicatedConsume{});
-    Tensor sL1 =
-        make_tensor(make_smem_ptr(recast_ptr<cutlass::bfloat16_t>(shared_tensors.smem_B.begin()) +
-                                  read_stage * BStageBf16Elems),
-                    SmemLayoutL1DedicatedConsume{});
-
-    LoRaMma lora_mma;
-    auto thread_lora = lora_mma.get_thread_slice(thread_idx);
-
-    Tensor tCrD = thread_lora.partition_fragment_A(sD);    // (MMA,MMA_M,MMA_K)
-    Tensor tCrL1 = thread_lora.partition_fragment_B(sL1);  // (MMA,MMA_N,MMA_K)
-
-    auto smem_tiled_copy_D = make_tiled_copy_A(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
-    auto smem_thr_copy_D = smem_tiled_copy_D.get_thread_slice(thread_idx);
-    Tensor tCsD = smem_thr_copy_D.partition_S(sD);
-    Tensor tCrD_copy_view = smem_thr_copy_D.retile_D(tCrD);
-
-    auto smem_tiled_copy_L1 = make_tiled_copy_B(
-        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<32>, cutlass::bfloat16_t>{}, lora_mma);
-    auto smem_thr_copy_L1 = smem_tiled_copy_L1.get_thread_slice(thread_idx);
-    Tensor tCsL1 = smem_thr_copy_L1.partition_S(sL1);
-    Tensor tCrL1_copy_view = smem_thr_copy_L1.retile_D(tCrL1);
-
-    lora_pipeline.consumer_wait(lora_pipe_read);
-
-    copy(smem_tiled_copy_D, tCsD, tCrD_copy_view);
-    copy(smem_tiled_copy_L1, tCsL1, tCrL1_copy_view);
-
-    // Every MMA thread must finish its smem reads before ANY thread releases the one-slot
-    // barrier; the release also un-gates the next work unit's first residual TMA into
-    // this stage (producer H2 guard).
-    cutlass::arch::NamedBarrier::sync(thr_size(TiledMma{}),
-                                      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-    lora_pipeline.consumer_release(lora_pipe_read);
-
-    return cute::make_tuple(tCrD, tCrL1);
-  }
-#endif  // SVDQ_SM120_LORA_EPI_OVERLAP
 
   /// Perform a Consumer Epilogue to release all buffers
   CUTLASS_DEVICE void mma_tail(MainloopPipeline, PipelineState, int) {}
@@ -2275,11 +1942,9 @@ class GemmUniversalLoRaSm120 {
   static_assert(!IsSmallM || (MaxThreadsPerBlock == 256 && NumFixupBarriers == 1),
                 "a 64-row tile must derive a 256-thread block and one fixup barrier");
 
-  // LoRA data-path policy (Sm120LoRaPath in the collective). The LoRa* types are valid for
-  // every policy; the pipeline object exists only under the pipeline-owning policies
-  // (dedicated carveout and smem-neutral borrow).
+  // The LoRa* types are valid for either policy; the pipeline object exists
+  // only for the dedicated side slot.
   static constexpr bool UseDedicatedLoRaTma = CollectiveMainloop::UseDedicatedLoRaTma;
-  static constexpr bool UseNeutralLoRaBarrier = CollectiveMainloop::UseNeutralLoRaBarrier;
   static constexpr bool UseRow80SideSlot = CollectiveMainloop::UseRow80SideSlot;
   static constexpr bool UseLoRaPipeline = CollectiveMainloop::UseLoRaPipeline;
   using LoRaPipeline = typename CollectiveMainloop::LoRaPipeline;
@@ -2792,15 +2457,6 @@ class GemmUniversalLoRaSm120 {
 
           // The epilogue-owning work unit produces one extra D/L1 stage after its K range.
           bool do_lora = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
-#if defined(SVDQ_SM120_LORA_EVERY_SPLIT)
-          // Testability hook: emit a LoRA stage from EVERY split. Numerically wrong under
-          // Stream-K by construction; exists to prove the duplicate-application detector.
-          do_lora = true;
-#elif defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY)
-          // Measurement rung: no LoRA stage is produced (or consumed) anywhere, so a
-          // fixed-tactic transfer-only-minus-this delta isolates the transfer protocol cost.
-          do_lora = false;
-#endif
 
           if (requires_clc_query) {
             scheduler_throttle_pipeline.producer_acquire(scheduler_pipe_throttle_producer_state);
@@ -2911,17 +2567,6 @@ class GemmUniversalLoRaSm120 {
         bool valid_work = TileScheduler::valid_warpgroup_in_work_tile(work_tile_info);
         bool do_epilogue = TileScheduler::compute_epilogue(work_tile_info, params.scheduler);
         bool do_lora = do_epilogue;
-        bool lora_before_fixup = false;
-#if defined(SVDQ_SM120_LORA_EVERY_SPLIT)
-        // Testability hook: fold the LoRA product into every split's partial accumulator
-        // before the Stream-K reduction, duplicating it once per split.
-        do_lora = true;
-        lora_before_fixup = true;
-#elif defined(SVDQ_SM120_LORA_LADDER_RESIDUAL_ONLY)
-        // Measurement rung: mirrors the producer-side forcing so the pipeline state stays
-        // balanced (no stage produced, none consumed).
-        do_lora = false;
-#endif
         if (valid_work) {
           collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
                                   work_k_tile_count, mma_thread_idx,
@@ -2935,33 +2580,11 @@ class GemmUniversalLoRaSm120 {
 
         int consumer_warp_group_idx = cutlass::canonical_warp_group_idx() - NumLoadWarpGroups;
 
-        if (valid_work && do_lora && lora_before_fixup) {
-          if constexpr (UseDedicatedLoRaTma) {
-            collective_mainloop.mma_lora(lora_pipeline, lora_pipe_consumer_state, accumulators,
-                                         mma_thread_idx, shared_storage.tensors.mainloop);
-            lora_pipe_consumer_state.advance(1);
-          } else if constexpr (UseNeutralLoRaBarrier) {
-            // The mainloop consumer state (already advanced past the residual steps)
-            // names the borrow stage; readiness and release ride the LoRA pipeline, so
-            // only the LoRA state advances.
-            collective_mainloop.mma_lora(lora_pipeline, lora_pipe_consumer_state,
-                                         mainloop_pipe_consumer_state, accumulators, mma_thread_idx,
-                                         shared_storage.tensors.mainloop);
-            lora_pipe_consumer_state.advance(1);
-          } else {
-            collective_mainloop.mma_lora(mainloop_pipeline, mainloop_pipe_consumer_state,
-                                         accumulators, mma_thread_idx,
-                                         shared_storage.tensors.mainloop);
-            mainloop_pipe_consumer_state.advance(1);
-          }
-        }
-
         // Perform reduction across splits, if needed
         TileScheduler::fixup(params.scheduler, work_tile_info, accumulators, NumMmaWarpGroups,
                              consumer_warp_group_idx);
 
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
-        // Byte-exact and smem-neutral paths on hook-enabled configs: consume the LoRA
+        // On hook-enabled configs, consume the LoRA
         // stage inside the epilogue store loop so the rank-32 tail folds under the store
         // schedule.
         // LoRA-once is preserved - only the epilogue owner produced the stage and only
@@ -2969,31 +2592,19 @@ class GemmUniversalLoRaSm120 {
         // hook does not cover (big-tile configs that keep the builder epilogue,
         // reduction subtiles - unused by our schedulers - and the dedicated pipeline).
         bool lora_in_epilogue = false;
-#if !defined(SVDQ_SM120_LORA_LADDER_TRANSFER_ONLY)
         if constexpr ((!UseDedicatedLoRaTma || UseRow80SideSlot) &&
                       flashinfer::gemm::svdquant_sm120::is_sm120_lora_hooked_epilogue_v<
                           CollectiveEpilogue>) {
-          lora_in_epilogue = valid_work && do_lora && !lora_before_fixup && do_epilogue &&
-                             work_tile_info.reduction_subtile_idx() == -1;
+          lora_in_epilogue =
+              valid_work && do_lora && do_epilogue && work_tile_info.reduction_subtile_idx() == -1;
         }
-#endif
-#else
-        constexpr bool lora_in_epilogue = false;
-#endif
 
         // Fold in the rank-32 LoRA-up exactly once per output tile: the accumulator is
         // fully reduced here, and only the epilogue owner produced (and consumes) the stage.
-        if (valid_work && do_lora && !lora_before_fixup && !lora_in_epilogue) {
+        if (valid_work && do_lora && !lora_in_epilogue) {
           if constexpr (UseDedicatedLoRaTma) {
             collective_mainloop.mma_lora(lora_pipeline, lora_pipe_consumer_state, accumulators,
                                          mma_thread_idx, shared_storage.tensors.mainloop);
-            lora_pipe_consumer_state.advance(1);
-          } else if constexpr (UseNeutralLoRaBarrier) {
-            // Borrow-stage fold: stage index from the mainloop consumer state, readiness
-            // and release from the LoRA pipeline; only the LoRA state advances.
-            collective_mainloop.mma_lora(lora_pipeline, lora_pipe_consumer_state,
-                                         mainloop_pipe_consumer_state, accumulators, mma_thread_idx,
-                                         shared_storage.tensors.mainloop);
             lora_pipe_consumer_state.advance(1);
           } else {
             collective_mainloop.mma_lora(mainloop_pipeline, mainloop_pipe_consumer_state,
@@ -3015,7 +2626,6 @@ class GemmUniversalLoRaSm120 {
             epi_store_pipe_producer_state = epi_store_pipe_producer_state_next;
             do_store_tail = true;
           };
-#if defined(SVDQ_SM120_LORA_EPI_OVERLAP)
           if constexpr (flashinfer::gemm::svdquant_sm120::is_sm120_lora_hooked_epilogue_v<
                             CollectiveEpilogue>) {
             if (lora_in_epilogue) {
@@ -3028,12 +2638,6 @@ class GemmUniversalLoRaSm120 {
                   auto frags = collective_mainloop.mma_lora_begin(
                       lora_pipeline, lora_pipe_consumer_state, mma_thread_idx,
                       shared_storage.tensors.mainloop);
-                  lora_pipe_consumer_state.advance(1);
-                  return frags;
-                } else if constexpr (UseNeutralLoRaBarrier) {
-                  auto frags = collective_mainloop.mma_lora_begin(
-                      lora_pipeline, lora_pipe_consumer_state, mainloop_pipe_consumer_state,
-                      mma_thread_idx, shared_storage.tensors.mainloop);
                   lora_pipe_consumer_state.advance(1);
                   return frags;
                 } else {
@@ -3057,9 +2661,7 @@ class GemmUniversalLoRaSm120 {
             } else {
               run_plain_store();
             }
-          } else
-#endif
-          {
+          } else {
             run_plain_store();
           }
         }

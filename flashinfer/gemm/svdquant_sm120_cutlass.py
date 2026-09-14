@@ -1,20 +1,9 @@
-"""The SM120 CUTLASS SVDQuant backend, kept beside upstream's CuTeDSL one.
+"""SM120 CUTLASS backend for NVFP4 SVDQuant GEMM and fused linear layers.
 
-FlashInfer already reaches SM120 through ``backend="cute-dsl"`` (PR #4420),
-which fuses the rank-r LoRA-up correction into the b12x CuTe DSL kernel. This
-module is a second, independent SM120 implementation: a CUTLASS C++ fused
-kernel (``csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu``) with a tactic space the
-autotuner selects over, plus a CuTeDSL prefix that fuses smooth-quantization
-with the rank-32 LoRA-down projection into one launch -- the half upstream
-still spends a ``torch.mm`` on.
-
-It is reached only through the explicit ``backend="cutlass-sm120"``; ``"auto"``
-does not offer it. That is deliberate. The two implementations have never been
-measured against each other, and until they are, changing what ``"auto"``
-selects on SM120 would be a guess. The 71-shape matrix this backend was tuned
-against compares it to tuned CUTLASS and cuBLASLt, not to ``"cute-dsl"``.
-
-Once the comparison exists, one of the two backends should go.
+The fused linear path combines CUDA smooth quantization and LoRA-down
+projection with a CUTLASS GEMM that applies the LoRA-up correction and bias.
+Select it explicitly with ``backend="cutlass-sm120"``; ``"auto"`` keeps the
+upstream backend selection.
 """
 
 import functools
@@ -49,44 +38,18 @@ from .gemm_svdquant import (
 
 
 _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
-
-
 _sm120_producer_variants = _sm120_routes.sm120_producer_variants
-
-
 _sm120_decode_producer_variant = _sm120_routes.sm120_decode_producer_variant
-
-
 _sm120_variant_packs_l2t = _sm120_routes.sm120_variant_packs_l2t
-
-
 _sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
-
-
 _sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
-
-
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
-
-
 _SM120_LINEAR_ROUTE_V6_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V6_MKR
-
-
 _SM120_LINEAR_ROUTE_V7_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V7_MKR
-
-
 _SM120_LINEAR_ROUTE_V8_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V8_MKR
-
-
 _SM120_LINEAR_ROUTE_V9_MKR = _sm120_routes.SM120_LINEAR_ROUTE_V9_MKR
-
-
 _SM120_TACTIC_ABI_VERSION = _sm120_routes.SM120_TACTIC_ABI_VERSION
-
-
 _sm120_linear_route_abi_version = _sm120_routes.sm120_linear_route_abi_version
-
-
 _sm120_tactic_abi_version = _sm120_routes.sm120_tactic_abi_version
 
 
@@ -170,6 +133,11 @@ def _cached_sm120_m537_l2t(
     l2t_smoothed: torch.Tensor,
 ) -> torch.Tensor:
     """Cache an invariant M537 L2T pack and invalidate it on mutation."""
+    # Inference tensors have no version counter, so their mutations cannot
+    # invalidate a cached pack. Repack them on each call.
+    if l2t_smoothed.is_inference():
+        return _pack_sm120_m537_l2t(l2t_smoothed)
+
     source_id = id(l2t_smoothed)
     source_version = int(l2t_smoothed._version)
     cached = _SM120_M537_PACKED_L2T_CACHE.get(source_id)

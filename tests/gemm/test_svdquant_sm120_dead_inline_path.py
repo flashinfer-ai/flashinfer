@@ -1,11 +1,8 @@
-"""Source guards for the optional SM120 inline-LoRA-down experiment.
+"""Keep SM120 inline-LoRA-down compilation choices consistent across sources.
 
-The optional CTA-level inline LoRA-down routine added by 711d72e never executes
-under the production entry, but instantiating it changes ptxas allocation for the
-whole kernel. Compiling it out is profitable for the persistent tiles and harmful
-for the Stream-K and static-scheduler siblings, so the selection is per config.
-These tests pin that contract and keep the three places that encode the list in
-lockstep.
+The routine never executes under the production entry, but instantiating it
+changes ptxas allocation. Its selection remains per config because removing it
+helps persistent tiles and hurts Stream-K and static-scheduler siblings.
 """
 
 import re

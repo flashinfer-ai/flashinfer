@@ -132,7 +132,7 @@ _GEOMETRY_MMA_N: Final = 8
 def sm120_producer_geometry_is_valid(
     m: int, k: int, block_threads: int, tile_m: int, tile_k: int
 ) -> bool:
-    """Mirror of the launcher's compile-time guard, as a predicate.
+    """Python counterpart of the runtime large-M launcher guards.
 
     Enumeration has to be able to skip a combination this shape cannot
     instantiate, and the C++ side refuses the same set, so the two must agree.
@@ -214,7 +214,7 @@ def sm120_m537_is_valid(m: int, k: int) -> bool:
 def sm120_small_m_tiling_is_valid(
     m: int, k: int, block_threads: int, down_tile_cols: int, rows_per_quant_block: int
 ) -> bool:
-    """Mirror of SmallMLaunchGeometry's asserts, as a predicate."""
+    """Python counterpart of the runtime small-M launcher guards."""
     if m <= 0 or rows_per_quant_block <= 0 or block_threads % 32:
         return False
     down_warps = block_threads // 32
@@ -347,26 +347,6 @@ PrefixRouteKey: TypeAlias = tuple[int, int]
 # where the axis is degenerate: a packed tactic whose producer half is zero is
 # numerically the same integer as the bare row it replaces, and selects the same
 # producer that row selected before this axis existed.
-
-
-# --- producer geometry axis -------------------------------------------------
-#
-# The large-M producer takes its block size and both tile extents as template
-# arguments, so a geometry is a whole kernel instantiation rather than a runtime
-# argument. Everything below mirrors
-# include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh; the mirror
-# exists because Python has to know how many candidates a shape offers in order
-# to build the tactic list, and C++ has to know which one an index names in
-# order to launch it. Tests hold the two against each other.
-
-# ORDER IS ABI -- see the same note on kGeometryLadder in the header.
-
-# Budget, not a judgement: every admitted geometry is another instantiation in a
-# single translation unit and another candidate the tuner profiles. Raising this
-# from 1 to 4 measurably lengthens that unit's compile and grows its object.
-
-# The geometry each exact large-M shape is pinned to today, which is always
-# variant 0 so an unselected shape runs what it has always run.
 
 
 # The (M, K) projection of the frozen benchmark matrix -- the shapes this

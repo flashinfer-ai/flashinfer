@@ -1,6 +1,5 @@
 """Integration tests for the exact-shape SM120 fused K1+K2 operator."""
 
-from collections.abc import Callable
 from pathlib import Path
 
 import math
@@ -160,6 +159,21 @@ def test_sm120_m537_l2t_pack_cache_reuses_and_invalidates() -> None:
 def test_sm120_m537_l2t_pack_rejects_sibling_shape() -> None:
     with pytest.raises(ValueError, match="requires rank 32"):
         svdquant_sm120_cutlass._pack_sm120_m537_l2t(torch.empty((5120, 64)))
+
+
+@pytest.mark.parametrize("k", (5120, 5376, 7168))
+def test_sm120_m537_l2t_pack_handles_inference_tensor_mutation(k: int) -> None:
+    cache = svdquant_sm120_cutlass._SM120_M537_PACKED_L2T_CACHE
+    with torch.inference_mode():
+        source = torch.zeros((k, 32), dtype=torch.bfloat16)
+        first = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
+        source.add_(1)
+        updated = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
+
+    assert id(source) not in cache
+    assert torch.equal(first, torch.zeros_like(first))
+    assert torch.equal(updated, torch.ones_like(updated))
+    assert updated is not first
 
 
 def test_sm120_jit_module_exports_fused_k1_k2_operator() -> None:
@@ -554,6 +568,7 @@ def test_sm120_combined_k12_k3_matches_separate_launches(
         global_scale,
         bias=bias,
         enable_pdl=False,
+        backend="cutlass-sm120",
     )
     # Not bit-equality: the raw FFI above was handed a fixed tactic, while the
     # public entry picks its own through the autotuner. A different K3 tactic
@@ -904,6 +919,7 @@ def test_sm120_k12288_large_m_combined_k12_k3_matches_separate_launches(
         global_scale,
         bias=bias,
         enable_pdl=False,
+        backend="cutlass-sm120",
     )
     # Not bit-equality: the raw FFI above was handed a fixed tactic, while the
     # public entry picks its own through the autotuner. A different K3 tactic
@@ -916,7 +932,7 @@ def test_sm120_k12288_large_m_combined_k12_k3_matches_separate_launches(
 
 
 # ---------------------------------------------------------------------------
-# Accepted M512/K3072 n16 producer and retained diagnostic seam.
+# M512/K3072 prefix coverage.
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -936,7 +952,7 @@ def _production_ffi_body(csrc: str) -> str:
     every assertion below about which shapes the FFI names passed vacuously.
     """
     start = csrc.index("void nvfp4_quantize_smooth_lora_down_sm120_impl(")
-    end = csrc.index(f"void {_N16_FFI}(")
+    end = csrc.index("void nvfp4_quantize_smooth_lora_down_sm120(", start)
     assert start < end
     body = csrc[start:end]
     assert "one of the measured SM120 K12 shapes" in body, (
@@ -988,26 +1004,23 @@ def test_sm120_m32760_k1536_has_exact_production_admission() -> None:
     assert svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION == 3
 
 
-_N16_M = 512
-_N16_K = 3072
-_N16_RANK = 32
-_N16_ROW0_N = 3072
-_N16_ROW0_K3_TACTIC = 36
-_N16_ROW28_N = 12288
-_N16_ROW28_K3_TACTIC = 55
-_N16_FFI = "nvfp4_quantize_smooth_lora_down_m512_k3072_n16_experimental_sm120"
-_N16_HOST_ENTRY = "nvfp4_smooth_quantize_lora_down_m512_k3072_n16_experimental_sm120"
-_N16_SHAPE_ERROR = r"\(512, 3072\).*n16 K12 shape"
+_M512_M = 512
+_M512_K = 3072
+_M512_RANK = 32
+_M512_ROW0_N = 3072
+_M512_ROW0_K3_TACTIC = 36
+_M512_ROW28_N = 12288
+_M512_ROW28_K3_TACTIC = 55
 
 
-def _n16_producer_inputs(
+def _m512_producer_inputs(
     seed: int = 20260725,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """bf16 fixture shared by promoted production and the n16 diagnostic entry."""
+    """bf16 inputs for the M512/K3072 prefix and combined linear route."""
     torch.manual_seed(seed)
-    x = torch.randn((_N16_M, _N16_K), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((_M512_M, _M512_K), dtype=torch.bfloat16, device="cuda")
     pre_quant_scale = (
-        (1.0 + 0.3 * torch.randn((_N16_K,), dtype=torch.bfloat16, device="cuda"))
+        (1.0 + 0.3 * torch.randn((_M512_K,), dtype=torch.bfloat16, device="cuda"))
         .abs()
         .contiguous()
     )
@@ -1015,127 +1028,32 @@ def _n16_producer_inputs(
         (448.0 * 6.0) / (x.float() * pre_quant_scale.float()).abs().nan_to_num().max()
     ).reshape(1)
     l2t_smoothed = torch.randn(
-        (_N16_K, _N16_RANK), dtype=torch.bfloat16, device="cuda"
+        (_M512_K, _M512_RANK), dtype=torch.bfloat16, device="cuda"
     ).contiguous()
     return x, pre_quant_scale, global_scale, l2t_smoothed
 
 
-def _n16_sf_numel() -> int:
-    return (((_N16_M + 127) // 128) * 128) * (_N16_K // 16)
+def _m512_sf_numel() -> int:
+    return (((_M512_M + 127) // 128) * 128) * (_M512_K // 16)
 
 
-def _n16_producer_outputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _m512_producer_outputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
-        torch.empty((_N16_M, _N16_K // 2), dtype=torch.uint8, device="cuda"),
-        torch.empty((_n16_sf_numel(),), dtype=torch.uint8, device="cuda"),
-        torch.empty((_N16_M, _N16_RANK), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((_M512_M, _M512_K // 2), dtype=torch.uint8, device="cuda"),
+        torch.empty((_m512_sf_numel(),), dtype=torch.uint8, device="cuda"),
+        torch.empty((_M512_M, _M512_RANK), dtype=torch.bfloat16, device="cuda"),
     )
 
 
-def test_sm120_m512_k3072_n16_is_a_candidate_only_seam() -> None:
-    """Pin the promoted n16 production topology and retained diagnostic seam.
-
-    Source-level only, so it runs without a GPU. The legacy test identifier is
-    retained for the frozen focused-node manifest; the contract now proves the
-    shared dispatcher uses n16 and public routing does not call the independently
-    exported diagnostic symbol.
-    """
-    header = _read_repo_source(
-        "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
-    )
-    mma_n = "constexpr int kMmaN = 8;"
-    default_tile = "constexpr int kDownTileColsDefault = kMmaN;"
-    legacy_launch = "launch_m512_kernel<3072, 256>"
-    promoted_launch = "launch_m512_kernel<3072, 256, 16>"
-    # Two namespaces define kMmaN now -- the general detail namespace and the
-    # small-M one, which carries its own kRank too -- so counting definitions no
-    # longer says anything. What the tile has to be is 8, everywhere it is
-    # named: a second namespace drifting to a different value is exactly the
-    # failure this guards, and it survives however many namespaces there are.
-    assert header.count("constexpr int kMmaN") == header.count(mma_n), (
-        "the default n8 tile must remain stable: a kMmaN definition is not 8"
-    )
-    assert header.count(mma_n) >= 1 and header.count(default_tile) == 1, (
-        "the default n8 tile must remain stable"
-    )
-    production_entry_at = header.index(
-        "inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120("
-    )
-    candidate_entry_at = header.index(f"inline cudaError_t {_N16_HOST_ENTRY}(")
-    production_dispatch = header[production_entry_at:candidate_entry_at]
-    # The production entry used to instantiate the promoted n16 launch for
-    # M512/K3072 -- one shape pinned to one kernel -- and this asserted that
-    # pinning. The entry computes its producer now and instantiates nothing, so
-    # the seam is sharper than "candidate only": n16 appears in its own
-    # diagnostic entry and nowhere else.
-    assert promoted_launch not in production_dispatch, (
-        "the production entry must not instantiate a shape's kernel by name"
-    )
-    assert legacy_launch not in production_dispatch, "the legacy n8 launch returned"
-    assert header[candidate_entry_at:].count(promoted_launch) == 1, (
-        "the retained n16 diagnostic entry must instantiate n16 exactly once"
-    )
-    assert header.count(promoted_launch) == 1
-
-    csrc = _read_repo_source("csrc/nvfp4_smooth_quantize_sm100.cu")
-    production_ffi_at = csrc.index("void nvfp4_quantize_smooth_lora_down_sm120(")
-    candidate_ffi_at = csrc.index(f"void {_N16_FFI}(")
-    assert production_ffi_at < candidate_ffi_at
-    assert _N16_HOST_ENTRY not in csrc[production_ffi_at:candidate_ffi_at], (
-        "the production FFI entry must not call the n16 host entry"
-    )
-    assert f"torch_ext::{_N16_FFI}" in csrc, (
-        "the n16 diagnostic entry must be exported under its own symbol"
-    )
-
-    # The diagnostic symbol is invisible to the combined C++ route and every Python
-    # routing surface: public routing, tactic table, route ABI, JIT source list.
-    for relative_path in (
-        "csrc/nvfp4_svdquant_gemm_cutlass_sm120.cu",
-        "flashinfer/gemm/gemm_svdquant.py",
-        "flashinfer/jit/gemm/svdquant_sm120.py",
-    ):
-        text = _read_repo_source(relative_path)
-        assert _N16_FFI not in text, f"{relative_path} references the n16 FFI"
-        assert _N16_HOST_ENTRY not in text, (
-            f"{relative_path} references the n16 host entry"
-        )
-
-    # This pre-existing fused route keeps the base route ABI: its runner set did
-    # not change, so the records the tuner persisted under that name stay
-    # reachable.
-    assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
-        _N16_M, _N16_K, _N16_RANK
-    )
-    assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_ABI_VERSION == 5
-    assert (
-        svdquant_sm120_cutlass._sm120_linear_route_abi_version(
-            _N16_M, _N16_K, _N16_RANK
-        )
-        == 5
-    )
-    assert svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION == 3
-
-
-def test_sm120_m512_k3072_n16_is_exported_beside_the_production_producer() -> None:
+def test_sm120_m512_k3072_writes_every_output_byte() -> None:
+    """The production prefix overwrites every xq/SF/down output element."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
+    x, pre_quant_scale, global_scale, l2t_smoothed = _m512_producer_inputs()
+    xq, sf, down = _m512_producer_outputs()
     module = get_nvfp4_svdquant_sm120_module()
-
-    assert hasattr(module, "nvfp4_quantize_smooth_lora_down_sm120")
-    assert hasattr(module, _N16_FFI)
-
-
-def test_sm120_m512_k3072_n16_writes_every_output_byte() -> None:
-    """The n16 diagnostic entry writes xq/SF under two hostile prefills."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("requires SM120")
-
-    x, pre_quant_scale, global_scale, l2t_smoothed = _n16_producer_inputs()
-    xq, sf, down = _n16_producer_outputs()
-    module = get_nvfp4_svdquant_sm120_module()
-    diagnostic = getattr(module, _N16_FFI)
+    prefix = module.nvfp4_quantize_smooth_lora_down_sm120
 
     xq_ref, sf_ref = nvfp4_quantize_smooth(
         x,
@@ -1149,17 +1067,17 @@ def test_sm120_m512_k3072_n16_writes_every_output_byte() -> None:
         xq.fill_(xq_sentinel)
         sf.fill_(sf_sentinel)
         down.fill_(float("nan"))
-        diagnostic(x, pre_quant_scale, global_scale, l2t_smoothed, xq, sf, down)
+        prefix(x, pre_quant_scale, global_scale, l2t_smoothed, xq, sf, down)
         torch.cuda.synchronize()
 
         assert torch.equal(xq, xq_ref), (
-            f"n16 xq left unwritten or wrong after the 0x{xq_sentinel:02x} prefill"
+            f"M512/K3072 xq left unwritten or wrong after the 0x{xq_sentinel:02x} prefill"
         )
         assert torch.equal(sf, sf_ref), (
-            f"n16 sf left unwritten or wrong after the 0x{sf_sentinel:02x} prefill"
+            f"M512/K3072 sf left unwritten or wrong after the 0x{sf_sentinel:02x} prefill"
         )
         assert bool(torch.isfinite(down).all()), (
-            "n16 down retains the NaN prefill after the opposing "
+            "M512/K3072 down retains the NaN prefill after the opposing "
             f"0x{xq_sentinel:02x}/0x{sf_sentinel:02x} run"
         )
 
@@ -1169,7 +1087,7 @@ def test_sm120_m512_k3072_n16_writes_every_output_byte() -> None:
         # hold: the eight-warp split accumulates in a different order from
         # torch.mm regardless of how the N tiles are grouped.
         assert float(sqnr) > 48.0, (
-            f"n16 LoRA-down SQNR {float(sqnr):.3f} dB is below 48.0 dB"
+            f"M512/K3072 LoRA-down SQNR {float(sqnr):.3f} dB is below 48.0 dB"
         )
 
         # A misaddressed N fragment corrupts one half of every patch, which a
@@ -1181,73 +1099,30 @@ def test_sm120_m512_k3072_n16_writes_every_output_byte() -> None:
         )
         worst = int(torch.argmin(column_sqnr))
         assert float(column_sqnr[worst]) > 48.0, (
-            f"n16 LoRA-down rank column {worst} SQNR "
+            f"M512/K3072 LoRA-down rank column {worst} SQNR "
             f"{float(column_sqnr[worst]):.3f} dB is below 48.0 dB"
         )
 
 
-@pytest.mark.parametrize(
-    ("m", "k"),
-    (
-        (511, 3072),
-        (513, 3072),
-        (512, 3008),
-        (512, 3136),
-        (512, 5120),
-        (512, 12288),
-        # Cross-family: both are admitted by the production FFI and served by
-        # entirely different kernels, so the diagnostic entry must reject them.
-        (64, 3072),
-        (27280, 3072),
-    ),
-)
-def test_sm120_m512_k3072_n16_rejects_neighboring_shapes(m: int, k: int) -> None:
-    """The n16 admission is exactly (512, 3072) and does not generalize."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("requires SM120")
-
-    module = get_nvfp4_svdquant_sm120_module()
-    x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
-    pre_quant_scale = torch.empty((k,), dtype=torch.bfloat16, device="cuda")
-    global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l2t_smoothed = torch.empty((k, 32), dtype=torch.bfloat16, device="cuda")
-    xq = torch.empty((m, k // 2), dtype=torch.uint8, device="cuda")
-    sf = torch.empty(
-        ((((m + 127) // 128) * 128) * (k // 16),),
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    down = torch.empty((m, 32), dtype=torch.bfloat16, device="cuda")
-
-    with pytest.raises(RuntimeError, match=_N16_SHAPE_ERROR):
-        getattr(module, _N16_FFI)(
-            x,
-            pre_quant_scale,
-            global_scale,
-            l2t_smoothed,
-            xq,
-            sf,
-            down,
-        )
-
-
 @pytest.mark.parametrize("lora_rank", (16, 64))
-def test_sm120_m512_k3072_n16_rejects_non_rank32_lora(lora_rank: int) -> None:
-    """The admitted n16 shape still requires the rank-32 LoRA-down topology."""
+def test_sm120_m512_k3072_rejects_non_rank32_lora(lora_rank: int) -> None:
+    """The admitted M512/K3072 shape still requires the rank-32 LoRA-down topology."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
     module = get_nvfp4_svdquant_sm120_module()
-    x = torch.empty((_N16_M, _N16_K), dtype=torch.bfloat16, device="cuda")
-    pre_quant_scale = torch.empty((_N16_K,), dtype=torch.bfloat16, device="cuda")
+    x = torch.empty((_M512_M, _M512_K), dtype=torch.bfloat16, device="cuda")
+    pre_quant_scale = torch.empty((_M512_K,), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.ones((1,), dtype=torch.float32, device="cuda")
-    l2t_smoothed = torch.empty((_N16_K, lora_rank), dtype=torch.bfloat16, device="cuda")
-    xq = torch.empty((_N16_M, _N16_K // 2), dtype=torch.uint8, device="cuda")
-    sf = torch.empty((_n16_sf_numel(),), dtype=torch.uint8, device="cuda")
-    down = torch.empty((_N16_M, lora_rank), dtype=torch.bfloat16, device="cuda")
+    l2t_smoothed = torch.empty(
+        (_M512_K, lora_rank), dtype=torch.bfloat16, device="cuda"
+    )
+    xq = torch.empty((_M512_M, _M512_K // 2), dtype=torch.uint8, device="cuda")
+    sf = torch.empty((_m512_sf_numel(),), dtype=torch.uint8, device="cuda")
+    down = torch.empty((_M512_M, lora_rank), dtype=torch.bfloat16, device="cuda")
 
     with pytest.raises(RuntimeError, match=r"l2t_smoothed must be \[k, 32\]"):
-        getattr(module, _N16_FFI)(
+        module.nvfp4_quantize_smooth_lora_down_sm120(
             x,
             pre_quant_scale,
             global_scale,
@@ -1256,99 +1131,20 @@ def test_sm120_m512_k3072_n16_rejects_non_rank32_lora(lora_rank: int) -> None:
             sf,
             down,
         )
-
-
-def test_sm120_m512_k3072_n16_preserves_quantize_bytes_and_records_down_equality(
-    record_property: Callable[[str, object], None],
-) -> None:
-    """Require the retained diagnostic entry to match promoted production.
-
-    Both builds give warp w the K span [w * 384, w * 384 + 384) and reduce eight
-    partials in warp order, and n16 fragment f of tile_n covers exactly the rank
-    columns BT256 block 2 * tile_n + f covers, in the same k order. Down is
-    therefore identical. After promotion this is a hard compatibility gate in
-    addition to the independent finite/whole/worst-column SQNR checks above.
-    """
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
-        pytest.skip("requires SM120")
-
-    x, pre_quant_scale, global_scale, l2t_smoothed = _n16_producer_inputs()
-    module = get_nvfp4_svdquant_sm120_module()
-
-    production_xq, production_sf, production_down = _n16_producer_outputs()
-    module.nvfp4_quantize_smooth_lora_down_sm120(
-        x,
-        pre_quant_scale,
-        global_scale,
-        l2t_smoothed,
-        production_xq,
-        production_sf,
-        production_down,
-    )
-
-    n16_xq, n16_sf, n16_down = _n16_producer_outputs()
-    getattr(module, _N16_FFI)(
-        x,
-        pre_quant_scale,
-        global_scale,
-        l2t_smoothed,
-        n16_xq,
-        n16_sf,
-        n16_down,
-    )
-    torch.cuda.synchronize()
-
-    assert torch.equal(n16_xq, production_xq), (
-        "the n16 diagnostic entry changed production xq bytes"
-    )
-    assert torch.equal(n16_sf, production_sf), (
-        "the n16 diagnostic entry changed production SF bytes"
-    )
-    # `down` used to be bit-identical because production for M512/K3072 *was*
-    # the promoted n16 kernel -- a pin, not a property. Production computes its
-    # producer now and lands on a different geometry, so the reduction order
-    # differs in the last bf16 bit. Measured on this card, both reach 51.8 dB
-    # against an fp32 reference and differ from each other at 74.9 dB: two
-    # equally accurate producers, not a regression. xq and SF stay bit-exact
-    # above, which is the part the quantizer owns and the part a diagnostic
-    # entry must not disturb.
-    down_equal = bool(torch.equal(n16_down, production_down))
-    record_property("n16_down_bit_exact", down_equal)
-    ref = torch.mm(x, l2t_smoothed).float()
-
-    def _sqnr(got):
-        return 10 * torch.log10(
-            ref.pow(2).mean() / (ref - got.float()).pow(2).mean().clamp_min(1e-30)
-        )
-
-    n16_db, prod_db = float(_sqnr(n16_down)), float(_sqnr(production_down))
-    assert min(n16_db, prod_db) > 40.0, (
-        f"n16 {n16_db:.1f} dB vs production {prod_db:.1f} dB against the fp32 reference"
-    )
-    assert abs(n16_db - prod_db) < 1.0, (
-        f"the diagnostic entry is not as accurate as production: "
-        f"n16 {n16_db:.1f} dB vs {prod_db:.1f} dB"
-    )
 
 
 def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> None:
-    """Both public combined routes consume the promoted n16 K12 producer.
-
-    The retained diagnostic symbol is byte-identical to production, so runtime
-    equality cannot identify the symbol. The structural promotion test owns
-    that proof; this test owns public combined-versus-production agreement, and
-    the perturbed fixture proves the comparison is live rather than stale.
-    """
+    """Combined routes use fresh prefix outputs after LoRA weights change."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
-    x, pre_quant_scale, global_scale, l2t_smoothed = _n16_producer_inputs()
+    x, pre_quant_scale, global_scale, l2t_smoothed = _m512_producer_inputs()
     perturbed_l2t = (l2t_smoothed.float() * -0.5 + 0.25).bfloat16().contiguous()
     module = get_nvfp4_svdquant_sm120_module()
 
     references = []
     for lora_weight in (l2t_smoothed, perturbed_l2t):
-        reference = _n16_producer_outputs()
+        reference = _m512_producer_outputs()
         module.nvfp4_quantize_smooth_lora_down_sm120(
             x,
             pre_quant_scale,
@@ -1365,32 +1161,32 @@ def test_sm120_m512_k3072_public_rows0_and_28_keep_the_production_producer() -> 
     )
 
     for n, tactic in (
-        (_N16_ROW0_N, _N16_ROW0_K3_TACTIC),
-        (_N16_ROW28_N, _N16_ROW28_K3_TACTIC),
+        (_M512_ROW0_N, _M512_ROW0_K3_TACTIC),
+        (_M512_ROW28_N, _M512_ROW28_K3_TACTIC),
     ):
         torch.manual_seed(20260807 + n)
         weight_fp4 = torch.randint(
-            0, 256, (n, _N16_K // 2), dtype=torch.uint8, device="cuda"
+            0, 256, (n, _M512_K // 2), dtype=torch.uint8, device="cuda"
         )
-        weight_sf = torch.ones((n * (_N16_K // 16),), dtype=torch.uint8, device="cuda")
+        weight_sf = torch.ones((n * (_M512_K // 16),), dtype=torch.uint8, device="cuda")
         alpha = torch.ones((1,), dtype=torch.float32, device="cuda")
         l1_scaled = torch.randn(
-            (n, _N16_RANK), dtype=torch.bfloat16, device="cuda"
+            (n, _M512_RANK), dtype=torch.bfloat16, device="cuda"
         ).contiguous()
         bias = torch.randn((n,), dtype=torch.bfloat16, device="cuda").contiguous()
         workspace_bytes = max(
             32 * 1024 * 1024,
-            int(module.nvfp4_svdquant_gemm_workspace_size(_N16_M, n, _N16_K, tactic)),
+            int(module.nvfp4_svdquant_gemm_workspace_size(_M512_M, n, _M512_K, tactic)),
         )
         workspace = torch.empty((workspace_bytes,), dtype=torch.uint8, device="cuda")
-        row = "row 0" if n == _N16_ROW0_N else "row 28"
+        row = "row 0" if n == _M512_ROW0_N else "row 28"
 
         for lora_weight, reference in zip(
             (l2t_smoothed, perturbed_l2t), references, strict=False
         ):
-            combined_xq, combined_sf, combined_down = _n16_producer_outputs()
+            combined_xq, combined_sf, combined_down = _m512_producer_outputs()
             combined_output = torch.full(
-                (_N16_M, n), float("nan"), dtype=torch.bfloat16, device="cuda"
+                (_M512_M, n), float("nan"), dtype=torch.bfloat16, device="cuda"
             )
             module.nvfp4_svdquant_linear_sm120(
                 x,
