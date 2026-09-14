@@ -263,7 +263,7 @@ class MoELayer:
 
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
-        per ``(num_tokens, mode)`` so repeated calls skip reselection.
+        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
 
         Parameters
         ----------

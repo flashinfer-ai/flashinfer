@@ -37,7 +37,6 @@ weight / activation formats and the layer output format as ``QuantFormat`` axes.
 .. autosummary::
     :toctree: ../generated
 
-    MoELayer
     MoEConfig
     RoutingConfig
     QuantConfig
