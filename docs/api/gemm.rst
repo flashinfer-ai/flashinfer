@@ -113,6 +113,19 @@ Blackwell SM100 GEMM
 
     tgv_gemm_sm100
 
+cuTile GEMM
+-----------
+
+.. autosummary::
+    :toctree: ../generated
+
+    gemm_alpha_beta
+    masked_bmm
+    masked_scaled_bmm
+    ragged_bmm
+    ragged_block_scaled_bmm
+    ragged_scaled_bmm
+
 Grouped GEMM (CuTe-DSL, Blackwell)
 ----------------------------------
 

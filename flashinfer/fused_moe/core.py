@@ -73,6 +73,7 @@ from ..tllm_enums import (
     Fp8QuantizationType,
     RoutingInputMode,
     RoutingMethodType,
+    SfLayout,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
 )
@@ -3377,6 +3378,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         routing_replay_out: Optional[torch.Tensor] = None,
         valid_hidden_size: Optional[int] = None,
         valid_intermediate_size: Optional[int] = None,
+        # Typed as int (SfLayout is an IntEnum) to match the other kernel-ABI
+        # enums crossing this op boundary -- activation_type, weight_layout,
+        # routing_method_type -- which stay schema-expressible if
+        # register_custom_op is ever re-enabled.
+        hidden_states_scale_layout: Optional[int] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3504,6 +3510,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             moe_inputs,
             tune_max_num_tokens=tune_max_num_tokens,
             routing_input_mode=RoutingInputMode(routing_input_mode),
+            hidden_states_scale_layout=hidden_states_scale_layout,
             use_cold_l2_cache=True,
             use_cuda_graph=True,
         )
@@ -6190,6 +6197,7 @@ def trtllm_fp4_block_scale_moe(
     num_fused_shared_experts: Optional[int] = None,
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
+    hidden_states_scale_layout: Optional[SfLayout] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -6209,6 +6217,11 @@ def trtllm_fp4_block_scale_moe(
     hidden_states_scale : Optional[torch.Tensor]
         Block scales for MXFP8 / NVFP4 hidden states of shape
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
+        The equivalent flat ``[seq_len * hidden_size // (32 if mxfp8 else 16)]``
+        buffer returned by :func:`~flashinfer.mxfp8_quantize` with
+        ``is_sf_swizzled_layout=False`` (the linear layout) is also accepted.
+        Declare which layout the buffer is in with
+        ``hidden_states_scale_layout``; only the linear layout is supported.
     gemm1_weights : torch.Tensor
         ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
         ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
@@ -6318,6 +6331,22 @@ def trtllm_fp4_block_scale_moe(
         with weight ``1.0``. With ``do_finalize=False``, the returned
         ``expert_weights`` and ``expanded_idx_to_permuted_idx`` cover
         ``top_k + num_fused_shared_experts`` slots per token.
+    hidden_states_scale_layout : Optional[flashinfer.tllm_enums.SfLayout]
+        Layout of ``hidden_states_scale``.  This is **validation only**: the
+        trtllm-gen routed GEMM can consume only
+        :attr:`~flashinfer.tllm_enums.SfLayout.layout_linear`, so declaring any
+        swizzled layout raises :class:`NotImplementedError` instead of reading
+        the buffer as linear bytes and silently producing wrong results.
+
+        .. deprecated::
+            Omitting this argument is deprecated.  ``None`` (the default)
+            preserves today's behavior — the linear layout is inferred — and
+            emits a :class:`DeprecationWarning`.  The layout genuinely cannot be
+            recovered from the tensor: a 128x4-swizzled buffer has exactly the
+            linear ``numel`` whenever ``num_tokens % 128 == 0``.  Both the
+            inference and this argument's optionality are deprecated together,
+            so a future release can make it required and drop the inference in
+            one step.
 
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
@@ -6397,6 +6426,7 @@ def trtllm_fp4_block_scale_moe(
         routing_replay_out,
         valid_hidden_size,
         valid_intermediate_size,
+        hidden_states_scale_layout,
     )
 
 
@@ -6437,6 +6467,7 @@ def trtllm_fp4_block_scale_routed_moe(
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
     num_fused_shared_experts: Optional[int] = None,
+    hidden_states_scale_layout: Optional[SfLayout] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -6466,7 +6497,12 @@ def trtllm_fp4_block_scale_routed_moe(
         MXFP8 (``float8_e4m3fn``), and NVFP4 (packed into ``uint8``).
     hidden_states_scale : Optional[torch.Tensor]
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]`` block scales of
-        the hidden states, float8.
+        the hidden states, float8.  The equivalent flat
+        ``[seq_len * hidden_size // (32 if mxfp8 else 16)]`` buffer returned by
+        :func:`~flashinfer.mxfp8_quantize` with ``is_sf_swizzled_layout=False``
+        (the linear layout) is also accepted.  Declare which layout the buffer
+        is in with ``hidden_states_scale_layout``; only the linear layout is
+        supported.
     gemm1_weights : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
         FP4 FC1 weights, ``uint8``.
@@ -6558,6 +6594,17 @@ def trtllm_fp4_block_scale_routed_moe(
         ``[num_tokens, top_k, 2 * intermediate_size]``, ``bfloat16``.  When
         set it is added to FC1 before the fused gated activation and the
         post-activation FC1 output is appended to the return list.
+    hidden_states_scale_layout : Optional[flashinfer.tllm_enums.SfLayout]
+        Layout of ``hidden_states_scale``.  See
+        :func:`trtllm_fp4_block_scale_moe` — validation only, linear layout
+        only, and omitting it is deprecated.
+
+        .. deprecated::
+            Omitting this argument is deprecated.  ``None`` (the default)
+            infers :attr:`~flashinfer.tllm_enums.SfLayout.layout_linear` and
+            emits a :class:`DeprecationWarning`.  Both the inference and this
+            argument's optionality are deprecated together.
+
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
         implied by the tensor shapes is treated as padded and only the valid
@@ -6663,6 +6710,7 @@ def trtllm_fp4_block_scale_routed_moe(
         None,  # routing_replay_out: not used for pre-computed routing
         valid_hidden_size,
         valid_intermediate_size,
+        hidden_states_scale_layout,
     )
 
 

@@ -32,25 +32,34 @@ Unified MoE API
 ---------------
 
 Backend-agnostic configuration and layer types. ``QuantConfig`` carries the MMA
-weight / activation formats and the layer output format as ``QuantFormat`` axes;
-``QuantVariant`` is a deprecated preset that expands to a ``(weight, activation)``
-pair.
+weight / activation formats and the layer output format as ``QuantFormat`` axes.
 
 .. autosummary::
     :toctree: ../generated
 
-    MoELayer
     MoEConfig
     RoutingConfig
     QuantConfig
     QuantFormat
-    QuantVariant
     ExpertConfig
     ExecutionConfig
     MoEFinalizeConfig
     BackendOptions
     MoEActivationPack
     MoEWeightPack
+
+``MoELayer`` is the official entry point of this API: both its constructor and
+its call operator are decorated with ``@flashinfer_api``, so they participate in
+``FLASHINFER_LOGLEVEL`` logging and ``FLASHINFER_DUMP_*`` capture. The lower-level
+per-backend functions above remain official in their own right — the two layers
+are designed to co-exist, and neither supersedes the other.
+
+.. autoclass:: MoELayer
+    :members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+    .. automethod:: __call__
 
 Utility Functions
 -----------------
@@ -124,6 +133,15 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+
+AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
+--------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    alphamoe_interleave_gated_weights
+    alphamoe_fp8_block_scale_aligned_moe
 
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------

@@ -23,6 +23,7 @@ consequences, and one of the consequences is a hang.
 
 import inspect
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -86,6 +87,11 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
         for t in tuning.TUNE_THREADS
         if b > policy.CE_MAX_PIECES or t != policy.CE_THREADS
     }
+    expected_rejected |= {
+        (int(IpcVariant.COPY_ENGINE_RING_MEMOP), b, t)
+        for b in tuning.TUNE_BLOCKS
+        for t in tuning.TUNE_THREADS
+    }
     assert rejected == expected_rejected
 
     # World size 4: no FLAT_STAGED, and threads must be at least world_size
@@ -93,7 +99,12 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
     rejected4 = set(grid) - set(tuning.candidate_tactics(4))
     # The island schedule is a 4+4 decomposition, so world size 4 rejects it.
     assert all(
-        t[0] in (int(IpcVariant.FLAT_STAGED), int(IpcVariant.COPY_ENGINE_ISLAND))
+        t[0]
+        in (
+            int(IpcVariant.FLAT_STAGED),
+            int(IpcVariant.COPY_ENGINE_ISLAND),
+            int(IpcVariant.COPY_ENGINE_RING_MEMOP),
+        )
         or (
             t[0] == int(IpcVariant.COPY_ENGINE_RING)
             and (t[1] > policy.CE_MAX_PIECES or t[2] != policy.CE_THREADS)
@@ -379,6 +390,7 @@ def test_cache_key_extras_separate_every_workspace_dimension() -> None:
         ("max_blocks", 32),
         ("max_numel", 6144 * 64),
         ("dtype", torch.float16),
+        ("memop_supported", True),
     ):
         assert tuning.cache_key_extras(**{**base, field: other}) != reference, field
 
@@ -397,6 +409,59 @@ def _synthesise_cache(monkeypatch, *entries) -> None:
     monkeypatch.setattr(AutoTuner.get(), "_file_configs", configs, raising=False)
 
 
+@pytest.mark.parametrize("memop_supported", [False, True])
+def test_original_and_memop_cache_namespaces_remain_loadable(
+    memop_supported, monkeypatch, tmp_path
+) -> None:
+    """Original v3 caches still hit; enabled SM120 retains its separate v4 key."""
+    from flashinfer.autotuner import AutoTuner
+
+    workspace_fields = dict(
+        world_size=4, profile=PROFILE_ROOTCPLX, max_blocks=128, max_numel=6144 * 128
+    )
+    # Literal persisted formats, independent of the current key builder.
+    if memop_supported:
+        head = (4, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True)
+    else:
+        head = (3, 4, PROFILE_ROOTCPLX, 128, 6144 * 128)
+    extras = head + ("torch.bfloat16",)
+    tactic = (6, 1, 256) if memop_supported else (1, 8, 256)
+    file_key = str(
+        (
+            "flashinfer::pcie_ipc_all_reduce",
+            "PcieIpcAllReduceRunner",
+            ((1, 4096),),
+            extras,
+        )
+    )
+    path = tmp_path / "pcie-ipc.json"
+    path.write_text(json.dumps({file_key: ["PcieIpcAllReduceRunner", list(tactic)]}))
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    assert tuner.load_configs(str(path))
+
+    workspace = SimpleNamespace(**workspace_fields, memop_supported=memop_supported)
+    runner = tuning.PcieIpcAllReduceRunner(workspace)
+    inp = torch.empty(1, 4096, dtype=torch.bfloat16)
+    assert runner.get_cache_key_extras([inp]) == extras
+    assert hash(runner) == hash(("PcieIpcAllReduceRunner", *head))
+    assert tuning.cache_covers_workspace(
+        **workspace_fields, memop_supported=memop_supported
+    )
+    assert not tuning.cache_covers_workspace(
+        **workspace_fields, memop_supported=not memop_supported
+    )
+    hit, runner_id, loaded_tactic, _ = tuner.search_cache(
+        tuning.PCIE_IPC_CUSTOM_OP,
+        [runner],
+        (tuple(inp.shape),),
+        tuning.pcie_ipc_tuning_config(),
+        inputs=[inp],
+    )
+    assert hit and runner_id == 0
+    assert loaded_tactic == tactic
+
+
 def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -> None:
     """A key mismatch misses every entry, which looks exactly like a hit."""
     tuned = dict(
@@ -409,6 +474,7 @@ def test_a_cache_written_for_another_workspace_reads_as_uncovered(monkeypatch) -
     assert tuning.cache_covers_workspace(**tuned)
     for field, other in (
         ("max_numel", 6144 * 256),
+        ("memop_supported", True),
         ("world_size", 8),
         ("max_blocks", 32),
         ("profile", PROFILE_SWITCHPAIR),
@@ -645,3 +711,15 @@ def test_unrelated_autotune_context_preserves_workspace_cache(monkeypatch) -> No
     assert tuner.loaded == [workspace._tune_cache]
     assert tuner.lookups == 1
     assert result == IpcLaunchConfig(16, 256, IpcVariant.STAGED)
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_memop_candidate_requires_group_capability_and_single_piece(world_size):
+    common = dict(world_size=world_size, numel=12 * 1024 * 1024 // 2)
+    legacy = set(tuning.candidate_tactics(**common, memop_supported=False))
+    enabled = set(tuning.candidate_tactics(**common, memop_supported=True))
+    expected = {(6, 1, 256)} if world_size in (4, 8) else set()
+    assert enabled - legacy == expected
+    assert legacy <= enabled
+    assert tuning.TUNE_RANK_ROUNDS == 3
+    assert tuning.TUNE_SURVIVORS == 48
