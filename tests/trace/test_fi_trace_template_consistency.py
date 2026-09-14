@@ -820,8 +820,25 @@ def test_prims_ts_block_sparse_goldens_match_templates(
     assert golden["constraints"] == list(template.constraints)
     assert list(golden["inputs"]) == list(template.inputs)
     for name, descriptor in template.inputs.items():
-        assert bool(golden["inputs"][name].get("optional")) == descriptor.optional
-        assert golden["inputs"][name].get("description", "") == descriptor.description
+        entry = golden["inputs"][name]
+        if isinstance(descriptor, Scalar):
+            assert entry["shape"] is None
+            assert entry["dtype"] == descriptor.dtype
+        else:
+            assert entry["shape"] == descriptor.dim_names
+        assert bool(entry.get("optional")) == descriptor.optional
+        assert entry.get("description", "") == descriptor.description
+    assert list(golden["outputs"]) == list(template.outputs)
+    for name, descriptor in template.outputs.items():
+        entry = golden["outputs"][name]
+        if isinstance(descriptor, Scalar):
+            assert entry["shape"] is None
+            assert entry["dtype"] == descriptor.dtype
+        else:
+            assert entry["shape"] == descriptor.dim_names
+        assert entry.get("param") == descriptor.param
+        assert bool(entry.get("optional")) == descriptor.optional
+        assert entry.get("description", "") == descriptor.description
 
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():

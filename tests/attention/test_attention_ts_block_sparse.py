@@ -5414,8 +5414,16 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     )
     kv_valid_bits_a = _pack_token_mask(case.seq_len_kv, valid_by_batch_a)
     kv_valid_bits_b = _pack_token_mask(case.seq_len_kv, valid_by_batch_b)
-    page_ids_a = torch.tensor([0, 2, 3, 5], device="cuda", dtype=torch.int32)
-    page_ids_b = torch.tensor([1, 4, 2, 5], device="cuda", dtype=torch.int32)
+    # Page-table rows per request. Only the live prefix of a row is read: the
+    # first request of round A (48 tokens) and the second request of round B
+    # (64 tokens) each own one 64-token page, so their trailing entries point
+    # at pages that belong to the other request and must be ignored.
+    block_table_rows_a = torch.tensor(
+        [[0, 2], [2, 3]], device="cuda", dtype=torch.int32
+    )
+    block_table_rows_b = torch.tensor(
+        [[1, 4], [2, 2]], device="cuda", dtype=torch.int32
+    )
 
     wrapper = prims_ts.BlockSparsePagedTSWrapper()
     wrapper.plan(
@@ -5510,7 +5518,7 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
         (case.batch_size, 3), -1, device="cuda", dtype=torch.int32
     )
     block_tables = block_table_storage[:, :2]
-    block_tables.copy_(torch.stack((page_ids_a[:2], page_ids_a[1:3])))
+    block_tables.copy_(block_table_rows_a)
     seq_lens_kv = seq_lens_a.clone()
     kv_valid_bits = kv_valid_bits_a.clone()
 
@@ -5554,9 +5562,7 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
 
     block_indptr.copy_(indptr_b)
     block_indices.copy_(indices_b)
-    block_tables.copy_(
-        torch.stack((page_ids_b[:2], torch.stack((page_ids_b[2], page_ids_b[2]))))
-    )
+    block_tables.copy_(block_table_rows_b)
     seq_lens_kv.copy_(seq_lens_b)
     kv_valid_bits.copy_(kv_valid_bits_b)
     replay()

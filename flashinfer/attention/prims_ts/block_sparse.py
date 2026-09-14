@@ -563,11 +563,11 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
     ) -> None:
         """Plan fixed-Q geometry and a maximum variable-K capacity.
 
-        The plan stores no request metadata. Every run supplies live page-table
-        offsets, page IDs, sequence lengths, sparse routes, and optional token
-        bits. ``max_seq_len_kv`` fixes compilation and mask capacity. Attention
-        consumes caller-owned live lengths directly, without a plan-owned copy
-        or device-to-host validation.
+        The plan stores no request metadata. Every run supplies a live fixed 2D
+        page table of physical page IDs, per-request K/V lengths, sparse routes,
+        and optional token bits. ``max_seq_len_kv`` fixes compilation and mask
+        capacity. Attention consumes caller-owned live lengths directly, without
+        a plan-owned copy or device-to-host validation.
 
         ``q_block_size`` may be any positive signed-Int32 value satisfying
         ``q_block_size * (Hq / Hkv) % 8 == 0``. This row-purity condition keeps
