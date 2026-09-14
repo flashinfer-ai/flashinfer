@@ -23,7 +23,12 @@ bound at the physical width and inflates only the routing value (DKG #60);
 ``validate_run_ws`` enforces the 16-byte alignment the compiled workspace
 declares; ``run_varlen`` rejects overlapping row layouts; ``run``/``run_ws``/
 ``run_varlen`` re-enter under the logits device and every compile passes an
-explicit ``--gpu-arch``. FlashInfer's ``top_k_varlen(backend="gvr_2")``
+explicit ``--gpu-arch``; ``route()`` adds two register-kernel rungs in the
+4K < n <= 8K band (VPT=2 for b <= sms, BLK=512 for sms < b <= 2*sms) and sizes its
+register band by the device SM count ``sms`` instead of the hard-coded 148
+(see the inline note; DKG #61); ``run_varlen`` accepts ``pre_idx=None`` and runs
+hint-free on a cached ``arange(k)`` anchor (``_hint_free_pre_idx``).
+FlashInfer's ``top_k_varlen(backend="gvr_2")``
 calls ``run_varlen`` below; the batch-uniform ``run``/``run_ws`` entries are
 kept for parity tests and benchmarking. Keep future diffs against upstream
 mechanical.
@@ -33,8 +38,9 @@ Three sections:
 
 1. dispatch — the CUDA host dispatch as a pure function
    ``route(b, n, npad, k)``;
-2. workspace — one zero-initialised per-device slab (20,973,568 B) via the
-   torch caching allocator, with keep-alive + double-checked locking;
+2. workspace — one zero-initialised slab (20,973,568 B) per (device, CUDA
+   stream) via the torch caching allocator (FlashInfer-local: upstream keys
+   it per device), with keep-alive + double-checked locking, eager-only;
 3. operator entry — ``run(logits, pre_idx, n_valid, indices)`` /
    ``run_ws(..., workspace)`` DPS forms with input hardening and a
    bind-once launch cache keyed on ``(b, n, npad, k)``.
@@ -79,6 +85,20 @@ def _device():
             import gvr2_topk_decode as _m
         _dev_mod = _m
     return _dev_mod
+
+
+_SM_COUNT = {}
+
+
+def _sm_count() -> int:
+    """SM count of the CURRENT device (per-device cache). FlashInfer-local
+    knob of ``route()``'s register-resident band (``wide`` / one-wave tests);
+    the streaming-path constants stay at upstream's 148 — see route()."""
+    d = torch.cuda.current_device()
+    v = _SM_COUNT.get(d)
+    if v is None:
+        v = _SM_COUNT[d] = int(torch.cuda.get_device_properties(d).multi_processor_count)
+    return v
 
 
 def _arch_token() -> str:
@@ -152,26 +172,41 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
-def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
-    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc."""
+def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
+    """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
+
+    FlashInfer-local deviations, marked inline: the register-resident band
+    is sized by ``sms`` (the device SM count; upstream hard-codes 148) — the
+    ``wide`` one-wave test, QC/CURE and the one-wave cutoff of the BLK=512
+    rung — and the 4K < n <= 8K band has two extra rungs (wide VPT=2, and
+    sms < b <= 2*sms BLK=512). The streaming-path constants keep upstream's
+    148 on every part."""
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     # 148 is the B200 SM count, baked in by the upstream CUDA dispatch (route()
     # is a pure mirror of it). It only steers occupancy heuristics (one-wave
-    # tests, split factors, cluster sizing), never correctness: on Rubin
-    # (SM107, 208 SMs) the same constants are merely conservative. Retuning
-    # per-arch is a perf follow-up, not a functional requirement.
-    wide = b <= 148
+    # tests, split factors, cluster sizing), never correctness. FlashInfer-
+    # local: the REGISTER-band tests use the real SM count `sms` (B300 160,
+    # Rubin 208): rows in (148, sms] are one wave of 1024-thread CTAs there
+    # and the register kernels beat the slab by 1.4-1.8x (B300 12288 x 160:
+    # 7.2 -> 4.6 us; Rubin 12288 x 160-192: 5.6 -> 4.0 us; measured same-node
+    # vs sglang, DKG #61). The STREAMING constants below stay at 148: scaling
+    # them too made the 131072 x 192-256 slab cells 3-28% slower on both parts.
+    wide = b <= sms
 
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    QC = 1024 if b > 148 else QUADC
-    CURE = not (n < 2 * k and b > 148)
+    QC = 1024 if b > sms else QUADC
+    CURE = not (n < 2 * k and b > sms)
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
         CMP = n
-    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 1024 and not wide)) else NB
+    # FlashInfer-local: the `n4 <= 2048 and not wide` window runs the BLK=512
+    # register kernel with NBH = NB for b <= 296 (upstream: main slab, which
+    # ignores NBSEL), so the NB selector must follow (IMGOFF == NBSEL == NBH
+    # is asserted at launch).
+    NBSEL = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
     IMGOFF = NBSEL
     smem_reg = (NBSEL + 2 * CMP) * 4
 
@@ -234,7 +269,13 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
 
     # ---- clustered register-resident path ----
     if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
-        av = 148 // (b if b > 0 else 1)  # truncating
+        # FlashInfer-local: cluster availability from the real SM count on
+        # parts with >= 148 SMs (Rubin 208: 4-CTA instead of 2-CTA clusters at
+        # b 38-48, and reg_clus instead of main/clus at b 80-104 / 48K-64K,
+        # 8-35% faster; B300 158-160: 12-34%); below 148 the upstream value
+        # stays — on DRIVE P2021 (68 SMs) the SM-aware rule won 34/44 measured
+        # cells but lost 10 by up to 40% (falls to clus/main at 48K-128K).
+        av = max(sms, 148) // (b if b > 0 else 1)  # truncating
         amax = 1
         while (amax << 1) <= av and amax < 8:
             amax <<= 1
@@ -266,6 +307,27 @@ def route(b: int, n: int, npad: int, k: int) -> dict[str, object]:
                 "ws": False,
             }
 
+    # FlashInfer-local rungs for the 4K < n <= 8K band (the upstream dispatch
+    # runs `wide` rows here on the VPT=4 kernel below and everything else on
+    # the streaming slab). Measured on B100/B200, K in {512, 1024, 2048},
+    # exact in every cell (logs/sglang_perf/force_plan*.py):
+    #   * wide (b <= 148): VPT=2 covers n4 <= 2048 exactly; the VPT=4 kernel
+    #     iterates two empty float4 slots per thread in every pass and is
+    #     ~18-20% slower (4.2 -> 3.4 us at n=8192, K=512).
+    #   * sms < b <= 2*sms (one wave at MINB=2, two CTAs per SM): the
+    #     BLK=512/VPT=4 register kernel beats the main slab by 1.3-1.7x
+    #     (8.0 -> 4.9 us at b=256, n=8192, K=512; Rubin 8192 x 400: 6.3 ->
+    #     4.2 us). A second wave (b <= 4*sms) still wins for the upper half
+    #     of the band (n >= 6144: B200 b=512 +11..12%, and the ragged-row
+    #     6144-8192 x 320-400 cells where the slab lost to sglang by up to
+    #     22%) but loses for the lower half (n=4160, b=512: -13%), so the
+    #     slab keeps that.
+    # Reported upstream for adoption as DKG issue #61.
+    if n4 <= 2048:
+        if wide:
+            return _reg(1024, 2, 1, 2 * NB)
+        if b <= 2 * sms or (b <= 4 * sms and n4 >= 1536):
+            return _reg(512, 4, 2, NB)
     if n4 <= 4096 and wide:
         return _reg(1024, 4, 1, 2 * NB)
 
@@ -495,11 +557,11 @@ _DYN_RT = {
 _DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
 
 
-def route_static(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_static(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
     Constant on maximal n-intervals ("bands"); every redacted field is
     reconstructible from (static, n) by route_dynamic."""
-    plan = route(b, n, npad, k)
+    plan = route(b, n, npad, k, sms=sms)
     st = {key: (dict(val) if isinstance(val, dict) else val) for key, val in plan.items()}
     for f in _DYN_RT[st["kernel"]]:
         st["rt"].pop(f)
@@ -585,10 +647,10 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     )
 
 
-def route_split(b: int, n: int, npad: int, k: int) -> dict[str, object]:
+def route_split(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """route_static + route_dynamic recombined — must equal route() exactly
     (the factorization fuzz in the unit tests asserts this)."""
-    st = route_static(b, n, npad, k)
+    st = route_static(b, n, npad, k, sms=sms)
     dyn, smem = route_dynamic(st, n)
     plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
     plan["rt"].update(dyn)
@@ -728,13 +790,52 @@ def route_streaming(
 
 _VARLEN_CACHE = {}
 
+# ---------------------------------------------------------------------------
+# first-call gate for compiled DSL kernel objects
+# ---------------------------------------------------------------------------
+# libcute_dsl_runtime's ``cuda_dialect_init_library_once`` (the per-kernel
+# CUDA init that runs inside the FIRST invocation of a compiled kernel) is a
+# double-checked once-init behind ONE process-wide spinlock. In
+# nvidia-cutlass-dsl 4.6.3, 4.7.0 and 4.7.1 the thread that acquires the lock
+# after another thread already initialised the same kernel returns WITHOUT
+# releasing it, so the next first call of ANY other kernel in the process
+# spins forever (fixed in 4.8.0.dev0 / nightlies >= 2026-08-18; reported as
+# DKG issue, see PR #4986). Until the DSL floor is past the fix, concurrent
+# first calls of one kernel object are serialized here; once the first call
+# has returned (the once-init is synchronous inside it) the wrapper costs one
+# list-element load per launch.
+_GATE_LOCK = threading.Lock()
+_GATED = {}  # id(compiled fn) -> (compiled fn kept alive, gated wrapper)
+
+
+def _gate_first_call(raw):
+    """Wrap a compiled DSL kernel object so its first invocation is exclusive."""
+    with _GATE_LOCK:
+        ent = _GATED.get(id(raw))
+        if ent is not None:
+            return ent[1]
+        lock = threading.Lock()
+        warm = [False]
+
+        def gated(*args, _raw=raw, _lock=lock, _warm=warm):
+            if _warm[0]:
+                return _raw(*args)
+            with _lock:
+                out = _raw(*args)
+                _warm[0] = True  # only after a completed first call
+            return out
+
+        _GATED[id(raw)] = (raw, gated)
+        return gated
+
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr, _arch_token())
+    sms = _sm_count()
+    key = (num_rows, npad, k, n_env, next_n, cr, _arch_token(), sms)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -755,10 +856,12 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # admission window (n4 <= 32768) fits capture-frozen envelopes. The
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
-    plan_free = route(num_rows, n_route, npad, k)
+    plan_free = route(num_rows, n_route, npad, k, sms=sms)
     if plan_free["kernel"] == "reg_clus":
-        fn = dev.get_compiled__regclus(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+        fn = _gate_first_call(
+            dev.get_compiled__regclus(
+                tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            )
         )
         lc = ("reg_clus", fn, n_kernel)
         _VARLEN_CACHE[key] = lc
@@ -771,8 +874,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
-        fn = dev.get_compiled__reg(
-            tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+        fn = _gate_first_call(
+            dev.get_compiled__reg(
+                tuple(plan_free["tpl"]), varlen=True, next_n=next_n, cr_shift=cr_shift
+            )
         )
         rt_f = plan_free["rt"]
         lc = (
@@ -791,13 +896,15 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # Per-row n / short-row handling in-kernel.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
-        fn = dev.get_compiled__clus(
-            tuple(plan_free["tpl"]),
-            scap=rt_f["SCAP"],
-            cmp_=rt_f["CMP"],
-            varlen=True,
-            next_n=next_n,
-            cr_shift=cr_shift,
+        fn = _gate_first_call(
+            dev.get_compiled__clus(
+                tuple(plan_free["tpl"]),
+                scap=rt_f["SCAP"],
+                cmp_=rt_f["CMP"],
+                varlen=True,
+                next_n=next_n,
+                cr_shift=cr_shift,
+            )
         )
         lc = (
             "clus",
@@ -813,7 +920,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
-    fn = dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+    fn = _gate_first_call(
+        dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const))
+    )
     big = num_rows * r_const <= 148
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
@@ -842,18 +951,25 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
 
 
 def route_bands(
-    b: int, npad: int, k: int, n_lo: int | None = None, n_hi: int | None = None
+    b: int,
+    npad: int,
+    k: int,
+    n_lo: int | None = None,
+    n_hi: int | None = None,
+    sms: int = 148,
 ) -> list[tuple[int, int, dict[str, object]]]:
     """Enumerate maximal n-intervals on which route_static is constant.
     Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
     engine-init tool (seconds for the 262144-token envelope), NOT a hot
-    path. Returns [(n_lo, n_hi, static_plan), ...]."""
+    path. Returns [(n_lo, n_hi, static_plan), ...]. Pass the target part's
+    SM count as ``sms`` (``_sm_count()`` on the device) or the bands describe
+    the B200 dispatch."""
     lo = k + 1 if n_lo is None else max(n_lo, k + 1)
     hi = npad if n_hi is None else min(n_hi, npad)
     bands = []
     cur_key, cur_lo, cur_plan = None, lo, None
     for n in range(lo, hi + 1):
-        st = route_static(b, n, npad, k)
+        st = route_static(b, n, npad, k, sms=sms)
         key = repr(st)
         if key != cur_key:
             if cur_key is not None:
@@ -867,11 +983,12 @@ def route_bands(
 # ===========================================================================
 # ==== workspace ============================================================
 # ===========================================================================
-"""Per-device workspace slab for the multi-CTA SPLIT path.
+"""Default workspace slabs for the multi-CTA SPLIT path.
 
 Semantics:
-  * ONE zero-initialised slab workspace per device, lazily allocated through
-    the torch caching allocator;
+  * ONE zero-initialised slab per (device index, raw CUDA stream handle),
+    lazily allocated through the torch caching allocator by the first EAGER
+    slab-using launch on that stream (never under CUDA-graph capture);
   * keep-alive store: module dict `_ws_keep` (tensor refcount = keep-alive);
   * double-checked locking: lock-free hot-path load (a GIL-atomic dict get
     plays an acquire load), slow path re-checks under a mutex;
@@ -880,8 +997,16 @@ Semantics:
     input checks, so a CPU logits tensor dies here with "device index out of
     range: -1").
 
-Concurrent STREAMS on one device that may both take the multi-CTA SPLIT path
-must pass their own workspace via run_ws().
+Concurrent streams on one device each get their own slab, so launches that
+overlap in time (distinct streams, graphs captured on different streams and
+replayed together) never share mutable scratch; a caller-provided workspace
+(run_ws() / `workspace=`) is optional, not required for concurrency. Two
+graphs captured on the SAME stream share that stream's slab and are correct
+as long as they replay in stream order. The number of slabs equals the number
+of distinct stream handles that have run an eager slab-using launch:
+`torch.cuda.Stream()` recycles handles from a fixed pool (32 per device and
+priority), but externally created / foreign stream handles are not bounded by
+that pool; `release_cached_resources()` frees them all.
 
 Size: workspace_bytes() = GVR_WS_BUF_OFF + MAXC*GCAP*sizeof(int2)
     = 2048 + 160*16384*8 = 20,973,568 B.
@@ -904,7 +1029,18 @@ WS_BYTES = _GVR_WS_BUF_OFF + _MAXC * _GCAP * 8  # 20,973,568
 assert WS_BYTES == 20_973_568
 
 _mu = threading.Lock()  # slow-path mutex
-_ws_keep = {}  # device index -> keep-alive int32 view
+# FlashInfer-local: one slab per (device index, CUDA stream) instead of one
+# per device. The SPLIT slab is mutable scratch (publish counters + candidate
+# buffer, restored by the kernel), so two launches that can overlap in time —
+# concurrent streams, or graphs captured on different streams and replayed
+# together — must not share it (measured 17/5120 corrupted rows through a
+# device-wide slab; see test_topk_varlen_serving). Keyed by the raw stream
+# handle; the tensor refcount is the keep-alive.
+_ws_keep = {}  # (device index, cuda stream handle) -> keep-alive int32 view
+
+
+def _ws_key(d: int) -> tuple[int, int]:
+    return (d, torch.cuda.current_stream(d).cuda_stream)
 
 
 def workspace_bytes() -> int:
@@ -913,26 +1049,37 @@ def workspace_bytes() -> int:
 
 
 def default_workspace(ref: torch.Tensor) -> torch.Tensor:
-    """Per-device cached workspace slab.
+    """Cached workspace slab for (ref's device, the CURRENT stream).
 
     Returns the kernel-facing 1-D int32 view (zero-initialised on first use;
     the kernel restores the zeros it consumes, so one zeroing suffices for
-    the lifetime of the cache entry)."""
+    the lifetime of the cache entry). Allocation is eager-only: under
+    CUDA-graph capture a slab would come from the graph's private pool and
+    its zero-fill would be part of the graph, so a capture on a stream that
+    has never run an eager gvr_2 call raises instead (same warm-up rule as
+    the launcher cache)."""
     d = ref.get_device()
     if not (0 <= d < GVR_MAX_DEV):
         raise RuntimeError(f"device index out of range: {d}")
-    ws = _ws_keep.get(d)  # hot path: one (GIL-atomic) load
+    key = _ws_key(d)
+    ws = _ws_keep.get(key)  # hot path: one (GIL-atomic) load
     if ws is not None:
         return ws
     with _mu:  # slow path: double-checked
-        ws = _ws_keep.get(d)
+        ws = _ws_keep.get(key)
         if ws is not None:
             return ws
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "gvr_2 default workspace: no slab for this stream yet; run one "
+                "eager gvr_2 call on the stream that captures the graph (or pass "
+                "workspace={'gvr2_workspace': ...}) before CUDA-graph capture"
+            )
         # lazy zeros via the torch caching allocator, viewed int32 for the
         # DSL launch signature.
         buf = torch.zeros(WS_BYTES, dtype=torch.uint8, device=ref.device)
         ws = buf.view(torch.int32)
-        _ws_keep[d] = ws  # keep-alive (ws_keep[d] = tensor)
+        _ws_keep[key] = ws  # keep-alive
         return ws
 
 
@@ -982,6 +1129,59 @@ def _reset_for_tests() -> None:
         _ws_keep.clear()
 
 
+def release_cached_resources(device=None) -> int:
+    """FlashInfer-local: release the lazily created per-device caches — every
+    default workspace slab (one per (device, stream), 20,973,568 B each) and
+    every hint-free anchor table (current and superseded) — for ``device``
+    (default: the current device; an int, a ``torch.device`` or a device
+    string, CUDA only). Synchronizes the device, then drops the references
+    under both cache locks; the memory returns to the torch caching
+    allocator (``torch.cuda.empty_cache()`` hands it back to the driver).
+    Returns the number of bytes released.
+
+    CONTRACT — caller quiescence. The launch hot paths read the caches
+    without taking the locks (a lock there would cost every launch), so this
+    call cannot exclude a launch that is being issued concurrently: while it
+    runs, no gvr_2 call on ``device`` may be in flight or issued — no eager
+    call from any thread and no CUDA-graph replay — exactly like
+    ``torch.cuda.empty_cache()`` versus live tensors. Under that contract the
+    device sync retires every launch that could still address a cached
+    object, and the locks make the clear atomic with respect to the slow
+    paths that create objects (a creation either completes before the clear
+    or starts after it; nothing is left half-published).
+
+    INVALIDATION: a CUDA graph captured against a released slab or table
+    replays on freed memory. Callers release only when no such graph will be
+    replayed again, and re-capture after a fresh eager warm-up on the
+    capturing stream (the same rule as the first capture)."""
+    if device is None:
+        d = torch.cuda.current_device()
+    else:
+        dev = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+        if dev.type != "cuda":
+            raise ValueError(
+                f"release_cached_resources: expected a CUDA device, got {dev!r}"
+            )
+        d = dev.index if dev.index is not None else torch.cuda.current_device()
+    freed = 0
+    with _mu, _HINT_FREE_LOCK:  # lock order: _mu -> _HINT_FREE_LOCK (never nested elsewhere)
+        torch.cuda.synchronize(d)
+        for key in [k for k in _ws_keep if k[0] == d]:
+            freed += _ws_keep.pop(key).numel() * 4
+        for key in [k for k in _HINT_FREE if k[0] == d]:
+            freed += _HINT_FREE.pop(key).numel() * 4
+        # partition by device index — never tensor equality (`in`/`remove`
+        # would compare tensor contents and raise across devices or shapes)
+        keep = []
+        for t in _HINT_FREE_KEEP:
+            if t.device.index == d:
+                freed += t.numel() * 4
+            else:
+                keep.append(t)
+        _HINT_FREE_KEEP[:] = keep
+    return freed
+
+
 # ===========================================================================
 # ==== operator entry =======================================================
 # ===========================================================================
@@ -1024,6 +1224,54 @@ builder in _build_launcher; only the main family takes the workspace.
 # shape key (b, n, npad, k) -> (fn, args tuple of python ints, needs_ws)
 _LAUNCH_CACHE = {}
 _DUMMY_KV = {}
+# hint-free entry: (device index, k) -> int32[cap, k] table whose every row
+# is arange(k). Superseded tables are kept alive (captured graphs may still
+# address them). Growth is serialized by _HINT_FREE_LOCK (locked re-check,
+# capacity only grows) and the producing stream is synchronized before a
+# table is published, so any thread/stream that sees the pointer sees a
+# complete table.
+_HINT_FREE = {}
+_HINT_FREE_KEEP = []
+_HINT_FREE_LOCK = threading.Lock()
+
+
+def _hint_free_pre_idx(batch, k, device):
+    """FlashInfer-local: the ``pre_idx`` stand-in for hint-free ``run_varlen``.
+
+    The kernels consume the hint only as a sampling anchor — the block-wide
+    (min, max) of ``logits[pre_idx[j]]`` — and never for exactness, so ANY k
+    distinct in-range indices are a valid hint; ``arange(k)`` is the cheapest
+    (rows shorter than k take the in-kernel identity path before the anchor
+    matters, and columns < k always lie inside the row's storage). One table
+    per (device, k), grown by doubling and reused as a contiguous row-prefix
+    view (16-byte aligned: k is a multiple of 512), so the hot path performs
+    no allocation and CUDA-graph replays see a stable address. Growth is
+    refused under capture — run one eager call (or ``warmup_varlen``) at the
+    largest batch first, like every other launcher resource.
+    """
+    key = (device.index if device.index is not None else torch.cuda.current_device(), k)
+    t = _HINT_FREE.get(key)  # hot path: one (GIL-atomic) load
+    if t is not None and t.shape[0] >= batch:
+        return t[:batch]
+    if _is_capturing():
+        raise RuntimeError(
+            f"hint-free gvr_2: no pre_idx table for batch={batch}, k={k} on "
+            f"{device}; run one eager call (or warmup_varlen) at this batch "
+            "before CUDA-graph capture"
+        )
+    with _HINT_FREE_LOCK:  # slow path: locked re-check, monotonic capacity
+        t = _HINT_FREE.get(key)
+        if t is not None and t.shape[0] >= batch:
+            return t[:batch]
+        cap = max(batch, 64 if t is None else 2 * t.shape[0])
+        new = torch.arange(k, dtype=_I32, device=device).unsqueeze(0).expand(cap, k).contiguous()
+        # the fill ran on the caller's stream; make it complete before any
+        # other stream/thread can see the pointer (eager-only, rare: doubling)
+        torch.cuda.current_stream(device).synchronize()
+        if t is not None:
+            _HINT_FREE_KEEP.append(t)
+        _HINT_FREE[key] = new
+        return new[:batch]
 
 
 def _dummy_kv(dev_index, device):
@@ -1051,13 +1299,13 @@ _GVR_MAX_DEV = GVR_MAX_DEV
 # per-family launcher builders (cold path: once per distinct shape key)
 # ---------------------------------------------------------------------------
 def _build_launcher(b, n, npad, k):
-    rd = route(b, n, npad, k)
+    rd = route(b, n, npad, k, sms=_sm_count())
     fam = rd["kernel"]
     tpl = tuple(rd["tpl"])
     rt = rd["rt"]
     if fam in ("reg", "regimg"):
         dev = _device()
-        raw = dev.get_compiled__reg(tpl)
+        raw = _gate_first_call(dev.get_compiled__reg(tpl))
 
         # compiled ABI: (logits, pre_idx, kv_lens, out, n, CMP, QC,
         # smem_total) -- kv_lens is the dead varlen slot in batch-uniform
@@ -1069,7 +1317,7 @@ def _build_launcher(b, n, npad, k):
         return (fn, args, False)
     if fam == "main":
         dev = _device()
-        raw = dev.get_compiled(tpl)
+        raw = _gate_first_call(dev.get_compiled(tpl))
 
         # compiled ABI: (logits, pre_idx, out, ws, n, npad, k, SCAP_, CMP_,
         #                R, SMP, TGT, Q, SS2, TGT2,
@@ -1099,7 +1347,9 @@ def _build_launcher(b, n, npad, k):
         # ABI: (logits, pre_idx, kv_lens, out, n, npad, k, SCAP, CMP, SMP,
         #       TGT, Q, SS2, TGT2) -- NO workspace; kv_lens is the dead
         # varlen slot in batch-uniform mode (cached dummy tensor)
-        fn = dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
+        fn = _gate_first_call(
+            dev.get_compiled__clus(tpl, scap=rt["SCAP"], cmp_=rt["CMP"])
+        )
         args = (
             rt["n"],
             rt["npad"],
@@ -1122,7 +1372,7 @@ def _build_launcher(b, n, npad, k):
         # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
         # dead varlen slot in batch-uniform mode (cached dummy tensor);
         # smem/k derived in-module
-        fn = dev.get_compiled__regclus(tpl)
+        fn = _gate_first_call(dev.get_compiled__regclus(tpl))
         n_arg = rt["n"]
 
         def _call(lg, pi, idx, _fn=fn, _n=n_arg):
@@ -1229,7 +1479,7 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
                 values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
-    key = (b, n, npad, k, _arch_token())
+    key = (b, n, npad, k, _arch_token(), _sm_count())
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
         lc = _build_launcher(b, n, npad, k)
@@ -1276,7 +1526,7 @@ def run(
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:  # checked on EVERY call
         raise RuntimeError(f"device index out of range: {d}")
-    ws = _ws_hot.get(d)
+    ws = _ws_hot.get(_ws_key(d))
     if ws is None:
         ws = default_workspace(logits)
     _run_impl(logits, pre_idx, n_valid, indices, ws, values)
@@ -1302,7 +1552,7 @@ def run_ws(
 
 def run_varlen(
     logits: torch.Tensor,
-    pre_idx: torch.Tensor,
+    pre_idx: torch.Tensor | None,
     kv_lens: torch.Tensor,
     indices: torch.Tensor,
     next_n: int = 1,
@@ -1311,8 +1561,15 @@ def run_varlen(
     max_seq_len: int | None = None,
     engine: str = "auto",
     workspace: torch.Tensor | None = None,
+    top_k: int | None = None,
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
+
+    HINT-FREE (FlashInfer-local): ``pre_idx=None`` runs with the cached
+    ``arange(k)`` stand-in of ``_hint_free_pre_idx`` and then REQUIRES
+    ``top_k`` (normally ``k = pre_idx.shape[1]``). Exact like the hinted
+    call; only the sampling anchor is weaker. When both are given they must
+    agree.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1360,6 +1617,7 @@ def run_varlen(
                 max_seq_len=max_seq_len,
                 engine=engine,
                 workspace=workspace,
+                top_k=top_k,
             )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
@@ -1388,6 +1646,19 @@ def run_varlen(
     batch = num_rows // nn
     if kv_lens.shape[0] != batch:
         raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
+    if pre_idx is None:
+        if top_k is None:
+            raise RuntimeError("run_varlen: top_k is required when pre_idx is None (hint-free)")
+        pre_idx = _hint_free_pre_idx(batch, _index(top_k), logits.device)
+    else:
+        if top_k is not None and len(pre_idx.shape) == 2 and pre_idx.shape[1] != _index(top_k):
+            raise RuntimeError(f"top_k={top_k} != pre_idx.shape[1]={pre_idx.shape[1]}")
+        if len(pre_idx.shape) == 2 and not _is_capturing():
+            # hint mode is NOT a warm-up dimension: a hinted eager call at this
+            # geometry also sizes the hint-free anchor table, so a later
+            # hint-free capture of the same geometry finds it (dict hit once
+            # sized; allocation only on growth)
+            _hint_free_pre_idx(batch, pre_idx.shape[1], logits.device)
     if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
         raise RuntimeError(
             f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
@@ -1401,9 +1672,10 @@ def run_varlen(
         validate_run_ws(workspace, logits)
         ws = kernel_view(workspace)
     else:
-        ws = _ws_hot.get(d)
-        if ws is None:
-            ws = default_workspace(logits)
+        # resolved lazily: only the streaming `main` family takes the slab, so
+        # register/cluster plans never need one (and can be captured on any
+        # stream without an eager launch there)
+        ws = None
 
     if engine == "auto":
         # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
@@ -1487,7 +1759,7 @@ def run_varlen(
             # R increment (bounded plans, bounded _VARLEN_CACHE)
             n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr, _arch_token())
+        key = (num_rows, npad, k, n_env, nn, cr, _arch_token(), _sm_count())
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -1514,6 +1786,10 @@ def run_varlen(
             lc[1](lg, pre_idx, kv_lens, idx, *lc[2])
         else:
             _, fn, pre, tail = lc
+            if ws is None:
+                ws = _ws_hot.get(_ws_key(d))
+                if ws is None:
+                    ws = default_workspace(logits)  # raises under capture
             fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
         if vals is not None:
             idx64 = idx.to(torch.int64)
@@ -1542,6 +1818,8 @@ def run_varlen(
     if vals is not None and vals.shape[1] != k:
         vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
     kl = kv_lens.tolist()  # the ONE documented D2H sync of this engine
+    if ws is None:
+        ws = default_workspace(logits)
     for r in range(num_rows):
         # production graph slots can carry kv_len < next_n (padded / evicted
         # requests): clamp to the empty row, emitting all -1 — the same
@@ -1623,12 +1901,21 @@ def warmup_varlen(
     # rows) even when CUDA-graph batch lists reach thousands of rows.
     n_env_c = max(1, int(max_seq_len) // int(compress_ratio))
     npad_c = (n_env_c + 63) // 64 * 64 if row_stride is None else int(row_stride)
+    # hint-free callers capture with the arange table: size it for the
+    # largest requested batch now (growth is refused under capture), and
+    # create THIS stream's default workspace slab (the band launches below may
+    # all land on register/cluster plans while a requested row count routes
+    # to the slab-using `main` family; both are refused under capture)
+    _hint_free_pre_idx(req_rows[-1] // nn, int(top_k), torch.device("cuda", dev))
+    default_workspace(torch.empty(0, dtype=torch.uint8, device=torch.device("cuda", dev)))
     seen_keys = set()
     rows_list = []
     r = nn
     r_max = req_rows[-1]
     while r <= r_max:
-        plan_free = route(r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k))
+        plan_free = route(
+            r, max(min(n_env_c, npad_c), int(top_k) + 1), npad_c, int(top_k), sms=_sm_count()
+        )
         if plan_free["kernel"] == "reg_clus":
             ekey = ("reg_clus", tuple(plan_free["tpl"]))
         elif plan_free["kernel"] in ("reg", "regimg"):

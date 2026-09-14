@@ -115,7 +115,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
-import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -1223,7 +1222,7 @@ class GdnDecodeUCacheFlushKernel:
         # verify kernel consumes nothing we write).
         self._pdl_trigger = bool(pdl_trigger)
 
-    @cute.experimental.jit
+    @cute.jit
     def __call__(
         self,
         gQ: cute.Tensor,
@@ -1305,7 +1304,7 @@ class GdnDecodeUCacheFlushKernel:
             min_blocks_per_mp=self._min_blocks_per_mp,
         )
 
-    @cute.experimental.kernel
+    @cute.kernel
     def kernel(
         self,
         gQ: cute.Tensor,
