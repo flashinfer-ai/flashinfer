@@ -95,7 +95,6 @@ from ._sparse_mla_sm120_policy import (
     _DECODE_GLM53_NOPE_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_GLM53_NOPE_TOPK,
     _D_V_BY_MODEL_TYPE,
-    _SUPPORTED_D_V,
     _decode_chunk_width,
     _decode_scratch_heads,
     _MODEL_TYPE_TO_FAMILY,
@@ -399,18 +398,6 @@ def _require_d_v(d_v: int, model_type: Optional[int] = None) -> None:
     expected = _expected_d_v(model_type)
     if int(d_v) != expected:
         raise ValueError(f"SM120 sparse-MLA requires d_v == {expected}, got {d_v}")
-
-
-def _require_supported_d_v(d_v: int) -> None:
-    """Check ``d_v`` against the supported set without loading the JIT module.
-
-    The strict per-model check runs again at plan/run time through
-    :func:`_require_d_v` once ``d_qk`` has resolved the model type.
-    """
-    if int(d_v) not in _SUPPORTED_D_V:
-        raise ValueError(
-            f"SM120 sparse-MLA requires d_v in {sorted(_SUPPORTED_D_V)}, got {d_v}"
-        )
 
 
 def _check_last_dim(
@@ -960,7 +947,8 @@ class _SparseMLAPagedAttentionRunner:
             raise ValueError(f"max_num_tokens must be > 0, got {max_num_tokens}")
         if max_num_heads is not None and (max_num_heads <= 0 or max_num_heads > 128):
             raise ValueError(f"max_num_heads must be in (0, 128], got {max_num_heads}")
-        _require_supported_d_v(d_v)
+        # d_v is validated against the compiled format table on the first
+        # plan/run; construction stays free of JIT module loading.
         self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
         if compute_precision not in ("default", "fp8", "bf16", "nvfp4"):
             raise ValueError("compute_precision must be default, fp8, bf16, or nvfp4")
