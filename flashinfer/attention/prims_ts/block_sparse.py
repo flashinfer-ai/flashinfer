@@ -63,13 +63,9 @@ from ._block_sparse.runtime import (
     record_block_sparse_run_args as _record_block_sparse_run_args,
     validate_block_sparse_metadata as _validate_block_sparse_metadata,
     validate_block_sparse_run as _validate_block_sparse_run,
+    validate_paged_kv_storage as _validate_paged_kv_storage,
 )
-from .decode import (
-    PagedKVCache,
-    _normalize_paged_kv_cache,
-    _resolve_cuda_device,
-    _validate_block_table_metadata,
-)
+from .decode import PagedKVCache, _resolve_cuda_device
 
 
 class _BlockSparseWrapperBase:
@@ -809,31 +805,20 @@ def block_sparse_attention_with_paged_kv_cache(
 
     batch_size, seq_len_q, num_qo_heads, head_dim = map(int, q.shape)
     metadata_device, _ = _resolve_cuda_device(q.device)
-    table_device, table_batch_size, table_capacity = _validate_block_table_metadata(
-        block_tables, seq_lens_kv
+    paged = _validate_paged_kv_storage(
+        _PagedKVStorage(
+            paged_kv_cache=paged_kv_cache,
+            block_tables=block_tables,
+            seq_lens_kv=seq_lens_kv,
+        ),
+        expected_device=q.device,
+        expected_batch_size=batch_size,
+        seq_len_kv=max_seq_len_kv,
     )
-    if table_device != q.device:
-        raise ValueError(f"paged-KV metadata must be on {q.device}, got {table_device}")
-    if table_batch_size != batch_size:
-        raise ValueError(
-            "seq_lens_kv must have one entry per request: "
-            f"expected {batch_size}, got {table_batch_size}"
-        )
-
-    (
-        k_cache,
-        _,
-        num_physical_kv_pages,
-        num_kv_heads,
-        page_size,
-        runtime_head_dim,
-        _,
-        _,
-    ) = _normalize_paged_kv_cache(paged_kv_cache, expected_device=q.device)
-    if runtime_head_dim != head_dim:
+    if paged.head_dim != head_dim:
         raise ValueError(
             "Q and paged K/V head dimensions must agree: "
-            f"expected {head_dim}, got {runtime_head_dim}"
+            f"expected {head_dim}, got {paged.head_dim}"
         )
 
     use_kv_valid_bits = kv_valid_bits is not None
@@ -842,23 +827,17 @@ def block_sparse_attention_with_paged_kv_cache(
         seq_len_q=seq_len_q,
         seq_len_kv=max_seq_len_kv,
         num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
+        num_kv_heads=paged.num_kv_heads,
         head_dim=head_dim,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        page_size=page_size,
+        page_size=paged.page_size,
         use_kv_valid_bits=use_kv_valid_bits,
         mask_type=mask_type,
         q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
+        kv_dtype=paged.k.dtype,
         output_dtype=q.dtype if out is None else out.dtype,
     )
-    if table_capacity * page_size < static.seq_len_kv:
-        raise ValueError(
-            "block_tables must cover the planned K/V capacity: expected at "
-            f"least {(static.seq_len_kv + page_size - 1) // page_size} columns, "
-            f"got {table_capacity}"
-        )
     _validate_block_sparse_metadata(
         sparse_format="bsr",
         block_indptr=block_indptr,
@@ -880,7 +859,7 @@ def block_sparse_attention_with_paged_kv_cache(
         block_tables,
         seq_lens_kv,
         static=static,
-        num_physical_kv_pages=num_physical_kv_pages,
+        num_physical_kv_pages=paged.payload.num_physical_kv_pages,
         stream=torch.cuda.current_stream(metadata_device),
     )
 

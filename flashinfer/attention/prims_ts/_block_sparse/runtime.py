@@ -64,6 +64,19 @@ class _PagedKVLaunchPayload:
 
 
 @dataclass(frozen=True)
+class _ValidatedPagedKV:
+    """Zero-copy paged K/V views, cache geometry, and launch metadata of one run."""
+
+    k: torch.Tensor
+    v: torch.Tensor
+    num_kv_heads: int
+    page_size: int
+    head_dim: int
+    table_capacity: int
+    payload: _PagedKVLaunchPayload
+
+
+@dataclass(frozen=True)
 class _BlockSparseRunArgs:
     """Validated launch arguments with optional values materialized once."""
 
@@ -221,6 +234,75 @@ def _validate_bshd_tensor(
     _validate_16byte_alignment(tensor, name)
 
 
+def validate_paged_kv_storage(
+    kv_storage: _PagedKVStorage,
+    *,
+    expected_device: torch.device,
+    expected_batch_size: int,
+    seq_len_kv: int,
+) -> _ValidatedPagedKV:
+    """Validate paged K/V structure and page-table metadata for one run.
+
+    The cache is normalized into zero-copy HND views, and the page table and
+    K/V lengths are checked structurally; both must sit on ``expected_device``
+    with one row per request, and every row must cover ``seq_len_kv`` tokens.
+    Agreement of the cache geometry and dtype with a plan stays with the
+    caller, because the one-shot entry point derives its plan from the values
+    returned here.
+    """
+
+    (
+        k,
+        v,
+        num_physical_kv_pages,
+        num_kv_heads,
+        page_size,
+        head_dim,
+        k_page_stride,
+        v_page_stride,
+    ) = _normalize_paged_kv_cache(
+        kv_storage.paged_kv_cache,
+        expected_device=expected_device,
+    )
+    metadata_device, metadata_batch_size, table_capacity = (
+        _validate_block_table_metadata(
+            kv_storage.block_tables,
+            kv_storage.seq_lens_kv,
+        )
+    )
+    if metadata_device != expected_device:
+        raise ValueError(
+            f"paged-KV metadata must be on {expected_device}, got {metadata_device}"
+        )
+    if metadata_batch_size != expected_batch_size:
+        raise ValueError(
+            "seq_lens_kv must have one entry per request: "
+            f"expected {expected_batch_size}, got {metadata_batch_size}"
+        )
+    if table_capacity * page_size < seq_len_kv:
+        raise ValueError(
+            "block_tables must cover the planned K/V capacity: expected at "
+            f"least {(seq_len_kv + page_size - 1) // page_size} columns, "
+            f"got {table_capacity}"
+        )
+    return _ValidatedPagedKV(
+        k=k,
+        v=v,
+        num_kv_heads=num_kv_heads,
+        page_size=page_size,
+        head_dim=head_dim,
+        table_capacity=table_capacity,
+        payload=_PagedKVLaunchPayload(
+            block_tables=kv_storage.block_tables,
+            block_table_row_stride=kv_storage.block_tables.stride(0),
+            seq_lens_kv=kv_storage.seq_lens_kv,
+            num_physical_kv_pages=num_physical_kv_pages,
+            k_page_stride=k_page_stride,
+            v_page_stride=v_page_stride,
+        ),
+    )
+
+
 def validate_block_sparse_run(
     q: torch.Tensor,
     kv_storage: _ContiguousKVStorage | _PagedKVStorage,
@@ -323,67 +405,26 @@ def validate_block_sparse_run(
         page_size = state.page_size
         if page_size is None:
             raise TypeError("paged K/V storage requires a paged plan state")
-        (
-            k,
-            v,
-            num_physical_kv_pages,
-            runtime_num_kv_heads,
-            runtime_page_size,
-            runtime_head_dim,
-            k_page_stride,
-            v_page_stride,
-        ) = _normalize_paged_kv_cache(
-            kv_storage.paged_kv_cache,
+        paged = validate_paged_kv_storage(
+            kv_storage,
             expected_device=state.device,
+            expected_batch_size=state.batch_size,
+            seq_len_kv=state.seq_len_kv,
         )
-        runtime_geometry = (
-            runtime_num_kv_heads,
-            runtime_page_size,
-            runtime_head_dim,
-        )
-        expected_geometry = (
-            state.num_kv_heads,
-            page_size,
-            state.head_dim,
-        )
+        runtime_geometry = (paged.num_kv_heads, paged.page_size, paged.head_dim)
+        expected_geometry = (state.num_kv_heads, page_size, state.head_dim)
         if runtime_geometry != expected_geometry:
             raise ValueError(
                 "paged_kv_cache geometry does not match the plan: expected "
                 f"Hkv/page/D={expected_geometry}, got {runtime_geometry}"
             )
-        if k.dtype != state.kv_dtype:
+        if paged.k.dtype != state.kv_dtype:
             raise ValueError(
-                f"K/V dtype must match the plan ({state.kv_dtype}), got {k.dtype}"
+                f"K/V dtype must match the plan ({state.kv_dtype}), got {paged.k.dtype}"
             )
-        metadata_device, metadata_batch_size, table_capacity = (
-            _validate_block_table_metadata(
-                kv_storage.block_tables,
-                kv_storage.seq_lens_kv,
-            )
-        )
-        if metadata_device != state.device:
-            raise ValueError(
-                f"per-run metadata must be on {state.device}, got {metadata_device}"
-            )
-        if metadata_batch_size != state.batch_size:
-            raise ValueError(
-                "per-run metadata batch size must match the plan "
-                f"({state.batch_size}), got {metadata_batch_size}"
-            )
-        if table_capacity * page_size < state.seq_len_kv:
-            raise ValueError(
-                "block_tables must cover the planned K/V capacity: expected at "
-                f"least {(state.seq_len_kv + page_size - 1) // page_size} columns, "
-                f"got {table_capacity}"
-            )
-        paged_kv = _PagedKVLaunchPayload(
-            block_tables=kv_storage.block_tables,
-            block_table_row_stride=kv_storage.block_tables.stride(0),
-            seq_lens_kv=kv_storage.seq_lens_kv,
-            num_physical_kv_pages=num_physical_kv_pages,
-            k_page_stride=k_page_stride,
-            v_page_stride=v_page_stride,
-        )
+        k = paged.k
+        v = paged.v
+        paged_kv = paged.payload
     else:
         raise TypeError("kv_storage must be _ContiguousKVStorage or _PagedKVStorage")
 
@@ -625,9 +666,11 @@ __all__ = [
     "_ContiguousKVStorage",
     "_PagedKVLaunchPayload",
     "_PagedKVStorage",
+    "_ValidatedPagedKV",
     "launch_block_sparse",
     "prepare_block_sparse_run_unchecked",
     "record_block_sparse_run_args",
     "validate_block_sparse_metadata",
     "validate_block_sparse_run",
+    "validate_paged_kv_storage",
 ]
