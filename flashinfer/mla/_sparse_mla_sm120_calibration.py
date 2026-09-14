@@ -1208,11 +1208,23 @@ def _apply_unit(
         dev.setdefault("profiles", {}).update(profiles)
 
 
+def _replay_unit(devices: dict, unit) -> None:
+    """Apply one stored unit, re-evaluating conditional replacement.
+
+    A conditional unit (recorded by replace_family_if_absent) is destructive
+    only while the family is still absent; once any publisher has landed the
+    family's constants, the unit merges instead of discarding entries."""
+    dev_key, constants, crossover, overrides, prefixes, profiles, conditional = unit
+    if conditional and any(f in devices.get(dev_key, {}) for f in conditional):
+        prefixes = ()
+    _apply_unit(devices, dev_key, constants, crossover, overrides, prefixes, profiles)
+
+
 def _materialize_store(state: dict) -> None:
     global _constants_version
     devices = json.loads(json.dumps(state["disk"]))
     for unit in state["overlay"]:
-        _apply_unit(devices, *unit)
+        _replay_unit(devices, unit)
     parsed = _parse_payload_devices(devices)
     state["profiles"] = {dev: data.get("profiles", {}) for dev, data in devices.items()}
     for name, values in zip(
@@ -1305,9 +1317,10 @@ def publish_calibration(
             overrides or {},
             prefixes,
             profiles,
+            aliases if (replace_family_if_absent and not replace_family) else (),
         )
         candidate: dict = {}
-        _apply_unit(candidate, *unit)
+        _apply_unit(candidate, *unit[:6])
         _parse_payload_devices(candidate)
         persisted = False
         tmp = None
@@ -1317,15 +1330,8 @@ def publish_calibration(
                 payload = _read_payload_for_merge(path)
                 devices = payload.setdefault("devices", {})
                 for pending in state["overlay"]:
-                    _apply_unit(devices, *pending)
-                effective = unit
-                if (
-                    replace_family_if_absent
-                    and not replace_family
-                    and any(f in devices.get(dev_key, {}) for f in aliases)
-                ):
-                    effective = unit[:4] + ((),) + unit[5:]
-                _apply_unit(devices, *effective)
+                    _replay_unit(devices, pending)
+                _replay_unit(devices, unit)
                 _parse_payload_devices(devices)
                 with tempfile.NamedTemporaryFile(
                     mode="w", dir=path.parent, delete=False

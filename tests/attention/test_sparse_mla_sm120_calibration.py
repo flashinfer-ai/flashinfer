@@ -1250,6 +1250,46 @@ def test_publish_if_absent_merges_concurrent_family(store) -> None:
     assert cpb_mod.get_decode_max_tokens(store, "dsv4", 32, 256) == 4
 
 
+def test_conditional_overlay_rechecked_on_replay(store, monkeypatch) -> None:
+    """A failed conditional publish sits in the overlay with replace intent;
+    replay must re-evaluate the condition instead of wiping a family that
+    landed on disk in the meantime."""
+    import os as real_os
+
+    monkeypatch.setattr(
+        cpb_mod.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("read only"))
+    )
+    assert not cpb_mod.publish_calibration(
+        store,
+        "dsv4",
+        constants=_C,
+        crossover={"dsv4|32|256": 4},
+        replace_family_if_absent=True,
+    )
+    monkeypatch.setattr(cpb_mod.os, "replace", real_os.replace)
+    # A concurrent process publishes the same family while our unit sits in the
+    # overlay.
+    path = cpb_mod.default_cache_path()
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": cpb_mod._SCHEMA_VERSION,
+                "devices": {
+                    str(store): {
+                        "dsv4": cpb_mod.asdict(replace(_C, c0=3e-6)),
+                        cpb_mod._DECODE_MAX_TOKENS_KEY: {"dsv4|16|128": 8},
+                    }
+                },
+            }
+        )
+    )
+    # Any later publish refreshes the disk view and replays the overlay.
+    cpb_mod.save_constants(store, "dsv3_2", _C)
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 16, 128) == 8
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 32, 256) == 4
+    assert cpb_mod.get_constants(store, "dsv4") == _C
+
+
 def test_atomic_alias_invalidation_and_writer_merge(store):
     cpb_mod.save_constants(store, "dsv3_2", _C)
     cpb_mod.save_crossover(
