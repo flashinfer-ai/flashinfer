@@ -903,7 +903,8 @@ class _SparseMLAPagedAttentionRunner:
         (T<=64, H=1..128), otherwise the existing FP8 prefill (H=8/16/32/64,
         main topk multiple of 64). Without a matching DSV4.1 profile the
         decode-first policy uses CPB=1, isolated from legacy calibration. Exact
-        profiles select same-precision phase/CPB by the next larger token bucket.
+        profiles select same-precision phase/CPB by an exact refined entry when
+        tuning measured one, else the next larger token bucket.
         FP8 prefill indices must be contiguous;
         independent page sizes and pitched cache/LSE buffers are supported.
         Full BF16 uses decode at T<=64 and direct prefill at larger T, retaining

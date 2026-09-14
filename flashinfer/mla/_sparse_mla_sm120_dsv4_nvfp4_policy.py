@@ -68,10 +68,10 @@ def _supports(
     )
 
 
-# Match the FP8 crossover policy, adding T=1 because single-request decode is
-# an important NVFP4 latency corner.  Non-probe decode batches use the next
-# larger bucket's measured CPB.
-_CROSSOVER_PROBED_T = (1, 4, 8, 16, 24, 32, 48, 64)
+# One profile bucket per canonical grid point; the store validator requires
+# the full grid.  Non-probe decode batches use the next larger bucket's
+# measured CPB.
+_CROSSOVER_PROBED_T = _cpb._PROFILE_T
 _CROSSOVER_MARGIN = _cpb._CROSSOVER_MARGIN
 
 # The calibration timing protocol queues calls and rotates index sets, keeping
