@@ -52,7 +52,10 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     )
 
 
-def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
+@pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
+def test_dcp_jit_selects_the_route_specialized_source_family(
+    monkeypatch, target
+) -> None:
     jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
     source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
     monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
@@ -65,9 +68,16 @@ def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> Non
     jit_dcp.gen_dcp_spec_fp8_module.cache_clear()
 
     try:
-        v1 = jit_dcp.gen_dcp_spec_module("v1", "sm100a", 1, 1, 64, 8, 1, 1)
-        v4 = jit_dcp.gen_dcp_spec_module("v4", "sm100a", 1, 1, 64, 8, 1, 16)
-        fp8 = jit_dcp.gen_dcp_spec_fp8_module("sm103a", 64, 3, 64, 8, 4, 3, 1)
+        v1 = jit_dcp.gen_dcp_spec_module("v1", target, 1, 1, 64, 8, 1, 1)
+        v4 = jit_dcp.gen_dcp_spec_module("v4", target, 1, 1, 64, 8, 1, 16)
+        fp8 = jit_dcp.gen_dcp_spec_fp8_module(target, 64, 3, 64, 8, 4, 3, 1)
+
+        arch = target.replace("sm", "", 1)
+        for spec in (v1, v4, fp8):
+            assert (
+                f"-gencode=arch=compute_{arch},code=sm_{arch}" in spec.extra_cuda_cflags
+            )
+            assert f"_{target}_" in spec.name
 
         assert Path(v1.sources[0]).name == "retain_kv_l21.cu"
         assert Path(v4.sources[0]).name == "num_split16.cu"
@@ -199,6 +209,7 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
     [
         ((10, 0), "sm100a"),
         ((10, 3), "sm103a"),
+        ((10, 7), "sm100f"),
     ],
 )
 def test_dcp_target_keeps_independent_architecture_baselines(
