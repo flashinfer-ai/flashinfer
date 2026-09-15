@@ -881,6 +881,33 @@ def test_sm100_blk64_kv_splits_from_count_thresholds():
     assert sm100_blk64_kv_splits_from_count(3500) == 8
 
 
+@pytest.mark.parametrize(
+    "arch,batch,heads,seqlen_q,kv_splits,expected",
+    [
+        (100, 1, 4, 8192, 1, False),
+        (103, 1, 4, 8128, 1, False),
+        (103, 1, 4, 8192, 1, True),
+        (103, 1, 8, 4096, 1, True),
+        (103, 1, 4, 8192, 4, False),
+    ],
+)
+def test_sm103_sage_fp8_ldred_policy(arch, batch, heads, seqlen_q, kv_splits, expected):
+    """Lock the SM103 Sage-FP8 ld.red row-max gating (arch==103, kv_splits==1,
+    q_tiles >= 512). Pure Python logic, no GPU dependency.
+
+    Ported from Block-Sparse-Attention's fix/sm100-fp8-parity branch
+    (commit f89ae28, "perf(fp8): use 16-token ld.red row-max on SM103").
+    """
+    from flashinfer.cute_dsl.sparse.sm100_blk64.dispatch_helpers import (
+        sm103_blk64_use_sage_fp8_ldred,
+    )
+
+    assert (
+        sm103_blk64_use_sage_fp8_ldred(arch, batch, heads, seqlen_q, kv_splits)
+        is expected
+    )
+
+
 @_requires_sm100_or_sm103
 def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
     """kv_splits="auto" must actually resolve to >1 once top-k reaches the
@@ -1059,6 +1086,392 @@ def test_vsa_blk64_sage_fp8(num_heads, workspace):
     o = wrapper.run(q_fp8, k_fp8, v_fp8)
 
     torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
+
+
+def _dequantized_sparse_reference_fp8_blk64(
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_sfs,
+    k_sfs,
+    v_sfs,
+    block_index,
+    softmax_scale,
+    block_sizes=None,
+):
+    """BHSD-layout reference matching bsa_attn_sm100_blk64_fwd's Sage-FP8 dequant contract.
+
+    ``block_index`` is (batch, heads, num_q_blocks, topk); ``block_sizes`` is
+    None (native non-64-aligned tail only) or rank-1/2/3 ``[N]``/``[B,N]``/``[B,H,N]``.
+    A native tail (non-64-aligned sk) and explicit block_sizes both apply; the
+    smaller of the two wins, matching the kernel's masking.
+    """
+    b, h, sq, d = q_fp8.shape
+    sk = k_fp8.shape[2]
+    q = (q_fp8.float() * q_sfs.unsqueeze(-1)).bfloat16()
+    k = (
+        k_fp8.float() * k_sfs.repeat_interleave(16, dim=-1)[..., :sk].unsqueeze(-1)
+    ).bfloat16()
+    v = (v_fp8.float() * v_sfs.view(1, h, 1, d)).bfloat16()
+
+    out = torch.empty((b, h, sq, d), device=q.device, dtype=torch.float32)
+    for bi in range(b):
+        for hi in range(h):
+            for qblk in range(math.ceil(sq / 64)):
+                q_begin, q_end = qblk * 64, min(qblk * 64 + 64, sq)
+                token_ids = []
+                for physical_idx in block_index[bi, hi, qblk].tolist():
+                    native_size = min(64, max(sk - physical_idx * 64, 0))
+                    if block_sizes is None:
+                        block_size = native_size
+                    elif block_sizes.ndim == 1:
+                        block_size = min(native_size, int(block_sizes[physical_idx]))
+                    elif block_sizes.ndim == 2:
+                        block_size = min(
+                            native_size, int(block_sizes[bi, physical_idx])
+                        )
+                    else:
+                        block_size = min(
+                            native_size, int(block_sizes[bi, hi, physical_idx])
+                        )
+                    token_ids.extend(
+                        range(physical_idx * 64, physical_idx * 64 + block_size)
+                    )
+                kv = torch.tensor(token_ids, dtype=torch.long, device=q.device)
+                q_tile = q[bi, hi, q_begin:q_end].float()
+                k_tile = k[bi, hi].index_select(0, kv).float()
+                v_tile = v[bi, hi].index_select(0, kv).float()
+                probs = torch.softmax(
+                    q_tile @ k_tile.transpose(0, 1) * softmax_scale, dim=-1
+                )
+                out[bi, hi, q_begin:q_end] = probs @ v_tile
+    return out
+
+
+def _make_block_index_blk64(heads, sq, sk, topk, batch=1, device="cuda"):
+    num_q_blocks = math.ceil(sq / 64)
+    num_k_blocks = math.ceil(sk / 64)
+    result = torch.empty(
+        (batch, heads, num_q_blocks, topk), device=device, dtype=torch.int32
+    )
+    base = torch.arange(num_k_blocks, device=device)
+    for bi in range(batch):
+        for hi in range(heads):
+            for qb in range(num_q_blocks):
+                shift = (bi + 3 * hi + qb) % num_k_blocks
+                selected = torch.roll(base, shifts=shift)[:topk].sort().values
+                result[bi, hi, qb] = selected.to(torch.int32)
+    return result
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("num_heads,topk", [(4, 4), (4, 128), (8, 4)])
+def test_vsa_blk64_sage_fp8_block_sizes(num_heads, topk, workspace):
+    """Sage-FP8 blk64 with rank-1 block_sizes masks padding inside 64-token KV blocks.
+
+    Ported from Block-Sparse-Attention's fix/sm100-fp8-parity branch
+    (commit b3c7add, "feat(fp8): support padded KV blocks on SM100"):
+    the upstream kernel already supports Sage-FP8 + block_sizes together, the
+    only gap was FlashInfer's validate_sm100_blk64_fp8_sage() unconditionally
+    rejecting a non-None block_sizes.
+    """
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
+        bsa_attn_sm100_blk64_fwd,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(1100 + topk)
+    sq = 64
+    sk = topk * 64
+    q = (
+        torch.randn(
+            (1, sq, num_heads, HEAD_DIM_BLK64), dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    k = (
+        torch.randn(
+            (1, sk, num_heads, HEAD_DIM_BLK64), dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    v = torch.randn_like(k)
+
+    q_fp8_shd, k_fp8_shd, v_fp8_shd, q_scale, k_scale, v_scale = _quantize_fp8_sage(
+        q[0], k[0], v[0], num_heads, sq, sk, HEAD_DIM_BLK64
+    )
+    q_fp8 = q_fp8_shd.unsqueeze(0).contiguous()
+    k_fp8 = k_fp8_shd.unsqueeze(0).contiguous()
+    v_fp8 = v_fp8_shd.unsqueeze(0).contiguous()
+
+    block_index = _make_block_index_blk64(num_heads, sq, sk, topk, device=device)
+    block_sizes = torch.full((topk,), 64, device=device, dtype=torch.int32)
+    block_sizes[-1] = 40
+    if topk > 4:
+        block_sizes[1] = 1
+        block_sizes[16] = 17
+        block_sizes[63] = 63
+
+    scale = 1.0 / math.sqrt(HEAD_DIM_BLK64)
+
+    # BHSD views for the reference (matches BSA's [B,H,S,D] dequant contract).
+    q_fp8_bhsd = q_fp8.transpose(1, 2).contiguous()
+    k_fp8_bhsd = k_fp8.transpose(1, 2).contiguous()
+    v_fp8_bhsd = v_fp8.transpose(1, 2).contiguous()
+    ref = _dequantized_sparse_reference_fp8_blk64(
+        q_fp8_bhsd,
+        k_fp8_bhsd,
+        v_fp8_bhsd,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        scale,
+        block_sizes=block_sizes,
+    )
+
+    out, _ = bsa_attn_sm100_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        block_index,
+        topk,
+        block_sizes=block_sizes,
+        softmax_scale=scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    out_bhsd = out.transpose(1, 2).float()
+
+    diff = (out_bhsd - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.035
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize(
+    "batch,num_heads,sq,sk,topk",
+    [
+        # sk is kept a multiple of 16 (the K-scale bucket granularity used by
+        # _quantize_fp8_sage below) while deliberately not a multiple of 64,
+        # so the kernel's native tail-masking path is exercised.
+        (1, 4, 65, 112, 2),
+        (2, 4, 65, 112, 2),
+        (1, 8, 96, 112, 2),
+    ],
+)
+def test_vsa_blk64_sage_fp8_dynamic_shape(batch, num_heads, sq, sk, topk, workspace):
+    """Sage-FP8 blk64 with batch>1 and non-64-aligned Q/KV tails, no block_sizes.
+
+    Ported from Block-Sparse-Attention's fix/sm100-fp8-parity branch
+    (commits 50afbc7 "align SM100 dynamic inputs with SM120" and 2f59c89
+    "handle SM100 sequence tails natively"): the upstream FP8 v1 contract
+    used to require batch_size==1 and 64-aligned Q/KV; the kernel now masks
+    a non-64-aligned tail natively via TMA zero-fill, with no manual padding
+    or block_sizes required from the caller.
+    """
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
+        bsa_attn_sm100_blk64_fwd,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(1050 + 100 * batch + 10 * num_heads + topk)
+    q = (
+        torch.randn(
+            (batch, sq, num_heads, HEAD_DIM_BLK64), dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    k = (
+        torch.randn(
+            (batch, sk, num_heads, HEAD_DIM_BLK64), dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    v = torch.randn_like(k) * 0.5
+
+    # v_scale has no batch axis (per-(head,dim) only), so it must be computed
+    # once across all batches -- quantizing each batch independently would
+    # give v_fp8 a different local scale than the single v_scale the kernel
+    # is told to use.
+    E4M3_MAX = 448.0
+    v_scale = (
+        v.float().abs().amax(dim=(0, 1)).clamp_min(1e-6) / E4M3_MAX
+    ).contiguous()  # [H, D]
+    v_fp8 = (
+        (v.float() / v_scale.unsqueeze(0).unsqueeze(0))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    ).contiguous()
+
+    q_fp8_list, k_fp8_list = [], []
+    q_scale_list, k_scale_list = [], []
+    for bi in range(batch):
+        qf, kf, _, qs, ks, _ = _quantize_fp8_sage(
+            q[bi], k[bi], v[bi], num_heads, sq, sk, HEAD_DIM_BLK64
+        )
+        q_fp8_list.append(qf)
+        k_fp8_list.append(kf)
+        q_scale_list.append(qs)
+        k_scale_list.append(ks)
+    q_fp8 = torch.stack(q_fp8_list, dim=0).contiguous()
+    k_fp8 = torch.stack(k_fp8_list, dim=0).contiguous()
+    q_scale = torch.cat(q_scale_list, dim=0).contiguous()
+    k_scale = torch.cat(k_scale_list, dim=0).contiguous()
+
+    block_index = _make_block_index_blk64(
+        num_heads, sq, sk, topk, batch=batch, device=device
+    )
+    scale = 1.0 / math.sqrt(HEAD_DIM_BLK64)
+
+    q_fp8_bhsd = q_fp8.transpose(1, 2).contiguous()
+    k_fp8_bhsd = k_fp8.transpose(1, 2).contiguous()
+    v_fp8_bhsd = v_fp8.transpose(1, 2).contiguous()
+    ref = _dequantized_sparse_reference_fp8_blk64(
+        q_fp8_bhsd,
+        k_fp8_bhsd,
+        v_fp8_bhsd,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        scale,
+    )
+
+    out, _ = bsa_attn_sm100_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        block_index,
+        topk,
+        softmax_scale=scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    out_bhsd = out.transpose(1, 2).float()
+
+    assert out.shape == q.shape
+    diff = (out_bhsd - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.035
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("block_sizes_mode", [2, 3])
+def test_vsa_blk64_sage_fp8_block_sizes_rank23(block_sizes_mode, workspace):
+    """Sage-FP8 blk64 with rank-2/3 block_sizes ([B,N], [B,H,N]).
+
+    Ported from Block-Sparse-Attention's fix/sm100-fp8-parity branch
+    (commit 50afbc7): block_sizes may now scope per-batch or per-(batch,head)
+    padding, not just a single rank-1 [N] tensor shared by every row -- rank-1
+    itself is already covered by test_vsa_blk64_sage_fp8_block_sizes above.
+    """
+    from flashinfer.cute_dsl.sparse.bsa_attn_sm100_blk64 import (
+        bsa_attn_sm100_blk64_fwd,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(1300 + block_sizes_mode)
+    num_heads = 4
+    batch = 2
+    topk = 4
+    sq = 64
+    sk = topk * 64
+    q = (
+        torch.randn(
+            (batch, sq, num_heads, HEAD_DIM_BLK64), dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    k = (
+        torch.randn(
+            (batch, sk, num_heads, HEAD_DIM_BLK64), dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    v = torch.randn_like(k) * 0.5
+
+    # v_scale has no batch axis; compute it once across all batches (see the
+    # dynamic_shape test above for why per-batch quantization is wrong here).
+    E4M3_MAX = 448.0
+    v_scale = (
+        v.float().abs().amax(dim=(0, 1)).clamp_min(1e-6) / E4M3_MAX
+    ).contiguous()  # [H, D]
+    v_fp8 = (
+        (v.float() / v_scale.unsqueeze(0).unsqueeze(0))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    ).contiguous()
+
+    q_fp8_list, k_fp8_list = [], []
+    q_scale_list, k_scale_list = [], []
+    for bi in range(batch):
+        qf, kf, _, qs, ks, _ = _quantize_fp8_sage(
+            q[bi], k[bi], v[bi], num_heads, sq, sk, HEAD_DIM_BLK64
+        )
+        q_fp8_list.append(qf)
+        k_fp8_list.append(kf)
+        q_scale_list.append(qs)
+        k_scale_list.append(ks)
+    q_fp8 = torch.stack(q_fp8_list, dim=0).contiguous()
+    k_fp8 = torch.stack(k_fp8_list, dim=0).contiguous()
+    q_scale = torch.cat(q_scale_list, dim=0).contiguous()
+    k_scale = torch.cat(k_scale_list, dim=0).contiguous()
+
+    block_index = _make_block_index_blk64(
+        num_heads, sq, sk, topk, batch=batch, device=device
+    )
+
+    if block_sizes_mode == 1:
+        block_sizes = torch.full((topk,), 64, device=device, dtype=torch.int32)
+        block_sizes[-1] = 40
+    elif block_sizes_mode == 2:
+        block_sizes = torch.full((batch, topk), 64, device=device, dtype=torch.int32)
+        block_sizes[0, -1] = 40
+        block_sizes[1, -1] = 24
+    else:
+        block_sizes = torch.full(
+            (batch, num_heads, topk), 64, device=device, dtype=torch.int32
+        )
+        block_sizes[0, :, -1] = 40
+        block_sizes[1, :, -1] = 24
+        block_sizes[:, 1, 0] = 17
+
+    scale = 1.0 / math.sqrt(HEAD_DIM_BLK64)
+    q_fp8_bhsd = q_fp8.transpose(1, 2).contiguous()
+    k_fp8_bhsd = k_fp8.transpose(1, 2).contiguous()
+    v_fp8_bhsd = v_fp8.transpose(1, 2).contiguous()
+    ref = _dequantized_sparse_reference_fp8_blk64(
+        q_fp8_bhsd,
+        k_fp8_bhsd,
+        v_fp8_bhsd,
+        q_scale,
+        k_scale,
+        v_scale,
+        block_index,
+        scale,
+        block_sizes=block_sizes,
+    )
+
+    out, _ = bsa_attn_sm100_blk64_fwd(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        block_index,
+        topk,
+        block_sizes=block_sizes,
+        softmax_scale=scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    out_bhsd = out.transpose(1, 2).float()
+
+    diff = (out_bhsd - ref).abs()
+    assert diff.max().item() < 0.15
+    assert (diff.mean() / ref.abs().mean()).item() < 0.035
 
 
 @_requires_sm100_or_sm103
