@@ -106,8 +106,6 @@ class QuantizationSFLayout:
     # The scale factor block rows map to data block rows in an interleaved pattern:
     # For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
     # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-    #
-    # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
     SWIZZLED_128x4 = 0
     SWIZZLED_8x4 = 1
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
