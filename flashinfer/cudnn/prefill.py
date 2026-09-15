@@ -1077,7 +1077,8 @@ def cudnn_batch_prefill_with_kv_cache(
         Cumulative per-request start offsets into a packed LSE tensor, shape
         ``(batch_size + 1,)``, in the units given by ``batch_offsets_units``
         (element offsets are ``token_offset * num_heads_qo``).  Derived from
-        ``batch_offsets_q`` when omitted and the LSE is packed.
+        ``batch_offsets_q`` when omitted and the LSE is packed; rejected with a
+        padded LSE.
     batch_offsets_units : str
         Units of the ``batch_offsets_*`` tensors. ``"elements"`` (default, the
         historical behavior): offsets are pre-scaled tensor-element offsets,
@@ -1188,6 +1189,14 @@ def cudnn_batch_prefill_with_kv_cache(
     if lse_packed and not use_cudnn_graph:
         raise ValueError(
             f"the cubin backend writes a padded LSE of shape {padded_shape}; got {tuple(lse.shape)}"
+        )
+    if lse is not None and not lse_packed and batch_offsets_stats is not None:
+        # Stats offsets address packed rows; declaring the padded buffer as a
+        # ragged Stats tensor would scatter every request after the first to
+        # the wrong rows.
+        raise ValueError(
+            f"batch_offsets_stats addresses a packed LSE of shape {packed_shape}; "
+            f"drop it for the padded form {padded_shape}"
         )
 
     if o_data_type is None:
