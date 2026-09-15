@@ -645,27 +645,121 @@ def test_top_k_page_table_transform_graph_safe_fallback(
 
 
 @pytest.mark.parametrize(
+    "api_name,num_rows,max_len",
+    [
+        ("top_k", 128, 16384),
+        ("top_k_ragged_transform", 8, 16384),
+        ("top_k_ragged_transform", 512, 32768),
+    ],
+)
+@pytest.mark.parametrize("k", [128, 4096])
+def test_top_k_siblings_graph_safe_fallback(
+    api_name, num_rows, max_len, k, set_topk_algo
+):
+    """Cover heuristic-declined plain/ragged calls in eager and graph modes."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("Long-row CUB top-k requires SM90+")
+    if k <= 2048 and can_implement_filtered_topk():
+        pytest.skip("This case requires a device without FilteredTopK support")
+    set_topk_algo("auto")
+    torch.manual_seed(5058)
+    scores = torch.stack(
+        [torch.randperm(max_len, device="cuda") for _ in range(num_rows)]
+    ).float()
+    lengths = torch.tensor(
+        [max_len, max_len - 1, max_len // 2, k + 1, k, k - 1, 1, 0],
+        device="cuda",
+        dtype=torch.int32,
+    ).repeat(num_rows // 8)
+    offsets = torch.arange(num_rows, device="cuda", dtype=torch.int32) * max_len
+
+    def run():
+        if api_name == "top_k":
+            return flashinfer.top_k(scores, k, dsa_graph_safe=True)
+        return flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, dsa_graph_safe=True
+        )
+
+    def check(result):
+        if api_name == "top_k":
+            values, indices = result
+            ref_values, ref_indices = scores.topk(k)
+            torch.testing.assert_close(
+                values.sort().values, ref_values.sort().values, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                indices.sort().values, ref_indices.sort().values, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                values, scores.gather(1, indices), rtol=0, atol=0
+            )
+        else:
+            valid = torch.arange(max_len, device="cuda")[None, :] < lengths[:, None]
+            ref = scores.masked_fill(~valid, -float("inf")).topk(k).indices
+            ref += offsets[:, None]
+            ref.masked_fill_(
+                torch.arange(k, device="cuda")[None, :] >= lengths[:, None], -1
+            )
+            torch.testing.assert_close(
+                result.sort().values.long(), ref.sort().values, rtol=0, atol=0
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        result = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    check(result)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    for _ in range(2):
+        scores.copy_(scores.roll(17, dims=1))
+        lengths.copy_(lengths.flip(0))
+        offsets.add_(19)
+        graph.replay()
+        check(result)
+
+
+@pytest.mark.parametrize(
+    "api_name", ["top_k", "top_k_page_table_transform", "top_k_ragged_transform"]
+)
+@pytest.mark.parametrize("k", [128, 4096])
+@pytest.mark.parametrize(
     "algo,deterministic",
     [("auto", True), ("default", False), ("filtered", False), ("multi_cta", False)],
 )
-def test_top_k_page_table_transform_graph_safe_unsupported(
-    algo, deterministic, set_topk_algo
-):
-    if can_implement_filtered_topk():
+def test_top_k_graph_safe_unsupported(api_name, k, algo, deterministic, set_topk_algo):
+    if k <= 2048 and can_implement_filtered_topk():
         pytest.skip("Requires a device without FilteredTopK support")
     set_topk_algo(algo)
     scores = torch.zeros((1, 16384), device="cuda")
     page_table = torch.zeros_like(scores, dtype=torch.int32)
     lengths = torch.tensor([16384], device="cuda", dtype=torch.int32)
-    with pytest.raises(NotImplementedError, match="dsa_graph_safe=True.*FilteredTopK"):
-        flashinfer.top_k_page_table_transform(
-            scores,
-            page_table,
-            lengths,
-            128,
-            deterministic=deterministic,
-            dsa_graph_safe=True,
-        )
+    kwargs = dict(deterministic=deterministic, dsa_graph_safe=True)
+    with pytest.raises(
+        NotImplementedError, match=f"{api_name} with dsa_graph_safe=True.*FilteredTopK"
+    ):
+        if api_name == "top_k":
+            flashinfer.top_k(scores, k, **kwargs)
+        elif api_name == "top_k_page_table_transform":
+            flashinfer.top_k_page_table_transform(
+                scores, page_table, lengths, k, **kwargs
+            )
+        else:
+            offsets = torch.zeros_like(lengths)
+            flashinfer.top_k_ragged_transform(scores, offsets, lengths, k, **kwargs)
+
+
+@pytest.mark.parametrize("k", [128, 4096])
+def test_top_k_graph_safe_sorted_unsupported(k, set_topk_algo):
+    """CUB fallback must not silently drop the sorted-output requirement."""
+    if k <= 2048 and can_implement_filtered_topk():
+        pytest.skip("Requires a device without FilteredTopK support")
+    set_topk_algo("auto")
+    scores = torch.zeros((128, 16384), device="cuda")
+    with pytest.raises(NotImplementedError, match="top_k.*sorted output"):
+        flashinfer.top_k(scores, k, sorted=True, dsa_graph_safe=True)
 
 
 @pytest.mark.parametrize("algo", ["multi_cta", "filtered"])
