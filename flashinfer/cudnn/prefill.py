@@ -1263,8 +1263,9 @@ def cudnn_batch_prefill_with_kv_cache(
             # Each request's rows of the packed LSE start where its query
             # tokens start. Token-unit offsets are the q indptr itself (the
             # graph applies the per-tensor multiplier h_qo); element-unit q
-            # offsets are token_offset * h_qo * d_qk, so the Stats' element
-            # offsets are those divided by d_qk. A single request without
+            # offsets are token_offset * q.stride(0) (h_qo * d_qk only for a
+            # contiguous q), so the token offset is recovered with q's real
+            # token stride and rescaled by h_qo. A single request without
             # offsets starts at row 0 and spans the buffer.
             if batch_offsets_q is None:
                 batch_offsets_stats = torch.tensor(
@@ -1280,8 +1281,9 @@ def cudnn_batch_prefill_with_kv_cache(
             elif batch_offsets_units == "tokens":
                 batch_offsets_stats = batch_offsets_q
             else:
-                batch_offsets_stats = torch.div(
-                    batch_offsets_q, d_qk, rounding_mode="floor"
+                batch_offsets_stats = (
+                    torch.div(batch_offsets_q, q.stride(0), rounding_mode="floor")
+                    * h_qo
                 )
 
         if batch_offsets_units == "tokens":
@@ -1332,10 +1334,19 @@ def cudnn_batch_prefill_with_kv_cache(
                 def apply_multiplier(offsets, multiplier):
                     return offsets * multiplier if offsets is not None else None
 
-                batch_offsets_q = apply_multiplier(batch_offsets_q, h_qo * d_qk)
+                # Element offsets are in each tensor's own storage, so use the
+                # real token strides (as the direct path's multipliers do); a
+                # non-contiguous q/k/v such as a T3HD view has stride > h * d.
+                batch_offsets_q = apply_multiplier(batch_offsets_q, q.stride(0))
                 batch_offsets_o = apply_multiplier(batch_offsets_o, h_qo * d_vo)
-                batch_offsets_k = apply_multiplier(batch_offsets_k, h_kv * d_qk)
-                batch_offsets_v = apply_multiplier(batch_offsets_v, h_kv * d_vo)
+                batch_offsets_k = apply_multiplier(
+                    batch_offsets_k,
+                    k_cache.stride(0) if k_cache.dim() == 3 else h_kv * d_qk,
+                )
+                batch_offsets_v = apply_multiplier(
+                    batch_offsets_v,
+                    v_cache.stride(0) if v_cache.dim() == 3 else h_kv * d_vo,
+                )
                 batch_offsets_stats = apply_multiplier(batch_offsets_stats, h_qo)
 
         return _batch_prefill_with_kv_cache(

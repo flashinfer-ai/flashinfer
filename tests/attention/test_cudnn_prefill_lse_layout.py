@@ -196,6 +196,58 @@ def test_cudnn_prefill_lse_rejects_other_shapes():
         )
 
 
+@pytest.mark.parametrize("units", ["tokens", "elements"])
+def test_cudnn_prefill_lse_packed_with_noncontiguous_q(units):
+    """Element-unit q offsets count elements of q's own storage, so for a
+    non-contiguous q (here a T3HD-style view, token stride 3 * h * d) the
+    derived Stats offsets must use q.stride(0), not h * d. Both unit paths
+    must match the contiguous-q result."""
+    _skip_unless_cudnn()
+    device = "cuda:0"
+    batch_size, s_qo, s_kv, h_qo, h_kv, d = 4, 64, 128, 8, 4, 128
+    q_lens, kv_lens, qo_indptr, kv_indptr, q, k, v = _ragged_case(
+        batch_size, s_qo, s_kv, h_qo, h_kv, d, device
+    )
+    qkv = torch.randn(q.shape[0], 3, h_qo, d, device=device, dtype=torch.bfloat16)
+    q_view = qkv[:, 0]
+    assert not q_view.is_contiguous() and q_view.stride(0) == 3 * h_qo * d
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    common = dict(
+        scale=float(d**-0.5),
+        workspace_buffer=ws,
+        max_token_per_sequence=s_qo,
+        max_sequence_kv=s_kv,
+        actual_seq_lens_q=q_lens.view(batch_size, 1, 1, 1),
+        actual_seq_lens_kv=kv_lens.view(batch_size, 1, 1, 1),
+        causal=True,
+        return_lse=True,
+    )
+    if units == "tokens":
+        offs = dict(batch_offsets_q=qo_indptr, batch_offsets_k=kv_indptr)
+    else:
+        offs = dict(
+            batch_offsets_q=qo_indptr * q_view.stride(0),
+            batch_offsets_o=qo_indptr * (h_qo * d),
+            batch_offsets_k=kv_indptr * (h_kv * d),
+            batch_offsets_v=kv_indptr * (h_kv * d),
+        )
+    out, lse = cudnn_batch_prefill_with_kv_cache(
+        q_view, k, v, **common, **offs, batch_offsets_units=units
+    )
+    out_ref, lse_ref = cudnn_batch_prefill_with_kv_cache(
+        q_view.contiguous(),
+        k,
+        v,
+        **common,
+        batch_offsets_q=qo_indptr,
+        batch_offsets_k=kv_indptr,
+        batch_offsets_units="tokens",
+    )
+    assert lse.shape == (q.shape[0], h_qo)
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("flaw", ["dtype", "contiguity"])
 def test_cudnn_prefill_lse_rejects_unbindable_buffers(flaw):
     """The packed LSE is bound to cuDNN's Stats as contiguous float32; other
