@@ -446,8 +446,8 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
                                const int* topk_length_extra_ptr, cudaStream_t stream) {
   if (page_block_size != 64) return false;
   if (topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr && topk_extra % BI == 0 &&
-      (extra_page_block_size == 64 || extra_page_block_size == 2 ||
-       extra_page_block_size == 128 || extra_page_block_size == 256)) {
+      (extra_page_block_size == 64 || extra_page_block_size == 2 || extra_page_block_size == 128 ||
+       extra_page_block_size == 256)) {
 #define DISPATCH_DUAL_MG_FULLTILE(NH, PBSX, NHG)                                                   \
   launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, 64, PBSX, NHG>(                             \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, topk, \
