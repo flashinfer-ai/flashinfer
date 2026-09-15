@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from flashinfer.fused_moe.da_moe import _local_load_spectrum
 from flashinfer.fused_moe.da_tuner import (
     DAPlanCompiler,
     DAProfileSelection,
@@ -122,3 +123,21 @@ def test_singleton_pruning_preserves_preferred_distribution_eager_winner():
     assert compiled.bodies == (uniform_tactic,)
     assert compiled.eager_distribution == "ddist:1.1"
     assert compiled.eager_tactic == preferred_tactic
+
+
+def test_nonlocal_assignment_changes_do_not_change_local_spectrum():
+    first = torch.tensor([[4, 0], [4, 1], [5, 2], [6, 3]], dtype=torch.int32)
+    second = torch.tensor([[4, 8], [4, 9], [5, 10], [6, 11]], dtype=torch.int32)
+
+    spectra = [
+        _local_load_spectrum(
+            ids,
+            num_experts=16,
+            local_expert_offset=4,
+            num_local_experts=4,
+            normalize=True,
+        )
+        for ids in (first, second)
+    ]
+
+    assert torch.equal(*spectra)
