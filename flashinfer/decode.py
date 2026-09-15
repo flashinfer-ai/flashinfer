@@ -303,6 +303,9 @@ def get_single_decode_module(*args):
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
     workspace_size_func = getattr(jit_module, "workspace_size", None)
+    workspace_size_upper_bound_func = getattr(
+        jit_module, "workspace_size_upper_bound", None
+    )
     run_func = jit_module.run
 
     @register_custom_op(
@@ -374,6 +377,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         run=run_batch_decode,
     )
 
@@ -384,6 +388,7 @@ def get_batch_decode_module(*args):
     mod = gen_batch_decode_module(*args).build_and_load()
     plan_func = mod.plan
     workspace_size_func = getattr(mod, "workspace_size", None)
+    workspace_size_upper_bound_func = getattr(mod, "workspace_size_upper_bound", None)
     run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
@@ -473,6 +478,7 @@ def get_batch_decode_module(*args):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         run=run_batch_decode,
     )
 
