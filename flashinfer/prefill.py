@@ -1800,6 +1800,7 @@ def _blackwell_ragged_auto_upgrade(
     cudnn_indptr_is_int32: bool,
     cutlass_work_items: int,
     cuda_graph_enabled: bool,
+    cutlass_indptr_is_int32: bool = False,
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
@@ -1865,6 +1866,10 @@ def _blackwell_ragged_auto_upgrade(
                 # reports unsupported *head dimensions*. Mismatched output
                 # dtype is therefore out of domain, not a slow path.
                 and o_data_type == q_data_type
+                # Both the planner and kernel read these buffers as int32.
+                # Device mirrors preserve the caller's dtype, so leave wider
+                # indices on a compatible backend instead of reinterpreting them.
+                and cutlass_indptr_is_int32
                 and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
                 and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
                 # `fmha_varlen_plan` allocates fresh work-index buffers on every
@@ -4587,6 +4592,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                             qo_indptr_host, num_qo_heads
                         ),
                         cuda_graph_enabled=self.is_cuda_graph_enabled,
+                        cutlass_indptr_is_int32=(
+                            self._qo_indptr_buf.dtype == torch.int32
+                            and self._kv_indptr_buf.dtype == torch.int32
+                        ),
                     )
                     if upgraded is not None:
                         self._backend = upgraded

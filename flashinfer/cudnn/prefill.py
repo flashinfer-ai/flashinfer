@@ -163,6 +163,7 @@ def _sdpa_prefill_key_fn(
         graph_b,
         q.dim(),
         q.dtype,
+        q.dtype if o_data_type is None else o_data_type,
         k_cache.dim(),
         max_token_seq_q,
         max_sequence_kv,
