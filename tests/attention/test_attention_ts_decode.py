@@ -7205,6 +7205,10 @@ def _check_q_token_sparse_case(
             dict(group=1, batch=256, context=512, shared=False), id="persistent-direct"
         ),
         pytest.param(
+            dict(group=4, batch=256, context=512, packed=True, shared=False),
+            id="persistent-grouped-q64",
+        ),
+        pytest.param(
             dict(group=8, batch=256, context=512, packed=True, shared=False),
             id="persistent-grouped",
         ),
