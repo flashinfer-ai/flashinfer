@@ -4667,10 +4667,13 @@ def _validate_fp8_block_scale_gemm1_activation_params(
             "for Fp8QuantizationType.MxFp8 and Fp8QuantizationType.DeepSeekFp8 in "
             f"FP8 block scale MoE, got {Fp8QuantizationType(fp8_quantization_type)}."
         )
-    if int(activation_type) != int(ActivationType.Swiglu):
+    if int(activation_type) not in (
+        int(ActivationType.Swiglu),
+        int(ActivationType.Situ),
+    ):
         raise ValueError(
             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
-            "for ActivationType.Swiglu."
+            "for ActivationType.Swiglu and ActivationType.Situ."
         )
 
 
@@ -5774,7 +5777,8 @@ def trtllm_fp8_block_scale_moe(
         otherwise a ``ValueError`` is raised.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``9`` Identity.
+        ``6`` Relu2; ``9`` Identity; ``10`` SiTU. SiTU computes
+        ``beta*tanh(X1/beta) * alpha*tanh(X2/alpha)*sigmoid(X2)``.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -5787,25 +5791,27 @@ def trtllm_fp8_block_scale_moe(
         ``top_k``, not ``top_k + num_fused_shared_experts``, and shared slots
         are not recorded.
     gemm1_alpha : Optional[torch.Tensor]
-        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
-        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.  Any
+        Optional ``[local_num_experts]`` float32 per-expert gated-activation
+        parameter. Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu`` or
+        ``ActivationType.Situ``. Any
         subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
-        can be provided independently.  When ``None`` (default),
-        ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
-        (linear/up half) and ``X2`` (gate half).  The activation
-        output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
+        can be provided independently. When ``None`` (default), ``alpha=1.0``
+        is used. For SiTU, alpha is the positive finite gate tanh scale. Let
+        GEMM1 output be split as ``X1`` (linear/up half) and ``X2`` (gate
+        half). SwiGLU produces ``X2 * sigmoid(alpha * X2) * (X1 + beta)``;
+        SiTU uses the formula documented under ``activation_type``. Pass raw
         values; neither block-scale recipe carries a scalar dequant scale, so
         no host-side conversion is applied.
     gemm1_beta : Optional[torch.Tensor]
-        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA beta
-        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
-        When ``None`` (default), ``beta=0.0`` is used.
+        Optional ``[local_num_experts]`` float32 per-expert gated-activation
+        parameter. Supported for SwiGLU and SiTU. When ``None``, SwiGLU uses
+        ``beta=0.0`` and SiTU uses ``beta=1.0``. For SiTU, beta is the positive
+        finite linear-branch tanh scale.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
         Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
+        ``Fp8QuantizationType.DeepSeekFp8`` with SwiGLU or SiTU.
         When provided, ``X1 = clamp(X1, -limit, limit)`` and
         ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
         is applied.
@@ -6053,27 +6059,30 @@ def trtllm_fp8_block_scale_routed_moe(
         FP8 quantization scheme (default ``Fp8QuantizationType.DeepSeekFp8``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``9`` Identity.
+        ``6`` Relu2; ``9`` Identity; ``10`` SiTU. SiTU computes
+        ``beta*tanh(X1/beta) * alpha*tanh(X2/alpha)*sigmoid(X2)``.
     gemm1_alpha : Optional[torch.Tensor]
-        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
-        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.  Any
+        Optional ``[local_num_experts]`` float32 per-expert gated-activation
+        parameter. Supported for ``Fp8QuantizationType.MxFp8`` and
+        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu`` or
+        ``ActivationType.Situ``. Any
         subset of ``gemm1_alpha``, ``gemm1_beta``, ``gemm1_clamp_limit``
-        can be provided independently.  When ``None`` (default),
-        ``alpha=1.0`` is used.  Let GEMM1 output be split as ``X1``
-        (linear/up half) and ``X2`` (gate half).  The activation
-        output is ``X2 * sigmoid(alpha * X2) * (X1 + beta)``.  Pass raw
+        can be provided independently. When ``None`` (default), ``alpha=1.0``
+        is used. For SiTU, alpha is the positive finite gate tanh scale. Let
+        GEMM1 output be split as ``X1`` (linear/up half) and ``X2`` (gate
+        half). SwiGLU produces ``X2 * sigmoid(alpha * X2) * (X1 + beta)``;
+        SiTU uses the formula documented under ``activation_type``. Pass raw
         values; neither block-scale recipe carries a scalar dequant scale, so
         no host-side conversion is applied.
     gemm1_beta : Optional[torch.Tensor]
-        Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA beta
-        parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
-        When ``None`` (default), ``beta=0.0`` is used.
+        Optional ``[local_num_experts]`` float32 per-expert gated-activation
+        parameter. Supported for SwiGLU and SiTU. When ``None``, SwiGLU uses
+        ``beta=0.0`` and SiTU uses ``beta=1.0``. For SiTU, beta is the positive
+        finite linear-branch tanh scale.
     gemm1_clamp_limit : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
         Supported for ``Fp8QuantizationType.MxFp8`` and
-        ``Fp8QuantizationType.DeepSeekFp8`` with ``ActivationType.Swiglu``.
+        ``Fp8QuantizationType.DeepSeekFp8`` with SwiGLU or SiTU.
         When provided, ``X1 = clamp(X1, -limit, limit)`` and
         ``X2 = clamp(X2, max=limit)``.  When ``None`` (default), no clamp
         is applied.

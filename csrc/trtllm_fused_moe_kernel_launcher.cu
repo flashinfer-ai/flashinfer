@@ -1010,7 +1010,7 @@ inline bool hasOptionalGemm1ActivationParams(Optional<TensorView> const& gemm1_a
 }
 
 // MxFp8 applies these in the fused FC1 epilogue of the trtllm-gen cubins; DeepSeekFp8 has no
-// fused activation and applies them in the separate activation kernel
+// fused activation and applies them in the separate gated-activation kernel
 // (moe::dev::activation::run). Both consume the values as-is: FP8 block scaling carries no
 // scalar dequant factor, so no host-side rescaling of the limit is needed.
 inline void validateFp8BlockScaleGemm1ActivationParams(
@@ -1026,9 +1026,10 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "Fp8QuantizationType::MxFp8 and Fp8QuantizationType::DeepSeekFp8 in FP8 block scale "
          "MoE, got "
       << fp8QuantizationTypeToString(quantization_type) << ".";
-  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
+  TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                 activation_type == ActivationType::Situ)
       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
-         "ActivationType::Swiglu.";
+         "ActivationType::Swiglu and ActivationType::Situ.";
 }
 
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
@@ -1717,6 +1718,7 @@ void FusedMoeLauncher::init_common(
       << "the value of weight_layout is not recognized";
   this->weight_layout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
   this->activation_type = activation_type;
+  this->args->activation_type = activation_type;
   this->intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
   this->norm_topk_prob = norm_topk_prob;
   this->gemm1_bias_type = bias_type_enum;
@@ -4328,9 +4330,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
     // Launch the complete body after every dtype-specific scale pointer is bound.
     cudaStream_t stream = get_stream(hidden_states.device());
@@ -4355,9 +4361,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
-    args->gemm1_alpha = nullptr;
-    args->gemm1_beta = nullptr;
-    args->gemm1_clamp_limit = nullptr;
+    args->gemm1_alpha =
+        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+    args->gemm1_beta =
+        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
+                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                  : nullptr;
     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
     // Launch the complete body after every dtype-specific scale pointer is bound.
     cudaStream_t stream = get_stream(hidden_states.device());
@@ -4463,9 +4473,9 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && dtype_act == btg::Dtype::E4m3 &&
           dtype_weights == btg::Dtype::E4m3 &&
           gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
-        TVM_FFI_ICHECK(static_cast<int>(activation_type) ==
-                       static_cast<int>(ActivationType::Swiglu))
-            << "DeepSeekFp8 only supports ActivationType::Swiglu, got "
+        TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+                       activation_type == ActivationType::Situ)
+            << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::Situ, got "
             << static_cast<int>(activation_type) << ".";
         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtype_weights, true /* useDeepSeekFp8 */, tile_N, use_shuffled_weight,
@@ -5584,12 +5594,11 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   auto activation_type = validateAndCastActivationType(act_type);
   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
                                              quantization_type, activation_type);
-  // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
-  // Fail for any other activation to avoid silently running incorrect activation behavior.
   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
-      activation_type != ActivationType::Swiglu) {
+      activation_type != ActivationType::Swiglu && activation_type != ActivationType::Situ) {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
-        << "DeepSeekFp8 only supports ActivationType::Swiglu in this runner path. "
+        << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::Situ in this "
+           "runner path. "
         << "Received activation_type=" << static_cast<int>(activation_type);
   }
 
@@ -6095,10 +6104,10 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
 
   } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
-    if (activation_type != ActivationType::Swiglu) {
+    if (activation_type != ActivationType::Swiglu && activation_type != ActivationType::Situ) {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
-          << "DeepSeekFp8 only supports ActivationType::Swiglu, " << "got act_type=" << act_type
-          << ".";
+          << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::Situ, "
+          << "got act_type=" << act_type << ".";
     }
     // FP8 block scale (DeepSeek)
     return Fp8BlockScaleLauncher::getValidConfigs(

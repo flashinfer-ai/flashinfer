@@ -180,11 +180,12 @@ def _fp8_moe_run_experts(
     topk_idx,
     local_expert_offset,
     E_global,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
 ):
-    """FP8 block-scale dequantization + SwiGLU + GEMM for all routing types.
+    """FP8 block-scale dequantization + gated activation + GEMM for all routing types.
 
     ``weights``   : [T, TOP_K] float32 — per-token expert weights (already normalised)
     ``topk_idx``  : [T, TOP_K] int64   — selected global expert indices
@@ -222,6 +223,31 @@ def _fp8_moe_run_experts(
 
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
+    activation_type = int(activation_type)
+    swiglu, situ = 3, 10
+    if activation_type not in (swiglu, situ):
+        raise ValueError(
+            "FP8 block-scale MoE trace reference supports activation_type 3 "
+            f"(SwiGLU) and 10 (SiTU), got {activation_type}"
+        )
+    if activation_type == situ:
+        for name, param in (
+            ("gemm1_alpha", gemm1_alpha),
+            ("gemm1_beta", gemm1_beta),
+            ("gemm1_clamp_limit", gemm1_clamp_limit),
+        ):
+            if param is None:
+                continue
+            if param.shape != (E_local,):
+                raise ValueError(
+                    f"{name} must have shape [{E_local}], got {tuple(param.shape)}"
+                )
+            if param.dtype != torch.float32:
+                raise ValueError(f"{name} must have dtype float32, got {param.dtype}")
+            if param.device != device:
+                raise ValueError(f"{name} must be on {device}, got {param.device}")
+            if not torch.isfinite(param).all() or not (param > 0).all():
+                raise ValueError(f"{name} must contain only finite positive values")
 
     for le in range(E_local):
         ge = local_start + le
@@ -239,18 +265,20 @@ def _fp8_moe_run_experts(
             limit = gemm1_clamp_limit[le].to(device=X1.device, dtype=torch.float32)
             X1 = torch.clamp(X1, min=-limit, max=limit)
             X2 = torch.clamp(X2, max=limit)
-        alpha = (
-            1.0
-            if gemm1_alpha is None
-            else gemm1_alpha[le].to(device=X2.device, dtype=torch.float32)
-        )
-        beta = (
-            0.0
-            if gemm1_beta is None
-            else gemm1_beta[le].to(device=X1.device, dtype=torch.float32)
-        )
-        silu_X2 = X2 * torch.sigmoid(alpha * X2)
-        O = (silu_X2 * (X1 + beta)).matmul(W2[le].t())
+        alpha = 1.0 if gemm1_alpha is None else gemm1_alpha[le].to(torch.float32)
+        beta_default = 1.0 if activation_type == situ else 0.0
+        beta = beta_default if gemm1_beta is None else gemm1_beta[le].to(torch.float32)
+        if activation_type == situ:
+            activated = (
+                beta
+                * torch.tanh(X1 / beta)
+                * alpha
+                * torch.tanh(X2 / alpha)
+                * torch.sigmoid(X2)
+            )
+        else:
+            activated = X2 * torch.sigmoid(alpha * X2) * (X1 + beta)
+        O = activated.matmul(W2[le].t())
         # per-expert contribution weight for each token
         w_tok = weights.index_select(0, token_idx)
         # find which slot in topk_idx[token_idx] corresponds to ge
@@ -283,6 +311,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
     routed_scaling_factor,
     *,
     num_fused_shared_experts=0,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -361,6 +390,7 @@ def _trtllm_fp8_block_scale_moe_ds_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global + S,
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -389,6 +419,7 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
     local_expert_offset,
     routed_scaling_factor,
     *,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -416,6 +447,7 @@ def _trtllm_fp8_block_scale_moe_default_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -436,6 +468,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
     local_expert_offset,
     routed_scaling_factor,
     *,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -464,6 +497,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -484,6 +518,7 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
     local_expert_offset,
     routed_scaling_factor,
     *,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -512,6 +547,7 @@ def _trtllm_fp8_block_scale_moe_llama4_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -532,6 +568,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
     local_expert_offset,
     routed_scaling_factor,
     *,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -561,6 +598,7 @@ def _trtllm_fp8_block_scale_moe_renormalize_naive_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -581,6 +619,7 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
     local_expert_offset,
     routed_scaling_factor,
     *,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -613,6 +652,7 @@ def _trtllm_fp8_block_scale_moe_topk_routing_reference(
         topk_idx,
         local_expert_offset,
         E_global,
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -648,6 +688,9 @@ _STANDARD_AXES = {
         description="Number of quantized blocks along the gemm1_out_size dimension (block_size=128).",
         abbrev="",
     ),
+    "activation_type": Const(
+        description="Fused activation type; 10 selects SiTU.", abbrev="act"
+    ),
 }
 
 _STANDARD_INPUTS = {
@@ -679,19 +722,19 @@ _STANDARD_INPUTS = {
     "gemm1_alpha": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
+        description="Per-expert SwiGLU alpha or SiTU gate tanh scale.",
         optional=True,
     ),
     "gemm1_beta": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
+        description="Per-expert SwiGLU beta or SiTU linear tanh scale.",
         optional=True,
     ),
     "gemm1_clamp_limit": Tensor(
         ["num_local_experts"],
         dtype="float32",
-        description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
+        description="Optional per-expert gated-activation clamp limit.",
         optional=True,
     ),
     "gemm2_weights": Tensor(
@@ -714,6 +757,9 @@ _STANDARD_INPUTS = {
         "float32",
         description="Scaling factor applied to routing weights.",
     ),
+    "activation_type": Scalar(
+        "int32", description="Fused activation type; 10 selects SiTU."
+    ),
 }
 
 _STANDARD_OUTPUTS = {
@@ -731,6 +777,7 @@ def _moe_fp8_block_scale_standard_init(
     *,
     seq_len: int,
     routing_method_type: int = 0,
+    activation_type: int = 3,
     num_experts: int = 256,
     top_k: int = 8,
     num_local_experts: int = 32,
@@ -803,6 +850,7 @@ def _moe_fp8_block_scale_standard_init(
         "local_num_experts": int(num_local_experts),
         "routed_scaling_factor": 2.5,
         "routing_method_type": int(routing_method_type),
+        "activation_type": int(activation_type),
     }
 
 
@@ -872,6 +920,7 @@ def _make_standard_moe_trace(name_prefix, description, reference, init):
 def _moe_fp8_block_scale_ds_init(
     *,
     seq_len: int,
+    activation_type: int = 3,
     num_experts: int = 256,
     top_k: int = 8,
     n_group: int = 8,
@@ -946,6 +995,7 @@ def _moe_fp8_block_scale_ds_init(
         "local_num_experts": int(num_local_experts),
         "routed_scaling_factor": 2.5,
         "routing_method_type": 2,
+        "activation_type": int(activation_type),
     }
 
 
@@ -1092,6 +1142,9 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
                 description="Number of quantized blocks along the gemm1_out_size dimension (block_size=128).",
                 abbrev="",
             ),
+            "activation_type": Const(
+                description="Fused activation type; 10 selects SiTU.", abbrev="act"
+            ),
         },
         inputs={
             **extra_inputs,
@@ -1122,19 +1175,19 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
             "gemm1_alpha": Tensor(
                 [rows],
                 dtype="float32",
-                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
+                description="Per-expert SwiGLU alpha or SiTU gate tanh scale.",
                 optional=True,
             ),
             "gemm1_beta": Tensor(
                 [rows],
                 dtype="float32",
-                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
+                description="Per-expert SwiGLU beta or SiTU linear tanh scale.",
                 optional=True,
             ),
             "gemm1_clamp_limit": Tensor(
                 [rows],
                 dtype="float32",
-                description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
+                description="Optional per-expert gated-activation clamp limit.",
                 optional=True,
             ),
             "gemm2_weights": Tensor(
@@ -1164,6 +1217,9 @@ def _make_fp8_block_ds_trace(*, shared_experts: bool) -> TraceTemplate:
             "routed_scaling_factor": Scalar(
                 "float32",
                 description="Scaling factor for routing weights.",
+            ),
+            "activation_type": Scalar(
+                "int32", description="Fused activation type; 10 selects SiTU."
             ),
         },
         outputs={
@@ -2754,6 +2810,7 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
     top_k,
     local_expert_offset,
     routed_scaling_factor=None,
+    activation_type=3,
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
@@ -2785,6 +2842,7 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
         topk_ids.to(torch.int64),
         local_expert_offset,
         int(num_experts),
+        activation_type=activation_type,
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -3376,6 +3434,9 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
         "num_hidden_blocks": Const(abbrev=""),
         "num_intermediate_blocks": Const(abbrev=""),
         "num_gemm1_out_blocks": Const(abbrev=""),
+        "activation_type": Const(
+            description="Fused activation type; 10 selects SiTU.", abbrev="act"
+        ),
     },
     inputs={
         "topk_ids": Tensor(
@@ -3404,19 +3465,19 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha.",
+            description="Per-expert SwiGLU alpha or SiTU gate tanh scale.",
         ),
         "gemm1_beta": Tensor(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta.",
+            description="Per-expert SwiGLU beta or SiTU linear tanh scale.",
         ),
         "gemm1_clamp_limit": Tensor(
             ["num_local_experts"],
             dtype="float32",
             optional=True,
-            description="Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit.",
+            description="Optional per-expert gated-activation clamp limit.",
         ),
         "gemm2_weights": Tensor(
             ["num_local_experts", "hidden_size", "intermediate_size"],
@@ -3430,6 +3491,9 @@ trtllm_fp8_block_scale_routed_moe_trace = TraceTemplate(
         "top_k": Scalar("int32"),
         "local_expert_offset": Scalar("int32"),
         "routed_scaling_factor": Scalar("float32", optional=True),
+        "activation_type": Scalar(
+            "int32", description="Fused activation type; 10 selects SiTU."
+        ),
     },
     outputs=dict(_TRTLLM_MOE_COMMON_OUTPUTS),
     tags=["status:verified", "backend:trtllm", "quantization:float8_e4m3fn"],

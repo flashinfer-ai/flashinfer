@@ -4906,9 +4906,15 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU, SiTU),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2, SiTU),
     }
+
+    def _check_activation_parameters(self) -> None:
+        if isinstance(self.config.activation, SiTU) and self.config.activation.linear_scale is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot represent SiTU(linear_scale=None)."
+            )
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -5198,9 +5204,8 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             routing_bias=routing_bias,
             gemm1_weights=view["gemm1_weights"],
             gemm1_weights_scale=view["gemm1_weights_scale"],
-            # Optional SwiGLU OA controls; absent keys mean alpha=1 / beta=0 / no clamp.
-            # Both block-scale variants consume them: MxFp8 in the fused FC1 epilogue,
-            # DeepSeekFp8 in its separate activation kernel.
+            # Optional gated-activation controls. Both block-scale variants consume them: MxFp8
+            # in the fused FC1 epilogue, DeepSeekFp8 in its separate activation kernel.
             gemm1_alpha=view.get("gemm1_alpha"),
             gemm1_beta=view.get("gemm1_beta"),
             gemm1_clamp_limit=view.get("gemm1_clamp_limit"),

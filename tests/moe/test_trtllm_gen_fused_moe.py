@@ -3514,6 +3514,58 @@ def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(cache_permute_indices
     )
 
 
+@pytest.mark.parametrize(
+    "quant_mode",
+    [
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, id="deepseek-fp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, id="mxfp8"),
+    ],
+)
+def test_fp8_block_scale_moe_situ_activation(quant_mode, cache_permute_indices):
+    """Both block-FP8 variants implement SiTU with per-expert scale and clamp tensors."""
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
+
+    num_experts = 32
+    intermediate_size = 512
+    routing_config = {
+        "num_experts": num_experts,
+        "top_k": 2,
+        "padding": 8,
+        "n_groups": None,
+        "top_k_groups": None,
+        "routed_scaling": None,
+        "has_routing_bias": False,
+        "routing_method_type": RoutingMethodType.Renormalize,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+        "compatible_intermediate_size": [intermediate_size],
+        "enable_autotune": False,
+    }
+    weight_processing = {
+        "use_shuffled_weight": True,
+        "layout": WeightLayout.MajorK,
+        "compatible_moe_impls": [FP8BlockScaleMoe],
+    }
+
+    def per_expert(value):
+        return torch.full((num_experts,), value, device="cuda", dtype=torch.float32)
+
+    run_moe_test(
+        64,
+        512,
+        intermediate_size,
+        FP8BlockScaleMoe(fp8_quantization_type=quant_mode),
+        routing_config,
+        weight_processing,
+        ActivationType.Situ,
+        cache_permute_indices,
+        gemm1_alpha=per_expert(4.0),
+        gemm1_beta=per_expert(25.0),
+        gemm1_clamp_limit=per_expert(6.0),
+    )
+
+
 # ====================================================================================
 # MoE LoRA: gemm1_lora_delta
 # ====================================================================================

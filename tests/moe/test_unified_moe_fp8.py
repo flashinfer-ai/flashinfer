@@ -12,6 +12,7 @@ from flashinfer.fused_moe import (
     # Typed activation values
     GeGLU,
     ReLU2,
+    SiTU,
     SwiGLU,
     # Unified configs, packs, and runners
     BackendOptions,
@@ -137,8 +138,8 @@ def _block_fp8_reference(
 ):
     """Dequantized block-FP8 MoE reference.
 
-    ``gemm1_alpha`` / ``gemm1_beta`` / ``gemm1_clamp_limit`` are the optional
-    per-expert SwiGLU OA controls; leaving all three unset reproduces plain SwiGLU.
+    ``gemm1_alpha`` / ``gemm1_beta`` / ``gemm1_clamp_limit`` are optional
+    per-expert gated-activation controls.
     """
     activation = activation or SwiGLU()
     if narrow_routing_weights:
@@ -166,7 +167,25 @@ def _block_fp8_reference(
                     limit = gemm1_clamp_limit[local_expert].float()
                     up = up.clamp(min=-limit, max=limit)
                     gate = gate.clamp(max=limit)
-                if has_oa:
+                if isinstance(activation, SiTU):
+                    alpha = (
+                        1.0
+                        if gemm1_alpha is None
+                        else gemm1_alpha[local_expert].float()
+                    )
+                    beta = (
+                        1.0
+                        if gemm1_beta is None
+                        else gemm1_beta[local_expert].float()
+                    )
+                    act = (
+                        beta
+                        * torch.tanh(up / beta)
+                        * alpha
+                        * torch.tanh(gate / alpha)
+                        * torch.sigmoid(gate)
+                    )
+                elif has_oa:
                     alpha = (
                         1.0
                         if gemm1_alpha is None
@@ -300,10 +319,23 @@ def _make_block_fp8_case(
         QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
     ],
 )
-def test_block_fp8_layer_and_direct_runner_match_reference(variant):
-    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(variant)
+@pytest.mark.parametrize("activation", (SwiGLU(), SiTU(clamp_limit=2.0)))
+def test_block_fp8_layer_and_direct_runner_match_reference(variant, activation):
+    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
+        variant, activation=activation
+    )
+    view = weights.get_view("trtllm_fp8_block")
     reference = _block_fp8_reference(
-        x, w1, w2, pack.topk_ids, pack.topk_weights, variant
+        x,
+        w1,
+        w2,
+        pack.topk_ids,
+        pack.topk_weights,
+        variant,
+        gemm1_alpha=view.get("gemm1_alpha"),
+        gemm1_beta=view.get("gemm1_beta"),
+        gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
+        activation=activation,
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
