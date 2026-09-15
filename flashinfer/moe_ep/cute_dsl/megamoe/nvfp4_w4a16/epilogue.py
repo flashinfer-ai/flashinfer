@@ -305,10 +305,11 @@ class W4A16Fc2Epilogue(EpilogueContext):
                 acc_ready = True
                 acc_pipeline.consumer_wait(acc_consumer_state)
         fc2_output_router = self._make_output_router(work_tile_info)
+        # Each warp may address only its own 32 TMEM rows.
         tmem_acc_tensor_tiled_by_epi_tile = cute.flat_divide(
             tmem_acc_tensor,
-            (self._EpilogueFc2HiddenTileSize, self._EpilogueTokenTileSize),
-        )[None, None, 0, None]
+            (32, self._EpilogueTokenTileSize),
+        )[None, None, self.tidx // 32, None]
         acc_pipeline.consumer_wait(acc_consumer_state, acc_ready)
         iket.range_push("fc2_epi")
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
