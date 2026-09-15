@@ -728,13 +728,13 @@ def mm_bf16(
         explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
         warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
-        with at most 64 K tiles; requires CuTe DSL >= 4.7), and cluster Split-K
-        otherwise. With autotuning, one call profiles the available low-M
-        kernels on the M <= 32 buckets and the cuBLASLt fallback on the larger
-        ones, so a single large-M warm-up tunes both ranges; with bias the
-        direct kernel is excluded.
-        Compiled CuTe DSL kernels are cached on disk and reused across processes
-        when the source, compiler stack, architecture, and configuration match.
+        with at most 64 K tiles; requires CuTe DSL >= 4.7), and
+        cluster Split-K otherwise. With autotuning, one call profiles the
+        available low-M kernels on their supported buckets and a single
+        cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
+        warm-up tunes both ranges; with bias the direct kernel is excluded.
+        Direct and warp Split-K reuse compiled kernels across M for matching
+        tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
@@ -2339,16 +2339,31 @@ def _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability: int):
         default_tactic,
         run_warp_splitk_dense,
         validate_inputs,
+        validate_tactic,
     )
 
-    # Every warp Split-K tactic serves every M in [1, _MAX_M], so the inherited
-    # ``is_tactic_compatible`` holds.
     class CuteDSLWarpSplitKBf16Runner(_CuteDSLBf16Runner):
         def supports_inputs(self, inputs: List[torch.Tensor]) -> bool:
             a, b, bias, _, out, *_ = inputs
             try:
                 validate_inputs(a, b, out, bias)
             except ValueError:
+                return False
+            return True
+
+        def is_tactic_compatible(
+            self, inputs: List[torch.Tensor], tactic: object
+        ) -> bool:
+            if tactic == -1:
+                return True
+            if not isinstance(tactic, (tuple, list)):
+                return False
+            a, b, *_ = inputs
+            try:
+                validate_tactic(
+                    WarpSplitKTactic(*tactic), a.shape[0], b.shape[1], a.shape[1]
+                )
+            except (TypeError, ValueError):
                 return False
             return True
 
@@ -2513,16 +2528,11 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
 def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
-    Every available runner is listed whatever the real M, so that one autotune
-    call profiles the low-M kernels on the buckets M <= 32 and the cuBLASLt
-    fallback on the buckets above (custom ``tuning_buckets`` are assigned the
-    same way). ``[0]`` is the no-autotune default and the autotuner's
-    fallback, so it must serve the real inputs: cuBLASLt above 32; below, the
-    direct kernel where its measured shape heuristic applies, otherwise the
-    warp Split-K kernel whenever eligible (it wins nearly every tuned M <= 32
-    cell on B300), otherwise cluster Split-K. For M <= 32, low-M kernels that
-    cannot serve the real inputs (bias, N, K) are dropped: they serve no
-    bucket either.
+    Keep every available runner for synthesized buckets: low-M kernels serve
+    M <= 32, and only the cuBLASLt fallback offers tactics above 32.
+    Runtime-supported runners come first so ``[0]`` is a valid no-autotune
+    default. Within that group, prefer direct where its shape heuristic applies,
+    then warp, then cluster Split-K.
     """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100
@@ -2542,12 +2552,6 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     cluster_splitk = _cute_dsl_splitk_bf16_gemm_runner(compute_capability)
     fallback = _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability)
 
-    if m > _CUTE_DSL_BF16_MAX_M:
-        return [
-            runner
-            for runner in (fallback, warp_splitk, cluster_splitk, direct)
-            if runner is not None
-        ]
     prefer_direct = direct.supports_inputs(inputs) and prefer_direct_bf16_gemm_sm100(
         m, n, k
     )
@@ -2556,11 +2560,10 @@ def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
         if prefer_direct
         else (warp_splitk, cluster_splitk, direct)
     )
-    return [
-        runner
-        for runner in kernels
-        if runner is not None and runner.supports_inputs(inputs)
-    ] + [fallback]
+    return sorted(
+        (runner for runner in (*kernels, fallback) if runner is not None),
+        key=lambda runner: not runner.supports_inputs(inputs),
+    )
 
 
 def bf16_gemm_sm100(
