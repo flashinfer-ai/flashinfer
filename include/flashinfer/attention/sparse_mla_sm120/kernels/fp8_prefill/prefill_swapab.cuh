@@ -133,6 +133,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(24));
 
     const int io_tid = threadIdx.x - MATH_THREADS;
+    // No barrier counts spectator IO threads. Retire them after the CTA sync
+    // and warpgroup register release: a starved spectator could otherwise wait
+    // on a ring phase that never completes again near kernel drain.
+    if (io_tid >= BI) return;
     const uint64_t kv_l2_policy = create_l2_evict_last_policy();
 
     // Stage this thread's candidate index a tile ahead: the LDG for tile ti+2
@@ -153,8 +157,6 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     for (int ti = 0; ti < actual_ni; ti++) {
       const int buf = ti & 1;
       const int next = ld_idx(ti + 2);
-      // Surplus IO lanes skip gathering but keep this wait to stay paced with
-      // the ring phases rather than falling behind into a retired phase.
       Ring::Free::wait(sm.mbar_wr + buf, wr_phase);
       io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
                                      cold.kv_stride_bytes, kv_l2_policy);
