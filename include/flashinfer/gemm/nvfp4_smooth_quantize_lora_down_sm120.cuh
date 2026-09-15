@@ -271,14 +271,22 @@ inline cudaError_t launch_m537_mixed_kernel(void const* x, void const* pre_quant
   return cudaGetLastError();
 }
 
-template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
+template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
+          bool SignalLaunch = false>
 __global__
 __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
     quant::Type* __restrict__ down, int M, int K) {
+  static_assert(!SignalLaunch || PackedL2T, "launch signaling requires packed L2T");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+  if constexpr (SignalLaunch) {
+    // The PDL consumer can set up early, but waits for this grid before reading outputs.
+    if (threadIdx.x == 0) {
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+  }
   int const kPaddedM = (M + 127) / 128 * 128;
   int const kQuantBlocks = (M + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
   constexpr int kDownWarps = BlockThreads / 32;
@@ -380,9 +388,19 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
     quant::Type const* b_base = l2t_smoothed + (k_base + pair_col) * kRank + b_col;
 #pragma unroll
     for (int fragment = 0; fragment < kNFragments; ++fragment) {
-      quant::Type const* b_fragment = b_base + fragment * kMmaN;
-      std::uint32_t const b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
-      std::uint32_t const b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      std::uint32_t b0;
+      std::uint32_t b1;
+      if constexpr (PackedL2T) {
+        int const packed_index =
+            (((k_base / 16 * kDownNTiles + tile_n) * kNFragments + fragment) * 32) + lane;
+        uint2 const packed_b = reinterpret_cast<uint2 const*>(l2t_smoothed)[packed_index];
+        b0 = packed_b.x;
+        b1 = packed_b.y;
+      } else {
+        quant::Type const* b_fragment = b_base + fragment * kMmaN;
+        b0 = base::pack_bf16_pair(b_fragment, b_fragment + kRank);
+        b1 = base::pack_bf16_pair(b_fragment + 8 * kRank, b_fragment + 9 * kRank);
+      }
       base::mma_m16n8k16_row_col(d[fragment][0], d[fragment][1], d[fragment][2], d[fragment][3], a0,
                                  a1, a2, a3, b0, b1);
     }
@@ -422,7 +440,8 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
 // Runtime-M/K small-M launch. Only the tiling stays in the type; the shape and
 // everything derived from it are arguments, so one instantiation per tiling
 // serves every shape whose K divides the warp split.
-template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock>
+template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
+          bool SignalLaunch = false>
 inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
                                              void const* l2t_smoothed, void* down, int m, int k,
@@ -442,8 +461,9 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     int const quant_blocks = (m + RowsPerQuantBlock - 1) / RowsPerQuantBlock;
     if (quant_blocks * RowsPerQuantBlock > padded_m) return cudaErrorInvalidValue;
     int const grid_blocks = quant_blocks + ((m + 15) / 16) * kDownNTiles;
-    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<BlockThreads, DownTileCols,
-                                                             RowsPerQuantBlock>
+    // Keep the primary's ordinary stream dependency, including the preceding GEMM.
+    nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
+        BlockThreads, DownTileCols, RowsPerQuantBlock, PackedL2T, SignalLaunch>
         <<<grid_blocks, BlockThreads, 0, stream>>>(
             static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
             global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
@@ -958,14 +978,17 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
 
 // Producer launch by family and tiling, with no shape lookup at all. The caller
 // enumerates what a shape may run from the same constraints the launchers check,
-// so this switch is over the two ladders rather than over shapes, and a shape
+// so this switch selects compiled families and tilings, and a shape
 // nobody wrote down reaches the same kernels as one that was.
 //   family 0 large-M (geometry a, b, c = block threads, tile M, tile K)
-//   family 1 small-M (tiling  a, b, c = block threads, down tile cols, rows/quant block)
+//   family 1 row-major small-M (a, b, c = block threads, down tile cols, rows/quant block)
+//   family 2 fixed-M537 with packed L2T (a, b, c = block threads, down warps, rows/quant block)
+//   family 4 packed small-M (same tiling fields as family 1)
+// Family 3 uses the separate cuBLASLt prefix entry.
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int family, int a, int b, int c,
-    int address_policy, cudaStream_t stream) {
+    int address_policy, cudaStream_t stream, bool signal_launch = false) {
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
   using large_m::DynAddress;
@@ -985,6 +1008,20 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
       return small_m::launch_m537_mixed_kernel<7168, 1024, 24, 16, 8>(
           x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, stream);
     }
+    return cudaErrorInvalidValue;
+  }
+  if (family == 4) {
+#define FI_SVDQ_PACKED_SMALL_CASE(BT, DTC, RPQB)                                       \
+  if (a == (BT) && b == (DTC) && c == (RPQB)) {                                        \
+    if (signal_launch) {                                                               \
+      return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, true, true>(            \
+          x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
+    }                                                                                  \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, true>(                    \
+        x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);   \
+  }
+    FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_PACKED_SMALL_CASE)
+#undef FI_SVDQ_PACKED_SMALL_CASE
     return cudaErrorInvalidValue;
   }
   if (family == 1) {
@@ -1020,10 +1057,10 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
   // ladders come from the same lists the dispatch expands, so a candidate
   // offered here is always a candidate that exists.
   //
-  // Row-major families only. The M537 family reads L2T prepacked; making it a
-  // default would hand it whatever layout an unopinionated caller happened to
+  // Row-major families only. M537 and packed small-M read L2T prepacked;
+  // making either a default would hand it whatever layout a caller happened to
   // pass, which is silent when it is wrong. A caller that wants it names
-  // family 2.
+  // family 2 or 4.
   (void)signal_m537_quant_ready;
   (void)geometry_variant;
 #define FI_SVDQ_TRY(FAMILY, A, B, C)                                                            \

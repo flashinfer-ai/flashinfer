@@ -91,7 +91,7 @@ def _svdquant_backend_for_capability(major: int, minor: int) -> str:
     )
 
 
-_SM120_M537_PACKED_L2T_K = frozenset({5120, 5376, 7168})
+_SM120_M537_PACKED_L2T_K = frozenset({3072, 5120, 5376, 7168})
 
 
 _SM120_M537_PACKED_L2T_CACHE_CAPACITY = 64
@@ -103,23 +103,33 @@ _SM120_M537_PACKED_L2T_CACHE: OrderedDict[
 
 
 class _SM120M537L2TPackingError(ValueError):
-    """Report an unsupported matrix shape at the M537 packing boundary."""
+    """Report an unsupported matrix shape at the shared L2T packing boundary."""
 
     shape: tuple[int, ...]
 
     def __init__(self, shape: tuple[int, ...]) -> None:
         self.shape = shape
         super().__init__(
-            "M537 L2T packing requires rank 32 and K in "
+            "SM120 L2T packing requires rank 32 and K in "
             f"{sorted(_SM120_M537_PACKED_L2T_K)}, got {shape}"
         )
 
 
 def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
-    """Pack an admitted M537 LoRA-down matrix for one load per lane."""
+    """Pack L2T for one load per lane in M537 and packed small-M producers."""
     shape = tuple(l2t_smoothed.shape)
     if len(shape) != 2 or shape[0] not in _SM120_M537_PACKED_L2T_K or shape[1] != 32:
         raise _SM120M537L2TPackingError(shape)
+    if (
+        l2t_smoothed.is_cuda
+        and l2t_smoothed.dtype == torch.bfloat16
+        and l2t_smoothed.is_contiguous()
+    ):
+        packed = torch.empty_like(l2t_smoothed)
+        get_nvfp4_svdquant_sm120_module().nvfp4_svdquant_pack_l2t_sm120(
+            l2t_smoothed, packed
+        )
+        return packed
     k = shape[0]
     return (
         l2t_smoothed.reshape(k // 16, 2, 4, 2, 2, 2, 8)
@@ -132,7 +142,7 @@ def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
 def _cached_sm120_m537_l2t(
     l2t_smoothed: torch.Tensor,
 ) -> torch.Tensor:
-    """Cache an invariant M537 L2T pack and invalidate it on mutation."""
+    """Cache a shared L2T pack and invalidate it on mutation."""
     # Inference tensors have no version counter, so their mutations cannot
     # invalidate a cached pack. Repack them on each call.
     if l2t_smoothed.is_inference():
@@ -411,10 +421,8 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
             family, tiling, address_policy = _sm120_decode_producer_variant(
                 m_rt, k_rt, producer_variant
             )
-            # The layout follows the producer the tactic selected, not the
-            # shape: the M537 family indexes L2T prepacked and every other
-            # family reads it row-major, and handing one the other's matrix
-            # misreads it rather than failing.
+            # M537 and packed small-M producers share the packed L2T layout;
+            # the remaining producers read the original row-major matrix.
             fused_l2t_smoothed = (
                 _cached_sm120_m537_l2t(l2t_smoothed)
                 if _sm120_variant_packs_l2t(m_rt, k_rt, producer_variant)
@@ -615,11 +623,9 @@ def _sm120_linear_op_name(m: int, k: int, rank: int, *, enable_pdl: bool) -> str
     it. The in-process dispatch key always separated the two; the persistent
     record did not, so a PDL=False winner could be replayed for PDL=True.
 
-    The name is only extended, never re-versioned: `enable_pdl=False` keeps the
-    exact historical name so the frozen/default benchmark path still reaches
-    every retained winner, and `enable_pdl=True` -- which never had a record of
-    its own -- gets its own stable `_pdl` suffix. `enable_pdl` is keyword-only
-    and has no default so no call site can silently reintroduce the collision.
+    The route version tracks changes to the admitted candidate set. The `_pdl`
+    suffix independently separates PDL-enabled measurements. `enable_pdl` is
+    required at every call site so the scheduling mode cannot be omitted.
     """
     name = (
         f"svdquant_linear_sm120_routes_v{_sm120_linear_route_abi_version(m, k, rank)}"

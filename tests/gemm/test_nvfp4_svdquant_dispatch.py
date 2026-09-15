@@ -590,8 +590,11 @@ _SM120_ROUTE_V6_MKR = (73984, 14336, 32)
     "m,k,rank,route_version",
     [
         (*_SM120_ROUTE_V6_MKR, 6),
-        (73984, 7168, 32, 6),
-        (82752, 5376, 32, 8),
+        (73984, 7168, 32, 10),
+        (82752, 5376, 32, 10),
+        (64, 3072, 32, 10),
+        (537, 5376, 32, 10),
+        (17, 3072, 32, 10),
     ],
 )
 def test_sm120_linear_op_name_uses_current_route_abi(m, k, rank, route_version):
@@ -605,8 +608,9 @@ def test_sm120_linear_op_name_uses_current_route_abi(m, k, rank, route_version):
 @pytest.mark.parametrize(
     "m,k,rank",
     [
-        (256, 12288, 32),  # ordinary non-fused shape
-        (512, 3072, 32),  # fused route that predates the admission
+        (256, 12288, 32),  # K outside the packed-family admission
+        (512, 3072, 64),  # rank outside the fused producer topology
+        (64, 1536, 32),  # native producers with no new packed family
         (27280, 14336, 32),  # fused route on the same K as row 52
         (73984, 14336, 16),  # right (m, k), rank the fused route never admitted
     ],
@@ -625,6 +629,9 @@ def test_sm120_linear_op_name_keeps_v5_for_every_other_shape(m, k, rank):
     [
         (256, 12288, 32, "svdquant_linear_sm120_routes_v5_tactics_v3"),
         (*_SM120_ROUTE_V6_MKR, "svdquant_linear_sm120_routes_v6_tactics_v3"),
+        (64, 3072, 32, "svdquant_linear_sm120_routes_v10_tactics_v3"),
+        (17, 3072, 32, "svdquant_linear_sm120_routes_v10_tactics_v3"),
+        (64, 3072, 64, "svdquant_linear_sm120_routes_v5_tactics_v3"),
     ],
 )
 def test_sm120_linear_op_name_separates_pdl_in_the_persistent_key(
@@ -636,11 +643,9 @@ def test_sm120_linear_op_name_separates_pdl_in_the_persistent_key(
     valid answer for a call that has it. The in-process dispatch key always
     separated the two; the persistent name did not, so a PDL=False winner could
     be replayed for PDL=True. The names below are asserted exactly, not by
-    suffix: PDL=False must stay byte-identical to the historical name (the
-    frozen/default benchmark path's retained winners all live under it), and
-    PDL=True must be that same name plus one stable `_pdl` suffix -- extending
-    the name, never re-versioning the routes, so no PDL=False record anywhere is
-    invalidated.
+    suffix: each route version has a separate PDL=False name and a PDL=True
+    name with one stable `_pdl` suffix. Changing the producer candidate set
+    advances the route version in both modes; toggling PDL alone does not.
 
     The helper drives the real chooser and asserts, on each call, that the name
     `choose_one` was keyed by is the same computed value the in-process dispatch
