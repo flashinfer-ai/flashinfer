@@ -93,10 +93,11 @@ _GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
     2,
     2,
 )
-# Block-sparse feature compatibility is validated by
-# ``validate_block_sparse_profile``. This set only selects the Keeps MMA
-# resource recipes qualified for that already-validated launch domain.
-_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
+# Keeps MMA resource recipes qualified for contiguous K/V, whether the launch
+# is block-sparse or dense, with either scheduler. Block-sparse feature
+# compatibility is validated by ``validate_block_sparse_profile``; a dense
+# contiguous launch is direct.
+_CONTIGUOUS_GROUPED_KEEPS_PROFILES = {
     _GROUPED_KEEPS_MAIN_PROFILE,
     (BFloat16, BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
 }
@@ -2239,15 +2240,27 @@ class FmhaDecodeConfig:
             return False
 
         profile = self._grouped_keeps_profile_key
-
-        # Keep block-sparse qualification separate from the dense/paged
-        # profile matrix below. Its structural, masking, and reduction
-        # constraints are validated separately; both scheduler modes use the
-        # same qualified recipe keys.
-        if self.use_block_sparse:
-            return profile in _BLOCK_SPARSE_GROUPED_KEEPS_PROFILES
-
         direct = not (self.use_split_kv or self.use_separate_reduction_kernel)
+
+        # Contiguous K/V launches share one qualified recipe set and admit both
+        # scheduler modes; keep them apart from the dense/paged profile matrix
+        # below. Block-sparse structural, masking, and reduction constraints
+        # are validated separately, and a dense contiguous launch is direct.
+        if self.use_block_sparse:
+            return profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+        if (
+            profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+            and direct
+            and not self.use_paged_kv
+            and not any(
+                (
+                    self.use_variable_seqlens_q,
+                    self.use_sliding_window_causal,
+                    self.use_attention_sinks,
+                )
+            )
+        ):
+            return True
 
         if profile in _GROUPED_KEEPS_PAGED_FP8_PROFILES:
             fixed_q1 = (
