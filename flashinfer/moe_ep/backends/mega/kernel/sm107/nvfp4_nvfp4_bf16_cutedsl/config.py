@@ -30,7 +30,7 @@ class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     schedule_policy: Tuple[str, Optional[int]] = ("grouped", None)
     work_id_mode: Literal["grid_stride", "atomic_counter"] = "grid_stride"
     fc2_use_bulk: bool = False

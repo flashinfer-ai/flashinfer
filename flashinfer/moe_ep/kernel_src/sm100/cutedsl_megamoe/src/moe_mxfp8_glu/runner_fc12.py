@@ -4,6 +4,7 @@
 Host driver for the MegaMoE MXFP8 GLU fused fc1+fc2 kernel.
 """
 
+
 import argparse
 import os
 import sys
@@ -28,7 +29,7 @@ from moe_nvfp4_swapab.runner_fc12_common import (
     add_common_fc12_arguments,
     parse_tuple,
 )
-from moe_mxfp8_glu.runner_common import TrainingImplDesc
+from moe_mxfp8_glu.runner_common import TrainingForwardImplDesc
 from moe_nvfp4_swapab.runner_common import (
     from_blocked,
     dequant_block_scale_to_fp32,
@@ -36,7 +37,7 @@ from moe_nvfp4_swapab.runner_common import (
 from common.host_utils import (
     kind_data_dtype,
     kind_sf_vec_size,
-    mxfp8_quantize_per_block_32,
+    mxfp8_quantize_per_block_32_row,
 )
 
 
@@ -51,7 +52,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
     def __init__(
         self,
         problem: ProblemDesc,
-        impl: TrainingImplDesc,
+        impl: TrainingForwardImplDesc,
         misc: MiscDesc,
     ) -> None:
         super().__init__(problem, impl, misc)
@@ -74,7 +75,6 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         if self.impl.generate_c:
             return 128
         from moe_nvfp4_swapab.epilogue import EpilogueTokenTile
-
         return EpilogueTokenTile
 
     # ------------------------------------------------------------------
@@ -129,7 +129,9 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         data_dtype = kind_data_dtype(problem.kind)
 
         # -- activation: (data_total_rows, hidden) fp8, hidden stride-1 --
-        self.activation = self._create_fp8_tensor((data_total_rows, hidden), data_dtype)
+        self.activation = self._create_fp8_tensor(
+            (data_total_rows, hidden), data_dtype
+        )
 
         # -- fc1_weight: (experts, intermediate, hidden) -> permute ->
         #    (experts, hidden, intermediate), hidden stride-1 --
@@ -148,9 +150,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         valid_tokens = self.valid_tokens_per_expert
         data_offsets = self.data_physical_offsets
         self.topk_scores = torch.zeros(
-            (data_total_rows,),
-            dtype=torch.float32,
-            device="cuda",
+            (data_total_rows,), dtype=torch.float32, device="cuda",
         )
         for e in range(self.problem.experts):
             v_e = valid_tokens[e]
@@ -168,8 +168,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         fc2_output_bytes = torch.full(
             (data_total_rows, hidden * problem.fc2_output_dtype.itemsize),
             0xFF,
-            dtype=torch.uint8,
-            device="cuda",
+            dtype=torch.uint8, device="cuda",
         )
         self.fc2_output = fc2_output_bytes.view(problem.fc2_output_dtype).reshape(
             data_total_rows, hidden
@@ -183,7 +182,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
         self, swiglu: torch.Tensor, norm_const_val: float
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         data_dtype = kind_data_dtype(self.problem.kind)
-        return mxfp8_quantize_per_block_32(swiglu, data_dtype)
+        return mxfp8_quantize_per_block_32_row(swiglu, data_dtype)
 
     # ------------------------------------------------------------------
     # Kind hooks: kernel + validation
@@ -203,6 +202,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
             gate_up_clamp=self.problem.gate_up_clamp,
             generate_c=self.impl.generate_c,
             use_stg_fc1=self.impl.use_stg_fc1,
+            act_func=self.impl.act_func,
         )
         self._kernel_c_dtype = kernel.c_dtype
         return kernel
@@ -279,9 +279,7 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
                 kfp32.cpu(),
                 ref_fp32.cpu(),
                 name=f"fc1_expert{e}",
-                atol=5e-2,
-                rtol=5e-2,
-                max_mismatches=5,
+                atol=5e-2, rtol=5e-2, max_mismatches=5,
             )
         print("=" * 60)
 
@@ -318,12 +316,9 @@ class SwigluMxfp8Fc12Tester(Fc12TesterBase):
             kernel_c = c[doff[e] : doff[e] + v_e].float().cpu()
             ref_c = ref.float().cpu()
             compare_and_report_mismatches(
-                kernel_c,
-                ref_c,
+                kernel_c, ref_c,
                 name=f"c_output_expert{e}",
-                atol=1e-5,
-                rtol=1e-2,
-                max_mismatches=5,
+                atol=1e-5, rtol=1e-2, max_mismatches=5,
             )
         if not any_checked:
             print("  (no valid tokens routed to any expert)")
@@ -346,55 +341,47 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # -- MXFP8-only Problem --
     parser.add_argument(
-        "--kind",
-        type=str,
-        default="mxfp8_e4m3",
+        "--kind", type=str, default="mxfp8_e4m3",
         choices=["mxfp8_e4m3", "mxfp8_e5m2"],
         help="MXFP8 element format: mxfp8_e4m3 (default) or mxfp8_e5m2.",
     )
     parser.add_argument(
-        "--flag_batch",
-        type=int,
-        default=1,
+        "--flag_batch", type=int, default=1,
         help="dispatch_pull release-flag batch size; 1 == per-token "
         "baseline, larger amortizes the device fence over more tokens.",
     )
     parser.add_argument(
-        "--token_back_mode",
-        type=str,
-        default="epi_warps",
+        "--token_back_mode", type=str, default="epi_warps",
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 push-back runs: epi_warps (epilogue "
-        "STG redirect, default), standalone_warps (dedicated warps 12-15), "
-        "or reuse_dispatch_warps (dispatch warps 8-11).",
+             "STG redirect, default), standalone_warps (dedicated warps 12-15), "
+             "or reuse_dispatch_warps (dispatch warps 8-11).",
     )
     parser.add_argument(
-        "--epi_flag_batch",
-        type=str,
-        default="1,1",
+        "--epi_flag_batch", type=str, default="1,1",
         help="Done-counter publish batching as 'fc1,fc2' (e.g. '2,4'). "
-        "Each component must be in [1, 32].",
+             "Each component must be in [1, 32].",
     )
     parser.add_argument(
-        "--gate_up_clamp",
-        type=float,
-        default=None,
+        "--gate_up_clamp", type=float, default=None,
         help="DeepSeek-V4 swiglu_limit: clamp gate/up pre-activations before SiLU.",
     )
     parser.add_argument(
-        "--generate_c",
-        action="store_true",
-        default=False,
+        "--generate_c", action="store_true", default=False,
         help="Save raw fc1 accumulator (gate+up, Float32) to a separate C tensor "
-        "before SwiGLU.  Allocates extra SMEM; reduces AB pipeline stages.",
+             "before SwiGLU.  Allocates extra SMEM; reduces AB pipeline stages.",
     )
     parser.add_argument(
-        "--use_stg_fc1",
-        action="store_true",
-        default=False,
+        "--use_stg_fc1", action="store_true", default=False,
         help="Write fc1 FP8 output directly to GMEM via STG.256 (RMEM→GMEM) "
-        "instead of the default R2S+TMA path.  Eliminates sD SMEM staging "
-        "(saves 16 KB); may increase AB pipeline stages.",
+             "instead of the default R2S+TMA path.  Eliminates sD SMEM staging "
+             "(saves 16 KB); may increase AB pipeline stages.",
+    )
+    parser.add_argument(
+        "--act_func", type=str, default="swiglu",
+        choices=["swiglu", "geglu"],
+        help="GLU activation variant.  Only 'swiglu' is implemented today; "
+             "'geglu' is recognized but raises NotImplementedError (planned).",
     )
 
     return parser
@@ -416,7 +403,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         gate_up_clamp=args.gate_up_clamp,
     )
 
-    impl = TrainingImplDesc(
+    impl = TrainingForwardImplDesc(
         mma_tiler_mnk=parse_tuple(args.mma_tiler_mnk),
         cluster_shape_mnk=parse_tuple(args.cluster_shape_mnk),
         use_2cta_instrs=args.use_2cta_instrs,
@@ -431,6 +418,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         epi_flag_batch=parse_tuple(args.epi_flag_batch),
         generate_c=args.generate_c,
         use_stg_fc1=args.use_stg_fc1,
+        act_func=args.act_func,
     )
 
     misc = MiscDesc(

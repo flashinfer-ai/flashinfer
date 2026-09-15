@@ -115,8 +115,8 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
-            defer_topk_reduce=not k.do_finalize,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=not k.do_finalize,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -135,9 +135,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
             activation_clamp=config.activation_clamp,
-            apply_topk_in_fc1=config.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(config.apply_routing_weights_before_fc2),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
-            defer_topk_reduce=not config.do_finalize,
+            use_custom_finalize=not config.do_finalize,
             fc1_alpha=config.fc1_alpha,
             fc2_alpha=config.fc2_alpha,
             fc1_norm_const=config.fc1_norm_const,
@@ -156,7 +156,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             ).view(fleet_params.max_tokens_per_rank, config.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if config.apply_topk_in_fc1
+                if config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
         return workspace
@@ -179,7 +179,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             _resolve_gate_up_clamp(config),
-            config.apply_topk_in_fc1,
+            config.apply_routing_weights_before_fc2,
             config.enable_in_kernel_fc2_reduce,
             config.do_finalize,
             epilogue_pool_key(config.fc1_alpha),

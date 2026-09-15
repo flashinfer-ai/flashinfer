@@ -98,9 +98,10 @@ class TestIsValid:
         assert not pkg.is_valid(
             {**swap, "cluster_shape_mnk": (2, 1, 1), "tail_split_pairs": True}
         )
-        # ikr requires apply_topk_in_fc1.
+        # IKR requires routing weights before FC2.
         assert not pkg.is_valid(
-            {**ok, "in_kernel_fc2_reduce": True}, apply_topk_in_fc1=False
+            {**ok, "in_kernel_fc2_reduce": True},
+            apply_routing_weights_before_fc2=False,
         )
 
     def test_iter_candidates_all_valid(self):

@@ -10,7 +10,7 @@ from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import Int32
 from cutlass._mlir import ir
 
-from moe_nvfp4_swapab.custom_ext import GluMxFp8Fc12SchedExtension
+from moe_mxfp8_glu.custom_ext import GluMxFp8Fc12SchedExtension
 from moe_nvfp4_swapab.moe_utils import rewrite_tensor_shape
 
 
@@ -56,6 +56,8 @@ class GluBf16Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
         result.fc1_done_counter_ptr = base.fc1_done_counter_ptr
         result.fc2_spin_threshold = base.fc2_spin_threshold
         result.fc1_ready_counter_ptr = base.fc1_ready_counter_ptr
+        result.token_cluster_size = base.token_cluster_size
+        result.fc1_done_per_cta_token = base.fc1_done_per_cta_token
         result.cluster_m = base.cluster_m
         return result
 
@@ -96,7 +98,9 @@ class GluBf16Fc12SchedExtension(GluMxFp8Fc12SchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name == "topk"):
-            real = cute.domain_offset((data_token_offset,), gmem_tensor_in_moe_view)
+            real = cute.domain_offset(
+                (data_token_offset,), gmem_tensor_in_moe_view
+            )
             return (real, None)
 
         raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")

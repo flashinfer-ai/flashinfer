@@ -238,7 +238,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
         intermediate_size=128,
         top_k=2,
         do_finalize=False,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
     )
     backend = create_mega_kernel(config)
     backend.bind_ep_bootstrap(
@@ -256,7 +256,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
             topk=2,
             max_tokens=64,
             live_tokens=live,
-            defer_topk_reduce=True,
+            use_custom_finalize=True,
         )
     assert backend.live_token_buckets(fleet) == [8, 16, 32]
     keys = [
@@ -424,10 +424,10 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
     layer.destroy()
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize("apply_routing_weights_before_fc2", [False, True])
 @pytest.mark.parametrize("backend", ["nvfp4", "bf16", "w4a16"])
 def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
-    monkeypatch, backend, apply_topk_in_fc1
+    monkeypatch, backend, apply_routing_weights_before_fc2
 ):
     """Remaining weights and identity indices reuse storage across live sizes."""
     import torch
@@ -454,13 +454,15 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         _frontend=mock.Mock(),
         _staging_inputs=None,
     )
-    raw._frontend.config.apply_topk_in_fc1 = apply_topk_in_fc1
-    options = {"apply_topk_in_fc1": apply_topk_in_fc1}
+    raw._frontend.config.apply_routing_weights_before_fc2 = (
+        apply_routing_weights_before_fc2
+    )
+    options = {"apply_routing_weights_before_fc2": apply_routing_weights_before_fc2}
     allocate = mock.Mock(return_value=raw)
     if backend == "nvfp4":
         config_cls = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
         monkeypatch.setattr(cutedsl_megamoe, "get_symm_buffer_for_mega_moe", allocate)
-        raw._frontend.deferred_topk_reduce_workspace.return_value = (
+        raw._frontend.custom_finalize_workspace.return_value = (
             partials,
             partials,
             None,
@@ -468,7 +470,11 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         launch = mock.Mock()
     elif backend == "bf16":
         config_cls = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
-        options = {"knobs": {"apply_topk_in_fc1": apply_topk_in_fc1}}
+        options = {
+            "knobs": {
+                "apply_routing_weights_before_fc2": apply_routing_weights_before_fc2
+            }
+        }
         monkeypatch.setattr(
             cutedsl_megamoe, "get_symm_buffer_for_bf16_mega_moe", allocate
         )
@@ -497,7 +503,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     workspace = kernel._allocate_workspace(FleetParams(2, capacity, hidden))
     assert workspace is raw
     if backend != "bf16":
-        assert allocate.call_args.kwargs["defer_topk_reduce"]
+        assert allocate.call_args.kwargs["use_custom_finalize"]
     assert kernel.supports_unfinalized_output
     with pytest.raises(ValueError, match="requires compute_unfinalized"):
         kernel.compute(workspace, (), output=None)
@@ -535,7 +541,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         assert indices.flatten().tolist() == list(range(live_tokens * top_k))
         expected_weights = (
             torch.full((live_tokens, top_k), 1.0)
-            if apply_topk_in_fc1
+            if apply_routing_weights_before_fc2
             else raw.topk_weights[:live_tokens]
         )
         torch.testing.assert_close(weights, expected_weights)
@@ -932,7 +938,7 @@ def test_nvfp4_recompiled_workspace_releases_obsolete_launch_scratch(monkeypatch
     def workspace(value):
         frontend = SimpleNamespace(
             _mega=session(value),
-            config=SimpleNamespace(defer_topk_reduce=False),
+            config=SimpleNamespace(use_custom_finalize=False),
             set_swiglu_params=lambda *args: None,
         )
         raw = SimpleNamespace(_frontend=frontend, output_activation=torch.empty(1, 128))

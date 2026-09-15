@@ -172,9 +172,9 @@ class MoEEpMegaLayer(nn.Module):
     def _preprocess_weights(self) -> None:
         if self._transformed is not None:
             return
-        assert self._weights is not None, (
-            "source weight pack was released but no transformed weights exist"
-        )
+        assert (
+            self._weights is not None
+        ), "source weight pack was released but no transformed weights exist"
         self._transformed = self._kernel.preprocess_weights(
             self._weights, self._fleet_params
         )
@@ -729,7 +729,8 @@ class MoEEpMegaLayer(nn.Module):
         Requires ``do_finalize=False``. Results are contiguous BF16
         ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
         ``[T, top_k]`` identity map whose entries index the first result.
-        Weights are one when ``apply_topk_in_fc1=True`` already applied routing.
+        Weights are one when ``apply_routing_weights_before_fc2=True`` already
+        applied routing.
         These tensors match the unfinalized TRTLLM MoE output layout.
 
         All results borrow pooled workspace storage: consume them on the current

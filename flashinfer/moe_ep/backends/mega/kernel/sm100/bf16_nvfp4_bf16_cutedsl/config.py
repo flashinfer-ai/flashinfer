@@ -15,13 +15,14 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     """BF16 activations and NVFP4 expert weights with online dequantization.
 
     Input, FC1 activation handoff, dispatch/combine and output remain BF16.
-    Routing scores are applied after FC2 by default. ``apply_topk_in_fc1``
-    instead multiplies the completed FP32 SwiGLU activation before its BF16
-    handoff, changing the rounding contract. ``MoEWeightPack`` supplies packed
-    weight data and E4M3 block scales; ``fc1_alpha`` and ``fc2_alpha`` supply
-    optional per-expert FP32 epilogue scales (default one). ``fc1_norm_const``
-    scales the completed activation, after optional routing weights and before
-    the BF16 FC1 handoff; it does not implicitly compensate ``fc2_alpha``.
+    Routing scores are applied after FC2 by default.
+    ``apply_routing_weights_before_fc2`` instead multiplies the completed FP32
+    SwiGLU activation before its BF16 handoff, changing the rounding contract.
+    ``MoEWeightPack`` supplies packed weight data and E4M3 block scales;
+    ``fc1_alpha`` and ``fc2_alpha`` supply optional per-expert FP32 epilogue
+    scales (default one). ``fc1_norm_const`` scales the completed activation,
+    after optional routing weights and before the BF16 FC1 handoff; it does not
+    implicitly compensate ``fc2_alpha``.
     MiniMax uses ``swiglu_alpha=1.702, swiglu_beta=1.0``. ``activation="situ"``
     selects ``beta * tanh(gate / beta) * sigmoid(gate)`` on the gate branch,
     with optional ``situ_linear_beta * tanh(up / situ_linear_beta)`` on up.
@@ -42,7 +43,7 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # both. "auto" tunes collectively on the first forward, before capture.
     knobs: dict | Literal["auto"] | None = None
 
-    apply_topk_in_fc1: bool = False
+    apply_routing_weights_before_fc2: bool = False
     # Append new fields to preserve existing positional construction.
     fc1_norm_const: torch.Tensor | None = None
     swiglu_alpha: float | None = None

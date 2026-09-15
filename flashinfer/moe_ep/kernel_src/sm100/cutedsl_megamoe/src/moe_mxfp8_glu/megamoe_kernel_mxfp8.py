@@ -46,6 +46,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64, Int32
 
@@ -57,6 +58,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 
 from moe_mxfp8_glu.kernel_mxfp8_glu_fc12 import Sm100SwigluMxfp8Fc12Kernel
+from moe_mxfp8_glu.mxfp8_col_requant import Mxfp8ColRequant
 from moe_nvfp4_swapab.moe_utils import spin_wait
 from moe_nvfp4_swapab.topk_reduce import TopkReduce
 from src.token_comm import (
@@ -112,16 +114,19 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         max_tokens_per_rank: int,
         hidden: int,
         fc2_in_kernel_topk_reduce: bool = False,
+        skip_topk_reduce: bool = False,
         token_back_mode: Literal[
             "epi_warps", "standalone_warps", "reuse_dispatch_warps"
         ] = "epi_warps",
-        epi_flag_batch: Tuple[int, int] = (1, 1),
+        epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
         gate_up_clamp: Optional[float] = None,
-        apply_topk_in_fc1: bool = True,
         generate_c: bool = False,
         use_stg_fc1: bool = False,
         combine_format: Optional[CombineFormat] = None,
+        col_quant_num_ctas: int = 2368,
+        act_func: str = "swiglu",
+        topk_reduce_persistent: bool = False,
     ) -> None:
         if static_expert_shape is None:
             raise NotImplementedError(
@@ -146,16 +151,15 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                 "fc2_in_kernel_topk_reduce requires a non-quantized (bf16) combine "
                 "format; quantized combine_format is incompatible."
             )
-        if fc2_in_kernel_topk_reduce and not apply_topk_in_fc1:
+        if skip_topk_reduce and (
+            fc2_in_kernel_topk_reduce or combine_format.is_quantized
+        ):
             raise ValueError(
-                "fc2_in_kernel_topk_reduce requires apply_topk_in_fc1=True; "
-                "the in-kernel REDG collapses the topk axis on the fly, so the "
-                "routing weight must already be folded into fc1."
+                "skip_topk_reduce requires fc2_in_kernel_topk_reduce=False "
+                "and a bf16 combine format."
             )
         if token_back_mode not in (
-            "epi_warps",
-            "standalone_warps",
-            "reuse_dispatch_warps",
+            "epi_warps", "standalone_warps", "reuse_dispatch_warps",
         ):
             raise ValueError(f"unsupported token_back_mode={token_back_mode!r}.")
 
@@ -179,9 +183,10 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             token_back_by_dispatch=token_back_by_dispatch,
             epi_flag_batch=epi_flag_batch,
             gate_up_clamp=gate_up_clamp,
-            apply_topk_in_fc1=apply_topk_in_fc1,
+            apply_topk_in_fc1=True,
             generate_c=generate_c,
             use_stg_fc1=use_stg_fc1,
+            act_func=act_func,
         )
 
         self.enable_token_comm = True
@@ -190,14 +195,11 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         # results back to source ranks concurrently with dispatch_pull.
         self.token_back_mode = token_back_mode
         self.token_back_standalone = (
-            token_back_by_dispatch and token_back_mode == "standalone_warps"
+            token_back_by_dispatch
+            and token_back_mode == "standalone_warps"
         )
-        self.token_back_warp_id = (
-            (12, 13, 14, 15) if self.token_back_standalone else None
-        )
-        num_token_back_warps = (
-            len(self.token_back_warp_id) if self.token_back_standalone else 0
-        )
+        self.token_back_warp_id = (12, 13, 14, 15) if self.token_back_standalone else None
+        num_token_back_warps = len(self.token_back_warp_id) if self.token_back_standalone else 0
         self.combine_format = combine_format
         # Per-(token, topk) SF block padded to a 16 B multiple so the token-back
         # cp.async.bulk push moves one aligned block per shot.  None for bf16.
@@ -235,6 +237,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden = hidden
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
+        self.skip_topk_reduce = skip_topk_reduce
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
@@ -247,8 +250,8 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         # to this ceiling with zero-filled bytes.
         sf_atom_k_elements = 4 * self.sf_vec_size
         self.sf_uint32_per_token = (
-            self.hidden + sf_atom_k_elements - 1
-        ) // sf_atom_k_elements
+            (self.hidden + sf_atom_k_elements - 1) // sf_atom_k_elements
+        )
         # Cross-rank totals: per-rank count * world_size.
         self.num_total_experts = world_size * self.num_experts_per_rank
 
@@ -266,6 +269,24 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             self.pool_sf_capacity,
             self.pool_task_tile_capacity,
         ) = self._pool_shapes()
+        col_quant_type = (
+            "mxfp8_e4m3"
+            if ab_dtype is cutlass.Float8E4M3FN
+            else "mxfp8_e5m2"
+        )
+        self.col_quant = Mxfp8ColRequant(
+            hidden=self.hidden,
+            num_experts=self.num_experts_per_rank,
+            max_total_tokens=(
+                self.world_size
+                * self.max_tokens_per_rank
+                * min(self.num_topk, self.num_experts_per_rank)
+            ),
+            quant_type=col_quant_type,
+            num_persistent_ctas=col_quant_num_ctas,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=self.sf_padding_block,
+        )
 
         # Cohabiting warps outside the dispatch group: epilogue + mma + tma_a
         # + tma_b + sched.
@@ -273,10 +294,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
 
         # For token_back_by_dispatch, the dispatch warp pushes fc2 results
         # from the local pool workspace back to each source rank's combine_output.
-        # fc2_publishes_per_token_cluster_tile = ceil(hidden / mma_tiler_m) * cluster_m:
-        # for each cluster token tile, each of cluster_m CTAs publishes once per
-        # hidden N-tile it processes (N-tile width = mma_tiler[1]).
-        if token_back_by_dispatch:
+        if token_back_by_dispatch or combine_format.is_quantized:
             _ctt_n = self.mma_tiler_mnk[1]
             fc2_publishes = (
                 (self.hidden + _ctt_n - 1) // _ctt_n
@@ -305,6 +323,17 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             is_swap_ab=False,
             flag_batch=flag_batch,
             token_back_schedule_mode=self.token_back_schedule_mode,
+        )
+
+        self.topk_reduce_persistent = bool(
+            topk_reduce_persistent
+            and not self.fc2_in_kernel_topk_reduce
+            and not self.skip_topk_reduce
+        )
+        self.topk_reduce_num_sms = (
+            cutlass_utils.HardwareInfo().get_device_multiprocessor_count()
+            if self.topk_reduce_persistent
+            else 0
         )
 
         # Region layout (same call drives both get_workspace_sizes() and the
@@ -355,8 +384,11 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             + _round_up(pull_buffer_bytes, 128)
         )
         if self.token_back_standalone:
-            total += _round_up(_DispatchWarpCount * 8, 16) + _round_up(
-                _DispatchWarpCount * self.token_comm.tb_chunk_bytes, 128
+            total += (
+                _round_up(_DispatchWarpCount * 8, 16)
+                + _round_up(
+                    _DispatchWarpCount * self.token_comm.tb_chunk_bytes, 128
+                )
             )
         return total
 
@@ -379,17 +411,19 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
 
         max_recv = world_size * max_tokens_per_rank
         max_per_token = min(num_topk, num_experts_per_rank)
-        raw = max_recv * max_per_token + num_experts_per_rank * (
-            token_padding_block - 1
+        raw = (
+            max_recv * max_per_token
+            + num_experts_per_rank * (token_padding_block - 1)
         )
         pool_token_capacity = _round_up(raw, token_padding_block)
         pool_sf_capacity = (
-            pool_token_capacity // token_padding_block
-        ) * sf_padding_block
+            (pool_token_capacity // token_padding_block) * sf_padding_block
+        )
         cluster_m = self.cluster_shape_mn[0]
         pool_task_tile_capacity = (
-            pool_token_capacity + cluster_tile_tokens - 1
-        ) // cluster_tile_tokens + num_experts_per_rank
+            (pool_token_capacity + cluster_tile_tokens - 1) // cluster_tile_tokens
+            + num_experts_per_rank
+        )
         return (
             pool_token_capacity,
             pool_sf_capacity,
@@ -416,10 +450,13 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         sf_total_rows_upper = (
             pool_token_capacity + num_experts_per_rank * sf_padding_block
         )
-        sf_block_cols = (((intermediate_downproj // sf_vec_size) + 3) // 4) * 4
+        sf_block_cols = (
+            (((intermediate_downproj // sf_vec_size) + 3) // 4) * 4
+        )
         fc1_done_slots = (
-            pool_token_capacity + mma_tiler_m - 1
-        ) // mma_tiler_m + num_experts_per_rank
+            (pool_token_capacity + mma_tiler_m - 1) // mma_tiler_m
+            + num_experts_per_rank
+        )
 
         # Accumulating-counter prefix: tail_reset_counters bulk-zeros all bytes
         # before l1_token_buffer so back-to-back launches do not inherit counters.
@@ -471,6 +508,15 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             specs.append(
                 _RegionSpec(
                     "load_balance_counter",
+                    cutlass.Int32,
+                    (1,),
+                    16,
+                )
+            )
+        if self.topk_reduce_persistent:
+            specs.append(
+                _RegionSpec(
+                    "topk_reduce_counters",
                     cutlass.Int32,
                     (1,),
                     16,
@@ -553,6 +599,18 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                 )
             )
 
+        # Snapshot of expert_recv_count_sum.low32 for the post-Mega col-quant
+        # launch. This region is after l1_token_buffer, so the generic local
+        # zero-prefix cleanup does not clear it; every launch overwrites it.
+        specs.append(
+            _RegionSpec(
+                "col_quant_expert_token_sizes",
+                cutlass.Int32,
+                (num_experts_per_rank,),
+                16,
+            )
+        )
+
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -630,6 +688,23 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
     def get_workspace_sizes(self) -> Tuple[int, int]:
         """Return ``(local_ws_bytes, shared_ws_bytes)``."""
         return self._local_total, self._shared_total
+
+    def topk_reduce_input_region(self) -> Dict[str, Any]:
+        """Describe the borrowed BF16 ``combine_quant`` staging region."""
+        if not self.skip_topk_reduce:
+            raise RuntimeError("skip_topk_reduce mode is not enabled")
+        spec = self._shared_region_by_name["combine_quant"]
+        if spec.cute_dtype is not cutlass.BFloat16:
+            raise RuntimeError("skip_topk_reduce staging must be BF16")
+        return {
+            "name": spec.name,
+            "byte_offset": self._shared_offsets[spec.name],
+            "nbytes": spec.nbytes,
+            "shape": spec.shape,
+            "stride": spec.stride_row_major,
+            "dtype": "bfloat16",
+            "alignment": spec.align,
+        }
 
     # =========================================================================
     # Workspace partition helpers (mirror the NVFP4 mega kernel)
@@ -713,12 +788,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
                 out.reverse()
                 st = tuple(out)
         return self._make_typed_view(
-            byte_workspace,
-            offsets[spec.name],
-            dt,
-            sh,
-            st,
-            spec.align,
+            byte_workspace, offsets[spec.name], dt, sh, st, spec.align,
         )
 
     # =========================================================================
@@ -729,26 +799,30 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
     def __call__(
         self,
         # User-domain inputs (peer-mapped on the symmetric heap).
-        activation: cute.Tensor,  # (T, hidden) fp8
-        activation_sf: cute.Tensor,  # (T, round_up(hidden, sf_atom_block_k)) E8M0
-        topk_idx: cute.Tensor,  # (T, num_topk) Int64
-        topk_weights: cute.Tensor,  # (T, num_topk) Float32
+        activation: cute.Tensor,           # (T, hidden) fp8
+        activation_sf: cute.Tensor,        # (T, round_up(hidden, sf_atom_block_k)) E8M0
+        topk_idx: cute.Tensor,             # (T, num_topk) Int64
+        topk_weights: cute.Tensor,         # (T, num_topk) Float32
         # Per-rank model weights (local-only; not in workspace).
         fc1_weight: cute.Tensor,
         fc1_weight_sf: cute.Tensor,
         fc2_weight: cute.Tensor,
         fc2_weight_sf: cute.Tensor,
-        fc1_c: Optional[cute.Tensor],  # fc1 c output
+        fc1_c: Optional[cute.Tensor],      # fc1 c output
         # Final combined output the caller consumes: 2D (T, hidden) BF16.
-        output_activation: cute.Tensor,  # (T, hidden) BF16
+        output_activation: cute.Tensor,    # (T, hidden) BF16
+        # Dispatch-local activation requantized along the token dimension.
+        col_quant_data: cute.Tensor,       # flat token-stride-1 fp8 segments
+        col_quant_sf: cute.Tensor,         # flat concat_e [hidden_atom][token_atom] E8M0 bytes
         # Opaque workspaces.
-        local_workspace: cute.Tensor,  # (local_ws_bytes,) Uint8
-        shared_workspace: cute.Tensor,  # (shared_ws_bytes,) Uint8
+        local_workspace: cute.Tensor,      # (local_ws_bytes,) Uint8
+        shared_workspace: cute.Tensor,     # (shared_ws_bytes,) Uint8
         # Runtime host payload; packed into ``SymBuffer{world_size}``.
         peer_rank_ptr_mapper_host,
         # Codegen / runtime.
         max_active_clusters: cutlass.Constexpr,
         stream,
+        num_valid_tokens: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch the MXFP8 MegaMoE-complete fused kernel.
 
@@ -798,6 +872,9 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         # view (base.activation_sf re-views via tile_atom_to_shape_SF off the
         # iterator, so the stride here is informational only).
         l1_sf_buffer_i32 = self._view_local(local_workspace, "l1_sf_buffer")
+        l1_sf_buffer_u8 = cute.flatten(
+            cute.recast_tensor(l1_sf_buffer_i32, cutlass.Uint8)
+        )
         l1_sf_buffer_e8m0 = self._make_typed_view(
             local_workspace,
             self._local_offsets["l1_sf_buffer"],
@@ -808,38 +885,36 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         )
 
         l1_topk_weights_buffer = self._view_local(
-            local_workspace,
-            "l1_topk_weights_buffer",
+            local_workspace, "l1_topk_weights_buffer",
         )
         l1_arrival_count = self._view_local(local_workspace, "l1_arrival_count")
         # token_src_metadata storage = (pool_token_capacity, TokenSrcMetadata.nbytes) Uint8;
         # dispatch_pull writes one packed Int64 per pool token row (see TokenSrcMetadata).
         token_src_metadata = self._view_local(
-            local_workspace,
-            "token_src_metadata",
+            local_workspace, "token_src_metadata",
         )
         expert_send_count = self._view_local(local_workspace, "expert_send_count")
         grid_sync_counter = self._view_local(local_workspace, "grid_sync_counter")
         nvlink_barrier_counter = self._view_local(
-            local_workspace,
-            "nvlink_barrier_counter",
+            local_workspace, "nvlink_barrier_counter",
         )
         fc1_output = self._view_local(local_workspace, "fc1_output")
         fc1_output_sf = self._view_local(local_workspace, "fc1_output_sf")
         fc1_done_counter = self._view_local(local_workspace, "fc1_done_counter")
+        col_quant_expert_token_sizes = self._view_local(
+            local_workspace, "col_quant_expert_token_sizes",
+        )
 
         load_balance_counter: Optional[cute.Tensor] = None
         if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
             load_balance_counter = self._view_local(
-                local_workspace,
-                "load_balance_counter",
+                local_workspace, "load_balance_counter",
             )
 
         token_back_schedule_counter = None
         if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
             token_back_schedule_counter = self._view_local(
-                local_workspace,
-                "token_back_schedule_counter",
+                local_workspace, "token_back_schedule_counter",
             ).iterator
 
         # MoE-domain (token, topk, hidden) combine data plane.
@@ -864,8 +939,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             act_dtype = self.combine_format.act_dtype
             act_bytes = int(act_dtype.width) // 8
             fc2_output_workspace_native = self._view_local(
-                local_workspace,
-                "fc2_output_workspace",
+                local_workspace, "fc2_output_workspace",
             )
             fc2_output_workspace_u8 = self._make_typed_view(
                 local_workspace,
@@ -880,7 +954,7 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         else:
             fc2_output_workspace_native = None
             fc2_output_workspace_u8 = None
-            combine_output_u8 = cute.recast_tensor(combine_target, cutlass.Uint8)
+            combine_output_u8 = combine_target
             fc2_output_target = combine_target
 
         if cutlass.const_expr(self.token_back_enabled):
@@ -892,13 +966,11 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         # of fc2_output_sf and (max_tokens, num_topk, valid_blocks) of combine_sf.
         sf_blocks = (
             hidden // self.combine_format.scale_block
-            if self.combine_format.is_quantized
-            else 0
+            if self.combine_format.is_quantized else 0
         )
         if cutlass.const_expr(self.combine_format.is_quantized):
             fc2_output_sf_phys = self._view_local(
-                local_workspace,
-                "fc2_output_sf",
+                local_workspace, "fc2_output_sf",
                 shape=(pool_token_capacity, 1, sf_blocks),
                 stride=(self.sf_block_pad, self.sf_block_pad, 1),
             )
@@ -907,21 +979,12 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             fc2_output_sf = cute.make_tensor(
                 fc2_output_sf_phys.iterator,
                 cute.make_layout(
-                    (
-                        sf_layout.shape[0],
-                        sf_layout.shape[1],
-                        (sf_vec, sf_layout.shape[2]),
-                    ),
-                    stride=(
-                        sf_layout.stride[0],
-                        sf_layout.stride[1],
-                        (0, sf_layout.stride[2]),
-                    ),
+                    (sf_layout.shape[0], sf_layout.shape[1], (sf_vec, sf_layout.shape[2])),
+                    stride=(sf_layout.stride[0], sf_layout.stride[1], (0, sf_layout.stride[2])),
                 ),
             )
             combine_sf = self._view_shared(
-                shared_workspace,
-                "combine_sf",
+                shared_workspace, "combine_sf",
                 shape=(self.max_tokens_per_rank, self.num_topk, sf_blocks),
                 stride=(self.num_topk * self.sf_block_pad, self.sf_block_pad, 1),
             )
@@ -931,17 +994,14 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
 
         # Shared regions.
         src_token_topk_idx = self._view_shared(
-            shared_workspace,
-            "src_token_topk_idx",
+            shared_workspace, "src_token_topk_idx",
         )
         expert_recv_count = self._view_shared(shared_workspace, "expert_recv_count")
         expert_recv_count_sum = self._view_shared(
-            shared_workspace,
-            "expert_recv_count_sum",
+            shared_workspace, "expert_recv_count_sum",
         )
         nvlink_barrier_signal = self._view_shared(
-            shared_workspace,
-            "nvlink_barrier_signal",
+            shared_workspace, "nvlink_barrier_signal",
         )
 
         # i32 stride=(2,) view onto the i64 ``expert_recv_count_sum`` buffer --
@@ -955,20 +1015,10 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
             stride=(2,),
         )
         local_zero_prefix = self._make_typed_view(
-            local_workspace,
-            0,
-            cutlass.Int32,
-            (self.local_zero_i32_count,),
-            (1,),
-            16,
+            local_workspace, 0, cutlass.Int32, (self.local_zero_i32_count,), (1,), 16,
         )
         shared_zero_prefix = self._make_typed_view(
-            shared_workspace,
-            0,
-            cutlass.Int32,
-            (self.shared_zero_i32_count,),
-            (1,),
-            16,
+            shared_workspace, 0, cutlass.Int32, (self.shared_zero_i32_count,), (1,), 16,
         )
 
         token_comm_args = ExtractedTokenCommArgs(
@@ -1036,25 +1086,62 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         # reduces over the topk axis).  Same stream, so it is ordered strictly
         # after the cross-rank combine writes landed (the mega kernel's nvlink
         # barrier guarantees all peer combine STGs to this rank completed before it
-        # exits, so combine_quant and combine_sf are fully populated).  Weighting
-        # follows the compute graph: apply_topk_in_fc1 folded the routing weight
-        # into fc1 -> plain K-sum; otherwise topk_weights is applied here.
-        if cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
-            score = (
-                topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
-            )
-            TopkReduce(
+        # exits, so combine_quant and combine_sf are fully populated). The
+        # routing weight is always folded into FC1, so this is a plain K-sum.
+        if cutlass.const_expr(
+            not self.fc2_in_kernel_topk_reduce and not self.skip_topk_reduce
+        ):
+            if cutlass.const_expr(
+                num_valid_tokens is not None and not self.topk_reduce_persistent
+            ):
+                raise ValueError(
+                    "num_valid_tokens requires topk_reduce_persistent=True."
+                )
+            if cutlass.const_expr(
+                num_valid_tokens is None and self.topk_reduce_persistent
+            ):
+                raise ValueError(
+                    "topk_reduce_persistent=True requires num_valid_tokens."
+                )
+            reduce = TopkReduce(
                 self.hidden,
                 self.num_topk,
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
-            )(
-                combine_target,
-                combine_sf,
-                output_activation,
-                score,
-                stream,
+                persistent=self.topk_reduce_persistent,
+                num_sms=self.topk_reduce_num_sms,
             )
+            if cutlass.const_expr(self.topk_reduce_persistent):
+                reduce(
+                    combine_target,
+                    combine_sf,
+                    output_activation,
+                    None,
+                    stream,
+                    self._view_local(local_workspace, "topk_reduce_counters"),
+                    num_tokens_dev=num_valid_tokens,
+                )
+            else:
+                reduce(
+                    combine_target,
+                    combine_sf,
+                    output_activation,
+                    None,
+                    stream,
+                )
+
+        # The fused Mega kernel and optional TopkReduce are complete on this
+        # stream. Requantize the preserved dispatch-local row-MXFP8 pool into
+        # token-axis MXFP8, using the same expert sizes consumed by the MoE
+        # scheduler to derive all padded offsets.
+        self.col_quant(
+            l1_token_buffer_fp8,
+            l1_sf_buffer_u8,
+            col_quant_expert_token_sizes,
+            col_quant_data,
+            col_quant_sf,
+            stream,
+        )
 
     # =========================================================================
     # TokenComm delegation surface consumed by the fc1/fc2 base kernel
@@ -1072,13 +1159,10 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
 
     @cute.jit
     def token_comm_hook_fc1_tma_b_predispatch_spin(
-        self,
-        token_comm_args,
-        work_tile_info,
+        self, token_comm_args, work_tile_info,
     ):
         self.token_comm.fc1_tma_b_predispatch_spin(
-            token_comm_args,
-            work_tile_info,
+            token_comm_args, work_tile_info,
         )
 
     @cute.jit
@@ -1142,6 +1226,23 @@ class Sm100MegaMoEMxfp8Kernel(Sm100SwigluMxfp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
+        # Preserve the dispatch-produced per-expert token sizes before the
+        # generic tail restores expert_recv_count_sum to zero between its
+        # NVLink barriers. CTA 0 performs a coalesced copy into a persistent
+        # local-workspace region; the tail's first CTA barrier keeps the shared
+        # reset from racing this snapshot.
+        cta_linear_id = self.token_comm._cta_linear_id()
+        if cta_linear_id == Int32(0):
+            snapshot_addr = token_comm_args.local_zero_prefix.iterator.toint() + Int64(self._local_offsets["col_quant_expert_token_sizes"])
+            snapshot_ptr = cute.make_ptr(cutlass.Int32, snapshot_addr, AddressSpace.gmem, assumed_align=16)
+            snapshot = cute.make_tensor(snapshot_ptr, cute.make_layout((self.num_experts_per_rank,)))
+            block_dim_x, _, _ = cute.arch.block_dim()
+            expert_idx = tidx
+            while expert_idx < Int32(self.num_experts_per_rank):
+                packed_count = Int64(token_comm_args.expert_recv_count_sum[expert_idx])
+                snapshot[expert_idx] = Int32(packed_count & Int64(0xFFFFFFFF))
+                expert_idx = expert_idx + block_dim_x
+
         self.token_comm.kernel_tail(
             token_comm_args,
             warp_idx=warp_idx,

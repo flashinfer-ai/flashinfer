@@ -136,8 +136,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             max_tokens=fleet_params.max_tokens_per_rank,
             combine_dtype=k.combine_dtype,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
-            defer_topk_reduce=not k.do_finalize
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=not k.do_finalize
             or self._uses_native_topk_reduce(fleet_params),
         )
 
@@ -161,10 +161,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            defer_topk_reduce=(
+            use_custom_finalize=(
                 not k.do_finalize or self._uses_native_topk_reduce(fleet_params)
+            ),
+            use_persistent_finalize_kernel=(
+                k.use_persistent_finalize_kernel and k.do_finalize
             ),
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
@@ -180,7 +183,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             ).view(fp.max_tokens_per_rank, k.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if k.apply_topk_in_fc1
+                if k.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
         return workspace
@@ -200,8 +203,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
             and not k.enable_in_kernel_fc2_reduce
+            and not k.use_persistent_finalize_kernel
             and k.combine_dtype == "bf16"
-            and k.apply_topk_in_fc1
+            and k.apply_routing_weights_before_fc2
         )
 
     def validate_forward(
@@ -306,7 +310,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "MegaMoE workspace is not warmed for CUDA graph capture; "
                 "call layer.warmup(..., workspace=workspace) first"
             )
-        if frontend.config.defer_topk_reduce and not self.supports_unfinalized_output:
+        if frontend.config.use_custom_finalize and not self.supports_unfinalized_output:
             from flashinfer.jit.cake_megamoe_topk_reduce import (
                 is_cake_megamoe_topk_reduce_module_loaded,
             )
@@ -340,6 +344,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
+            num_valid_tokens=workspace.num_valid_tokens,
         )
 
     def _prepared_thunk_state(
@@ -444,9 +449,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         state = self._prepared_thunk_state(workspace, transformed_weights)
         key, thunk, out_buf = state
         reducer_state = None
-        if workspace._frontend.config.defer_topk_reduce:
+        if workspace._frontend.config.use_custom_finalize:
             partials, workspace_root, _region = (
-                workspace._frontend.deferred_topk_reduce_workspace()
+                workspace._frontend.custom_finalize_workspace()
             )
             # Resolve/load the native module and borrowed view before the
             # upstream launch.  The terminal interval below must contain only
@@ -462,6 +467,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace_root,
                 key[3],
             )
+        if workspace._frontend.config.use_persistent_finalize_kernel:
+            workspace.num_valid_tokens.fill_(num_tokens)
         thunk()
         if reducer_state is not None:
             reducer, partials, workspace_root, stream = reducer_state
@@ -488,7 +495,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
         _, thunk, _ = self._prepared_thunk_state(workspace, transformed_weights)
         partials, _workspace_root, _region = (
-            workspace._frontend.deferred_topk_reduce_workspace()
+            workspace._frontend.custom_finalize_workspace()
         )
         top_k, hidden = partials.shape[1:]
         gemm2_permuted = partials[:num_tokens].view(num_tokens * top_k, hidden)
@@ -526,7 +533,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.activation,
             k.situ_beta,
             k.situ_linear_beta,
-            k.apply_topk_in_fc1,
+            k.apply_routing_weights_before_fc2,
             k.enable_in_kernel_fc2_reduce,
             k.do_finalize,
             self._uses_native_topk_reduce(fleet_params),

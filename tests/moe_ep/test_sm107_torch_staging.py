@@ -72,7 +72,7 @@ def test_sampled_oracle_matches_full_raw_scale_oracle(kind):
         quant_kind=kind,
         local_expert_offset=0,
         gate_up_clamp=None,
-        apply_topk_at_fc1=True,
+        apply_routing_weights_before_fc2=True,
     )
     torch.testing.assert_close(expected, full[indices], rtol=0.01, atol=0.001)
 

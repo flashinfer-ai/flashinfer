@@ -76,7 +76,7 @@ def sampled_reference(
             combine_dtype=cfg.combine_dtype,
             local_expert_offset=cfg.rank * cfg.experts_per_rank,
             gate_up_clamp=cfg.gate_up_clamp,
-            apply_topk_at_fc1=cfg.apply_topk_at_fc1,
+            apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
             weight_scales_are_swizzled=True,
             return_fp32=True,
             situ_beta=cfg.situ_beta,

@@ -142,7 +142,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             # Default BF16 folds routing into FC1; respect pinned frontend knobs.
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if workspace._frontend.config.apply_topk_in_fc1
+                if workspace._frontend.config.apply_routing_weights_before_fc2
                 else workspace.topk_weights
             )
         return workspace
