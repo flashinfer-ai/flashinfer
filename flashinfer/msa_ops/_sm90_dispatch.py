@@ -93,8 +93,15 @@ def topk_select_sm90(
     from .cute_dsl.topk_select_sm90 import run as _topk
 
     # The kernel emits (Hq, total_q, topk); this op returns (total_q, Hq, topk).
-    # With the MQA indexer Hq is 1, so the permuted copy is a contiguous reshape.
+    # Permuting the caller's buffer gives the kernel's view for free whenever that
+    # view is contiguous -- always so for the MQA indexer (Hq == 1), which is the
+    # MiniMax-M3 path. Staging through a temporary instead costs an allocation and
+    # a copy launch, ~12us against a ~7us kernel, so only pay it when forced.
     hq, _, total_q = max_score.shape
+    view = output.permute(1, 0, 2)
+    if view.is_contiguous():
+        _topk(max_score, None, None, view)
+        return output
     tmp = torch.empty((hq, total_q, topk), dtype=torch.int32, device=max_score.device)
     _topk(max_score, None, None, tmp)
     output.copy_(tmp.permute(1, 0, 2))
