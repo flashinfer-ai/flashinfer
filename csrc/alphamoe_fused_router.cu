@@ -79,10 +79,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define LOOM_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define SMEM_SCAN_VALUES_OFF 0
-#define SMEM_SCAN_VALUES_STAGE_BYTES 4096
-#define SMEM_SCAN_VALUES_STRIDE 4096
-#define SMEM_TOTAL 4096
+#define SMEM_LOCAL_OFFSETS_OFF 0
+#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
+#define SMEM_LOCAL_OFFSETS_STRIDE 4100
+#define SMEM_SCAN_VALUES_OFF 4100
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
+#define SMEM_TOTAL 4224
 #define THREADS 256
 #define NUM_WARPS 8
 #define MAX_EXPERTS 512
@@ -129,11 +132,17 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
     const int num_bids = gridDim.x;
 
     // Kernel setup ops
-    int* scan_values = reinterpret_cast<int*>(smem_raw + 0);
-    const int scan_values_addr = smem + 0;
+    int* local_offsets = reinterpret_cast<int*>(smem_raw + 0);
+    const int local_offsets_addr = smem + 0;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 4100);
+    const int scan_values_addr = smem + 4100;
 
     // === Task calls (dependency order) ===
     int global_thread = bid * THREADS + tid;
+    int use_cta_reservations = 0;
+    if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0 && M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+        use_cta_reservations = 1;
+    }
     if (bid == 0) {
         #pragma unroll
         for (int expert_slot_zero = 0; expert_slot_zero < MAX_EXPERTS / THREADS; expert_slot_zero++) {
@@ -149,19 +158,832 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
             num_tokens_post_padded[0] = 0;
         }
     }
-    __threadfence();
+    if (use_cta_reservations != 0) {
+        #pragma unroll
+        for (int expert_slot_local_zero = 0; expert_slot_local_zero < MAX_EXPERTS / THREADS; expert_slot_local_zero++) {
+            int expert_local_zero = tid + expert_slot_local_zero * THREADS;
+            local_offsets[expert_local_zero] = 0;
+        }
+    }
     cooperative_groups::this_grid().sync();
     int routed_experts = E - has_shared_expert;
     int routed_top_k = top_k - has_shared_expert;
     for (int token = (unsigned int)(bid * NUM_WARPS) + warp; token < M; token += num_bids * NUM_WARPS) {
         unsigned long long row_base = (unsigned long long)token * (unsigned long long)E;
         float row_values[MAX_EXPERTS / 32];
+        if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0) {
+            unsigned long long lane_row_base = row_base + (unsigned long long)lane;
+            #pragma unroll
+            for (int expert_slot_full = 0; expert_slot_full < MAX_EXPERTS / 32; expert_slot_full++) {
+                row_values[expert_slot_full] = logits[lane_row_base + (unsigned long long)(expert_slot_full * 32)];
+            }
+        } else {
+            #pragma unroll
+            for (int expert_slot_load = 0; expert_slot_load < MAX_EXPERTS / 32; expert_slot_load++) {
+                int expert_load = lane + (unsigned int)(expert_slot_load * 32);
+                row_values[expert_slot_load] = -LOOM_INF;
+                if (expert_load < routed_experts) {
+                    row_values[expert_slot_load] = logits[row_base + (unsigned long long)expert_load];
+                }
+            }
+        }
+        unsigned long long output_base = (unsigned long long)token * (unsigned long long)top_k;
+        float selected_logit = -LOOM_INF;
+        int selected_expert = MAX_EXPERTS;
+        #pragma unroll 1
+        for (int route = 0; route < routed_top_k; route++) {
+            float local_value = 0.0f;
+            {
+                float _fmax_0 = fmaxf(row_values[0], row_values[1]);
+                float _fmax_1 = fmaxf(_fmax_0, row_values[2]);
+                float local_max_t0 = _fmax_1;
+                float _fmax_2 = fmaxf(row_values[3], row_values[4]);
+                float _fmax_3 = fmaxf(_fmax_2, row_values[5]);
+                float local_max_t1 = _fmax_3;
+                float _fmax_4 = fmaxf(row_values[6], row_values[7]);
+                float _fmax_5 = fmaxf(_fmax_4, row_values[8]);
+                float local_max_t2 = _fmax_5;
+                float _fmax_6 = fmaxf(row_values[9], row_values[10]);
+                float _fmax_7 = fmaxf(_fmax_6, row_values[11]);
+                float local_max_t3 = _fmax_7;
+                float _fmax_8 = fmaxf(row_values[12], row_values[13]);
+                float _fmax_9 = fmaxf(_fmax_8, row_values[14]);
+                float local_max_t4 = _fmax_9;
+                float _fmax_10 = fmaxf(local_max_t0, local_max_t1);
+                float _fmax_11 = fmaxf(_fmax_10, local_max_t2);
+                float local_max_u = _fmax_11;
+                float _fmax_12 = fmaxf(local_max_t3, local_max_t4);
+                float _fmax_13 = fmaxf(_fmax_12, row_values[15]);
+                float local_max_v = _fmax_13;
+                float _fmax_14 = fmaxf(local_max_u, local_max_v);
+                float _fmax_15 = fmaxf(_fmax_14, -LOOM_INF);
+                local_value = _fmax_15;
+            }
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
+            unsigned int tied_index = MAX_EXPERTS;
+            int descending_tie_key = 0;
+            {
+                unsigned int bounded_tie_masks[4];
+                #pragma unroll
+                for (int bounded_mask_init = 0; bounded_mask_init < 4; bounded_mask_init++) {
+                    bounded_tie_masks[bounded_mask_init] = 0;
+                }
+                #pragma unroll
+                for (int bounded_mask_slot = 0; bounded_mask_slot < MAX_EXPERTS / 128; bounded_mask_slot++) {
+                    #pragma unroll
+                    for (int bounded_mask_group = 0; bounded_mask_group < 4; bounded_mask_group++) {
+                        if (row_values[bounded_mask_group * (MAX_EXPERTS / 128) + bounded_mask_slot] == best_value) {
+                            bounded_tie_masks[bounded_mask_group] = bounded_tie_masks[bounded_mask_group] | (unsigned int)(2147483648 >> bounded_mask_group * (MAX_EXPERTS / 128) + bounded_mask_slot);
+                        }
+                    }
+                }
+                unsigned int bounded_mask_low = bounded_tie_masks[0] | bounded_tie_masks[1];
+                unsigned int bounded_mask_high = bounded_tie_masks[2] | bounded_tie_masks[3];
+                unsigned int bounded_mask_all = bounded_mask_low | bounded_mask_high;
+                int _find_msb_0;
+                asm volatile("bfind.u32 %0, %1;" : "=r"(_find_msb_0) : "r"(bounded_mask_all));
+                int bounded_high_bit = _find_msb_0;
+                descending_tie_key = bounded_high_bit * 32 - (int)lane;
+            }
+            int best_index = 0;
+            {
+                int _warp_redux_i32_0;
+                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_i32_0) : "r"(descending_tie_key));
+                int best_tie_key = _warp_redux_i32_0;
+                best_index = 992 - best_tie_key;
+            }
+            {
+                best_index = ((best_index < routed_experts) ? best_index : MAX_EXPERTS);
+            }
+            if (lane == (unsigned int)route) {
+                selected_logit = best_value;
+                selected_expert = best_index;
+            }
+            #pragma unroll
+            for (int remove_group = 0; remove_group < MAX_EXPERTS / 256; remove_group++) {
+                if (best_index >= remove_group * 256 && best_index < (remove_group + 1) * 256) {
+                    if (best_index < remove_group * 256 + 128) {
+                        if (best_index < remove_group * 256 + 64) {
+                            if (best_index < remove_group * 256 + 32) {
+                                if (lane + (unsigned int)(remove_group * 8 * 32) == (unsigned int)best_index) {
+                                    row_values[remove_group * 8] = -LOOM_INF;
+                                }
+                            } else if (lane + (unsigned int)((remove_group * 8 + 1) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 1] = -LOOM_INF;
+                            }
+                        } else if (best_index < remove_group * 256 + 96) {
+                            if (lane + (unsigned int)((remove_group * 8 + 2) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 2] = -LOOM_INF;
+                            }
+                        } else {
+                            if (lane + (unsigned int)((remove_group * 8 + 3) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 3] = -LOOM_INF;
+                            }
+                        }
+                    } else if (best_index < remove_group * 256 + 192) {
+                        if (best_index < remove_group * 256 + 160) {
+                            if (lane + (unsigned int)((remove_group * 8 + 4) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 4] = -LOOM_INF;
+                            }
+                        } else if (lane + (unsigned int)((remove_group * 8 + 5) * 32) == (unsigned int)best_index) {
+                            row_values[remove_group * 8 + 5] = -LOOM_INF;
+                        }
+                    } else {
+                        if (best_index < remove_group * 256 + 224) {
+                            if (lane + (unsigned int)((remove_group * 8 + 6) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 6] = -LOOM_INF;
+                            }
+                        } else if (lane + (unsigned int)((remove_group * 8 + 7) * 32) == (unsigned int)best_index) {
+                            row_values[remove_group * 8 + 7] = -LOOM_INF;
+                        }
+                    }
+                }
+            }
+        }
+        if (has_shared_expert != 0) {
+            if (lane == (unsigned int)routed_top_k) {
+                selected_expert = E - 1;
+                selected_logit = logits[row_base + (unsigned long long)selected_expert];
+            }
+        }
+        int count_ordinal = 0;
+        if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+            if (lane < (unsigned int)top_k) {
+                if (use_cta_reservations != 0) {
+                    int _atomic_old_0 = atomicAdd(&local_offsets[selected_expert], 1);
+                    count_ordinal = _atomic_old_0;
+                } else {
+                    int _atomic_old_1 = atomicAdd(&expert_counts[selected_expert], 1);
+                    count_ordinal = _atomic_old_1;
+                }
+            }
+        }
+        int softmax_top_k = routed_top_k;
+        {
+            softmax_top_k = top_k;
+        }
+        float selected_for_max = -LOOM_INF;
+        if ((unsigned int)softmax_top_k > lane) {
+            selected_for_max = selected_logit;
+        }
+        float _warp_reduce_0 = selected_for_max;
         #pragma unroll
-        for (int expert_slot_load = 0; expert_slot_load < MAX_EXPERTS / 32; expert_slot_load++) {
-            int expert_load = lane + (unsigned int)(expert_slot_load * 32);
-            row_values[expert_slot_load] = -LOOM_INF;
-            if (expert_load < routed_experts) {
-                row_values[expert_slot_load] = logits[row_base + (unsigned long long)expert_load];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
+        float selected_exp = 0.0f;
+        if ((unsigned int)softmax_top_k > lane) {
+            float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
+            selected_exp = _exp2_0;
+        }
+        float _warp_reduce_1 = selected_exp;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
+        float _rcp_0 = approx_rcp(selected_sum);
+        float selected_sum_rcp = _rcp_0;
+        if (lane < (unsigned int)top_k) {
+            float weight = selected_logit;
+            if ((unsigned int)softmax_top_k > lane) {
+                weight = selected_exp * selected_sum_rcp;
+            }
+            topk_weights[output_base + (unsigned long long)lane] = weight;
+            int stored_expert = selected_expert;
+            if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                stored_expert = count_ordinal * MAX_EXPERTS + selected_expert;
+            } else {
+                atomicAdd(&expert_counts[selected_expert], 1);
+            }
+            topk_ids[output_base + (unsigned long long)lane] = stored_expert;
+        }
+    }
+    if (use_cta_reservations != 0) {
+        int first_rebase_token = (unsigned int)(bid * NUM_WARPS) + warp;
+        int first_stored_expert = 0;
+        if (first_rebase_token < M) {
+            if (lane < (unsigned int)top_k) {
+                unsigned long long first_rebase_pair = (unsigned long long)first_rebase_token * (unsigned long long)top_k + (unsigned long long)lane;
+                first_stored_expert = topk_ids[first_rebase_pair];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int expert_slot_reserve = 0; expert_slot_reserve < MAX_EXPERTS / THREADS; expert_slot_reserve++) {
+            int expert_reserve = tid + expert_slot_reserve * THREADS;
+            int count_reserve = local_offsets[expert_reserve];
+            if (count_reserve > 0) {
+                int _atomic_old_2 = atomicAdd(&expert_counts[expert_reserve], count_reserve);
+                int base_reserve = _atomic_old_2;
+                local_offsets[expert_reserve] = base_reserve;
+            }
+        }
+        __syncthreads();
+        for (int token_rebase = (unsigned int)(bid * NUM_WARPS) + warp; token_rebase < M; token_rebase += num_bids * NUM_WARPS) {
+            if (lane < (unsigned int)top_k) {
+                unsigned long long pair_rebase = (unsigned long long)token_rebase * (unsigned long long)top_k + (unsigned long long)lane;
+                int stored_rebase = first_stored_expert;
+                if (token_rebase != first_rebase_token) {
+                    stored_rebase = topk_ids[pair_rebase];
+                }
+                int expert_rebase = stored_rebase & MAX_EXPERTS - 1;
+                topk_ids[pair_rebase] = stored_rebase + local_offsets[expert_rebase] * MAX_EXPERTS;
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kThreads = THREADS;
+constexpr int kSmemTotal = SMEM_TOTAL;
+constexpr int kWarps = NUM_WARPS;
+static_assert(THREADS == NUM_WARPS * 32);
+static_assert(MAX_EXPERTS == 512);
+#undef LOOM_INF
+#undef MAX_BLOCK_M
+#undef MAX_EXPERTS
+#undef MAX_TOP_K
+#undef NUM_MAIN_STAGES
+#undef NUM_WARPS
+#undef PUBLIC_SHARED_SOFTMAX
+#undef SMEM_LOCAL_OFFSETS_OFF
+#undef SMEM_LOCAL_OFFSETS_STAGE_BYTES
+#undef SMEM_LOCAL_OFFSETS_STRIDE
+#undef SMEM_SCAN_VALUES_OFF
+#undef SMEM_SCAN_VALUES_STAGE_BYTES
+#undef SMEM_SCAN_VALUES_STRIDE
+#undef SMEM_TOTAL
+#undef THREADS
+}  // namespace alphamoe_router_large_generated
+
+using alphamoe_router_large_generated::kernel_alpha_moe_fused_router;
+
+namespace alphamoe_router_large_routed_generated {
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(64) LoomTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(LoomTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(LoomTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(LoomTensorMap) >= alignof(CUtensorMap), "LoomTensorMap alignment must cover the CUtensorMap CUDA ABI");
+
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_LOCAL_OFFSETS_OFF 0
+#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
+#define SMEM_LOCAL_OFFSETS_STRIDE 4100
+#define SMEM_SCAN_VALUES_OFF 4100
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
+#define SMEM_TOTAL 4224
+#define THREADS 256
+#define NUM_WARPS 8
+#define MAX_EXPERTS 512
+#define MAX_TOP_K 16
+#define MAX_BLOCK_M 16
+#define PUBLIC_SHARED_SOFTMAX 0
+
+
+__device__ __forceinline__ float approx_exp2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float approx_rcp(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float max_noftz(float a, float b) {
+    float c;
+    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+    return c;
+}
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_alpha_moe_fused_router_routed(float* __restrict__ logits, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M, int E, int top_k, int block_m, int has_shared_expert)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // Kernel setup ops
+    int* local_offsets = reinterpret_cast<int*>(smem_raw + 0);
+    const int local_offsets_addr = smem + 0;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 4100);
+    const int scan_values_addr = smem + 4100;
+
+    // === Task calls (dependency order) ===
+    int global_thread = bid * THREADS + tid;
+    int use_cta_reservations = 0;
+    if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0 && M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+        use_cta_reservations = 1;
+    }
+    if (bid == 0) {
+        #pragma unroll
+        for (int expert_slot_zero = 0; expert_slot_zero < MAX_EXPERTS / THREADS; expert_slot_zero++) {
+            int expert_zero = tid + expert_slot_zero * THREADS;
+            if (expert_zero < E) {
+                expert_counts[expert_zero] = 0;
+                expert_offsets[expert_zero] = 0;
+                expert_scatter_offsets[expert_zero] = 0;
+            }
+        }
+        if (tid == 0) {
+            expert_offsets[E] = 0;
+            num_tokens_post_padded[0] = 0;
+        }
+    }
+    if (use_cta_reservations != 0) {
+        #pragma unroll
+        for (int expert_slot_local_zero = 0; expert_slot_local_zero < MAX_EXPERTS / THREADS; expert_slot_local_zero++) {
+            int expert_local_zero = tid + expert_slot_local_zero * THREADS;
+            local_offsets[expert_local_zero] = 0;
+        }
+    }
+    cooperative_groups::this_grid().sync();
+    int routed_experts = E - has_shared_expert;
+    int routed_top_k = top_k - has_shared_expert;
+    for (int token = (unsigned int)(bid * NUM_WARPS) + warp; token < M; token += num_bids * NUM_WARPS) {
+        unsigned long long row_base = (unsigned long long)token * (unsigned long long)E;
+        float row_values[MAX_EXPERTS / 32];
+        if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0) {
+            unsigned long long lane_row_base = row_base + (unsigned long long)lane;
+            #pragma unroll
+            for (int expert_slot_full = 0; expert_slot_full < MAX_EXPERTS / 32; expert_slot_full++) {
+                row_values[expert_slot_full] = logits[lane_row_base + (unsigned long long)(expert_slot_full * 32)];
+            }
+        } else {
+            #pragma unroll
+            for (int expert_slot_load = 0; expert_slot_load < MAX_EXPERTS / 32; expert_slot_load++) {
+                int expert_load = lane + (unsigned int)(expert_slot_load * 32);
+                row_values[expert_slot_load] = -LOOM_INF;
+                if (expert_load < routed_experts) {
+                    row_values[expert_slot_load] = logits[row_base + (unsigned long long)expert_load];
+                }
+            }
+        }
+        unsigned long long output_base = (unsigned long long)token * (unsigned long long)top_k;
+        float selected_logit = -LOOM_INF;
+        int selected_expert = MAX_EXPERTS;
+        #pragma unroll 1
+        for (int route = 0; route < routed_top_k; route++) {
+            float local_value = 0.0f;
+            {
+                float _fmax_0 = fmaxf(row_values[0], row_values[1]);
+                float _fmax_1 = fmaxf(_fmax_0, row_values[2]);
+                float local_max_t0 = _fmax_1;
+                float _fmax_2 = fmaxf(row_values[3], row_values[4]);
+                float _fmax_3 = fmaxf(_fmax_2, row_values[5]);
+                float local_max_t1 = _fmax_3;
+                float _fmax_4 = fmaxf(row_values[6], row_values[7]);
+                float _fmax_5 = fmaxf(_fmax_4, row_values[8]);
+                float local_max_t2 = _fmax_5;
+                float _fmax_6 = fmaxf(row_values[9], row_values[10]);
+                float _fmax_7 = fmaxf(_fmax_6, row_values[11]);
+                float local_max_t3 = _fmax_7;
+                float _fmax_8 = fmaxf(row_values[12], row_values[13]);
+                float _fmax_9 = fmaxf(_fmax_8, row_values[14]);
+                float local_max_t4 = _fmax_9;
+                float _fmax_10 = fmaxf(local_max_t0, local_max_t1);
+                float _fmax_11 = fmaxf(_fmax_10, local_max_t2);
+                float local_max_u = _fmax_11;
+                float _fmax_12 = fmaxf(local_max_t3, local_max_t4);
+                float _fmax_13 = fmaxf(_fmax_12, row_values[15]);
+                float local_max_v = _fmax_13;
+                float _fmax_14 = fmaxf(local_max_u, local_max_v);
+                float _fmax_15 = fmaxf(_fmax_14, -LOOM_INF);
+                local_value = _fmax_15;
+            }
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
+            unsigned int tied_index = MAX_EXPERTS;
+            int descending_tie_key = 0;
+            {
+                unsigned int bounded_tie_masks[4];
+                #pragma unroll
+                for (int bounded_mask_init = 0; bounded_mask_init < 4; bounded_mask_init++) {
+                    bounded_tie_masks[bounded_mask_init] = 0;
+                }
+                #pragma unroll
+                for (int bounded_mask_slot = 0; bounded_mask_slot < MAX_EXPERTS / 128; bounded_mask_slot++) {
+                    #pragma unroll
+                    for (int bounded_mask_group = 0; bounded_mask_group < 4; bounded_mask_group++) {
+                        if (row_values[bounded_mask_group * (MAX_EXPERTS / 128) + bounded_mask_slot] == best_value) {
+                            bounded_tie_masks[bounded_mask_group] = bounded_tie_masks[bounded_mask_group] | (unsigned int)(2147483648 >> bounded_mask_group * (MAX_EXPERTS / 128) + bounded_mask_slot);
+                        }
+                    }
+                }
+                unsigned int bounded_mask_low = bounded_tie_masks[0] | bounded_tie_masks[1];
+                unsigned int bounded_mask_high = bounded_tie_masks[2] | bounded_tie_masks[3];
+                unsigned int bounded_mask_all = bounded_mask_low | bounded_mask_high;
+                int _find_msb_0;
+                asm volatile("bfind.u32 %0, %1;" : "=r"(_find_msb_0) : "r"(bounded_mask_all));
+                int bounded_high_bit = _find_msb_0;
+                descending_tie_key = bounded_high_bit * 32 - (int)lane;
+            }
+            int best_index = 0;
+            {
+                int _warp_redux_i32_0;
+                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_i32_0) : "r"(descending_tie_key));
+                int best_tie_key = _warp_redux_i32_0;
+                best_index = 992 - best_tie_key;
+            }
+            {
+                best_index = ((best_index < routed_experts) ? best_index : MAX_EXPERTS);
+            }
+            if (lane == (unsigned int)route) {
+                selected_logit = best_value;
+                selected_expert = best_index;
+            }
+            #pragma unroll
+            for (int remove_group = 0; remove_group < MAX_EXPERTS / 256; remove_group++) {
+                if (best_index >= remove_group * 256 && best_index < (remove_group + 1) * 256) {
+                    if (best_index < remove_group * 256 + 128) {
+                        if (best_index < remove_group * 256 + 64) {
+                            if (best_index < remove_group * 256 + 32) {
+                                if (lane + (unsigned int)(remove_group * 8 * 32) == (unsigned int)best_index) {
+                                    row_values[remove_group * 8] = -LOOM_INF;
+                                }
+                            } else if (lane + (unsigned int)((remove_group * 8 + 1) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 1] = -LOOM_INF;
+                            }
+                        } else if (best_index < remove_group * 256 + 96) {
+                            if (lane + (unsigned int)((remove_group * 8 + 2) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 2] = -LOOM_INF;
+                            }
+                        } else {
+                            if (lane + (unsigned int)((remove_group * 8 + 3) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 3] = -LOOM_INF;
+                            }
+                        }
+                    } else if (best_index < remove_group * 256 + 192) {
+                        if (best_index < remove_group * 256 + 160) {
+                            if (lane + (unsigned int)((remove_group * 8 + 4) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 4] = -LOOM_INF;
+                            }
+                        } else if (lane + (unsigned int)((remove_group * 8 + 5) * 32) == (unsigned int)best_index) {
+                            row_values[remove_group * 8 + 5] = -LOOM_INF;
+                        }
+                    } else {
+                        if (best_index < remove_group * 256 + 224) {
+                            if (lane + (unsigned int)((remove_group * 8 + 6) * 32) == (unsigned int)best_index) {
+                                row_values[remove_group * 8 + 6] = -LOOM_INF;
+                            }
+                        } else if (lane + (unsigned int)((remove_group * 8 + 7) * 32) == (unsigned int)best_index) {
+                            row_values[remove_group * 8 + 7] = -LOOM_INF;
+                        }
+                    }
+                }
+            }
+        }
+        if (has_shared_expert != 0) {
+            if (lane == (unsigned int)routed_top_k) {
+                selected_expert = E - 1;
+                selected_logit = logits[row_base + (unsigned long long)selected_expert];
+            }
+        }
+        int count_ordinal = 0;
+        if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+            if (lane < (unsigned int)top_k) {
+                if (use_cta_reservations != 0) {
+                    int _atomic_old_0 = atomicAdd(&local_offsets[selected_expert], 1);
+                    count_ordinal = _atomic_old_0;
+                } else {
+                    int _atomic_old_1 = atomicAdd(&expert_counts[selected_expert], 1);
+                    count_ordinal = _atomic_old_1;
+                }
+            }
+        }
+        int softmax_top_k = routed_top_k;
+        float selected_for_max = -LOOM_INF;
+        if ((unsigned int)softmax_top_k > lane) {
+            selected_for_max = selected_logit;
+        }
+        float _warp_reduce_0 = selected_for_max;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
+        float selected_exp = 0.0f;
+        if ((unsigned int)softmax_top_k > lane) {
+            float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
+            selected_exp = _exp2_0;
+        }
+        float _warp_reduce_1 = selected_exp;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
+        float _rcp_0 = approx_rcp(selected_sum);
+        float selected_sum_rcp = _rcp_0;
+        if (lane < (unsigned int)top_k) {
+            float weight = selected_logit;
+            if ((unsigned int)softmax_top_k > lane) {
+                weight = selected_exp * selected_sum_rcp;
+            }
+            topk_weights[output_base + (unsigned long long)lane] = weight;
+            int stored_expert = selected_expert;
+            if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                stored_expert = count_ordinal * MAX_EXPERTS + selected_expert;
+            } else {
+                atomicAdd(&expert_counts[selected_expert], 1);
+            }
+            topk_ids[output_base + (unsigned long long)lane] = stored_expert;
+        }
+    }
+    if (use_cta_reservations != 0) {
+        int first_rebase_token = (unsigned int)(bid * NUM_WARPS) + warp;
+        int first_stored_expert = 0;
+        if (first_rebase_token < M) {
+            if (lane < (unsigned int)top_k) {
+                unsigned long long first_rebase_pair = (unsigned long long)first_rebase_token * (unsigned long long)top_k + (unsigned long long)lane;
+                first_stored_expert = topk_ids[first_rebase_pair];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int expert_slot_reserve = 0; expert_slot_reserve < MAX_EXPERTS / THREADS; expert_slot_reserve++) {
+            int expert_reserve = tid + expert_slot_reserve * THREADS;
+            int count_reserve = local_offsets[expert_reserve];
+            if (count_reserve > 0) {
+                int _atomic_old_2 = atomicAdd(&expert_counts[expert_reserve], count_reserve);
+                int base_reserve = _atomic_old_2;
+                local_offsets[expert_reserve] = base_reserve;
+            }
+        }
+        __syncthreads();
+        for (int token_rebase = (unsigned int)(bid * NUM_WARPS) + warp; token_rebase < M; token_rebase += num_bids * NUM_WARPS) {
+            if (lane < (unsigned int)top_k) {
+                unsigned long long pair_rebase = (unsigned long long)token_rebase * (unsigned long long)top_k + (unsigned long long)lane;
+                int stored_rebase = first_stored_expert;
+                if (token_rebase != first_rebase_token) {
+                    stored_rebase = topk_ids[pair_rebase];
+                }
+                int expert_rebase = stored_rebase & MAX_EXPERTS - 1;
+                topk_ids[pair_rebase] = stored_rebase + local_offsets[expert_rebase] * MAX_EXPERTS;
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kThreads = THREADS;
+constexpr int kSmemTotal = SMEM_TOTAL;
+constexpr int kWarps = NUM_WARPS;
+static_assert(THREADS == NUM_WARPS * 32);
+static_assert(MAX_EXPERTS == 512);
+#undef LOOM_INF
+#undef MAX_BLOCK_M
+#undef MAX_EXPERTS
+#undef MAX_TOP_K
+#undef NUM_MAIN_STAGES
+#undef NUM_WARPS
+#undef PUBLIC_SHARED_SOFTMAX
+#undef SMEM_LOCAL_OFFSETS_OFF
+#undef SMEM_LOCAL_OFFSETS_STAGE_BYTES
+#undef SMEM_LOCAL_OFFSETS_STRIDE
+#undef SMEM_SCAN_VALUES_OFF
+#undef SMEM_SCAN_VALUES_STAGE_BYTES
+#undef SMEM_SCAN_VALUES_STRIDE
+#undef SMEM_TOTAL
+#undef THREADS
+}  // namespace alphamoe_router_large_routed_generated
+
+using alphamoe_router_large_routed_generated::kernel_alpha_moe_fused_router_routed;
+
+namespace alphamoe_router_medium_generated {
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(64) LoomTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(LoomTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(LoomTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(LoomTensorMap) >= alignof(CUtensorMap), "LoomTensorMap alignment must cover the CUtensorMap CUDA ABI");
+
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_LOCAL_OFFSETS_OFF 0
+#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
+#define SMEM_LOCAL_OFFSETS_STRIDE 4100
+#define SMEM_SCAN_VALUES_OFF 4100
+#define SMEM_SCAN_VALUES_STAGE_BYTES 16
+#define SMEM_SCAN_VALUES_STRIDE 16
+#define SMEM_PRIVATE_COUNTS_OFF 2052
+#define SMEM_PRIVATE_COUNTS_STAGE_BYTES 2048
+#define SMEM_PRIVATE_COUNTS_STRIDE 2048
+#define SMEM_TOTAL 4224
+#define THREADS 128
+#define NUM_WARPS 4
+#define MAX_EXPERTS 512
+#define MAX_TOP_K 16
+#define MAX_BLOCK_M 16
+#define PUBLIC_SHARED_SOFTMAX 1
+
+
+__device__ __forceinline__ float approx_exp2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float approx_rcp(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float max_noftz(float a, float b) {
+    float c;
+    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+    return c;
+}
+
+extern "C" {
+
+__global__ __launch_bounds__(128) void
+kernel_alpha_moe_fused_router_medium(float* __restrict__ logits, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M, int E, int top_k, int block_m, int has_shared_expert)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // Kernel setup ops
+    int* local_offsets = reinterpret_cast<int*>(smem_raw + 0);
+    const int local_offsets_addr = smem + 0;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 4100);
+    const int scan_values_addr = smem + 4100;
+    int* private_counts = reinterpret_cast<int*>(smem_raw + 2052);
+    const int private_counts_addr = smem + 2052;
+
+    // === Task calls (dependency order) ===
+    int global_thread = bid * THREADS + tid;
+    int private_raw_hist = 0;
+    if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0 && M <= 512 && M <= num_bids * NUM_WARPS) {
+        private_raw_hist = 1;
+    }
+    if (bid == 0) {
+        #pragma unroll
+        for (int expert_slot_zero = 0; expert_slot_zero < MAX_EXPERTS / THREADS; expert_slot_zero++) {
+            int expert_zero = tid + expert_slot_zero * THREADS;
+            if (expert_zero < E) {
+                if (private_raw_hist == 0) {
+                    expert_counts[expert_zero] = 0;
+                }
+                expert_offsets[expert_zero] = 0;
+                expert_scatter_offsets[expert_zero] = 0;
+            }
+        }
+        if (tid == 0) {
+            expert_offsets[E] = 0;
+            num_tokens_post_padded[0] = 0;
+        }
+    }
+    float row_values[MAX_EXPERTS / 32];
+    int preload_single_row = 0;
+    if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0 && M <= num_bids * NUM_WARPS) {
+        preload_single_row = 1;
+        int preload_token = (unsigned int)(bid * NUM_WARPS) + warp;
+        if (preload_token < M) {
+            unsigned long long preload_row_base = (unsigned long long)preload_token * (unsigned long long)E;
+            unsigned long long preload_lane_base = preload_row_base + (unsigned long long)lane;
+            #pragma unroll
+            for (int preload_slot = 0; preload_slot < MAX_EXPERTS / 32; preload_slot++) {
+                row_values[preload_slot] = logits[preload_lane_base + (unsigned long long)(preload_slot * 32)];
+            }
+        }
+    }
+    if (private_raw_hist == 0) {
+        cooperative_groups::this_grid().sync();
+    }
+    int routed_experts = E - has_shared_expert;
+    int routed_top_k = top_k - has_shared_expert;
+    for (int token = (unsigned int)(bid * NUM_WARPS) + warp; token < M; token += num_bids * NUM_WARPS) {
+        unsigned long long row_base = 0;
+        if (preload_single_row == 0) {
+            row_base = (unsigned long long)token * (unsigned long long)E;
+            if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0) {
+                unsigned long long lane_row_base = row_base + (unsigned long long)lane;
+                #pragma unroll
+                for (int expert_slot_full = 0; expert_slot_full < MAX_EXPERTS / 32; expert_slot_full++) {
+                    row_values[expert_slot_full] = logits[lane_row_base + (unsigned long long)(expert_slot_full * 32)];
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_load = 0; expert_slot_load < MAX_EXPERTS / 32; expert_slot_load++) {
+                    int expert_load = lane + (unsigned int)(expert_slot_load * 32);
+                    row_values[expert_slot_load] = -LOOM_INF;
+                    if (expert_load < routed_experts) {
+                        row_values[expert_slot_load] = logits[row_base + (unsigned long long)expert_load];
+                    }
+                }
             }
         }
         unsigned long long output_base = (unsigned long long)token * (unsigned long long)top_k;
@@ -206,12 +1028,22 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
             float best_value = 0.0f;
             best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
-            #pragma unroll
-            for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
-                int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
-                if (expert_tie < routed_experts) {
-                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
-                        tied_index = (unsigned int)expert_tie;
+            if (best_value != -LOOM_INF) {
+                #pragma unroll
+                for (int expert_slot_finite_tie = 0; expert_slot_finite_tie < MAX_EXPERTS / 32; expert_slot_finite_tie++) {
+                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie] == best_value) {
+                        int expert_finite_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie) * 32);
+                        tied_index = (unsigned int)expert_finite_tie;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
+                    int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
+                    if (expert_tie < routed_experts) {
+                        if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
+                            tied_index = (unsigned int)expert_tie;
+                        }
                     }
                 }
             }
@@ -266,282 +1098,253 @@ kernel_alpha_moe_fused_router(float* __restrict__ logits, float* __restrict__ to
                 weight = selected_exp * selected_sum_rcp;
             }
             topk_weights[output_base + (unsigned long long)lane] = weight;
-            topk_ids[output_base + (unsigned long long)lane] = selected_expert;
-            atomicAdd(&expert_counts[selected_expert], 1);
+            int stored_expert = selected_expert;
+            if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                int _atomic_old_0 = atomicAdd(&expert_counts[selected_expert], 1);
+                int counted_row = _atomic_old_0;
+                stored_expert = counted_row * MAX_EXPERTS + selected_expert;
+            } else if (private_raw_hist == 0) {
+                atomicAdd(&expert_counts[selected_expert], 1);
+            }
+            topk_ids[output_base + (unsigned long long)lane] = stored_expert;
         }
     }
-    __threadfence();
     cooperative_groups::this_grid().sync();
-    if (bid == 0) {
+    if (bid * THREADS < M * top_k || bid * THREADS < E) {
+        int scan_counts[MAX_EXPERTS / THREADS];
+        if (private_raw_hist != 0) {
+            #pragma unroll
+            for (int private_zero_slot = 0; private_zero_slot < 512 / THREADS; private_zero_slot++) {
+                private_counts[tid + private_zero_slot * THREADS] = 0;
+            }
+            __syncthreads();
+            for (int count_pair = tid; count_pair < M * top_k; count_pair += THREADS) {
+                int count_expert = topk_ids[count_pair];
+                atomicAdd(&private_counts[count_expert], 1);
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int private_load_slot = 0; private_load_slot < MAX_EXPERTS / THREADS; private_load_slot++) {
+                int private_expert = tid * (MAX_EXPERTS / THREADS) + private_load_slot;
+                int private_count = private_counts[private_expert];
+                scan_counts[private_load_slot] = private_count;
+                if (bid == 0) {
+                    expert_counts[private_expert] = private_count;
+                }
+            }
+        } else if (MAX_EXPERTS == 512 && E == 512 && ((unsigned long long)expert_counts & 15) == 0) {
+            {
+                int4 _iv4 = *reinterpret_cast<const int4*>(expert_counts + tid * 4);
+                scan_counts[0 + 0] = _iv4.x;
+                scan_counts[0 + 1] = _iv4.y;
+                scan_counts[0 + 2] = _iv4.z;
+                scan_counts[0 + 3] = _iv4.w;
+            }
+        } else {
+            #pragma unroll
+            for (int expert_slot_count_load = 0; expert_slot_count_load < MAX_EXPERTS / THREADS; expert_slot_count_load++) {
+                int expert_count_load = tid * (MAX_EXPERTS / THREADS) + expert_slot_count_load;
+                int count_loaded = 0;
+                if (expert_count_load < E) {
+                    count_loaded = expert_counts[expert_count_load];
+                }
+                scan_counts[expert_slot_count_load] = count_loaded;
+            }
+        }
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
         #pragma unroll
         for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
-            int expert_scan_init = tid + expert_slot_scan_init * THREADS;
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
             int padded_count_init = 0;
             if (expert_scan_init < E) {
-                int count_init = expert_counts[expert_scan_init];
-                padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                int count_init = scan_counts[expert_slot_scan_init];
+                if (block_m == 8) {
+                    padded_count_init = count_init + 7 & -8;
+                } else if (block_m == 16) {
+                    padded_count_init = count_init + 15 & -16;
+                } else {
+                    padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                }
             }
-            scan_values[expert_scan_init] = padded_count_init;
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
         }
         __syncthreads();
-        int scan_index_up = (tid + 1) * 2 - 1;
-        if (scan_index_up < MAX_EXPERTS) {
-            scan_values[scan_index_up] = scan_values[scan_index_up] + scan_values[scan_index_up - 1];
-        }
-        int scan_index_up_0 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_up_0 < MAX_EXPERTS) {
-            scan_values[scan_index_up_0] = scan_values[scan_index_up_0] + scan_values[scan_index_up_0 - 1];
-        }
-        __syncthreads();
-        int scan_index_up_1 = (tid + 1) * 4 - 1;
-        if (scan_index_up_1 < MAX_EXPERTS) {
-            scan_values[scan_index_up_1] = scan_values[scan_index_up_1] + scan_values[scan_index_up_1 - 2];
-        }
-        int scan_index_up_2 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_up_2 < MAX_EXPERTS) {
-            scan_values[scan_index_up_2] = scan_values[scan_index_up_2] + scan_values[scan_index_up_2 - 2];
-        }
-        __syncthreads();
-        int scan_index_up_3 = (tid + 1) * 8 - 1;
-        if (scan_index_up_3 < MAX_EXPERTS) {
-            scan_values[scan_index_up_3] = scan_values[scan_index_up_3] + scan_values[scan_index_up_3 - 4];
-        }
-        int scan_index_up_4 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_up_4 < MAX_EXPERTS) {
-            scan_values[scan_index_up_4] = scan_values[scan_index_up_4] + scan_values[scan_index_up_4 - 4];
-        }
-        __syncthreads();
-        int scan_index_up_5 = (tid + 1) * 16 - 1;
-        if (scan_index_up_5 < MAX_EXPERTS) {
-            scan_values[scan_index_up_5] = scan_values[scan_index_up_5] + scan_values[scan_index_up_5 - 8];
-        }
-        int scan_index_up_6 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_up_6 < MAX_EXPERTS) {
-            scan_values[scan_index_up_6] = scan_values[scan_index_up_6] + scan_values[scan_index_up_6 - 8];
-        }
-        __syncthreads();
-        int scan_index_up_7 = (tid + 1) * 32 - 1;
-        if (scan_index_up_7 < MAX_EXPERTS) {
-            scan_values[scan_index_up_7] = scan_values[scan_index_up_7] + scan_values[scan_index_up_7 - 16];
-        }
-        int scan_index_up_8 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_up_8 < MAX_EXPERTS) {
-            scan_values[scan_index_up_8] = scan_values[scan_index_up_8] + scan_values[scan_index_up_8 - 16];
-        }
-        __syncthreads();
-        int scan_index_up_9 = (tid + 1) * 64 - 1;
-        if (scan_index_up_9 < MAX_EXPERTS) {
-            scan_values[scan_index_up_9] = scan_values[scan_index_up_9] + scan_values[scan_index_up_9 - 32];
-        }
-        int scan_index_up_10 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_up_10 < MAX_EXPERTS) {
-            scan_values[scan_index_up_10] = scan_values[scan_index_up_10] + scan_values[scan_index_up_10 - 32];
-        }
-        __syncthreads();
-        int scan_index_up_11 = (tid + 1) * 128 - 1;
-        if (scan_index_up_11 < MAX_EXPERTS) {
-            scan_values[scan_index_up_11] = scan_values[scan_index_up_11] + scan_values[scan_index_up_11 - 64];
-        }
-        int scan_index_up_12 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_up_12 < MAX_EXPERTS) {
-            scan_values[scan_index_up_12] = scan_values[scan_index_up_12] + scan_values[scan_index_up_12 - 64];
-        }
-        __syncthreads();
-        int scan_index_up_13 = (tid + 1) * 256 - 1;
-        if (scan_index_up_13 < MAX_EXPERTS) {
-            scan_values[scan_index_up_13] = scan_values[scan_index_up_13] + scan_values[scan_index_up_13 - 128];
-        }
-        int scan_index_up_14 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_up_14 < MAX_EXPERTS) {
-            scan_values[scan_index_up_14] = scan_values[scan_index_up_14] + scan_values[scan_index_up_14 - 128];
-        }
-        __syncthreads();
-        int scan_index_up_15 = (tid + 1) * 512 - 1;
-        if (scan_index_up_15 < MAX_EXPERTS) {
-            scan_values[scan_index_up_15] = scan_values[scan_index_up_15] + scan_values[scan_index_up_15 - 256];
-        }
-        int scan_index_up_16 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_up_16 < MAX_EXPERTS) {
-            scan_values[scan_index_up_16] = scan_values[scan_index_up_16] + scan_values[scan_index_up_16 - 256];
-        }
-        __syncthreads();
-        int scan_index_up_17 = (tid + 1) * 1024 - 1;
-        if (scan_index_up_17 < MAX_EXPERTS) {
-            scan_values[scan_index_up_17] = scan_values[scan_index_up_17] + scan_values[scan_index_up_17 - 512];
-        }
-        int scan_index_up_18 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_up_18 < MAX_EXPERTS) {
-            scan_values[scan_index_up_18] = scan_values[scan_index_up_18] + scan_values[scan_index_up_18 - 512];
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int padded_total = scan_values[MAX_EXPERTS - 1];
-            num_tokens_post_padded[0] = padded_total;
-            scan_values[MAX_EXPERTS - 1] = 0;
-        }
-        __syncthreads();
-        int scan_index_down = (tid + 1) * 1024 - 1;
-        if (scan_index_down < MAX_EXPERTS) {
-            int scan_left = scan_values[scan_index_down - 512];
-            scan_values[scan_index_down - 512] = scan_values[scan_index_down];
-            scan_values[scan_index_down] = scan_values[scan_index_down] + scan_left;
-        }
-        int scan_index_down_19 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_down_19 < MAX_EXPERTS) {
-            int scan_left_1 = scan_values[scan_index_down_19 - 512];
-            scan_values[scan_index_down_19 - 512] = scan_values[scan_index_down_19];
-            scan_values[scan_index_down_19] = scan_values[scan_index_down_19] + scan_left_1;
-        }
-        __syncthreads();
-        int scan_index_down_20 = (tid + 1) * 512 - 1;
-        if (scan_index_down_20 < MAX_EXPERTS) {
-            int scan_left_2 = scan_values[scan_index_down_20 - 256];
-            scan_values[scan_index_down_20 - 256] = scan_values[scan_index_down_20];
-            scan_values[scan_index_down_20] = scan_values[scan_index_down_20] + scan_left_2;
-        }
-        int scan_index_down_21 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_down_21 < MAX_EXPERTS) {
-            int scan_left_3 = scan_values[scan_index_down_21 - 256];
-            scan_values[scan_index_down_21 - 256] = scan_values[scan_index_down_21];
-            scan_values[scan_index_down_21] = scan_values[scan_index_down_21] + scan_left_3;
-        }
-        __syncthreads();
-        int scan_index_down_22 = (tid + 1) * 256 - 1;
-        if (scan_index_down_22 < MAX_EXPERTS) {
-            int scan_left_4 = scan_values[scan_index_down_22 - 128];
-            scan_values[scan_index_down_22 - 128] = scan_values[scan_index_down_22];
-            scan_values[scan_index_down_22] = scan_values[scan_index_down_22] + scan_left_4;
-        }
-        int scan_index_down_23 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_down_23 < MAX_EXPERTS) {
-            int scan_left_5 = scan_values[scan_index_down_23 - 128];
-            scan_values[scan_index_down_23 - 128] = scan_values[scan_index_down_23];
-            scan_values[scan_index_down_23] = scan_values[scan_index_down_23] + scan_left_5;
-        }
-        __syncthreads();
-        int scan_index_down_24 = (tid + 1) * 128 - 1;
-        if (scan_index_down_24 < MAX_EXPERTS) {
-            int scan_left_6 = scan_values[scan_index_down_24 - 64];
-            scan_values[scan_index_down_24 - 64] = scan_values[scan_index_down_24];
-            scan_values[scan_index_down_24] = scan_values[scan_index_down_24] + scan_left_6;
-        }
-        int scan_index_down_25 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_down_25 < MAX_EXPERTS) {
-            int scan_left_7 = scan_values[scan_index_down_25 - 64];
-            scan_values[scan_index_down_25 - 64] = scan_values[scan_index_down_25];
-            scan_values[scan_index_down_25] = scan_values[scan_index_down_25] + scan_left_7;
-        }
-        __syncthreads();
-        int scan_index_down_26 = (tid + 1) * 64 - 1;
-        if (scan_index_down_26 < MAX_EXPERTS) {
-            int scan_left_8 = scan_values[scan_index_down_26 - 32];
-            scan_values[scan_index_down_26 - 32] = scan_values[scan_index_down_26];
-            scan_values[scan_index_down_26] = scan_values[scan_index_down_26] + scan_left_8;
-        }
-        int scan_index_down_27 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_down_27 < MAX_EXPERTS) {
-            int scan_left_9 = scan_values[scan_index_down_27 - 32];
-            scan_values[scan_index_down_27 - 32] = scan_values[scan_index_down_27];
-            scan_values[scan_index_down_27] = scan_values[scan_index_down_27] + scan_left_9;
-        }
-        __syncthreads();
-        int scan_index_down_28 = (tid + 1) * 32 - 1;
-        if (scan_index_down_28 < MAX_EXPERTS) {
-            int scan_left_10 = scan_values[scan_index_down_28 - 16];
-            scan_values[scan_index_down_28 - 16] = scan_values[scan_index_down_28];
-            scan_values[scan_index_down_28] = scan_values[scan_index_down_28] + scan_left_10;
-        }
-        int scan_index_down_29 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_down_29 < MAX_EXPERTS) {
-            int scan_left_11 = scan_values[scan_index_down_29 - 16];
-            scan_values[scan_index_down_29 - 16] = scan_values[scan_index_down_29];
-            scan_values[scan_index_down_29] = scan_values[scan_index_down_29] + scan_left_11;
-        }
-        __syncthreads();
-        int scan_index_down_30 = (tid + 1) * 16 - 1;
-        if (scan_index_down_30 < MAX_EXPERTS) {
-            int scan_left_12 = scan_values[scan_index_down_30 - 8];
-            scan_values[scan_index_down_30 - 8] = scan_values[scan_index_down_30];
-            scan_values[scan_index_down_30] = scan_values[scan_index_down_30] + scan_left_12;
-        }
-        int scan_index_down_31 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_down_31 < MAX_EXPERTS) {
-            int scan_left_13 = scan_values[scan_index_down_31 - 8];
-            scan_values[scan_index_down_31 - 8] = scan_values[scan_index_down_31];
-            scan_values[scan_index_down_31] = scan_values[scan_index_down_31] + scan_left_13;
-        }
-        __syncthreads();
-        int scan_index_down_32 = (tid + 1) * 8 - 1;
-        if (scan_index_down_32 < MAX_EXPERTS) {
-            int scan_left_14 = scan_values[scan_index_down_32 - 4];
-            scan_values[scan_index_down_32 - 4] = scan_values[scan_index_down_32];
-            scan_values[scan_index_down_32] = scan_values[scan_index_down_32] + scan_left_14;
-        }
-        int scan_index_down_33 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_down_33 < MAX_EXPERTS) {
-            int scan_left_15 = scan_values[scan_index_down_33 - 4];
-            scan_values[scan_index_down_33 - 4] = scan_values[scan_index_down_33];
-            scan_values[scan_index_down_33] = scan_values[scan_index_down_33] + scan_left_15;
-        }
-        __syncthreads();
-        int scan_index_down_34 = (tid + 1) * 4 - 1;
-        if (scan_index_down_34 < MAX_EXPERTS) {
-            int scan_left_16 = scan_values[scan_index_down_34 - 2];
-            scan_values[scan_index_down_34 - 2] = scan_values[scan_index_down_34];
-            scan_values[scan_index_down_34] = scan_values[scan_index_down_34] + scan_left_16;
-        }
-        int scan_index_down_35 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_down_35 < MAX_EXPERTS) {
-            int scan_left_17 = scan_values[scan_index_down_35 - 2];
-            scan_values[scan_index_down_35 - 2] = scan_values[scan_index_down_35];
-            scan_values[scan_index_down_35] = scan_values[scan_index_down_35] + scan_left_17;
-        }
-        __syncthreads();
-        int scan_index_down_36 = (tid + 1) * 2 - 1;
-        if (scan_index_down_36 < MAX_EXPERTS) {
-            int scan_left_18 = scan_values[scan_index_down_36 - 1];
-            scan_values[scan_index_down_36 - 1] = scan_values[scan_index_down_36];
-            scan_values[scan_index_down_36] = scan_values[scan_index_down_36] + scan_left_18;
-        }
-        int scan_index_down_37 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_down_37 < MAX_EXPERTS) {
-            int scan_left_19 = scan_values[scan_index_down_37 - 1];
-            scan_values[scan_index_down_37 - 1] = scan_values[scan_index_down_37];
-            scan_values[scan_index_down_37] = scan_values[scan_index_down_37] + scan_left_19;
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
-            int expert_scan_store = tid + expert_slot_scan_store * THREADS;
-            if (expert_scan_store < E) {
-                expert_offsets[expert_scan_store] = scan_values[expert_scan_store];
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                local_offsets[E] = scan_warp_inclusive;
+                if (bid == 0) {
+                    num_tokens_post_padded[0] = scan_warp_inclusive;
+                    expert_offsets[E] = scan_warp_inclusive;
+                }
             }
         }
-        if (tid == 0) {
-            expert_offsets[E] = num_tokens_post_padded[0];
+        __syncthreads();
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        if (MAX_EXPERTS == 512 && E == 512) {
+            #pragma unroll
+            for (int expert_slot_full_prefix = 0; expert_slot_full_prefix < MAX_EXPERTS / THREADS; expert_slot_full_prefix++) {
+                int expert_full_prefix = tid * (MAX_EXPERTS / THREADS) + expert_slot_full_prefix;
+                local_offsets[expert_full_prefix] = scan_expert_prefix;
+                if (bid == 0) {
+                    expert_offsets[expert_full_prefix] = scan_expert_prefix;
+                    if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                        expert_scatter_offsets[expert_full_prefix] = expert_counts[expert_full_prefix];
+                    }
+                }
+                scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_full_prefix];
+            }
+        } else {
+            #pragma unroll
+            for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+                int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+                if (expert_scan_store < E) {
+                    local_offsets[expert_scan_store] = scan_expert_prefix;
+                    if (bid == 0) {
+                        expert_offsets[expert_scan_store] = scan_expert_prefix;
+                        if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                            expert_scatter_offsets[expert_scan_store] = expert_counts[expert_scan_store];
+                        }
+                    }
+                }
+                scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
+            }
         }
-    }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
-    for (int pair = global_thread; pair < M * top_k; pair += num_bids * THREADS) {
-        int pair_expert = topk_ids[pair];
-        int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[pair_expert], 1);
-        int local_row = _atomic_old_0;
-        int grouped_row = expert_offsets[pair_expert] + local_row;
-        sorted_token_ids[grouped_row] = pair;
-        if (local_row % block_m == 0) {
-            expert_ids[grouped_row / block_m] = pair_expert;
+        __syncthreads();
+        int scatter_block_mask = block_m - 1;
+        int scatter_block_shift = 0;
+        if (block_m == 8) {
+            scatter_block_shift = 3;
+        } else if (block_m == 16) {
+            scatter_block_shift = 4;
         }
-    }
-    for (int padding_expert = global_thread; padding_expert < E; padding_expert += num_bids * THREADS) {
-        int count_final = expert_counts[padding_expert];
-        int expert_start = expert_offsets[padding_expert];
-        int padded_count_final = (count_final + block_m - 1) / block_m * block_m;
-        int padding_count = padded_count_final - count_final;
-        #pragma unroll
-        for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
-            if (padding_count > padding_slot) {
-                sorted_token_ids[expert_start + count_final + padding_slot] = M * top_k;
+        if (M * top_k <= num_bids * THREADS) {
+            if (global_thread < M * top_k) {
+                int pair = global_thread;
+                int stored_pair = topk_ids[pair];
+                int pair_expert = stored_pair;
+                int local_row = 0;
+                if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                    pair_expert = stored_pair % MAX_EXPERTS;
+                    local_row = stored_pair / MAX_EXPERTS;
+                    topk_ids[pair] = pair_expert;
+                } else {
+                    int _atomic_old_1 = atomicAdd(&expert_scatter_offsets[pair_expert], 1);
+                    local_row = _atomic_old_1;
+                }
+                int grouped_row = local_offsets[pair_expert] + local_row;
+                sorted_token_ids[grouped_row] = pair;
+                int scatter_block_remainder = 0;
+                if (scatter_block_shift != 0) {
+                    scatter_block_remainder = local_row & scatter_block_mask;
+                } else {
+                    scatter_block_remainder = local_row % block_m;
+                }
+                if (scatter_block_remainder == 0) {
+                    int scatter_block_index = 0;
+                    if (scatter_block_shift != 0) {
+                        scatter_block_index = grouped_row >> scatter_block_shift;
+                    } else {
+                        scatter_block_index = grouped_row / block_m;
+                    }
+                    expert_ids[scatter_block_index] = pair_expert;
+                }
+            }
+        } else {
+            for (int pair_1 = global_thread; pair_1 < M * top_k; pair_1 += num_bids * THREADS) {
+                int stored_pair_1 = topk_ids[pair_1];
+                int pair_expert_1 = stored_pair_1;
+                int local_row_1 = 0;
+                if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                    pair_expert_1 = stored_pair_1 % MAX_EXPERTS;
+                    local_row_1 = stored_pair_1 / MAX_EXPERTS;
+                    topk_ids[pair_1] = pair_expert_1;
+                } else {
+                    int _atomic_old_2 = atomicAdd(&expert_scatter_offsets[pair_expert_1], 1);
+                    local_row_1 = _atomic_old_2;
+                }
+                int grouped_row_1 = local_offsets[pair_expert_1] + local_row_1;
+                sorted_token_ids[grouped_row_1] = pair_1;
+                int scatter_block_remainder_1 = 0;
+                if (scatter_block_shift != 0) {
+                    scatter_block_remainder_1 = local_row_1 & scatter_block_mask;
+                } else {
+                    scatter_block_remainder_1 = local_row_1 % block_m;
+                }
+                if (scatter_block_remainder_1 == 0) {
+                    int scatter_block_index_1 = 0;
+                    if (scatter_block_shift != 0) {
+                        scatter_block_index_1 = grouped_row_1 >> scatter_block_shift;
+                    } else {
+                        scatter_block_index_1 = grouped_row_1 / block_m;
+                    }
+                    expert_ids[scatter_block_index_1] = pair_expert_1;
+                }
+            }
+        }
+        for (int padding_expert = global_thread; padding_expert < E; padding_expert += num_bids * THREADS) {
+            int count_final = 0;
+            if (private_raw_hist != 0) {
+                count_final = private_counts[padding_expert];
+            } else {
+                count_final = expert_counts[padding_expert];
+            }
+            int expert_start = local_offsets[padding_expert];
+            int padded_count_final = local_offsets[padding_expert + 1] - expert_start;
+            int padding_count = padded_count_final - count_final;
+            #pragma unroll
+            for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
+                if (padding_count > padding_slot) {
+                    sorted_token_ids[expert_start + count_final + padding_slot] = M * top_k;
+                }
             }
         }
     }
@@ -562,12 +1365,574 @@ static_assert(MAX_EXPERTS == 512);
 #undef NUM_MAIN_STAGES
 #undef NUM_WARPS
 #undef PUBLIC_SHARED_SOFTMAX
+#undef SMEM_LOCAL_OFFSETS_OFF
+#undef SMEM_LOCAL_OFFSETS_STAGE_BYTES
+#undef SMEM_LOCAL_OFFSETS_STRIDE
+#undef SMEM_PRIVATE_COUNTS_OFF
+#undef SMEM_PRIVATE_COUNTS_STAGE_BYTES
+#undef SMEM_PRIVATE_COUNTS_STRIDE
 #undef SMEM_SCAN_VALUES_OFF
 #undef SMEM_SCAN_VALUES_STAGE_BYTES
 #undef SMEM_SCAN_VALUES_STRIDE
 #undef SMEM_TOTAL
 #undef THREADS
-}  // namespace alphamoe_router_large_generated
+}  // namespace alphamoe_router_medium_generated
+
+using alphamoe_router_medium_generated::kernel_alpha_moe_fused_router_medium;
+
+namespace alphamoe_router_medium_routed_generated {
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(64) LoomTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(LoomTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(LoomTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
+
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(LoomTensorMap) >= alignof(CUtensorMap), "LoomTensorMap alignment must cover the CUtensorMap CUDA ABI");
+
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_LOCAL_OFFSETS_OFF 0
+#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
+#define SMEM_LOCAL_OFFSETS_STRIDE 4100
+#define SMEM_SCAN_VALUES_OFF 4100
+#define SMEM_SCAN_VALUES_STAGE_BYTES 16
+#define SMEM_SCAN_VALUES_STRIDE 16
+#define SMEM_PRIVATE_COUNTS_OFF 2052
+#define SMEM_PRIVATE_COUNTS_STAGE_BYTES 2048
+#define SMEM_PRIVATE_COUNTS_STRIDE 2048
+#define SMEM_TOTAL 4224
+#define THREADS 128
+#define NUM_WARPS 4
+#define MAX_EXPERTS 512
+#define MAX_TOP_K 16
+#define MAX_BLOCK_M 16
+#define PUBLIC_SHARED_SOFTMAX 0
+
+
+__device__ __forceinline__ float approx_exp2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float approx_rcp(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float max_noftz(float a, float b) {
+    float c;
+    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
+    return c;
+}
+
+extern "C" {
+
+__global__ __launch_bounds__(128) void
+kernel_alpha_moe_fused_router_medium_routed(float* __restrict__ logits, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M, int E, int top_k, int block_m, int has_shared_expert)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // Kernel setup ops
+    int* local_offsets = reinterpret_cast<int*>(smem_raw + 0);
+    const int local_offsets_addr = smem + 0;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 4100);
+    const int scan_values_addr = smem + 4100;
+    int* private_counts = reinterpret_cast<int*>(smem_raw + 2052);
+    const int private_counts_addr = smem + 2052;
+
+    // === Task calls (dependency order) ===
+    int global_thread = bid * THREADS + tid;
+    int private_raw_hist = 0;
+    if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0 && M <= 512 && M <= num_bids * NUM_WARPS) {
+        private_raw_hist = 1;
+    }
+    if (bid == 0) {
+        #pragma unroll
+        for (int expert_slot_zero = 0; expert_slot_zero < MAX_EXPERTS / THREADS; expert_slot_zero++) {
+            int expert_zero = tid + expert_slot_zero * THREADS;
+            if (expert_zero < E) {
+                if (private_raw_hist == 0) {
+                    expert_counts[expert_zero] = 0;
+                }
+                expert_offsets[expert_zero] = 0;
+                expert_scatter_offsets[expert_zero] = 0;
+            }
+        }
+        if (tid == 0) {
+            expert_offsets[E] = 0;
+            num_tokens_post_padded[0] = 0;
+        }
+    }
+    float row_values[MAX_EXPERTS / 32];
+    int preload_single_row = 0;
+    if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0 && M <= num_bids * NUM_WARPS) {
+        preload_single_row = 1;
+        int preload_token = (unsigned int)(bid * NUM_WARPS) + warp;
+        if (preload_token < M) {
+            unsigned long long preload_row_base = (unsigned long long)preload_token * (unsigned long long)E;
+            unsigned long long preload_lane_base = preload_row_base + (unsigned long long)lane;
+            #pragma unroll
+            for (int preload_slot = 0; preload_slot < MAX_EXPERTS / 32; preload_slot++) {
+                row_values[preload_slot] = logits[preload_lane_base + (unsigned long long)(preload_slot * 32)];
+            }
+        }
+    }
+    if (private_raw_hist == 0) {
+        cooperative_groups::this_grid().sync();
+    }
+    int routed_experts = E - has_shared_expert;
+    int routed_top_k = top_k - has_shared_expert;
+    for (int token = (unsigned int)(bid * NUM_WARPS) + warp; token < M; token += num_bids * NUM_WARPS) {
+        unsigned long long row_base = 0;
+        if (preload_single_row == 0) {
+            row_base = (unsigned long long)token * (unsigned long long)E;
+            if (MAX_EXPERTS == 512 && PUBLIC_SHARED_SOFTMAX == 0 && E == 512 && has_shared_expert == 0) {
+                unsigned long long lane_row_base = row_base + (unsigned long long)lane;
+                #pragma unroll
+                for (int expert_slot_full = 0; expert_slot_full < MAX_EXPERTS / 32; expert_slot_full++) {
+                    row_values[expert_slot_full] = logits[lane_row_base + (unsigned long long)(expert_slot_full * 32)];
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_load = 0; expert_slot_load < MAX_EXPERTS / 32; expert_slot_load++) {
+                    int expert_load = lane + (unsigned int)(expert_slot_load * 32);
+                    row_values[expert_slot_load] = -LOOM_INF;
+                    if (expert_load < routed_experts) {
+                        row_values[expert_slot_load] = logits[row_base + (unsigned long long)expert_load];
+                    }
+                }
+            }
+        }
+        unsigned long long output_base = (unsigned long long)token * (unsigned long long)top_k;
+        float selected_logit = -LOOM_INF;
+        int selected_expert = MAX_EXPERTS;
+        #pragma unroll 1
+        for (int route = 0; route < routed_top_k; route++) {
+            float local_max_0 = -LOOM_INF;
+            float local_max_1 = -LOOM_INF;
+            float local_max_2 = -LOOM_INF;
+            float local_max_3 = -LOOM_INF;
+            #pragma unroll
+            for (int scan_group = 0; scan_group < MAX_EXPERTS / 128; scan_group++) {
+                float _fmax_0 = fmaxf(local_max_0, row_values[scan_group * 4]);
+                local_max_0 = _fmax_0;
+                float _fmax_1 = fmaxf(local_max_1, row_values[scan_group * 4 + 1]);
+                local_max_1 = _fmax_1;
+                float _fmax_2 = fmaxf(local_max_2, row_values[scan_group * 4 + 2]);
+                local_max_2 = _fmax_2;
+                float _fmax_3 = fmaxf(local_max_3, row_values[scan_group * 4 + 3]);
+                local_max_3 = _fmax_3;
+            }
+            float _fmax_4 = fmaxf(local_max_0, local_max_1);
+            float local_max_low = _fmax_4;
+            float _fmax_5 = fmaxf(local_max_2, local_max_3);
+            float local_max_high = _fmax_5;
+            float _fmax_6 = fmaxf(local_max_low, local_max_high);
+            float local_value = _fmax_6;
+            unsigned int local_bits = 0;
+            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
+            unsigned int local_key = local_bits ^ 2147483648;
+            if ((local_bits & 2147483648) != 0) {
+                local_key = local_bits ^ 4294967295;
+            }
+            unsigned int _warp_redux_u32_0;
+            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
+            unsigned int best_key = _warp_redux_u32_0;
+            unsigned int best_bits = best_key ^ 2147483648;
+            if ((best_key & 2147483648) == 0) {
+                best_bits = best_key ^ 4294967295;
+            }
+            float best_value = 0.0f;
+            best_value = reinterpret_cast<float*>(&best_bits)[0];
+            unsigned int tied_index = MAX_EXPERTS;
+            if (best_value != -LOOM_INF) {
+                #pragma unroll
+                for (int expert_slot_finite_tie = 0; expert_slot_finite_tie < MAX_EXPERTS / 32; expert_slot_finite_tie++) {
+                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie] == best_value) {
+                        int expert_finite_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie) * 32);
+                        tied_index = (unsigned int)expert_finite_tie;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
+                    int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
+                    if (expert_tie < routed_experts) {
+                        if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
+                            tied_index = (unsigned int)expert_tie;
+                        }
+                    }
+                }
+            }
+            unsigned int _warp_redux_u32_1;
+            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
+            int best_index = (int)_warp_redux_u32_1;
+            if (lane == (unsigned int)route) {
+                selected_logit = best_value;
+                selected_expert = best_index;
+            }
+            #pragma unroll
+            for (int expert_slot_remove = 0; expert_slot_remove < MAX_EXPERTS / 32; expert_slot_remove++) {
+                if (lane + (unsigned int)(expert_slot_remove * 32) == (unsigned int)best_index) {
+                    row_values[expert_slot_remove] = -LOOM_INF;
+                }
+            }
+        }
+        if (has_shared_expert != 0) {
+            if (lane == (unsigned int)routed_top_k) {
+                selected_expert = E - 1;
+                selected_logit = logits[row_base + (unsigned long long)selected_expert];
+            }
+        }
+        int softmax_top_k = routed_top_k;
+        float selected_for_max = -LOOM_INF;
+        if ((unsigned int)softmax_top_k > lane) {
+            selected_for_max = selected_logit;
+        }
+        float _warp_reduce_0 = selected_for_max;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
+        float selected_max = _warp_reduce_0;
+        float selected_exp = 0.0f;
+        if ((unsigned int)softmax_top_k > lane) {
+            float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
+            selected_exp = _exp2_0;
+        }
+        float _warp_reduce_1 = selected_exp;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        float selected_sum = _warp_reduce_1;
+        float _rcp_0 = approx_rcp(selected_sum);
+        float selected_sum_rcp = _rcp_0;
+        if (lane < (unsigned int)top_k) {
+            float weight = selected_logit;
+            if ((unsigned int)softmax_top_k > lane) {
+                weight = selected_exp * selected_sum_rcp;
+            }
+            topk_weights[output_base + (unsigned long long)lane] = weight;
+            int stored_expert = selected_expert;
+            if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                int _atomic_old_0 = atomicAdd(&expert_counts[selected_expert], 1);
+                int counted_row = _atomic_old_0;
+                stored_expert = counted_row * MAX_EXPERTS + selected_expert;
+            } else if (private_raw_hist == 0) {
+                atomicAdd(&expert_counts[selected_expert], 1);
+            }
+            topk_ids[output_base + (unsigned long long)lane] = stored_expert;
+        }
+    }
+    cooperative_groups::this_grid().sync();
+    if (bid * THREADS < M * top_k || bid * THREADS < E) {
+        int scan_counts[MAX_EXPERTS / THREADS];
+        if (private_raw_hist != 0) {
+            #pragma unroll
+            for (int private_zero_slot = 0; private_zero_slot < 512 / THREADS; private_zero_slot++) {
+                private_counts[tid + private_zero_slot * THREADS] = 0;
+            }
+            __syncthreads();
+            for (int count_pair = tid; count_pair < M * top_k; count_pair += THREADS) {
+                int count_expert = topk_ids[count_pair];
+                atomicAdd(&private_counts[count_expert], 1);
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int private_load_slot = 0; private_load_slot < MAX_EXPERTS / THREADS; private_load_slot++) {
+                int private_expert = tid * (MAX_EXPERTS / THREADS) + private_load_slot;
+                int private_count = private_counts[private_expert];
+                scan_counts[private_load_slot] = private_count;
+                if (bid == 0) {
+                    expert_counts[private_expert] = private_count;
+                }
+            }
+        } else if (MAX_EXPERTS == 512 && E == 512 && ((unsigned long long)expert_counts & 15) == 0) {
+            {
+                int4 _iv4 = *reinterpret_cast<const int4*>(expert_counts + tid * 4);
+                scan_counts[0 + 0] = _iv4.x;
+                scan_counts[0 + 1] = _iv4.y;
+                scan_counts[0 + 2] = _iv4.z;
+                scan_counts[0 + 3] = _iv4.w;
+            }
+        } else {
+            #pragma unroll
+            for (int expert_slot_count_load = 0; expert_slot_count_load < MAX_EXPERTS / THREADS; expert_slot_count_load++) {
+                int expert_count_load = tid * (MAX_EXPERTS / THREADS) + expert_slot_count_load;
+                int count_loaded = 0;
+                if (expert_count_load < E) {
+                    count_loaded = expert_counts[expert_count_load];
+                }
+                scan_counts[expert_slot_count_load] = count_loaded;
+            }
+        }
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
+        #pragma unroll
+        for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
+            int padded_count_init = 0;
+            if (expert_scan_init < E) {
+                int count_init = scan_counts[expert_slot_scan_init];
+                if (block_m == 8) {
+                    padded_count_init = count_init + 7 & -8;
+                } else if (block_m == 16) {
+                    padded_count_init = count_init + 15 & -16;
+                } else {
+                    padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                }
+            }
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                local_offsets[E] = scan_warp_inclusive;
+                if (bid == 0) {
+                    num_tokens_post_padded[0] = scan_warp_inclusive;
+                    expert_offsets[E] = scan_warp_inclusive;
+                }
+            }
+        }
+        __syncthreads();
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        if (MAX_EXPERTS == 512 && E == 512) {
+            #pragma unroll
+            for (int expert_slot_full_prefix = 0; expert_slot_full_prefix < MAX_EXPERTS / THREADS; expert_slot_full_prefix++) {
+                int expert_full_prefix = tid * (MAX_EXPERTS / THREADS) + expert_slot_full_prefix;
+                local_offsets[expert_full_prefix] = scan_expert_prefix;
+                if (bid == 0) {
+                    expert_offsets[expert_full_prefix] = scan_expert_prefix;
+                    if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                        expert_scatter_offsets[expert_full_prefix] = expert_counts[expert_full_prefix];
+                    }
+                }
+                scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_full_prefix];
+            }
+        } else {
+            #pragma unroll
+            for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+                int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+                if (expert_scan_store < E) {
+                    local_offsets[expert_scan_store] = scan_expert_prefix;
+                    if (bid == 0) {
+                        expert_offsets[expert_scan_store] = scan_expert_prefix;
+                        if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                            expert_scatter_offsets[expert_scan_store] = expert_counts[expert_scan_store];
+                        }
+                    }
+                }
+                scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
+            }
+        }
+        __syncthreads();
+        int scatter_block_mask = block_m - 1;
+        int scatter_block_shift = 0;
+        if (block_m == 8) {
+            scatter_block_shift = 3;
+        } else if (block_m == 16) {
+            scatter_block_shift = 4;
+        }
+        if (M * top_k <= num_bids * THREADS) {
+            if (global_thread < M * top_k) {
+                int pair = global_thread;
+                int stored_pair = topk_ids[pair];
+                int pair_expert = stored_pair;
+                int local_row = 0;
+                if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                    pair_expert = stored_pair % MAX_EXPERTS;
+                    local_row = stored_pair / MAX_EXPERTS;
+                    topk_ids[pair] = pair_expert;
+                } else {
+                    int _atomic_old_1 = atomicAdd(&expert_scatter_offsets[pair_expert], 1);
+                    local_row = _atomic_old_1;
+                }
+                int grouped_row = local_offsets[pair_expert] + local_row;
+                sorted_token_ids[grouped_row] = pair;
+                int scatter_block_remainder = 0;
+                if (scatter_block_shift != 0) {
+                    scatter_block_remainder = local_row & scatter_block_mask;
+                } else {
+                    scatter_block_remainder = local_row % block_m;
+                }
+                if (scatter_block_remainder == 0) {
+                    int scatter_block_index = 0;
+                    if (scatter_block_shift != 0) {
+                        scatter_block_index = grouped_row >> scatter_block_shift;
+                    } else {
+                        scatter_block_index = grouped_row / block_m;
+                    }
+                    expert_ids[scatter_block_index] = pair_expert;
+                }
+            }
+        } else {
+            for (int pair_1 = global_thread; pair_1 < M * top_k; pair_1 += num_bids * THREADS) {
+                int stored_pair_1 = topk_ids[pair_1];
+                int pair_expert_1 = stored_pair_1;
+                int local_row_1 = 0;
+                if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                    pair_expert_1 = stored_pair_1 % MAX_EXPERTS;
+                    local_row_1 = stored_pair_1 / MAX_EXPERTS;
+                    topk_ids[pair_1] = pair_expert_1;
+                } else {
+                    int _atomic_old_2 = atomicAdd(&expert_scatter_offsets[pair_expert_1], 1);
+                    local_row_1 = _atomic_old_2;
+                }
+                int grouped_row_1 = local_offsets[pair_expert_1] + local_row_1;
+                sorted_token_ids[grouped_row_1] = pair_1;
+                int scatter_block_remainder_1 = 0;
+                if (scatter_block_shift != 0) {
+                    scatter_block_remainder_1 = local_row_1 & scatter_block_mask;
+                } else {
+                    scatter_block_remainder_1 = local_row_1 % block_m;
+                }
+                if (scatter_block_remainder_1 == 0) {
+                    int scatter_block_index_1 = 0;
+                    if (scatter_block_shift != 0) {
+                        scatter_block_index_1 = grouped_row_1 >> scatter_block_shift;
+                    } else {
+                        scatter_block_index_1 = grouped_row_1 / block_m;
+                    }
+                    expert_ids[scatter_block_index_1] = pair_expert_1;
+                }
+            }
+        }
+        for (int padding_expert = global_thread; padding_expert < E; padding_expert += num_bids * THREADS) {
+            int count_final = 0;
+            if (private_raw_hist != 0) {
+                count_final = private_counts[padding_expert];
+            } else {
+                count_final = expert_counts[padding_expert];
+            }
+            int expert_start = local_offsets[padding_expert];
+            int padded_count_final = local_offsets[padding_expert + 1] - expert_start;
+            int padding_count = padded_count_final - count_final;
+            #pragma unroll
+            for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
+                if (padding_count > padding_slot) {
+                    sorted_token_ids[expert_start + count_final + padding_slot] = M * top_k;
+                }
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kThreads = THREADS;
+constexpr int kSmemTotal = SMEM_TOTAL;
+constexpr int kWarps = NUM_WARPS;
+static_assert(THREADS == NUM_WARPS * 32);
+static_assert(MAX_EXPERTS == 512);
+#undef LOOM_INF
+#undef MAX_BLOCK_M
+#undef MAX_EXPERTS
+#undef MAX_TOP_K
+#undef NUM_MAIN_STAGES
+#undef NUM_WARPS
+#undef PUBLIC_SHARED_SOFTMAX
+#undef SMEM_LOCAL_OFFSETS_OFF
+#undef SMEM_LOCAL_OFFSETS_STAGE_BYTES
+#undef SMEM_LOCAL_OFFSETS_STRIDE
+#undef SMEM_PRIVATE_COUNTS_OFF
+#undef SMEM_PRIVATE_COUNTS_STAGE_BYTES
+#undef SMEM_PRIVATE_COUNTS_STRIDE
+#undef SMEM_SCAN_VALUES_OFF
+#undef SMEM_SCAN_VALUES_STAGE_BYTES
+#undef SMEM_SCAN_VALUES_STRIDE
+#undef SMEM_TOTAL
+#undef THREADS
+}  // namespace alphamoe_router_medium_routed_generated
+
+using alphamoe_router_medium_routed_generated::kernel_alpha_moe_fused_router_medium_routed;
 
 namespace alphamoe_router_small_generated {
 typedef signed char        int8_t;
@@ -612,9 +1977,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SHARED_OFFSETS_OFF 4096
 #define SMEM_SHARED_OFFSETS_STAGE_BYTES 4100
 #define SMEM_SHARED_OFFSETS_STRIDE 4100
-#define SMEM_SCAN_VALUES_OFF 4096
-#define SMEM_SCAN_VALUES_STAGE_BYTES 4096
-#define SMEM_SCAN_VALUES_STRIDE 4096
+#define SMEM_SCAN_VALUES_OFF 20488
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
 #define SMEM_SHARED_SCATTER_OFF 8196
 #define SMEM_SHARED_SCATTER_STAGE_BYTES 4096
 #define SMEM_SHARED_SCATTER_STRIDE 4096
@@ -677,8 +2042,8 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
     const int shared_counts_addr = smem + 0;
     int* shared_offsets = reinterpret_cast<int*>(smem_raw + 4096);
     const int shared_offsets_addr = smem + 4096;
-    int* scan_values = reinterpret_cast<int*>(smem_raw + 4096);
-    const int scan_values_addr = smem + 4096;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 20488);
+    const int scan_values_addr = smem + 20488;
     int* shared_scatter = reinterpret_cast<int*>(smem_raw + 8196);
     const int shared_scatter_addr = smem + 8196;
     int* shared_ids = reinterpret_cast<int*>(smem_raw + 12292);
@@ -742,12 +2107,22 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
             float best_value = 0.0f;
             best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
-            #pragma unroll
-            for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
-                int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
-                if (expert_tie < routed_experts) {
-                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
-                        tied_index = (unsigned int)expert_tie;
+            if (best_value != -LOOM_INF) {
+                #pragma unroll
+                for (int expert_slot_finite_tie = 0; expert_slot_finite_tie < MAX_EXPERTS / 32; expert_slot_finite_tie++) {
+                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie] == best_value) {
+                        int expert_finite_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie) * 32);
+                        tied_index = (unsigned int)expert_finite_tie;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
+                    int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
+                    if (expert_tie < routed_experts) {
+                        if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
+                            tied_index = (unsigned int)expert_tie;
+                        }
                     }
                 }
             }
@@ -825,245 +2200,95 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
             atomicAdd(&shared_counts[count_expert], 1);
         }
         __syncthreads();
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
         #pragma unroll
         for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
-            int expert_scan_init = tid + expert_slot_scan_init * THREADS;
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
             int padded_count_init = 0;
             if (expert_scan_init < E) {
                 int count_init = shared_counts[expert_scan_init];
                 {
-                    padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                    if (block_m == 8) {
+                        padded_count_init = count_init + 7 & -8;
+                    } else if (block_m == 16) {
+                        padded_count_init = count_init + 15 & -16;
+                    } else {
+                        padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                    }
                 }
             }
-            scan_values[expert_scan_init] = padded_count_init;
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
         }
         __syncthreads();
-        int scan_index_up = (tid + 1) * 2 - 1;
-        if (scan_index_up < MAX_EXPERTS) {
-            scan_values[scan_index_up] = scan_values[scan_index_up] + scan_values[scan_index_up - 1];
-        }
-        int scan_index_up_0 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_up_0 < MAX_EXPERTS) {
-            scan_values[scan_index_up_0] = scan_values[scan_index_up_0] + scan_values[scan_index_up_0 - 1];
-        }
-        __syncthreads();
-        int scan_index_up_1 = (tid + 1) * 4 - 1;
-        if (scan_index_up_1 < MAX_EXPERTS) {
-            scan_values[scan_index_up_1] = scan_values[scan_index_up_1] + scan_values[scan_index_up_1 - 2];
-        }
-        int scan_index_up_2 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_up_2 < MAX_EXPERTS) {
-            scan_values[scan_index_up_2] = scan_values[scan_index_up_2] + scan_values[scan_index_up_2 - 2];
-        }
-        __syncthreads();
-        int scan_index_up_3 = (tid + 1) * 8 - 1;
-        if (scan_index_up_3 < MAX_EXPERTS) {
-            scan_values[scan_index_up_3] = scan_values[scan_index_up_3] + scan_values[scan_index_up_3 - 4];
-        }
-        int scan_index_up_4 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_up_4 < MAX_EXPERTS) {
-            scan_values[scan_index_up_4] = scan_values[scan_index_up_4] + scan_values[scan_index_up_4 - 4];
-        }
-        __syncthreads();
-        int scan_index_up_5 = (tid + 1) * 16 - 1;
-        if (scan_index_up_5 < MAX_EXPERTS) {
-            scan_values[scan_index_up_5] = scan_values[scan_index_up_5] + scan_values[scan_index_up_5 - 8];
-        }
-        int scan_index_up_6 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_up_6 < MAX_EXPERTS) {
-            scan_values[scan_index_up_6] = scan_values[scan_index_up_6] + scan_values[scan_index_up_6 - 8];
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
+            int scan_warp_peer_1 = _shfl_up_7;
+            if (lane >= 4) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_1;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                shared_total[0] = scan_warp_inclusive;
+            }
         }
         __syncthreads();
-        int scan_index_up_7 = (tid + 1) * 32 - 1;
-        if (scan_index_up_7 < MAX_EXPERTS) {
-            scan_values[scan_index_up_7] = scan_values[scan_index_up_7] + scan_values[scan_index_up_7 - 16];
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        #pragma unroll
+        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+            int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+            if (expert_scan_store < E) {
+                shared_offsets[expert_scan_store] = scan_expert_prefix;
+            }
+            scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
         }
-        int scan_index_up_8 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_up_8 < MAX_EXPERTS) {
-            scan_values[scan_index_up_8] = scan_values[scan_index_up_8] + scan_values[scan_index_up_8 - 16];
-        }
-        __syncthreads();
-        int scan_index_up_9 = (tid + 1) * 64 - 1;
-        if (scan_index_up_9 < MAX_EXPERTS) {
-            scan_values[scan_index_up_9] = scan_values[scan_index_up_9] + scan_values[scan_index_up_9 - 32];
-        }
-        int scan_index_up_10 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_up_10 < MAX_EXPERTS) {
-            scan_values[scan_index_up_10] = scan_values[scan_index_up_10] + scan_values[scan_index_up_10 - 32];
-        }
-        __syncthreads();
-        int scan_index_up_11 = (tid + 1) * 128 - 1;
-        if (scan_index_up_11 < MAX_EXPERTS) {
-            scan_values[scan_index_up_11] = scan_values[scan_index_up_11] + scan_values[scan_index_up_11 - 64];
-        }
-        int scan_index_up_12 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_up_12 < MAX_EXPERTS) {
-            scan_values[scan_index_up_12] = scan_values[scan_index_up_12] + scan_values[scan_index_up_12 - 64];
-        }
-        __syncthreads();
-        int scan_index_up_13 = (tid + 1) * 256 - 1;
-        if (scan_index_up_13 < MAX_EXPERTS) {
-            scan_values[scan_index_up_13] = scan_values[scan_index_up_13] + scan_values[scan_index_up_13 - 128];
-        }
-        int scan_index_up_14 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_up_14 < MAX_EXPERTS) {
-            scan_values[scan_index_up_14] = scan_values[scan_index_up_14] + scan_values[scan_index_up_14 - 128];
-        }
-        __syncthreads();
-        int scan_index_up_15 = (tid + 1) * 512 - 1;
-        if (scan_index_up_15 < MAX_EXPERTS) {
-            scan_values[scan_index_up_15] = scan_values[scan_index_up_15] + scan_values[scan_index_up_15 - 256];
-        }
-        int scan_index_up_16 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_up_16 < MAX_EXPERTS) {
-            scan_values[scan_index_up_16] = scan_values[scan_index_up_16] + scan_values[scan_index_up_16 - 256];
-        }
-        __syncthreads();
-        int scan_index_up_17 = (tid + 1) * 1024 - 1;
-        if (scan_index_up_17 < MAX_EXPERTS) {
-            scan_values[scan_index_up_17] = scan_values[scan_index_up_17] + scan_values[scan_index_up_17 - 512];
-        }
-        int scan_index_up_18 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_up_18 < MAX_EXPERTS) {
-            scan_values[scan_index_up_18] = scan_values[scan_index_up_18] + scan_values[scan_index_up_18 - 512];
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int padded_total = scan_values[MAX_EXPERTS - 1];
-            shared_total[0] = padded_total;
-            scan_values[MAX_EXPERTS - 1] = 0;
-        }
-        __syncthreads();
-        int scan_index_down = (tid + 1) * 1024 - 1;
-        if (scan_index_down < MAX_EXPERTS) {
-            int scan_left = scan_values[scan_index_down - 512];
-            scan_values[scan_index_down - 512] = scan_values[scan_index_down];
-            scan_values[scan_index_down] = scan_values[scan_index_down] + scan_left;
-        }
-        int scan_index_down_19 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_down_19 < MAX_EXPERTS) {
-            int scan_left_1 = scan_values[scan_index_down_19 - 512];
-            scan_values[scan_index_down_19 - 512] = scan_values[scan_index_down_19];
-            scan_values[scan_index_down_19] = scan_values[scan_index_down_19] + scan_left_1;
-        }
-        __syncthreads();
-        int scan_index_down_20 = (tid + 1) * 512 - 1;
-        if (scan_index_down_20 < MAX_EXPERTS) {
-            int scan_left_2 = scan_values[scan_index_down_20 - 256];
-            scan_values[scan_index_down_20 - 256] = scan_values[scan_index_down_20];
-            scan_values[scan_index_down_20] = scan_values[scan_index_down_20] + scan_left_2;
-        }
-        int scan_index_down_21 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_down_21 < MAX_EXPERTS) {
-            int scan_left_3 = scan_values[scan_index_down_21 - 256];
-            scan_values[scan_index_down_21 - 256] = scan_values[scan_index_down_21];
-            scan_values[scan_index_down_21] = scan_values[scan_index_down_21] + scan_left_3;
-        }
-        __syncthreads();
-        int scan_index_down_22 = (tid + 1) * 256 - 1;
-        if (scan_index_down_22 < MAX_EXPERTS) {
-            int scan_left_4 = scan_values[scan_index_down_22 - 128];
-            scan_values[scan_index_down_22 - 128] = scan_values[scan_index_down_22];
-            scan_values[scan_index_down_22] = scan_values[scan_index_down_22] + scan_left_4;
-        }
-        int scan_index_down_23 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_down_23 < MAX_EXPERTS) {
-            int scan_left_5 = scan_values[scan_index_down_23 - 128];
-            scan_values[scan_index_down_23 - 128] = scan_values[scan_index_down_23];
-            scan_values[scan_index_down_23] = scan_values[scan_index_down_23] + scan_left_5;
-        }
-        __syncthreads();
-        int scan_index_down_24 = (tid + 1) * 128 - 1;
-        if (scan_index_down_24 < MAX_EXPERTS) {
-            int scan_left_6 = scan_values[scan_index_down_24 - 64];
-            scan_values[scan_index_down_24 - 64] = scan_values[scan_index_down_24];
-            scan_values[scan_index_down_24] = scan_values[scan_index_down_24] + scan_left_6;
-        }
-        int scan_index_down_25 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_down_25 < MAX_EXPERTS) {
-            int scan_left_7 = scan_values[scan_index_down_25 - 64];
-            scan_values[scan_index_down_25 - 64] = scan_values[scan_index_down_25];
-            scan_values[scan_index_down_25] = scan_values[scan_index_down_25] + scan_left_7;
-        }
-        __syncthreads();
-        int scan_index_down_26 = (tid + 1) * 64 - 1;
-        if (scan_index_down_26 < MAX_EXPERTS) {
-            int scan_left_8 = scan_values[scan_index_down_26 - 32];
-            scan_values[scan_index_down_26 - 32] = scan_values[scan_index_down_26];
-            scan_values[scan_index_down_26] = scan_values[scan_index_down_26] + scan_left_8;
-        }
-        int scan_index_down_27 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_down_27 < MAX_EXPERTS) {
-            int scan_left_9 = scan_values[scan_index_down_27 - 32];
-            scan_values[scan_index_down_27 - 32] = scan_values[scan_index_down_27];
-            scan_values[scan_index_down_27] = scan_values[scan_index_down_27] + scan_left_9;
-        }
-        __syncthreads();
-        int scan_index_down_28 = (tid + 1) * 32 - 1;
-        if (scan_index_down_28 < MAX_EXPERTS) {
-            int scan_left_10 = scan_values[scan_index_down_28 - 16];
-            scan_values[scan_index_down_28 - 16] = scan_values[scan_index_down_28];
-            scan_values[scan_index_down_28] = scan_values[scan_index_down_28] + scan_left_10;
-        }
-        int scan_index_down_29 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_down_29 < MAX_EXPERTS) {
-            int scan_left_11 = scan_values[scan_index_down_29 - 16];
-            scan_values[scan_index_down_29 - 16] = scan_values[scan_index_down_29];
-            scan_values[scan_index_down_29] = scan_values[scan_index_down_29] + scan_left_11;
-        }
-        __syncthreads();
-        int scan_index_down_30 = (tid + 1) * 16 - 1;
-        if (scan_index_down_30 < MAX_EXPERTS) {
-            int scan_left_12 = scan_values[scan_index_down_30 - 8];
-            scan_values[scan_index_down_30 - 8] = scan_values[scan_index_down_30];
-            scan_values[scan_index_down_30] = scan_values[scan_index_down_30] + scan_left_12;
-        }
-        int scan_index_down_31 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_down_31 < MAX_EXPERTS) {
-            int scan_left_13 = scan_values[scan_index_down_31 - 8];
-            scan_values[scan_index_down_31 - 8] = scan_values[scan_index_down_31];
-            scan_values[scan_index_down_31] = scan_values[scan_index_down_31] + scan_left_13;
-        }
-        __syncthreads();
-        int scan_index_down_32 = (tid + 1) * 8 - 1;
-        if (scan_index_down_32 < MAX_EXPERTS) {
-            int scan_left_14 = scan_values[scan_index_down_32 - 4];
-            scan_values[scan_index_down_32 - 4] = scan_values[scan_index_down_32];
-            scan_values[scan_index_down_32] = scan_values[scan_index_down_32] + scan_left_14;
-        }
-        int scan_index_down_33 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_down_33 < MAX_EXPERTS) {
-            int scan_left_15 = scan_values[scan_index_down_33 - 4];
-            scan_values[scan_index_down_33 - 4] = scan_values[scan_index_down_33];
-            scan_values[scan_index_down_33] = scan_values[scan_index_down_33] + scan_left_15;
-        }
-        __syncthreads();
-        int scan_index_down_34 = (tid + 1) * 4 - 1;
-        if (scan_index_down_34 < MAX_EXPERTS) {
-            int scan_left_16 = scan_values[scan_index_down_34 - 2];
-            scan_values[scan_index_down_34 - 2] = scan_values[scan_index_down_34];
-            scan_values[scan_index_down_34] = scan_values[scan_index_down_34] + scan_left_16;
-        }
-        int scan_index_down_35 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_down_35 < MAX_EXPERTS) {
-            int scan_left_17 = scan_values[scan_index_down_35 - 2];
-            scan_values[scan_index_down_35 - 2] = scan_values[scan_index_down_35];
-            scan_values[scan_index_down_35] = scan_values[scan_index_down_35] + scan_left_17;
-        }
-        __syncthreads();
-        int scan_index_down_36 = (tid + 1) * 2 - 1;
-        if (scan_index_down_36 < MAX_EXPERTS) {
-            int scan_left_18 = scan_values[scan_index_down_36 - 1];
-            scan_values[scan_index_down_36 - 1] = scan_values[scan_index_down_36];
-            scan_values[scan_index_down_36] = scan_values[scan_index_down_36] + scan_left_18;
-        }
-        int scan_index_down_37 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_down_37 < MAX_EXPERTS) {
-            int scan_left_19 = scan_values[scan_index_down_37 - 1];
-            scan_values[scan_index_down_37 - 1] = scan_values[scan_index_down_37];
-            scan_values[scan_index_down_37] = scan_values[scan_index_down_37] + scan_left_19;
-        }
-        __syncthreads();
         if (tid == 0) {
             shared_offsets[E] = shared_total[0];
         }
@@ -1075,18 +2300,25 @@ kernel_alpha_moe_fused_router_small(float* __restrict__ logits, float* __restric
             int grouped_row = shared_offsets[pair_expert] + local_row;
             sorted_token_ids[grouped_row] = pair;
             {
-                if (local_row % block_m == 0) {
-                    expert_ids[grouped_row / block_m] = pair_expert;
+                if (block_m == 8) {
+                    if ((local_row & 7) == 0) {
+                        expert_ids[grouped_row >> 3] = pair_expert;
+                    }
+                } else if (block_m == 16) {
+                    if ((local_row & 15) == 0) {
+                        expert_ids[grouped_row >> 4] = pair_expert;
+                    }
+                } else {
+                    if (local_row % block_m == 0) {
+                        expert_ids[grouped_row / block_m] = pair_expert;
+                    }
                 }
             }
         }
         for (int padding_expert = tid; padding_expert < E; padding_expert += THREADS) {
             int count_final = shared_counts[padding_expert];
             int expert_start = shared_offsets[padding_expert];
-            int padded_count_final = 0;
-            {
-                padded_count_final = (count_final + block_m - 1) / block_m * block_m;
-            }
+            int padded_count_final = shared_offsets[padding_expert + 1] - expert_start;
             int padding_count = padded_count_final - count_final;
             #pragma unroll
             for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
@@ -1147,539 +2379,7 @@ static_assert(MAX_EXPERTS == 512);
 #undef THREADS
 }  // namespace alphamoe_router_small_generated
 
-using alphamoe_router_large_generated::kernel_alpha_moe_fused_router;
 using alphamoe_router_small_generated::kernel_alpha_moe_fused_router_small;
-constexpr int kGeneratedThreads = alphamoe_router_large_generated::kThreads;
-constexpr int kGeneratedSmemTotal = alphamoe_router_large_generated::kSmemTotal;
-constexpr int kGeneratedWarps = alphamoe_router_large_generated::kWarps;
-constexpr int kSmallGeneratedThreads = alphamoe_router_small_generated::kThreads;
-constexpr int kSmallGeneratedSmemTotal = alphamoe_router_small_generated::kSmemTotal;
-constexpr int kSmallGeneratedWarps = alphamoe_router_small_generated::kWarps;
-
-
-namespace alphamoe_router_large_routed_generated {
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
-struct __align__(64) LoomTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(LoomTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(LoomTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(LoomTensorMap) >= alignof(CUtensorMap), "LoomTensorMap alignment must cover the CUtensorMap CUDA ABI");
-
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define LOOM_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SCAN_VALUES_OFF 0
-#define SMEM_SCAN_VALUES_STAGE_BYTES 4096
-#define SMEM_SCAN_VALUES_STRIDE 4096
-#define SMEM_TOTAL 4096
-#define THREADS 256
-#define NUM_WARPS 8
-#define MAX_EXPERTS 512
-#define MAX_TOP_K 16
-#define MAX_BLOCK_M 16
-#define PUBLIC_SHARED_SOFTMAX 0
-
-
-__device__ __forceinline__ float approx_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float approx_rcp(float x) {
-    float y;
-    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
-extern "C" {
-
-__global__ __launch_bounds__(256) void
-kernel_alpha_moe_fused_router_routed(float* __restrict__ logits, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M, int E, int top_k, int block_m, int has_shared_expert)
-{
-    const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
-
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    // Kernel setup ops
-    int* scan_values = reinterpret_cast<int*>(smem_raw + 0);
-    const int scan_values_addr = smem + 0;
-
-    // === Task calls (dependency order) ===
-    int global_thread = bid * THREADS + tid;
-    if (bid == 0) {
-        #pragma unroll
-        for (int expert_slot_zero = 0; expert_slot_zero < MAX_EXPERTS / THREADS; expert_slot_zero++) {
-            int expert_zero = tid + expert_slot_zero * THREADS;
-            if (expert_zero < E) {
-                expert_counts[expert_zero] = 0;
-                expert_offsets[expert_zero] = 0;
-                expert_scatter_offsets[expert_zero] = 0;
-            }
-        }
-        if (tid == 0) {
-            expert_offsets[E] = 0;
-            num_tokens_post_padded[0] = 0;
-        }
-    }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
-    int routed_experts = E - has_shared_expert;
-    int routed_top_k = top_k - has_shared_expert;
-    for (int token = (unsigned int)(bid * NUM_WARPS) + warp; token < M; token += num_bids * NUM_WARPS) {
-        unsigned long long row_base = (unsigned long long)token * (unsigned long long)E;
-        float row_values[MAX_EXPERTS / 32];
-        #pragma unroll
-        for (int expert_slot_load = 0; expert_slot_load < MAX_EXPERTS / 32; expert_slot_load++) {
-            int expert_load = lane + (unsigned int)(expert_slot_load * 32);
-            row_values[expert_slot_load] = -LOOM_INF;
-            if (expert_load < routed_experts) {
-                row_values[expert_slot_load] = logits[row_base + (unsigned long long)expert_load];
-            }
-        }
-        unsigned long long output_base = (unsigned long long)token * (unsigned long long)top_k;
-        float selected_logit = -LOOM_INF;
-        int selected_expert = MAX_EXPERTS;
-        #pragma unroll 1
-        for (int route = 0; route < routed_top_k; route++) {
-            float local_max_0 = -LOOM_INF;
-            float local_max_1 = -LOOM_INF;
-            float local_max_2 = -LOOM_INF;
-            float local_max_3 = -LOOM_INF;
-            #pragma unroll
-            for (int scan_group = 0; scan_group < MAX_EXPERTS / 128; scan_group++) {
-                float _fmax_0 = fmaxf(local_max_0, row_values[scan_group * 4]);
-                local_max_0 = _fmax_0;
-                float _fmax_1 = fmaxf(local_max_1, row_values[scan_group * 4 + 1]);
-                local_max_1 = _fmax_1;
-                float _fmax_2 = fmaxf(local_max_2, row_values[scan_group * 4 + 2]);
-                local_max_2 = _fmax_2;
-                float _fmax_3 = fmaxf(local_max_3, row_values[scan_group * 4 + 3]);
-                local_max_3 = _fmax_3;
-            }
-            float _fmax_4 = fmaxf(local_max_0, local_max_1);
-            float local_max_low = _fmax_4;
-            float _fmax_5 = fmaxf(local_max_2, local_max_3);
-            float local_max_high = _fmax_5;
-            float _fmax_6 = fmaxf(local_max_low, local_max_high);
-            float local_value = _fmax_6;
-            unsigned int local_bits = 0;
-            local_bits = reinterpret_cast<unsigned int*>(&local_value)[0];
-            unsigned int local_key = local_bits ^ 2147483648;
-            if ((local_bits & 2147483648) != 0) {
-                local_key = local_bits ^ 4294967295;
-            }
-            unsigned int _warp_redux_u32_0;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(local_key));
-            unsigned int best_key = _warp_redux_u32_0;
-            unsigned int best_bits = best_key ^ 2147483648;
-            if ((best_key & 2147483648) == 0) {
-                best_bits = best_key ^ 4294967295;
-            }
-            float best_value = 0.0f;
-            best_value = reinterpret_cast<float*>(&best_bits)[0];
-            unsigned int tied_index = MAX_EXPERTS;
-            #pragma unroll
-            for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
-                int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
-                if (expert_tie < routed_experts) {
-                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
-                        tied_index = (unsigned int)expert_tie;
-                    }
-                }
-            }
-            unsigned int _warp_redux_u32_1;
-            asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_1) : "r"(tied_index));
-            int best_index = (int)_warp_redux_u32_1;
-            if (lane == (unsigned int)route) {
-                selected_logit = best_value;
-                selected_expert = best_index;
-            }
-            #pragma unroll
-            for (int expert_slot_remove = 0; expert_slot_remove < MAX_EXPERTS / 32; expert_slot_remove++) {
-                if (lane + (unsigned int)(expert_slot_remove * 32) == (unsigned int)best_index) {
-                    row_values[expert_slot_remove] = -LOOM_INF;
-                }
-            }
-        }
-        if (has_shared_expert != 0) {
-            if (lane == (unsigned int)routed_top_k) {
-                selected_expert = E - 1;
-                selected_logit = logits[row_base + (unsigned long long)selected_expert];
-            }
-        }
-        int softmax_top_k = routed_top_k;
-        float selected_for_max = -LOOM_INF;
-        if ((unsigned int)softmax_top_k > lane) {
-            selected_for_max = selected_logit;
-        }
-        float _warp_reduce_0 = selected_for_max;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 = max_noftz(_warp_reduce_0, __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset));
-        float selected_max = _warp_reduce_0;
-        float selected_exp = 0.0f;
-        if ((unsigned int)softmax_top_k > lane) {
-            float _exp2_0 = approx_exp2((selected_logit - selected_max) * 1.4426950408889634f);
-            selected_exp = _exp2_0;
-        }
-        float _warp_reduce_1 = selected_exp;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
-        float selected_sum = _warp_reduce_1;
-        float _rcp_0 = approx_rcp(selected_sum);
-        float selected_sum_rcp = _rcp_0;
-        if (lane < (unsigned int)top_k) {
-            float weight = selected_logit;
-            if ((unsigned int)softmax_top_k > lane) {
-                weight = selected_exp * selected_sum_rcp;
-            }
-            topk_weights[output_base + (unsigned long long)lane] = weight;
-            topk_ids[output_base + (unsigned long long)lane] = selected_expert;
-            atomicAdd(&expert_counts[selected_expert], 1);
-        }
-    }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
-    if (bid == 0) {
-        #pragma unroll
-        for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
-            int expert_scan_init = tid + expert_slot_scan_init * THREADS;
-            int padded_count_init = 0;
-            if (expert_scan_init < E) {
-                int count_init = expert_counts[expert_scan_init];
-                padded_count_init = (count_init + block_m - 1) / block_m * block_m;
-            }
-            scan_values[expert_scan_init] = padded_count_init;
-        }
-        __syncthreads();
-        int scan_index_up = (tid + 1) * 2 - 1;
-        if (scan_index_up < MAX_EXPERTS) {
-            scan_values[scan_index_up] = scan_values[scan_index_up] + scan_values[scan_index_up - 1];
-        }
-        int scan_index_up_0 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_up_0 < MAX_EXPERTS) {
-            scan_values[scan_index_up_0] = scan_values[scan_index_up_0] + scan_values[scan_index_up_0 - 1];
-        }
-        __syncthreads();
-        int scan_index_up_1 = (tid + 1) * 4 - 1;
-        if (scan_index_up_1 < MAX_EXPERTS) {
-            scan_values[scan_index_up_1] = scan_values[scan_index_up_1] + scan_values[scan_index_up_1 - 2];
-        }
-        int scan_index_up_2 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_up_2 < MAX_EXPERTS) {
-            scan_values[scan_index_up_2] = scan_values[scan_index_up_2] + scan_values[scan_index_up_2 - 2];
-        }
-        __syncthreads();
-        int scan_index_up_3 = (tid + 1) * 8 - 1;
-        if (scan_index_up_3 < MAX_EXPERTS) {
-            scan_values[scan_index_up_3] = scan_values[scan_index_up_3] + scan_values[scan_index_up_3 - 4];
-        }
-        int scan_index_up_4 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_up_4 < MAX_EXPERTS) {
-            scan_values[scan_index_up_4] = scan_values[scan_index_up_4] + scan_values[scan_index_up_4 - 4];
-        }
-        __syncthreads();
-        int scan_index_up_5 = (tid + 1) * 16 - 1;
-        if (scan_index_up_5 < MAX_EXPERTS) {
-            scan_values[scan_index_up_5] = scan_values[scan_index_up_5] + scan_values[scan_index_up_5 - 8];
-        }
-        int scan_index_up_6 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_up_6 < MAX_EXPERTS) {
-            scan_values[scan_index_up_6] = scan_values[scan_index_up_6] + scan_values[scan_index_up_6 - 8];
-        }
-        __syncthreads();
-        int scan_index_up_7 = (tid + 1) * 32 - 1;
-        if (scan_index_up_7 < MAX_EXPERTS) {
-            scan_values[scan_index_up_7] = scan_values[scan_index_up_7] + scan_values[scan_index_up_7 - 16];
-        }
-        int scan_index_up_8 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_up_8 < MAX_EXPERTS) {
-            scan_values[scan_index_up_8] = scan_values[scan_index_up_8] + scan_values[scan_index_up_8 - 16];
-        }
-        __syncthreads();
-        int scan_index_up_9 = (tid + 1) * 64 - 1;
-        if (scan_index_up_9 < MAX_EXPERTS) {
-            scan_values[scan_index_up_9] = scan_values[scan_index_up_9] + scan_values[scan_index_up_9 - 32];
-        }
-        int scan_index_up_10 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_up_10 < MAX_EXPERTS) {
-            scan_values[scan_index_up_10] = scan_values[scan_index_up_10] + scan_values[scan_index_up_10 - 32];
-        }
-        __syncthreads();
-        int scan_index_up_11 = (tid + 1) * 128 - 1;
-        if (scan_index_up_11 < MAX_EXPERTS) {
-            scan_values[scan_index_up_11] = scan_values[scan_index_up_11] + scan_values[scan_index_up_11 - 64];
-        }
-        int scan_index_up_12 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_up_12 < MAX_EXPERTS) {
-            scan_values[scan_index_up_12] = scan_values[scan_index_up_12] + scan_values[scan_index_up_12 - 64];
-        }
-        __syncthreads();
-        int scan_index_up_13 = (tid + 1) * 256 - 1;
-        if (scan_index_up_13 < MAX_EXPERTS) {
-            scan_values[scan_index_up_13] = scan_values[scan_index_up_13] + scan_values[scan_index_up_13 - 128];
-        }
-        int scan_index_up_14 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_up_14 < MAX_EXPERTS) {
-            scan_values[scan_index_up_14] = scan_values[scan_index_up_14] + scan_values[scan_index_up_14 - 128];
-        }
-        __syncthreads();
-        int scan_index_up_15 = (tid + 1) * 512 - 1;
-        if (scan_index_up_15 < MAX_EXPERTS) {
-            scan_values[scan_index_up_15] = scan_values[scan_index_up_15] + scan_values[scan_index_up_15 - 256];
-        }
-        int scan_index_up_16 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_up_16 < MAX_EXPERTS) {
-            scan_values[scan_index_up_16] = scan_values[scan_index_up_16] + scan_values[scan_index_up_16 - 256];
-        }
-        __syncthreads();
-        int scan_index_up_17 = (tid + 1) * 1024 - 1;
-        if (scan_index_up_17 < MAX_EXPERTS) {
-            scan_values[scan_index_up_17] = scan_values[scan_index_up_17] + scan_values[scan_index_up_17 - 512];
-        }
-        int scan_index_up_18 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_up_18 < MAX_EXPERTS) {
-            scan_values[scan_index_up_18] = scan_values[scan_index_up_18] + scan_values[scan_index_up_18 - 512];
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int padded_total = scan_values[MAX_EXPERTS - 1];
-            num_tokens_post_padded[0] = padded_total;
-            scan_values[MAX_EXPERTS - 1] = 0;
-        }
-        __syncthreads();
-        int scan_index_down = (tid + 1) * 1024 - 1;
-        if (scan_index_down < MAX_EXPERTS) {
-            int scan_left = scan_values[scan_index_down - 512];
-            scan_values[scan_index_down - 512] = scan_values[scan_index_down];
-            scan_values[scan_index_down] = scan_values[scan_index_down] + scan_left;
-        }
-        int scan_index_down_19 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_down_19 < MAX_EXPERTS) {
-            int scan_left_1 = scan_values[scan_index_down_19 - 512];
-            scan_values[scan_index_down_19 - 512] = scan_values[scan_index_down_19];
-            scan_values[scan_index_down_19] = scan_values[scan_index_down_19] + scan_left_1;
-        }
-        __syncthreads();
-        int scan_index_down_20 = (tid + 1) * 512 - 1;
-        if (scan_index_down_20 < MAX_EXPERTS) {
-            int scan_left_2 = scan_values[scan_index_down_20 - 256];
-            scan_values[scan_index_down_20 - 256] = scan_values[scan_index_down_20];
-            scan_values[scan_index_down_20] = scan_values[scan_index_down_20] + scan_left_2;
-        }
-        int scan_index_down_21 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_down_21 < MAX_EXPERTS) {
-            int scan_left_3 = scan_values[scan_index_down_21 - 256];
-            scan_values[scan_index_down_21 - 256] = scan_values[scan_index_down_21];
-            scan_values[scan_index_down_21] = scan_values[scan_index_down_21] + scan_left_3;
-        }
-        __syncthreads();
-        int scan_index_down_22 = (tid + 1) * 256 - 1;
-        if (scan_index_down_22 < MAX_EXPERTS) {
-            int scan_left_4 = scan_values[scan_index_down_22 - 128];
-            scan_values[scan_index_down_22 - 128] = scan_values[scan_index_down_22];
-            scan_values[scan_index_down_22] = scan_values[scan_index_down_22] + scan_left_4;
-        }
-        int scan_index_down_23 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_down_23 < MAX_EXPERTS) {
-            int scan_left_5 = scan_values[scan_index_down_23 - 128];
-            scan_values[scan_index_down_23 - 128] = scan_values[scan_index_down_23];
-            scan_values[scan_index_down_23] = scan_values[scan_index_down_23] + scan_left_5;
-        }
-        __syncthreads();
-        int scan_index_down_24 = (tid + 1) * 128 - 1;
-        if (scan_index_down_24 < MAX_EXPERTS) {
-            int scan_left_6 = scan_values[scan_index_down_24 - 64];
-            scan_values[scan_index_down_24 - 64] = scan_values[scan_index_down_24];
-            scan_values[scan_index_down_24] = scan_values[scan_index_down_24] + scan_left_6;
-        }
-        int scan_index_down_25 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_down_25 < MAX_EXPERTS) {
-            int scan_left_7 = scan_values[scan_index_down_25 - 64];
-            scan_values[scan_index_down_25 - 64] = scan_values[scan_index_down_25];
-            scan_values[scan_index_down_25] = scan_values[scan_index_down_25] + scan_left_7;
-        }
-        __syncthreads();
-        int scan_index_down_26 = (tid + 1) * 64 - 1;
-        if (scan_index_down_26 < MAX_EXPERTS) {
-            int scan_left_8 = scan_values[scan_index_down_26 - 32];
-            scan_values[scan_index_down_26 - 32] = scan_values[scan_index_down_26];
-            scan_values[scan_index_down_26] = scan_values[scan_index_down_26] + scan_left_8;
-        }
-        int scan_index_down_27 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_down_27 < MAX_EXPERTS) {
-            int scan_left_9 = scan_values[scan_index_down_27 - 32];
-            scan_values[scan_index_down_27 - 32] = scan_values[scan_index_down_27];
-            scan_values[scan_index_down_27] = scan_values[scan_index_down_27] + scan_left_9;
-        }
-        __syncthreads();
-        int scan_index_down_28 = (tid + 1) * 32 - 1;
-        if (scan_index_down_28 < MAX_EXPERTS) {
-            int scan_left_10 = scan_values[scan_index_down_28 - 16];
-            scan_values[scan_index_down_28 - 16] = scan_values[scan_index_down_28];
-            scan_values[scan_index_down_28] = scan_values[scan_index_down_28] + scan_left_10;
-        }
-        int scan_index_down_29 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_down_29 < MAX_EXPERTS) {
-            int scan_left_11 = scan_values[scan_index_down_29 - 16];
-            scan_values[scan_index_down_29 - 16] = scan_values[scan_index_down_29];
-            scan_values[scan_index_down_29] = scan_values[scan_index_down_29] + scan_left_11;
-        }
-        __syncthreads();
-        int scan_index_down_30 = (tid + 1) * 16 - 1;
-        if (scan_index_down_30 < MAX_EXPERTS) {
-            int scan_left_12 = scan_values[scan_index_down_30 - 8];
-            scan_values[scan_index_down_30 - 8] = scan_values[scan_index_down_30];
-            scan_values[scan_index_down_30] = scan_values[scan_index_down_30] + scan_left_12;
-        }
-        int scan_index_down_31 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_down_31 < MAX_EXPERTS) {
-            int scan_left_13 = scan_values[scan_index_down_31 - 8];
-            scan_values[scan_index_down_31 - 8] = scan_values[scan_index_down_31];
-            scan_values[scan_index_down_31] = scan_values[scan_index_down_31] + scan_left_13;
-        }
-        __syncthreads();
-        int scan_index_down_32 = (tid + 1) * 8 - 1;
-        if (scan_index_down_32 < MAX_EXPERTS) {
-            int scan_left_14 = scan_values[scan_index_down_32 - 4];
-            scan_values[scan_index_down_32 - 4] = scan_values[scan_index_down_32];
-            scan_values[scan_index_down_32] = scan_values[scan_index_down_32] + scan_left_14;
-        }
-        int scan_index_down_33 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_down_33 < MAX_EXPERTS) {
-            int scan_left_15 = scan_values[scan_index_down_33 - 4];
-            scan_values[scan_index_down_33 - 4] = scan_values[scan_index_down_33];
-            scan_values[scan_index_down_33] = scan_values[scan_index_down_33] + scan_left_15;
-        }
-        __syncthreads();
-        int scan_index_down_34 = (tid + 1) * 4 - 1;
-        if (scan_index_down_34 < MAX_EXPERTS) {
-            int scan_left_16 = scan_values[scan_index_down_34 - 2];
-            scan_values[scan_index_down_34 - 2] = scan_values[scan_index_down_34];
-            scan_values[scan_index_down_34] = scan_values[scan_index_down_34] + scan_left_16;
-        }
-        int scan_index_down_35 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_down_35 < MAX_EXPERTS) {
-            int scan_left_17 = scan_values[scan_index_down_35 - 2];
-            scan_values[scan_index_down_35 - 2] = scan_values[scan_index_down_35];
-            scan_values[scan_index_down_35] = scan_values[scan_index_down_35] + scan_left_17;
-        }
-        __syncthreads();
-        int scan_index_down_36 = (tid + 1) * 2 - 1;
-        if (scan_index_down_36 < MAX_EXPERTS) {
-            int scan_left_18 = scan_values[scan_index_down_36 - 1];
-            scan_values[scan_index_down_36 - 1] = scan_values[scan_index_down_36];
-            scan_values[scan_index_down_36] = scan_values[scan_index_down_36] + scan_left_18;
-        }
-        int scan_index_down_37 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_down_37 < MAX_EXPERTS) {
-            int scan_left_19 = scan_values[scan_index_down_37 - 1];
-            scan_values[scan_index_down_37 - 1] = scan_values[scan_index_down_37];
-            scan_values[scan_index_down_37] = scan_values[scan_index_down_37] + scan_left_19;
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
-            int expert_scan_store = tid + expert_slot_scan_store * THREADS;
-            if (expert_scan_store < E) {
-                expert_offsets[expert_scan_store] = scan_values[expert_scan_store];
-            }
-        }
-        if (tid == 0) {
-            expert_offsets[E] = num_tokens_post_padded[0];
-        }
-    }
-    __threadfence();
-    cooperative_groups::this_grid().sync();
-    for (int pair = global_thread; pair < M * top_k; pair += num_bids * THREADS) {
-        int pair_expert = topk_ids[pair];
-        int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[pair_expert], 1);
-        int local_row = _atomic_old_0;
-        int grouped_row = expert_offsets[pair_expert] + local_row;
-        sorted_token_ids[grouped_row] = pair;
-        if (local_row % block_m == 0) {
-            expert_ids[grouped_row / block_m] = pair_expert;
-        }
-    }
-    for (int padding_expert = global_thread; padding_expert < E; padding_expert += num_bids * THREADS) {
-        int count_final = expert_counts[padding_expert];
-        int expert_start = expert_offsets[padding_expert];
-        int padded_count_final = (count_final + block_m - 1) / block_m * block_m;
-        int padding_count = padded_count_final - count_final;
-        #pragma unroll
-        for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
-            if (padding_count > padding_slot) {
-                sorted_token_ids[expert_start + count_final + padding_slot] = M * top_k;
-            }
-        }
-    }
-}
-
-} // extern "C"
-
-
-constexpr int kThreads = THREADS;
-constexpr int kSmemTotal = SMEM_TOTAL;
-constexpr int kWarps = NUM_WARPS;
-static_assert(THREADS == NUM_WARPS * 32);
-static_assert(MAX_EXPERTS == 512);
-#undef LOOM_INF
-#undef MAX_BLOCK_M
-#undef MAX_EXPERTS
-#undef MAX_TOP_K
-#undef NUM_MAIN_STAGES
-#undef NUM_WARPS
-#undef PUBLIC_SHARED_SOFTMAX
-#undef SMEM_SCAN_VALUES_OFF
-#undef SMEM_SCAN_VALUES_STAGE_BYTES
-#undef SMEM_SCAN_VALUES_STRIDE
-#undef SMEM_TOTAL
-#undef THREADS
-}  // namespace alphamoe_router_large_routed_generated
 
 namespace alphamoe_router_small_routed_generated {
 typedef signed char        int8_t;
@@ -1724,9 +2424,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SHARED_OFFSETS_OFF 4096
 #define SMEM_SHARED_OFFSETS_STAGE_BYTES 4100
 #define SMEM_SHARED_OFFSETS_STRIDE 4100
-#define SMEM_SCAN_VALUES_OFF 4096
-#define SMEM_SCAN_VALUES_STAGE_BYTES 4096
-#define SMEM_SCAN_VALUES_STRIDE 4096
+#define SMEM_SCAN_VALUES_OFF 20488
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
 #define SMEM_SHARED_SCATTER_OFF 8196
 #define SMEM_SHARED_SCATTER_STAGE_BYTES 4096
 #define SMEM_SHARED_SCATTER_STRIDE 4096
@@ -1789,8 +2489,8 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
     const int shared_counts_addr = smem + 0;
     int* shared_offsets = reinterpret_cast<int*>(smem_raw + 4096);
     const int shared_offsets_addr = smem + 4096;
-    int* scan_values = reinterpret_cast<int*>(smem_raw + 4096);
-    const int scan_values_addr = smem + 4096;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 20488);
+    const int scan_values_addr = smem + 20488;
     int* shared_scatter = reinterpret_cast<int*>(smem_raw + 8196);
     const int shared_scatter_addr = smem + 8196;
     int* shared_ids = reinterpret_cast<int*>(smem_raw + 12292);
@@ -1854,12 +2554,22 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
             float best_value = 0.0f;
             best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
-            #pragma unroll
-            for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
-                int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
-                if (expert_tie < routed_experts) {
-                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
-                        tied_index = (unsigned int)expert_tie;
+            if (best_value != -LOOM_INF) {
+                #pragma unroll
+                for (int expert_slot_finite_tie = 0; expert_slot_finite_tie < MAX_EXPERTS / 32; expert_slot_finite_tie++) {
+                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie] == best_value) {
+                        int expert_finite_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie) * 32);
+                        tied_index = (unsigned int)expert_finite_tie;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
+                    int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
+                    if (expert_tie < routed_experts) {
+                        if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
+                            tied_index = (unsigned int)expert_tie;
+                        }
                     }
                 }
             }
@@ -1934,245 +2644,95 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
             atomicAdd(&shared_counts[count_expert], 1);
         }
         __syncthreads();
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
         #pragma unroll
         for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
-            int expert_scan_init = tid + expert_slot_scan_init * THREADS;
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
             int padded_count_init = 0;
             if (expert_scan_init < E) {
                 int count_init = shared_counts[expert_scan_init];
                 {
-                    padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                    if (block_m == 8) {
+                        padded_count_init = count_init + 7 & -8;
+                    } else if (block_m == 16) {
+                        padded_count_init = count_init + 15 & -16;
+                    } else {
+                        padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                    }
                 }
             }
-            scan_values[expert_scan_init] = padded_count_init;
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
         }
         __syncthreads();
-        int scan_index_up = (tid + 1) * 2 - 1;
-        if (scan_index_up < MAX_EXPERTS) {
-            scan_values[scan_index_up] = scan_values[scan_index_up] + scan_values[scan_index_up - 1];
-        }
-        int scan_index_up_0 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_up_0 < MAX_EXPERTS) {
-            scan_values[scan_index_up_0] = scan_values[scan_index_up_0] + scan_values[scan_index_up_0 - 1];
-        }
-        __syncthreads();
-        int scan_index_up_1 = (tid + 1) * 4 - 1;
-        if (scan_index_up_1 < MAX_EXPERTS) {
-            scan_values[scan_index_up_1] = scan_values[scan_index_up_1] + scan_values[scan_index_up_1 - 2];
-        }
-        int scan_index_up_2 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_up_2 < MAX_EXPERTS) {
-            scan_values[scan_index_up_2] = scan_values[scan_index_up_2] + scan_values[scan_index_up_2 - 2];
-        }
-        __syncthreads();
-        int scan_index_up_3 = (tid + 1) * 8 - 1;
-        if (scan_index_up_3 < MAX_EXPERTS) {
-            scan_values[scan_index_up_3] = scan_values[scan_index_up_3] + scan_values[scan_index_up_3 - 4];
-        }
-        int scan_index_up_4 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_up_4 < MAX_EXPERTS) {
-            scan_values[scan_index_up_4] = scan_values[scan_index_up_4] + scan_values[scan_index_up_4 - 4];
-        }
-        __syncthreads();
-        int scan_index_up_5 = (tid + 1) * 16 - 1;
-        if (scan_index_up_5 < MAX_EXPERTS) {
-            scan_values[scan_index_up_5] = scan_values[scan_index_up_5] + scan_values[scan_index_up_5 - 8];
-        }
-        int scan_index_up_6 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_up_6 < MAX_EXPERTS) {
-            scan_values[scan_index_up_6] = scan_values[scan_index_up_6] + scan_values[scan_index_up_6 - 8];
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
+            int scan_warp_peer_1 = _shfl_up_7;
+            if (lane >= 4) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_1;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                shared_total[0] = scan_warp_inclusive;
+            }
         }
         __syncthreads();
-        int scan_index_up_7 = (tid + 1) * 32 - 1;
-        if (scan_index_up_7 < MAX_EXPERTS) {
-            scan_values[scan_index_up_7] = scan_values[scan_index_up_7] + scan_values[scan_index_up_7 - 16];
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        #pragma unroll
+        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+            int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+            if (expert_scan_store < E) {
+                shared_offsets[expert_scan_store] = scan_expert_prefix;
+            }
+            scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
         }
-        int scan_index_up_8 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_up_8 < MAX_EXPERTS) {
-            scan_values[scan_index_up_8] = scan_values[scan_index_up_8] + scan_values[scan_index_up_8 - 16];
-        }
-        __syncthreads();
-        int scan_index_up_9 = (tid + 1) * 64 - 1;
-        if (scan_index_up_9 < MAX_EXPERTS) {
-            scan_values[scan_index_up_9] = scan_values[scan_index_up_9] + scan_values[scan_index_up_9 - 32];
-        }
-        int scan_index_up_10 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_up_10 < MAX_EXPERTS) {
-            scan_values[scan_index_up_10] = scan_values[scan_index_up_10] + scan_values[scan_index_up_10 - 32];
-        }
-        __syncthreads();
-        int scan_index_up_11 = (tid + 1) * 128 - 1;
-        if (scan_index_up_11 < MAX_EXPERTS) {
-            scan_values[scan_index_up_11] = scan_values[scan_index_up_11] + scan_values[scan_index_up_11 - 64];
-        }
-        int scan_index_up_12 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_up_12 < MAX_EXPERTS) {
-            scan_values[scan_index_up_12] = scan_values[scan_index_up_12] + scan_values[scan_index_up_12 - 64];
-        }
-        __syncthreads();
-        int scan_index_up_13 = (tid + 1) * 256 - 1;
-        if (scan_index_up_13 < MAX_EXPERTS) {
-            scan_values[scan_index_up_13] = scan_values[scan_index_up_13] + scan_values[scan_index_up_13 - 128];
-        }
-        int scan_index_up_14 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_up_14 < MAX_EXPERTS) {
-            scan_values[scan_index_up_14] = scan_values[scan_index_up_14] + scan_values[scan_index_up_14 - 128];
-        }
-        __syncthreads();
-        int scan_index_up_15 = (tid + 1) * 512 - 1;
-        if (scan_index_up_15 < MAX_EXPERTS) {
-            scan_values[scan_index_up_15] = scan_values[scan_index_up_15] + scan_values[scan_index_up_15 - 256];
-        }
-        int scan_index_up_16 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_up_16 < MAX_EXPERTS) {
-            scan_values[scan_index_up_16] = scan_values[scan_index_up_16] + scan_values[scan_index_up_16 - 256];
-        }
-        __syncthreads();
-        int scan_index_up_17 = (tid + 1) * 1024 - 1;
-        if (scan_index_up_17 < MAX_EXPERTS) {
-            scan_values[scan_index_up_17] = scan_values[scan_index_up_17] + scan_values[scan_index_up_17 - 512];
-        }
-        int scan_index_up_18 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_up_18 < MAX_EXPERTS) {
-            scan_values[scan_index_up_18] = scan_values[scan_index_up_18] + scan_values[scan_index_up_18 - 512];
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int padded_total = scan_values[MAX_EXPERTS - 1];
-            shared_total[0] = padded_total;
-            scan_values[MAX_EXPERTS - 1] = 0;
-        }
-        __syncthreads();
-        int scan_index_down = (tid + 1) * 1024 - 1;
-        if (scan_index_down < MAX_EXPERTS) {
-            int scan_left = scan_values[scan_index_down - 512];
-            scan_values[scan_index_down - 512] = scan_values[scan_index_down];
-            scan_values[scan_index_down] = scan_values[scan_index_down] + scan_left;
-        }
-        int scan_index_down_19 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_down_19 < MAX_EXPERTS) {
-            int scan_left_1 = scan_values[scan_index_down_19 - 512];
-            scan_values[scan_index_down_19 - 512] = scan_values[scan_index_down_19];
-            scan_values[scan_index_down_19] = scan_values[scan_index_down_19] + scan_left_1;
-        }
-        __syncthreads();
-        int scan_index_down_20 = (tid + 1) * 512 - 1;
-        if (scan_index_down_20 < MAX_EXPERTS) {
-            int scan_left_2 = scan_values[scan_index_down_20 - 256];
-            scan_values[scan_index_down_20 - 256] = scan_values[scan_index_down_20];
-            scan_values[scan_index_down_20] = scan_values[scan_index_down_20] + scan_left_2;
-        }
-        int scan_index_down_21 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_down_21 < MAX_EXPERTS) {
-            int scan_left_3 = scan_values[scan_index_down_21 - 256];
-            scan_values[scan_index_down_21 - 256] = scan_values[scan_index_down_21];
-            scan_values[scan_index_down_21] = scan_values[scan_index_down_21] + scan_left_3;
-        }
-        __syncthreads();
-        int scan_index_down_22 = (tid + 1) * 256 - 1;
-        if (scan_index_down_22 < MAX_EXPERTS) {
-            int scan_left_4 = scan_values[scan_index_down_22 - 128];
-            scan_values[scan_index_down_22 - 128] = scan_values[scan_index_down_22];
-            scan_values[scan_index_down_22] = scan_values[scan_index_down_22] + scan_left_4;
-        }
-        int scan_index_down_23 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_down_23 < MAX_EXPERTS) {
-            int scan_left_5 = scan_values[scan_index_down_23 - 128];
-            scan_values[scan_index_down_23 - 128] = scan_values[scan_index_down_23];
-            scan_values[scan_index_down_23] = scan_values[scan_index_down_23] + scan_left_5;
-        }
-        __syncthreads();
-        int scan_index_down_24 = (tid + 1) * 128 - 1;
-        if (scan_index_down_24 < MAX_EXPERTS) {
-            int scan_left_6 = scan_values[scan_index_down_24 - 64];
-            scan_values[scan_index_down_24 - 64] = scan_values[scan_index_down_24];
-            scan_values[scan_index_down_24] = scan_values[scan_index_down_24] + scan_left_6;
-        }
-        int scan_index_down_25 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_down_25 < MAX_EXPERTS) {
-            int scan_left_7 = scan_values[scan_index_down_25 - 64];
-            scan_values[scan_index_down_25 - 64] = scan_values[scan_index_down_25];
-            scan_values[scan_index_down_25] = scan_values[scan_index_down_25] + scan_left_7;
-        }
-        __syncthreads();
-        int scan_index_down_26 = (tid + 1) * 64 - 1;
-        if (scan_index_down_26 < MAX_EXPERTS) {
-            int scan_left_8 = scan_values[scan_index_down_26 - 32];
-            scan_values[scan_index_down_26 - 32] = scan_values[scan_index_down_26];
-            scan_values[scan_index_down_26] = scan_values[scan_index_down_26] + scan_left_8;
-        }
-        int scan_index_down_27 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_down_27 < MAX_EXPERTS) {
-            int scan_left_9 = scan_values[scan_index_down_27 - 32];
-            scan_values[scan_index_down_27 - 32] = scan_values[scan_index_down_27];
-            scan_values[scan_index_down_27] = scan_values[scan_index_down_27] + scan_left_9;
-        }
-        __syncthreads();
-        int scan_index_down_28 = (tid + 1) * 32 - 1;
-        if (scan_index_down_28 < MAX_EXPERTS) {
-            int scan_left_10 = scan_values[scan_index_down_28 - 16];
-            scan_values[scan_index_down_28 - 16] = scan_values[scan_index_down_28];
-            scan_values[scan_index_down_28] = scan_values[scan_index_down_28] + scan_left_10;
-        }
-        int scan_index_down_29 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_down_29 < MAX_EXPERTS) {
-            int scan_left_11 = scan_values[scan_index_down_29 - 16];
-            scan_values[scan_index_down_29 - 16] = scan_values[scan_index_down_29];
-            scan_values[scan_index_down_29] = scan_values[scan_index_down_29] + scan_left_11;
-        }
-        __syncthreads();
-        int scan_index_down_30 = (tid + 1) * 16 - 1;
-        if (scan_index_down_30 < MAX_EXPERTS) {
-            int scan_left_12 = scan_values[scan_index_down_30 - 8];
-            scan_values[scan_index_down_30 - 8] = scan_values[scan_index_down_30];
-            scan_values[scan_index_down_30] = scan_values[scan_index_down_30] + scan_left_12;
-        }
-        int scan_index_down_31 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_down_31 < MAX_EXPERTS) {
-            int scan_left_13 = scan_values[scan_index_down_31 - 8];
-            scan_values[scan_index_down_31 - 8] = scan_values[scan_index_down_31];
-            scan_values[scan_index_down_31] = scan_values[scan_index_down_31] + scan_left_13;
-        }
-        __syncthreads();
-        int scan_index_down_32 = (tid + 1) * 8 - 1;
-        if (scan_index_down_32 < MAX_EXPERTS) {
-            int scan_left_14 = scan_values[scan_index_down_32 - 4];
-            scan_values[scan_index_down_32 - 4] = scan_values[scan_index_down_32];
-            scan_values[scan_index_down_32] = scan_values[scan_index_down_32] + scan_left_14;
-        }
-        int scan_index_down_33 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_down_33 < MAX_EXPERTS) {
-            int scan_left_15 = scan_values[scan_index_down_33 - 4];
-            scan_values[scan_index_down_33 - 4] = scan_values[scan_index_down_33];
-            scan_values[scan_index_down_33] = scan_values[scan_index_down_33] + scan_left_15;
-        }
-        __syncthreads();
-        int scan_index_down_34 = (tid + 1) * 4 - 1;
-        if (scan_index_down_34 < MAX_EXPERTS) {
-            int scan_left_16 = scan_values[scan_index_down_34 - 2];
-            scan_values[scan_index_down_34 - 2] = scan_values[scan_index_down_34];
-            scan_values[scan_index_down_34] = scan_values[scan_index_down_34] + scan_left_16;
-        }
-        int scan_index_down_35 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_down_35 < MAX_EXPERTS) {
-            int scan_left_17 = scan_values[scan_index_down_35 - 2];
-            scan_values[scan_index_down_35 - 2] = scan_values[scan_index_down_35];
-            scan_values[scan_index_down_35] = scan_values[scan_index_down_35] + scan_left_17;
-        }
-        __syncthreads();
-        int scan_index_down_36 = (tid + 1) * 2 - 1;
-        if (scan_index_down_36 < MAX_EXPERTS) {
-            int scan_left_18 = scan_values[scan_index_down_36 - 1];
-            scan_values[scan_index_down_36 - 1] = scan_values[scan_index_down_36];
-            scan_values[scan_index_down_36] = scan_values[scan_index_down_36] + scan_left_18;
-        }
-        int scan_index_down_37 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_down_37 < MAX_EXPERTS) {
-            int scan_left_19 = scan_values[scan_index_down_37 - 1];
-            scan_values[scan_index_down_37 - 1] = scan_values[scan_index_down_37];
-            scan_values[scan_index_down_37] = scan_values[scan_index_down_37] + scan_left_19;
-        }
-        __syncthreads();
         if (tid == 0) {
             shared_offsets[E] = shared_total[0];
         }
@@ -2184,18 +2744,25 @@ kernel_alpha_moe_fused_router_small_routed(float* __restrict__ logits, float* __
             int grouped_row = shared_offsets[pair_expert] + local_row;
             sorted_token_ids[grouped_row] = pair;
             {
-                if (local_row % block_m == 0) {
-                    expert_ids[grouped_row / block_m] = pair_expert;
+                if (block_m == 8) {
+                    if ((local_row & 7) == 0) {
+                        expert_ids[grouped_row >> 3] = pair_expert;
+                    }
+                } else if (block_m == 16) {
+                    if ((local_row & 15) == 0) {
+                        expert_ids[grouped_row >> 4] = pair_expert;
+                    }
+                } else {
+                    if (local_row % block_m == 0) {
+                        expert_ids[grouped_row / block_m] = pair_expert;
+                    }
                 }
             }
         }
         for (int padding_expert = tid; padding_expert < E; padding_expert += THREADS) {
             int count_final = shared_counts[padding_expert];
             int expert_start = shared_offsets[padding_expert];
-            int padded_count_final = 0;
-            {
-                padded_count_final = (count_final + block_m - 1) / block_m * block_m;
-            }
+            int padded_count_final = shared_offsets[padding_expert + 1] - expert_start;
             int padding_count = padded_count_final - count_final;
             #pragma unroll
             for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
@@ -2256,15 +2823,7 @@ static_assert(MAX_EXPERTS == 512);
 #undef THREADS
 }  // namespace alphamoe_router_small_routed_generated
 
-using alphamoe_router_large_routed_generated::kernel_alpha_moe_fused_router_routed;
-static_assert(alphamoe_router_large_routed_generated::kThreads == alphamoe_router_large_generated::kThreads);
-static_assert(alphamoe_router_large_routed_generated::kSmemTotal == alphamoe_router_large_generated::kSmemTotal);
-static_assert(alphamoe_router_large_routed_generated::kWarps == alphamoe_router_large_generated::kWarps);
 using alphamoe_router_small_routed_generated::kernel_alpha_moe_fused_router_small_routed;
-static_assert(alphamoe_router_small_routed_generated::kThreads == alphamoe_router_small_generated::kThreads);
-static_assert(alphamoe_router_small_routed_generated::kSmemTotal == alphamoe_router_small_generated::kSmemTotal);
-static_assert(alphamoe_router_small_routed_generated::kWarps == alphamoe_router_small_generated::kWarps);
-
 
 namespace alphamoe_router_tiny_generated {
 typedef signed char        int8_t;
@@ -2309,9 +2868,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SHARED_OFFSETS_OFF 4096
 #define SMEM_SHARED_OFFSETS_STAGE_BYTES 4100
 #define SMEM_SHARED_OFFSETS_STRIDE 4100
-#define SMEM_SCAN_VALUES_OFF 4096
-#define SMEM_SCAN_VALUES_STAGE_BYTES 4096
-#define SMEM_SCAN_VALUES_STRIDE 4096
+#define SMEM_SCAN_VALUES_OFF 20488
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
 #define SMEM_SHARED_SCATTER_OFF 8196
 #define SMEM_SHARED_SCATTER_STAGE_BYTES 4096
 #define SMEM_SHARED_SCATTER_STRIDE 4096
@@ -2374,8 +2933,8 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
     const int shared_counts_addr = smem + 0;
     int* shared_offsets = reinterpret_cast<int*>(smem_raw + 4096);
     const int shared_offsets_addr = smem + 4096;
-    int* scan_values = reinterpret_cast<int*>(smem_raw + 4096);
-    const int scan_values_addr = smem + 4096;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 20488);
+    const int scan_values_addr = smem + 20488;
     int* shared_scatter = reinterpret_cast<int*>(smem_raw + 8196);
     const int shared_scatter_addr = smem + 8196;
     int* shared_ids = reinterpret_cast<int*>(smem_raw + 12292);
@@ -2439,12 +2998,22 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
             float best_value = 0.0f;
             best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
-            #pragma unroll
-            for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
-                int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
-                if (expert_tie < routed_experts) {
-                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
-                        tied_index = (unsigned int)expert_tie;
+            if (best_value != -LOOM_INF) {
+                #pragma unroll
+                for (int expert_slot_finite_tie = 0; expert_slot_finite_tie < MAX_EXPERTS / 32; expert_slot_finite_tie++) {
+                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie] == best_value) {
+                        int expert_finite_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie) * 32);
+                        tied_index = (unsigned int)expert_finite_tie;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
+                    int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
+                    if (expert_tie < routed_experts) {
+                        if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
+                            tied_index = (unsigned int)expert_tie;
+                        }
                     }
                 }
             }
@@ -2521,9 +3090,11 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
             atomicAdd(&shared_counts[count_expert], 1);
         }
         __syncthreads();
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
         #pragma unroll
         for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
-            int expert_scan_init = tid + expert_slot_scan_init * THREADS;
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
             int padded_count_init = 0;
             if (expert_scan_init < E) {
                 int count_init = shared_counts[expert_scan_init];
@@ -2537,235 +3108,77 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
                     }
                 }
             }
-            scan_values[expert_scan_init] = padded_count_init;
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
         }
         __syncthreads();
-        int scan_index_up = (tid + 1) * 2 - 1;
-        if (scan_index_up < MAX_EXPERTS) {
-            scan_values[scan_index_up] = scan_values[scan_index_up] + scan_values[scan_index_up - 1];
-        }
-        int scan_index_up_0 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_up_0 < MAX_EXPERTS) {
-            scan_values[scan_index_up_0] = scan_values[scan_index_up_0] + scan_values[scan_index_up_0 - 1];
-        }
-        __syncthreads();
-        int scan_index_up_1 = (tid + 1) * 4 - 1;
-        if (scan_index_up_1 < MAX_EXPERTS) {
-            scan_values[scan_index_up_1] = scan_values[scan_index_up_1] + scan_values[scan_index_up_1 - 2];
-        }
-        int scan_index_up_2 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_up_2 < MAX_EXPERTS) {
-            scan_values[scan_index_up_2] = scan_values[scan_index_up_2] + scan_values[scan_index_up_2 - 2];
-        }
-        __syncthreads();
-        int scan_index_up_3 = (tid + 1) * 8 - 1;
-        if (scan_index_up_3 < MAX_EXPERTS) {
-            scan_values[scan_index_up_3] = scan_values[scan_index_up_3] + scan_values[scan_index_up_3 - 4];
-        }
-        int scan_index_up_4 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_up_4 < MAX_EXPERTS) {
-            scan_values[scan_index_up_4] = scan_values[scan_index_up_4] + scan_values[scan_index_up_4 - 4];
-        }
-        __syncthreads();
-        int scan_index_up_5 = (tid + 1) * 16 - 1;
-        if (scan_index_up_5 < MAX_EXPERTS) {
-            scan_values[scan_index_up_5] = scan_values[scan_index_up_5] + scan_values[scan_index_up_5 - 8];
-        }
-        int scan_index_up_6 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_up_6 < MAX_EXPERTS) {
-            scan_values[scan_index_up_6] = scan_values[scan_index_up_6] + scan_values[scan_index_up_6 - 8];
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
+            int scan_warp_peer_1 = _shfl_up_7;
+            if (lane >= 4) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_1;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                shared_total[0] = scan_warp_inclusive;
+            }
         }
         __syncthreads();
-        int scan_index_up_7 = (tid + 1) * 32 - 1;
-        if (scan_index_up_7 < MAX_EXPERTS) {
-            scan_values[scan_index_up_7] = scan_values[scan_index_up_7] + scan_values[scan_index_up_7 - 16];
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        #pragma unroll
+        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+            int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+            if (expert_scan_store < E) {
+                shared_offsets[expert_scan_store] = scan_expert_prefix;
+            }
+            scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
         }
-        int scan_index_up_8 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_up_8 < MAX_EXPERTS) {
-            scan_values[scan_index_up_8] = scan_values[scan_index_up_8] + scan_values[scan_index_up_8 - 16];
-        }
-        __syncthreads();
-        int scan_index_up_9 = (tid + 1) * 64 - 1;
-        if (scan_index_up_9 < MAX_EXPERTS) {
-            scan_values[scan_index_up_9] = scan_values[scan_index_up_9] + scan_values[scan_index_up_9 - 32];
-        }
-        int scan_index_up_10 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_up_10 < MAX_EXPERTS) {
-            scan_values[scan_index_up_10] = scan_values[scan_index_up_10] + scan_values[scan_index_up_10 - 32];
-        }
-        __syncthreads();
-        int scan_index_up_11 = (tid + 1) * 128 - 1;
-        if (scan_index_up_11 < MAX_EXPERTS) {
-            scan_values[scan_index_up_11] = scan_values[scan_index_up_11] + scan_values[scan_index_up_11 - 64];
-        }
-        int scan_index_up_12 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_up_12 < MAX_EXPERTS) {
-            scan_values[scan_index_up_12] = scan_values[scan_index_up_12] + scan_values[scan_index_up_12 - 64];
-        }
-        __syncthreads();
-        int scan_index_up_13 = (tid + 1) * 256 - 1;
-        if (scan_index_up_13 < MAX_EXPERTS) {
-            scan_values[scan_index_up_13] = scan_values[scan_index_up_13] + scan_values[scan_index_up_13 - 128];
-        }
-        int scan_index_up_14 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_up_14 < MAX_EXPERTS) {
-            scan_values[scan_index_up_14] = scan_values[scan_index_up_14] + scan_values[scan_index_up_14 - 128];
-        }
-        __syncthreads();
-        int scan_index_up_15 = (tid + 1) * 512 - 1;
-        if (scan_index_up_15 < MAX_EXPERTS) {
-            scan_values[scan_index_up_15] = scan_values[scan_index_up_15] + scan_values[scan_index_up_15 - 256];
-        }
-        int scan_index_up_16 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_up_16 < MAX_EXPERTS) {
-            scan_values[scan_index_up_16] = scan_values[scan_index_up_16] + scan_values[scan_index_up_16 - 256];
-        }
-        __syncthreads();
-        int scan_index_up_17 = (tid + 1) * 1024 - 1;
-        if (scan_index_up_17 < MAX_EXPERTS) {
-            scan_values[scan_index_up_17] = scan_values[scan_index_up_17] + scan_values[scan_index_up_17 - 512];
-        }
-        int scan_index_up_18 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_up_18 < MAX_EXPERTS) {
-            scan_values[scan_index_up_18] = scan_values[scan_index_up_18] + scan_values[scan_index_up_18 - 512];
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int padded_total = scan_values[MAX_EXPERTS - 1];
-            shared_total[0] = padded_total;
-            scan_values[MAX_EXPERTS - 1] = 0;
-        }
-        __syncthreads();
-        int scan_index_down = (tid + 1) * 1024 - 1;
-        if (scan_index_down < MAX_EXPERTS) {
-            int scan_left = scan_values[scan_index_down - 512];
-            scan_values[scan_index_down - 512] = scan_values[scan_index_down];
-            scan_values[scan_index_down] = scan_values[scan_index_down] + scan_left;
-        }
-        int scan_index_down_19 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_down_19 < MAX_EXPERTS) {
-            int scan_left_1 = scan_values[scan_index_down_19 - 512];
-            scan_values[scan_index_down_19 - 512] = scan_values[scan_index_down_19];
-            scan_values[scan_index_down_19] = scan_values[scan_index_down_19] + scan_left_1;
-        }
-        __syncthreads();
-        int scan_index_down_20 = (tid + 1) * 512 - 1;
-        if (scan_index_down_20 < MAX_EXPERTS) {
-            int scan_left_2 = scan_values[scan_index_down_20 - 256];
-            scan_values[scan_index_down_20 - 256] = scan_values[scan_index_down_20];
-            scan_values[scan_index_down_20] = scan_values[scan_index_down_20] + scan_left_2;
-        }
-        int scan_index_down_21 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_down_21 < MAX_EXPERTS) {
-            int scan_left_3 = scan_values[scan_index_down_21 - 256];
-            scan_values[scan_index_down_21 - 256] = scan_values[scan_index_down_21];
-            scan_values[scan_index_down_21] = scan_values[scan_index_down_21] + scan_left_3;
-        }
-        __syncthreads();
-        int scan_index_down_22 = (tid + 1) * 256 - 1;
-        if (scan_index_down_22 < MAX_EXPERTS) {
-            int scan_left_4 = scan_values[scan_index_down_22 - 128];
-            scan_values[scan_index_down_22 - 128] = scan_values[scan_index_down_22];
-            scan_values[scan_index_down_22] = scan_values[scan_index_down_22] + scan_left_4;
-        }
-        int scan_index_down_23 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_down_23 < MAX_EXPERTS) {
-            int scan_left_5 = scan_values[scan_index_down_23 - 128];
-            scan_values[scan_index_down_23 - 128] = scan_values[scan_index_down_23];
-            scan_values[scan_index_down_23] = scan_values[scan_index_down_23] + scan_left_5;
-        }
-        __syncthreads();
-        int scan_index_down_24 = (tid + 1) * 128 - 1;
-        if (scan_index_down_24 < MAX_EXPERTS) {
-            int scan_left_6 = scan_values[scan_index_down_24 - 64];
-            scan_values[scan_index_down_24 - 64] = scan_values[scan_index_down_24];
-            scan_values[scan_index_down_24] = scan_values[scan_index_down_24] + scan_left_6;
-        }
-        int scan_index_down_25 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_down_25 < MAX_EXPERTS) {
-            int scan_left_7 = scan_values[scan_index_down_25 - 64];
-            scan_values[scan_index_down_25 - 64] = scan_values[scan_index_down_25];
-            scan_values[scan_index_down_25] = scan_values[scan_index_down_25] + scan_left_7;
-        }
-        __syncthreads();
-        int scan_index_down_26 = (tid + 1) * 64 - 1;
-        if (scan_index_down_26 < MAX_EXPERTS) {
-            int scan_left_8 = scan_values[scan_index_down_26 - 32];
-            scan_values[scan_index_down_26 - 32] = scan_values[scan_index_down_26];
-            scan_values[scan_index_down_26] = scan_values[scan_index_down_26] + scan_left_8;
-        }
-        int scan_index_down_27 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_down_27 < MAX_EXPERTS) {
-            int scan_left_9 = scan_values[scan_index_down_27 - 32];
-            scan_values[scan_index_down_27 - 32] = scan_values[scan_index_down_27];
-            scan_values[scan_index_down_27] = scan_values[scan_index_down_27] + scan_left_9;
-        }
-        __syncthreads();
-        int scan_index_down_28 = (tid + 1) * 32 - 1;
-        if (scan_index_down_28 < MAX_EXPERTS) {
-            int scan_left_10 = scan_values[scan_index_down_28 - 16];
-            scan_values[scan_index_down_28 - 16] = scan_values[scan_index_down_28];
-            scan_values[scan_index_down_28] = scan_values[scan_index_down_28] + scan_left_10;
-        }
-        int scan_index_down_29 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_down_29 < MAX_EXPERTS) {
-            int scan_left_11 = scan_values[scan_index_down_29 - 16];
-            scan_values[scan_index_down_29 - 16] = scan_values[scan_index_down_29];
-            scan_values[scan_index_down_29] = scan_values[scan_index_down_29] + scan_left_11;
-        }
-        __syncthreads();
-        int scan_index_down_30 = (tid + 1) * 16 - 1;
-        if (scan_index_down_30 < MAX_EXPERTS) {
-            int scan_left_12 = scan_values[scan_index_down_30 - 8];
-            scan_values[scan_index_down_30 - 8] = scan_values[scan_index_down_30];
-            scan_values[scan_index_down_30] = scan_values[scan_index_down_30] + scan_left_12;
-        }
-        int scan_index_down_31 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_down_31 < MAX_EXPERTS) {
-            int scan_left_13 = scan_values[scan_index_down_31 - 8];
-            scan_values[scan_index_down_31 - 8] = scan_values[scan_index_down_31];
-            scan_values[scan_index_down_31] = scan_values[scan_index_down_31] + scan_left_13;
-        }
-        __syncthreads();
-        int scan_index_down_32 = (tid + 1) * 8 - 1;
-        if (scan_index_down_32 < MAX_EXPERTS) {
-            int scan_left_14 = scan_values[scan_index_down_32 - 4];
-            scan_values[scan_index_down_32 - 4] = scan_values[scan_index_down_32];
-            scan_values[scan_index_down_32] = scan_values[scan_index_down_32] + scan_left_14;
-        }
-        int scan_index_down_33 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_down_33 < MAX_EXPERTS) {
-            int scan_left_15 = scan_values[scan_index_down_33 - 4];
-            scan_values[scan_index_down_33 - 4] = scan_values[scan_index_down_33];
-            scan_values[scan_index_down_33] = scan_values[scan_index_down_33] + scan_left_15;
-        }
-        __syncthreads();
-        int scan_index_down_34 = (tid + 1) * 4 - 1;
-        if (scan_index_down_34 < MAX_EXPERTS) {
-            int scan_left_16 = scan_values[scan_index_down_34 - 2];
-            scan_values[scan_index_down_34 - 2] = scan_values[scan_index_down_34];
-            scan_values[scan_index_down_34] = scan_values[scan_index_down_34] + scan_left_16;
-        }
-        int scan_index_down_35 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_down_35 < MAX_EXPERTS) {
-            int scan_left_17 = scan_values[scan_index_down_35 - 2];
-            scan_values[scan_index_down_35 - 2] = scan_values[scan_index_down_35];
-            scan_values[scan_index_down_35] = scan_values[scan_index_down_35] + scan_left_17;
-        }
-        __syncthreads();
-        int scan_index_down_36 = (tid + 1) * 2 - 1;
-        if (scan_index_down_36 < MAX_EXPERTS) {
-            int scan_left_18 = scan_values[scan_index_down_36 - 1];
-            scan_values[scan_index_down_36 - 1] = scan_values[scan_index_down_36];
-            scan_values[scan_index_down_36] = scan_values[scan_index_down_36] + scan_left_18;
-        }
-        int scan_index_down_37 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_down_37 < MAX_EXPERTS) {
-            int scan_left_19 = scan_values[scan_index_down_37 - 1];
-            scan_values[scan_index_down_37 - 1] = scan_values[scan_index_down_37];
-            scan_values[scan_index_down_37] = scan_values[scan_index_down_37] + scan_left_19;
-        }
-        __syncthreads();
         if (tid == 0) {
             shared_offsets[E] = shared_total[0];
         }
@@ -2795,16 +3208,7 @@ kernel_alpha_moe_fused_router_tiny(float* __restrict__ logits, float* __restrict
         for (int padding_expert = tid; padding_expert < E; padding_expert += THREADS) {
             int count_final = shared_counts[padding_expert];
             int expert_start = shared_offsets[padding_expert];
-            int padded_count_final = 0;
-            {
-                if (block_m == 8) {
-                    padded_count_final = count_final + 7 & -8;
-                } else if (block_m == 16) {
-                    padded_count_final = count_final + 15 & -16;
-                } else {
-                    padded_count_final = (count_final + block_m - 1) / block_m * block_m;
-                }
-            }
+            int padded_count_final = shared_offsets[padding_expert + 1] - expert_start;
             int padding_count = padded_count_final - count_final;
             #pragma unroll
             for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
@@ -2867,12 +3271,6 @@ static_assert(MAX_EXPERTS == 512);
 
 using alphamoe_router_tiny_generated::kernel_alpha_moe_fused_router_tiny;
 
-static_assert(alphamoe_router_tiny_generated::kThreads == alphamoe_router_small_generated::kThreads);
-
-static_assert(alphamoe_router_tiny_generated::kSmemTotal == alphamoe_router_small_generated::kSmemTotal);
-
-static_assert(alphamoe_router_tiny_generated::kWarps == alphamoe_router_small_generated::kWarps);
-
 namespace alphamoe_router_tiny_routed_generated {
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -2916,9 +3314,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SHARED_OFFSETS_OFF 4096
 #define SMEM_SHARED_OFFSETS_STAGE_BYTES 4100
 #define SMEM_SHARED_OFFSETS_STRIDE 4100
-#define SMEM_SCAN_VALUES_OFF 4096
-#define SMEM_SCAN_VALUES_STAGE_BYTES 4096
-#define SMEM_SCAN_VALUES_STRIDE 4096
+#define SMEM_SCAN_VALUES_OFF 20488
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
 #define SMEM_SHARED_SCATTER_OFF 8196
 #define SMEM_SHARED_SCATTER_STAGE_BYTES 4096
 #define SMEM_SHARED_SCATTER_STRIDE 4096
@@ -2981,8 +3379,8 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
     const int shared_counts_addr = smem + 0;
     int* shared_offsets = reinterpret_cast<int*>(smem_raw + 4096);
     const int shared_offsets_addr = smem + 4096;
-    int* scan_values = reinterpret_cast<int*>(smem_raw + 4096);
-    const int scan_values_addr = smem + 4096;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 20488);
+    const int scan_values_addr = smem + 20488;
     int* shared_scatter = reinterpret_cast<int*>(smem_raw + 8196);
     const int shared_scatter_addr = smem + 8196;
     int* shared_ids = reinterpret_cast<int*>(smem_raw + 12292);
@@ -3046,12 +3444,22 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
             float best_value = 0.0f;
             best_value = reinterpret_cast<float*>(&best_bits)[0];
             unsigned int tied_index = MAX_EXPERTS;
-            #pragma unroll
-            for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
-                int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
-                if (expert_tie < routed_experts) {
-                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
-                        tied_index = (unsigned int)expert_tie;
+            if (best_value != -LOOM_INF) {
+                #pragma unroll
+                for (int expert_slot_finite_tie = 0; expert_slot_finite_tie < MAX_EXPERTS / 32; expert_slot_finite_tie++) {
+                    if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie] == best_value) {
+                        int expert_finite_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_finite_tie) * 32);
+                        tied_index = (unsigned int)expert_finite_tie;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int expert_slot_tie = 0; expert_slot_tie < MAX_EXPERTS / 32; expert_slot_tie++) {
+                    int expert_tie = lane + (unsigned int)((MAX_EXPERTS / 32 - 1 - expert_slot_tie) * 32);
+                    if (expert_tie < routed_experts) {
+                        if (row_values[MAX_EXPERTS / 32 - 1 - expert_slot_tie] == best_value) {
+                            tied_index = (unsigned int)expert_tie;
+                        }
                     }
                 }
             }
@@ -3125,9 +3533,11 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
             atomicAdd(&shared_counts[count_expert], 1);
         }
         __syncthreads();
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
         #pragma unroll
         for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
-            int expert_scan_init = tid + expert_slot_scan_init * THREADS;
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
             int padded_count_init = 0;
             if (expert_scan_init < E) {
                 int count_init = shared_counts[expert_scan_init];
@@ -3141,235 +3551,77 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
                     }
                 }
             }
-            scan_values[expert_scan_init] = padded_count_init;
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
         }
         __syncthreads();
-        int scan_index_up = (tid + 1) * 2 - 1;
-        if (scan_index_up < MAX_EXPERTS) {
-            scan_values[scan_index_up] = scan_values[scan_index_up] + scan_values[scan_index_up - 1];
-        }
-        int scan_index_up_0 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_up_0 < MAX_EXPERTS) {
-            scan_values[scan_index_up_0] = scan_values[scan_index_up_0] + scan_values[scan_index_up_0 - 1];
-        }
-        __syncthreads();
-        int scan_index_up_1 = (tid + 1) * 4 - 1;
-        if (scan_index_up_1 < MAX_EXPERTS) {
-            scan_values[scan_index_up_1] = scan_values[scan_index_up_1] + scan_values[scan_index_up_1 - 2];
-        }
-        int scan_index_up_2 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_up_2 < MAX_EXPERTS) {
-            scan_values[scan_index_up_2] = scan_values[scan_index_up_2] + scan_values[scan_index_up_2 - 2];
-        }
-        __syncthreads();
-        int scan_index_up_3 = (tid + 1) * 8 - 1;
-        if (scan_index_up_3 < MAX_EXPERTS) {
-            scan_values[scan_index_up_3] = scan_values[scan_index_up_3] + scan_values[scan_index_up_3 - 4];
-        }
-        int scan_index_up_4 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_up_4 < MAX_EXPERTS) {
-            scan_values[scan_index_up_4] = scan_values[scan_index_up_4] + scan_values[scan_index_up_4 - 4];
-        }
-        __syncthreads();
-        int scan_index_up_5 = (tid + 1) * 16 - 1;
-        if (scan_index_up_5 < MAX_EXPERTS) {
-            scan_values[scan_index_up_5] = scan_values[scan_index_up_5] + scan_values[scan_index_up_5 - 8];
-        }
-        int scan_index_up_6 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_up_6 < MAX_EXPERTS) {
-            scan_values[scan_index_up_6] = scan_values[scan_index_up_6] + scan_values[scan_index_up_6 - 8];
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
+            int scan_warp_peer_1 = _shfl_up_7;
+            if (lane >= 4) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_1;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                shared_total[0] = scan_warp_inclusive;
+            }
         }
         __syncthreads();
-        int scan_index_up_7 = (tid + 1) * 32 - 1;
-        if (scan_index_up_7 < MAX_EXPERTS) {
-            scan_values[scan_index_up_7] = scan_values[scan_index_up_7] + scan_values[scan_index_up_7 - 16];
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        #pragma unroll
+        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+            int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+            if (expert_scan_store < E) {
+                shared_offsets[expert_scan_store] = scan_expert_prefix;
+            }
+            scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
         }
-        int scan_index_up_8 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_up_8 < MAX_EXPERTS) {
-            scan_values[scan_index_up_8] = scan_values[scan_index_up_8] + scan_values[scan_index_up_8 - 16];
-        }
-        __syncthreads();
-        int scan_index_up_9 = (tid + 1) * 64 - 1;
-        if (scan_index_up_9 < MAX_EXPERTS) {
-            scan_values[scan_index_up_9] = scan_values[scan_index_up_9] + scan_values[scan_index_up_9 - 32];
-        }
-        int scan_index_up_10 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_up_10 < MAX_EXPERTS) {
-            scan_values[scan_index_up_10] = scan_values[scan_index_up_10] + scan_values[scan_index_up_10 - 32];
-        }
-        __syncthreads();
-        int scan_index_up_11 = (tid + 1) * 128 - 1;
-        if (scan_index_up_11 < MAX_EXPERTS) {
-            scan_values[scan_index_up_11] = scan_values[scan_index_up_11] + scan_values[scan_index_up_11 - 64];
-        }
-        int scan_index_up_12 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_up_12 < MAX_EXPERTS) {
-            scan_values[scan_index_up_12] = scan_values[scan_index_up_12] + scan_values[scan_index_up_12 - 64];
-        }
-        __syncthreads();
-        int scan_index_up_13 = (tid + 1) * 256 - 1;
-        if (scan_index_up_13 < MAX_EXPERTS) {
-            scan_values[scan_index_up_13] = scan_values[scan_index_up_13] + scan_values[scan_index_up_13 - 128];
-        }
-        int scan_index_up_14 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_up_14 < MAX_EXPERTS) {
-            scan_values[scan_index_up_14] = scan_values[scan_index_up_14] + scan_values[scan_index_up_14 - 128];
-        }
-        __syncthreads();
-        int scan_index_up_15 = (tid + 1) * 512 - 1;
-        if (scan_index_up_15 < MAX_EXPERTS) {
-            scan_values[scan_index_up_15] = scan_values[scan_index_up_15] + scan_values[scan_index_up_15 - 256];
-        }
-        int scan_index_up_16 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_up_16 < MAX_EXPERTS) {
-            scan_values[scan_index_up_16] = scan_values[scan_index_up_16] + scan_values[scan_index_up_16 - 256];
-        }
-        __syncthreads();
-        int scan_index_up_17 = (tid + 1) * 1024 - 1;
-        if (scan_index_up_17 < MAX_EXPERTS) {
-            scan_values[scan_index_up_17] = scan_values[scan_index_up_17] + scan_values[scan_index_up_17 - 512];
-        }
-        int scan_index_up_18 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_up_18 < MAX_EXPERTS) {
-            scan_values[scan_index_up_18] = scan_values[scan_index_up_18] + scan_values[scan_index_up_18 - 512];
-        }
-        __syncthreads();
-        if (tid == 0) {
-            int padded_total = scan_values[MAX_EXPERTS - 1];
-            shared_total[0] = padded_total;
-            scan_values[MAX_EXPERTS - 1] = 0;
-        }
-        __syncthreads();
-        int scan_index_down = (tid + 1) * 1024 - 1;
-        if (scan_index_down < MAX_EXPERTS) {
-            int scan_left = scan_values[scan_index_down - 512];
-            scan_values[scan_index_down - 512] = scan_values[scan_index_down];
-            scan_values[scan_index_down] = scan_values[scan_index_down] + scan_left;
-        }
-        int scan_index_down_19 = (THREADS + tid + 1) * 1024 - 1;
-        if (scan_index_down_19 < MAX_EXPERTS) {
-            int scan_left_1 = scan_values[scan_index_down_19 - 512];
-            scan_values[scan_index_down_19 - 512] = scan_values[scan_index_down_19];
-            scan_values[scan_index_down_19] = scan_values[scan_index_down_19] + scan_left_1;
-        }
-        __syncthreads();
-        int scan_index_down_20 = (tid + 1) * 512 - 1;
-        if (scan_index_down_20 < MAX_EXPERTS) {
-            int scan_left_2 = scan_values[scan_index_down_20 - 256];
-            scan_values[scan_index_down_20 - 256] = scan_values[scan_index_down_20];
-            scan_values[scan_index_down_20] = scan_values[scan_index_down_20] + scan_left_2;
-        }
-        int scan_index_down_21 = (THREADS + tid + 1) * 512 - 1;
-        if (scan_index_down_21 < MAX_EXPERTS) {
-            int scan_left_3 = scan_values[scan_index_down_21 - 256];
-            scan_values[scan_index_down_21 - 256] = scan_values[scan_index_down_21];
-            scan_values[scan_index_down_21] = scan_values[scan_index_down_21] + scan_left_3;
-        }
-        __syncthreads();
-        int scan_index_down_22 = (tid + 1) * 256 - 1;
-        if (scan_index_down_22 < MAX_EXPERTS) {
-            int scan_left_4 = scan_values[scan_index_down_22 - 128];
-            scan_values[scan_index_down_22 - 128] = scan_values[scan_index_down_22];
-            scan_values[scan_index_down_22] = scan_values[scan_index_down_22] + scan_left_4;
-        }
-        int scan_index_down_23 = (THREADS + tid + 1) * 256 - 1;
-        if (scan_index_down_23 < MAX_EXPERTS) {
-            int scan_left_5 = scan_values[scan_index_down_23 - 128];
-            scan_values[scan_index_down_23 - 128] = scan_values[scan_index_down_23];
-            scan_values[scan_index_down_23] = scan_values[scan_index_down_23] + scan_left_5;
-        }
-        __syncthreads();
-        int scan_index_down_24 = (tid + 1) * 128 - 1;
-        if (scan_index_down_24 < MAX_EXPERTS) {
-            int scan_left_6 = scan_values[scan_index_down_24 - 64];
-            scan_values[scan_index_down_24 - 64] = scan_values[scan_index_down_24];
-            scan_values[scan_index_down_24] = scan_values[scan_index_down_24] + scan_left_6;
-        }
-        int scan_index_down_25 = (THREADS + tid + 1) * 128 - 1;
-        if (scan_index_down_25 < MAX_EXPERTS) {
-            int scan_left_7 = scan_values[scan_index_down_25 - 64];
-            scan_values[scan_index_down_25 - 64] = scan_values[scan_index_down_25];
-            scan_values[scan_index_down_25] = scan_values[scan_index_down_25] + scan_left_7;
-        }
-        __syncthreads();
-        int scan_index_down_26 = (tid + 1) * 64 - 1;
-        if (scan_index_down_26 < MAX_EXPERTS) {
-            int scan_left_8 = scan_values[scan_index_down_26 - 32];
-            scan_values[scan_index_down_26 - 32] = scan_values[scan_index_down_26];
-            scan_values[scan_index_down_26] = scan_values[scan_index_down_26] + scan_left_8;
-        }
-        int scan_index_down_27 = (THREADS + tid + 1) * 64 - 1;
-        if (scan_index_down_27 < MAX_EXPERTS) {
-            int scan_left_9 = scan_values[scan_index_down_27 - 32];
-            scan_values[scan_index_down_27 - 32] = scan_values[scan_index_down_27];
-            scan_values[scan_index_down_27] = scan_values[scan_index_down_27] + scan_left_9;
-        }
-        __syncthreads();
-        int scan_index_down_28 = (tid + 1) * 32 - 1;
-        if (scan_index_down_28 < MAX_EXPERTS) {
-            int scan_left_10 = scan_values[scan_index_down_28 - 16];
-            scan_values[scan_index_down_28 - 16] = scan_values[scan_index_down_28];
-            scan_values[scan_index_down_28] = scan_values[scan_index_down_28] + scan_left_10;
-        }
-        int scan_index_down_29 = (THREADS + tid + 1) * 32 - 1;
-        if (scan_index_down_29 < MAX_EXPERTS) {
-            int scan_left_11 = scan_values[scan_index_down_29 - 16];
-            scan_values[scan_index_down_29 - 16] = scan_values[scan_index_down_29];
-            scan_values[scan_index_down_29] = scan_values[scan_index_down_29] + scan_left_11;
-        }
-        __syncthreads();
-        int scan_index_down_30 = (tid + 1) * 16 - 1;
-        if (scan_index_down_30 < MAX_EXPERTS) {
-            int scan_left_12 = scan_values[scan_index_down_30 - 8];
-            scan_values[scan_index_down_30 - 8] = scan_values[scan_index_down_30];
-            scan_values[scan_index_down_30] = scan_values[scan_index_down_30] + scan_left_12;
-        }
-        int scan_index_down_31 = (THREADS + tid + 1) * 16 - 1;
-        if (scan_index_down_31 < MAX_EXPERTS) {
-            int scan_left_13 = scan_values[scan_index_down_31 - 8];
-            scan_values[scan_index_down_31 - 8] = scan_values[scan_index_down_31];
-            scan_values[scan_index_down_31] = scan_values[scan_index_down_31] + scan_left_13;
-        }
-        __syncthreads();
-        int scan_index_down_32 = (tid + 1) * 8 - 1;
-        if (scan_index_down_32 < MAX_EXPERTS) {
-            int scan_left_14 = scan_values[scan_index_down_32 - 4];
-            scan_values[scan_index_down_32 - 4] = scan_values[scan_index_down_32];
-            scan_values[scan_index_down_32] = scan_values[scan_index_down_32] + scan_left_14;
-        }
-        int scan_index_down_33 = (THREADS + tid + 1) * 8 - 1;
-        if (scan_index_down_33 < MAX_EXPERTS) {
-            int scan_left_15 = scan_values[scan_index_down_33 - 4];
-            scan_values[scan_index_down_33 - 4] = scan_values[scan_index_down_33];
-            scan_values[scan_index_down_33] = scan_values[scan_index_down_33] + scan_left_15;
-        }
-        __syncthreads();
-        int scan_index_down_34 = (tid + 1) * 4 - 1;
-        if (scan_index_down_34 < MAX_EXPERTS) {
-            int scan_left_16 = scan_values[scan_index_down_34 - 2];
-            scan_values[scan_index_down_34 - 2] = scan_values[scan_index_down_34];
-            scan_values[scan_index_down_34] = scan_values[scan_index_down_34] + scan_left_16;
-        }
-        int scan_index_down_35 = (THREADS + tid + 1) * 4 - 1;
-        if (scan_index_down_35 < MAX_EXPERTS) {
-            int scan_left_17 = scan_values[scan_index_down_35 - 2];
-            scan_values[scan_index_down_35 - 2] = scan_values[scan_index_down_35];
-            scan_values[scan_index_down_35] = scan_values[scan_index_down_35] + scan_left_17;
-        }
-        __syncthreads();
-        int scan_index_down_36 = (tid + 1) * 2 - 1;
-        if (scan_index_down_36 < MAX_EXPERTS) {
-            int scan_left_18 = scan_values[scan_index_down_36 - 1];
-            scan_values[scan_index_down_36 - 1] = scan_values[scan_index_down_36];
-            scan_values[scan_index_down_36] = scan_values[scan_index_down_36] + scan_left_18;
-        }
-        int scan_index_down_37 = (THREADS + tid + 1) * 2 - 1;
-        if (scan_index_down_37 < MAX_EXPERTS) {
-            int scan_left_19 = scan_values[scan_index_down_37 - 1];
-            scan_values[scan_index_down_37 - 1] = scan_values[scan_index_down_37];
-            scan_values[scan_index_down_37] = scan_values[scan_index_down_37] + scan_left_19;
-        }
-        __syncthreads();
         if (tid == 0) {
             shared_offsets[E] = shared_total[0];
         }
@@ -3399,16 +3651,7 @@ kernel_alpha_moe_fused_router_tiny_routed(float* __restrict__ logits, float* __r
         for (int padding_expert = tid; padding_expert < E; padding_expert += THREADS) {
             int count_final = shared_counts[padding_expert];
             int expert_start = shared_offsets[padding_expert];
-            int padded_count_final = 0;
-            {
-                if (block_m == 8) {
-                    padded_count_final = count_final + 7 & -8;
-                } else if (block_m == 16) {
-                    padded_count_final = count_final + 15 & -16;
-                } else {
-                    padded_count_final = (count_final + block_m - 1) / block_m * block_m;
-                }
-            }
+            int padded_count_final = shared_offsets[padding_expert + 1] - expert_start;
             int padding_count = padded_count_final - count_final;
             #pragma unroll
             for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
@@ -3471,11 +3714,270 @@ static_assert(MAX_EXPERTS == 512);
 
 using alphamoe_router_tiny_routed_generated::kernel_alpha_moe_fused_router_tiny_routed;
 
-static_assert(alphamoe_router_tiny_routed_generated::kThreads == alphamoe_router_small_generated::kThreads);
+namespace alphamoe_router_large_tail_generated {
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+#if defined(__CUDACC_RTC__)
+typedef unsigned long long uint64_t;
+#else
+typedef unsigned long      uint64_t;
+#endif
+static_assert(sizeof(uint64_t) == 8, "Requires an LP64 CUDA host ABI");
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
+struct __align__(64) LoomTensorMap64 { uint64_t opaque[16]; };
+static_assert(sizeof(LoomTensorMap64) == 128, "64-aligned tensor-map ABI size");
+static_assert(alignof(LoomTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
-static_assert(alphamoe_router_tiny_routed_generated::kSmemTotal == alphamoe_router_small_generated::kSmemTotal);
+#if defined(__CUDACC_RTC__)
+typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
+#else
 
-static_assert(alphamoe_router_tiny_routed_generated::kWarps == alphamoe_router_small_generated::kWarps);
+#endif
+
+static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
+static_assert(alignof(LoomTensorMap) >= alignof(CUtensorMap), "LoomTensorMap alignment must cover the CUtensorMap CUDA ABI");
+
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define LOOM_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_LOCAL_OFFSETS_OFF 0
+#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
+#define SMEM_LOCAL_OFFSETS_STRIDE 4100
+#define SMEM_SCAN_VALUES_OFF 4100
+#define SMEM_SCAN_VALUES_STAGE_BYTES 32
+#define SMEM_SCAN_VALUES_STRIDE 32
+#define SMEM_TOTAL 4224
+#define THREADS 256
+#define NUM_WARPS 8
+#define MAX_EXPERTS 512
+#define MAX_TOP_K 16
+#define MAX_BLOCK_M 16
+#define PUBLIC_SHARED_SOFTMAX 0
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_alpha_moe_fused_router_large_tail(float* __restrict__ logits, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M, int E, int top_k, int block_m, int has_shared_expert)
+{
+    const int tid = threadIdx.x;
+    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // Kernel setup ops
+    int* local_offsets = reinterpret_cast<int*>(smem_raw + 0);
+    const int local_offsets_addr = smem + 0;
+    int* scan_values = reinterpret_cast<int*>(smem_raw + 4100);
+    const int scan_values_addr = smem + 4100;
+
+    // === Task calls (dependency order) ===
+    int global_thread = bid * THREADS + tid;
+    if (bid * THREADS < M * top_k || bid * THREADS < E) {
+        int first_stored_pair = 0;
+        {
+            if (global_thread < M * top_k) {
+                first_stored_pair = topk_ids[global_thread];
+            }
+        }
+        int scan_padded[MAX_EXPERTS / THREADS];
+        int scan_thread_total = 0;
+        #pragma unroll
+        for (int expert_slot_scan_init = 0; expert_slot_scan_init < MAX_EXPERTS / THREADS; expert_slot_scan_init++) {
+            int expert_scan_init = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_init;
+            int padded_count_init = 0;
+            if (expert_scan_init < E) {
+                int count_init = expert_counts[expert_scan_init];
+                if (block_m == 8) {
+                    padded_count_init = count_init + 7 & -8;
+                } else if (block_m == 16) {
+                    padded_count_init = count_init + 15 & -16;
+                } else {
+                    padded_count_init = (count_init + block_m - 1) / block_m * block_m;
+                }
+            }
+            scan_padded[expert_slot_scan_init] = padded_count_init;
+            scan_thread_total = scan_thread_total + padded_count_init;
+        }
+        int scan_thread_inclusive = scan_thread_total;
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 1, 32);
+        int scan_peer = _shfl_up_0;
+        if (lane >= 1) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer;
+        }
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 2, 32);
+        int scan_peer_0 = _shfl_up_1;
+        if (lane >= 2) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_0;
+        }
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 4, 32);
+        int scan_peer_1 = _shfl_up_2;
+        if (lane >= 4) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_1;
+        }
+        int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 8, 32);
+        int scan_peer_2 = _shfl_up_3;
+        if (lane >= 8) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_2;
+        }
+        int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, scan_thread_inclusive, 16, 32);
+        int scan_peer_3 = _shfl_up_4;
+        if (lane >= 16) {
+            scan_thread_inclusive = scan_thread_inclusive + scan_peer_3;
+        }
+        if (lane == 31) {
+            scan_values[warp] = scan_thread_inclusive;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            int scan_warp_total = 0;
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_warp_total = scan_values[lane];
+            }
+            int scan_warp_inclusive = scan_warp_total;
+            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 1, 32);
+            int scan_warp_peer = _shfl_up_5;
+            if (lane >= 1) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer;
+            }
+            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 2, 32);
+            int scan_warp_peer_0 = _shfl_up_6;
+            if (lane >= 2) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_0;
+            }
+            int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, scan_warp_inclusive, 4, 32);
+            int scan_warp_peer_1 = _shfl_up_7;
+            if (lane >= 4) {
+                scan_warp_inclusive = scan_warp_inclusive + scan_warp_peer_1;
+            }
+            if (lane < (unsigned int)NUM_WARPS) {
+                scan_values[lane] = scan_warp_inclusive - scan_warp_total;
+            }
+            if (lane == (unsigned int)(NUM_WARPS - 1)) {
+                local_offsets[E] = scan_warp_inclusive;
+                if (bid == 0) {
+                    num_tokens_post_padded[0] = scan_warp_inclusive;
+                    expert_offsets[E] = scan_warp_inclusive;
+                }
+            }
+        }
+        __syncthreads();
+        int scan_expert_prefix = scan_values[warp] + scan_thread_inclusive - scan_thread_total;
+        #pragma unroll
+        for (int expert_slot_scan_store = 0; expert_slot_scan_store < MAX_EXPERTS / THREADS; expert_slot_scan_store++) {
+            int expert_scan_store = tid * (MAX_EXPERTS / THREADS) + expert_slot_scan_store;
+            if (expert_scan_store < E) {
+                local_offsets[expert_scan_store] = scan_expert_prefix;
+                if (bid == 0) {
+                    expert_offsets[expert_scan_store] = scan_expert_prefix;
+                    if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                        expert_scatter_offsets[expert_scan_store] = expert_counts[expert_scan_store];
+                    }
+                }
+            }
+            scan_expert_prefix = scan_expert_prefix + scan_padded[expert_slot_scan_store];
+        }
+        __syncthreads();
+        int scatter_block_mask = block_m - 1;
+        int scatter_block_shift = 0;
+        if (block_m == 8) {
+            scatter_block_shift = 3;
+        } else if (block_m == 16) {
+            scatter_block_shift = 4;
+        }
+        for (int pair = global_thread; pair < M * top_k; pair += num_bids * THREADS) {
+            int stored_pair = 0;
+            {
+                stored_pair = first_stored_pair;
+                if (pair != global_thread) {
+                    stored_pair = topk_ids[pair];
+                }
+            }
+            int pair_expert = stored_pair;
+            int local_row = 0;
+            if (M > 512 && M <= 2147483647 / (MAX_EXPERTS * MAX_TOP_K)) {
+                pair_expert = stored_pair % MAX_EXPERTS;
+                local_row = stored_pair / MAX_EXPERTS;
+                topk_ids[pair] = pair_expert;
+            } else {
+                int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[pair_expert], 1);
+                local_row = _atomic_old_0;
+            }
+            int grouped_row = local_offsets[pair_expert] + local_row;
+            sorted_token_ids[grouped_row] = pair;
+            int scatter_block_remainder = 0;
+            if (scatter_block_shift != 0) {
+                scatter_block_remainder = local_row & scatter_block_mask;
+            } else {
+                scatter_block_remainder = local_row % block_m;
+            }
+            if (scatter_block_remainder == 0) {
+                int scatter_block_index = 0;
+                if (scatter_block_shift != 0) {
+                    scatter_block_index = grouped_row >> scatter_block_shift;
+                } else {
+                    scatter_block_index = grouped_row / block_m;
+                }
+                expert_ids[scatter_block_index] = pair_expert;
+            }
+        }
+        for (int padding_expert = global_thread; padding_expert < E; padding_expert += num_bids * THREADS) {
+            int count_final = expert_counts[padding_expert];
+            int expert_start = local_offsets[padding_expert];
+            int padded_count_final = local_offsets[padding_expert + 1] - expert_start;
+            int padding_count = padded_count_final - count_final;
+            #pragma unroll
+            for (int padding_slot = 0; padding_slot < MAX_BLOCK_M; padding_slot++) {
+                if (padding_count > padding_slot) {
+                    sorted_token_ids[expert_start + count_final + padding_slot] = M * top_k;
+                }
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+
+constexpr int kThreads = THREADS;
+constexpr int kSmemTotal = SMEM_TOTAL;
+constexpr int kWarps = NUM_WARPS;
+static_assert(THREADS == NUM_WARPS * 32);
+static_assert(MAX_EXPERTS == 512);
+#undef LOOM_INF
+#undef MAX_BLOCK_M
+#undef MAX_EXPERTS
+#undef MAX_TOP_K
+#undef NUM_MAIN_STAGES
+#undef NUM_WARPS
+#undef PUBLIC_SHARED_SOFTMAX
+#undef SMEM_LOCAL_OFFSETS_OFF
+#undef SMEM_LOCAL_OFFSETS_STAGE_BYTES
+#undef SMEM_LOCAL_OFFSETS_STRIDE
+#undef SMEM_SCAN_VALUES_OFF
+#undef SMEM_SCAN_VALUES_STAGE_BYTES
+#undef SMEM_SCAN_VALUES_STRIDE
+#undef SMEM_TOTAL
+#undef THREADS
+}  // namespace alphamoe_router_large_tail_generated
+
+using alphamoe_router_large_tail_generated::kernel_alpha_moe_fused_router_large_tail;
 
 // clang-format on
 
@@ -3485,15 +3987,6 @@ namespace alphamoe_fused_router {
 constexpr int64_t kMaxExperts = 512;
 constexpr int64_t kMaxTopK = 16;
 constexpr int64_t kMaxBlockM = 16;
-constexpr int64_t kThreads = kGeneratedThreads;
-constexpr int64_t kDynamicSmemBytes = kGeneratedSmemTotal;
-constexpr int64_t kSmallThreads = kSmallGeneratedThreads;
-constexpr int64_t kSmallDynamicSmemBytes = kSmallGeneratedSmemTotal;
-constexpr int64_t kSmallMLimit = 128;
-
-static_assert(kGeneratedThreads == kThreads);
-static_assert(kGeneratedSmemTotal == kDynamicSmemBytes);
-
 inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
@@ -3501,17 +3994,16 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
 struct RouterLaunchConfig {
   int sm_count;
   int active_blocks_per_sm;
+  int medium_active_blocks_per_sm;
   int small_active_blocks_per_sm;
 };
 
 inline RouterLaunchConfig GetRouterLaunchConfig(int32_t device_id) {
-  // Run selects the tensor device before resolving its runtime launch configuration.
   static std::mutex mutex;
   static std::unordered_map<int32_t, RouterLaunchConfig> cache;
   std::lock_guard<std::mutex> lock(mutex);
   const auto cached = cache.find(device_id);
   if (cached != cache.end()) return cached->second;
-
   int major = 0, minor = 0, sm_count = 0, cooperative_launch = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(compute capability major)");
@@ -3528,74 +4020,107 @@ inline RouterLaunchConfig GetRouterLaunchConfig(int32_t device_id) {
       << "AlphaMoE fused router requires cooperative-launch support";
   CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kDynamicSmemBytes)),
-            "cudaFuncSetAttribute(AlphaMoE router dynamic smem)");
-  CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_small,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kSmallDynamicSmemBytes)),
-            "cudaFuncSetAttribute(AlphaMoE small router dynamic smem)");
-  int active_blocks_per_sm = 0;
-  CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active_blocks_per_sm, kernel_alpha_moe_fused_router, static_cast<int>(kThreads),
-                static_cast<size_t>(kDynamicSmemBytes)),
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE router)");
-  TVM_FFI_ICHECK(active_blocks_per_sm > 0)
-      << "AlphaMoE fused router has zero cooperative occupancy";
-  int small_active_blocks_per_sm = 0;
-  CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &small_active_blocks_per_sm, kernel_alpha_moe_fused_router_small,
-                static_cast<int>(kSmallThreads), static_cast<size_t>(kSmallDynamicSmemBytes)),
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE small router)");
-  TVM_FFI_ICHECK(small_active_blocks_per_sm > 0)
-      << "AlphaMoE small fused router has zero cooperative occupancy";
+                                 alphamoe_router_large_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE large dynamic smem)");
+  int large_active = 0;
+  CheckCuda(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&large_active, kernel_alpha_moe_fused_router,
+                                                    alphamoe_router_large_generated::kThreads,
+                                                    alphamoe_router_large_generated::kSmemTotal),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE large)");
+  TVM_FFI_ICHECK(large_active > 0) << "AlphaMoE large has zero occupancy";
   CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_routed,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kDynamicSmemBytes)),
-            "cudaFuncSetAttribute(AlphaMoE large_routed router dynamic smem)");
-  int routed_active_blocks_per_sm = 0;
+                                 alphamoe_router_large_routed_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE large_routed dynamic smem)");
+  int large_routed_active = 0;
   CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &routed_active_blocks_per_sm, kernel_alpha_moe_fused_router_routed,
-                static_cast<int>(kThreads), static_cast<size_t>(kDynamicSmemBytes)),
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE large_routed router)");
-  TVM_FFI_ICHECK(routed_active_blocks_per_sm > 0)
-      << "AlphaMoE large_routed router has zero cooperative occupancy";
+                &large_routed_active, kernel_alpha_moe_fused_router_routed,
+                alphamoe_router_large_routed_generated::kThreads,
+                alphamoe_router_large_routed_generated::kSmemTotal),
+            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE large_routed)");
+  TVM_FFI_ICHECK(large_routed_active > 0) << "AlphaMoE large_routed has zero occupancy";
+  CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_medium,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 alphamoe_router_medium_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE medium dynamic smem)");
+  int medium_active = 0;
+  CheckCuda(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &medium_active, kernel_alpha_moe_fused_router_medium,
+          alphamoe_router_medium_generated::kThreads, alphamoe_router_medium_generated::kSmemTotal),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE medium)");
+  TVM_FFI_ICHECK(medium_active > 0) << "AlphaMoE medium has zero occupancy";
+  CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_medium_routed,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 alphamoe_router_medium_routed_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE medium_routed dynamic smem)");
+  int medium_routed_active = 0;
+  CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &medium_routed_active, kernel_alpha_moe_fused_router_medium_routed,
+                alphamoe_router_medium_routed_generated::kThreads,
+                alphamoe_router_medium_routed_generated::kSmemTotal),
+            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE medium_routed)");
+  TVM_FFI_ICHECK(medium_routed_active > 0) << "AlphaMoE medium_routed has zero occupancy";
+  CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_small,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 alphamoe_router_small_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE small dynamic smem)");
+  int small_active = 0;
+  CheckCuda(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &small_active, kernel_alpha_moe_fused_router_small,
+          alphamoe_router_small_generated::kThreads, alphamoe_router_small_generated::kSmemTotal),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE small)");
+  TVM_FFI_ICHECK(small_active > 0) << "AlphaMoE small has zero occupancy";
   CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_small_routed,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kSmallDynamicSmemBytes)),
-            "cudaFuncSetAttribute(AlphaMoE small_routed router dynamic smem)");
-  int small_routed_active_blocks_per_sm = 0;
+                                 alphamoe_router_small_routed_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE small_routed dynamic smem)");
+  int small_routed_active = 0;
   CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &small_routed_active_blocks_per_sm, kernel_alpha_moe_fused_router_small_routed,
-                static_cast<int>(kSmallThreads), static_cast<size_t>(kSmallDynamicSmemBytes)),
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE small_routed router)");
-  TVM_FFI_ICHECK(small_routed_active_blocks_per_sm > 0)
-      << "AlphaMoE small_routed router has zero cooperative occupancy";
+                &small_routed_active, kernel_alpha_moe_fused_router_small_routed,
+                alphamoe_router_small_routed_generated::kThreads,
+                alphamoe_router_small_routed_generated::kSmemTotal),
+            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE small_routed)");
+  TVM_FFI_ICHECK(small_routed_active > 0) << "AlphaMoE small_routed has zero occupancy";
   CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_tiny,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kSmallDynamicSmemBytes)),
-            "cudaFuncSetAttribute(AlphaMoE tiny router dynamic smem)");
-  int tiny_active_blocks_per_sm = 0;
-  CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &tiny_active_blocks_per_sm, kernel_alpha_moe_fused_router_tiny,
-                static_cast<int>(kSmallThreads), static_cast<size_t>(kSmallDynamicSmemBytes)),
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE tiny router)");
-  TVM_FFI_ICHECK(tiny_active_blocks_per_sm > 0)
-      << "AlphaMoE tiny router has zero cooperative occupancy";
+                                 alphamoe_router_tiny_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE tiny dynamic smem)");
+  int tiny_active = 0;
+  CheckCuda(
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &tiny_active, kernel_alpha_moe_fused_router_tiny,
+          alphamoe_router_tiny_generated::kThreads, alphamoe_router_tiny_generated::kSmemTotal),
+      "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE tiny)");
+  TVM_FFI_ICHECK(tiny_active > 0) << "AlphaMoE tiny has zero occupancy";
   CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_tiny_routed,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(kSmallDynamicSmemBytes)),
-            "cudaFuncSetAttribute(AlphaMoE tiny_routed router dynamic smem)");
-  int tiny_routed_active_blocks_per_sm = 0;
+                                 alphamoe_router_tiny_routed_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE tiny_routed dynamic smem)");
+  int tiny_routed_active = 0;
   CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &tiny_routed_active_blocks_per_sm, kernel_alpha_moe_fused_router_tiny_routed,
-                static_cast<int>(kSmallThreads), static_cast<size_t>(kSmallDynamicSmemBytes)),
-            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE tiny_routed router)");
-  TVM_FFI_ICHECK(tiny_routed_active_blocks_per_sm > 0)
-      << "AlphaMoE tiny_routed router has zero cooperative occupancy";
+                &tiny_routed_active, kernel_alpha_moe_fused_router_tiny_routed,
+                alphamoe_router_tiny_routed_generated::kThreads,
+                alphamoe_router_tiny_routed_generated::kSmemTotal),
+            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE tiny_routed)");
+  TVM_FFI_ICHECK(tiny_routed_active > 0) << "AlphaMoE tiny_routed has zero occupancy";
+  CheckCuda(cudaFuncSetAttribute(kernel_alpha_moe_fused_router_large_tail,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 alphamoe_router_large_tail_generated::kSmemTotal),
+            "cudaFuncSetAttribute(AlphaMoE large_tail dynamic smem)");
+  int large_tail_active = 0;
+  CheckCuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &large_tail_active, kernel_alpha_moe_fused_router_large_tail,
+                alphamoe_router_large_tail_generated::kThreads,
+                alphamoe_router_large_tail_generated::kSmemTotal),
+            "cudaOccupancyMaxActiveBlocksPerMultiprocessor(AlphaMoE large_tail)");
+  TVM_FFI_ICHECK(large_tail_active > 0) << "AlphaMoE large_tail has zero occupancy";
   const RouterLaunchConfig config{
-      sm_count, std::min(active_blocks_per_sm, routed_active_blocks_per_sm),
-      std::min({small_active_blocks_per_sm, small_routed_active_blocks_per_sm,
-                tiny_active_blocks_per_sm, tiny_routed_active_blocks_per_sm})};
+      sm_count, std::min(large_active, large_routed_active),
+      std::min(medium_active, medium_routed_active),
+      std::min({small_active, small_routed_active, tiny_active, tiny_routed_active})};
   cache.emplace(device_id, config);
   return config;
 }
@@ -3717,23 +4242,25 @@ void Run(TensorView logits, TensorView topk_weights, TensorView topk_ids,
   }
 
   const RouterLaunchConfig config = GetRouterLaunchConfig(device_id);
-  const bool use_small = m <= kSmallMLimit;
-  const int64_t grid_x =
-      use_small
-          ? std::max<int64_t>(
-                1, std::min<int64_t>((m + kSmallGeneratedWarps - 1) / kSmallGeneratedWarps,
-                                     config.sm_count))
-          : std::max<int64_t>(
-                1, std::min<int64_t>(
-                       ((m <= 512) ? (std::min<int64_t>((m + 7) / 8, config.sm_count))
-                                   : ((((m + 3) / 4 + config.sm_count - 1) / config.sm_count) *
-                                      config.sm_count)),
-                       static_cast<int64_t>(config.sm_count) *
-                           std::min(2, config.active_blocks_per_sm)));
-  const int64_t cooperative_capacity =
-      static_cast<int64_t>(use_small ? config.small_active_blocks_per_sm
-                                     : config.active_blocks_per_sm) *
-      config.sm_count;
+  const bool use_tiny = m <= 8;
+  const bool use_small = m <= 128;
+  const bool use_medium = m <= 512;
+  int64_t grid_x =
+      use_tiny ? 1 : std::max<int64_t>(1, std::min<int64_t>((m + 7) / 8, config.sm_count));
+  int active_blocks = config.small_active_blocks_per_sm;
+  if (!use_small && use_medium) {
+    active_blocks = config.medium_active_blocks_per_sm;
+    grid_x = std::max<int64_t>(
+        1, std::min<int64_t>((m + 3) / 4, static_cast<int64_t>(config.sm_count) * active_blocks));
+  } else if (!use_medium) {
+    active_blocks = config.active_blocks_per_sm;
+    const int64_t full_wave_grid =
+        (((m + 3) / 4 + config.sm_count - 1) / config.sm_count) * config.sm_count;
+    grid_x = std::max<int64_t>(
+        1, std::min<int64_t>(full_wave_grid,
+                             static_cast<int64_t>(config.sm_count) * std::min(5, active_blocks)));
+  }
+  const int64_t cooperative_capacity = static_cast<int64_t>(active_blocks) * config.sm_count;
   TVM_FFI_ICHECK(grid_x >= 1 && grid_x <= cooperative_capacity)
       << "AlphaMoE fused router grid " << grid_x << " exceeds cooperative residency capacity "
       << cooperative_capacity;
@@ -3770,31 +4297,47 @@ void Run(TensorView logits, TensorView topk_weights, TensorView topk_ids,
   };
 
   const cudaStream_t stream = get_stream(logits.device());
-  if (m <= 8) {
+  if (use_tiny) {
     CheckCuda(cudaLaunchKernel(reinterpret_cast<const void*>(
                                    has_shared_expert ? kernel_alpha_moe_fused_router_tiny
                                                      : kernel_alpha_moe_fused_router_tiny_routed),
-                               dim3(1, 1, 1), dim3(static_cast<unsigned int>(kSmallThreads), 1, 1),
-                               arguments, static_cast<size_t>(kSmallDynamicSmemBytes), stream),
-              "cudaLaunchKernel(AlphaMoE single-CTA fused router)");
+                               dim3(static_cast<unsigned int>(grid_x), 1, 1),
+                               dim3(alphamoe_router_tiny_generated::kThreads, 1, 1), arguments,
+                               alphamoe_router_tiny_generated::kSmemTotal, stream),
+              "cudaLaunchKernel(AlphaMoE tiny)");
   } else if (use_small) {
     CheckCuda(cudaLaunchCooperativeKernel(
                   reinterpret_cast<const void*>(has_shared_expert
                                                     ? kernel_alpha_moe_fused_router_small
                                                     : kernel_alpha_moe_fused_router_small_routed),
                   dim3(static_cast<unsigned int>(grid_x), 1, 1),
-                  dim3(static_cast<unsigned int>(kSmallThreads), 1, 1), arguments,
-                  static_cast<size_t>(kSmallDynamicSmemBytes), stream),
-              "cudaLaunchCooperativeKernel(AlphaMoE small fused router)");
+                  dim3(alphamoe_router_small_generated::kThreads, 1, 1), arguments,
+                  alphamoe_router_small_generated::kSmemTotal, stream),
+              "cudaLaunchCooperativeKernel(AlphaMoE small)");
+  } else if (use_medium) {
+    CheckCuda(cudaLaunchCooperativeKernel(
+                  reinterpret_cast<const void*>(has_shared_expert
+                                                    ? kernel_alpha_moe_fused_router_medium
+                                                    : kernel_alpha_moe_fused_router_medium_routed),
+                  dim3(static_cast<unsigned int>(grid_x), 1, 1),
+                  dim3(alphamoe_router_medium_generated::kThreads, 1, 1), arguments,
+                  alphamoe_router_medium_generated::kSmemTotal, stream),
+              "cudaLaunchCooperativeKernel(AlphaMoE medium)");
   } else {
     CheckCuda(
         cudaLaunchCooperativeKernel(
             reinterpret_cast<const void*>(has_shared_expert ? kernel_alpha_moe_fused_router
                                                             : kernel_alpha_moe_fused_router_routed),
             dim3(static_cast<unsigned int>(grid_x), 1, 1),
-            dim3(static_cast<unsigned int>(kThreads), 1, 1), arguments,
-            static_cast<size_t>(kDynamicSmemBytes), stream),
-        "cudaLaunchCooperativeKernel(AlphaMoE fused router)");
+            dim3(alphamoe_router_large_generated::kThreads, 1, 1), arguments,
+            alphamoe_router_large_generated::kSmemTotal, stream),
+        "cudaLaunchCooperativeKernel(AlphaMoE large)");
+    CheckCuda(
+        cudaLaunchKernel(reinterpret_cast<const void*>(kernel_alpha_moe_fused_router_large_tail),
+                         dim3(static_cast<unsigned int>(grid_x), 1, 1),
+                         dim3(alphamoe_router_large_tail_generated::kThreads, 1, 1), arguments,
+                         alphamoe_router_large_tail_generated::kSmemTotal, stream),
+        "cudaLaunchKernel(AlphaMoE large tail)");
   }
 }
 
