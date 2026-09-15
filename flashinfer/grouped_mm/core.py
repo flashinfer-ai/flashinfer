@@ -42,7 +42,7 @@ def _check_grouped_mm_bf16(
     out_dtype: torch.dtype = torch.bfloat16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ):
     if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
         raise ValueError(f"a and b must be bfloat16, got {a.dtype} and {b.dtype}")
@@ -86,7 +86,7 @@ def grouped_mm_bf16(
     out_dtype: torch.dtype = torch.bfloat16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with BF16/FP16 data types (cuDNN MOE backend).
 
@@ -114,9 +114,12 @@ def grouped_mm_bf16(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
-    tactic : int
-        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
-        plan; non-negative values select a specific plan.
+    tactic : int or tuple
+        Stable ``(engine_id, sorted_knob_items)`` identity for exact plan replay.
+        ``-1`` uses the cached autotune result for plain BF16/FP8 grouped GEMM,
+        or the heuristic plan when untuned. Non-negative integer plan indices
+        remain accepted for compatibility but should not be persisted across
+        graphs or cuDNN versions. Block-scale APIs use the heuristic at ``-1``.
 
     Returns
     -------
@@ -160,7 +163,7 @@ def _check_grouped_mm_fp8(
     out_dtype: torch.dtype = torch.bfloat16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ):
     if a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(f"a must be float8_e4m3fn or float8_e5m2, got {a.dtype}")
@@ -212,7 +215,7 @@ def grouped_mm_fp8(
     out_dtype: torch.dtype = torch.bfloat16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with FP8 data types (cuDNN MOE backend).
 
@@ -295,7 +298,7 @@ def _check_grouped_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ):
     if a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
         raise ValueError(f"a must be float8_e4m3fn or float8_e5m2, got {a.dtype}")
@@ -355,7 +358,7 @@ def grouped_mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with MXFP8 data types (cuDNN MOE backend).
 
@@ -391,9 +394,12 @@ def grouped_mm_mxfp8(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
-    tactic : int
-        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
-        plan; non-negative values select a specific plan.
+    tactic : int or tuple
+        Stable ``(engine_id, sorted_knob_items)`` identity for exact plan replay.
+        ``-1`` uses the cached autotune result for plain BF16/FP8 grouped GEMM,
+        or the heuristic plan when untuned. Non-negative integer plan indices
+        remain accepted for compatibility but should not be persisted across
+        graphs or cuDNN versions. Block-scale APIs use the heuristic at ``-1``.
 
     Returns
     -------
@@ -438,7 +444,7 @@ def _check_grouped_mm_fp4(
     block_size: int = 16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ):
     if a.dtype not in (torch.float4_e2m1fn_x2, torch.uint8):
         raise ValueError(f"a must be float4_e2m1fn_x2 or uint8, got {a.dtype}")
@@ -517,7 +523,7 @@ def grouped_mm_fp4(
     block_size: int = 16,
     *,
     backend: str = "cudnn",
-    tactic: int = -1,
+    tactic: int | tuple = -1,
 ) -> torch.Tensor:
     r"""Grouped matrix multiplication with FP4 data types (cuDNN MOE backend).
 
@@ -559,9 +565,12 @@ def grouped_mm_fp4(
         scales).  Defaults to ``16``.
     backend : str
         Backend selector.  Currently only ``"cudnn"`` is supported.
-    tactic : int
-        cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
-        plan; non-negative values select a specific plan.
+    tactic : int or tuple
+        Stable ``(engine_id, sorted_knob_items)`` identity for exact plan replay.
+        ``-1`` uses the cached autotune result for plain BF16/FP8 grouped GEMM,
+        or the heuristic plan when untuned. Non-negative integer plan indices
+        remain accepted for compatibility but should not be persisted across
+        graphs or cuDNN versions. Block-scale APIs use the heuristic at ``-1``.
 
     Returns
     -------

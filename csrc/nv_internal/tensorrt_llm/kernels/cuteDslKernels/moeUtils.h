@@ -49,6 +49,21 @@ void moeUnpermute(InputType const* permuted_input, InputType* output,
                   int32_t const num_tokens, int32_t const hidden_size, int32_t const top_k,
                   bool input_is_expanded, bool enable_pdl, cudaStream_t stream);
 
+// Explicitly round FP32 routing weights to the input type before accumulation.
+// Only the BF16 specialization is instantiated; the existing ABI is unchanged.
+template <typename InputType>
+void moeUnpermuteRoundScales(InputType const* permuted_input, InputType* output,
+                             int32_t const* expanded_idx_to_permuted_idx, float const* topk_scales,
+                             int32_t const num_tokens, int32_t const hidden_size,
+                             int32_t const top_k, bool input_is_expanded, bool enable_pdl,
+                             cudaStream_t stream);
+
+// BF16/FP32-scale column tiling with PDL disabled; other entry points retain their ABI.
+template <typename InputType>
+void moeUnpermuteTiled(InputType const* input, InputType* output, int32_t const* inverse,
+                       float const* scales, int32_t tokens, int32_t hidden, int32_t top_k,
+                       bool expanded, bool round_scales, cudaStream_t stream);
+
 template <typename InputType>
 void moeOutputMemset(InputType* input, int32_t const* tile_idx_to_mn_limit,
                      int32_t const* expanded_idx_to_permuted_idx,

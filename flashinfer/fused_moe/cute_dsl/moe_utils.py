@@ -261,6 +261,8 @@ def moe_unpermute(
     top_k: int,
     enable_pdl: bool = False,
     input_is_expanded: bool = False,
+    round_scales_to_bf16: bool = False,
+    use_wide_tiling: bool = False,
 ) -> None:
     """
     Unpermute and scale outputs after expert computation.
@@ -284,6 +286,16 @@ def moe_unpermute(
                     Default is False.
         input_is_expanded: Whether input rows use expanded (token, top-k slot)
             order instead of expert-permuted order.
+        round_scales_to_bf16: Round FP32 weights to BF16 inside this kernel before
+            weighted FP32 accumulation. Requires BF16 input and output, preserving
+            PackedPrecomputed routing semantics without a separate conversion.
+            The default retains the supplied scale precision.
+        use_wide_tiling: Use BF16/FP32-scale column tiling with PDL disabled.
+            Supports 1..1024 tokens, hidden size 4096/8192 and top-k 2/4/8/16.
+            Hidden size 4096 with top-k 8 additionally supports up to 8192 tokens.
+            Explicit tiling can be slower at large token counts; callers should tune.
+            Input and output data pointers must be 16-byte aligned.
+            Other callers retain the existing kernel by default.
 
     Note:
         Output is the weighted sum of expert contributions:
@@ -304,7 +316,70 @@ def moe_unpermute(
     else:
         raise ValueError(f"Unsupported scale dtype: {topk_scales.dtype}")
 
+    if use_wide_tiling:
+        if (
+            enable_pdl
+            or permuted_input.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or topk_scales.dtype != torch.float32
+            or expanded_idx_to_permuted_idx.dtype != torch.int32
+            or not (
+                0 < num_tokens <= 1024
+                or (0 < num_tokens <= 8192 and hidden_size == 4096 and top_k == 8)
+            )
+            or hidden_size not in (4096, 8192)
+            or top_k not in (2, 4, 8, 16)
+        ):
+            raise ValueError(
+                "Wide tiling requires BF16 data, FP32 scales, Int32 indices, PDL off, tokens 1..1024, hidden 4096/8192 and top-k 2/4/8/16; hidden4096/top-k8 additionally supports up to8192 tokens"
+            )
+        tensors = (permuted_input, output, expanded_idx_to_permuted_idx, topk_scales)
+        if not all(
+            t.is_cuda and t.is_contiguous() and t.device == output.device
+            for t in tensors
+        ):
+            raise ValueError(
+                "Wide tiling requires contiguous tensors on one CUDA device"
+            )
+        if permuted_input.data_ptr() % 16 or output.data_ptr() % 16:
+            raise ValueError("Wide tiling requires 16-byte aligned input and output")
+        if permuted_input.ndim != 2 or output.shape != (num_tokens, hidden_size):
+            raise ValueError(
+                "Wide tiling requires rank-2 input and [tokens, hidden] output"
+            )
+        if (
+            expanded_idx_to_permuted_idx.numel() != num_tokens * top_k
+            or topk_scales.numel() != num_tokens * top_k
+        ):
+            raise ValueError("Wide tiling requires tokens * top-k indices and scales")
+        if input_is_expanded and permuted_input.shape[0] < num_tokens * top_k:
+            raise ValueError("Expanded input has insufficient row capacity")
+        with torch.cuda.device(output.device):
+            module["flashinfer_moe_unpermute_bf16_float_scale_tiled"](
+                permuted_input.data_ptr(),
+                output.data_ptr(),
+                expanded_idx_to_permuted_idx.data_ptr(),
+                topk_scales.data_ptr(),
+                num_tokens,
+                hidden_size,
+                top_k,
+                input_is_expanded,
+                round_scales_to_bf16,
+                _get_cuda_stream_ptr(),
+            )
+        return
+
     func_name = f"flashinfer_moe_unpermute_{input_dtype_suffix}_{scale_suffix}_scale"
+    if round_scales_to_bf16:
+        if (
+            permuted_input.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or topk_scales.dtype != torch.float32
+        ):
+            raise ValueError(
+                "round_scales_to_bf16 requires BF16 input/output and FP32 scales"
+            )
+        func_name += "_rounded"
     func = module[func_name]
 
     func(
@@ -532,6 +607,7 @@ def moe_sort(
     out_permuted_idx_to_expanded_idx: Optional[torch.Tensor] = None,
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    out_expert_first_token_offset: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor,  # tile_idx_to_expert_idx
     torch.Tensor,  # tile_idx_to_mn_limit
@@ -581,6 +657,11 @@ def moe_sort(
         out_permuted_idx_to_expanded_idx: Pre-allocated buffer for permuted_idx_to_expanded_idx.
         out_total_num_padded_tokens: Pre-allocated buffer for total_num_padded_tokens.
         out_num_non_exiting_tiles: Pre-allocated buffer for num_non_exiting_tiles.
+        out_expert_first_token_offset: Optional contiguous CUDA int32 [num_experts + 1]
+            output of token-space expert boundaries, including per-expert padding.
+            With tile_tokens_dim=1 these are unpadded grouped-GEMM offsets.
+            Non-local experts have empty spans; the last value is the total size.
+            The six-element return tuple is unchanged.
 
     Returns:
         tuple: A tuple of 6 elements:
@@ -632,6 +713,18 @@ def moe_sort(
         num_local_experts = num_experts
 
     device = token_selected_experts.device
+    if out_expert_first_token_offset is not None:
+        offsets = out_expert_first_token_offset
+        if (
+            offsets.device != device
+            or offsets.dtype != torch.int32
+            or tuple(offsets.shape) != (num_experts + 1,)
+            or not offsets.is_contiguous()
+        ):
+            raise ValueError(
+                "out_expert_first_token_offset must be contiguous int32 "
+                "[num_experts + 1] on the routing input device"
+            )
 
     # Calculate buffer sizes
     max_num_tiles = get_max_num_tiles(
@@ -712,7 +805,7 @@ def moe_sort(
 
     # Get the JIT module and call the kernel
     module = _get_moe_utils_module()
-    func = module["flashinfer_moe_sort"]
+    func = module["flashinfer_moe_sort_with_offsets"]
 
     # Get PyTorch's current stream for CUDA graph compatibility
     cuda_stream_ptr = _get_cuda_stream_ptr()
@@ -739,6 +832,11 @@ def moe_sort(
         expert_counts_ptr,
         # CUDA stream for CUDA graph compatibility
         cuda_stream_ptr,
+        (
+            out_expert_first_token_offset.data_ptr()
+            if out_expert_first_token_offset is not None
+            else 0
+        ),
     )
 
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility

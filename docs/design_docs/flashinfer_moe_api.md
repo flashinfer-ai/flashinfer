@@ -737,7 +737,8 @@ config-derived values.
 
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
-unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
+unclamped linear branch, supported by the CuTe-DSL scalar ABI and the cuDNN
+graph adapter. The
 TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
@@ -755,6 +756,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `W4A16` | `SwiGLU`, `ReLU2` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4` | `SwiGLU` |
+| `cudnn` | `CudnnMoeConfig` | `BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep` |
+| `cudnn_fp8_per_tensor` | `CudnnFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `W4A16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
@@ -791,6 +794,10 @@ CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `clamp_limit`, so that non-default field is rejected. CUTLASS SiTU uses the
 same two native keys and likewise has no clamp channel or unclamped-linear
 encoding, so `clamp_limit` and `linear_scale=None` are rejected there too.
+The cuDNN BF16 graph adapter represents these branches explicitly and supports
+both optional parameters; see [cuDNN MoE](cudnn_moe.md) for its runtime and
+capture contract. Its prepared weight view does not accept per-expert scalar
+overrides; typed activation values apply to all experts.
 `SiTU()` defaults to the canonical Kimi-K3 scales, which are the CUTLASS
 `SituAdaptor` compile-time defaults, so CUTLASS materializes config-derived
 per-expert tensors only for a non-default value. The TRT-LLM path cannot do the

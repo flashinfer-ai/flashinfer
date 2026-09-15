@@ -472,6 +472,10 @@ __device__ void routingPermutation(KernelParams params,
         offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
       }
 
+      if (clusterBlockRank == 0 && params.mPtrExpertFirstTokenOffset != nullptr) {
+        params.mPtrExpertFirstTokenOffset[expert] = offset;
+      }
+
       // write expert offsets to shared
       smemExpertOffset[expert] = offset + blockExpertOffset[e];
     }
@@ -487,6 +491,9 @@ __device__ void routingPermutation(KernelParams params,
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    if (params.mPtrExpertFirstTokenOffset != nullptr) {
+      params.mPtrExpertFirstTokenOffset[params.mNumExperts] = permutedIdxSize;
+    }
   }
 
   // make expert offsets available to all threads
@@ -728,6 +735,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
         offset = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim);
       }
 
+      if (blockIdx.x == 0 && params.mPtrExpertFirstTokenOffset != nullptr) {
+        params.mPtrExpertFirstTokenOffset[expert] = offset;
+      }
+
       // Write expert offsets to shared
       smemExpertOffset[expert] = offset;
     }
@@ -746,6 +757,9 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     }
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    if (params.mPtrExpertFirstTokenOffset != nullptr) {
+      params.mPtrExpertFirstTokenOffset[params.mNumExperts] = permutedIdxSize;
+    }
   }
 
 #pragma unroll
@@ -1169,6 +1183,14 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   if (gridBlockIdx == 0 && warpIdx == NumThreads / WarpSize - 1 && cute::elect_one_sync()) {
     params.mPtrPermutedIdxSize[0] = permutedIdxSize;
     params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    if (params.mPtrExpertFirstTokenOffset != nullptr) {
+      params.mPtrExpertFirstTokenOffset[params.mNumExperts] = permutedIdxSize;
+    }
+  }
+
+  if (gridBlockIdx == 0 && threadIdx.x < params.mNumExperts &&
+      params.mPtrExpertFirstTokenOffset != nullptr) {
+    params.mPtrExpertFirstTokenOffset[threadIdx.x] = offset;
   }
 
   // write expert offsets to shared

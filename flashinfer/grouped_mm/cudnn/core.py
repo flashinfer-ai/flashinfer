@@ -15,6 +15,7 @@ backend-agnostic.
 """
 
 import functools
+import os
 from enum import Enum
 from typing import Optional
 
@@ -23,6 +24,7 @@ import torch
 from ...gemm.gemm_base import (
     DEFAULT_WORKSPACE_SIZE,
     _check_cudnn_plan_build_not_capturing,
+    _is_cudnn_engine_knob_tactic,
     _gemm_workspace_at_least,
     _get_real_fp4_shape_from_packed_uint8,
 )
@@ -133,6 +135,47 @@ def _to_cudnn_dtype(dtype: torch.dtype):
     return _TORCH_TO_CUDNN[dtype]
 
 
+def _runtime_key(device):
+    return (
+        str(device),
+        cudnn.backend_version(),
+        cudnn.__version__,
+        os.environ.get("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "0").strip().lower(),
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _plan_indices(graph):
+    indices = {}
+    for index in range(graph.get_execution_plan_count()):
+        engine, knobs = graph.get_engine_and_knobs_at_index(index)
+        tactic = (
+            int(engine),
+            tuple(sorted((int(k), int(v)) for k, v in knobs.items())),
+        )
+        indices.setdefault(tactic, index)
+    return indices
+
+
+def _plan_index(graph, tactic):
+    if _is_cudnn_engine_knob_tactic(tactic):
+        engine, knobs = tactic
+        key = (int(engine), tuple(sorted((int(k), int(v)) for k, v in knobs)))
+        try:
+            return _plan_indices(graph)[key]
+        except KeyError:
+            raise ValueError(
+                "cuDNN grouped GEMM tactic is unavailable for this graph; retune this shape"
+            ) from None
+    if (
+        type(tactic) is not int
+        or tactic < -1
+        or tactic >= graph.get_execution_plan_count()
+    ):
+        raise ValueError(f"Invalid cuDNN grouped GEMM tactic: {tactic!r}")
+    return tactic
+
+
 # ---------------------------------------------------------------------------
 # Generic cuDNN MOE graph builder & executor
 # ---------------------------------------------------------------------------
@@ -152,6 +195,7 @@ def _build_cudnn_moe_grouped_gemm_graph(
     alpha_cudnn_dtype,
     output_cudnn_dtype,
     policy=None,
+    runtime_key=None,
 ):
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -224,21 +268,22 @@ def _build_cudnn_moe_grouped_gemm_graph(
     return graph, graph.get_workspace_size()
 
 
-def _run_cudnn_moe_grouped_gemm(
+def _execute_cudnn_moe_grouped_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
     m_indptr: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
-    tactic: int = -1,
+    tactic: int | tuple = -1,
+    _prepare_only: bool = False,
 ):
     """Build/cache graph → allocate output → execute.
 
     Args:
-        tactic: Execution plan index. -1 (default) uses the heuristic-best
-            plan.  Non-negative values select a specific plan built with
-            ``build_plan_policy.ALL``.
+        tactic: Stable ``(engine_id, sorted_knob_items)`` identity, or a legacy
+            integer plan index. ``-1`` executes the default built plan; explicit
+            identities are resolved exactly from plans built with ``ALL``.
     """
     token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
     weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
@@ -274,7 +319,11 @@ def _run_cudnn_moe_grouped_gemm(
         alpha_cudnn_dtype,
         out_cudnn_dtype,
         policy=policy,
+        runtime_key=_runtime_key(a.device),
     )
+
+    if _prepare_only:
+        return graph
 
     if out is None:
         out = torch.empty(cum_m, n, dtype=out_dtype, device=a.device)
@@ -292,13 +341,11 @@ def _run_cudnn_moe_grouped_gemm(
     workspace = _gemm_workspace_at_least(
         _get_cache_buf("grouped_mm_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
     )
-    if tactic == -1:
+    plan_index = _plan_index(graph, tactic)
+    if plan_index == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
-        plan_count = graph.get_execution_plan_count()
-        if tactic >= plan_count:
-            return None
-        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+        graph.execute_plan_at_index(variant_pack, workspace, plan_index, handle=handle)
     return out
 
 
@@ -323,6 +370,7 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
     output_cudnn_dtype,
     block_size,
     policy=None,
+    runtime_key=None,
 ):
     if policy is None:
         policy = cudnn.build_plan_policy.HEURISTICS_CHOICE
@@ -340,10 +388,16 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
         data_type=token_cudnn_dtype,
         uid=_CUDNN_UIDs.TOKEN.value,
     )
+    # F8_128x4 descriptors describe the globally padded logical tensor. The
+    # allocation may be larger: routed groups each own a separately padded SF
+    # segment. Describing that full allocation as the logical M dimension makes
+    # backend lowering reject valid ragged MoE graphs before Frost can plan.
+    sf_rows = (token_shape[1] + 127) // 128 * 128
+    sf_cols = ((token_shape[2] // block_size) + 3) // 4 * 4
     token_descale = graph.tensor(
         name="token_descale",
-        dim=list(token_descale_shape),
-        stride=list(token_descale_stride),
+        dim=[token_shape[0], sf_rows, sf_cols],
+        stride=[sf_rows * sf_cols, sf_cols, 1],
         data_type=token_descale_cudnn_dtype,
         reordering_type=cudnn.tensor_reordering.F8_128x4,
         uid=_CUDNN_UIDs.TOKEN_SCALE_FACTOR.value,
@@ -434,14 +488,15 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
-    tactic: int = -1,
+    tactic: int | tuple = -1,
+    _prepare_only: bool = False,
 ):
     """Build/cache graph → allocate output → execute.
 
     Args:
-        tactic: Execution plan index. -1 (default) uses the heuristic-best
-            plan.  Non-negative values select a specific plan built with
-            ``build_plan_policy.ALL``.
+        tactic: Stable ``(engine_id, sorted_knob_items)`` identity, or a legacy
+            integer plan index. ``-1`` executes the default built plan; explicit
+            identities are resolved exactly from plans built with ``ALL``.
     """
     token_cudnn_dtype = _to_cudnn_dtype(a.dtype)
     weight_cudnn_dtype = _to_cudnn_dtype(b.dtype)
@@ -486,7 +541,11 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         out_cudnn_dtype,
         block_size=32,
         policy=policy,
+        runtime_key=_runtime_key(a.device),
     )
+
+    if _prepare_only:
+        return graph
 
     if out is None:
         out = torch.empty(cum_m, n, dtype=out_dtype, device=a.device)
@@ -507,13 +566,11 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         _get_cache_buf("grouped_mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device),
         ws,
     )
-    if tactic == -1:
+    plan_index = _plan_index(graph, tactic)
+    if plan_index == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
-        plan_count = graph.get_execution_plan_count()
-        if tactic >= plan_count:
-            return None
-        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+        graph.execute_plan_at_index(variant_pack, workspace, plan_index, handle=handle)
     return out
 
 
@@ -527,14 +584,15 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
-    tactic: int = -1,
+    tactic: int | tuple = -1,
+    _prepare_only: bool = False,
 ):
     """Build/cache graph → allocate output → execute.
 
     Args:
-        tactic: Execution plan index. -1 (default) uses the heuristic-best
-            plan.  Non-negative values select a specific plan built with
-            ``build_plan_policy.ALL``.
+        tactic: Stable ``(engine_id, sorted_knob_items)`` identity, or a legacy
+            integer plan index. ``-1`` executes the default built plan; explicit
+            identities are resolved exactly from plans built with ``ALL``.
     """
     a_descale_cudnn_type = (
         cudnn.data_type.FP8_E8M0
@@ -594,7 +652,11 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
         out_cudnn_dtype,
         block_size=block_size,
         policy=policy,
+        runtime_key=_runtime_key(a.device),
     )
+
+    if _prepare_only:
+        return graph
 
     if out is None:
         out = torch.empty(cum_m, n, dtype=out_dtype, device=a.device)
@@ -614,11 +676,33 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     workspace = _gemm_workspace_at_least(
         _get_cache_buf("grouped_mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
     )
-    if tactic == -1:
+    plan_index = _plan_index(graph, tactic)
+    if plan_index == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
-        plan_count = graph.get_execution_plan_count()
-        if tactic >= plan_count:
-            return None
-        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+        graph.execute_plan_at_index(variant_pack, workspace, plan_index, handle=handle)
     return out
+
+
+def _run_cudnn_moe_grouped_gemm(
+    a,
+    b,
+    m_indptr,
+    alpha=None,
+    out_dtype=torch.bfloat16,
+    out=None,
+    tactic=-1,
+):
+    if tactic != -1:
+        return _execute_cudnn_moe_grouped_gemm(
+            a,
+            b,
+            m_indptr,
+            alpha=alpha,
+            out_dtype=out_dtype,
+            out=out,
+            tactic=tactic,
+        )
+    from .autotune import run
+
+    return run(a, b, m_indptr, alpha, out_dtype, out)
