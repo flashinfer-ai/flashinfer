@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -25,6 +26,7 @@ import torch
 from .api_logging import flashinfer_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .jit import (
+    MissingJITCacheError,
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
@@ -36,7 +38,16 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
 )
+from .jit.attention.modules import (
+    BatchPrefillModuleSurface,
+    BatchPrefillPagedKVStrideMode,
+    _gen_batch_prefill_independent_paged_module,
+    _gen_batch_prefill_primary_module,
+)
 from .jit.attention.utils import _is_nvfp4_kv_dtype
+from .mla import (
+    trtllm_prefill_with_kv_cache_mla as trtllm_prefill_with_kv_cache_mla,
+)
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
@@ -196,6 +207,8 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
+    module_surface: BatchPrefillModuleSurface = "full",
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -217,6 +230,8 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+        module_surface=module_surface,
     ).build_and_load()
 
 
@@ -224,7 +239,8 @@ def get_customize_batch_prefill_module(
 def get_trtllm_gen_prefill_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
 
     def _paged_run(
         query: torch.Tensor,
@@ -455,13 +471,80 @@ def get_single_prefill_module(backend, *args):
     return SimpleNamespace(run=run_single_prefill)
 
 
+class _LazyBatchPrefillIndependentModule:
+    """Load one independent-stride batch-prefill module on first eager use."""
+
+    def __init__(self, spec: Any) -> None:
+        self._spec = spec
+        self._lock = threading.Lock()
+        self._module: Optional[Any] = None
+
+    @property
+    def is_loaded(self) -> bool:
+        """Whether this holder already has an in-process loaded module."""
+        return self._module is not None
+
+    @staticmethod
+    def _check_not_capturing() -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "The lazy independent paged-KV-stride module cannot be compiled "
+                "or loaded during CUDA graph capture. Call "
+                "prewarm_paged_kv_stride_variant('independent') after plan() "
+                "and before capture."
+            )
+
+    def get(self) -> Any:
+        """Return the loaded module, building it once outside graph capture."""
+        module = self._module
+        if module is not None:
+            return module
+
+        self._check_not_capturing()
+        with self._lock:
+            module = self._module
+            if module is not None:
+                return module
+            self._check_not_capturing()
+            try:
+                module = self._spec.build_and_load()
+            except MissingJITCacheError as exc:
+                raise MissingJITCacheError(
+                    "Unequal K/V data strides require FlashInfer's lazy "
+                    "independent paged module, which is not included in the "
+                    "default JIT cache. Use equal-stride K/V tensors, enable "
+                    "local JIT and call "
+                    "prewarm_paged_kv_stride_variant('independent') after "
+                    "plan(), or install a compatible independent-module cache "
+                    "package when one becomes available.",
+                    spec=exc.spec,
+                ) from exc
+            self._module = module
+            return module
+
+    def prewarm(self) -> None:
+        """Eagerly load the independent module for later graph capture."""
+        self.get()
+
+
 @functools.cache
 def get_batch_prefill_module(backend, *args):
+    lazy_independent_module: Optional[_LazyBatchPrefillIndependentModule] = None
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
+    elif backend == "fa2":
+        uri = get_batch_prefill_uri(backend, *args)
+        module = _gen_batch_prefill_primary_module(backend, *args).build_and_load()
+        lazy_independent_module = _LazyBatchPrefillIndependentModule(
+            _gen_batch_prefill_independent_paged_module(backend, *args)
+        )
+        plan_func = module.plan
+        workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
@@ -748,7 +831,12 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
-            paged_run_func(
+            if tuple(paged_k_cache.stride()) == tuple(paged_v_cache.stride()):
+                routed_paged_run_func = paged_run_func
+            else:
+                assert lazy_independent_module is not None
+                routed_paged_run_func = lazy_independent_module.get().paged_run
+            routed_paged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -896,11 +984,23 @@ def get_batch_prefill_module(backend, *args):
     #
     # Note that plan is not part of model logic. It should not be included in
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+    def prewarm_paged_kv_stride_variant(variant: str = "independent") -> None:
+        """Load the requested lazy paged-KV-stride variant before graph capture."""
+        if variant != "independent":
+            raise ValueError(f"variant must be 'independent', got {variant!r}")
+        if lazy_independent_module is None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is available only for standard FA2 "
+                f"batch-prefill modules, got backend={backend!r}."
+            )
+        lazy_independent_module.prewarm()
+
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
+        prewarm_paged_kv_stride_variant=prewarm_paged_kv_stride_variant,
     )
 
 
@@ -2753,6 +2853,38 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
+
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Load a lazy paged-KV-stride variant after :meth:`plan`.
+
+        Call this method before CUDA graph capture when a planned standard FA2
+        wrapper will receive K and V tensors with different data strides.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        if (
+            getattr(self, "_plan_info", None) is None
+            or getattr(self, "_cached_module", None) is None
+        ):
+            raise RuntimeError(
+                "plan() must complete before prewarming a paged-KV-stride variant."
+            )
+        if self._jit_module is not None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is not supported for a custom JIT module."
+            )
+        if self._backend != "fa2":
+            raise RuntimeError(
+                "Paged-KV-stride prewarm requires a standard FA2 plan, "
+                f"got backend={self._backend!r}."
+            )
+        assert self._cached_module is not None
+        self._cached_module.prewarm_paged_kv_stride_variant(variant)
 
     begin_forward = plan
 
@@ -5046,7 +5178,8 @@ def fmha_varlen(
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
     return op
 
 
@@ -5235,7 +5368,7 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
-    skip_all_rows_active_check: bool = False,
+    skip_all_rows_active_check: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5312,23 +5445,21 @@ def trtllm_ragged_attention_deepseek(
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
-        together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
-        all-active ragged fast path asynchronous while still compacting empty
-        rows (either ``q_len == 0`` or ``kv_len == 0``). If omitted, the
-        wrapper derives lengths from the device indptrs and may synchronize
-        to preserve correctness for direct callers. Under CUDA graph capture,
-        this device-side detection would require an illegal ``.item()``
-        readback, so both mirrors must be provided; without them the wrapper
-        cannot tell whether any row has ``q_len == 0`` or ``kv_len == 0`` and
-        will refuse to launch. Currently only consulted by the ``trtllm-gen``
-        backend.
+        together with ``kv_seq_lens_cpu``, the Python wrapper validates and
+        compacts empty rows (either ``q_len == 0`` or ``kv_len == 0``). Mirrors
+        take precedence over the omitted/default all-rows-active mode. Currently
+        only consulted by the ``trtllm-gen`` backend.
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
     skip_all_rows_active_check : bool
-        Skip empty-row detection when the caller guarantees that every row has
-        positive query and KV lengths. Mutually exclusive with CPU length
-        mirrors. Currently only consulted by the ``trtllm-gen`` backend.
+        Controls empty-row detection. ``True`` (default) assumes every row has
+        positive query and KV lengths and avoids device-to-host synchronization.
+        Paired CPU length mirrors take precedence and request checked/compacting
+        behavior regardless of this setting. ``False`` without CPU mirrors
+        derives row activity from device tensors, which may synchronize outside
+        CUDA graph capture and requires CPU mirrors during capture. Currently
+        only consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -5497,13 +5628,7 @@ def trtllm_ragged_attention_deepseek(
         has_inactive_rows = False
         has_active_rows = True
 
-        if skip_all_rows_active_check:
-            if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
-                raise ValueError(
-                    "skip_all_rows_active_check cannot be combined with CPU length "
-                    "mirrors"
-                )
-        elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
             if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
@@ -5532,6 +5657,10 @@ def trtllm_ragged_attention_deepseek(
             if not bool(active_rows_cpu.all().item()):
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
+        elif skip_all_rows_active_check:
+            # The default assumes all rows have positive Q and KV lengths.
+            # Keep the original tensors and avoid device-to-host row inspection.
+            pass
         else:
             # An active row requires q_len > 0 AND kv_len > 0; detecting
             # either kind of empty row from device indptrs needs an
@@ -5824,6 +5953,7 @@ def trtllm_batch_context_with_kv_cache(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    backend: str = "trtllm-gen",
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -5949,6 +6079,10 @@ def trtllm_batch_context_with_kv_cache(
         zero-initialized at allocation (e.g. via ``torch.zeros``); the kernel
         self-resets the counters after each launch, so it does not need to be
         re-zeroed between calls.
+    backend : str = "trtllm-gen"
+        The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
+        selects the separately versioned Cake FMHA product. The default remains
+        the conventional TRTLLM implementation.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -5966,6 +6100,10 @@ def trtllm_batch_context_with_kv_cache(
     )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if backend not in ("trtllm-gen", "cake"):
+        raise ValueError(
+            "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
+        )
     if not causal and window_left >= 0:
         raise NotImplementedError(
             "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
@@ -6011,7 +6149,8 @@ def trtllm_batch_context_with_kv_cache(
             key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
             value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+    if backend != "cake":
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -6114,6 +6253,54 @@ def trtllm_batch_context_with_kv_cache(
     else:
         lse_stride_tokens = 0
         lse_stride_heads = 0
+
+    if backend == "cake":
+        from .cake_fmha import (
+            get_cake_fmha_context_module,
+            select_cake_fmha_context_route,
+        )
+
+        cake_route = select_cake_fmha_context_route(
+            query.device,
+            query=query,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            out=out,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            window_left=window_left,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            key_block_scales=key_block_scales,
+            value_block_scales=value_block_scales,
+            skip_softmax_threshold_scale_factor=(skip_softmax_threshold_scale_factor),
+            is_causal=causal,
+            lse=lse,
+            kv_layout=kv_layout,
+            workspace_buffer=workspace_buffer,
+        )
+        if skip_softmax_threshold_scale_factor == 1e-30:
+            # The pinned public matrix uses 1e-30 as a numerically inert
+            # skip-softmax probe. Both exact routes and compat_v1 consume the
+            # disabled form at the FFI boundary.
+            skip_softmax_threshold_scale_factor = None
+        # All context adapters consume host scalar scales. Device scalar
+        # values are resolved only after exact route selection, preserving
+        # their public value while converting bmm1 back from log2 form.
+        if isinstance(bmm1_scale, torch.Tensor):
+            bmm1_scale = float(bmm1_scale.item()) / log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            bmm2_scale = float(bmm2_scale.item())
+        run_func = get_cake_fmha_context_module(
+            query.device, cake_route
+        ).cake_paged_attention_context
 
     run_func(
         out,

@@ -1331,7 +1331,12 @@ def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_
 
 def test_bf16q_fp8kv_transform_mode_kwarg_exists():
     signature = inspect.signature(flashinfer.decode.trtllm_batch_decode_with_kv_cache)
-    assert list(signature.parameters)[-1] == "bf16q_fp8kv_transform_mode"
+    parameter = signature.parameters["bf16q_fp8kv_transform_mode"]
+    assert parameter.default is None
+    assert parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 @pytest.mark.parametrize(

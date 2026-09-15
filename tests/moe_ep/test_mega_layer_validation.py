@@ -118,8 +118,18 @@ def test_mega_layer_forward_rejects_token_overflow():
         topk_ids=torch.zeros(65, 2, dtype=torch.int64),
         topk_weights=torch.zeros(65, 2),
     )
-    with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
+    with (
+        mock.patch.object(layer, "_ensure_workspace") as ensure_workspace,
+        mock.patch.object(layer._kernel, "stage_inputs") as stage_inputs,
+        mock.patch.object(layer._kernel, "compute") as compute,
+        pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"),
+    ):
         layer.forward(t)
+
+    ensure_workspace.assert_not_called()
+    stage_inputs.assert_not_called()
+    compute.assert_not_called()
+    assert layer._workspace is None  # type: ignore[attr-defined]
 
 
 def test_mega_layer_forward_accepts_partial_batch():
@@ -713,5 +723,11 @@ def test_mega_layer_warmup_requires_tensors_when_prestaged():
     from flashinfer.moe_ep import MoEEpConfigError
 
     layer = _mega_layer(quantize_input=False)
-    with pytest.raises(MoEEpConfigError, match="quantize_input=False"):
+    with (
+        mock.patch.object(layer, "_resolve_workspace") as resolve_workspace,
+        pytest.raises(MoEEpConfigError, match="quantize_input=False"),
+    ):
         layer.warmup()
+
+    resolve_workspace.assert_not_called()
+    assert layer._workspace is None  # type: ignore[attr-defined]
