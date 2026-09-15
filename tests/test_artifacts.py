@@ -1,3 +1,9 @@
+import ctypes
+from pathlib import Path
+import shutil
+import subprocess
+import textwrap
+
 from flashinfer.artifacts import (
     ArtifactPath,
     get_available_cubin_files,
@@ -321,6 +327,108 @@ def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
             "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
         ): "abc123"
     }
+
+
+def test_get_artifact_download_failure_raises(monkeypatch, tmp_path):
+    """A missing runtime cubin must not become an empty native kernel image."""
+    from flashinfer.jit import cubin_loader
+
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(
+        cubin_loader, "FLASHINFER_CUBINS_REPOSITORY", "https://artifacts.invalid/"
+    )
+    monkeypatch.setattr(cubin_loader, "download_file", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError, match="missing.cubin") as excinfo:
+        cubin_loader.get_artifact("test-pin/missing.cubin", "0" * 64)
+
+    assert "Install the matching flashinfer-cubin package" in str(excinfo.value)
+
+
+def test_get_artifact_download_checksum_failure_raises(monkeypatch, tmp_path):
+    """A successful download with invalid contents must fail explicitly."""
+    from flashinfer.jit import cubin_loader
+
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(
+        cubin_loader, "FLASHINFER_CUBINS_REPOSITORY", "https://artifacts.invalid/"
+    )
+
+    def download_corrupt_file(_source, destination, **_kwargs):
+        Path(destination).write_bytes(b"corrupt cubin")
+        return True
+
+    monkeypatch.setattr(cubin_loader, "download_file", download_corrupt_file)
+
+    with pytest.raises(RuntimeError, match="missing.cubin") as excinfo:
+        cubin_loader.get_artifact("test-pin/missing.cubin", "0" * 64)
+
+    message = str(excinfo.value)
+    assert "checksum validation failed" in message
+    assert "Install the matching flashinfer-cubin package" in message
+
+
+def test_cpp_loader_rejects_empty_callback_result(tmp_path):
+    """The native loader must not reuse a cubin after a callback failure."""
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("A C++ compiler is required for the native cubin loader test")
+
+    source = tmp_path / "test_cubin_loader.cc"
+    library = tmp_path / "test_cubin_loader.so"
+    source.write_text(
+        textwrap.dedent(
+            r"""
+            #include <stdexcept>
+            #include <string>
+
+            #include "flashinfer/cubin_loader.h"
+
+            void provide_first_cubin(const char* path, const char*) {
+              if (std::string(path) == "first.cubin") {
+                const std::string cubin = "first cubin contents";
+                FlashInferSetCurrentCubin(cubin.data(), cubin.size());
+              }
+            }
+
+            extern "C" int check_callback_failure() {
+              FlashInferSetCubinCallback(provide_first_cubin);
+              if (getCubin("first.cubin", "unused") != "first cubin contents") {
+                return 1;
+              }
+
+              try {
+                (void)getCubin("missing.cubin", "unused");
+              } catch (const std::runtime_error& error) {
+                return std::string(error.what()).find("missing.cubin") == std::string::npos;
+              }
+              return 2;
+            }
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    include_dir = Path(__file__).resolve().parents[1] / "include"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            "-I",
+            str(include_dir),
+            str(source),
+            "-o",
+            str(library),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    native_test = ctypes.CDLL(str(library))
+    native_test.check_callback_failure.restype = ctypes.c_int
+    assert native_test.check_callback_failure() == 0
 
 
 @responses.activate

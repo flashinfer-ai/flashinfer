@@ -53,6 +53,12 @@ std::string getCubin(const std::string& name, const std::string& sha256) {
   if (!callbackGetCubin) {
     throw std::runtime_error("FlashInferSetCubinCallback not set");
   }
+  // A callback can fail without propagating an exception through ctypes. Do
+  // not let that failure reuse the bytes from a previously loaded kernel.
+  current_cubin.clear();
   callbackGetCubin(name.c_str(), sha256.c_str());
+  if (current_cubin.empty()) {
+    throw std::runtime_error("Failed to load FlashInfer cubin artifact: " + name);
+  }
   return current_cubin;
 }
