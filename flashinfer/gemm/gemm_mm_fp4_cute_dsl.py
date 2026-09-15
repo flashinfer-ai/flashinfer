@@ -321,7 +321,7 @@ def _mm_fp4_precompile_worker(payload):
             _hash_source_files(tuple(payload["key_files"])),
         )
         if not spec.is_compiled:
-            spec.compile_and_persist()
+            spec.build()
         return (kernel_name, None)
     except Exception as e:  # noqa: BLE001 -- reported to the parent
         return (kernel_name, f"{type(e).__name__}: {e}")
