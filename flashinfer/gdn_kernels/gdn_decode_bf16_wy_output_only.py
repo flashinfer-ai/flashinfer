@@ -2265,6 +2265,19 @@ def gated_delta_rule_mtp(
     # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
     # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
     mbp = max(1, min(_needed + 1, 8))
+    # SM107 (Rubin): force mbp=1. Any min_blocks_per_mp > 1 makes CuTe DSL
+    # auto-derive a preferred SMEM carveout (cutlass_dsl/cutlass.py, the
+    # `preferred_smem_carveout is None and min_blocks_per_mp > 1` branch) and
+    # apply it via cudaFuncSetAttribute at module load. On sm_107a that faults
+    # with Xid 13 / cudaErrorLaunchFailure once the grid needs more than one
+    # wave (> num_sms * max_resident_ctas). The carveout VALUE is irrelevant --
+    # 20% through 99% all fault with byte-identical cubins -- so suppressing the
+    # DSL's auto-derivation is the only lever. See issue #4957.
+    # mbp=1 is also faster on SM107 at these shapes (clocks pinned:
+    # B=128 8.5%, B=256 12.0%, B=512 17.6%): 80 regs/thread beats the 63 that
+    # mbp=8 forces, and SMEM caps occupancy at 7 CTAs either way.
+    if torch.cuda.get_device_capability(device) == (10, 7):
+        mbp = 1
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
