@@ -1616,8 +1616,8 @@ def create_load_task_split_kv(
                 "load_v0",
             ),
             (
-                smem_k1,
-                smem_v1,
+                smem_k0 if smem_k1 is None and not cfg.use_block_sparse else smem_k1,
+                smem_v0 if smem_v1 is None and not cfg.use_block_sparse else smem_v1,
                 sparse_kv_metadata1,
                 sparse_softmax_metadata1,
                 "load_k1",
@@ -1626,12 +1626,9 @@ def create_load_task_split_kv(
         )
         # Preserve the original full-resource lowering order while allowing a
         # per-instance task to omit the other stream's resources.
-        for smem_k, _, _, _, _, _ in active_instances:
-            if smem_k is not None:
-                smem_k.init_load_state()
-        for _, smem_v, _, _, _, _ in active_instances:
-            if smem_v is not None:
-                smem_v.init_load_state()
+        for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
+            if resource is not None:
+                resource.init_load_state()
         for _, _, sparse_kv_metadata, _, _, _ in active_instances:
             if sparse_kv_metadata is not None:
                 sparse_kv_metadata.init_load_state()
@@ -2195,10 +2192,9 @@ def create_mma_task_split_kv(
     ) -> None:
         """Initialize invariant split-resource descriptor slots."""
         smem_q.init_descriptor_state()
-        smem_k0.init_descriptor_state()
-        smem_k1.init_descriptor_state()
-        smem_v0.init_descriptor_state()
-        smem_v1.init_descriptor_state()
+        for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
+            if resource is not None:
+                resource.init_descriptor_state()
         smem_p0.init_descriptor_state()
         smem_p1.init_descriptor_state()
 
@@ -2312,9 +2308,9 @@ def create_mma_task_split_kv(
             mma_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2325,9 +2321,9 @@ def create_mma_task_split_kv(
             else mma_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2342,9 +2338,9 @@ def create_mma_task_split_kv(
             mma_keeps_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2357,9 +2353,9 @@ def create_mma_task_split_kv(
             else mma_keeps_schedule(
                 smem_q,
                 smem_k0,
-                smem_k1,
+                smem_k0 if smem_k1 is None else smem_k1,
                 smem_v0,
-                smem_v1,
+                smem_v0 if smem_v1 is None else smem_v1,
                 tmem_s0,
                 tmem_s1,
                 smem_p0,
@@ -2377,7 +2373,11 @@ def create_mma_task_split_kv(
             tmem_stats_done0,
             tmem_stats_done1,
         ]
-    src = [smem_q, smem_k0, smem_k1, smem_v0, smem_v1, smem_p0, smem_p1]
+    src = [
+        resource
+        for resource in (smem_q, smem_k0, smem_k1, smem_v0, smem_v1, smem_p0, smem_p1)
+        if resource is not None
+    ]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(

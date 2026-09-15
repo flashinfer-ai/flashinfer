@@ -71,8 +71,8 @@ from .helpers_common import (
     _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
     _logical_q_group_idx,
-    _mma_k_step,
-    _mma_kind_for_qkv,
+    _mma_k_step_qk,
+    _mma_kind_for_qk,
     _neg_max_f32,
     _softmax_scale_pair_width,
     _swaps_routed_coordinate,
@@ -359,7 +359,9 @@ class TmemSResource(DecodeGenResourceBase):
         MMA-K slice.
         """
         cfg = self.cfg
-        if cutlass.const_expr(not cfg.use_fp8_qkv and crosses_64b_chunk):
+        if cutlass.const_expr(
+            not (cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1) and crosses_64b_chunk
+        ):
             k_desc = k_desc + Int32(8 * cfg.tile_size_kv - 6)
             if cutlass.const_expr(cfg.tile_size_q >= 16):
                 q_desc = q_desc + Int32(8 * cfg.tile_size_q - 6)
@@ -644,7 +646,7 @@ class TmemSResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             if prims.elect_sync():
                 scale_d = False
-                for ki in cutlass.range_constexpr(cfg.headdim // _mma_k_step(cfg)):
+                for ki in cutlass.range_constexpr(cfg.headdim // _mma_k_step_qk(cfg)):
                     # Keeps computes Q x K^T (A=Q, B=K); Swaps computes the
                     # transposed K x Q^T tile (A=K, B=Q). The first
                     # instruction overwrites S and later slices accumulate.
@@ -654,7 +656,7 @@ class TmemSResource(DecodeGenResourceBase):
                         a_desc, b_desc = k_desc, q_desc
                     if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
                         tcgen05_mma_ws(
-                            _mma_kind_for_qkv(cfg),
+                            _mma_kind_for_qk(cfg),
                             tmem_col,
                             a_desc,
                             b_desc,
@@ -663,7 +665,7 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                     else:
                         prims.tcgen05_mma(
-                            _mma_kind_for_qkv(cfg),
+                            _mma_kind_for_qk(cfg),
                             prims.CTAGroup.CTA_1,
                             tmem_col,
                             a_desc,
@@ -672,14 +674,14 @@ class TmemSResource(DecodeGenResourceBase):
                             scale_d,
                         )
                     scale_d = True
-                    if cutlass.const_expr(ki + 1 < cfg.headdim // _mma_k_step(cfg)):
+                    if cutlass.const_expr(ki + 1 < cfg.headdim // _mma_k_step_qk(cfg)):
                         k_desc, q_desc = self._advance_qk_descs_after_mma_k(
                             k_desc,
                             q_desc,
                             crosses_64b_chunk=cfg.headdim == 128 and ki == 3,
                         )
         else:
-            mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step(cfg)
+            mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step_qk(cfg)
             if prims.elect_sync():
                 # Peel the first MMA so overwrite-vs-accumulate remains a
                 # compile-time value rather than loop-carried state.
@@ -688,7 +690,7 @@ class TmemSResource(DecodeGenResourceBase):
                 else:
                     first_a_desc, first_b_desc = k_desc, q_desc
                 prims.tcgen05_mma(
-                    _mma_kind_for_qkv(cfg),
+                    _mma_kind_for_qk(cfg),
                     prims.CTAGroup.CTA_1,
                     tmem_col,
                     first_a_desc,
@@ -703,11 +705,11 @@ class TmemSResource(DecodeGenResourceBase):
             # closed form therefore adds each boundary jump minus that +2.
             # Keeping descriptors out of iter_args avoids staged-D256 spills.
             for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
-                if cutlass.const_expr(cfg.use_fp8_qkv):
+                if cutlass.const_expr(cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
                 else:
-                    chunk_idx = (ki * Int32(_mma_k_step(cfg))) // Int32(64)
+                    chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(64)
                     k_desc_offset = ki * Int32(2) + chunk_idx * Int32(1016)
                     q_chunk_extra = (
                         8 * cfg.tile_size_q - 8
@@ -723,7 +725,7 @@ class TmemSResource(DecodeGenResourceBase):
                     else:
                         iter_a_desc, iter_b_desc = iter_k_desc, iter_q_desc
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_qk(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         iter_a_desc,
@@ -1883,7 +1885,7 @@ class TmemSResource(DecodeGenResourceBase):
         cfg = self.cfg
         # ConsTailWork: denominator update runs after P has been materialized,
         # so the resource-owned local sum matches the P payload consumed by BMM2.
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
             # FP8 uses TmemSoftmaxGlobal to update sums after P
             # quantization, so this stage only copies the corrected sums
             # back into the running state. This keeps the denominator
@@ -1928,7 +1930,7 @@ class TmemSResource(DecodeGenResourceBase):
                 cfg.has_static_dense_full_kv_tiles
                 and cfg.tile_size_q in (16, 32)
                 and not cfg.use_keeps_mma_ab
-                and not cfg.use_fp8_qkv
+                and not (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
                 and cfg.q_tiles_are_full
             ):
                 for pair_idx in cutlass.range_constexpr(pair_width):

@@ -414,6 +414,15 @@ def parse_attention_args(line, parser):
         help="Key/value data type; supported values depend on the selected backend.",
     )
     parser.add_argument(
+        "--v_dtype",
+        type=str,
+        required=False,
+        default=None,
+        help="Value data type. If not specified, defaults to kv_dtype. Only the "
+        "prims-ts backend accepts a V dtype that differs from kv_dtype "
+        "(QK-BF16/PV-FP8).",
+    )
+    parser.add_argument(
         "--out_dtype",
         type=str,
         required=False,
@@ -691,6 +700,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         return res
     kv_init_dtype = torch.float16 if kv_dtype == torch.float16 else torch.bfloat16
 
+    v_dtype = dtype_str_to_torch_dtype(args.v_dtype) if args.v_dtype else kv_dtype
+
     o_data_type = (
         dtype_str_to_torch_dtype(args.out_dtype) if args.out_dtype else q_dtype
     )
@@ -788,6 +799,18 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             _drop_backend(backends, "prims-ts", "does not support NVFP4 K/V")
         elif q_dtype != kv_dtype:
             _drop_backend(backends, "prims-ts", "requires matching Q and K/V dtypes")
+        elif v_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+            _drop_backend(
+                backends, "prims-ts", "supports only FP16, BF16, or FP8-E4M3 V"
+            )
+        elif v_dtype != kv_dtype and not (
+            kv_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+        ):
+            _drop_backend(
+                backends,
+                "prims-ts",
+                "requires matching K/V dtypes, except QK-BF16/PV-FP8",
+            )
         elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 256):
             _drop_backend(
                 backends,
@@ -1036,6 +1059,15 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         else:
             resolved_backends[backend] = backend
 
+    # Helper function to convert to FP8 (matches test_trtllm_gen_attention_decode.py approach)
+    def to_float8(x, dtype=torch.float8_e4m3fn):
+        finfo = torch.finfo(dtype)
+        min_val, max_val = x.aminmax()
+        amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+        scale = finfo.max / amax * 0.1
+        x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+        return x_scl_sat.to(dtype), scale.float().reciprocal()
+
     ## Prepare dtype-specific data
     k_scale, v_scale = None, None
     kv_cache_sf = None
@@ -1065,20 +1097,38 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     prims_ts_kv_cache = None
     prims_ts_out = None
+    prims_ts_bmm2_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_mask_type = (
             "causal" if not speculative_decode or effective_causal else "dense"
         )
-        # The common fixture intentionally exposes nonstandard outer strides;
-        # PrimTS accepts compact HND pages, so preserve the logical values in a
-        # backend-specific compact cache.
-        prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_q_shape = (
             (batch_size, num_qo_heads, head_dim_qk)
             if s_qo == 1
             else (batch_size, s_qo, num_qo_heads, head_dim_qk)
         )
+        # The common fixture intentionally exposes nonstandard outer strides;
+        # PrimTS accepts compact HND pages, so preserve the logical values in a
+        # backend-specific compact cache. Matching K/V dtypes keep the combined
+        # cache so both operands stay in one allocation.
+        if v_dtype != kv_dtype:
+            prims_ts_k_cache = kv_cache[:, 0].contiguous()
+            prims_ts_v_cache, prims_ts_v_scale_t = to_float8(
+                kv_cache[:, 1].contiguous(), v_dtype
+            )
+            prims_ts_v_scale = prims_ts_v_scale_t.item()
+            prims_ts_kv_cache = (prims_ts_k_cache, prims_ts_v_cache)
+            # Write the FP8-rounded V back into the caches every other backend
+            # reads so --refcheck compares the same V across backends.
+            v_dequant = prims_ts_v_cache.to(torch.float32) * prims_ts_v_scale
+            kv_cache[:, 1].copy_(v_dequant)
+            if "trtllm-gen" in backends:
+                kv_cache_for_trt[:, 1].copy_(v_dequant)
+        else:
+            prims_ts_v_scale = v_scale
+            prims_ts_kv_cache = kv_cache.contiguous()
+        prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
@@ -1092,7 +1142,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             max_seq_len_q=s_qo,
             packed_query=False,
             q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
+            k_data_type=kv_dtype,
+            v_data_type=v_dtype,
             o_data_type=o_data_type,
             mask_type=prims_ts_mask_type,
             seq_lens=actual_seq_lens_kv.flatten().tolist(),
@@ -1185,7 +1236,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=1.0 if v_scale is None else v_scale,
+                bmm2_scale=prims_ts_bmm2_scale,
                 out=out,
                 validate=False,
             )
@@ -1277,7 +1328,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=1.0 if v_scale is None else v_scale,
+                bmm2_scale=prims_ts_bmm2_scale,
                 out=prims_ts_out,
                 validate=False,
             ),
@@ -1341,7 +1392,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 num_kv_heads,
                 median_time,
                 q_dtype=q_dtype,
-                kv_dtype=kv_dtype,
+                k_dtype=kv_dtype,
+                v_dtype=v_dtype if backend == "prims-ts" else kv_dtype,
                 o_dtype=o_data_type,
             )
             resolved_backend = resolved_backends.get(backend, backend)
@@ -1379,6 +1431,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["causal"] = effective_causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
+                cur_res["v_dtype"] = v_dtype if backend == "prims-ts" else kv_dtype
                 cur_res["out_dtype"] = o_data_type
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
@@ -1439,6 +1492,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")
         return res
     kv_init_dtype = torch.float16 if kv_dtype == torch.float16 else torch.bfloat16
+
+    v_dtype = dtype_str_to_torch_dtype(args.v_dtype) if args.v_dtype else kv_dtype
 
     o_data_type = (
         dtype_str_to_torch_dtype(args.out_dtype) if args.out_dtype else q_dtype
@@ -1539,7 +1594,19 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         if is_nvfp4_kv:
             _drop_backend(backends, "prims-ts", "does not support NVFP4 K/V")
         elif q_dtype != kv_dtype:
-            _drop_backend(backends, "prims-ts", "requires matching Q and K/V dtypes")
+            _drop_backend(backends, "prims-ts", "requires matching Q and K dtypes")
+        elif v_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+            _drop_backend(
+                backends, "prims-ts", "supports only FP16, BF16, or FP8-E4M3 V"
+            )
+        elif v_dtype != kv_dtype and not (
+            kv_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+        ):
+            _drop_backend(
+                backends,
+                "prims-ts",
+                "requires matching K/V dtypes, except QK-BF16/PV-FP8",
+            )
         elif head_dim_qk != head_dim_vo or head_dim_qk not in (128, 256):
             _drop_backend(
                 backends,
@@ -1782,6 +1849,19 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         v_quantized, _ = to_float8(v_data, kv_dtype)
         kv_cache = torch.cat([k_quantized, v_quantized], dim=1)
 
+    prims_ts_v_cache = None
+    prims_ts_v_scale = v_scale
+    if "prims-ts" in backends and v_dtype != kv_dtype:
+        # prims-ts consumes an FP8 V while every other backend keeps kv_dtype.
+        # Write the FP8-rounded values back into the shared cache (k_cache and
+        # v_cache are views of it) so all backends and the reference see the
+        # same V and --refcheck compares like with like.
+        prims_ts_v_cache, prims_ts_v_scale_t = to_float8(
+            kv_cache[:, 1].contiguous(), v_dtype
+        )
+        prims_ts_v_scale = prims_ts_v_scale_t.item()
+        kv_cache[:, 1].copy_(prims_ts_v_cache.to(torch.float32) * prims_ts_v_scale)
+
     # Ensure trtllm-fmha-v2 sees contiguous HND-physical paged KV cache.
     # Skip if kv_cache is not a plain Tensor (e.g., NVFP4 packed tuple).
     # backend filter further down also drops trtllm-fmha-v2 in that case.
@@ -1791,19 +1871,19 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         _fmha_v2_kv_cache = kv_cache
 
     prims_ts_k_cache = None
-    prims_ts_v_cache = None
     prims_ts_out = None
     prims_ts_sm_scale = None
     prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_k_cache = kv_cache[:, 0].contiguous()
-        prims_ts_v_cache = kv_cache[:, 1].contiguous()
+        if prims_ts_v_cache is None:
+            prims_ts_v_cache = kv_cache[:, 1].contiguous()
         prims_ts_out = torch.empty_like(q, dtype=o_data_type)
         backend_wrappers_prims_ts = prims_ts.BatchPrefillPagedTSWrapper("HND")
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
-        _v_scale = v_scale if v_scale is not None else 1.0
+        _v_scale = prims_ts_v_scale if prims_ts_v_scale is not None else 1.0
         prims_ts_sm_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers_prims_ts.plan(
@@ -1815,7 +1895,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim_qk,
             q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
+            k_dtype=kv_dtype,
+            v_dtype=v_dtype,
             out_dtype=o_data_type,
             page_size=page_size,
             mask_type="causal" if causal else "dense",
@@ -2265,7 +2346,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 num_kv_heads,
                 median_time,
                 q_dtype=q_dtype,
-                kv_dtype=kv_dtype,
+                k_dtype=kv_dtype,
+                v_dtype=v_dtype if backend == "prims-ts" else kv_dtype,
                 o_dtype=o_data_type,
             )
             resolved_backend = resolved_backends.get(backend, backend)
@@ -2296,6 +2378,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cur_res["causal"] = causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
+                cur_res["v_dtype"] = v_dtype if backend == "prims-ts" else kv_dtype
                 cur_res["out_dtype"] = o_data_type
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
@@ -2785,7 +2868,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             head_dim=head_dim_qk,
             head_dim_vo=head_dim_vo,
             q_dtype=q.dtype,
-            kv_dtype=k.dtype,
+            k_dtype=k.dtype,
             packed=True,
             mask_type="causal" if causal else "dense",
             sm_scale=prims_ts_sm_scale,
@@ -3166,7 +3249,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 num_kv_heads,
                 median_time,
                 q_dtype=q_dtype,
-                kv_dtype=kv_dtype,
+                k_dtype=kv_dtype,
+                v_dtype=kv_dtype,
                 o_dtype=out_dtype,
             )
 
