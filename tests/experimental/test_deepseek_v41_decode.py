@@ -541,3 +541,96 @@ def test_mxfp8_all_finite_codes():
     assert torch.equal(
         out.view(torch.int16)[finite], expected.view(torch.int16)[finite]
     )
+
+
+@pytest.mark.parametrize(
+    "batch,compressed_k",
+    [(1, 0), (1, 512), (16, 512), (128, 0), (128, 512), (None, 512)],
+)
+def test_finite_sink_overflow_changed_graph(batch, compressed_k):
+    gate()
+    if batch is None:
+        batch = max(128, torch.cuda.get_device_properties(0).multi_processor_count + 1)
+    q_values = (torch.arange(64, device="cuda") - 32).to(torch.bfloat16) / 64
+    q = q_values[None, None, :, None].expand(batch, 1, 64, 512).contiguous()
+    data = torch.ones((64, 512), device="cuda").to(torch.float8_e4m3fn)
+    swa = pack(
+        data.view(torch.uint8),
+        torch.full((64, 16), 127, device="cuda", dtype=torch.uint8),
+        528,
+    )
+    wi = torch.zeros((batch, 1, 128), device="cuda", dtype=torch.int32)
+    main = (
+        torch.full((1, 64, 1, 288), 255, device="cuda", dtype=torch.uint8)
+        if compressed_k
+        else None
+    )
+    ci = (
+        torch.full((batch, 1, compressed_k), -1, device="cuda", dtype=torch.int32)
+        if compressed_k
+        else None
+    )
+    maximum = torch.finfo(torch.float32).max
+    boundary = torch.tensor(maximum / math.log2(math.e), device="cuda")
+    below = torch.nextafter(boundary, torch.full_like(boundary, -math.inf)).item()
+    above = torch.nextafter(boundary, torch.full_like(boundary, math.inf)).item()
+    sink = torch.tensor(
+        [
+            maximum,
+            above,
+            below,
+            -maximum,
+            -above,
+            -below,
+            1e30,
+            -1e30,
+            1000,
+            -1000,
+            -math.inf,
+            0,
+            math.log(128),
+            math.log(128) + 1,
+            1,
+            -1,
+        ],
+        device="cuda",
+        dtype=torch.float32,
+    ).repeat(4)
+    args = q, swa, main, wi, ci, sink
+    out, lse, plan = deepseek_v41_decode(*args)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        deepseek_v41_decode(*args, plan=plan)
+    torch.cuda.current_stream().wait_stream(stream)
+    for replay in range(3):
+        if replay:
+            q.mul_(-0.5)
+            sink.copy_(sink.roll(7))
+        if replay == 2:
+            wi[0].fill_(-1)
+        out.fill_(math.nan)
+        lse.fill_(math.nan)
+        if plan.workspace is not None:
+            plan.workspace.fill_(-1)
+        graph.replay()
+        # All real values are exactly one, so the output is their probability
+        # mass. Evaluate the sigmoid in FP64 without either kernel's log2 path.
+        expected_lse = q[:, 0, :, 0].double() * math.sqrt(512) + math.log(128)
+        expected_out = torch.sigmoid(expected_lse - sink.double()[None, :])
+        if replay == 2:
+            expected_out[0] = 0
+            expected_lse[0] = -math.inf
+        torch.testing.assert_close(
+            out[:, 0].double(),
+            expected_out[:, :, None].expand(batch, 64, 512),
+            rtol=0.005,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            lse[..., 0].double(),
+            expected_lse,
+            rtol=0,
+            atol=1e-5,
+        )

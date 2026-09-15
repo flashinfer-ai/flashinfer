@@ -1784,22 +1784,15 @@ class BlackwellV41MixedCacheDecode:
             if tidx == 0:
                 mLSE[blk_coord[0], blk_coord[1], blk_coord[2]] = global_lse / LOG2_E
             # Add one sink to the denominator, never to the returned LSE.
-            sink_log2 = attn_sink[blk_coord[0]] * LOG2_E
-            denominator_max = cute.arch.fmax(global_lse, sink_log2)
-            denominator_max = (
-                denominator_max if denominator_max != -self.lse_dtype.inf else 0.0
-            )
-            denominator_lse = denominator_max + cute.math.log2(
-                cute.math.exp2(global_lse - denominator_max, fastmath=True)
-                + cute.math.exp2(sink_log2 - denominator_max, fastmath=True),
-                fastmath=True,
-            )
+            sink_log2_scale = self._sink_log2_scale(global_lse, attn_sink[blk_coord[0]])
             # store the scale to shared memory
             for i in cutlass.range_constexpr(lse_per_thread):
                 split_kv_idx = tidx + i * self.threads_per_warp
                 if cute.elem_less(split_kv_idx, local_split_kv):
                     smem_lse_scale[split_kv_idx] = (
-                        cute.math.exp2(local_lse[i] - denominator_lse, fastmath=True)
+                        cute.math.exp2(
+                            local_lse[i] - global_lse + sink_log2_scale, fastmath=True
+                        )
                         if has_reduction_mass
                         else self.acc_dtype(0.0)
                     )
@@ -1859,6 +1852,22 @@ class BlackwellV41MixedCacheDecode:
                 element_idx = tidx + j * self.threads_per_warp * self.num_compute_warps
                 mO[blk_coord[0], element_idx, blk_coord[1], blk_coord[2]] = rO[j]
         return
+
+    @cute.jit
+    def _sink_log2_scale(self, lse_log2: cutlass.Float32, sink: cutlass.Float32):
+        """Log2 of the real-key probability mass after adding one sink."""
+        # Stabilize in natural-log space before multiplying by LOG2_E: a
+        # finite FP32 sink can overflow that conversion. With d = sink - LSE,
+        # log(sigmoid(-d)) = -max(d, 0) - log(1 + exp(-abs(d))). Even if d
+        # overflows to +/-inf, all exponent arguments are nonpositive.
+        # Empty rows select zero mass at the caller; avoid -inf - -inf here.
+        finite_lse = lse_log2 if lse_log2 != -self.lse_dtype.inf else 0.0
+        delta = sink - finite_lse / LOG2_E
+        return -cute.arch.fmax(delta, 0.0) * LOG2_E - cute.math.log2(
+            1.0
+            + cute.math.exp2(-cute.arch.fmax(delta, -delta) * LOG2_E, fastmath=True),
+            fastmath=True,
+        )
 
     @cute.jit
     def slot_offsets(self, key, slot):
@@ -3659,18 +3668,9 @@ class BlackwellV41MixedCacheDecode:
         sink_scale = self.acc_dtype(1.0)
         if cutlass.const_expr(common_params.mAccO is None):
             head = common_params.blk_coord[0] * cta_pv_tiler[0] + lse_row
-            sink_log2 = common_params.attn_sink[head] * LOG2_E
-            denominator_max = cute.arch.fmax(lse, sink_log2)
-            denominator_max = (
-                denominator_max if denominator_max != -self.lse_dtype.inf else 0.0
-            )
-            denominator_lse = denominator_max + cute.math.log2(
-                cute.math.exp2(lse - denominator_max, fastmath=True)
-                + cute.math.exp2(sink_log2 - denominator_max, fastmath=True),
-                fastmath=True,
-            )
+            sink_log2_scale = self._sink_log2_scale(lse, common_params.attn_sink[head])
             sink_scale = (
-                cute.math.exp2(lse - denominator_lse, fastmath=True)
+                cute.math.exp2(sink_log2_scale, fastmath=True)
                 if row_sum != self.acc_dtype(0.0)
                 else self.acc_dtype(0.0)
             )
