@@ -537,6 +537,7 @@ def get_batch_prefill_module(backend, *args):
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
+        workspace_size_upper_bound_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     elif backend == "fa2":
@@ -547,6 +548,9 @@ def get_batch_prefill_module(backend, *args):
         )
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
+        workspace_size_upper_bound_func = getattr(
+            module, "workspace_size_upper_bound", None
+        )
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
@@ -554,6 +558,9 @@ def get_batch_prefill_module(backend, *args):
         module = gen_batch_prefill_module(backend, *args).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
+        workspace_size_upper_bound_func = getattr(
+            module, "workspace_size_upper_bound", None
+        )
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
 
@@ -1000,6 +1007,7 @@ def get_batch_prefill_module(backend, *args):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
         prewarm_paged_kv_stride_variant=prewarm_paged_kv_stride_variant,
@@ -1010,6 +1018,9 @@ def get_batch_prefill_module(backend, *args):
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
     workspace_size_func = getattr(jit_module, "workspace_size", None)
+    workspace_size_upper_bound_func = getattr(
+        jit_module, "workspace_size_upper_bound", None
+    )
     ragged_run_func = jit_module.ragged_run
     paged_run_func = jit_module.paged_run
 
@@ -1152,6 +1163,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )
@@ -1679,6 +1691,37 @@ def _build_block_tables_from_paged_kv_indices(
         end = int(paged_kv_indptr_host[i + 1])
         block_tables[i, :num_blocks_needed] = paged_kv_indices[start:end]
     return block_tables
+
+
+def _resolve_prefill_backend(
+    backend: str,
+    device: torch.device,
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    use_custom_mask: bool,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> str:
+    """Resolve ``auto`` exactly the way :meth:`plan` does.
+
+    Sizing that resolved ``auto`` differently from the plan it is sizing for
+    would hand the caller a number from the wrong scheduler, so both go
+    through here.
+    """
+    if backend != "auto":
+        return backend
+    return determine_attention_backend(
+        device,
+        PosEncodingMode[pos_encoding_mode].value,
+        use_fp16_qk_reduction,
+        use_custom_mask,
+        q_data_type,
+        kv_data_type,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+    )
 
 
 # Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
@@ -2456,15 +2499,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             module = self._jit_module
         else:
-            if backend == "auto":
-                backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    use_custom_mask,
-                    q_data_type,
-                    kv_data_type,
-                )
+            backend = _resolve_prefill_backend(
+                backend,
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                use_custom_mask,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+            )
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -2511,6 +2556,190 @@ class BatchPrefillWithPagedKVCacheWrapper:
             args.append(0)  # num_colocated_ctas
             args.append(0)  # uniform_q_len
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
+        return int(float_workspace_size), int(int_workspace_size)
+
+    @flashinfer_api
+    def workspace_size_upper_bound(
+        self,
+        *,
+        max_batch_size: int,
+        max_total_num_rows: int,
+        max_num_pages_per_request: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        page_size: int,
+        head_dim_vo: Optional[int] = None,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        use_custom_mask: bool = False,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+        num_colocated_ctas: int = 0,
+    ) -> Tuple[int, int]:
+        r"""Return a workspace size no plan within the given bounds can exceed.
+
+        :meth:`workspace_size` answers for one specific ``plan()``. This answers
+        for every ``plan()`` whose shape stays inside ``max_batch_size``,
+        ``max_total_num_rows`` and ``max_num_pages_per_request``, so a caller
+        that must reserve before it knows the shapes it will serve can size the
+        buffers once and never grow them.
+
+        The bound is derived from the scheduler rather than sampled: it covers
+        every ``CTA_TILE_Q`` the tile selector can return, bounds the tile count
+        over all distributions of rows across the batch, and uses the
+        ``max_batch_size_if_split`` ceiling the split search enforces whenever
+        it reports ``split_kv``. It is therefore conservative: an individual
+        ``plan()`` usually needs less.
+
+        Parameters
+        ----------
+        max_batch_size : int
+            Largest ``batch_size`` (that is, ``len(qo_indptr) - 1``) any plan
+            will use.
+        max_total_num_rows : int
+            Largest ``qo_indptr[-1]`` any plan will use, summed over the batch.
+        max_num_pages_per_request : int
+            Largest paged-KV length of a single request, in pages.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        head_dim_vo : Optional[int]
+            The dimension of the value/output heads. Defaults to ``head_dim_qk``.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        use_fp16_qk_reduction : bool
+            Whether the plans will use fp16 for qk reduction. Defaults to ``False``.
+        use_custom_mask : bool
+            Whether the plans will carry a custom mask. Defaults to ``False``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``,
+            the window size will be set to the full length of the sequence.
+            Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2,
+            etc.), if not provided, will be set to ``0``.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to
+            ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to
+            ``q_data_type``.
+        fixed_split_size : Optional[int]
+            The fixed split size for split-kv prefill, in pages. When set, the
+            bound uses ``max_num_pages_per_request`` to bound the chunk count
+            instead of the split search ceiling.
+        disable_split_kv : bool
+            Whether split-kv is disabled. Defaults to ``False``.
+        num_colocated_ctas : int
+            CTAs reserved for a colocated kernel, as passed to ``plan()``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
+        Raises
+        ------
+        NotImplementedError
+            If the resolved backend cannot bound its workspace. Callers must
+            fall back to their own default allocation in that case.
+        """
+        if self._backend == "cute-dsl-prims":
+            raise NotImplementedError(
+                "workspace_size_upper_bound is not available for the "
+                "cute-dsl-prims prefill backend"
+            )
+        if (
+            max_batch_size < 0
+            or max_total_num_rows < 0
+            or max_num_pages_per_request < 0
+        ):
+            raise ValueError("workspace_size_upper_bound bounds must be non-negative")
+
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        if fixed_split_size is None:
+            fixed_split_size = -1
+
+        backend = self._backend
+        if self._jit_module is not None:
+            module = self._jit_module
+        else:
+            backend = _resolve_prefill_backend(
+                backend,
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                use_custom_mask,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+            )
+            if backend == "cudnn":
+                raise NotImplementedError(
+                    "workspace_size_upper_bound is not available for the cudnn "
+                    "prefill backend"
+                )
+            module = get_batch_prefill_module(
+                backend,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                torch.int32,
+                head_dim_qk,
+                head_dim_vo,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,
+                logits_soft_cap > 0,
+                use_fp16_qk_reduction,
+            )
+        bound_fn = getattr(module, "workspace_size_upper_bound", None)
+        if bound_fn is None:
+            raise NotImplementedError(
+                "workspace_size_upper_bound is not available for prefill "
+                f"backend {backend!r}"
+            )
+
+        float_workspace_size, int_workspace_size = bound_fn(
+            self._float_workspace_buffer,
+            max_batch_size,
+            max_total_num_rows,
+            max_num_pages_per_request,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim_qk,
+            head_dim_vo,
+            fixed_split_size,
+            disable_split_kv,
+            num_colocated_ctas,
+        )
         return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api
@@ -2953,17 +3182,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
-                )
+            self._backend = _resolve_prefill_backend(
+                self._backend,
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                self._custom_mask_buf is not None,  # use_custom_mask
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+            )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
