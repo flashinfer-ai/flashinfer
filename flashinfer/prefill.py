@@ -3997,9 +3997,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._requested_backend = backend
         self._backend = backend
         self._cached_module = None
-        # cudnn: stats ragged offset so the LSE lands packed as
-        # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
-        self._cudnn_stats_offsets: Optional[torch.Tensor] = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -4662,7 +4659,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._kv_indptr_buf = self._kv_indptr_buf.to(torch.int32)
                 self._o_indptr_buf = self._o_indptr_buf.to(torch.int32)
                 self._v_indptr_buf = self._v_indptr_buf.to(torch.int32)
-            self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
             if self.is_cuda_graph_enabled:
@@ -5178,7 +5174,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 batch_offsets_k=self._kv_indptr_buf,
                 batch_offsets_v=self._v_indptr_buf,
                 batch_offsets_o=self._o_indptr_buf,
-                batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
                 batch_offsets_units="tokens",
                 is_cuda_graph_compatible=self._use_cuda_graph,
                 out=out,
