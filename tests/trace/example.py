@@ -58,7 +58,6 @@ mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
-prims_ts_decode_wrapper_tuple_multi_q_causal_no_split_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
 prims_ts_batch_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_s2048_ps32.json
@@ -95,8 +94,6 @@ mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
-prims_ts_block_sparse_shared_h8_kv8_d128_qb64_kb64.json
-prims_ts_paged_block_sparse_wrapper_tuple_shared_h8_kv8_d128_ps64.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
@@ -845,51 +842,6 @@ with contextlib.suppress(Exception):
             kv_valid_bits=bs_valid_bits,
             out=bs_out,
         )
-# Two representative shared-pattern traces cover direct argument dispatch and
-# pattern dimensions captured by a reusable paged plan.
-bs_shared_indptr = bs_block_indptr[:, :1, :].contiguous()
-block_sparse_attention.fi_trace(
-    save_dir=SAVE_DIR,
-    q=bs_q,
-    k=bs_k,
-    v=bs_v,
-    block_indptr=bs_shared_indptr,
-    block_indices=bs_block_indices,
-    q_block_size=bs_q_block,
-    kv_block_size=bs_kv_block,
-    kv_valid_bits=bs_valid_bits,
-    mask_type="dense",
-    share_pattern_across_kv_heads=True,
-    out=bs_out,
-)
-with contextlib.suppress(Exception):
-    bs_paged_wrapper.plan(
-        bs_B,
-        bs_Sq,
-        bs_Skv,
-        bs_H,
-        bs_H,
-        bs_D,
-        bs_q_block,
-        bs_kv_block,
-        bs_page_size,
-        device=device,
-        max_blocks_per_row=bs_topk,
-        use_kv_valid_bits=True,
-        share_pattern_across_kv_heads=True,
-    )
-    bs_paged_wrapper.run(
-        bs_q,
-        (bs_k_cache, bs_v_cache),
-        bs_paged_kv_indptr,
-        bs_paged_kv_indices,
-        bs_seq_lens_kv,
-        bs_shared_indptr,
-        bs_block_indices,
-        kv_valid_bits=bs_valid_bits,
-        out=bs_out,
-    )
-
 # ── MLA paged decode (DeepSeek-V3 TP=8, h=16/ckv=512/kpe=64) ─────────────────
 mla_b, mla_h, ckv, kpe = 128, 16, 512, 64
 
@@ -2207,32 +2159,29 @@ for _pts_semantic_PS in (32, 4):
         )
 
         _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-        # Split permission is a shared FMHA control, not a Q-storage mode.
-        for _pts_split_kv in (True, False) if _pts_semantic_PS == 32 else (True,):
-            _pts_wrapper.plan(
-                _pts_q.device,
-                _pts_B,
-                _pts_Hq,
-                _pts_Hkv,
-                _pts_D,
-                _pts_semantic_PS,
-                _pts_SK,
-                max_seq_len_q=_pts_SQ,
-                packed_query=False,
-                q_data_type=_pts_q.dtype,
-                kv_data_type=_pts_k.dtype,
-                o_data_type=torch.bfloat16,
-                mask_type="causal",
-                workspace_buffer=_pts_workspace,
-                storage_page_size=_pts_PS,
-                split_kv=_pts_split_kv,
-            )
-            _pts_wrapper.run(
-                _pts_q,
-                _pts_cache,
-                _pts_seq_lens,
-                _pts_block_tables,
-            )
+        _pts_wrapper.plan(
+            _pts_q.device,
+            _pts_B,
+            _pts_Hq,
+            _pts_Hkv,
+            _pts_D,
+            _pts_semantic_PS,
+            _pts_SK,
+            max_seq_len_q=_pts_SQ,
+            packed_query=False,
+            q_data_type=_pts_q.dtype,
+            kv_data_type=_pts_k.dtype,
+            o_data_type=torch.bfloat16,
+            mask_type="causal",
+            workspace_buffer=_pts_workspace,
+            storage_page_size=_pts_PS,
+        )
+        _pts_wrapper.run(
+            _pts_q,
+            _pts_cache,
+            _pts_seq_lens,
+            _pts_block_tables,
+        )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).

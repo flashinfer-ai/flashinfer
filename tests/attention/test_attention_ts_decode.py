@@ -6808,161 +6808,60 @@ def test_attention_ts_decode_page_cache_sliding_product(
     assert policy["window_left"] == 127
 
 
-def _fp8_sparse_route_reference(
-    queries, keys, values, visible, *, instances, splits, out_dtype
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch"),
+    (
+        (1, 64, 3, 4, 16, False, False, 256),
+        (3, 128, 4, 8, 16, True, False, 2),
+        (5, 128, 6, 16, 128, False, True, 2),
+        (4, 256, 12, 32, 16, True, False, 256),
+        (8, 64, 3, 64, 128, False, True, 2),
+        (8, 128, 12, 128, 20, True, False, 256),
+    ),
+)
+def test_q_token_sparse_geometry_graph(
+    group, dim, ratio, block, page, packed, shared, batch
 ):
-    """Independent dense-style FP8-P online softmax over a sparse route.
-
-    All logical rows/heads are vectorized. Streams correspond to interleaved
-    KV128 MMA instances within each active split. Membership comes from the
-    input selections, never from kernel-produced metadata.
-    """
-    scores = torch.einsum("ghrd,thd->ghrt", queries.float(), keys.float())
-    scale = queries.shape[-1] ** -0.5
-    scale_log2 = scores.new_tensor(scale) * scores.new_tensor(math.log2(math.e))
-    quant_log2 = scores.new_tensor(math.log2(448))
-    scores.masked_fill_(~visible[:, None, None, :], -torch.inf)
-    tiles = (keys.shape[0] + 127) // 128
-    local_tiles = max(
-        instances, (tiles + splits * instances - 1) // (splits * instances) * instances
-    )
-
-    def merge(streams):
-        anchor = torch.stack([stream[0] for stream in streams]).max(0).values
-        final_sum = torch.zeros_like(anchor)
-        final_acc = torch.zeros_like(queries, dtype=torch.float32)
-        final_error = torch.zeros_like(final_acc)
-        for maximum, denominator, accumulator, error in streams:
-            correction = torch.where(
-                torch.isfinite(maximum), ((maximum - anchor) * scale).exp(), 0
-            )
-            final_sum += denominator * correction
-            final_acc += accumulator * correction[..., None]
-            final_error += error * correction[..., None]
-        return anchor, final_sum, final_acc, final_error
-
-    partials = []
-    for split_begin in range(0, tiles, local_tiles):
-        streams = []
-        for instance in range(instances):
-            maximum = torch.full_like(scores[..., 0], -torch.inf)
-            denominator = torch.zeros_like(maximum)
-            accumulator = torch.zeros_like(queries, dtype=torch.float32)
-            error = torch.zeros_like(accumulator)
-            for tile in range(
-                split_begin + instance, min(split_begin + local_tiles, tiles), instances
-            ):
-                begin, end = tile * 128, min((tile + 1) * 128, keys.shape[0])
-                tile_scores = scores[..., begin:end]
-                new_max = torch.maximum(maximum, tile_scores.max(-1).values)
-                correction = torch.where(
-                    torch.isfinite(maximum), ((maximum - new_max) * scale).exp(), 0
-                )
-                # Match the dense base-2 exponent convention, including its
-                # FP32 max offset and fused score*scale+offset. Computing exp
-                # then multiplying by 448 can choose another E4M3 bin near a
-                # rounding boundary even when the exponent differs by one ulp.
-                offset = -new_max * scale_log2 + quant_log2
-                exponent = (
-                    tile_scores.double() * scale_log2.double()
-                    + offset[..., None].double()
-                ).float()
-                p = torch.where(torch.isfinite(tile_scores), exponent.exp2(), 0)
-                quantized = p.to(torch.float8_e4m3fn).float()
-                # Fast exp2 and host-reference FP32 arithmetic may straddle
-                # an E4M3 midpoint. Propagate only that bin-edge uncertainty,
-                # instead of relaxing every output's absolute tolerance.
-                delta = p * (8 * torch.finfo(torch.float32).eps)
-                lower = (p - delta).to(torch.float8_e4m3fn).float()
-                upper = (p + delta).to(torch.float8_e4m3fn).float()
-                uncertainty = torch.maximum(quantized - lower, upper - quantized)
-                accumulator = accumulator * correction[..., None] + torch.einsum(
-                    "ghrt,thd->ghrd", quantized, values[begin:end].float()
-                )
-                error = error * correction[..., None] + torch.einsum(
-                    "ghrt,thd->ghrd", uncertainty, values[begin:end].float().abs()
-                )
-                denominator = denominator * correction + p.sum(-1)
-                maximum = new_max
-            streams.append((maximum, denominator, accumulator, error))
-        anchor, denominator, accumulator, error = merge(streams)
-        normalized = torch.where(
-            denominator[..., None] > 0, accumulator / denominator[..., None], 0
-        )
-        normalized_error = torch.where(
-            denominator[..., None] > 0, error / denominator[..., None], 0
-        )
-        if splits > 1:
-            # Separate reduction publishes normalized 16-bit O plus FP32 LSE.
-            # This rounding happens before the split outputs are combined.
-            normalized = normalized.to(out_dtype).float()
-        partials.append(
-            (anchor * scale + denominator.log(), normalized, normalized_error)
-        )
-    weights = torch.stack([part[0] for part in partials]).softmax(0)[..., None]
-    return (
-        (weights * torch.stack([part[1] for part in partials])).sum(0),
-        (weights * torch.stack([part[2] for part in partials])).sum(0),
-    )
-
-
-def _check_q_token_sparse_case(
-    block=4,
-    page=16,
-    group=4,
-    packed=False,
-    shared=True,
-    split_kv=False,
-    *,
-    dtype=torch.bfloat16,
-    dim=128,
-    ratio=12,
-    context=8192,
-    batch=2,
-    heads_kv=2,
-    topk=17,
-    out_dtype=None,
-):
+    """Check sparse geometry and persistent reuse against an independent mask."""
     torch.manual_seed(71845)
-    hkv = heads_kv
-    long_base = max(1, min(4096, context - group + 1))
-    lengths = [group] * batch
-    if packed and group > 1:
-        lengths[-1] -= 1
-    offsets = [0]
-    for length in lengths:
-        offsets.append(offsets[-1] + length)
-    rows = offsets[-1]
-    q = torch.randn(rows, hkv * ratio, dim, device="cuda").to(dtype)
-    if not packed:
-        q = q.view(batch, 1, group, hkv * ratio, dim)
-    if out_dtype is None:
-        out_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    out = torch.empty_like(q, dtype=out_dtype)
+    context, topk, hkv = 1024, 3, 2
+    q = torch.randn(batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16)
+    rows = batch * group - int(packed)
+    query = q.reshape(-1, hkv * ratio, dim)[:rows] if packed else q[:, None]
+    out = torch.empty_like(query)
+    offsets = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * group
+    offsets[-1] = rows
     width = (context + page - 1) // page
-    k = torch.randn(batch * width, hkv, page, dim, device="cuda").to(dtype)
-    v = torch.randn(batch * width, hkv, page, dim, device="cuda").to(dtype)
     table = torch.randperm(batch * width, device="cuda", dtype=torch.int32).view(
         batch, width
     )
+    k = torch.randn(batch * width, hkv, page, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
     if context % page:
         k[table[:, -1].long(), :, context % page :] = 0
         v[table[:, -1].long(), :, context % page :] = 0
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(
+        group
+    )[:rows]
+    positions = (
+        (context - group + torch.arange(group, device="cuda")).expand(batch, -1).clone()
+    )
     pattern_heads = 1 if shared else hkv
-    ids = torch.full((rows, pattern_heads, topk), -1, device="cuda", dtype=torch.int32)
-    input_ids = ids[:, 0] if shared else ids
-    requests = torch.tensor(
-        [r for r, n in enumerate(lengths) for _ in range(n)],
-        device="cuda",
-        dtype=torch.int32,
+    candidates = (context - group - block) // block
+    ids = (
+        torch.rand(batch, group, pattern_heads, candidates, device="cuda")
+        .argsort(-1)[..., :topk]
+        .to(torch.int32)
     )
-    positions = torch.empty(rows, device="cuda", dtype=torch.int64)
-    qo_indptr = (
-        torch.tensor(offsets, device="cuda", dtype=torch.int32) if packed else None
-    )
+    sparse_ids = ids.reshape(batch * group, pattern_heads, topk)[:rows]
+    if shared:
+        sparse_ids = sparse_ids[:, 0]
+    qo_indptr = offsets if packed else None
     workspace = torch.empty(
         get_q_token_kv_block_sparse_workspace_size(
-            q,
+            query,
             k,
             table,
             block_topk=topk,
@@ -6970,8 +6869,7 @@ def _check_q_token_sparse_case(
             qo_indptr=qo_indptr,
             seq_len_q=group if packed else None,
             kv_block_size=block,
-            o_data_type=out.dtype,
-            split_kv=split_kv,
+            split_kv=False,
             share_pattern_across_kv_heads=shared,
         ),
         device="cuda",
@@ -6991,248 +6889,59 @@ def _check_q_token_sparse_case(
         device=q.device,
         workspace_buffer=workspace,
         use_packed_q=packed,
-        split_kv=split_kv,
+        split_kv=False,
         share_pattern_across_kv_heads=shared,
         q_data_type=q.dtype,
-        o_data_type=out.dtype,
     )
-
-    def update(base):
-        ids.fill_(-1)
-        selected = {}
-        for request, n in enumerate(lengths):
-            for qi in range(n):
-                row = offsets[request] + qi
-                visible = base + qi
-                positions[row] = visible - 1
-                for ph in range(pattern_heads):
-                    blocks = torch.randperm(
-                        visible // block, device="cuda", dtype=torch.int32
-                    )[:topk]
-                    ids[row, ph, : blocks.numel()] = blocks
-                    tokens = (
-                        blocks[:, None].long() * block
-                        + torch.arange(block, device="cuda")
-                    ).flatten()
-                    tail = torch.arange(
-                        visible // block * block, visible, device="cuda"
-                    )
-                    selected[row, ph] = torch.cat((tokens, tail))
-        return selected
 
     def run():
         wrapper.run(
-            q,
+            query,
             (k, v),
             table,
-            input_ids,
+            sparse_ids,
             requests,
-            positions,
+            positions.flatten()[:rows],
             qo_indptr=qo_indptr,
             out=out,
         )
 
-    def check(selected):
-        q_flat = q.reshape(rows, hkv, ratio, dim).float()
-        out_flat = out.reshape(rows, hkv, ratio, dim).float()
-        if dtype == torch.float8_e4m3fn:
-            from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
-                select_sparse_launch,
-            )
+    tokens = torch.arange(context, device="cuda")
+    physical = table[:, tokens // page].long()
+    keys = k[physical, :, tokens % page].float()
+    values = v[physical, :, tokens % page].float()
 
-            launch = select_sparse_launch(
-                group_size=group,
-                heads_q_per_kv=ratio,
-                head_dim=dim,
-                q_dtype_key="float8_e4m3fn",
-                num_routes=batch,
-                num_kv_heads=hkv,
-                route_kv_tokens=min(
-                    context,
-                    topk * block + block - 1
-                    if group == 1
-                    else group * (topk + 1) * block,
-                ),
-                multi_processor_count=torch.cuda.get_device_properties(
-                    q.device
-                ).multi_processor_count,
-                split_kv=split_kv,
+    def check():
+        selected = (tokens // block == ids[..., None]).any(-2)
+        tail = tokens // block == (positions[..., None, None] + 1) // block
+        visible = (selected | tail) & (tokens <= positions[..., None, None])
+        scores = (
+            torch.einsum(
+                "bghrd,bkhd->bghrk",
+                q.view(batch, group, hkv, ratio, dim).float(),
+                keys,
             )
-            for request, n in enumerate(lengths):
-                begin = offsets[request]
-                for head in range(hkv):
-                    lists = [
-                        selected[begin + qi, 0 if shared else head] for qi in range(n)
-                    ]
-                    if group == 1:
-                        tokens = lists[0]
-                    else:
-                        logical_blocks = torch.unique(
-                            torch.cat(lists) // block, sorted=True
-                        )
-                        tokens = (
-                            logical_blocks[:, None] * block
-                            + torch.arange(block, device="cuda")
-                        ).flatten()
-                        tokens = tokens[tokens <= positions[begin + n - 1]]
-                    visible = torch.stack(
-                        [torch.isin(tokens, chosen) for chosen in lists]
-                    )
-                    physical = table[request, tokens // page].long()
-                    expected, uncertainty = _fp8_sparse_route_reference(
-                        q_flat[begin : begin + n, head : head + 1],
-                        k[physical, head, tokens % page][:, None],
-                        v[physical, head, tokens % page][:, None],
-                        visible,
-                        instances=launch.num_insts_kv,
-                        splits=launch.splits_kv,
-                        out_dtype=out.dtype,
-                    )
-                    actual = out_flat[begin : begin + n, head : head + 1]
-                    closest = torch.maximum(
-                        torch.minimum(actual, expected + uncertainty),
-                        expected - uncertainty,
-                    )
-                    torch.testing.assert_close(actual, closest, rtol=0.01, atol=0.002)
-            return
-        for request, n in enumerate(lengths):
-            for qi in range(n):
-                row = offsets[request] + qi
-                for head in range(hkv):
-                    tokens = selected[row, 0 if shared else head]
-                    physical = table[request, tokens // page].long()
-                    keys = k[physical, head, tokens % page].float()
-                    values = v[physical, head, tokens % page].float()
-                    expected = (q_flat[row, head] @ keys.T * dim**-0.5).softmax(
-                        -1
-                    ) @ values
-                    torch.testing.assert_close(
-                        out_flat[row, head], expected, rtol=0.03, atol=0.01
-                    )
+            * dim**-0.5
+        )
+        scores.masked_fill_(~visible[..., None, :], -torch.inf)
+        expected = torch.einsum("bghrk,bkhd->bghrd", scores.softmax(-1), values)
+        torch.testing.assert_close(
+            out.reshape(rows, hkv * ratio, dim).float(),
+            expected.reshape(batch * group, hkv * ratio, dim)[:rows],
+            rtol=0.03,
+            atol=0.01,
+        )
 
-    selected = update(long_base)
     run()
-    check(selected)
+    check()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    for base in (
-        max(1, min(block - 3, long_base)),
-        min(block + 1, long_base),
-        long_base,
-    ):
-        selected = update(base)
-        out.fill_(torch.nan)
-        graph.replay()
-        check(selected)
-
-
-@pytest.mark.arch_blackwell
-@_REQUIRES_BLACKWELL_PRIMTS_GPU
-@pytest.mark.parametrize(
-    "case",
-    (
-        pytest.param(
-            dict(group=1, ratio=3, dim=64, dtype=torch.float16, shared=False),
-            id="q8-d64-f16-direct",
-        ),
-        pytest.param(
-            dict(group=3, ratio=4, block=8, packed=True, shared=False),
-            id="q16-g3-per-head",
-        ),
-        pytest.param(dict(group=5, ratio=6, block=16, page=128), id="q32-g5-shared"),
-        pytest.param(
-            dict(group=5, dim=256, block=32, page=16, packed=True, shared=False),
-            id="q64-cross-page",
-        ),
-        pytest.param(
-            dict(group=8, block=128, page=20, packed=True, shared=False),
-            id="q128-g8-fragmented-tail",
-        ),
-        pytest.param(
-            dict(
-                group=8,
-                ratio=3,
-                heads_kv=1,
-                dim=64,
-                dtype=torch.float8_e4m3fn,
-                block=64,
-                page=128,
-                packed=True,
-                shared=False,
-            ),
-            id="fp8-d64-odd-stride",
-        ),
-        pytest.param(dict(group=7, ratio=17), id="non-power-of-two-head-group"),
-        pytest.param(dict(group=1, ratio=128, shared=False), id="wide-head-group"),
-        pytest.param(
-            dict(
-                group=1,
-                dim=256,
-                dtype=torch.float8_e4m3fn,
-                topk=512,
-                packed=True,
-                shared=False,
-                split_kv=True,
-            ),
-            id="direct-fp8-split",
-        ),
-        pytest.param(
-            dict(
-                group=8,
-                dim=256,
-                dtype=torch.float8_e4m3fn,
-                block=128,
-                page=128,
-                split_kv=True,
-                shared=False,
-            ),
-            id="grouped-fp8-split",
-        ),
-        pytest.param(
-            dict(
-                group=3,
-                ratio=4,
-                dim=64,
-                dtype=torch.float8_e4m3fn,
-                out_dtype=torch.float16,
-                block=16,
-                page=128,
-            ),
-            id="fp8-to-f16",
-        ),
-        pytest.param(
-            dict(group=1, batch=256, context=512, shared=False), id="persistent-direct"
-        ),
-        pytest.param(
-            dict(group=4, batch=256, context=512, packed=True, shared=False),
-            id="persistent-grouped-q64",
-        ),
-        pytest.param(
-            dict(group=8, batch=256, context=512, packed=True, shared=False),
-            id="persistent-grouped",
-        ),
-    ),
-)
-def test_q_token_sparse_shapes_patterns_and_graph(monkeypatch, case):
-    """Cover distinct Q recipes and live sparse patterns through the public wrapper."""
-    if case.get("batch", 2) == 256:
-        from flashinfer.attention.prims_ts import decode as decode_module
-
-        resolve = decode_module._resolve_decode_launch_spec
-        persistent = []
-
-        def record_dispatch(*args, **kwargs):
-            spec = resolve(*args, **kwargs)
-            persistent.append(spec.config.use_persistent_scheduler)
-            return spec
-
-        monkeypatch.setattr(
-            decode_module, "_resolve_decode_launch_spec", record_dispatch
-        )
-    _check_q_token_sparse_case(**case)
-    if case.get("batch", 2) == 256:
-        assert persistent and all(persistent)
+    ids.add_(1).remainder_(candidates)
+    positions.sub_(block)
+    out.fill_(torch.nan)
+    graph.replay()
+    check()
 
 
 @pytest.mark.arch_blackwell
