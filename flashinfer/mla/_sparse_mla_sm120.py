@@ -328,6 +328,7 @@ def supported_sparse_mla_sm120_configs(
             min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
             bytes_per_token=_BPT_DSV4,
+            extra_page_block_sizes=frozenset({2, 64, 128}),
         ),
         "dsv3_2": dsv3_2,
         "glm_nsa": dsv3_2,

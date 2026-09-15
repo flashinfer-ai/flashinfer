@@ -379,6 +379,8 @@ _DSV4_DECODE_CONFIGS = [
     (128, 192),
     (128, 256),
     (128, 1024),
+    # DeepSeek-V4.1-Flash production shape: TP4 shard of 64 heads at topk=1152.
+    (16, 1152),
     # Runtime-H instantiation: arbitrary head counts ride the NUM_HEADS=0
     # kernel (zero-Q-padded tile, HPB-aligned scratch). 12 exercises the
     # in-block pad path, 24 a remainder second block, 80 an exact multiple.
@@ -2958,10 +2960,17 @@ _DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 
 # (num_heads, topk, extra_topk, extra_pbs). topk=512: DeepSeek V4 Vision
 # primary candidate set (H=32/64 shards, both extra-cache page layouts).
+# extra_pbs=128: DeepSeek V4.1-Flash compress_ratio=1 layers (128/1).
 _DSV4_PREFILL_DUAL_CONFIGS = [
     (num_heads, 128, extra_topk, extra_pbs)
     for num_heads in _DSV4_PREFILL_DUAL_HEADS
-    for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
+    for extra_topk, extra_pbs in [
+        (128, 64),
+        (512, 64),
+        (512, 2),
+        (128, 128),
+        (512, 128),
+    ]
 ] + [
     (32, 512, 512, 64),
     (32, 512, 128, 2),
@@ -3336,7 +3345,9 @@ def test_sparse_mla_sm120_prefill_dsv3_2_sg_zero_topk_length() -> None:
     torch.testing.assert_close(out_lse, torch.full_like(out_lse, -1e30))
 
 
-@pytest.mark.parametrize("extra_topk,extra_pbs", [(1024, 2), (1664, 2), (1024, 64)])
+@pytest.mark.parametrize(
+    "extra_topk,extra_pbs", [(1024, 2), (1664, 2), (1024, 64), (1024, 128)]
+)
 def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
     extra_topk: int, extra_pbs: int
 ) -> None:
