@@ -32,6 +32,16 @@ def gen_mla_module() -> JitSpec:
     )
 
 
+def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+    """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
+    """Compatibility alias: the MMA layout probes live in the unified module."""
+    return gen_sparse_mla_sm120_module()
+
+
 def gen_sparse_mla_sm120_module() -> JitSpec:
     """Sparse-MLA paged attention for SM120.
 
@@ -45,39 +55,19 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
     return gen_jit_spec(
         "sparse_mla_sm120",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv3_2.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv4.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_prefill.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_jit_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv32_decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/nvfp4_mma_layout_probe.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "sparse_mla_sm120/dsv4_nvfp4_attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_resolve.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_resolve.cu",
         ],
-        extra_cuda_cflags=nvcc_flags,
-    )
-
-
-def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
-    """DeepSeek-V4 NVFP4 sparse-MLA cache, prefill, and decode operators."""
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[12]
-    )
-    return gen_jit_spec(
-        "sparse_mla_nvfp4_sm120",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_quant.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_decode.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_prefill.cu",
-        ],
-        extra_cuda_cflags=nvcc_flags,
-    )
-
-
-def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
-    """Internal NVFP4 sparse-MLA MMA-layout validation operators."""
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[12]
-    )
-    return gen_jit_spec(
-        "sparse_mla_nvfp4_sm120_tile",
-        [jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_nvfp4_tile.cu"],
         extra_cuda_cflags=nvcc_flags,
     )
