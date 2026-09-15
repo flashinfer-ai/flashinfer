@@ -75,7 +75,7 @@ def _extract_tactic_params(tactic: Any) -> Dict[str, Any]:
             (gemm1_tile_shape_mn, gemm1_swizzle_size),
             (gemm2_tile_shape_mn, gemm2_cluster_shape_mn, gemm2_raster_along_m),
         ) = tactic
-        return {
+        params: Dict[str, Any] = {
             "tile_size": int(tile_size),
             "gemm1_tile_shape_mn": tuple(gemm1_tile_shape_mn),
             "gemm1_swizzle_size": int(gemm1_swizzle_size),
@@ -88,6 +88,17 @@ def _extract_tactic_params(tactic: Any) -> Dict[str, Any]:
             "SM90 MoE tactic must be (tile_size, (tile_shape_mn, swizzle_size), "
             f"(tile_shape_mn, cluster_shape_mn, raster_along_m)); got {tactic!r}"
         ) from exc
+    if not (
+        params["gemm1_tile_shape_mn"][0]
+        == params["tile_size"]
+        == params["gemm2_tile_shape_mn"][0]
+    ):
+        raise ValueError(
+            "SM90 MoE tactic: both GEMM M tiles must equal tile_size; got "
+            f"tile_size={params['tile_size']}, gemm1 {params['gemm1_tile_shape_mn']}, "
+            f"gemm2 {params['gemm2_tile_shape_mn']}"
+        )
+    return params
 
 
 def is_valid_tactic(
