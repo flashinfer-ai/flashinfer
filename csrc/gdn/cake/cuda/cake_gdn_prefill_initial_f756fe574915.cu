@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // clang-format off
-#include "cake_gdn_common.cuh"
+#include "gdn_prefill_generated.cuh"
 
-#define CAKE_GDN_INF CUDART_INF_F
+#define GDN_NONCP_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_TMEM_STATE_OFFSET 0
 #define TMEM_TMEM_Q_STATE_OFFSET 128
@@ -522,7 +522,7 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
                     int inverse_group_cg0 = warp_id_in_role_cg0 / 2;
                     int inverse_local_warp_cg0 = warp_id_in_role_cg0 & 1;
                     unsigned int inverse_stage_cg0 = ((inverse_group_cg0 == 1) ? ainv1_stage : ainv0_stage);
-                    int inverse_row_cg0 = ((0) ? (unsigned int)(warp_id_in_role_cg0 * 32) + lane : (unsigned int)(inverse_local_warp_cg0 * 32) + lane);
+                    int inverse_row_cg0 = tid & 63;
                     int diag_block_cg0 = inverse_row_cg0 / 8;
                     int lane_in_diag_cg0 = lane & 7;
                     int diag_col_base_cg0 = diag_block_cg0 * 8;
@@ -558,7 +558,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
                             #pragma unroll
                             for (int prev_col_cg0 = 0; prev_col_cg0 < src_row_cg0; prev_col_cg0++) {
                                 int pivot_lane_cg0 = diag_group_base_cg0 + src_row_cg0;
-                                float _shfl_0 = __shfl_sync(0xFFFFFFFF, inv_row_cg0[prev_col_cg0], pivot_lane_cg0);
+                                float _shfl_0;
+                                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(inv_row_cg0[prev_col_cg0]), "r"(pivot_lane_cg0));
                                 float shfl_val_cg0 = _shfl_0;
                                 if (lane_in_diag_cg0 > src_row_cg0) {
                                     inv_row_cg0[prev_col_cg0] = inv_row_cg0[prev_col_cg0] + row_scale_cg0 * shfl_val_cg0;
@@ -2436,8 +2437,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
                     for (int chunk_in_pair_1 = 0; chunk_in_pair_1 < ((0) ? 1 : 2); chunk_in_pair_1++) {
                         int chunk_idx_3 = pair_idx_tma * 2 + chunk_in_pair_1;
                         int chunk_offset_4 = batch_start_3 + chunk_idx_3 * 64;
+                        mbarrier_wait(q_smem_empty_addr + (q_stage) * 8, q_empty_phase_tma);
                         if (elect_sync()) {
-                            mbarrier_wait(q_smem_empty_addr + (q_stage) * 8, q_empty_phase_tma);
                             mbarrier_arrive_expect_tx(load_q_full_addr + (q_stage) * 8, 16384);
                             #pragma unroll
                             for (int dim_half_1 = 0; dim_half_1 < 2; dim_half_1++) {
@@ -3109,7 +3110,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
                         if (gb_lane >= 16) {
                             gate_log_1 = gate_log_1 + _shfl_up_9;
                         }
-                        float _shfl_1 = __shfl_sync(0xFFFFFFFF, gate_log_0, 31);
+                        float _shfl_1;
+                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(gate_log_0), "r"(31));
                         gate_log_1 = gate_log_1 + _shfl_1;
                         smem_cumsumlog[gate_elem_base + gb_lane] = gate_log_0;
                         smem_cumsumlog[gate_elem_base + gb_lane + 32] = gate_log_1;
@@ -3217,7 +3219,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
                             if (gb_lane_1 >= 16) {
                                 gate_log_1_1 = gate_log_1_1 + _shfl_up_19;
                             }
-                            float _shfl_2 = __shfl_sync(0xFFFFFFFF, gate_log_0_1, 31);
+                            float _shfl_2;
+                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(gate_log_0_1), "r"(31));
                             gate_log_1_1 = gate_log_1_1 + _shfl_2;
                             smem_cumsumlog[gate_elem_base_1 + gb_lane_1] = gate_log_0_1;
                             smem_cumsumlog[gate_elem_base_1 + gb_lane_1 + 32] = gate_log_1_1;
@@ -3330,7 +3333,8 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
                         if (gb_lane_2 >= 16) {
                             gate_log_1_2 = gate_log_1_2 + _shfl_up_29;
                         }
-                        float _shfl_3 = __shfl_sync(0xFFFFFFFF, gate_log_0_2, 31);
+                        float _shfl_3;
+                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_3) : "f"(gate_log_0_2), "r"(31));
                         gate_log_1_2 = gate_log_1_2 + _shfl_3;
                         smem_cumsumlog[gate_elem_base_2 + gb_lane_2] = gate_log_0_2;
                         smem_cumsumlog[gate_elem_base_2 + gb_lane_2 + 32] = gate_log_1_2;
@@ -3408,7 +3412,7 @@ kernel_flashinfer_blackwell_gdn_prefill_initial(const __grid_constant__ CUtensor
 #undef ENABLE_CHECKPOINTS
 #undef HEAD_GROUP_LOG2
 #undef IS_GQA
-#undef CAKE_GDN_INF
+#undef GDN_NONCP_INF
 #undef NUM_AINV_PIPE_STAGES
 #undef NUM_CG0_ACC_PIPE_STAGES
 #undef NUM_GATE_PIPE_STAGES
