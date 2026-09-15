@@ -212,7 +212,7 @@ def recurrent_kda(
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
-    .. deprecated::
+    .. deprecated:: 0.8
         Call :func:`flashinfer.recurrent_kda` instead. It serves this same
         decode contract, accepts a superset of what this entry point accepts,
         and defaults to ``backend="auto"``. This facade remains a thin shim
