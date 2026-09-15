@@ -36,7 +36,7 @@ FP4_SHIFT_BITS = 2
 
 def make_ldmatrix_atom(operand_dtype, transpose, num_matrices=4, mixed_mode=False):
     if mixed_mode or operand_dtype != cutlass.Float4E2M1FN:
-        raise ValueError("The SM12x experimental kernel only accepts NVFP4 operands")
+        raise ValueError("The SM12x kernel only accepts NVFP4 operands")
     return cute.make_copy_atom(
         cute.nvgpu.warp.LdMatrix8x8x16bOp(
             transpose=transpose,
@@ -54,7 +54,5 @@ def make_sm120_blockscaled_mma_op(a_dtype, b_dtype, acc_dtype, sf_dtype, sf_vec_
         or sf_dtype != cutlass.Float8E4M3FN
         or sf_vec_size != 16
     ):
-        raise ValueError(
-            "The SM12x experimental kernel requires NVFP4 and FP32 accumulation"
-        )
+        raise ValueError("The SM12x kernel requires NVFP4 and FP32 accumulation")
     return cute.nvgpu.warp.MmaMXF4NVF4Op(a_dtype, acc_dtype, sf_dtype), False

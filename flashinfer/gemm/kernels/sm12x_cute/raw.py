@@ -49,7 +49,7 @@ from .blockscaled_gemm_dispatch import (
 
 A and B use packed E2M1 with standard 128x4 E4M3 scale layout. Accumulation
 and the device alpha multiplication use FP32 before conversion to BF16.
-This experimental kernel only exposes full-tile NVFP4 configurations.
+This kernel only exposes full-tile NVFP4 configurations.
 """
 
 
