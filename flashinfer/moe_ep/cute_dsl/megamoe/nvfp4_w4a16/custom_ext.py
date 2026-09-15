@@ -7,7 +7,12 @@ from typing import List, Optional, Tuple, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Pointer
-from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
+from cutlass.cutlass_dsl import (
+    Int32,
+    dsl_user_op,
+    extract_mlir_values,
+    new_from_mlir_values,
+)
 from cutlass._mlir import ir
 
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
@@ -98,6 +103,29 @@ class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
             ),
             phase_and_peek=new_from_mlir_values(self.phase_and_peek, [values[6]]),
         )
+
+    @dsl_user_op
+    @cute.jit
+    def write_to_smem(
+        self,
+        smem_buf_tensor: cute.Tensor,
+        dependency,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Publish one coherent record while all scheduler lanes signal the pipeline."""
+        pipe, state = dependency
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128
+        )
+        pipe.producer_acquire(state)
+        with cute.arch.elect_one():
+            rmem = self.to_rmem()
+            cute.copy(copy_atom, rmem, smem_buf_tensor[(None, state.index)])
+        cute.arch.fence_proxy("async.shared", space="cta")
+        pipe.producer_commit(state)
+        state.advance()
 
     def to_rmem(self) -> cute.Tensor:
         rmem = cute.make_rmem_tensor((self.TotalFields,), Int32)
