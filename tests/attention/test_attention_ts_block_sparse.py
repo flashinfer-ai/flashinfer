@@ -592,6 +592,37 @@ def _stub_block_sparse_config(_key):
     return SimpleNamespace(uses_prepared_score_keep_words=False)
 
 
+def _plan_state_stub(**overrides: object) -> SimpleNamespace:
+    """Stand in for a published plan state in host-only ABI and launch tests."""
+
+    fields: dict[str, object] = {
+        "device": torch.device("cpu"),
+        "share_pattern_across_kv_heads": False,
+        "batch_size": 1,
+        "seq_len_q": 1,
+        "seq_len_kv": 1,
+        "num_qo_heads": 1,
+        "num_kv_heads": 1,
+        "head_dim": _HEAD_DIM,
+        "q_block_size": 1,
+        "kv_block_size": 8,
+        "use_block_sparse": True,
+        "sparse_format": "bsr",
+        "use_proxy_routes": False,
+        "use_kv_valid_bits": False,
+        "q_dtype": torch.float16,
+        "kv_dtype": torch.float16,
+        "output_dtype": torch.float16,
+        "dummy_kv_valid_bits": None,
+        "row_route_offsets": None,
+        "route_workspace": None,
+        "max_blocks_per_row": None,
+        "page_size": None,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def _make_patterns(case: _Case) -> _Patterns:
     num_q_rows = math.ceil(case.seq_len_q / case.q_block_size)
     num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
@@ -932,8 +963,13 @@ def test_block_sparse_wrapper_routes_are_run_inputs() -> None:
         "dynamic_metadata",
     }
     assert plan_routing_parameters.isdisjoint(plan_parameters)
-    for name in ("device", "max_blocks_per_row", "use_kv_valid_bits"):
-        assert plan_parameters[name].default is inspect.Parameter.empty
+    assert plan_parameters["device"].default is inspect.Parameter.empty
+    assert plan_parameters["use_block_sparse"].default is True
+    # A block-sparse plan declares its route capacity before any device work.
+    with pytest.raises(ValueError, match="max_blocks_per_row is required"):
+        block_sparse_module.BlockSparseTSWrapper().plan(
+            1, 8, 64, 8, 1, _HEAD_DIM, 8, 64, device="cuda"
+        )
 
     run_parameters = inspect.signature(
         block_sparse_module.BlockSparseTSWrapper.run
@@ -984,10 +1020,7 @@ def test_block_sparse_contiguous_wrapper_trace_uses_bound_plan_state() -> None:
         fi_trace(wrapper.run, **kwargs)
 
     # A successful plan atomically publishes this state. Avoid a CUDA plan here.
-    wrapper._plan_state = SimpleNamespace(
-        sparse_format="bsr",
-        use_proxy_routes=False,
-    )
+    wrapper._plan_state = _plan_state_stub()
     defn = fi_trace(wrapper.run, **kwargs)
     assert defn["name"].startswith("prims_ts_block_sparse_wrapper")
     assert defn["inputs"]["q"]["shape"] == [
@@ -1008,19 +1041,22 @@ def test_block_sparse_contiguous_wrapper_trace_uses_bound_plan_state() -> None:
 
 
 @pytest.mark.parametrize(
-    ("sparse_format", "use_proxy_routes", "expected_max_blocks"),
+    ("use_block_sparse", "sparse_format", "use_proxy_routes", "expected_max_blocks"),
     (
-        ("bsr", False, 3),
-        ("bitmask", False, 4),
-        ("bsr", True, 3),
-        ("bitmask", True, 4),
+        (True, "bsr", False, 3),
+        (True, "bitmask", False, 4),
+        (True, "bsr", True, 3),
+        (True, "bitmask", True, 4),
+        # The dense mode plans without route inspection or capacity.
+        (False, "bsr", False, None),
     ),
 )
 def test_contiguous_one_shot_forwards_route_mode_and_capacity(
     monkeypatch: pytest.MonkeyPatch,
+    use_block_sparse: bool,
     sparse_format: str,
     use_proxy_routes: bool,
-    expected_max_blocks: int,
+    expected_max_blocks: int | None,
 ) -> None:
     """One-shot planning should differ from the wrapper only by inspection."""
 
@@ -1055,17 +1091,20 @@ def test_contiguous_one_shot_forwards_route_mode_and_capacity(
     exact_block_bits = torch.tensor([[[[0b0101]]]], dtype=torch.uint32)
     summaries = torch.empty((1, 4, 1, 128), dtype=torch.float16)
 
+    uses_bsr = use_block_sparse and sparse_format == "bsr"
+    uses_bitmask = use_block_sparse and sparse_format == "bitmask"
     result = block_sparse_module.block_sparse_attention(
         q,
         k,
         k,
-        block_indptr if sparse_format == "bsr" else None,
-        block_indices if sparse_format == "bsr" else None,
+        block_indptr if uses_bsr else None,
+        block_indices if uses_bsr else None,
         64,
         64,
-        exact_block_bits=(exact_block_bits if sparse_format == "bitmask" else None),
+        exact_block_bits=exact_block_bits if uses_bitmask else None,
         k_summary=summaries if use_proxy_routes else None,
         v_summary=summaries if use_proxy_routes else None,
+        use_block_sparse=use_block_sparse,
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
     )
@@ -1074,12 +1113,13 @@ def test_contiguous_one_shot_forwards_route_mode_and_capacity(
     plan_kwargs = calls[0][1]
     run_kwargs = calls[1][1]
     assert calls[0][0] == "plan"
+    assert plan_kwargs["use_block_sparse"] is use_block_sparse
     assert plan_kwargs["max_blocks_per_row"] == expected_max_blocks
     assert plan_kwargs["sparse_format"] == sparse_format
     assert plan_kwargs["use_proxy_routes"] is use_proxy_routes
     assert calls[1][0] == "run"
     assert run_kwargs["exact_block_bits"] is (
-        exact_block_bits if sparse_format == "bitmask" else None
+        exact_block_bits if uses_bitmask else None
     )
     assert run_kwargs["k_summary"] is (summaries if use_proxy_routes else None)
     assert run_kwargs["v_summary"] is (summaries if use_proxy_routes else None)
@@ -2658,27 +2698,15 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
         validate_block_sparse_run,
     )
 
-    state = SimpleNamespace(
-        share_pattern_across_kv_heads=False,
-        device=torch.device("cpu"),
-        batch_size=1,
+    state = _plan_state_stub(
         seq_len_q=8,
         seq_len_kv=64,
         num_qo_heads=8,
-        num_kv_heads=1,
-        head_dim=_HEAD_DIM,
         q_block_size=8,
         kv_block_size=64,
-        sparse_format="bsr",
-        use_proxy_routes=False,
-        use_kv_valid_bits=False,
-        q_dtype=torch.float16,
-        kv_dtype=torch.float16,
-        output_dtype=torch.float16,
         dummy_kv_valid_bits=torch.zeros((1, 2), dtype=torch.uint32),
         row_route_offsets=torch.zeros(2, dtype=torch.int32),
         route_workspace=torch.zeros(4, dtype=torch.int32),
-        page_size=None,
     )
     q = torch.empty((1, 8, 8, _HEAD_DIM), dtype=torch.float16)
     k = torch.empty((1, 64, 1, _HEAD_DIM), dtype=torch.float16)
@@ -2745,10 +2773,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
         launch_block_sparse,
     )
 
-    state = SimpleNamespace(
-        page_size=None,
-        sparse_format="bsr",
-        use_proxy_routes=False,
+    state = _plan_state_stub(
         row_route_offsets=object(),
         route_workspace=object(),
         max_blocks_per_row=3,
@@ -2786,13 +2811,63 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             run_args.q,
             run_args.k,
             run_args.v,
+            None,  # k_summary
+            None,  # v_summary
             run_args.out,
             run_args.block_indptr,
             run_args.block_indices,
+            None,  # exact_block_bits
             run_args.kv_valid_bits,
             state.row_route_offsets,
             state.route_workspace,
             3,
+            1.25,
+        )
+    ]
+
+
+def test_dense_launch_leaves_every_routing_slot_of_the_shared_adapter_empty() -> None:
+    """A dense plan calls the same contiguous adapter with ``None`` route slots."""
+
+    from flashinfer.attention.prims_ts._block_sparse.runtime import (
+        _BlockSparseRunArgs,
+        launch_block_sparse,
+    )
+
+    calls: list[tuple[object, ...]] = []
+    state = _plan_state_stub(
+        use_block_sparse=False,
+        compiled=lambda *args: calls.append(args),
+    )
+    values = {name: object() for name in ("q", "k", "v", "out")}
+    run_args = _BlockSparseRunArgs(
+        **values,
+        block_indptr=None,
+        block_indices=None,
+        kv_valid_bits=None,
+        kv_valid_bits_is_live=False,
+        sm_scale=1.25,
+        paged_kv=None,
+    )
+
+    result = launch_block_sparse(run_args, state=state)
+
+    assert result is run_args.out
+    assert calls == [
+        (
+            run_args.q,
+            run_args.k,
+            run_args.v,
+            None,
+            None,
+            run_args.out,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
             1.25,
         )
     ]
@@ -2806,10 +2881,8 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
     )
 
     calls: list[tuple[object, ...]] = []
-    state = SimpleNamespace(
+    state = _plan_state_stub(
         page_size=64,
-        sparse_format="bsr",
-        use_proxy_routes=False,
         row_route_offsets=object(),
         route_workspace=object(),
         max_blocks_per_row=3,
@@ -5469,3 +5542,453 @@ def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_spa
     assert torch.isfinite(graph_out).all()
     torch.testing.assert_close(graph_out, expected_b, rtol=1e-2, atol=1e-2)
     assert wrapper._published_state() is planned_state
+
+
+_DENSE_MHA_Q64_KV256 = _Case(
+    "q64_kv256_mha",
+    1,
+    8,
+    1024,
+    1024,
+    64,
+    64,
+    torch.bfloat16,
+    "dense",
+    "none",
+    "static",
+    num_kv_heads=8,
+    expected_q_tile=64,
+    expected_kv_tile=256,
+)
+_DENSE_GQA_Q128_KV128 = _Case(
+    "q128_kv128_gqa8",
+    1,
+    8,
+    256,
+    512,
+    16,
+    64,
+    torch.float16,
+    "dense",
+    "none",
+    "static",
+    num_kv_heads=1,
+    expected_q_tile=128,
+    expected_kv_tile=128,
+)
+_DENSE_CONTIGUOUS_CASES = (
+    _DENSE_MHA_Q64_KV256,
+    _DENSE_GQA_Q128_KV128,
+    # Two batches with a K/V length that is not a multiple of the KV route
+    # width exercise the contiguous batch stride and the TMA tail together.
+    # Their 240 Q tiles exceed one resident wave, so the plan takes the
+    # persistent scheduler.
+    _Case(
+        "q64_kv256_mha_b2_ragged_persistent",
+        2,
+        8,
+        960,
+        1000,
+        64,
+        64,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "persistent",
+        num_kv_heads=8,
+        expected_q_tile=64,
+        expected_kv_tile=256,
+    ),
+    # Ten batches of the Q128/KV128 profile also exceed one resident wave.
+    _Case(
+        "q128_kv128_gqa8_b10_persistent",
+        10,
+        8,
+        256,
+        512,
+        16,
+        64,
+        torch.float16,
+        "dense",
+        "none",
+        "persistent",
+        num_kv_heads=1,
+        expected_q_tile=128,
+        expected_kv_tile=128,
+    ),
+    _Case(
+        "q128_kv128_gqa8_bf16_b2_ragged",
+        2,
+        8,
+        256,
+        500,
+        16,
+        64,
+        torch.bfloat16,
+        "dense",
+        "none",
+        "static",
+        num_kv_heads=1,
+        expected_q_tile=128,
+        expected_kv_tile=128,
+    ),
+    # Fine KV blocks select the SwapsMmaAb profiles exactly as block-sparse
+    # plans do; the twelve-batch Q32 case exceeds one resident wave.
+    _Case(
+        "q8_kv8_mha",
+        1,
+        4,
+        16,
+        200,
+        8,
+        8,
+        torch.float16,
+        "dense",
+        "none",
+        "static",
+        num_kv_heads=4,
+        expected_q_tile=8,
+        expected_kv_tile=128,
+    ),
+    _Case(
+        "q32_kv32_gqa4_b12_persistent",
+        12,
+        16,
+        64,
+        512,
+        8,
+        32,
+        torch.float16,
+        "dense",
+        "none",
+        "persistent",
+        num_kv_heads=4,
+        expected_q_tile=32,
+        expected_kv_tile=128,
+    ),
+)
+
+
+def _all_blocks_patterns(case: _Case) -> _Patterns:
+    """Select every semantic KV block, making the sparse oracle dense."""
+
+    num_q_rows = math.ceil(case.seq_len_q / case.q_block_size)
+    num_kv_blocks = math.ceil(case.seq_len_kv / case.kv_block_size)
+    all_blocks = tuple(range(num_kv_blocks))
+    return tuple(
+        tuple(
+            tuple(all_blocks for _ in range(num_q_rows))
+            for _ in range(case.effective_num_kv_heads)
+        )
+        for _ in range(case.batch_size)
+    )
+
+
+def _plan_dense_contiguous(
+    wrapper: block_sparse_module.BlockSparseTSWrapper,
+    case: _Case,
+    *,
+    device: torch.device,
+    mask_type: str,
+) -> None:
+    block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        wrapper.plan(
+            case.batch_size,
+            case.seq_len_q,
+            case.seq_len_kv,
+            case.num_heads,
+            case.effective_num_kv_heads,
+            _HEAD_DIM,
+            case.q_block_size,
+            case.kv_block_size,
+            device=device,
+            use_block_sparse=False,
+            mask_type=mask_type,
+            q_data_type=case.dtype,
+        )
+    finally:
+        block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+
+
+def test_dense_contiguous_compile_key_selects_a_dense_decode_config() -> None:
+    """Dense mode reuses the sparse tile selection without sparse routing."""
+
+    key = make_block_sparse_compile_key(
+        seq_len_q=1024,
+        seq_len_kv=1024,
+        num_qo_heads=8,
+        num_kv_heads=8,
+        dtype_key="bfloat16",
+        use_block_sparse=False,
+    )
+    cfg = block_sparse_config._make_block_sparse_config(key)
+
+    assert cfg.use_block_sparse is False
+    assert cfg.use_paged_kv is False
+    assert cfg.tile_size_q == 64
+    assert cfg.tile_size_kv == 256
+    assert cfg.groups_tokens_heads_q is True
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_dense_contiguous_plan_state_owns_no_route_workspace() -> None:
+    """A dense plan skips route capacity, scratch, and the token-mask ABI."""
+
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    _plan_dense_contiguous(
+        wrapper,
+        _DENSE_MHA_Q64_KV256,
+        device=torch.device("cuda", 0),
+        mask_type="dense",
+    )
+
+    state = wrapper._published_state()
+    assert state.use_block_sparse is False
+    assert state.route_workspace is None
+    assert state.row_route_offsets is None
+    assert state.dummy_kv_valid_bits is None
+    policy = dict(state.policy)
+    assert policy["tile_size_q"] == 64
+    assert policy["tile_size_kv"] == 256
+
+
+def test_dense_contiguous_tracing_dispatches_to_the_dense_template() -> None:
+    """A dense plan traces through the dense wrapper template with dense inputs only."""
+
+    from flashinfer.trace.templates.attention import (
+        prims_ts_block_sparse_wrapper_trace_dispatch,
+    )
+
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    wrapper._plan_state = _plan_state_stub(use_block_sparse=False)
+    template = prims_ts_block_sparse_wrapper_trace_dispatch(self=wrapper)
+    assert template.name_prefix == "prims_ts_block_sparse_wrapper_dense"
+    assert set(template.inputs) == {
+        "q",
+        "k",
+        "v",
+        "q_block_size",
+        "kv_block_size",
+        "mask_type",
+        "sm_scale",
+        "validate",
+    }
+
+
+def test_dense_contiguous_plan_rejects_int32_kv_batch_stride() -> None:
+    """The contiguous launch ABI carries the K/V batch stride as Int32."""
+
+    from flashinfer.attention.prims_ts._block_sparse.config import (
+        _validate_dense_contiguous_kv_extent,
+    )
+
+    _validate_dense_contiguous_kv_extent(
+        seq_len_kv=1 << 20,
+        num_kv_heads=8,
+        head_dim=_HEAD_DIM,
+    )
+    with pytest.raises(OverflowError, match="batch stride must fit in signed int32"):
+        _validate_dense_contiguous_kv_extent(
+            seq_len_kv=1 << 24,
+            num_kv_heads=8,
+            head_dim=_HEAD_DIM,
+        )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "argument",
+    ("max_blocks_per_row", "use_kv_valid_bits", "use_proxy_routes", "sparse_format"),
+)
+def test_dense_contiguous_plan_rejects_block_sparse_arguments(argument: str) -> None:
+    """Dense planning owns no routing capacity, mask, or route format."""
+
+    overrides: dict[str, object] = {
+        "max_blocks_per_row": 1,
+        "use_kv_valid_bits": True,
+        "use_proxy_routes": True,
+        "sparse_format": "bitmask",
+    }
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    with pytest.raises(ValueError, match=argument):
+        wrapper.plan(
+            1,
+            64,
+            128,
+            1,
+            1,
+            _HEAD_DIM,
+            64,
+            64,
+            device=torch.device("cuda", 0),
+            use_block_sparse=False,
+            **{argument: overrides[argument]},
+        )
+
+
+def _dummy_routing_inputs(
+    device: torch.device, k: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Return one placeholder tensor per routing input that a dense run rejects."""
+
+    return {
+        "block_indptr": torch.zeros((1, 1, 2), device=device, dtype=torch.int32),
+        "block_indices": torch.zeros((1,), device=device, dtype=torch.int32),
+        "exact_block_bits": torch.zeros(
+            (1, 1, 1, 1), device=device, dtype=torch.uint32
+        ),
+        "k_summary": torch.zeros_like(k),
+        "v_summary": torch.zeros_like(k),
+        "kv_valid_bits": torch.zeros(
+            (1, math.ceil(k.shape[1] / 32)), device=device, dtype=torch.uint32
+        ),
+    }
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "argument",
+    (
+        "block_indptr",
+        "block_indices",
+        "exact_block_bits",
+        "k_summary",
+        "v_summary",
+        "kv_valid_bits",
+    ),
+)
+def test_dense_contiguous_run_rejects_routing_inputs(argument: str) -> None:
+    """Dense runs consume Q/K/V only; every routing input is a usage error."""
+
+    case = _DENSE_GQA_Q128_KV128
+    device = torch.device("cuda", 0)
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    _plan_dense_contiguous(wrapper, case, device=device, mask_type="dense")
+
+    q = torch.zeros(
+        (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+        device=device,
+        dtype=case.dtype,
+    )
+    k = torch.zeros(
+        (case.batch_size, case.seq_len_kv, case.effective_num_kv_heads, _HEAD_DIM),
+        device=device,
+        dtype=case.dtype,
+    )
+    routing = _dummy_routing_inputs(device, k)
+    with pytest.raises(ValueError, match="dense"):
+        wrapper.run(q, k, k.clone(), **{argument: routing[argument]})
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+def test_dense_one_shot_runs_the_dense_plan() -> None:
+    """The dense one-shot plans and runs the same launch as a dense wrapper."""
+
+    torch.manual_seed(20260915)
+    case = _DENSE_MHA_Q64_KV256
+    device = torch.device("cuda", 0)
+    q = torch.randn(
+        (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+        device=device,
+        dtype=case.dtype,
+    )
+    k = torch.randn(
+        (case.batch_size, case.seq_len_kv, case.effective_num_kv_heads, _HEAD_DIM),
+        device=device,
+        dtype=case.dtype,
+    )
+    v = torch.randn_like(k)
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    _plan_dense_contiguous(wrapper, case, device=device, mask_type="dense")
+    expected = wrapper.run(q, k, v)
+
+    actual = block_sparse_module.block_sparse_attention(
+        q,
+        k,
+        v,
+        None,
+        None,
+        case.q_block_size,
+        case.kv_block_size,
+        use_block_sparse=False,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "argument", ("block_indptr", "exact_block_bits", "kv_valid_bits")
+)
+def test_dense_one_shot_rejects_routing_inputs(argument: str) -> None:
+    """The dense one-shot takes Q/K/V only, like a dense wrapper run."""
+
+    device = torch.device("cuda", 0)
+    q = torch.zeros((1, 64, 1, _HEAD_DIM), device=device, dtype=torch.float16)
+    k = torch.zeros((1, 128, 1, _HEAD_DIM), device=device, dtype=torch.float16)
+    arguments: dict[str, object] = {"block_indptr": None, "block_indices": None}
+    arguments[argument] = _dummy_routing_inputs(device, k)[argument]
+    with pytest.raises(ValueError, match="dense contiguous plan"):
+        block_sparse_module.block_sparse_attention(
+            q,
+            k,
+            k.clone(),
+            q_block_size=64,
+            kv_block_size=64,
+            use_block_sparse=False,
+            **arguments,
+        )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+@pytest.mark.parametrize("case", _DENSE_CONTIGUOUS_CASES, ids=lambda case: case.name)
+@torch.no_grad()
+def test_dense_contiguous_run_matches_reference(case: _Case, mask_type: str) -> None:
+    """The contiguous dense branch reproduces the FP32 attention oracle."""
+
+    torch.manual_seed(20260908)
+    device = torch.device("cuda", 0)
+    case = replace(case, mask_type=mask_type)
+    q = (
+        torch.randn(
+            (case.batch_size, case.seq_len_q, case.num_heads, _HEAD_DIM),
+            device=device,
+            dtype=case.dtype,
+        )
+        * 0.25
+    )
+    k = (
+        torch.randn(
+            (case.batch_size, case.seq_len_kv, case.effective_num_kv_heads, _HEAD_DIM),
+            device=device,
+            dtype=case.dtype,
+        )
+        * 0.25
+    )
+    v = torch.randn_like(k)
+    sm_scale = _HEAD_DIM**-0.5
+    expected = _reference(
+        case,
+        q,
+        k,
+        v,
+        _all_blocks_patterns(case),
+        (frozenset(range(case.seq_len_kv)),) * case.batch_size,
+        sm_scale,
+    )
+
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    _plan_dense_contiguous(wrapper, case, device=device, mask_type=mask_type)
+    policy = dict(wrapper._policy)
+    assert policy["tile_size_q"] == case.expected_q_tile
+    assert policy["tile_size_kv"] == case.expected_kv_tile
+    assert policy["scheduler"] == case.scheduler
+
+    actual = wrapper.run(q, k, v, sm_scale=sm_scale)
+    torch.cuda.synchronize()
+    tolerance = 2e-2 if case.dtype is torch.bfloat16 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)

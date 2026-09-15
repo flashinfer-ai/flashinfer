@@ -20,6 +20,8 @@ an immutable revision. ``run()`` validates compact BSHD Q/K/V and caller-owned
 routing tensors, then enqueues route preparation followed by attention in one
 compiled adapter on the caller's CUDA stream. The one-shot entry point retains
 synchronous canonical-BSR inspection to derive its temporary plan capacity.
+A dense plan (``use_block_sparse=False``) keeps the tile selection but attends
+over the whole K/V sequence without route preparation.
 
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
 kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
@@ -45,8 +47,12 @@ from flashinfer.trace.templates.attention import (
 from ._block_sparse.common import (
     _num_sparse_pattern_heads,
     _validate_contiguous_route_mode,
+    _validate_dense_contiguous_plan_inputs,
 )
-from ._block_sparse.config import _validate_block_sparse_static_profile
+from ._block_sparse.config import (
+    _CAPACITY_UNSET,
+    _validate_block_sparse_static_profile,
+)
 from ._block_sparse.inspection import (
     _inspect_block_sparse_bsr,
     _inspect_paged_block_sparse_metadata,
@@ -124,6 +130,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
     using them. CUDA Graph capture pins plan-owned state only, so captured
     routing storage remains the caller's responsibility.
 
+    A dense plan (``use_block_sparse=False``) attends over the whole K/V
+    sequence with the same tile selection; it owns no routing storage and its
+    runs take Q/K/V only.
+
     One plan revision owns one mutable route workspace. Its runs must be ordered
     on one stream or externally synchronized; unordered concurrent runs require
     distinct wrappers.
@@ -142,8 +152,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_block_size: int,
         *,
         device: torch.device | str | int,
-        max_blocks_per_row: int,
-        use_kv_valid_bits: bool,
+        use_block_sparse: bool = True,
+        max_blocks_per_row: int | None = None,
+        use_kv_valid_bits: bool = False,
         sparse_format: Literal["bsr", "bitmask"] = "bsr",
         use_proxy_routes: bool = False,
         mask_type: Literal["dense", "causal"] = "dense",
@@ -166,6 +177,15 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         tensor identities and index extents to each run as long as they fit
         this declared capacity.
 
+        ``use_block_sparse=False`` plans dense attention over the whole K/V
+        sequence instead. A dense plan owns no route workspace and launches no
+        route preparation, so ``max_blocks_per_row``, ``use_kv_valid_bits``,
+        ``sparse_format``, and ``use_proxy_routes`` must keep their defaults,
+        and :meth:`run` takes Q/K/V only. The block sizes select the same Q
+        tile and KV route as a block-sparse plan, and the scheduler follows
+        the decode kernel's launch heuristic between the static grid and the
+        persistent scheduler.
+
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
         prepares each pattern once. K/V values still have every physical head.
@@ -183,14 +203,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         multiple of 64. The Q tile groups complete Q-head groups and as many Q
         tokens as fit without crossing a semantic Q-block row, up to Q128;
         fine KV blocks cap this at a SWAPAB Q32 tile. Proxy routes reuse the
-        same Q-tile, KV-route, and MMA geometry as exact routes, but currently
-        use the direct scheduler because reusable planning cannot observe live
-        exact-route work. Every run prepares its selected BSR or bitmask into
+        same Q-tile, KV-route, MMA geometry, and scheduler selection as exact
+        routes. Every run prepares its selected BSR or bitmask into
         compact, profile-selected fixed-width route metadata, and the attention
         core consumes only that metadata. This remains true when every KV block
-        is selected;
-        callers that know a pattern is dense should choose the dense FMHA API
-        explicitly.
+        is selected; callers that know a pattern is dense should plan the dense
+        mode instead.
 
         Planning does not inspect routing values and does not synchronize the
         host. Reusable runs trust those values; assertion-enabled CuTe DSL
@@ -205,7 +223,26 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         runs require distinct wrappers.
         """
 
-        _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
+        if use_block_sparse:
+            if max_blocks_per_row is None:
+                raise ValueError(
+                    "max_blocks_per_row is required by a block-sparse plan"
+                )
+            _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
+        else:
+            _validate_dense_contiguous_plan_inputs(
+                (
+                    ("max_blocks_per_row", max_blocks_per_row, None),
+                    ("use_kv_valid_bits", use_kv_valid_bits, False),
+                    ("sparse_format", sparse_format, "bsr"),
+                    ("use_proxy_routes", use_proxy_routes, False),
+                    (
+                        "share_pattern_across_kv_heads",
+                        share_pattern_across_kv_heads,
+                        False,
+                    ),
+                )
+            )
         static = _validate_block_sparse_static_profile(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -221,7 +258,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
             output_dtype=o_data_type,
-            max_blocks_per_row=max_blocks_per_row,
+            max_blocks_per_row=(
+                max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
+            ),
+            use_block_sparse=use_block_sparse,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -239,6 +279,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 plan_stream=plan_stream,
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
+                use_block_sparse=use_block_sparse,
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
@@ -270,6 +311,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         supplied; otherwise it is a newly allocated compact BSHD tensor.
         Only O is returned; this PrimTS API does not return LSE. The launch is
         enqueued asynchronously on the caller's current CUDA stream.
+
+        A dense contiguous plan attends over the whole K/V sequence and rejects
+        every routing argument below; all of them must remain ``None``.
 
         ``validate=True`` performs structural and plan-geometry validation
         without reading tensor values; it is the safe public default.
@@ -382,6 +426,7 @@ def block_sparse_attention(
     k_summary: torch.Tensor | None = None,
     v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None = None,
+    use_block_sparse: bool = True,
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     mask_type: Literal["dense", "causal"] = "dense",
@@ -389,14 +434,16 @@ def block_sparse_attention(
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Plan and run one compact-BSHD block-sparse attention launch.
+    """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
     This one-shot form creates a capacity-only plan and passes the original
     routing tensors to :meth:`BlockSparseTSWrapper.run`. BSR inputs are
     synchronously inspected to validate canonical rows and derive their maximum
     width. Bitmask inputs use the structural KV-block count as a conservative
-    capacity bound. It therefore cannot be invoked inside CUDA Graph capture;
-    plan a wrapper outside capture and capture only ``run()`` instead.
+    capacity bound. With ``use_block_sparse=False`` the call plans the dense
+    mode of :meth:`BlockSparseTSWrapper.plan` instead and takes Q/K/V only.
+    Planning cannot happen inside CUDA Graph capture; plan a wrapper outside
+    capture and capture only ``run()`` instead.
 
     Parameters
     ----------
@@ -428,6 +475,11 @@ def block_sparse_attention(
         Per-block summed V tensor required when proxy routes are enabled.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
+    use_block_sparse : bool, optional
+        Select the block-sparse mode (default) or, when ``False``, dense
+        attention over the whole K/V sequence; the dense mode requires every
+        routing argument to be ``None`` and the route options at their defaults,
+        while the block sizes keep selecting the tile profile.
     sparse_format : {"bsr", "bitmask"}, optional
         Runtime sparse representation. Defaults to ``"bsr"``.
     use_proxy_routes : bool, optional
@@ -486,36 +538,40 @@ def block_sparse_attention(
     if use_proxy_routes and static.mask_type != "dense":
         raise ValueError("block-sparse proxy routes require mask_type='dense'")
     device, _ = _resolve_cuda_device(q.device)
-    _validate_block_sparse_metadata(
-        sparse_format=sparse_format,
-        block_indptr=block_indptr,
-        block_indices=block_indices,
-        exact_block_bits=exact_block_bits,
-        kv_valid_bits=kv_valid_bits,
-        device=device,
-        batch_size=static.batch_size,
-        seq_len_q=static.seq_len_q,
-        seq_len_kv=static.seq_len_kv,
-        num_kv_heads=_num_sparse_pattern_heads(
-            static.num_kv_heads, static.share_pattern_across_kv_heads
-        ),
-        q_block_size=static.q_block_size,
-        kv_block_size=static.kv_block_size,
-        use_kv_valid_bits=static.use_kv_valid_bits,
-    )
-    if sparse_format == "bsr":
-        max_blocks_per_row = _inspect_block_sparse_bsr(
-            block_indptr,
-            block_indices,
-            static=static,
-            stream=torch.cuda.current_stream(device),
+    # A dense plan owns no route capacity; the wrapper rejects any routing
+    # tensor that reaches its plan or run.
+    max_blocks_per_row = None
+    if use_block_sparse:
+        _validate_block_sparse_metadata(
+            sparse_format=sparse_format,
+            block_indptr=block_indptr,
+            block_indices=block_indices,
+            exact_block_bits=exact_block_bits,
+            kv_valid_bits=kv_valid_bits,
+            device=device,
+            batch_size=static.batch_size,
+            seq_len_q=static.seq_len_q,
+            seq_len_kv=static.seq_len_kv,
+            num_kv_heads=_num_sparse_pattern_heads(
+                static.num_kv_heads, static.share_pattern_across_kv_heads
+            ),
+            q_block_size=static.q_block_size,
+            kv_block_size=static.kv_block_size,
+            use_kv_valid_bits=static.use_kv_valid_bits,
         )
-    elif sparse_format == "bitmask":
-        max_blocks_per_row = (
-            static.seq_len_kv + static.kv_block_size - 1
-        ) // static.kv_block_size
-    else:
-        raise AssertionError(f"unsupported sparse format {sparse_format!r}")
+        if sparse_format == "bsr":
+            max_blocks_per_row = _inspect_block_sparse_bsr(
+                block_indptr,
+                block_indices,
+                static=static,
+                stream=torch.cuda.current_stream(device),
+            )
+        elif sparse_format == "bitmask":
+            max_blocks_per_row = (
+                static.seq_len_kv + static.kv_block_size - 1
+            ) // static.kv_block_size
+        else:
+            raise AssertionError(f"unsupported sparse format {sparse_format!r}")
 
     wrapper = BlockSparseTSWrapper()
     wrapper.plan(
@@ -528,6 +584,7 @@ def block_sparse_attention(
         static.q_block_size,
         static.kv_block_size,
         device=device,
+        use_block_sparse=use_block_sparse,
         max_blocks_per_row=max_blocks_per_row,
         use_kv_valid_bits=static.use_kv_valid_bits,
         sparse_format=sparse_format,
