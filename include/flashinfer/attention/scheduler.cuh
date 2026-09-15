@@ -937,16 +937,6 @@ inline cudaError_t PrefillPlanWorkspaceSize(
 }
 
 /*!
- * \brief The CTA_TILE_Q values FA2DetermineCtaTileQ can select.
- *
- * The upper-bound helpers below cannot know which one a future plan will get,
- * so they evaluate every one of them and keep the largest workspace. Adding a
- * value to FA2DetermineCtaTileQ without adding it here would silently weaken
- * the bound, so the helpers check the selector against this list.
- */
-constexpr uint32_t kFA2CtaTileQCandidates[] = {16, 32, 64, 128};
-
-/*!
  * \brief A workspace size no reachable batch-prefill plan can exceed.
  *
  * `PrefillPlanWorkspaceSize` answers for one plan. This answers for every plan

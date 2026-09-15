@@ -1679,6 +1679,37 @@ def _build_block_tables_from_paged_kv_indices(
     return block_tables
 
 
+def _resolve_prefill_backend(
+    backend: str,
+    device: torch.device,
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    use_custom_mask: bool,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+) -> str:
+    """Resolve ``auto`` exactly the way :meth:`plan` does.
+
+    Sizing that resolved ``auto`` differently from the plan it is sizing for
+    would hand the caller a number from the wrong scheduler, so both go
+    through here.
+    """
+    if backend != "auto":
+        return backend
+    return determine_attention_backend(
+        device,
+        PosEncodingMode[pos_encoding_mode].value,
+        use_fp16_qk_reduction,
+        use_custom_mask,
+        q_data_type,
+        kv_data_type,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+    )
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
@@ -2253,15 +2284,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             module = self._jit_module
         else:
-            if backend == "auto":
-                backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    use_custom_mask,
-                    q_data_type,
-                    kv_data_type,
-                )
+            backend = _resolve_prefill_backend(
+                backend,
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                use_custom_mask,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+            )
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -2368,6 +2401,29 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The size of each page in the paged kv-cache.
         head_dim_vo : Optional[int]
             The dimension of the value/output heads. Defaults to ``head_dim_qk``.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        use_fp16_qk_reduction : bool
+            Whether the plans will use fp16 for qk reduction. Defaults to ``False``.
+        use_custom_mask : bool
+            Whether the plans will carry a custom mask. Defaults to ``False``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``,
+            the window size will be set to the full length of the sequence.
+            Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2,
+            etc.), if not provided, will be set to ``0``.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to
+            ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to
+            ``q_data_type``.
         fixed_split_size : Optional[int]
             The fixed split size for split-kv prefill, in pages. When set, the
             bound uses ``max_num_pages_per_request`` to bound the chunk count
@@ -2393,7 +2449,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "workspace_size_upper_bound is not available for the "
                 "cute-dsl-prims prefill backend"
             )
-        if max_batch_size < 0 or max_total_num_rows < 0 or max_num_pages_per_request < 0:
+        if (
+            max_batch_size < 0
+            or max_total_num_rows < 0
+            or max_num_pages_per_request < 0
+        ):
             raise ValueError("workspace_size_upper_bound bounds must be non-negative")
 
         q_data_type = canonicalize_torch_dtype(q_data_type)
@@ -2414,15 +2474,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             module = self._jit_module
         else:
-            if backend == "auto":
-                backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    use_custom_mask,
-                    q_data_type,
-                    kv_data_type,
-                )
+            backend = _resolve_prefill_backend(
+                backend,
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                use_custom_mask,
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+            )
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size_upper_bound is not available for the cudnn "
