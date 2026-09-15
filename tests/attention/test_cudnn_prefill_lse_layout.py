@@ -196,6 +196,43 @@ def test_cudnn_prefill_lse_rejects_other_shapes():
         )
 
 
+@pytest.mark.parametrize("flaw", ["dtype", "contiguity"])
+def test_cudnn_prefill_lse_rejects_unbindable_buffers(flaw):
+    """The packed LSE is bound to cuDNN's Stats as contiguous float32; other
+    buffers are rejected up front instead of at graph execution."""
+    _skip_unless_cudnn()
+    device = "cuda:0"
+    batch_size, s_qo, s_kv, h_qo, h_kv, d = 2, 32, 64, 4, 4, 128
+    q_lens, kv_lens, qo_indptr, kv_indptr, q, k, v = _ragged_case(
+        batch_size, s_qo, s_kv, h_qo, h_kv, d, device
+    )
+    ws = torch.empty(64 * 1024 * 1024, dtype=torch.int8, device=device)
+    if flaw == "dtype":
+        lse = torch.empty(q.shape[0], h_qo, device=device, dtype=torch.float16)
+        match = "lse must have dtype torch.float32"
+    else:
+        lse = torch.empty(h_qo, q.shape[0], device=device, dtype=torch.float32).T
+        match = "lse must be contiguous"
+    with pytest.raises(ValueError, match=match):
+        cudnn_batch_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            float(d**-0.5),
+            ws,
+            max_token_per_sequence=s_qo,
+            max_sequence_kv=s_kv,
+            actual_seq_lens_q=q_lens.view(batch_size, 1, 1, 1),
+            actual_seq_lens_kv=kv_lens.view(batch_size, 1, 1, 1),
+            causal=False,
+            return_lse=True,
+            batch_offsets_q=qo_indptr,
+            batch_offsets_k=kv_indptr,
+            batch_offsets_units="tokens",
+            lse=lse,
+        )
+
+
 def test_cudnn_prefill_lse_rejects_padded_with_stats_offsets():
     """Stats offsets address packed rows, so they cannot accompany a padded
     buffer: cuDNN would write every request after the first to the wrong
