@@ -85,6 +85,9 @@ def test_supported_configs_families() -> None:
     assert dsv4.max_num_heads == 128
     assert dsv4.topks == frozenset({128, 192, 256, 512, 1024})  # calibrated values
     assert dsv4.min_topk == 1
+    # DSv4 dual-cache prefill accepts 128-token secondary pages
+    # (DeepSeek V4.1-Flash compress_ratio=1 layers).
+    assert dsv4.extra_page_block_sizes == frozenset({2, 64, 128})
     # The dispatch envelope is a membership predicate (topk is a runtime
     # kernel argument): any H in [1, 128] at any topk >= min_topk. vLLM
     # probes ``(num_heads, topk) in _DECODE_DSV4_DISPATCH`` directly.
