@@ -611,6 +611,18 @@ quantize_with_block_size_tma(
       }
     }
   }
+  // Async-proxy fence: make our generic-proxy stores to `out` and `SFout`
+  // visible to the next kernel's async-proxy reads (e.g. TMA loads in the
+  // subsequent GEMM). Without this, PDL allows the dependent kernel to
+  // start before our writes have drained across the proxy boundary, and
+  // the consumer reads stale/partial data, producing NaN output.
+  // The `fence` then `__syncthreads` ordering
+  // is mandated by the CUDA async-proxy memory model: the fence applies
+  // only to the calling thread's memory ops, and __syncthreads is what
+  // makes those orderings observable to the leader thread issuing the
+  // dependent-grid launch.
+  asm volatile("fence.proxy.async.global;");
+  __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
