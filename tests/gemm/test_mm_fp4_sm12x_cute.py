@@ -295,6 +295,9 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
     larger = [
+        ((512, 8192, 14336), ("cooperative", 128, 64, 256)),
+        ((512, 5120, 16384), ("cooperative", 128, 128, 256)),
+        ((1024, 4608, 7168), ("raw", 64, 32, 8, False, True, 256, True)),
         ((512, 8192, 28672), ("cooperative", 128, 128, 256)),
         ((512, 5120, 4096), ("cooperative", 128, 64, 256)),
         ((256, 34816, 5120), ("cooperative", 128, 128, 256)),
@@ -323,6 +326,22 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         for n, k in [(34816, 5120), (5120, 17408)]
     ]
     neighbors += [(1024, 34816, 5120)]
+    neighbors += [
+        (256, 8192, 14336),
+        (1024, 8192, 14336),
+        (512, 8320, 14336),
+        (512, 8192, 14592),
+        (256, 5120, 16384),
+        (1024, 5120, 16384),
+        (512, 5248, 16384),
+        (512, 5120, 16640),
+    ]
+    neighbors += [
+        (512, 4608, 7168),
+        (2048, 4608, 7168),
+        (1024, 4736, 7168),
+        (1024, 4608, 7424),
+    ]
     neighbors += [
         (256, 8192, 28672),
         (1024, 8192, 28672),
@@ -356,6 +375,9 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (8192, 5120, 17408),
         (512, 5120, 4096),
         (512, 8192, 28672),
+        (1024, 4608, 7168),
+        (512, 8192, 14336),
+        (512, 5120, 16384),
     ],
 )
 def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypatch):
