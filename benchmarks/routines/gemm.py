@@ -155,6 +155,7 @@ def parse_gemm_args(line, parser):
             "tgv",
             "cublaslt",
             "cute-dsl",
+            "cute-dsl-native",
             "b12x",
             "auto",
             "tinygemm",
