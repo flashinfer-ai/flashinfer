@@ -1404,7 +1404,8 @@ class UlyssesCommunicator:
         ----------
         max_elems : int, optional
             Capacity of each send and receive staging buffer in elements.
-            ``None`` uses the communicator's ``max_elems`` capacity.
+            ``None`` fills the communicator's ``max_bytes`` capacity at the
+            communicator dtype.
 
         Returns
         -------
@@ -1416,14 +1417,16 @@ class UlyssesCommunicator:
                 "create_workspace called on a "
                 f"{self._state} UlyssesCommunicator (use-after-close)"
             )
+        capacity_elems = self.max_bytes // self.dtype.itemsize
         if max_elems is None:
-            max_elems = self.max_elems
+            max_elems = capacity_elems
         if type(max_elems) is not int or max_elems <= 0:
             raise ValueError(f"max_elems must be a positive int, got {max_elems!r}")
-        if max_elems > self.max_elems:
+        if max_elems > capacity_elems:
             raise ValueError(
-                f"workspace max_elems={max_elems} exceeds communicator "
-                f"capacity max_elems={self.max_elems}"
+                f"workspace max_elems={max_elems} exceeds the communicator "
+                f"capacity max_bytes={self.max_bytes} ({capacity_elems} elements "
+                f"of {self.dtype.itemsize})"
             )
         return UlyssesWorkspace(
             max_elems=max_elems, dtype=self.dtype, device=self.device
@@ -2087,10 +2090,14 @@ class UlyssesCommunicator:
             )
 
     def _validate_capacity(self, required_elems: int, op: str) -> None:
-        if required_elems > self.max_elems:
+        # Capacity is a byte budget; both callers pin their operands to the
+        # communicator dtype first, so the element count converts exactly.
+        required_bytes = required_elems * self.dtype.itemsize
+        if required_bytes > self.max_bytes:
             raise ValueError(
-                f"{op} payload has {required_elems} elements, exceeding the "
-                f"communicator capacity max_elems={self.max_elems}"
+                f"{op} payload is {required_bytes} bytes ({required_elems} "
+                f"elements of {self.dtype.itemsize}), exceeding the communicator "
+                f"capacity max_bytes={self.max_bytes}"
             )
 
     def _validate(self, x, op: str, dtype: Optional[torch.dtype] = None) -> None:
