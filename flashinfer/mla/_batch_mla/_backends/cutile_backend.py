@@ -11,9 +11,6 @@ from typing import ClassVar, Optional, cast
 
 import torch
 
-from ....attention.prims_ts._tensor_aliasing import (
-    _validate_out_does_not_overlap_inputs,
-)
 from ....utils import get_compute_capability
 from .._contracts import _are_adjacent_last_dim_views
 from .._planning import _MLAPlanArguments
@@ -21,6 +18,50 @@ from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
 
 
 _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0), (12, 1)})
+
+
+def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """Conservatively bound a cuTile input view, including stride holes."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("tensor must be a torch.Tensor")
+    if tensor.layout != torch.strided:
+        raise TypeError("tensor must have strided layout")
+    byte_start = tensor.data_ptr()
+    numel = tensor.numel()
+    if numel == 0:
+        return byte_start, byte_start
+    element_size = tensor.element_size()
+    if tensor.is_contiguous():
+        return byte_start, byte_start + numel * element_size
+    min_element_offset = 0
+    max_element_offset = 0
+    for extent, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        last_offset = (int(extent) - 1) * int(stride)
+        min_element_offset += min(last_offset, 0)
+        max_element_offset += max(last_offset, 0)
+    return (
+        byte_start + min_element_offset * element_size,
+        byte_start + (max_element_offset + 1) * element_size,
+    )
+
+
+def _validate_out_does_not_overlap_inputs(
+    out: torch.Tensor,
+    *named_inputs: tuple[str, Optional[torch.Tensor]],
+) -> None:
+    """Preserve cuTile MLA's checked-output contract independently of PrimTS."""
+    out_start, out_end = _tensor_byte_span(out)
+    for name, tensor in named_inputs:
+        if tensor is None or tensor.device != out.device:
+            continue
+        start, end = _tensor_byte_span(tensor)
+        if (
+            out_start != out_end
+            and start != end
+            and out_start < end
+            and start < out_end
+        ):
+            raise ValueError(f"out must not overlap {name} storage")
 
 
 def _get_compute_capability(device: torch.device):

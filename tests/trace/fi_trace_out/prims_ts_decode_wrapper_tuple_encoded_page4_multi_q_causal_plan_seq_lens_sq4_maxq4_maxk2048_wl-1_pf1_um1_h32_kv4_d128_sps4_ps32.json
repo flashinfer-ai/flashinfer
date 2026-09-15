@@ -1,12 +1,16 @@
 {
-  "name": "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "One-shot PrimTS GQA decode over a fixed row-strided page table using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
+  "name": "prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32",
+  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. The plan also owns the K/V length vector, so run() must omit seq_lens. Every run supplies a fixed row-strided page table; packed-Q runs also supply Q offsets.",
   "op_type": "gqa_paged",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.decode.batch_decode_with_paged_kv_cache",
+    "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
-    "status:experimental"
+    "status:experimental",
+    "mask:causal",
+    "kv-prefix-mode:planned_full",
+    "kv-lengths-mode:planned_uniform_max",
+    "seq-lens-source:plan"
   ],
   "axes": {
     "batch_size": {
@@ -17,6 +21,41 @@
       "type": "const",
       "value": 4,
       "description": "Fixed query length per request."
+    },
+    "max_seq_len_q": {
+      "type": "const",
+      "value": 4,
+      "description": "Query-length capacity frozen by plan()."
+    },
+    "max_kv_len": {
+      "type": "const",
+      "value": 2048,
+      "description": "K/V-length capacity frozen by plan()."
+    },
+    "causal": {
+      "type": "const",
+      "value": 1,
+      "description": "One for a causal plan and zero for a dense plan."
+    },
+    "window_left": {
+      "type": "const",
+      "value": -1,
+      "description": "Sliding-window extent frozen by plan()."
+    },
+    "planned_full_kv_prefix": {
+      "type": "const",
+      "value": 1,
+      "description": "Whether plan() compiled the full-prefix specialization."
+    },
+    "planned_uniform_max_kv_lengths": {
+      "type": "const",
+      "value": 1,
+      "description": "Whether plan() compiled uniform maximum K/V lengths."
+    },
+    "plan_owns_seq_lens": {
+      "type": "const",
+      "value": 1,
+      "description": "One when plan() owns the K/V length vector and zero when run() supplies it."
     },
     "num_qo_heads": {
       "type": "const",
@@ -36,7 +75,8 @@
     },
     "page_size": {
       "type": "const",
-      "value": 32
+      "value": 4,
+      "description": "Semantic size addressed by encoded subpage locators."
     },
     "max_pages_per_seq": {
       "type": "var",
@@ -45,17 +85,22 @@
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "storage_page_size": {
+      "type": "const",
+      "value": 32
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
     "page_size in (4, 16, 32, 64, 128)",
-    "max_pages_per_seq * page_size >= max(seq_lens_kv)",
-    "min(seq_lens_kv) >= 1",
+    "storage_page_size > page_size",
+    "storage_page_size % page_size == 0",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 128",
-    "window_left == -1 or mask_type == 'causal'",
-    "kv_layout == 'HND'",
+    "max_pages_per_seq * page_size >= max(seq_lens)",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_kv_len",
     "seq_len_q >= 2"
   ],
   "inputs": {
@@ -72,7 +117,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -81,7 +126,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -91,45 +136,24 @@
         "batch_size",
         "max_pages_per_seq"
       ],
-      "dtype": "int32"
+      "dtype": "int32",
+      "description": "Required fixed row-strided physical page table supplied to run()."
     },
-    "seq_lens_kv": {
+    "seq_lens": {
       "shape": [
         "batch_size"
       ],
-      "dtype": "int32"
+      "dtype": "int32",
+      "optional": true,
+      "description": "Plan-owned per-request K/V lengths; this is optional trace context and run() must receive seq_lens=None."
     },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
       ],
       "dtype": "int32",
-      "optional": true
-    },
-    "seq_len_q": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
-    },
-    "max_seq_len_q": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
-    },
-    "mask_type": {
-      "shape": null,
-      "dtype": "string",
-      "optional": true
-    },
-    "window_left": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
-    },
-    "kv_layout": {
-      "shape": null,
-      "dtype": "string",
-      "optional": true
+      "optional": true,
+      "description": "Cumulative Q offsets required by a packed-Q run."
     },
     "bmm1_scale": {
       "shape": null,
@@ -141,10 +165,11 @@
       "dtype": "float32",
       "optional": true
     },
-    "out_dtype": {
+    "validate": {
       "shape": null,
-      "dtype": "dtype",
-      "optional": true
+      "dtype": "bool",
+      "optional": true,
+      "description": "Whether to validate per-run tensors and metadata values."
     }
   },
   "outputs": {
