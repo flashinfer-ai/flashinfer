@@ -295,6 +295,8 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
     larger = [
+        ((256, 7168, 256), ("raw", 32, 64, 13, True, True, 256, False)),
+        ((256, 7168, 512), ("raw", 32, 64, 13, True, True, 256, False)),
         ((128, 2688, 1856), ("b12x", 128, 128, 256)),
         ((128, 3712, 2688), ("b12x", 128, 128, 256)),
         ((128, 2688, 3712), ("b12x", 128, 128, 256)),
@@ -492,6 +494,16 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (512, 1792, 5376),
         (512, 1280, 8448),
     ]
+    neighbors += [
+        (128, 7168, 256),
+        (512, 7168, 256),
+        (128, 7168, 512),
+        (512, 7168, 512),
+        (256, 7296, 256),
+        (256, 7296, 512),
+        (256, 7168, 768),
+        (1024, 896, 1024),
+    ]
     for shape in neighbors:
         assert policy.default_tactic(
             *shape, compute_capability=(12, 1)
@@ -509,6 +521,8 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         for n, k in [(34816, 5120), (5120, 17408)]
     ]
     + [
+        (256, 7168, 256),
+        (256, 7168, 512),
         (128, 2688, 1856),
         (128, 3712, 2688),
         (128, 2688, 3712),
