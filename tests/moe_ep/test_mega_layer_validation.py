@@ -1,7 +1,8 @@
-"""MoEEpMegaLayer validation error paths (no deep_gemm kernel launch)."""
+"""MoEEpMegaLayer public validation without kernel launches."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -28,6 +29,7 @@ def _fake_deep_gemm_transformed(
 
 def _mega_layer(
     *,
+    backend_name: str = "deep_gemm",
     quantize_input: bool = True,
     preprocess_weights: bool = False,
     transformed_weights=None,
@@ -36,6 +38,7 @@ def _mega_layer(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
@@ -43,26 +46,45 @@ def _mega_layer(
         MoEWeightPack,
     )
 
-    with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
-    ):
-        if transformed_weights is None:
+    config_type, num_experts = {
+        "deep_gemm": (Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig, 1),
+        "w4a16": (Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig, 2),
+    }[backend_name]
+    if transformed_weights is None:
+        if backend_name == "deep_gemm":
             transformed_weights = _fake_deep_gemm_transformed()
+        elif backend_name == "w4a16":
+            # Aligned fixture: packed K-major weights, native per-expert SF,
+            # and separate FP32 global scales. No preprocessing/quantizer mock.
+            transformed_weights = tuple(
+                (
+                    torch.zeros(2, rows, 64, dtype=torch.uint8).transpose(1, 2),
+                    torch.zeros(2, rows * 8, dtype=torch.uint8),
+                    torch.ones(2, dtype=torch.float32),
+                )
+                for rows in (256, 128)
+            )
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
+        ),
+        mock.patch("torch.cuda.is_available", return_value=False)
+        if backend_name == "w4a16"
+        else nullcontext(),
+    ):
         return MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
-                num_experts=1,
+                num_experts=num_experts,
                 max_tokens_per_rank=64,
                 token_hidden_size=128,
             ),
             weights=MoEWeightPack(
-                w13=torch.zeros(1, 256, 128),
-                w2=torch.zeros(1, 128, 128),
+                w13=torch.zeros(num_experts, 256, 128),
+                w2=torch.zeros(num_experts, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
-                    intermediate_size=128, top_k=2
-                ),
+                megakernel=config_type(intermediate_size=128, top_k=2),
                 quantize_input=quantize_input,
                 preprocess_weights=preprocess_weights,
                 transformed_weights=transformed_weights,
@@ -105,6 +127,55 @@ def test_mega_layer_requires_weights():
                 transformed_weights=_fake_deep_gemm_transformed(),
             ),
         )
+
+
+@pytest.mark.parametrize("backend_name", ("w4a4", "w4a16", "split"))
+@pytest.mark.parametrize("scale_field", ("w13_global_scale", "w2_global_scale"))
+def test_layer_global_weight_scale_support(backend_name, scale_field):
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpConfigError,
+        MoEEpLayer,
+        PrequantizedMoEWeights,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    config_types = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
+    if backend_name == "split":
+        backend = "nccl_ep"
+    else:
+        backend = MegaConfig(
+            megakernel=config_types[backend_name](intermediate_size=128, top_k=2),
+            preprocess_weights=False,
+        )
+    weights = PrequantizedMoEWeights(
+        torch.zeros(2, 256, 64, dtype=torch.uint8),
+        torch.zeros(2, 128, 64, dtype=torch.uint8),
+        torch.zeros(2, 256, 8, dtype=torch.float8_e4m3fn),
+        torch.zeros(2, 128, 8, dtype=torch.float8_e4m3fn),
+        **{scale_field: torch.full((2,), 2.0)},
+    )
+    with (
+        mock.patch("torch.cuda.is_available", return_value=False),
+        nullcontext()
+        if backend_name == "w4a16"
+        else pytest.raises(MoEEpConfigError, match="global weight scales"),
+    ):
+        layer = MoEEpLayer(
+            BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            FleetParams(num_experts=2, max_tokens_per_rank=64, token_hidden_size=128),
+            weights,
+            backend=backend,
+        )
+        layer.destroy()
 
 
 def test_mega_layer_forward_rejects_token_overflow():
@@ -223,7 +294,11 @@ def test_mega_layer_forward_rejects_topk_weights_shape_mismatch():
         layer.forward(t)
 
 
-def test_mega_layer_forward_requires_scales_when_copy_mode():
+@pytest.mark.parametrize(
+    "backend_name, error",
+    (("deep_gemm", "scales is required"), ("w4a16", "quantize_input=True")),
+)
+def test_mega_layer_forward_rejects_invalid_copy_mode(backend_name, error):
     import torch
 
     if not hasattr(torch, "float8_e4m3fn"):
@@ -231,7 +306,7 @@ def test_mega_layer_forward_requires_scales_when_copy_mode():
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(quantize_input=False)
+    layer = _mega_layer(backend_name=backend_name, quantize_input=False)
     layer._workspace = _fake_symm_buffer()  # type: ignore[attr-defined]
 
     t = MoEEpTensors(
@@ -240,7 +315,7 @@ def test_mega_layer_forward_requires_scales_when_copy_mode():
         topk_weights=torch.zeros(4, 2),
         scales=None,
     )
-    with pytest.raises(MoEEpConfigError, match="scales is required"):
+    with pytest.raises(MoEEpConfigError, match=error):
         layer.forward(t)
 
 
@@ -347,22 +422,54 @@ def test_mega_layer_forward_skips_quantize_when_config_disabled():
         assert stage_mock.call_args.kwargs["quantize_input"] is False
 
 
-def test_mega_layer_forward_rejects_non_bf16_with_quantize_input():
+@pytest.mark.parametrize(
+    "backend_name, field, dtype, error",
+    (
+        ("deep_gemm", "hidden_states", "float8_e4m3fn", "expects bf16"),
+        ("w4a16", "hidden_states", "float16", "expects bf16"),
+        ("w4a16", "topk_ids", "float32", "int32 or int64"),
+        ("w4a16", "topk_weights", "bfloat16", "must be FP32"),
+    ),
+)
+def test_mega_layer_forward_rejects_invalid_input_dtype(
+    backend_name, field, dtype, error
+):
     import torch
 
-    if not hasattr(torch, "float8_e4m3fn"):
-        pytest.skip("needs torch.float8_e4m3fn")
+    if not hasattr(torch, dtype):
+        pytest.skip(f"needs torch.{dtype}")
 
     from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
 
-    layer = _mega_layer(quantize_input=True)
+    layer = _mega_layer(backend_name=backend_name, quantize_input=True)
+    inputs = {
+        "hidden_states": torch.zeros(8, 128, dtype=torch.bfloat16),
+        "topk_ids": torch.zeros(8, 2, dtype=torch.int64),
+        "topk_weights": torch.zeros(8, 2, dtype=torch.float32),
+    }
+    inputs[field] = inputs[field].to(getattr(torch, dtype))
+    with pytest.raises(MoEEpConfigError, match=error):
+        layer.forward(MoEEpTensors(**inputs))
+
+
+@pytest.mark.parametrize(
+    "field", ("scales", "fc1_alpha", "fc2_alpha", "fc1_norm_const")
+)
+def test_mega_layer_scale_free_input_rejects_quantization_fields(field):
+    import torch
+
+    from flashinfer.moe_ep import MoEEpConfigError, MoEEpTensors
+
+    layer = _mega_layer(backend_name="w4a16")
     t = MoEEpTensors(
-        hidden_states=torch.zeros(8, 128, dtype=torch.float8_e4m3fn),
+        hidden_states=torch.zeros(8, 128, dtype=torch.bfloat16),
         topk_ids=torch.zeros(8, 2, dtype=torch.int64),
-        topk_weights=torch.zeros(8, 2),
-        scales=torch.zeros(8, 4),
+        topk_weights=torch.zeros(8, 2, dtype=torch.float32),
+        **{field: torch.ones(1)},
     )
-    with pytest.raises(MoEEpConfigError, match="quantize_input=True expects bf16"):
+    with pytest.raises(
+        MoEEpConfigError, match="does not accept activation quantization"
+    ):
         layer.forward(t)
 
 

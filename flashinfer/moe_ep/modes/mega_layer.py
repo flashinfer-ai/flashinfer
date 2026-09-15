@@ -125,7 +125,12 @@ class MoEEpMegaLayer(nn.Module):
         self._kernel.validate_init(bootstrap, fleet_params)
 
         if backend.transformed_weights is None:
-            validate_fleet_weights(weights, fleet_params, bootstrap.world_size)
+            validate_fleet_weights(
+                weights,
+                fleet_params,
+                bootstrap.world_size,
+                supports_global_weight_scales=self._kernel.supports_global_weight_scales,
+            )
 
         self._weights: Optional[MoEWeightPack] = (
             weights if backend.transformed_weights is None else None

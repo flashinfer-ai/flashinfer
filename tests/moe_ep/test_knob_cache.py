@@ -180,8 +180,14 @@ def test_backend_warns_on_auto_knobs():
 
 
 @pytest.mark.arch_blackwell
-def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
-    """knobs=None buffer creation must pick up the recorded winner."""
+@pytest.mark.parametrize(
+    "mode,mma_m,explicit",
+    [("nvfp4", 256, False), ("w4a16", 128, False), ("w4a16", 128, True)],
+)
+def test_symm_buffer_resolves_cached_knobs(
+    monkeypatch, tmp_path, mode, mma_m, explicit
+):
+    """Cached and explicit partial tiles derive the same CTA instruction mode."""
     import torch
 
     if not torch.cuda.is_available():
@@ -197,21 +203,30 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
         record_knobs,
     )
 
+    if mode == "w4a16":
+        from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
+            get_symm_buffer_for_w4a16_mega_moe as get_symm_buffer_for_mega_moe,
+        )
+
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     _cache_env(monkeypatch, tmp_path)
     hidden, intermediate2x, num_experts, topk, max_tokens = 2048, 2048, 4, 4, 64
+    token_back_mode = {
+        "nvfp4": "standalone_warps",
+        "w4a16": "reuse_dispatch_warps",
+    }[mode]
     cached = {
-        "mma_tiler_mnk": (256, 128, 256),
+        "mma_tiler_mnk": (mma_m, 128, 256),
         "cluster_shape_mnk": (2, 1, 1),
         "group_hint": 128,
         "flag_batch": 16,
         "epi_flag_batch": (1, 2),
-        "token_back_mode": "standalone_warps",
+        "token_back_mode": token_back_mode,
         "load_balance_mode": "atomic_counter",
     }
     record_knobs(
-        cached,
-        dtype="nvfp4",
+        {**cached, "flag_batch": 8} if explicit else cached,
+        dtype=mode,
         world_size=1,
         hidden=hidden,
         intermediate=intermediate2x,
@@ -219,14 +234,17 @@ def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
         topk=topk,
         max_tokens=max_tokens,
     )
+    knobs = cached if explicit else None
     buf = get_symm_buffer_for_mega_moe(
-        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1
+        num_experts, max_tokens, topk, hidden, intermediate2x, 0, 1, knobs=knobs
     )
     try:
         cfg = buf._frontend.config
+        assert cfg.mma_tiler_mnk == cached["mma_tiler_mnk"]
+        assert cfg.use_2cta_instrs == (mma_m == 256)
         assert cfg.flag_batch == 16
         assert cfg.group_hint == 128
-        assert cfg.token_back_mode == "standalone_warps"
+        assert cfg.token_back_mode == token_back_mode
         assert cfg.epi_flag_batch == (1, 2)
     finally:
         buf.destroy()
