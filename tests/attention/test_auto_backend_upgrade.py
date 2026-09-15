@@ -618,3 +618,169 @@ def test_explicit_cutlass_refuses_cuda_graph():
             q_data_type=DTYPE,
             kv_data_type=DTYPE,
         )
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups from review: sinks, fp8, int64 indptrs, non-contiguous q/k/v
+# ---------------------------------------------------------------------------
+
+
+def _new_wrapper(backend):
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    return flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend=backend
+    )
+
+
+@requires_cutlass_arch
+def test_auto_declines_with_wrapper_sinks():
+    """vLLM's metadata builder stashes attention sinks on the wrapper (``_sinks``)
+    for the fa2 route; neither upgraded kernel consumes them, so `auto` must
+    stay on fa2 rather than silently drop the sink."""
+    wrapper = _new_wrapper("auto")
+    wrapper._sinks = torch.zeros(64, dtype=torch.float32, device="cuda")
+    _, _, _, qo_indptr, kv_indptr = _inputs(4, 1024, 1024, 64, 8, 128, 128)
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        64,
+        8,
+        128,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    assert wrapper._backend == "fa2"
+    del wrapper._sinks
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        64,
+        8,
+        128,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    assert wrapper._backend == BLACKWELL_DEFAULT
+
+
+@requires_cutlass_arch
+def test_upgraded_backends_refuse_sinks_set_after_plan():
+    """Sinks that appear between plan() and run() (the vLLM order) hit an
+    explicit error on the upgraded backends, never a silent drop."""
+    q, k, v, qo_indptr, kv_indptr = _inputs(4, 512, 512, 64, 8, 128, 128)
+    wrapper = _new_wrapper("auto")
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        64,
+        8,
+        128,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    assert wrapper._backend in ("cudnn", "cutlass")
+    wrapper._sinks = torch.zeros(64, dtype=torch.float32, device="cuda")
+    with pytest.raises(NotImplementedError, match="attention sinks"):
+        wrapper.run(q, k, v)
+
+
+@requires_cudnn_upgrade
+def test_auto_keeps_fp8_off_cudnn():
+    """`_cudnn_supports_direct_seqlens` is True for fp8 on recent cuDNN, but the
+    wrapper's cuDNN run branch takes the tensors as they are and the fp8 scale
+    handling lives on the paths after it: fp8 q/k/v must not resolve to cudnn.
+    Checked on the eligibility function itself -- a full fp8 plan() has no
+    Blackwell ragged backend to land on (fa2 rejects fp8 q at JIT time)."""
+    from flashinfer.prefill import _blackwell_ragged_auto_upgrade
+
+    dev = torch.device("cuda")
+    common = dict(
+        pos_encoding_mode=0,
+        has_custom_mask=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        has_multi_item_scoring=False,
+        has_sinks=False,
+        cudnn_indptr_is_int32=True,
+        cutlass_work_items=1,
+        cuda_graph_enabled=False,
+    )
+    assert (
+        _blackwell_ragged_auto_upgrade(
+            dev, "NHD", 128, 128, DTYPE, DTYPE, DTYPE, **common
+        )
+        == "cudnn"
+    )
+    fp8 = torch.float8_e4m3fn
+    assert (
+        _blackwell_ragged_auto_upgrade(dev, "NHD", 128, 128, fp8, fp8, fp8, **common)
+        is None
+    )
+    assert (
+        _blackwell_ragged_auto_upgrade(
+            dev, "NHD", 128, 128, fp8, fp8, torch.bfloat16, **common
+        )
+        is None
+    )
+
+
+@requires_cudnn_upgrade
+def test_explicit_cudnn_int64_indptr_converts_all_four_buffers():
+    """int64 token indptrs outside graph mode: plan() re-dtypes q/kv AND the o/v
+    buffers that default to aliases of them, so cuDNN never sees mixed dtypes."""
+    h_qo, h_kv, d = 64, 8, 128
+    q, k, v, indptr, _ = _varlen_inputs(6, 1024, h_qo, h_kv, d, d)
+    indptr64 = indptr.to(torch.int64)
+    _, out_fa2, lse_fa2 = _run_varlen("fa2", q, k, v, indptr, h_qo, h_kv, d, d)
+    wrapper = _new_wrapper("cudnn")
+    wrapper.plan(
+        indptr64,
+        indptr64,
+        h_qo,
+        h_kv,
+        d,
+        causal=True,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    for name in ("_qo_indptr_buf", "_kv_indptr_buf", "_o_indptr_buf", "_v_indptr_buf"):
+        assert getattr(wrapper, name).dtype == torch.int32, name
+    out, lse = wrapper.run(q, k, v, return_lse=True)
+    torch.cuda.synchronize()
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "explicit cudnn, int64 indptr")
+
+
+def _t3hd_views(batch, s_max, h, d, seed=777):
+    """q/k/v as views into one packed [tokens, 3, h, d] buffer (token stride 3*h*d)."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(seed)
+    lens = torch.randint(max(1, s_max // 4), s_max + 1, (batch,), generator=g)
+    indptr = torch.zeros(batch + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(lens, 0)
+    total = int(indptr[-1])
+    torch.manual_seed(seed)
+    qkv = torch.randn(total, 3, h, d, dtype=DTYPE, device=dev)
+    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+    assert not q.is_contiguous() and q.stride(0) == 3 * h * d
+    return q, k, v, indptr.to(dev)
+
+
+@requires_cudnn_upgrade
+def test_cudnn_ragged_handles_packed_t3hd_views():
+    """cuDNN follows the tensors' strides; the token-unit ragged offsets are
+    scaled by each tensor's real token stride (3*h*d here), and the graph cache
+    keys on strides, so a contiguous call of the same shape first does not
+    replay its graph for the packed views."""
+    h, d = 8, 128
+    q, k, v, indptr = _t3hd_views(6, 512, h, d)
+    qc, kc, vc = q.contiguous(), k.contiguous(), v.contiguous()
+    # contiguous graph first, same shapes -- must not be reused for the views
+    _, out_c, lse_c = _run_varlen("cudnn", qc, kc, vc, indptr, h, h, d, d)
+    _, out_fa2, lse_fa2 = _run_varlen("fa2", q, k, v, indptr, h, h, d, d)
+    resolved, out, lse = _run_varlen("cudnn", q, k, v, indptr, h, h, d, d)
+    assert resolved == "cudnn"
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "cudnn on packed T3HD views")
+    _assert_close_to_fa2(out_c, lse_c, out_fa2, lse_fa2, "cudnn on contiguous copies")

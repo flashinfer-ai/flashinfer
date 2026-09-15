@@ -1795,6 +1795,7 @@ def _blackwell_ragged_auto_upgrade(
     window_left: int,
     logits_soft_cap: float,
     has_multi_item_scoring: bool,
+    has_sinks: bool,
     cudnn_indptr_is_int32: bool,
     cutlass_work_items: int,
     cuda_graph_enabled: bool,
@@ -1808,8 +1809,9 @@ def _blackwell_ragged_auto_upgrade(
     wherever both candidates are eligible.
 
     Both candidates' run paths receive only ``causal`` and the scales, so any
-    request for RoPE, a custom mask, a sliding window, a logits soft cap or the
-    multi-item-scoring pointers disqualifies every upgrade: selecting one would
+    request for RoPE, a custom mask, a sliding window, a logits soft cap, the
+    multi-item-scoring pointers or attention sinks stashed on the wrapper
+    (vLLM's ``_sinks``) disqualifies every upgrade: selecting one would
     silently drop the feature.
 
     ``cudnn`` is chosen only when the installed cuDNN can consume the caller's
@@ -1832,12 +1834,17 @@ def _blackwell_ragged_auto_upgrade(
         or window_left >= 0
         or logits_soft_cap != 0.0
         or has_multi_item_scoring
+        or has_sinks
     ):
         return None
     for backend in _blackwell_ragged_auto_order(head_dim_qk, head_dim_vo):
         if backend == "cudnn":
             if (
                 is_sm100a_supported(device)
+                # fp16 / bf16 only: the cuDNN run branch below takes the caller's
+                # tensors as they are, and the wrapper's fp8 handling (scales,
+                # descale tensors) lives on the paths after it.
+                and q_data_type in (torch.float16, torch.bfloat16)
                 and _cudnn_supports_direct_seqlens(q_data_type)
                 and (head_dim_qk, head_dim_vo) in _CUDNN_RAGGED_AUTO_HEAD_DIMS
                 # cuDNN reads the indptrs as int32. plan() can re-dtype them
@@ -4558,15 +4565,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                             or token_pos_in_items_ptr is not None
                             or max_item_len_ptr is not None
                         ),
+                        has_sinks=getattr(self, "_sinks", None) is not None,
                         # Outside graph mode the cuDNN branch below converts a
                         # non-int32 indptr in place, so any dtype is fine; under
                         # capture it raises, and `auto` must route around that
                         # rather than pick a backend that cannot run.
                         cudnn_indptr_is_int32=(
                             not self.is_cuda_graph_enabled
-                            or (
-                                self._qo_indptr_buf.dtype == torch.int32
-                                and self._kv_indptr_buf.dtype == torch.int32
+                            or all(
+                                buf.dtype == torch.int32
+                                for buf in (
+                                    self._qo_indptr_buf,
+                                    self._kv_indptr_buf,
+                                    self._o_indptr_buf,
+                                    self._v_indptr_buf,
+                                )
                             )
                         ),
                         cutlass_work_items=_cutlass_plan_work_items(
@@ -4621,17 +4634,24 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._max_token_per_sequence = max_qo_len
             if self._max_sequence_kv is None:
                 self._max_sequence_kv = max_seq_in_batch
-            if (
-                self._qo_indptr_buf.dtype != torch.int32
-                or self._kv_indptr_buf.dtype != torch.int32
-            ):
+            indptr_bufs = (
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
+                self._o_indptr_buf,
+                self._v_indptr_buf,
+            )
+            if any(buf.dtype != torch.int32 for buf in indptr_bufs):
                 if self.is_cuda_graph_enabled:
                     raise ValueError(
-                        "the cudnn backend reads qo_indptr/kv_indptr as int32; "
-                        "pass int32 indptr buffers in CUDA-graph mode"
+                        "the cudnn backend reads qo_indptr/kv_indptr (and o_indptr/"
+                        "v_indptr) as int32; pass int32 indptr buffers in CUDA-graph mode"
                     )
+                # All four together: o/v default to aliases of q/kv taken above,
+                # so converting only q/kv would hand cuDNN mixed dtypes.
                 self._qo_indptr_buf = self._qo_indptr_buf.to(torch.int32)
                 self._kv_indptr_buf = self._kv_indptr_buf.to(torch.int32)
+                self._o_indptr_buf = self._o_indptr_buf.to(torch.int32)
+                self._v_indptr_buf = self._v_indptr_buf.to(torch.int32)
             self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
@@ -5081,6 +5101,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out
         elif self._backend == "cutlass":
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but the "
+                    "cutlass ragged prefill backend does not consume them; plan() "
+                    "again (auto routes past cutlass when sinks are set) or use fa2"
+                )
             out, lse = fmha_varlen(
                 q,
                 k,
@@ -5106,6 +5132,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._kv_layout != "NHD":
                 raise NotImplementedError(
                     "cuDNN ragged prefill backend requires kv_layout='NHD'"
+                )
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but the "
+                    "cuDNN ragged prefill backend does not consume them; plan() "
+                    "again (auto routes past cuDNN when sinks are set) or use fa2"
                 )
             # The caller's token-unit indptrs go straight to cuDNN (mask +
             # ragged offsets, scaled in-engine); no per-call conversion kernels.
