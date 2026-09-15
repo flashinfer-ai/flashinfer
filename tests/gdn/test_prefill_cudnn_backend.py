@@ -175,6 +175,10 @@ def test_cudnn_backend_matches_default(
     seq_lens, num_q_heads, num_k_heads, num_v_heads, use_initial_state, dtype
 ):
     """FlashInfer's own SM100 kernel as the oracle."""
+    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    if cuda_major < 13:
+        pytest.skip("Default Blackwell GDN prefill requires CUDA 13+")
+
     device = torch.device("cuda")
     inputs = _make_inputs(
         seq_lens,
