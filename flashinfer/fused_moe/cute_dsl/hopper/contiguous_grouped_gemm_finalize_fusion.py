@@ -51,7 +51,7 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
     """Persistent warp-specialized MoE GEMM2 with fused finalize.
 
     :param acc_dtype: Accumulator dtype (Float32 for bf16 inputs).
-    :param tile_shape_mn: CTA tile (M, N). M in {64, 128}; N % 8 == 0,
+    :param tile_shape_mn: CTA tile (M, N). M in {64, 128}; N % 32 == 0,
         N <= 256. tile M must equal ``moe_sort``'s ``tile_tokens_dim``.
     :param topk: MoE top-k.
     :param use_fused_finalize: True -> atomic scatter-reduce into the
@@ -60,21 +60,86 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
         host applies scales via ``moe_unpermute``).
     """
 
+    @staticmethod
+    def is_valid_tile_and_cluster_shape(
+        tile_shape_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
+    ) -> bool:
+        """Tile and cluster constraints of the kernel itself: M in {64, 128},
+        N a multiple of 32 up to 256, with N > 128 (two consumer warpgroups)
+        at M = 128 only, cluster (1, 1) or (1, 2)."""
+        tile_m, tile_n = tile_shape_mn
+        return (
+            tile_m in (64, 128)
+            and (tile_n <= 128 or tile_m == 128)
+            and tile_n % 32 == 0
+            and 32 <= tile_n <= 256
+            and cluster_shape_mn in ((1, 1), (1, 2))
+        )
+
+    @classmethod
+    def can_implement(
+        cls,
+        a_dtype: type[cutlass.Numeric],
+        b_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
+        tile_shape_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        l: int,  # noqa: E741
+    ) -> bool:
+        """Whether the kernel can run this problem with these options.
+
+        :param a_dtype: intermediate dtype, bf16 or fp16, equal to ``b_dtype``
+        :param b_dtype: weight dtype
+        :param c_dtype: output dtype, bf16, fp16 or fp32
+        :param tile_shape_mn: CTA tile (M, N); M is ``moe_sort``'s tile size
+        :param cluster_shape_mn: (1, 1) or (1, 2)
+        :param m: permuted rows, a multiple of the M tile (``moe_sort`` pads
+            every expert to whole tiles)
+        :param n: hidden size, a multiple of the N tile (the finalize scatter
+            copies full N-tile rows); (1, 2) also needs an even N-tile count
+            so that every CTA pair is complete
+        :param k: per-rank intermediate size; a partial last K tile is
+            zero-filled by TMA, so it only has to keep 16 B rows
+        :param l: local experts, at least 1
+        """
+        if (
+            a_dtype.width != 16
+            or a_dtype != b_dtype
+            or c_dtype not in (cutlass.BFloat16, cutlass.Float16, cutlass.Float32)
+        ):
+            return False
+        if not cls.is_valid_tile_and_cluster_shape(tile_shape_mn, cluster_shape_mn):
+            return False
+        tile_m, tile_n = tile_shape_mn
+        if (
+            m % tile_m != 0
+            or n % tile_n != 0
+            or (k * a_dtype.width) % 128 != 0
+            or l < 1
+        ):
+            return False
+        if cluster_shape_mn == (1, 2) and (n // tile_n) % 2 != 0:
+            return False
+        return True
+
     def __init__(
         self,
         acc_dtype: type[cutlass.Numeric],
         tile_shape_mn: tuple[int, int],
         topk: int,
         use_fused_finalize: bool = True,
-        tile_k: int = 64,
         cluster_shape_mn: tuple[int, int] = (1, 1),
         swizzle_size: int = 1,
         raster_along_m: bool = False,
         enable_pdl: bool = True,
     ):
-        """``tile_k``: CTA K-tile in elements — 64 (default) or 32. A 32-wide
-        tile supports reduction dimensions not divisible by 64 and halves the
-        SMEM atom to SW64, increasing the stage count allowed by capacity.
+        """The CTA K tile is four WGMMA K-steps (64 elements for 16-bit
+        inputs, one SW128 atom); a partial last K tile is zero-filled by TMA
+        on both operands.
 
         ``cluster_shape_mn``: (1, 1) or (1, 2). (1, 2) pairs two N-tile CTAs
         of the same M-tile and TMA-multicasts A between them — halves the
@@ -82,11 +147,11 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
         the ncu roofline showed both GEMMs L2/DRAM-bound). The two CTAs read
         different B N-slices, so B is never multicast; the meta warp runs in
         both CTAs on the same rows (duplicated but harmless)."""
-        if tile_k not in (32, 64):
-            raise ValueError("tile_k must be 32 or 64 for 16-bit inputs")
-        if cluster_shape_mn not in ((1, 1), (1, 2)):
-            raise ValueError("cluster_shape_mn must be (1, 1) or (1, 2)")
-        self.tile_k = tile_k
+        if not self.is_valid_tile_and_cluster_shape(tile_shape_mn, cluster_shape_mn):
+            raise ValueError(
+                f"unsupported tile_shape_mn={tile_shape_mn}, "
+                f"cluster_shape_mn={cluster_shape_mn}"
+            )
         self.acc_dtype = acc_dtype
         self.topk = topk
         self.use_fused_finalize = use_fused_finalize
@@ -135,11 +200,6 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
         self.c_row_pad = None  # set in _setup_attributes (dtype dependent)
 
     def _setup_attributes(self):
-        if self.tile_shape_mnk[0] not in [64, 128]:
-            raise ValueError("CTA tile shape M must be 64/128")
-        if self.tile_shape_mnk[1] % 8 != 0 or not 8 <= self.tile_shape_mnk[1] <= 256:
-            raise ValueError("CTA tile shape N must be a multiple of 8, <= 256")
-
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -150,15 +210,11 @@ class Sm90ContiguousGroupedGemmFinalizeFusionKernel:
             tiler_mn=(64, self.tile_shape_mnk[1]),
         )
         mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
-        if self.tile_k % mma_inst_shape_k != 0:
-            raise ValueError(
-                f"tile_k={self.tile_k} not a multiple of the MMA instruction "
-                f"K ({mma_inst_shape_k})"
-            )
+        mma_inst_tile_k = 4
         self.tile_shape_mnk = (
             self.tile_shape_mnk[0],
             self.tile_shape_mnk[1],
-            self.tile_k,
+            mma_inst_shape_k * mma_inst_tile_k,
         )
 
         self.cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
