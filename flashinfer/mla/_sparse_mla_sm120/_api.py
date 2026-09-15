@@ -67,6 +67,10 @@ from ._execution import (
     KV_SCALE_FORMATS as _KV_SCALE_FORMATS,  # noqa: F401
 )
 from ...api_logging import flashinfer_api
+from ...trace.templates.quantize import (
+    dsv41_fp4_quantize_append_sparse_mla_cache_trace,
+    dsv41_fp4_quantize_pack_sparse_mla_cache_trace,
+)
 from ...utils import (
     register_custom_op,
     register_fake_op,
@@ -1255,7 +1259,7 @@ def sparse_mla_sm120_decode_dsv4(
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api
+@flashinfer_api(trace=dsv41_fp4_quantize_pack_sparse_mla_cache_trace)
 def dsv41_fp4_quantize_pack_sparse_mla_cache(
     latent_kv: torch.Tensor,
     *,
@@ -1320,7 +1324,7 @@ def dsv41_fp4_quantize_pack_sparse_mla_cache(
 
 
 @supported_compute_capability([120, 121])
-@flashinfer_api
+@flashinfer_api(trace=dsv41_fp4_quantize_append_sparse_mla_cache_trace)
 def dsv41_fp4_quantize_append_sparse_mla_cache(
     latent_kv: torch.Tensor,
     slot_mapping: torch.Tensor,
