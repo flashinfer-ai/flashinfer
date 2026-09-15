@@ -40,7 +40,9 @@ from .fmha_decode_constants import (
     FP32_BYTES,
     FP8_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP8_P_PACKED_REGS_PER_Q_REPEAT,
+    FP8_MMA_K_STEP,
     FP8_VALUES_PER_REG,
+    FP16_MMA_K_STEP,
     FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP16_P_PACKED_REGS_PER_Q_REPEAT,
     FP16_VALUES_PER_REG,
@@ -160,6 +162,20 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
 }
 
 _KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
+
+
+def _kv256_supports_dtypes(q_dtype: type, kv_dtype: type, out_dtype: type) -> bool:
+    """Whether the Q64/KV256 profile is qualified for one dtype combination.
+
+    16-bit profiles keep one dtype for Q, K/V and O. FP8 Q/K/V publishes
+    either FP8 or FP16 output, matching the FP8 D128 Keeps profiles.
+    """
+    if q_dtype != kv_dtype:
+        return False
+    if q_dtype in (Float16, BFloat16):
+        return out_dtype == q_dtype
+    return q_dtype == Float8E4M3FN and out_dtype in (Float8E4M3FN, Float16)
+
 
 # Public cost-model collection uses the FP8 proxy for every source dtype. The
 # fixed-Q1 path admits every head ratio covered by its Q64/Q128 tile, while the
@@ -1192,6 +1208,26 @@ class FmhaDecodeConfig:
         return self.num_s_regs_per_thread // self.softmax_score_fragment_regs
 
     @property
+    def p_values_per_reg(self) -> int:
+        """Return the probabilities packed into one 32-bit P register."""
+        return FP8_VALUES_PER_REG if self.use_fp8_qkv else FP16_VALUES_PER_REG
+
+    @property
+    def fragment_p_packed_cols(self) -> int:
+        """Return the packed TMEM P columns published by one score fragment.
+
+        A 32-bit TMEM column holds two 16-bit or four FP8 probabilities, so a
+        K32 fragment occupies 16 or 8 columns.
+        """
+        return self.softmax_score_fragment_regs // self.p_values_per_reg
+
+    @property
+    def pv_mma_steps_per_fragment(self) -> int:
+        """Return the PV MMA instructions consumed by one score fragment."""
+        mma_k_step = FP8_MMA_K_STEP if self.use_fp8_qkv else FP16_MMA_K_STEP
+        return self.softmax_score_fragment_regs // mma_k_step
+
+    @property
     def block_sparse_kv_atom_size(self) -> int:
         """Return the K token span of one block-sparse route origin."""
         assert self.use_block_sparse
@@ -1219,10 +1255,7 @@ class FmhaDecodeConfig:
     def num_packed_p_regs(self) -> int:
         """Return packed P registers stored by each softmax producer lane."""
         if self.use_keeps_mma_ab:
-            values_per_reg = (
-                FP8_VALUES_PER_REG if self.use_fp8_qkv else FP16_VALUES_PER_REG
-            )
-            return max(self.num_s_regs_per_thread // values_per_reg, 1)
+            return max(self.num_s_regs_per_thread // self.p_values_per_reg, 1)
         q_repeats = max(self.tile_size_q // Q_REPETITION_GROUP_HEADS, 1)
         regs_per_repeat = (
             FP8_P_PACKED_REGS_PER_Q_REPEAT
@@ -1779,18 +1812,23 @@ class FmhaDecodeConfig:
         the MMA warp start its PV k-slice before the row is complete, at the
         cost of one barrier round per fragment.
 
-        Streaming is limited to the 16-bit two-instance profiles whose route
-        loop waits on the K/V loads, where the earlier PV start hides load
-        latency: Q64/KV256 and block-sparse Q128/KV128. Dense Q128/KV128
-        keeps the complete row because its route loop is not load-bound, so
-        the per-fragment barriers are not compensated. FP8 Q128 keeps the
-        complete row because its P publication packs four values per column
-        into one store.
+        Streaming is limited to the two-instance profiles whose route loop
+        waits on the K/V loads, where the earlier PV start hides load
+        latency: Q64/KV256 and block-sparse Q128/KV128, in 16-bit and FP8.
+        Dense 16-bit Q128/KV128 keeps the complete row because its route loop
+        is not load-bound, so the per-fragment barriers are not compensated.
+        Every two-instance FP8 profile whose softmax stats already travel
+        through SMEM streams, dense Q128/KV128 included, so the FP8 P pipeline
+        has one form; the streamed layout overlays P on S from its first
+        column, which a profile with standalone TMEM stats (D64) cannot do,
+        so that profile keeps the complete-row P.
         """
+        if not self.uses_two_inst_tmem_p:
+            return False
         return (
-            self.uses_two_inst_tmem_p
-            and not self.use_fp8_qkv
-            and (self.tile_size_kv == 256 or self.use_block_sparse)
+            self.tile_size_kv == 256
+            or self.use_block_sparse
+            or (self.use_fp8_qkv and self.keeps_stats_via_smem)
         )
 
     @property
@@ -1802,10 +1840,14 @@ class FmhaDecodeConfig:
         ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
         (2**8) for fewer TMEM rescales. The profiles listed here are the ones
         where that trade was measured to pay: KV256 tiles and block-sparse
-        routes, whose row maximum moves often but rarely by much.
+        routes, whose row maximum moves often but rarely by much. FP8 P is
+        quantized with the static 448 scale, which requires every probability
+        to stay at most one, so FP8 always anchors on the exact row maximum.
         """
-        return self.use_keeps_mma_ab and (
-            self.tile_size_kv == 256 or self.use_block_sparse
+        return (
+            self.use_keeps_mma_ab
+            and not self.use_fp8_qkv
+            and (self.tile_size_kv == 256 or self.use_block_sparse)
         )
 
     @property
@@ -2038,8 +2080,12 @@ class FmhaDecodeConfig:
                 or not self.groups_tokens_heads_q
                 or self.tile_size_q != 64
                 or self.headdim != 128
-                or self.q_dtype not in (Float16, BFloat16)
-                or not (self.q_dtype == self.kv_dtype == self.out_dtype)
+                or not _kv256_supports_dtypes(
+                    self.q_dtype, self.kv_dtype, self.out_dtype
+                )
+                # FP8 Keeps recipes exclude attention sinks, as the paged FP8
+                # Q64/Q128 profiles do.
+                or (self.use_fp8_qkv and self.use_attention_sinks)
                 or self.use_cluster_smem_reduction
                 or not self.matches_kv256_task_topology
             ):
@@ -2442,8 +2488,8 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
         )
     if not cfg.supports_grouped_keeps:
         raise ValueError(
-            "KV256 currently supports only the qualified Q64 FP16/BF16/D128 "
-            "grouped Keeps profile"
+            "KV256 currently supports only the qualified Q64 FP16/BF16/E4M3 "
+            "D128 grouped Keeps profile"
         )
 
 
@@ -3868,8 +3914,8 @@ def _validate_profile_support(
         cfg.tile_size_kv == 256 and supports_grouped_keeps
     ):
         raise ValueError(
-            "wide KeepsMmaAb is enabled only for the qualified FP16/BF16/D128 "
-            "KV256 native warp-specialized profile"
+            "wide KeepsMmaAb is enabled only for the qualified FP16/BF16/E4M3 "
+            "D128 KV256 native warp-specialized profile"
         )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
         if not (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps):
