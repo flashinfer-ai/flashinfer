@@ -71,7 +71,6 @@ from .helpers_common import (
     _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
     _logical_q_group_idx,
-    _mma_k_step,
     _mma_kind_for_qkv,
     _neg_max_f32,
     _softmax_scale_pair_width,
@@ -645,7 +644,7 @@ class TmemSResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.head_dim_per_stage_kv == 0):
             if prims.elect_sync():
                 scale_d = False
-                for ki in cutlass.range_constexpr(cfg.headdim // _mma_k_step(cfg)):
+                for ki in cutlass.range_constexpr(cfg.headdim // cfg.mma_k_step):
                     # Keeps computes Q x K^T (A=Q, B=K); Swaps computes the
                     # transposed K x Q^T tile (A=K, B=Q). The first
                     # instruction overwrites S and later slices accumulate.
@@ -673,14 +672,14 @@ class TmemSResource(DecodeGenResourceBase):
                             scale_d,
                         )
                     scale_d = True
-                    if cutlass.const_expr(ki + 1 < cfg.headdim // _mma_k_step(cfg)):
+                    if cutlass.const_expr(ki + 1 < cfg.headdim // cfg.mma_k_step):
                         k_desc, q_desc = self._advance_qk_descs_after_mma_k(
                             k_desc,
                             q_desc,
                             crosses_64b_chunk=cfg.headdim == 128 and ki == 3,
                         )
         else:
-            mma_k_steps = cfg.head_dim_kv_stage // _mma_k_step(cfg)
+            mma_k_steps = cfg.head_dim_kv_stage // cfg.mma_k_step
             if prims.elect_sync():
                 # Peel the first MMA so overwrite-vs-accumulate remains a
                 # compile-time value rather than loop-carried state.
@@ -708,7 +707,7 @@ class TmemSResource(DecodeGenResourceBase):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
                 else:
-                    chunk_idx = (ki * Int32(_mma_k_step(cfg))) // Int32(64)
+                    chunk_idx = (ki * Int32(cfg.mma_k_step)) // Int32(64)
                     k_desc_offset = ki * Int32(2) + chunk_idx * Int32(1016)
                     q_chunk_extra = (
                         8 * cfg.tile_size_q - 8
@@ -1253,13 +1252,6 @@ class TmemSResource(DecodeGenResourceBase):
                 new_max_arr=new_max_arr,
                 s_arr=s_arr,
                 use_sparse=False,
-                sparse_origin0=Int32(0),
-                sparse_origin1=Int32(0),
-                sparse_route_flags=Int32(0),
-                sparse_token_word0=Uint32(0xFFFFFFFF),
-                sparse_token_word1=Uint32(0xFFFFFFFF),
-                sparse_token_word2=Uint32(0xFFFFFFFF),
-                sparse_token_word3=Uint32(0xFFFFFFFF),
             )
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
@@ -2178,13 +2170,13 @@ class TmemSResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
         use_sparse: Constexpr[bool],
-        sparse_origin0: Int32,
-        sparse_origin1: Int32,
-        sparse_route_flags: Int32,
-        sparse_token_word0: Uint32,
-        sparse_token_word1: Uint32,
-        sparse_token_word2: Uint32,
-        sparse_token_word3: Uint32,
+        sparse_origin0: Int32 | None = None,
+        sparse_origin1: Int32 | None = None,
+        sparse_route_flags: Int32 | None = None,
+        sparse_token_word0: Uint32 | None = None,
+        sparse_token_word1: Uint32 | None = None,
+        sparse_token_word2: Uint32 | None = None,
+        sparse_token_word3: Uint32 | None = None,
     ) -> tuple[object, object, object, object]:
         """Mask streamed K32 score fragments in place and reduce their max.
 
@@ -2201,6 +2193,16 @@ class TmemSResource(DecodeGenResourceBase):
         fragment_regs = cfg.softmax_score_fragment_regs
         # The seven-slot softmax metadata ABI carries exactly four token words.
         assert num_fragments == 4 and fragment_regs == 32
+        if cutlass.const_expr(not use_sparse):
+            # A dense tile has no route: no atoms, no validity flags, and
+            # all-ones token words.
+            sparse_origin0 = Int32(0)
+            sparse_origin1 = Int32(0)
+            sparse_route_flags = Int32(0)
+            sparse_token_word0 = Uint32(0xFFFFFFFF)
+            sparse_token_word1 = Uint32(0xFFFFFFFF)
+            sparse_token_word2 = Uint32(0xFFFFFFFF)
+            sparse_token_word3 = Uint32(0xFFFFFFFF)
         task_cache = _decode_gen_task_cache(stage_info)
         keep_words = cutlass.Array(
             Uint32, num_fragments, space=cutlass.AddressSpace.rmem

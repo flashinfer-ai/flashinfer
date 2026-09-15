@@ -39,6 +39,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import FP8_P_QUANT_SCALE
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
     Constexpr,
@@ -572,6 +573,24 @@ class TmemCorrResource(DecodeGenResourceBase):
         return self.output_scale * self._safe_norm_rcp(sum_val)
 
     @cute.jit
+    def _split_partial_scale(self, denominator: Float32) -> Float32:
+        """Return the scale applied to a split-KV partial O before it is stored.
+
+        The separate reduction kernel receives normalized partials, so the
+        scale is the row's public output-domain normalization. Fused GMEM and
+        cluster reductions receive unnormalized partials: 16-bit ones as they
+        are, byte-wide ones with the 448 P scale removed before they are
+        narrowed to 16 bits (the reducer restores it).
+        """
+        cfg = self.cfg
+        partial_scale = Float32(1.0)
+        if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+            partial_scale = self._separate_partial_norm_scale(denominator)
+        elif cutlass.const_expr(cfg.use_fp8_qkv):
+            partial_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
+        return partial_scale
+
+    @cute.jit
     def _separate_partial_lse(self, max_val: Float32, sum_val: Float32) -> Float32:
         """Convert one local max/sum pair to the shared log2-LSE contract."""
 
@@ -1049,7 +1068,14 @@ class TmemCorrResource(DecodeGenResourceBase):
         sum_val: Float32,
         max_val: Float32,
     ) -> tuple[Int64, Float32]:
-        """Resolve one logical row's output address and normalization once."""
+        """Resolve one logical row's output address and normalization once.
+
+        FP8 O accumulators and row sums both carry the 448 P scale. Direct
+        tails normalize the FP32 accumulator, so the two cancel. Split-KV
+        kernels divide their partials by 448 before narrowing them to 16 bits
+        and reach this helper only from the fused reducers, which restore the
+        scale after the FP32 reduction.
+        """
         cfg = self.cfg
         attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
         attention_sink_head_idx = _local_head_from_q_output_row(
@@ -1069,11 +1095,10 @@ class TmemCorrResource(DecodeGenResourceBase):
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
         norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
-        if cutlass.const_expr(cfg.use_fp8_qkv):
-            # Since P is scaled to [0, 448] for Fused GMEM/cluster FP8-Q,
-            # divide the partial O by 448 before narrowing it to 16 bits,
-            # and restore after the partials have been reduced in FP32.
-            norm_scale *= Float32(448.0)
+        if cutlass.const_expr(cfg.use_fp8_qkv and cfg.use_split_kv):
+            # Fused GMEM/cluster partials were divided by 448 before they were
+            # narrowed to 16 bits; restore the P scale after the FP32 reduction.
+            norm_scale *= Float32(FP8_P_QUANT_SCALE)
         physical_dst_row_idx = _q_physical_output_row_from_logical(
             cfg,
             self.h_r,
@@ -2539,8 +2564,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     exchange_row_idx,
                     self.seq_len_q,
                 )
-                if cutlass.const_expr(cfg.use_separate_reduction_kernel):
-                    partial_scale = self._separate_partial_norm_scale(denominator)
+                partial_scale = self._split_partial_scale(denominator)
                 partial_row_base = self._gmem_partial_row_offset(
                     logical_kv_idx,
                     cta_idx_kv,
@@ -2560,6 +2584,8 @@ class TmemCorrResource(DecodeGenResourceBase):
                     exchange_row_idx,
                     self.seq_len_q,
                 )
+                # The direct tail normalizes the FP32 accumulators, so the
+                # FP8 P scale in O and in the denominator cancel.
                 dst_row_base, norm_scale = self._softmax_output_row_state(
                     logical_h_k_idx,
                     logical_b_idx,
@@ -2938,7 +2964,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                 partial_norm_scale = self._separate_partial_norm_scale(reduced_sum_0)
             elif cutlass.const_expr(cfg.use_fp8_qkv):
-                partial_norm_scale = Float32(1.0 / 448.0)
+                partial_norm_scale = Float32(1.0 / FP8_P_QUANT_SCALE)
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             partial_o_row_base = self._gmem_partial_row_offset(
                 logical_kv_idx,
@@ -3536,11 +3562,7 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    norm_scale = Float32(1.0 / 448.0)
-                    if cutlass.const_expr(cfg.use_separate_reduction_kernel):
-                        norm_scale = self._separate_partial_norm_scale(
-                            reduced_sum[scale_idx]
-                        )
+                    norm_scale = self._split_partial_scale(reduced_sum[scale_idx])
                     final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
                     final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
@@ -4012,11 +4034,7 @@ class TmemCorrResource(DecodeGenResourceBase):
 
             if cutlass.const_expr(cfg.use_separate_reduction_kernel or cfg.use_fp8_qkv):
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                    norm_scale = Float32(1.0 / 448.0)
-                    if cutlass.const_expr(cfg.use_separate_reduction_kernel):
-                        norm_scale = self._separate_partial_norm_scale(
-                            reduced_sum[scale_idx]
-                        )
+                    norm_scale = self._split_partial_scale(reduced_sum[scale_idx])
                     final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
                     final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
