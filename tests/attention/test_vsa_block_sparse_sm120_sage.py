@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import math
+from unittest import mock
 
 import pytest
 import torch
@@ -745,4 +746,233 @@ def test_unsupported_backend():
             index,
             block_sparse_num=num_blocks,
             backend="unknown",
+        )
+
+
+def test_vsa_sm120_sage_default_backend_is_cake():
+    """The default `backend` must remain "cake": omitting it (and the
+    cake-required `out`/`tma_descriptor_workspace` kwargs) must raise the
+    cake-specific error, not silently succeed via cute_dsl (which allocates
+    `out` internally and does not require `tma_descriptor_workspace`)."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+    with pytest.raises(ValueError, match="requires a caller-owned out tensor"):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Additional validation coverage: block_sparse_num=0 without q2k_block_nums,
+# and the guards added in the "SM120 Sage" review round (softmax_scale
+# finiteness/positivity, out device/contiguity, inputs on the current CUDA
+# device).
+# ---------------------------------------------------------------------------
+
+
+def test_vsa_sm120_sage_block_sparse_num_zero_scalar():
+    """block_sparse_num=0 with no q2k_block_nums (the has_block_nums=False
+    branch, unlike test_vsa_sm120_sage_empty_row which goes through
+    q2k_block_nums) must select zero KV blocks for every Q row and produce
+    an exactly zero output."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+
+    index = torch.zeros(
+        batch, num_heads, num_blocks, num_blocks, dtype=torch.int32, device=device
+    )
+
+    o = bsa_attn_sm120_blk64_sage_fwd(
+        q8,
+        k8,
+        v8,
+        qs,
+        ks,
+        vs,
+        index,
+        block_sparse_num=0,
+        backend="cute_dsl",
+    )
+
+    assert torch.all(o == 0), "block_sparse_num=0 must produce an all-zero output"
+
+
+@pytest.mark.parametrize("bad_scale", [-1.0, 0.0, float("nan"), float("inf")])
+def test_vsa_sm120_sage_softmax_scale_guard(bad_scale):
+    """softmax_scale must be finite and strictly positive; negative, zero,
+    and NaN/inf must all raise ValueError rather than run the kernel.
+    ``-inf`` is not parametrized separately: it hits the same
+    ``math.isfinite()`` branch as ``inf`` and adds no new coverage."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+
+    with pytest.raises(ValueError):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            softmax_scale=bad_scale,
+            backend="cute_dsl",
+        )
+
+
+def test_vsa_sm120_sage_out_wrong_device_guard():
+    """A pre-allocated `out` on a different device than the inputs must
+    raise ValueError instead of silently computing a cross-device result.
+    Uses a CPU `out` rather than a second CUDA device: the check being
+    tested is a plain ``out.device != q_int8.device`` comparison, so a CPU
+    tensor exercises it identically without requiring >=2 GPUs."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+    out = torch.empty(
+        batch, num_heads, seqlen, HEAD_DIM, dtype=torch.bfloat16, device="cpu"
+    )
+
+    with pytest.raises(ValueError, match="out must be on"):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            out=out,
+            backend="cute_dsl",
+        )
+
+
+def test_vsa_sm120_sage_out_non_contiguous_guard():
+    """A non-contiguous `out` must raise ValueError instead of writing
+    through a mismatched stride."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+    # Same logical shape/dtype as a valid `out`, but transposed to a
+    # non-contiguous view.
+    out = torch.empty(
+        batch, num_heads, HEAD_DIM, seqlen, dtype=torch.bfloat16, device=device
+    ).transpose(2, 3)
+    assert out.shape == (batch, num_heads, seqlen, HEAD_DIM)
+    assert not out.is_contiguous()
+
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            out=out,
+            backend="cute_dsl",
+        )
+
+
+def test_vsa_sm120_sage_inputs_not_on_current_device_guard():
+    """Inputs living on a CUDA device other than `torch.cuda.current_device()`
+    must raise ValueError instead of launching against the wrong context.
+    The check being tested is a plain
+    ``q_int8.device.index != torch.cuda.current_device()`` comparison, so
+    this mocks ``torch.cuda.current_device()`` to report a device index
+    that differs from where the (real, single-GPU) inputs live, rather
+    than requiring >=2 physical GPUs."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    batch, num_heads, num_blocks = 1, 2, 2
+    seqlen = num_blocks * BLOCK
+
+    q = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    k = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    v = _random_bf16_bhsd(batch, num_heads, seqlen, device)
+    q8, k8, v8, qs, ks, vs = quantize_sage_qkv_sm120(q, k, v)
+    index = (
+        torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+        .expand(batch, num_heads, num_blocks, num_blocks)
+        .contiguous()
+    )
+
+    fake_current_device = q8.device.index + 1
+    with (
+        mock.patch("torch.cuda.current_device", return_value=fake_current_device),
+        pytest.raises(ValueError, match="current CUDA device"),
+    ):
+        bsa_attn_sm120_blk64_sage_fwd(
+            q8,
+            k8,
+            v8,
+            qs,
+            ks,
+            vs,
+            index,
+            block_sparse_num=num_blocks,
+            backend="cute_dsl",
         )
