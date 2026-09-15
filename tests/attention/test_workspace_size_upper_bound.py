@@ -216,8 +216,22 @@ def test_decode_tensor_core_bound_refuses_fa3_without_an_entry_point(monkeypatch
         )
 
 
-def test_decode_bound_forwards_the_split_settings(monkeypatch):
-    """A fixed split bypasses the scheduler ceiling, so the bound must see it."""
+@pytest.mark.parametrize(
+    ("fixed_split_size", "disable_split_kv", "expected_fixed"),
+    [
+        pytest.param(8, False, 8, id="fixed-split"),
+        pytest.param(None, True, -1, id="split-disabled"),
+    ],
+)
+def test_decode_bound_forwards_the_split_settings(
+    monkeypatch, fixed_split_size, disable_split_kv, expected_fixed
+):
+    """A fixed split bypasses the scheduler ceiling, so the bound must see it.
+
+    The two settings are exercised apart: disabling the split makes a fixed
+    split size moot, so passing both would not prove the fixed-split branch
+    reaches the module.
+    """
     monkeypatch.setattr(
         decode_module, "determine_attention_backend", lambda *a, **k: "fa2"
     )
@@ -234,14 +248,14 @@ def test_decode_bound_forwards_the_split_settings(monkeypatch):
         num_kv_heads=2,
         head_dim=128,
         page_size=16,
-        fixed_split_size=8,
-        disable_split_kv=True,
+        fixed_split_size=fixed_split_size,
+        disable_split_kv=disable_split_kv,
     )
 
     # (buffer, batch, rows, pages, qo, kv, page_size, graph, qk, vo,
     #  fixed_split_size, disable_split_kv, colocated)
-    assert bound_module.args[10] == 8
-    assert bound_module.args[11] is True
+    assert bound_module.args[10] == expected_fixed
+    assert bound_module.args[11] is disable_split_kv
 
 
 def test_decode_bound_rejects_a_zero_q_len_per_req():
@@ -287,3 +301,23 @@ def test_cta_tile_q_candidates_have_a_single_source():
     assert "kFA2CtaTileQCandidates" in scheduler
     # The selector's result is checked against the list rather than assumed.
     assert "FA2CtaTileQIsCandidate(cta_tile_q)" in utils
+
+
+def test_plan_and_sizing_share_the_backend_resolvers():
+    """Only the shared helpers decide `auto` on the wrapper paths.
+
+    Sizing that resolved `auto` separately from the plan it sizes for is the
+    defect these helpers exist to prevent, so no wrapper path may keep its own
+    copy of the selection.
+    """
+    prefill_source = pathlib.Path(prefill_module.__file__).read_text()
+    decode_source = pathlib.Path(decode_module.__file__).read_text()
+
+    # The only direct calls left are inside the helpers and the module-level
+    # functional entry points, which take no wrapper state.
+    assert prefill_source.count("self._backend = determine_attention_backend(") == 0
+    assert decode_source.count("self._backend = determine_attention_backend(") == 0
+    # plan(), workspace_size() and workspace_size_upper_bound() all go through
+    # the helper, whose definition is the third occurrence in each file.
+    assert prefill_source.count("_resolve_prefill_backend(") >= 4
+    assert decode_source.count("_resolve_decode_tensor_core_backend(") >= 4

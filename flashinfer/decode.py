@@ -2048,28 +2048,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
-                if self._backend == "auto":
-                    if {
-                        torch.float8_e4m3fn,
-                        torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
-                        self._backend = determine_attention_backend(
-                            self.device,
-                            PosEncodingMode[pos_encoding_mode].value,
-                            False,  # use_fp16_qk_reductions
-                            False,  # use_custom_mask
-                            q_data_type,
-                            kv_data_type,
-                            head_dim_qk=head_dim,
-                            head_dim_vo=head_dim,
-                        )
-                    else:
-                        self._backend = "fa2"
-                if q_len_per_req > 1 and self._backend == "fa3":
-                    raise NotImplementedError(
-                        "q_len_per_req > 1 is currently only supported on the "
-                        "fa2 tensor-core backend."
-                    )
+                self._backend = _resolve_decode_tensor_core_backend(
+                    self._backend,
+                    self.device,
+                    pos_encoding_mode,
+                    q_data_type,
+                    kv_data_type,
+                    head_dim,
+                    q_len_per_req,
+                )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,

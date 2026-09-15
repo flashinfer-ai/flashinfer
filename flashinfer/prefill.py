@@ -2967,17 +2967,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
-                )
+            self._backend = _resolve_prefill_backend(
+                self._backend,
+                self.device,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                self._custom_mask_buf is not None,  # use_custom_mask
+                q_data_type,
+                kv_data_type,
+                head_dim_qk,
+                head_dim_vo,
+            )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -4494,15 +4494,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
-                self._backend = determine_attention_backend(
+                self._backend = _resolve_prefill_backend(
+                    self._backend,
                     self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
+                    pos_encoding_mode,
                     use_fp16_qk_reduction,
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
+                    head_dim_qk,
+                    head_dim_vo,
                 )
                 # SM12x: use fmha_v2 HMMA kernels for large-sequence MHA.
                 # fmha_v2 outperforms FA2 at longer sequences (S>=256) on SM120
