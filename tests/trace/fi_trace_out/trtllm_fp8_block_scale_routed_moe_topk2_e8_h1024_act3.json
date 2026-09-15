@@ -1,5 +1,5 @@
 {
-  "name": "trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024",
+  "name": "trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024_act3",
   "description": "TRT-LLM FP8 block-scale MoE with precomputed topk_ids.",
   "op_type": "moe",
   "tags": [
@@ -50,6 +50,11 @@
     "num_gemm1_out_blocks": {
       "type": "const",
       "value": 8
+    },
+    "activation_type": {
+      "type": "const",
+      "value": 3,
+      "description": "Fused activation type; 10 selects SiTU."
     }
   },
   "inputs": {
@@ -109,7 +114,7 @@
       ],
       "dtype": "float32",
       "optional": true,
-      "description": "Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA alpha."
+      "description": "Per-expert SwiGLU alpha or SiTU gate tanh scale."
     },
     "gemm1_beta": {
       "shape": [
@@ -117,7 +122,7 @@
       ],
       "dtype": "float32",
       "optional": true,
-      "description": "Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA beta."
+      "description": "Per-expert SwiGLU beta or SiTU linear tanh scale."
     },
     "gemm1_clamp_limit": {
       "shape": [
@@ -125,7 +130,7 @@
       ],
       "dtype": "float32",
       "optional": true,
-      "description": "Optional MxFp8/DeepSeekFp8-only per-expert SwiGLU OA clamp limit."
+      "description": "Optional per-expert gated-activation clamp limit."
     },
     "gemm2_weights": {
       "shape": [
@@ -162,6 +167,11 @@
       "shape": null,
       "dtype": "float32",
       "optional": true
+    },
+    "activation_type": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Fused activation type; 10 selects SiTU."
     }
   },
   "outputs": {
@@ -174,6 +184,6 @@
       "description": "MoE output."
     }
   },
-  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _trtllm_fp8_block_scale_routed_moe_reference(\n    topk_ids,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    num_experts,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor=None,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    **_unused,\n):\n    \"\"\"Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).\n\n    Reuses ``_fp8_moe_run_experts`` for the dequant + SwiGLU path, and builds\n    a uniform per-token weight tensor (real routing scales are not available\n    from topk_ids alone).\n    \"\"\"\n    T = topk_ids.shape[0]\n    TOP_K = int(top_k)\n    scale = float(routed_scaling_factor or 1.0)\n    w_topk = torch.full(\n        (T, TOP_K),\n        scale / TOP_K,\n        dtype=torch.float32,\n        device=hidden_states.device,\n    )\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        w_topk,\n        topk_ids.to(torch.int64),\n        local_expert_offset,\n        int(num_experts),\n        gemm1_alpha=gemm1_alpha,\n        gemm1_beta=gemm1_beta,\n        gemm1_clamp_limit=gemm1_clamp_limit,\n    )\n",
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _trtllm_fp8_block_scale_routed_moe_reference(\n    topk_ids,\n    hidden_states,\n    hidden_states_scale,\n    gemm1_weights,\n    gemm1_weights_scale,\n    gemm2_weights,\n    gemm2_weights_scale,\n    num_experts,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor=None,\n    activation_type=3,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    **_unused,\n):\n    \"\"\"Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).\n\n    Reuses ``_fp8_moe_run_experts`` for the dequant + SwiGLU path, and builds\n    a uniform per-token weight tensor (real routing scales are not available\n    from topk_ids alone).\n    \"\"\"\n    T = topk_ids.shape[0]\n    TOP_K = int(top_k)\n    scale = float(routed_scaling_factor or 1.0)\n    w_topk = torch.full(\n        (T, TOP_K),\n        scale / TOP_K,\n        dtype=torch.float32,\n        device=hidden_states.device,\n    )\n    return _fp8_moe_run_experts(\n        hidden_states,\n        hidden_states_scale,\n        gemm1_weights,\n        gemm1_weights_scale,\n        gemm2_weights,\n        gemm2_weights_scale,\n        w_topk,\n        topk_ids.to(torch.int64),\n        local_expert_offset,\n        int(num_experts),\n        activation_type=activation_type,\n        gemm1_alpha=gemm1_alpha,\n        gemm1_beta=gemm1_beta,\n        gemm1_clamp_limit=gemm1_clamp_limit,\n    )\n",
   "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
 }
