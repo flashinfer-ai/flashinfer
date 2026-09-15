@@ -2419,7 +2419,7 @@ def create_mma_task_one_inst_qkv(
     work_queue: WorkQueue | None,
     cfg: FmhaDecodeConfig,
     *,
-    tmem_stats_done: MemoryResource | None,
+    tmem_stats_done: MemoryResource,
     domain: int | cutlass.Int32,
     warp_idx: int | None = None,
     num_warps: int | None = None,
@@ -2656,8 +2656,11 @@ def create_transform_kv_task(
         work_queue: WorkQueue | None = None,
     ) -> None:
         smem_kv.init_descriptor_state()
-        transform_kv_schedule_body(smem_transformed_kv, lambda _: smem_kv)
-        _work_queue_tail(work_queue)
+        _decode_work_tile_schedule(
+            cfg,
+            work_queue,
+            lambda: transform_kv_schedule_body(smem_transformed_kv, lambda _: smem_kv),
+        )
 
     @schedule
     def transform_split_kv_schedule(
@@ -2682,8 +2685,11 @@ def create_transform_kv_task(
                 return smem_v0
             return smem_v1
 
-        transform_kv_schedule_body(smem_transformed_kv, source_for_label)
-        _work_queue_tail(work_queue)
+        _decode_work_tile_schedule(
+            cfg,
+            work_queue,
+            lambda: transform_kv_schedule_body(smem_transformed_kv, source_for_label),
+        )
 
     if use_split_sources:
         split_schedule_args = [*split_sources, smem_transformed_kv]
