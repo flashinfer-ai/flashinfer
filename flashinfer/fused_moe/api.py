@@ -529,6 +529,9 @@ class TrtllmFp4Config:
         activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build a ``trtllm_fp4_routed`` weight view from canonical BF16 weights.
 
@@ -554,6 +557,9 @@ class TrtllmFp4Config:
             activation=activation,
             device=device,
             permute_cache=permute_cache,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     @staticmethod
@@ -561,6 +567,7 @@ class TrtllmFp4Config:
         hidden_states_bf16,
         *,
         quant: QuantConfig = _NVFP4_NVFP4,
+        hidden_states_scale_global=None,
     ):
         """Prepare activations for NVFP4×NVFP4, MXFP4×MXFP8, or MXFP4×BF16.
 
@@ -572,6 +579,7 @@ class TrtllmFp4Config:
         return prepare_trtllm_fp4_activations(
             hidden_states_bf16,
             quant=quant,
+            hidden_states_scale_global=hidden_states_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -617,6 +625,9 @@ class CakeWarpDecodeConfig:
         activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build the shared TRTLLM NVFP4 physical weight view.
 
@@ -657,6 +668,9 @@ class CakeWarpDecodeConfig:
             activation=activation,
             device=device,
             permute_cache=permute_cache,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     @staticmethod
@@ -664,6 +678,7 @@ class CakeWarpDecodeConfig:
         hidden_states_bf16,
         *,
         quant: QuantConfig = _NVFP4_NVFP4,
+        hidden_states_scale_global=None,
     ):
         """Build the shared TRTLLM NVFP4 packed activation view."""
         if quant.pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
@@ -674,6 +689,7 @@ class CakeWarpDecodeConfig:
         return TrtllmFp4Config.prepare_activations(
             hidden_states_bf16,
             quant=quant,
+            hidden_states_scale_global=hidden_states_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -1400,6 +1416,9 @@ class CuteDslConfig:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
+        gemm1_scales_global=None,
+        gemm2_scales_global=None,
+        intermediate_scale_global=None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
@@ -1418,6 +1437,9 @@ class CuteDslConfig:
             intermediate_size=intermediate_size,
             activation=activation,
             device=device,
+            gemm1_scales_global=gemm1_scales_global,
+            gemm2_scales_global=gemm2_scales_global,
+            intermediate_scale_global=intermediate_scale_global,
         )
 
     def __repr__(self) -> str:
@@ -1822,6 +1844,9 @@ class MoEActivationPack:
     topk_weights: Optional[Tensor] = None
     # Per-token NVFP4 row scale, shape [M].
     per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)
+    # Scalar used to globally scale NVFP4 activations before block quantization.
+    # Runners fold its reciprocal into GEMM1 dequantization (gh #3548).
+    hidden_states_scale_global: Optional[Tensor] = field(default=None, kw_only=True)
     # In-kernel routing inputs (FromLogits) — keyword-only so a stale positional
     # call site fails loudly instead of silently binding a tensor to the mode.
     routing_input_mode: RoutingInputMode = field(
@@ -1925,6 +1950,7 @@ class MoEActivationPack:
             "topk_ids",
             "topk_weights",
             "per_token_scale",
+            "hidden_states_scale_global",
             "routing_logits",
             "routing_bias",
         ):
@@ -1933,6 +1959,18 @@ class MoEActivationPack:
                 raise ValueError(
                     f"{name} is on {t.device} but hidden_states_q is on {dev}; "
                     "all pack tensors must be on the same device."
+                )
+        if self.hidden_states_scale_global is not None:
+            scale = self.hidden_states_scale_global
+            if scale.dtype != torch.float32 or scale.numel() != 1:
+                raise ValueError(
+                    "hidden_states_scale_global must be a scalar float32 tensor."
+                )
+            if not bool(torch.isfinite(scale).all().item()) or not bool(
+                (scale > 0).all().item()
+            ):
+                raise ValueError(
+                    "hidden_states_scale_global must be finite and positive."
                 )
 
     @property
