@@ -58,6 +58,29 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
+def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=[
+            "-gencode=arch=compute_103a,code=sm_103a",
+            "-DNDEBUG",
+        ],
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        needs_device_linking=True,
+    )
+
+    assert "cuda_arch_flags = -gencode=arch=compute_103a,code=sm_103a" in ninja
+    assert "command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out" in ninja
+    assert "cuda_arch_flags = -DNDEBUG" not in ninja
+
+
 def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
