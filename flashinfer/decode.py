@@ -3697,7 +3697,8 @@ def trtllm_batch_decode_with_kv_cache(
         bindings. Its contents may change in place between
         CUDA Graph replays; a null pointer preserves the existing path.
         An explicit FP8-query plan additionally supports batches 64, 128, 160,
-        192, 224 and 256, six query tokens per request, 32 query heads and
+        192, 224 and 256, plus low-batch split plans for 8, 27 and 32,
+        six query tokens per request, 32 query heads and
         two KV heads, with BF16 output.
         That route requires KV lengths at least six, shared page tables, and
         HND K/V views with strides ``[32768, 256, 512, 1]``.

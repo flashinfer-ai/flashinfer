@@ -54,12 +54,13 @@ _FP8Q_CONTRACT: dict[str, Any] = {
 }
 
 
-def _fp8q_source_root() -> Path:
-    directory = "request_ordered_paged_decode_fp8q"
+def _fp8q_source_root(*, split: bool = False) -> Path:
+    directory = "request_ordered_paged_decode_fp8q" + ("_split" if split else "")
+    manifest_name = _FP8Q_SPLIT_MANIFEST_NAME if split else _FP8Q_MANIFEST_NAME
     installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
     checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory
     for candidate in (installed, checkout):
-        if (candidate / _FP8Q_MANIFEST_NAME).is_file():
+        if (candidate / manifest_name).is_file():
             return candidate
     raise FileNotFoundError("request-ordered FP8-Q sources were not found")
 
@@ -112,6 +113,104 @@ def get_cake_fmha_request_ordered_fp8q_manifest() -> dict[str, Any]:
     _require(
         {binding["module_name"] for binding in bindings} == names,
         "FP8-Q module coverage",
+    )
+    return manifest
+
+
+_FP8Q_SPLIT_MANIFEST_NAME = (
+    "cake_fmha_request_ordered_paged_decode_fp8q_split_manifest.json"
+)
+_FP8Q_SPLIT_CONTRACT = {
+    "query_dtype": "float8_e4m3fn",
+    "output_dtype": "bfloat16",
+    "kv_dtype": "float8_e4m3fn",
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 64,
+    "q_len": 6,
+    "batch_splits": [[8, 8], [27, 2], [32, 2]],
+    "minimum_kv_len": 6,
+    "write_lse": [False, True],
+    "lse_base": 2,
+    "partial_dtype": "float32",
+    "kv_strides": [32768, 256, 512, 1],
+    "shared_page_table": True,
+    "request_order": "device_int32_permutation",
+}
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_fp8q_split_manifest() -> dict[str, Any]:
+    """Authenticate compound FP8-query producer/reducer plans."""
+    root = _fp8q_source_root(split=True)
+    manifest = json.loads(
+        (root / _FP8Q_SPLIT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    _require(
+        manifest.get("schema") == "flashinfer.cake_fmha_request_ordered_fp8q_split.v1",
+        "FP8-Q split schema",
+    )
+    _require(manifest.get("target") == "sm_103a", "FP8-Q split target")
+    _require(manifest.get("contract") == _FP8Q_SPLIT_CONTRACT, "FP8-Q split contract")
+    modules, bindings = manifest.get("modules"), manifest.get("bindings")
+    _require(
+        isinstance(modules, list) and isinstance(bindings, list),
+        "FP8-Q split inventory",
+    )
+    _require(
+        len(modules) == manifest.get("module_count") == 7 and len(bindings) == 6,
+        "FP8-Q split inventory count",
+    )
+    producers = [m for m in modules if m.get("tma_workspace_bytes") == 384]
+    reducers = [m for m in modules if m.get("tma_workspace_bytes") == 0]
+    _require(len(producers) == 3 and len(reducers) == 4, "FP8-Q split module roles")
+    producer_names = _verify_modules(root, producers)
+    reducer_names = _verify_modules(root, reducers, tma_workspace_bytes=0)
+    seen = set()
+    for row in bindings:
+        batch, splits, write_lse = (
+            row.get("batch_size"),
+            row.get("workspace_parts"),
+            row.get("write_lse"),
+        )
+        _require(
+            [batch, splits] in _FP8Q_SPLIT_CONTRACT["batch_splits"]
+            and type(write_lse) is bool,
+            "FP8-Q split geometry",
+        )
+        _require((batch, write_lse) not in seen, "FP8-Q split duplicate binding")
+        seen.add((batch, write_lse))
+        expected = dict(
+            batch_size=batch,
+            q_len=6,
+            num_q_heads=32,
+            num_kv_heads=2,
+            workspace_parts=splits,
+            grid=[1, 1, batch * 2 * splits],
+            total_tiles=batch * 2 * splits,
+            write_lse=write_lse,
+            query_dtype="float8_e4m3fn",
+            reducer_grid=[batch * 6 * 32, 1, 1],
+        )
+        _require(
+            {
+                k: v
+                for k, v in row.items()
+                if k not in ("module_name", "reducer_module_name")
+            }
+            == expected,
+            "FP8-Q split binding",
+        )
+        _require(
+            row.get("module_name") in producer_names
+            and row.get("reducer_module_name") in reducer_names,
+            "FP8-Q split module binding",
+        )
+    _require(
+        {row["module_name"] for row in bindings} == producer_names
+        and {row["reducer_module_name"] for row in bindings} == reducer_names,
+        "FP8-Q split module coverage",
     )
     return manifest
 
@@ -186,7 +285,9 @@ def _verified_source(root: Path, value: object, digest: object, label: str) -> P
     return path
 
 
-def _verify_modules(root: Path, modules: list[dict[str, Any]]) -> set[str]:
+def _verify_modules(
+    root: Path, modules: list[dict[str, Any]], *, tma_workspace_bytes: int = 384
+) -> set[str]:
     names: set[str] = set()
     for index, module in enumerate(modules):
         _require(isinstance(module, dict), f"modules[{index}]")
@@ -236,7 +337,7 @@ def _verify_modules(root: Path, modules: list[dict[str, Any]]) -> set[str]:
             f"modules[{index}].compile_options",
         )
         _require(
-            module.get("tma_workspace_bytes") == 384,
+            module.get("tma_workspace_bytes") == tma_workspace_bytes,
             f"modules[{index}].tma_workspace_bytes",
         )
     return names
@@ -403,7 +504,10 @@ def get_cake_fmha_request_ordered_module_spec(
         if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_")
         else (8, 1)
     )
-    if name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_"):
+    if name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_split_"):
+        root = _fp8q_source_root(split=True)
+        manifest = get_cake_fmha_request_ordered_fp8q_split_manifest()
+    elif name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_"):
         root = _fp8q_source_root()
         manifest = get_cake_fmha_request_ordered_fp8q_manifest()
     else:
@@ -446,11 +550,19 @@ def get_cake_fmha_request_ordered_module_spec(
         f"module {name} embedded-cubin declaration",
     )
     _require(
-        binding.count(
-            f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
-            f'"{spec.kernel_symbol}")'
-        )
-        == 2,
+        (
+            binding.count(
+                f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
+                f'"{spec.kernel_symbol}")'
+            )
+            == 2
+            if spec.tma_workspace_bytes
+            else binding.count(
+                f"TVM_FFI_EMBED_CUBIN_GET_KERNEL({spec.module_ident}, "
+                f'"{spec.kernel_symbol}")'
+            )
+            == 1
+        ),
         f"module {name} ordinary and capture kernel lookups",
     )
     _require(

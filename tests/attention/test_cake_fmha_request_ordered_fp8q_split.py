@@ -1,22 +1,19 @@
-"""Public FP8-query request-order planning, zero-copy binding and graph replay."""
+"""Compound low-batch FP8 request-order plans and public graph replay."""
 
 import dataclasses
 import math
-
 import flashinfer
 import flashinfer.cake_fmha as api
 import pytest
 import torch
 from flashinfer.jit.cake_fmha_request_ordered import (
-    get_cake_fmha_request_ordered_fp8q_manifest,
-    get_cake_fmha_request_ordered_manifest,
     get_cake_fmha_request_ordered_module_spec,
 )
 
 
-def fp8_plan(lengths=None, **kwargs):
+def fp8_plan(lengths, **kwargs):
     return flashinfer.plan_cake_fmha_request_ordered_paged_decode(
-        [257] * 64 if lengths is None else lengths,
+        lengths,
         6,
         num_q_heads=32,
         num_kv_heads=2,
@@ -25,104 +22,88 @@ def fp8_plan(lengths=None, **kwargs):
     )
 
 
-@pytest.mark.parametrize("batch", [64, 128, 160, 192, 224, 256])
-def test_fp8q_plan_and_legacy_precision_are_separate(batch):
-    plan = fp8_plan([257] * batch)
-    manifest = get_cake_fmha_request_ordered_fp8q_manifest()
-    assert plan.query_dtype == torch.float8_e4m3fn
-    assert plan.module_name == next(
-        row["module_name"] for row in manifest["bindings"] if row["batch_size"] == batch
-    )
+@pytest.mark.parametrize("batch,splits", [(8, 8), (27, 2), (32, 2)])
+@pytest.mark.parametrize("write_lse", [False, True])
+def test_fp8q_split_plan_and_binding(batch, splits, write_lse):
+    plan = fp8_plan([257] * batch, write_lse=write_lse)
+    assert plan == fp8_plan([257] * batch, write_lse=write_lse, num_kv_splits=splits)
     assert api._is_authenticated_request_ordered_plan(plan)
+    assert plan.workspace_parts == splits and plan.reducer_grid == (
+        batch * 6 * 32,
+        1,
+        1,
+    )
     assert (
         get_cake_fmha_request_ordered_module_spec(plan.module_name).tma_workspace_bytes
         == 384
     )
-    legacy = flashinfer.plan_cake_fmha_request_ordered_paged_decode(
-        [257] * 64, 6, num_q_heads=32, num_kv_heads=2
-    )
     assert (
-        legacy.query_dtype == torch.bfloat16 and legacy.module_name != plan.module_name
+        get_cake_fmha_request_ordered_module_spec(
+            plan.reducer_module_name
+        ).tma_workspace_bytes
+        == 0
     )
-    assert (
-        get_cake_fmha_request_ordered_manifest(32, 2)["contract"]["query_output_dtype"]
-        == "bfloat16"
-    )
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        dict(grid=(1, 1, 64)),
-        dict(workspace_parts=2),
-        dict(total_tiles=64),
-        dict(query_dtype=torch.bfloat16),
-        dict(module_name="unknown"),
-    ],
-)
-def test_fp8q_forged_plan_is_rejected(change):
     assert not api._is_authenticated_request_ordered_plan(
-        dataclasses.replace(fp8_plan(), **change)
+        dataclasses.replace(plan, reducer_module_name="unknown")
     )
-
-
-@pytest.mark.parametrize(
-    "lengths,kwargs",
-    [
-        ([257] * 16, {}),
-        ([257] * 64, {"write_lse": True}),
-        ([5] * 64, {}),
-        ([257] * 64, {"num_kv_splits": 2}),
-    ],
-)
-def test_fp8q_unexported_shapes_and_modes_are_rejected(lengths, kwargs):
     with pytest.raises(ValueError):
-        fp8_plan(lengths, **kwargs)
-
-
-@pytest.mark.parametrize("batch", [64, 128, 160, 192, 224, 256])
-def test_fp8q_binding_preserves_caller_storage(batch):
+        fp8_plan([257] * batch, num_kv_splits=3)
     q = torch.empty((batch * 6, 32, 256), dtype=torch.float8_e4m3fn)
     k = torch.empty((8, 64, 2, 256), dtype=torch.float8_e4m3fn).permute(0, 2, 1, 3)
     v = torch.empty_like(k)
     out = torch.empty(q.shape, dtype=torch.bfloat16)
-    dummy = torch.empty(1, dtype=torch.float32)
-    order = torch.arange(batch, dtype=torch.int32)
+    lse = torch.empty(q.shape[:-1]) if write_lse else None
+    workspace = torch.empty(api._fp8q_split_workspace_bytes(plan), dtype=torch.uint8)
     table = torch.empty((batch, 8), dtype=torch.int32)
     lens = torch.full((batch,), 257, dtype=torch.int32)
-    scales = (torch.tensor([math.log2(math.e) / 16]), torch.tensor([1.0]))
-    args = api._fp8q_request_ordered_arguments(
-        q, k, v, out, dummy, order, table, lens, *scales
+    order = torch.arange(batch, dtype=torch.int32)
+    qk = torch.tensor([0.01])
+    pv = torch.tensor([1.0])
+    producer, reducer = api._fp8q_split_request_ordered_arguments(
+        plan, q, k, v, out, lse, workspace, order, table, lens, qk, pv
     )
-    assert len(args) == 19 and args[0].shape == (batch * 6, 2, 16, 256)
-    for view, original in zip(
-        (
-            args[0],
-            args[1],
-            args[2],
-            args[3],
-            args[5],
-            args[7],
-            args[8],
-            args[9],
-            args[10],
-        ),
-        (q, k, v, out, order, table, lens, *scales),
-        strict=True,
+    for index, tensor in (
+        (0, q),
+        (1, k),
+        (2, v),
+        (3, out),
+        (5, order),
+        (7, table),
+        (8, lens),
+        (9, qk),
+        (10, pv),
     ):
-        assert view.data_ptr() == original.data_ptr()
-    assert args[0].stride() == (8192, 4096, 256, 1)
-    assert args[1].stride() == (32768, 256, 512, 1)
-    assert args[14:] == (8, 0, 1, 1, 0)
-    with pytest.raises(ValueError, match="strides"):
-        api._fp8q_request_ordered_arguments(
-            q, k.contiguous(), v, out, dummy, order, table, lens, *scales
+        assert producer[index].data_ptr() == tensor.data_ptr()
+    rows = batch * 6 * 32 * splits
+    begin = workspace.data_ptr() + 384
+    assert [tensor.data_ptr() for tensor in producer[11:14]] == [
+        begin,
+        begin + rows * 256 * 4,
+        begin + rows * 257 * 4,
+    ]
+    assert [tensor.data_ptr() for tensor in reducer[:3]] == [
+        tensor.data_ptr() for tensor in producer[11:14]
+    ]
+    assert (
+        producer[4].data_ptr()
+        == reducer[4].data_ptr()
+        == (lse.data_ptr() if write_lse else begin + rows * 258 * 4)
+    )
+    assert producer[17] == splits
+    assert (
+        reducer[3].data_ptr() == out.data_ptr()
+        and reducer[5].data_ptr() == pv.data_ptr()
+    )
+    with pytest.raises(ValueError, match="workspace_buffer"):
+        api._fp8q_split_request_ordered_arguments(
+            plan, q, k, v, out, lse, workspace[:-4], order, table, lens, qk, pv
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("batch", [64, 128, 160, 192, 224, 256])
-def test_fp8q_gpu_public_graph_mutable_metadata(batch):
+@pytest.mark.parametrize("batch", [8, 27, 32])
+@pytest.mark.parametrize("write_lse", [False, True])
+def test_fp8q_split_gpu_public_graph_mutable_metadata(batch, write_lse):
     if torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("requires SM103")
     device = torch.device("cuda")
@@ -130,7 +111,7 @@ def test_fp8q_gpu_public_graph_mutable_metadata(batch):
     lengths = ([6, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257] * ((batch + 10) // 11))[
         :batch
     ]
-    plan = fp8_plan(lengths)
+    plan = fp8_plan(lengths, write_lse=write_lse)
     key, value = tuple(
         torch.randn((batch * 8, 64, 2, 256), device=device)
         .mul_(0.1)
@@ -144,12 +125,13 @@ def test_fp8q_gpu_public_graph_mutable_metadata(batch):
     qk = torch.tensor([math.log2(math.e) / 16], device=device)
     pv = torch.tensor([1.0], device=device)
 
-    def invoke(q, workspace, out, preparation=None):
+    def invoke(q, workspace, out, lse, preparation=None):
         return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=(key, value),
             workspace_buffer=workspace,
             out=out,
+            lse=lse,
             block_tables=table,
             seq_lens=lens,
             max_seq_len=257,
@@ -165,6 +147,7 @@ def test_fp8q_gpu_public_graph_mutable_metadata(batch):
 
     def reference(q):
         rows = []
+        lse_rows = []
         for b, length in enumerate(lengths):
             indices = table[b].long()
             k = (
@@ -190,8 +173,15 @@ def test_fp8q_gpu_public_graph_mutable_metadata(batch):
                 torch.arange(6, device=device)[:, None] + length - 6
             )
             scores.masked_fill_(mask[None], -float("inf"))
+            lse_rows.append(scores.logsumexp(-1).transpose(0, 1) * math.log2(math.e))
             rows.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), v) * pv)
-        return torch.cat(rows).to(torch.bfloat16)
+        return torch.cat(rows).to(torch.bfloat16), torch.cat(lse_rows)
+
+    def check(q, out, lse):
+        expected_o, expected_lse = reference(q)
+        torch.testing.assert_close(out, expected_o, atol=0.1, rtol=0.1)
+        if write_lse:
+            torch.testing.assert_close(lse, expected_lse, atol=0.01, rtol=0.01)
 
     instances = []
     for _ in range(8):
@@ -200,20 +190,23 @@ def test_fp8q_gpu_public_graph_mutable_metadata(batch):
             .mul_(0.1)
             .to(torch.float8_e4m3fn)
         )
-        workspace = torch.empty(512, dtype=torch.uint8, device=device)
+        workspace = torch.empty(
+            api._fp8q_split_workspace_bytes(plan), dtype=torch.uint8, device=device
+        )
         out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
-        assert invoke(q, workspace, out).dtype == torch.bfloat16
-        torch.testing.assert_close(out, reference(q), atol=0.1, rtol=0.1)
+        lse = torch.empty(q.shape[:-1], device=device) if write_lse else None
+        assert invoke(q, workspace, out, lse).dtype == torch.bfloat16
+        check(q, out, lse)
         preparation = api.CakeFmhaRequestOrderedCapture([plan])
         graph = torch.cuda.CUDAGraph()
         try:
             with torch.cuda.graph(graph):
-                invoke(q, workspace, out, preparation)
+                invoke(q, workspace, out, lse, preparation)
             preparation.finalize()
         except BaseException:
             preparation.discard()
             raise
-        instances.append((q, workspace, out, preparation, graph))
+        instances.append((q, workspace, out, lse, preparation, graph))
     for mutation in range(3):
         order.copy_(
             torch.arange(batch - 1, -1, -1, device=device, dtype=torch.int32)
@@ -225,7 +218,7 @@ def test_fp8q_gpu_public_graph_mutable_metadata(batch):
         table.copy_(table.roll(1, 0))
         qk.mul_(0.95)
         pv.mul_(0.98)
-        for q, _workspace, out, _preparation, graph in instances:
+        for q, _workspace, out, lse, _preparation, graph in instances:
             out.zero_()
             graph.replay()
-            torch.testing.assert_close(out, reference(q), atol=0.1, rtol=0.1)
+            check(q, out, lse)

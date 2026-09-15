@@ -36,6 +36,7 @@ from .jit.cake_fmha import (
 from .jit.cake_fmha_request_ordered import (
     get_cake_fmha_request_ordered_manifest,
     get_cake_fmha_request_ordered_fp8q_manifest,
+    get_cake_fmha_request_ordered_fp8q_split_manifest,
     get_cake_fmha_request_ordered_runtime_q_manifest,
     load_cake_fmha_request_ordered_module,
 )
@@ -56,6 +57,8 @@ class CakeFmhaRequestOrderedDecodePlan:
     num_q_heads: int = 8
     num_kv_heads: int = 1
     query_dtype: torch.dtype = torch.bfloat16
+    reducer_module_name: str | None = None
+    reducer_grid: tuple[int, int, int] | None = None
 
 
 def _request_ordered_plan_from_route(
@@ -327,7 +330,12 @@ def _dynamic_split_cake_fmha_request_ordered_plan(
 def _fp8q_request_ordered_plan(
     *, batch_size: int, q_len: int, num_q_heads: int, num_kv_heads: int, write_lse: bool
 ) -> CakeFmhaRequestOrderedDecodePlan | None:
-    for row in get_cake_fmha_request_ordered_fp8q_manifest()["bindings"]:
+    manifest = (
+        get_cake_fmha_request_ordered_fp8q_split_manifest()
+        if batch_size in (8, 27, 32)
+        else get_cake_fmha_request_ordered_fp8q_manifest()
+    )
+    for row in manifest["bindings"]:
         if (
             row["batch_size"],
             row["q_len"],
@@ -347,6 +355,10 @@ def _fp8q_request_ordered_plan(
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
                 query_dtype=torch.float8_e4m3fn,
+                reducer_module_name=row.get("reducer_module_name"),
+                reducer_grid=tuple(row["reducer_grid"])
+                if "reducer_grid" in row
+                else None,
             )
     return None
 
@@ -370,8 +382,9 @@ def plan_cake_fmha_request_ordered_paged_decode(
     in place between replays. An explicit num_kv_splits selects an exported
     split schedule; unavailable split/LSE combinations raise ValueError.
     FP8 E4M3 queries select separate Q6, 32Q/2KV exports for batches
-    64, 128, 160, 192, 224 and 256 with BF16
-    output, shared page tables, native HND views, and KV lengths at least six.
+    64, 128, 160, 192, 224 and 256, plus compound split plans for B8/S8
+    and B27 or B32/S2. All use BF16 output, shared page tables, native HND
+    views, and KV lengths at least six. Low-batch plans optionally write base2 LSE.
     """
 
     lengths = tuple(int(value) for value in kv_lens)
@@ -385,8 +398,8 @@ def plan_cake_fmha_request_ordered_paged_decode(
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
 
     if query_dtype == torch.float8_e4m3fn:
-        if num_kv_splits is not None or min(lengths) < q_len:
-            raise ValueError("FP8-Q requires unsplit attention and kv_lens >= q_len")
+        if min(lengths) < q_len:
+            raise ValueError("FP8-Q requires kv_lens >= q_len")
         selected = _fp8q_request_ordered_plan(
             batch_size=batch_size,
             q_len=q_len,
@@ -394,6 +407,13 @@ def plan_cake_fmha_request_ordered_paged_decode(
             num_kv_heads=num_kv_heads,
             write_lse=write_lse,
         )
+        if num_kv_splits is not None and (
+            type(num_kv_splits) is not int
+            or selected is None
+            or num_kv_splits != selected.workspace_parts
+            or num_kv_splits <= 1
+        ):
+            raise ValueError("num_kv_splits does not match the exported FP8-Q plan")
         if selected is None:
             raise ValueError(
                 "no exported FP8-Q request-order schedule for this shape/LSE mode"
@@ -544,6 +564,7 @@ class CakeFmhaRequestOrderedCapture:
             )
         self._plans = frozenset(plans)
         self._tokens: dict[str, tuple[Any, int]] = {}
+        self._reducers: dict[str, Any] = {}
         self._workspaces: dict[int, torch.Tensor] = {}
         self._state = "recording"
         try:
@@ -551,6 +572,10 @@ class CakeFmhaRequestOrderedCapture:
                 if not _is_authenticated_request_ordered_plan(plan):
                     raise ValueError(
                         "request-order capture plan is not an exported route"
+                    )
+                if plan.reducer_module_name is not None:
+                    self._reducers[plan.reducer_module_name] = (
+                        load_cake_fmha_request_ordered_module(plan.reducer_module_name)
                     )
                 if plan.module_name not in self._tokens:
                     module = load_cake_fmha_request_ordered_module(plan.module_name)
@@ -571,6 +596,7 @@ class CakeFmhaRequestOrderedCapture:
         plan: CakeFmhaRequestOrderedDecodePlan,
         workspace: torch.Tensor,
         arguments: tuple[Any, ...],
+        reducer_arguments: tuple[Any, ...] | None = None,
     ) -> None:
         if self._state != "recording" or plan not in self._plans:
             raise ValueError(
@@ -582,6 +608,8 @@ class CakeFmhaRequestOrderedCapture:
             )
         module, token = self._tokens[plan.module_name]
         module.run_tma_capture(token, *arguments)
+        if reducer_arguments is not None:
+            self._reducers[plan.reducer_module_name].run(*reducer_arguments)
         self._workspaces[workspace.data_ptr()] = workspace
 
     def finalize(self) -> None:
@@ -652,6 +680,56 @@ def _fp8q_request_ordered_arguments(
         1,
         0,
     )
+
+
+def _fp8q_split_workspace_bytes(plan: CakeFmhaRequestOrderedDecodePlan) -> int:
+    rows = plan.batch_size * plan.q_len * plan.num_q_heads * plan.workspace_parts
+    return 384 + (rows * 258 + 1) * 4
+
+
+def _fp8q_split_request_ordered_arguments(
+    plan,
+    query,
+    key_cache,
+    value_cache,
+    out,
+    lse,
+    workspace,
+    request_order,
+    page_table,
+    seq_lens,
+    scale1,
+    scale2,
+):
+    """Bind FP32 split partials and the two zero-copy launch argument tuples."""
+    required = _fp8q_split_workspace_bytes(plan)
+    if workspace.numel() < required:
+        raise ValueError(
+            f"workspace_buffer needs at least {required} bytes for this plan"
+        )
+    values = workspace[384:required].view(torch.float32)
+    rows = plan.batch_size * plan.q_len * plan.num_q_heads * plan.workspace_parts
+    partial_o = values[: rows * 256]
+    partial_max = values[rows * 256 : rows * 257]
+    partial_sum = values[rows * 257 : rows * 258]
+    lse_arg = lse if plan.write_lse else values[rows * 258 : rows * 258 + 1]
+    args = list(
+        _fp8q_request_ordered_arguments(
+            query,
+            key_cache,
+            value_cache,
+            out,
+            lse_arg,
+            request_order,
+            page_table,
+            seq_lens,
+            scale1,
+            scale2,
+        )
+    )
+    args[11:14] = (partial_o, partial_max, partial_sum)
+    args[17] = plan.workspace_parts
+    return tuple(args), (partial_o, partial_max, partial_sum, out, lse_arg, scale2)
 
 
 def _run_cake_fmha_request_ordered_paged_decode(
@@ -815,27 +893,52 @@ def _run_cake_fmha_request_ordered_paged_decode(
     if plan.query_dtype == torch.float8_e4m3fn:
         if not uses_shared_paged_kv_idx:
             raise ValueError("the FP8-Q export requires a shared page table")
-        arguments = _fp8q_request_ordered_arguments(
-            query,
-            key_cache,
-            value_cache,
-            out,
-            lse_arg,
-            request_order,
-            page_table_arg,
-            seq_lens,
-            bmm1_scale_log2,
-            bmm2_scale,
-        )
+        reducer_arguments = None
+        if plan.reducer_module_name is not None:
+            arguments, reducer_arguments = _fp8q_split_request_ordered_arguments(
+                plan,
+                query,
+                key_cache,
+                value_cache,
+                out,
+                lse,
+                workspace_buffer,
+                request_order,
+                page_table_arg,
+                seq_lens,
+                bmm1_scale_log2,
+                bmm2_scale,
+            )
+            reducer_arguments = (*reducer_arguments, *plan.reducer_grid)
+        else:
+            arguments = _fp8q_request_ordered_arguments(
+                query,
+                key_cache,
+                value_cache,
+                out,
+                lse_arg,
+                request_order,
+                page_table_arg,
+                seq_lens,
+                bmm1_scale_log2,
+                bmm2_scale,
+            )
         import tvm_ffi
 
         module = load_cake_fmha_request_ordered_module(plan.module_name)
         with tvm_ffi.use_torch_stream():
             if capture is None:
                 module.run(*arguments, tma_workspace, *plan.grid)
+                if reducer_arguments is not None:
+                    load_cake_fmha_request_ordered_module(plan.reducer_module_name).run(
+                        *reducer_arguments
+                    )
             else:
                 capture._record(
-                    plan, workspace_buffer, (*arguments, tma_workspace, *plan.grid)
+                    plan,
+                    workspace_buffer,
+                    (*arguments, tma_workspace, *plan.grid),
+                    reducer_arguments,
                 )
         return
     if plan.workspace_parts == 1:

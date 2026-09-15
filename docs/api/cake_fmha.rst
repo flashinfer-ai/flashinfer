@@ -126,3 +126,21 @@ warm an ordinary invocation, record with the capture object, and finalize it
 before replay. Keep its workspace alive with the graph. Tensor contents may
 change in place while their storage, shape and minimum-length contract remain
 valid.
+
+
+Low-batch FP8 query plans
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The request-order planner also supports Q6, 32 query heads, 2 KV heads,
+head dimension 256, and page size 64 for batch 8 with eight KV splits and
+batches 27 or 32 with two splits. The selected public decode call launches
+the generated producer followed by its FP32 partial reducer on the same
+stream. Caller Q/K/V, page tables, sequence lengths, scales and request
+order keep their storage; there is no external gather/scatter.
+
+These plans accept ``write_lse=True`` for FP32 base2 LSE. Their caller-owned,
+128-byte-aligned uint8 workspace must contain at least
+``384 + (batch * 6 * 32 * splits * 258 + 1) * 4`` bytes. Allocate a separate
+workspace for each live graph binding and use
+``CakeFmhaRequestOrderedCapture`` to prepare descriptors before replay.
+The graph includes both the producer and reducer launches.
