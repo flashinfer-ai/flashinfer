@@ -215,6 +215,7 @@ def _run_bf16_split(
 
 def _route(
     *,
+    arch: str,
     dtype: torch.dtype,
     num_heads: int,
     max_q_len: int,
@@ -255,6 +256,8 @@ def _route(
         if is_swa:
             return "fp8_lowhead_prefill"
         if num_heads == 64:
+            if arch == "sm_100a" and sparse_topk >= 640:
+                return "fp8_lowhead_h64_split"
             return "fp8_lowhead_h64"
         return (
             "fp8_lowhead_one_partition" if sparse_topk <= 256 else "fp8_lowhead_split"
@@ -500,6 +503,7 @@ def run_cake_dsv4(
     has_sinks = int(sinks is not None)
     sink_tensor = sinks if sinks is not None else scale1
     route = _route(
+        arch=_target_arch(query.device),
         dtype=query.dtype,
         num_heads=num_heads,
         max_q_len=max_q_len,
@@ -835,9 +839,10 @@ def run_cake_dsv4(
         "fp8_lowhead_one_partition",
         "fp8_lowhead_split",
         "fp8_lowhead_h64",
+        "fp8_lowhead_h64_split",
         "fp8_lowhead_prefill",
     ):
-        num_splits = 2 if route == "fp8_lowhead_split" else 1
+        num_splits = 2 if route in ("fp8_lowhead_split", "fp8_lowhead_h64_split") else 1
         partial_o, partial_lse = _partition_workspace(
             workspace_buffer, out_rows, num_query_tokens, num_heads, num_splits
         )
@@ -867,7 +872,18 @@ def run_cake_dsv4(
             stream=stream,
             workspace=workspace_buffer,
         )
-        if num_splits > 1:
+        if route == "fp8_lowhead_h64_split":
+            _launch_variant(
+                "fp8_h64_split_reduce2",
+                partial_o,
+                partial_lse,
+                out_rows,
+                num_heads,
+                grid=(num_query_tokens, num_heads, 1),
+                stream=stream,
+                workspace=workspace_buffer,
+            )
+        elif num_splits > 1:
             _launch_shared_reduce(
                 partial_o,
                 partial_lse,

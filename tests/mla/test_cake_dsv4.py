@@ -98,7 +98,10 @@ from flashinfer.mla.cake_dsv4 import (
             True,
             640,
             64,
-            "fp8_lowhead_h64",
+            {
+                "sm_100a": "fp8_lowhead_h64_split",
+                "sm_103a": "fp8_lowhead_h64",
+            },
             id="case-07",
         ),
         pytest.param(
@@ -123,7 +126,10 @@ from flashinfer.mla.cake_dsv4 import (
             True,
             640,
             64,
-            "fp8_lowhead_h64",
+            {
+                "sm_100a": "fp8_lowhead_h64_split",
+                "sm_103a": "fp8_lowhead_h64",
+            },
             id="case-10",
         ),
         pytest.param(
@@ -214,7 +220,10 @@ from flashinfer.mla.cake_dsv4 import (
             True,
             640,
             64,
-            "fp8_lowhead_h64",
+            {
+                "sm_100a": "fp8_lowhead_h64_split",
+                "sm_103a": "fp8_lowhead_h64",
+            },
             id="case-19",
         ),
         pytest.param(
@@ -239,7 +248,10 @@ from flashinfer.mla.cake_dsv4 import (
             True,
             640,
             64,
-            "fp8_lowhead_h64",
+            {
+                "sm_100a": "fp8_lowhead_h64_split",
+                "sm_103a": "fp8_lowhead_h64",
+            },
             id="case-22",
         ),
         pytest.param(
@@ -804,8 +816,9 @@ from flashinfer.mla.cake_dsv4 import (
 def test_cake_dsv4_semantic_routes(
     dtype, num_heads, batch_size, max_q_len, ragged, sparse_topk, page_size, expected
 ):
-    assert (
-        _route(
+    for arch in ("sm_100a", "sm_103a"):
+        assert _route(
+            arch=arch,
             dtype=dtype,
             num_heads=num_heads,
             batch_size=batch_size,
@@ -813,9 +826,7 @@ def test_cake_dsv4_semantic_routes(
             ragged=ragged,
             sparse_topk=sparse_topk,
             compressed_page_size=page_size,
-        )
-        == expected
-    )
+        ) == (expected[arch] if isinstance(expected, dict) else expected)
 
 
 @pytest.mark.parametrize(
@@ -830,18 +841,20 @@ def test_cake_dsv4_semantic_routes(
 def test_fp8_prefill_keeps_batch_and_cache_layout_predicates(
     num_heads, batch_size, page_size, expected
 ):
-    assert (
-        _route(
-            dtype=torch.float8_e4m3fn,
-            num_heads=num_heads,
-            batch_size=batch_size,
-            max_q_len=257,
-            ragged=True,
-            sparse_topk=640 if num_heads == 64 else 1152,
-            compressed_page_size=page_size,
+    for arch in ("sm_100a", "sm_103a"):
+        assert (
+            _route(
+                arch=arch,
+                dtype=torch.float8_e4m3fn,
+                num_heads=num_heads,
+                batch_size=batch_size,
+                max_q_len=257,
+                ragged=True,
+                sparse_topk=640 if num_heads == 64 else 1152,
+                compressed_page_size=page_size,
+            )
+            == expected
         )
-        == expected
-    )
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
