@@ -202,6 +202,7 @@ try:
         CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
+        W4A16PackedWeights,
         cute_dsl_fused_moe_bf16,
         CuteDslBf16MoEWrapper,
     )
@@ -369,6 +370,7 @@ if _cute_dsl_available:
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "W4A16PackedWeights",
         "cute_dsl_fused_moe_bf16",
         "CuteDslBf16MoEWrapper",
     ]
