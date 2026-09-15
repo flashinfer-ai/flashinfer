@@ -19,6 +19,7 @@ from flashinfer.gemm.svdquant_sm120_routes import (
     sm120_producer_variants,
     sm120_variant_packs_l2t,
     SM120_FAMILY_M537,
+    SM120_FAMILY_SMALL_M_PACKED,
     SM120_FUSED_LINEAR_MK,
     SM120_LINEAR_ROUTE_ABI_OVERRIDES,
     SM120_LINEAR_ROUTE_V6_MKR,
@@ -39,10 +40,21 @@ def test_route_manifest_containers_are_immutable() -> None:
     "m,k,rank,expected_version",
     [
         (256, 12288, 32, 5),
-        (73984, 7168, 32, 6),
-        (537, 5376, 32, 7),
-        (82752, 5376, 32, 8),
+        (73984, 14336, 32, 6),
+        (1935, 14336, 32, 7),
         (537, 14336, 32, 9),
+        (64, 3072, 32, 10),
+        (64, 5120, 32, 10),
+        (64, 5376, 32, 10),
+        (64, 7168, 32, 10),
+        (73984, 7168, 32, 10),
+        (537, 5376, 32, 10),
+        (82752, 5376, 32, 10),
+        (17, 3072, 32, 10),
+        (0, 3072, 32, 5),
+        (64, 1536, 32, 5),
+        (64, 3072, 16, 5),
+        (64, 3072, 64, 5),
     ],
 )
 def test_route_abi_version_matches_manifest(
@@ -51,7 +63,7 @@ def test_route_abi_version_matches_manifest(
     rank: int,
     expected_version: int,
 ) -> None:
-    # Given: one shape from each persisted route-ABI generation.
+    # Given: affected and unaffected shapes, including an unlisted M and ranks.
     # When: its current cache namespace is selected.
     actual_version = sm120_linear_route_abi_version(m, k, rank)
     # Then: only runner-set changes advance beyond the retained v5 base.
@@ -216,21 +228,55 @@ def test_swept_producers_are_admitted_and_route_native(m: int, k: int) -> None:
     # launch geometries measured the fused producer beating the unfused prefix
     # by a measured margin.
     # When: each is resolved through the manifest.
-    # Then: it is admitted, it routes native, and it does not claim the packed
-    # L2T layout, which belongs to the M537 mixed producer alone.
+    # Then: it has native candidates and no fixed-M537 candidate.
     assert (m, k) in SM120_FUSED_LINEAR_MK
     assert _has_native_producer(m, k)
     # Was `(m, k) in _ffi_guard_shapes()`. The FFI no longer carries a shape
     # list; being runnable is being able to compute a producer geometry.
     assert sm120_producer_variants(m, k)
-    # "routes native and does not claim the packed L2T layout" used to be two
-    # table lookups. The producer is chosen per tactic now, so the same claim is
-    # made about the variants themselves: none of these shapes offers the M537
-    # family, which is the only one that reads L2T prepacked.
+    # Packed small-M candidates may coexist with row-major native candidates;
+    # the selected family determines the L2T layout.
     variants = sm120_producer_variants(m, k)
     assert variants, f"({m}, {k}) computes no producer geometry"
     assert all(family != SM120_FAMILY_M537 for family, _, _ in variants)
-    assert not any(sm120_variant_packs_l2t(m, k, v) for v in range(len(variants)))
+    for variant, (family, _, _) in enumerate(variants):
+        assert sm120_variant_packs_l2t(m, k, variant) == (
+            family == SM120_FAMILY_SMALL_M_PACKED
+        )
+
+
+@pytest.mark.parametrize("m,k", sorted(SM120_FUSED_LINEAR_MK | {(17, 3072)}))
+def test_packed_family_is_appended_after_all_legacy_variants(m: int, k: int) -> None:
+    # Given: old producer IDs are persisted as part of each packed tactic.
+    # When: the producer list admits the new layout family.
+    variants = sm120_producer_variants(m, k)
+    packed_indices = [
+        index
+        for index, (family, _, _) in enumerate(variants)
+        if family == SM120_FAMILY_SMALL_M_PACKED
+    ]
+    # Then: new entries form a suffix, preserving all previous indices.
+    if packed_indices:
+        assert packed_indices == list(range(packed_indices[0], len(variants)))
+
+
+@pytest.mark.parametrize(
+    "m,k,variant,expected",
+    [
+        (64, 3072, 17, (1, (768, 8, 8), 0)),
+        (64, 3072, 23, (3, (0, 0, 0), 0)),
+        (537, 5376, 19, (2, (1024, 24, 16), 0)),
+        (537, 5376, 20, (3, (0, 0, 0), 0)),
+    ],
+)
+def test_legacy_producer_ids_keep_their_meaning(
+    m: int, k: int, variant: int, expected: tuple[int, tuple[int, int, int], int]
+) -> None:
+    # Given: representative persisted IDs from every affected legacy family.
+    # When: the current producer list resolves each index.
+    actual = sm120_producer_variants(m, k)[variant]
+    # Then: appending candidates changes no existing tactic interpretation.
+    assert actual == expected
 
 
 @pytest.mark.parametrize(
