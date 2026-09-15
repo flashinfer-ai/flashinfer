@@ -295,12 +295,17 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
     larger = [
+        ((512, 1792, 5120), ("cooperative", 128, 64, 256)),
+        ((512, 5120, 1024), ("cooperative", 128, 64, 256)),
+        ((512, 1280, 8192), ("cooperative", 128, 128, 256)),
+        ((512, 896, 5120), ("cooperative", 128, 128, 256)),
+        ((512, 5120, 2048), ("cooperative", 128, 64, 256)),
         ((512, 5120, 8192), ("cooperative", 128, 64, 256)),
         ((512, 8192, 3584), ("cooperative", 128, 64, 256)),
         ((512, 3584, 5120), ("cooperative", 128, 64, 256)),
         ((512, 2560, 8192), ("cooperative", 128, 128, 256)),
         ((512, 5120, 5120), ("cooperative", 128, 64, 256)),
-        ((1024, 512, 7168), ("cooperative", 128, 64, 256)),
+        ((1024, 512, 7168), ("b12x", 128, 128, 128)),
         ((8192, 34816, 5120), ("raw", 32, 64, 13, True, True, 256, False)),
         ((2048, 34816, 5120), ("cooperative", 256, 128, 128)),
         ((2048, 5120, 17408), ("raw", 64, 32, 8, False, True, 256, True)),
@@ -450,6 +455,20 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (512, 8192, 3840),
         (512, 3584, 5376),
     ]
+    neighbors += [
+        (513, 1792, 5120),
+        (513, 5120, 1024),
+        (513, 1280, 8192),
+        (513, 896, 5120),
+        (513, 5120, 2048),
+        (512, 1920, 5120),
+        (512, 5248, 1024),
+        (512, 1408, 8192),
+        (512, 1024, 5120),
+        (512, 5248, 2048),
+        (512, 1792, 5376),
+        (512, 1280, 8448),
+    ]
     for shape in neighbors:
         assert policy.default_tactic(
             *shape, compute_capability=(12, 1)
@@ -467,6 +486,11 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         for n, k in [(34816, 5120), (5120, 17408)]
     ]
     + [
+        (512, 1792, 5120),
+        (512, 5120, 1024),
+        (512, 1280, 8192),
+        (512, 896, 5120),
+        (512, 5120, 2048),
         (512, 5120, 8192),
         (512, 8192, 3584),
         (512, 3584, 5120),
@@ -545,12 +569,15 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
         graph.replay()
         _assert_bits(out, changed_expected)
         # The new default does not silently migrate an existing cached choice.
-        legacy = policy.default_tactic(m, n, k)
-        winners[key] = (legacy, None)
-        _assert_bits(
-            mm_fp4(*operands, alpha, out=out, backend="cute-dsl"), changed_expected
-        )
-        assert selected[-1] == legacy
+        legacy_choices = [policy.default_tactic(m, n, k)]
+        if (m, n, k) == (1024, 512, 7168):
+            legacy_choices.append(("cooperative", 128, 64, 256))
+        for legacy in legacy_choices:
+            winners[key] = (legacy, None)
+            _assert_bits(
+                mm_fp4(*operands, alpha, out=out, backend="cute-dsl"), changed_expected
+            )
+            assert selected[-1] == legacy
     finally:
         if previous is sentinel:
             winners.pop(key, None)
