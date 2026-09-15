@@ -121,12 +121,24 @@ _WS = 64 * 1024 * 1024  # 64 MiB workspace (kept small for SM75)
 
 
 def _paged_kv(
-    batch_size, kv_len, page_size, num_kv_heads, head_dim, q_dtype, dtype, dev
+    batch_size,
+    kv_len,
+    page_size,
+    num_kv_heads,
+    head_dim,
+    q_dtype,
+    dtype,
+    dev,
+    kv_layout="HND",
 ):
-    """Build paged indices and the three KV caches (orig/dequant/slot), HND layout.
+    """Build paged indices and the three KV caches (orig/dequant/slot).
 
-    Returns ``(indptr, indices, last_page_len, kv_slot, kv_deq, kv_orig)`` with
-    each cache shaped ``[num_pages, 2, num_kv_heads, page_size, *]``.
+    ``kv_layout`` selects the cache shape (the K/V head vector is always the
+    last dim, so ``pack_inline_slot`` is layout-agnostic):
+      - HND: ``[num_pages, 2, num_kv_heads, page_size, *]``
+      - NHD: ``[num_pages, 2, page_size, num_kv_heads, *]``
+
+    Returns ``(indptr, indices, last_page_len, kv_slot, kv_deq, kv_orig)``.
     """
     indptr = [0]
     indices = []
@@ -141,12 +153,12 @@ def _paged_kv(
     indices = torch.tensor(indices, dtype=torch.int32).to(dev)
     last_page_len = torch.tensor(last_page_len, dtype=torch.int32).to(dev)
 
-    k_ref = 0.05 * torch.randn(
-        num_pages, num_kv_heads, page_size, head_dim, dtype=q_dtype
-    ).to(dev)
-    v_ref = 0.05 * torch.randn(
-        num_pages, num_kv_heads, page_size, head_dim, dtype=q_dtype
-    ).to(dev)
+    if kv_layout == "HND":
+        inner = (num_pages, num_kv_heads, page_size, head_dim)
+    else:  # NHD
+        inner = (num_pages, page_size, num_kv_heads, head_dim)
+    k_ref = (0.05 * torch.randn(*inner, dtype=q_dtype)).to(dev)
+    v_ref = (0.05 * torch.randn(*inner, dtype=q_dtype)).to(dev)
     k_slot, k_deq, _ = pack_inline_slot(k_ref, dtype, head_dim)
     v_slot, v_deq, _ = pack_inline_slot(v_ref, dtype, head_dim)
     kv_slot = torch.cat([k_slot.unsqueeze(1), v_slot.unsqueeze(1)], dim=1)
@@ -255,12 +267,15 @@ def test_batch_prefill_ragged_inline_scale(head_dim, dtype, q_dtype, gqa, causal
 # ---------------------------------------------------------------------------
 # 3. batch prefill (paged)
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gqa", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-def test_batch_prefill_paged_inline_scale(head_dim, dtype, q_dtype, gqa, causal):
+def test_batch_prefill_paged_inline_scale(
+    head_dim, dtype, q_dtype, gqa, causal, kv_layout
+):
     _skip_bf16_on_sm75(q_dtype)
     torch.manual_seed(42)
     dev = "cuda:0"
@@ -280,14 +295,22 @@ def test_batch_prefill_paged_inline_scale(head_dim, dtype, q_dtype, gqa, causal)
         k_deq_cache,
         k_orig_cache,
     ) = _paged_kv(
-        batch_size, kv_len, page_size, num_kv_heads, head_dim, q_dtype, dtype, dev
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        q_dtype,
+        dtype,
+        dev,
+        kv_layout,
     )
 
     q = torch.randn(total_qo, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
 
     ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
     ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        ws, kv_layout="HND", backend="fa2"
+        ws, kv_layout=kv_layout, backend="fa2"
     )
     ref.plan(
         qo_indptr,
@@ -306,7 +329,7 @@ def test_batch_prefill_paged_inline_scale(head_dim, dtype, q_dtype, gqa, causal)
     o_ref = ref.run(q, k_deq_cache)
 
     fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        ws, kv_layout="HND", backend="fa2"
+        ws, kv_layout=kv_layout, backend="fa2"
     )
     fi.plan(
         qo_indptr,
@@ -372,13 +395,14 @@ def test_single_decode_inline_scale(head_dim, dtype, q_dtype, gqa, use_tensor_co
 # use_tensor_cores=True reuses the FA2 paged-prefill kernel, the same
 # inline-scale path exercised by test_batch_prefill_paged_inline_scale.
 # ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("use_tensor_cores", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gqa", [False, True])
 def test_batch_decode_paged_inline_scale(
-    head_dim, dtype, q_dtype, gqa, use_tensor_cores
+    head_dim, dtype, q_dtype, gqa, use_tensor_cores, kv_layout
 ):
     _skip_bf16_on_sm75(q_dtype)
     torch.manual_seed(42)
@@ -396,14 +420,22 @@ def test_batch_decode_paged_inline_scale(
         k_deq_cache,
         k_orig_cache,
     ) = _paged_kv(
-        batch_size, kv_len, page_size, num_kv_heads, head_dim, q_dtype, dtype, dev
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        q_dtype,
+        dtype,
+        dev,
+        kv_layout,
     )
 
     q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
 
     ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
     ref = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        ws, kv_layout="HND", use_tensor_cores=use_tensor_cores
+        ws, kv_layout=kv_layout, use_tensor_cores=use_tensor_cores
     )
     ref.plan(
         paged_kv_indptr,
@@ -420,7 +452,7 @@ def test_batch_decode_paged_inline_scale(
     o_ref = ref.run(q, k_deq_cache)
 
     fi = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        ws, kv_layout="HND", use_tensor_cores=use_tensor_cores
+        ws, kv_layout=kv_layout, use_tensor_cores=use_tensor_cores
     )
     fi.plan(
         paged_kv_indptr,
@@ -727,8 +759,606 @@ def test_batch_prefill_paged_inline_scale_cta128(head_dim, q_dtype, gqa, causal)
     _check(o_fp8, o_ref, o_orig, "batch_prefill_paged_cta128")
 
 
+# ---------------------------------------------------------------------------
+# 8. negative / validation tests
+#
+# The inline-scale feature adds host-side validation at plan() and run() time;
+# the fix commits (V-dtype check, custom-JIT-module use_inline_sf check) are the
+# newest. These tests pin the error paths so a regression that silently drops a
+# check is caught. They use one small fixed config (head_dim 128, e4m3, fp16,
+# MHA) because they exercise validation, not kernel numerics.
+# ---------------------------------------------------------------------------
+_NEG = dict(head_dim=128, qo_len=16, kv_len=16, batch=2, heads=4, page=16)
+
+
+def _neg_q(dev, total_rows):
+    return torch.randn(
+        total_rows, _NEG["heads"], _NEG["head_dim"], dtype=torch.float16
+    ).to(dev)
+
+
+# -- single prefill (ragged) ----------------------------------------------
+def test_single_prefill_rejects_non_fp8_kv():
+    c = _NEG
+    dev = "cuda:0"
+    q = _neg_q(dev, c["qo_len"])
+    k = torch.randn(
+        c["kv_len"], c["heads"], c["head_dim"] + 16, dtype=torch.float16
+    ).to(dev)
+    v = torch.randn(
+        c["kv_len"], c["heads"], c["head_dim"] + 16, dtype=torch.float16
+    ).to(dev)
+    with pytest.raises(AssertionError, match="fp8"):
+        flashinfer.single_prefill_with_kv_cache(
+            q, k, v, use_inline_sf=True, backend="fa2"
+        )
+
+
+def test_single_prefill_rejects_kv_dtype_mismatch():
+    c = _NEG
+    dev = "cuda:0"
+    q = _neg_q(dev, c["qo_len"])
+    k = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    v = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e5m2)
+    )
+    with pytest.raises(AssertionError, match="same dtype"):
+        flashinfer.single_prefill_with_kv_cache(
+            q, k, v, use_inline_sf=True, backend="fa2"
+        )
+
+
+def test_single_prefill_rejects_bad_k_slot():
+    c = _NEG
+    dev = "cuda:0"
+    q = _neg_q(dev, c["qo_len"])
+    k = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"])
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    v = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    with pytest.raises(AssertionError, match="K slot"):
+        flashinfer.single_prefill_with_kv_cache(
+            q, k, v, use_inline_sf=True, backend="fa2"
+        )
+
+
+def test_single_prefill_rejects_non_fa2_backend():
+    c = _NEG
+    dev = "cuda:0"
+    q = _neg_q(dev, c["qo_len"])
+    k = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    v = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    with pytest.raises(ValueError, match="backend='fa2'"):
+        flashinfer.single_prefill_with_kv_cache(
+            q, k, v, use_inline_sf=True, backend="fa3"
+        )
+
+
+# -- single decode (ragged) -----------------------------------------------
+def test_single_decode_rejects_non_fp8_kv():
+    c = _NEG
+    dev = "cuda:0"
+    q = torch.randn(c["heads"], c["head_dim"], dtype=torch.float16).to(dev)
+    k = torch.randn(
+        c["kv_len"], c["heads"], c["head_dim"] + 16, dtype=torch.float16
+    ).to(dev)
+    v = torch.randn(
+        c["kv_len"], c["heads"], c["head_dim"] + 16, dtype=torch.float16
+    ).to(dev)
+    with pytest.raises(AssertionError, match="fp8"):
+        flashinfer.single_decode_with_kv_cache(q, k, v, use_inline_sf=True)
+
+
+def test_single_decode_rejects_bad_kv_slot():
+    c = _NEG
+    dev = "cuda:0"
+    q = torch.randn(c["heads"], c["head_dim"], dtype=torch.float16).to(dev)
+    # K slot is head_dim (not head_dim + 16) -> the KV last-dim assert fires.
+    k = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"])
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    v = (
+        torch.randn(c["kv_len"], c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    with pytest.raises(AssertionError, match="KV last dim"):
+        flashinfer.single_decode_with_kv_cache(q, k, v, use_inline_sf=True)
+
+
+# -- batch prefill (ragged) ------------------------------------------------
+def test_ragged_prefill_plan_rejects_non_fp8_kv():
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
+    with pytest.raises(AssertionError, match="fp8"):
+        fi.plan(
+            qo_indptr,
+            kv_indptr,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            use_inline_sf=True,
+        )
+
+
+def test_ragged_prefill_plan_rejects_non_fa2_backend():
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa3")
+    with pytest.raises(ValueError, match="backend='fa2'"):
+        fi.plan(
+            qo_indptr,
+            kv_indptr,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            use_inline_sf=True,
+        )
+
+
+def test_ragged_prefill_run_rejects_v_dtype_mismatch():
+    # k is the planned e4m3; v is e5m2 -> run() must reject the dtype mismatch.
+    c = _NEG
+    dev = "cuda:0"
+    total_kv = c["batch"] * c["kv_len"]
+    slot = c["head_dim"] + 16
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
+    fi.plan(
+        qo_indptr,
+        kv_indptr,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    q = _neg_q(dev, c["batch"] * c["qo_len"])
+    k = torch.randn(total_kv, c["heads"], slot).to(dev).to(torch.float8_e4m3fn)
+    v = torch.randn(total_kv, c["heads"], slot).to(dev).to(torch.float8_e5m2)
+    with pytest.raises(ValueError, match="dtype of v"):
+        fi.run(q, k, v)
+
+
+def test_ragged_prefill_run_rejects_bad_k_slot():
+    # k last dim is head_dim (not head_dim + 16) -> run() must reject it.
+    c = _NEG
+    dev = "cuda:0"
+    total_kv = c["batch"] * c["kv_len"]
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
+    fi.plan(
+        qo_indptr,
+        kv_indptr,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    q = _neg_q(dev, c["batch"] * c["qo_len"])
+    k = torch.randn(total_kv, c["heads"], c["head_dim"]).to(dev).to(torch.float8_e4m3fn)
+    v = (
+        torch.randn(total_kv, c["heads"], c["head_dim"] + 16)
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    with pytest.raises(ValueError, match="K last dim"):
+        fi.run(q, k, v)
+
+
+# -- batch prefill (paged) -------------------------------------------------
+def test_paged_prefill_plan_rejects_non_fp8_kv():
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, *_rest) = _paged_kv(
+        c["batch"],
+        c["kv_len"],
+        c["page"],
+        c["heads"],
+        c["head_dim"],
+        torch.float16,
+        torch.float8_e4m3fn,
+        dev,
+        "HND",
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="fa2"
+    )
+    with pytest.raises(AssertionError, match="fp8"):
+        fi.plan(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            c["page"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            use_inline_sf=True,
+        )
+
+
+def test_paged_prefill_plan_rejects_non_fa2_backend():
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, *_rest) = _paged_kv(
+        c["batch"],
+        c["kv_len"],
+        c["page"],
+        c["heads"],
+        c["head_dim"],
+        torch.float16,
+        torch.float8_e4m3fn,
+        dev,
+        "HND",
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="fa3"
+    )
+    with pytest.raises(ValueError, match="backend='fa2'"):
+        fi.plan(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            c["page"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            use_inline_sf=True,
+        )
+
+
+def test_paged_prefill_run_rejects_v_dtype_mismatch():
+    # e5m2 cache vs e4m3 plan; paged K/V share a dtype, so the k-dtype check fires first.
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_slot, *_rest) = (
+        _paged_kv(
+            c["batch"],
+            c["kv_len"],
+            c["page"],
+            c["heads"],
+            c["head_dim"],
+            torch.float16,
+            torch.float8_e4m3fn,
+            dev,
+            "HND",
+        )
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="fa2"
+    )
+    fi.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        c["page"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    q = _neg_q(dev, c["batch"] * c["qo_len"])
+    with pytest.raises(ValueError, match="does not match the kv_data_type"):
+        fi.run(q, kv_slot.to(torch.float8_e5m2))
+
+
+def test_paged_prefill_run_rejects_bad_k_slot():
+    # Cache last dim is head_dim (not head_dim + 16) -> run() must reject it.
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_slot, *_rest) = (
+        _paged_kv(
+            c["batch"],
+            c["kv_len"],
+            c["page"],
+            c["heads"],
+            c["head_dim"],
+            torch.float16,
+            torch.float8_e4m3fn,
+            dev,
+            "HND",
+        )
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="fa2"
+    )
+    fi.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        c["page"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    q = _neg_q(dev, c["batch"] * c["qo_len"])
+    bad_cache = (
+        torch.randn(kv_slot.shape[0], 2, c["heads"], c["page"], c["head_dim"])
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    with pytest.raises(ValueError, match="K cache last dim"):
+        fi.run(q, bad_cache)
+
+
+# -- batch decode (paged) --------------------------------------------------
+def test_decode_batch_plan_rejects_non_fa2_backend():
+    c = _NEG
+    dev = "cuda:0"
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, *_rest) = _paged_kv(
+        c["batch"],
+        c["kv_len"],
+        c["page"],
+        c["heads"],
+        c["head_dim"],
+        torch.float16,
+        torch.float8_e4m3fn,
+        dev,
+        "HND",
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="fa3"
+    )
+    with pytest.raises(ValueError, match="backend='fa2'"):
+        fi.plan(
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            c["page"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            use_inline_sf=True,
+        )
+
+
+def test_decode_batch_run_rejects_bad_k_slot():
+    c = _NEG
+    dev = "cuda:0"
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, kv_slot, *_rest) = (
+        _paged_kv(
+            c["batch"],
+            c["kv_len"],
+            c["page"],
+            c["heads"],
+            c["head_dim"],
+            torch.float16,
+            torch.float8_e4m3fn,
+            dev,
+            "HND",
+        )
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", use_tensor_cores=False
+    )
+    fi.plan(
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        c["page"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    q = torch.randn(c["batch"], c["heads"], c["head_dim"], dtype=torch.float16).to(dev)
+    bad_cache = (
+        torch.randn(kv_slot.shape[0], 2, c["heads"], c["page"], c["head_dim"])
+        .to(dev)
+        .to(torch.float8_e4m3fn)
+    )
+    with pytest.raises(ValueError, match="K cache last dim"):
+        fi.run(q, bad_cache)
+
+
+# -- custom JIT module: use_inline_sf must match the built module ----------
+# The check reads only _jit_module/_jit_use_inline_sf and fires before plan()
+# uses the module, so we fake a non-inline-sf module without compiling.
+
+
+def test_paged_prefill_plan_rejects_jit_inline_sf_mismatch():
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, *_rest) = _paged_kv(
+        c["batch"],
+        c["kv_len"],
+        c["page"],
+        c["heads"],
+        c["head_dim"],
+        torch.float16,
+        torch.float8_e4m3fn,
+        dev,
+        "HND",
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="fa2"
+    )
+    fi._jit_module = object()
+    fi._jit_use_inline_sf = False
+    with pytest.raises(ValueError, match="use_inline_sf must match"):
+        fi.plan(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            c["page"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            use_inline_sf=True,
+        )
+
+
+def test_ragged_prefill_plan_rejects_jit_inline_sf_mismatch():
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
+    fi._jit_module = object()
+    fi._jit_use_inline_sf = False
+    with pytest.raises(ValueError, match="use_inline_sf must match"):
+        fi.plan(
+            qo_indptr,
+            kv_indptr,
+            c["heads"],
+            c["heads"],
+            c["head_dim"],
+            q_data_type=torch.float16,
+            kv_data_type=torch.float8_e4m3fn,
+            use_inline_sf=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 9. split-KV (flash-decoding) coverage for batch decode
+#
+# A long kv_len with a small batch drives the decode kernel onto the split-KV
+# path (the KV range is partitioned across CTAs and the partial results are
+# reduced). This exercises the inline-scale decode kernel under split-KV.
+# NOTE: verify offline that split-KV is actually taken for these sizes (e.g.
+# via FLASHINFER_LOGLEVEL=3, or by confirming the split-kv workspace is used);
+# the numerics check below is valid regardless of which path is taken.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_batch_decode_paged_inline_scale_split_kv(use_tensor_cores):
+    torch.manual_seed(42)
+    dev = "cuda:0"
+    head_dim = 128
+    batch_size = 1
+    kv_len = 4096
+    num_qo_heads = num_kv_heads = 4
+    page_size = 16
+    dtype = torch.float8_e4m3fn
+    q_dtype = torch.float16
+
+    (
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        paged_kv_cache,
+        k_deq_cache,
+        k_orig_cache,
+    ) = _paged_kv(
+        batch_size, kv_len, page_size, num_kv_heads, head_dim, q_dtype, dtype, dev
+    )
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
+
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    ref = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", use_tensor_cores=use_tensor_cores
+    )
+    ref.plan(
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=q_dtype,
+    )
+    o_orig = ref.run(q, k_orig_cache)
+    o_ref = ref.run(q, k_deq_cache)
+
+    fi = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", use_tensor_cores=use_tensor_cores
+    )
+    fi.plan(
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=q_dtype,
+        kv_data_type=dtype,
+        use_inline_sf=True,
+    )
+    o_fp8 = fi.run(q, paged_kv_cache)
+
+    assert o_fp8.shape == (batch_size, num_qo_heads, head_dim), o_fp8.shape
+    _check(o_fp8, o_ref, o_orig, "batch_decode_paged_split_kv")
+
+
 if __name__ == "__main__":
-    # Quick smoke: one config per entry (head_dim 128, e4m3, fp16, MHA).
+    # Quick smoke: one config per entry (head_dim 128, e4m3, fp16, MHA) plus a
+    # couple of cheap negative checks.
     test_single_prefill_inline_scale(
         128, torch.float8_e4m3fn, torch.float16, False, False
     )
@@ -736,12 +1366,14 @@ if __name__ == "__main__":
         128, torch.float8_e4m3fn, torch.float16, False, False
     )
     test_batch_prefill_paged_inline_scale(
-        128, torch.float8_e4m3fn, torch.float16, False, False
+        128, torch.float8_e4m3fn, torch.float16, False, False, "HND"
     )
     test_single_decode_inline_scale(
         128, torch.float8_e4m3fn, torch.float16, False, False
     )
     test_batch_decode_paged_inline_scale(
-        128, torch.float8_e4m3fn, torch.float16, False, False
+        128, torch.float8_e4m3fn, torch.float16, False, False, "HND"
     )
+    test_single_prefill_rejects_non_fp8_kv()
+    test_ragged_prefill_run_rejects_v_dtype_mismatch()
     print("ALL PASS")
