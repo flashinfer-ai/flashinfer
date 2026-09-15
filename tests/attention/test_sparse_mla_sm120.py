@@ -38,6 +38,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _SparseMLAPagedAttentionRunner,
     _sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
 )
+from flashinfer.mla._sparse_mla_sm120_plan import _DECODE_MAX_TOKENS
 from flashinfer.utils import is_sm12x_supported
 
 pytestmark = pytest.mark.skipif(
@@ -393,19 +394,15 @@ _DSV4_DECODE_CONFIGS = [
 ]
 
 
-@pytest.mark.parametrize("num_heads,topk", _DSV4_DECODE_CONFIGS)
-@pytest.mark.parametrize("num_tokens", [1, 16, 64])
-@pytest.mark.parametrize("with_sink", [False, True])
-def test_sparse_mla_sm120_decode_dsv4(
-    num_heads: int, topk: int, num_tokens: int, with_sink: bool
+def _check_decode_dsv4(
+    num_heads: int, topk: int, page_block_size: int, num_tokens: int, with_sink: bool
 ) -> None:
-    """DSv4 decode."""
+    """Run DSv4 decode for one shape and compare against the dense reference."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
-    page_block_size = 64
     num_blocks = 64
-    s_kv = num_blocks * page_block_size  # 4096
+    s_kv = num_blocks * page_block_size
 
     kv_bf16 = (
         torch.randn(
@@ -415,6 +412,18 @@ def test_sparse_mla_sm120_decode_dsv4(
     ).clamp(-1, 1)
     kv_packed = quantize_kv_dsv4(kv_bf16)
     kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    if page_block_size % 2:
+        # 584 bytes/token makes odd-sized packed blocks only 8B-aligned.
+        # Pad between blocks while keeping the payload and footer packed.
+        block_bytes = page_block_size * 584
+        padded = torch.empty(
+            (num_blocks, block_bytes + 8), dtype=torch.uint8, device=device
+        )
+        kv_cache = padded[:, :block_bytes]
+        kv_cache.copy_(kv_packed.reshape(num_blocks, block_bytes))
+    else:
+        kv_cache = kv_packed
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -445,7 +454,7 @@ def test_sparse_mla_sm120_decode_dsv4(
 
     sparse_mla_sm120_paged_attention(
         q,
-        kv_packed,
+        kv_cache,
         indices,
         output,
         out_lse,
@@ -458,6 +467,57 @@ def test_sparse_mla_sm120_decode_dsv4(
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+    if page_block_size != 64:
+        # A scale-relative check catches incorrect page/footer addressing even
+        # when the attention output is smaller than the absolute tolerance.
+        torch.testing.assert_close(
+            output.float(),
+            ref_out.float(),
+            atol=0.05 * ref_out.float().abs().max().item(),
+            rtol=0,
+        )
+
+
+@pytest.mark.parametrize("num_heads,topk", _DSV4_DECODE_CONFIGS)
+@pytest.mark.parametrize("num_tokens", [1, 16, 64])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_decode_dsv4(
+    num_heads: int, topk: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DSv4 decode on the compiled-in 64-token page layout."""
+    _check_decode_dsv4(num_heads, topk, 64, num_tokens, with_sink)
+
+
+# Main-cache page geometries served by the runtime-page instantiation. The
+# reference path (page_block_size=64) runs here too, so a failure that is not
+# specific to page geometry is visible in the same test.
+_DSV4_PAGE_GEOMETRY_CASES = [
+    # (num_heads, topk, page_block_size)
+    (8, 1152, 64),  # control: same shape on the compiled-in layout
+    (8, 1152, 32),  # DeepSeek-V4.1-Flash at TP8: 2*512 index + 128 window
+    (12, 1152, 32),  # the same page size on the runtime-H fallback
+    (128, 1152, 32),  # widest head grid
+    (8, 129, 16),  # ragged top-k, page narrower than the 64-candidate tile
+    (8, 129, 128),  # page wider than the candidate tile
+    (8, 65, 1),  # degenerate page; needs inter-block padding to stay 16B
+    (12, 129, 3),  # odd page on the runtime-H fallback
+]
+
+
+@pytest.mark.parametrize("num_heads,topk,page_block_size", _DSV4_PAGE_GEOMETRY_CASES)
+@pytest.mark.parametrize("num_tokens", [1, _DECODE_MAX_TOKENS])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_decode_dsv4_page_geometry(
+    num_heads: int, topk: int, page_block_size: int, num_tokens: int, with_sink: bool
+) -> None:
+    """DSv4 decode on main-cache pages other than 64 tokens.
+
+    Page size reaches the kernel as gather addresses and the scale-footer
+    offset only, so the failure this guards is silently wrong data, not a
+    launch error: every case is checked against the dense reference.
+    """
+    _check_decode_dsv4(num_heads, topk, page_block_size, num_tokens, with_sink)
 
 
 @pytest.mark.parametrize("num_heads", [8, 64])
@@ -923,16 +983,18 @@ def test_sparse_mla_sm120_decode_dots3_swa(
 
 
 @pytest.mark.parametrize("num_heads", [8, 32])
-@pytest.mark.parametrize("topk,topk_len", [(192, 133), (256, 133), (512, 128)])
+@pytest.mark.parametrize(
+    "topk,topk_len,page_block_size",
+    [(192, 133, 64), (256, 133, 64), (512, 128, 64), (1152, 133, 32)],
+)
 def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation(
-    num_heads: int, topk: int, topk_len: int
+    num_heads: int, topk: int, topk_len: int, page_block_size: int
 ) -> None:
     """DSv4 decode honors topk_length."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens = 16
     d_qk, d_v = 512, 512
-    page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size
 
@@ -1147,22 +1209,23 @@ def test_sparse_mla_sm120_decode_row_strided_indices(family: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "num_heads,topk,num_tokens,kv_layout",
+    "num_heads,topk,num_tokens,kv_layout,page_block_size",
     [
-        (32, 128, 7, "NHD"),
-        (32, 192, 7, "HND"),
-        (32, 256, 7, "HND"),
-        (8, 192, 128, "HND"),
-        (8, 256, 128, "HND"),
+        (32, 128, 7, "NHD", 64),
+        (32, 192, 7, "HND", 64),
+        (32, 256, 7, "HND", 64),
+        (8, 192, 128, "HND", 64),
+        (8, 256, 128, "HND", 64),
+        (8, 1152, 8, "NHD", 32),
+        (8, 1152, 8, "HND", 32),
     ],
 )
 def test_sparse_mla_sm120_dsv4_public_api(
-    num_heads: int, topk: int, num_tokens: int, kv_layout: str
+    num_heads: int, topk: int, num_tokens: int, kv_layout: str, page_block_size: int
 ) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
-    page_block_size = 64
     num_blocks = 32
     s_kv = num_blocks * page_block_size
 
@@ -1219,6 +1282,24 @@ def test_sparse_mla_sm120_dsv4_public_api(
     assert returned.data_ptr() == out_buffer.data_ptr()
     torch.testing.assert_close(out_buffer.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
+    if page_block_size == 32:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+                query=q.unsqueeze(1),
+                swa_kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                sparse_indices=indices,
+                seq_lens=seq_lens,
+                out=out_buffer,
+                swa_topk_lens=swa_topk_lens,
+                bmm1_scale=sm_scale,
+                kv_layout=kv_layout,
+            )
+        out_buffer.zero_()
+        graph.replay()
+        torch.testing.assert_close(out_buffer.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
+
     with pytest.raises(ValueError, match="only supports BF16 query"):
         flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
             query=q.to(torch.float8_e4m3fn).unsqueeze(1),
@@ -1232,14 +1313,18 @@ def test_sparse_mla_sm120_dsv4_public_api(
         )
 
 
-def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
+@pytest.mark.parametrize(
+    "main_pbs,topk,num_heads", [(64, 128, 16), (32, 1152, 8), (48, 193, 12)]
+)
+@pytest.mark.parametrize("extra_pbs", [2, 64])
+def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk(
+    main_pbs: int, topk: int, num_heads: int, extra_pbs: int
+) -> None:
     """DSv4 dual-cache decode handles large compressed top-k."""
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_tokens, num_heads = 1, 16
-    topk, extra_topk = 128, 2176
+    num_tokens, extra_topk = 1, 2176
     d_qk, d_v = 512, 512
-    main_pbs, extra_pbs = 64, 2
     main_num_blocks = 16
     extra_num_blocks = (extra_topk + extra_pbs - 1) // extra_pbs
     main_s_kv = main_num_blocks * main_pbs
