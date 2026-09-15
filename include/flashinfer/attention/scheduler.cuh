@@ -1622,9 +1622,11 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   int cluster_tile_q = cluster_size * cta_tile_q;
 
   int64_t total_kv_lens = 0;
+  int64_t total_num_qo_tiles = 0;
   for (auto& [_, qo_len, kv_len] : idx_qo_kv_len_vec) {
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
+    total_num_qo_tiles += num_qo_tiles;
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
       int effective_kv_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
                                                            cluster_tile_q, num_qo_tiles, num_heads)
@@ -1738,13 +1740,30 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                    "Internal Error: merge_cta_counter should be less than or equal to num_sm, "
                    "please report this bug to the developers");
 
-  int max_total_num_works = 16384;  // NOTE(Zihao): adjust it later
+  // Upper bound on total_num_works, so the per-work plan arrays below are always large enough.
+  //
+  // The loop above emits max(ceil_div(remaining_len, kv_len_limit), 1) works per (request, q tile),
+  // and ceil_div(a, b) <= a / b + 1, so
+  //
+  //   total_num_works <= sum(remaining_len) / kv_len_limit + total_num_qo_tiles
+  //
+  // sum(remaining_len) is total_kv_lens, and kv_len_limit >= ceil_div(total_kv_lens, num_clusters)
+  // because f() is non-shrinking, so the first term is at most num_clusters.
+  //
+  // The 16384 floor is what this used to allocate unconditionally. Keeping it means every problem
+  // that fits today keeps the exact plan-info offsets it has now, which matters because a captured
+  // CUDA graph reuses the int workspace across replans.
+  int max_total_num_works = static_cast<int>(
+      std::max<int64_t>(16384, total_num_qo_tiles + static_cast<int64_t>(num_clusters)));
 
   std::vector<IdType> work_indptr_vec(num_clusters + 1, 0);
   for (uint32_t i = 0; i < num_clusters; ++i) {
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cluster_q_indptr[i].size();
   }
   int total_num_works = work_indptr_vec.back();
+  FLASHINFER_CHECK(total_num_works <= max_total_num_works,
+                   "Internal Error: total_num_works should be less than or equal to "
+                   "max_total_num_works, please report this bug to the developers");
   auto q_indptr_vec = flatten(cluster_q_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cluster_kv_indptr, total_num_works);
   auto partial_indptr_vec = flatten(cluster_partial_indptr, total_num_works);
