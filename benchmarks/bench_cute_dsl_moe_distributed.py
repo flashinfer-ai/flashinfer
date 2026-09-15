@@ -884,7 +884,7 @@ def _create_distributed_moe_layer(
         CuteDslConfig.prepare_weights(
             w13,
             w2,
-            variant=moe_config.quant.variant,
+            quant=moe_config.quant,
             num_local_experts=num_local_experts,
             hidden_size=CFG.hidden_size,
             intermediate_size=intermediate_size,

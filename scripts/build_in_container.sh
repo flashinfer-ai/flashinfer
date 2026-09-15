@@ -109,7 +109,7 @@ export VIRTUAL_ENV="${VENV}"
 
 uv pip install --python "${VENV}/bin/python" \
     torch setuptools packaging \
-    "apache-tvm-ffi>=0.1.6,<0.2,!=0.1.8,!=0.1.8.post0" \
+    "apache-tvm-ffi>=0.1.11,<0.2" \
     cython pybind11
 
 # NIXL-EP runtime base library — supplied by this pip wheel; the NIXL-EP
@@ -140,7 +140,7 @@ if [[ -n "${CUDA_EXTRA_DEPENDENCY_OUTPUT}" ]]; then
 fi
 uv pip install --python "${VENV}/bin/python" \
     numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
-    "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.13.0" \
+    "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.29.0" \
     "cuda-tile>=1.4.0" "cuda-python>=13.0" \
     "nccl-extensions>=0.1.0" "nccl4py>=0.4.1" \
     "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
