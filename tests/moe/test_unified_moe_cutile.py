@@ -514,6 +514,96 @@ def test_cutile_bf16_runner_matches_reference(
 
 @cutile_bf16_required
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+def test_cutile_bf16_sorted_io_matches_unsorted(activation, monkeypatch):
+    from flashinfer.fused_moe import runners as runners_module
+
+    device = torch.device("cuda")
+    # 192 and 96 leave partial tiles on every GEMM edge, and 64 tokens x top_k 2
+    # over 4 experts fill several routing blocks per expert.
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k = 64, 192, 96, 4, 2
+    torch.manual_seed(1)
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    w1 = (
+        torch.randn(
+            num_experts,
+            intermediate_size * (2 if activation.is_gated else 1),
+            hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / hidden_size**0.5
+    )
+    w2 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        / intermediate_size**0.5
+    )
+    ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    routing_weights = torch.softmax(
+        torch.randn(num_tokens, top_k, device=device), dim=-1
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        "cutile_bf16",
+        CuTileBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+        ),
+    )
+    act = MoEActivationPack(hidden_states, None, ids, routing_weights)
+
+    def run(min_assignments: int) -> torch.Tensor:
+        monkeypatch.setattr(
+            runners_module, "_CUTILE_BF16_SORTED_IO_MIN_ASSIGNMENTS", min_assignments
+        )
+        monkeypatch.setattr(
+            runners_module, "_CUTILE_BF16_SORTED_IO_MIN_INTERMEDIATE", 0
+        )
+        config = _config(
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=intermediate_size,
+            tune_max_num_tokens=num_tokens,
+            activation=activation,
+        )
+        runner = CuTileBf16Runner(config, device)
+        runner.check_support()
+        runner.build()
+        inputs = runner.pack_inputs(act, weights)
+        tactic = runner._fallback_tactic(inputs)
+        out = runner.forward(inputs, tactic=tactic).clone()
+        assert runner._use_sorted_io(num_tokens * top_k) is (min_assignments == 0)
+        assert runner._workspace.activation_out.shape[0] >= (
+            num_tokens * top_k
+            + (
+                num_experts * (max(runner._block_sizes) - 1)
+                if min_assignments == 0
+                else 0
+            )
+        )
+        return out
+
+    unsorted = run(1 << 30)
+    sorted_io = run(0)
+    assert torch.isfinite(sorted_io).all()
+    torch.testing.assert_close(sorted_io, unsorted, rtol=0, atol=0)
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_int64_specialization_matches_int32(activation, monkeypatch):
     device = torch.device("cuda")
     num_tokens, hidden_size, intermediate_size = 3, 64, 64
