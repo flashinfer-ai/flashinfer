@@ -2377,6 +2377,24 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16():
     )
 
 
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_ragged_kv_cache_nvfp4_head_dim_256(q_dtype):
+    # Ragged counterpart of the paged head_dim 256 case above: the two launchers size their
+    # shared-memory budget independently, so the widest repack-eligible shape has to run on
+    # both.
+    skip_if_head_dim_unsupported(256)
+    test_batch_prefill_with_ragged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=256,
+        qo_len=128,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=256,
+        causal=False,
+        q_dtype=q_dtype,
+    )
+
+
 def test_batch_prefill_with_ragged_kv_cache_nvfp4_large_head():
     skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_ragged_kv_cache_nvfp4(
