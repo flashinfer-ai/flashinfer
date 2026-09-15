@@ -907,12 +907,43 @@ class GmemCResource(MemoryResource):
                         warp_idx,
                     )
 
+    @producer_work
+    @cute.jit
+    def store_non_swap_overlap(
+        self,
+        stage_info: StageInfo,
+        *,
+        t2r_rmem: cutlass.Float32,
+        t2r_rmem_1: cutlass.Float32,
+        t2r_output_call_idx: Int32,
+    ) -> None:
+        """Store the one or two fragments preloaded from shared TMEM columns."""
+        if self.gC is not None:
+            tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
+            warp_idx = cute.arch.warp_idx()
+            self._store_non_swap_32x32b(
+                t2r_rmem,
+                tile_coord_m,
+                tile_coord_n,
+                t2r_output_call_idx,
+                warp_idx,
+            )
+            overlap_loads = self.cfg.non_swap_tmem_overlap_loads
+            if cutlass.const_expr(overlap_loads == 2):
+                self._store_non_swap_32x32b(
+                    t2r_rmem_1,
+                    tile_coord_m,
+                    tile_coord_n,
+                    t2r_output_call_idx + Int32(1),
+                    warp_idx,
+                )
+
     @cute.jit
     def _store_non_swap_32x32b(
         self, t2r_rmem, tile_coord_m, tile_coord_n, call_idx, warp_idx
     ):
         """Non-swapAB: 32x32b T2R, row-major output."""
-        epi_t2r_repx = self.cfg.epi_tile_n // 4
+        epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
         warp_in_epi = warp_idx - Int32(self.cfg.epilogue_warp_idx)
         warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
         lane_id = cute.arch.lane_idx()
@@ -1050,38 +1081,82 @@ class GmemCResource(MemoryResource):
         warp_idx,
     ):
         """Stage one non-swap epilogue subtile to SMEM and TMA-store it."""
-        epi_t2r_repx = self.cfg.epi_tile_n // 4
-        tma_store_cols = min(16, max(8, self.cfg.tile_n))
+        epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+        tma_store_cols = self.cfg.non_swap_tma_store_cols
         calls_per_tma = max(1, tma_store_cols // epi_t2r_repx)
         call_in_tma = call_idx % calls_per_tma
-        # Each TMA group is committed and waited before the next group starts,
-        # so the same scratch box can be reused across output subtiles.
-        smem_box_base = self.sC
-        smem_row = smem_box_base.subview(
-            row_in_tile * Int32(tma_store_cols) + Int32(call_in_tma * epi_t2r_repx)
+        use_tile256_overlap = (
+            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
         )
-        if token_in_bounds:
-            smem_row.store(
-                vec_out,
-                vector_size=epi_t2r_repx,
-                alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
-            )
+        # In the max-overlap path, wait only when the next TMA group is about
+        # to reuse the scratch box. Keep the waits at the actual store sites:
+        # placing one at the top of this helper lets PTXAS hoist it ahead of
+        # the independent epilogue math and shortens the intended overlap.
+        smem_box_base = self.sC
+        smem_col = Int32(call_in_tma * epi_t2r_repx)
+        if cutlass.const_expr(self.cfg.dtype_c_bits == 16 and use_tile256_overlap):
+            # Match the TMA descriptor's 32/64/128-byte swizzle. Split the
+            # coalesced max-overlap fragment into 16-byte atoms because TMA
+            # swizzling permutes those atoms within each row; a wider vector
+            # store could cross a swizzle boundary. Non-overlap schedules keep
+            # the established row-vector staging layout below.
+            if token_in_bounds:
+                if cutlass.const_expr(use_tile256_overlap):
+                    if call_in_tma == Int32(0):
+                        prims.cp_async_bulk_wait_group(0, read=True)
+                        prims.barrier_cta_sync(
+                            barrier_id=9,
+                            thread_count=self.cfg.num_epilogue_warps * 32,
+                        )
+                self._stage_non_swap_16bit_tma_vec(vec_out, row_in_tile, smem_col)
+            else:
+                zero_vec = cutlass.vector.full_like(vec_out, 0.0)
+                if cutlass.const_expr(use_tile256_overlap):
+                    if call_in_tma == Int32(0):
+                        prims.cp_async_bulk_wait_group(0, read=True)
+                        prims.barrier_cta_sync(
+                            barrier_id=9,
+                            thread_count=self.cfg.num_epilogue_warps * 32,
+                        )
+                self._stage_non_swap_16bit_tma_vec(zero_vec, row_in_tile, smem_col)
         else:
-            zero_vec = cutlass.vector.full_like(vec_out, 0.0)
-            smem_row.store(
-                zero_vec,
-                vector_size=epi_t2r_repx,
-                alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
+            smem_row = smem_box_base.subview(
+                row_in_tile * Int32(tma_store_cols) + smem_col
             )
+            if token_in_bounds:
+                if cutlass.const_expr(use_tile256_overlap):
+                    if call_in_tma == Int32(0):
+                        prims.cp_async_bulk_wait_group(0, read=True)
+                        prims.barrier_cta_sync(
+                            barrier_id=9,
+                            thread_count=self.cfg.num_epilogue_warps * 32,
+                        )
+                smem_row.store(
+                    vec_out,
+                    vector_size=epi_t2r_repx,
+                    alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
+                )
+            else:
+                zero_vec = cutlass.vector.full_like(vec_out, 0.0)
+                if cutlass.const_expr(use_tile256_overlap):
+                    if call_in_tma == Int32(0):
+                        prims.cp_async_bulk_wait_group(0, read=True)
+                        prims.barrier_cta_sync(
+                            barrier_id=9,
+                            thread_count=self.cfg.num_epilogue_warps * 32,
+                        )
+                smem_row.store(
+                    zero_vec,
+                    vector_size=epi_t2r_repx,
+                    alignment=((1 if self.cfg.uses_fp8_output else 2) * epi_t2r_repx),
+                )
 
         cute.arch.fence_view_async_shared()
         prims.barrier_cta_sync(
             barrier_id=9,
             thread_count=self.cfg.num_epilogue_warps * 32,
         )
-        if cutlass.const_expr(
-            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
-        ):
+        if cutlass.const_expr(use_tile256_overlap):
             if call_in_tma == Int32(calls_per_tma - 1):
                 tma_col_base = col_base - Int32(call_in_tma * epi_t2r_repx)
                 if (warp_idx == Int32(self.cfg.epilogue_warp_idx)) & prims.elect_sync():
@@ -1091,7 +1166,8 @@ class GmemCResource(MemoryResource):
                         (tma_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
                     )
                     prims.cp_async_bulk_commit_group()
-                prims.cp_async_bulk_wait_group(0, read=True)
+                if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+                    prims.cp_async_bulk_wait_group(0, read=True)
         elif cutlass.const_expr(call_in_tma == calls_per_tma - 1):
             tma_col_base = col_base - Int32(call_in_tma * epi_t2r_repx)
             if (warp_idx == Int32(self.cfg.epilogue_warp_idx)) & prims.elect_sync():
@@ -1106,6 +1182,52 @@ class GmemCResource(MemoryResource):
             barrier_id=9,
             thread_count=self.cfg.num_epilogue_warps * 32,
         )
+
+    @cute.jit
+    def _non_swap_16bit_tma_smem_element_offset(self, m_local_row, n_local_col):
+        """Map a row-major 16-bit C element into the TMA-swizzled scratch."""
+        tma_store_cols = Int32(self.cfg.non_swap_tma_store_cols)
+        smem_offset_bytes = (m_local_row * tma_store_cols + n_local_col) * Int32(2)
+        if cutlass.const_expr(self.cfg.non_swap_tma_store_cols >= 64):
+            swizzle_mask = (m_local_row % Int32(8)) * Int32(16)
+        elif cutlass.const_expr(self.cfg.non_swap_tma_store_cols >= 32):
+            swizzle_mask = (m_local_row % Int32(4)) * Int32(16)
+        elif cutlass.const_expr(self.cfg.non_swap_tma_store_cols >= 16):
+            swizzle_mask = (m_local_row % Int32(2)) * Int32(16)
+        else:
+            swizzle_mask = Int32(0)
+        return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
+
+    @cute.jit
+    def _stage_non_swap_16bit_tma_vec(self, vec_out, m_local_row, n_local_col):
+        """Stage a 16-bit fragment as independently swizzled 16-byte atoms."""
+        epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+        full_atoms = epi_t2r_repx // 8
+        for atom_idx in cutlass.range_constexpr(full_atoms):
+            atom_col = atom_idx * 8
+            atom = tuple(vec_out[atom_col + elem_idx] for elem_idx in range(8))
+            smem_offset = self._non_swap_16bit_tma_smem_element_offset(
+                m_local_row, n_local_col + Int32(atom_col)
+            )
+            self.sC.store(
+                atom,
+                idx=smem_offset,
+                vector_size=8,
+                alignment=16,
+            )
+        tail_elems = epi_t2r_repx % 8
+        if cutlass.const_expr(tail_elems != 0):
+            atom_col = full_atoms * 8
+            tail = tuple(vec_out[atom_col + elem_idx] for elem_idx in range(tail_elems))
+            smem_offset = self._non_swap_16bit_tma_smem_element_offset(
+                m_local_row, n_local_col + Int32(atom_col)
+            )
+            self.sC.store(
+                tail,
+                idx=smem_offset,
+                vector_size=tail_elems,
+                alignment=2 * tail_elems,
+            )
 
     @cute.jit
     def _bf16_tma_smem_element_offset(self, m_local_row, n_local_col):
