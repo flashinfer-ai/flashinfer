@@ -69,6 +69,8 @@ class IpcVariant(IntEnum):
     # candidate list on fabrics it does not describe, where it lost to both
     # the flat ring and the SM path.
     COPY_ENGINE_ISLAND = 5
+    # Single-piece flat ring with CE stream publication, enabled jointly on SM120.
+    COPY_ENGINE_RING_MEMOP = 6
 
 
 @dataclass(frozen=True)
@@ -173,7 +175,11 @@ def _is_launchable(
     candidate that reaches the launcher and fails its hard check raises on one
     rank while its peers spin with no timeout.
     """
-    if config.variant in (IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND):
+    if config.variant in (
+        IpcVariant.COPY_ENGINE_RING,
+        IpcVariant.COPY_ENGINE_ISLAND,
+        IpcVariant.COPY_ENGINE_RING_MEMOP,
+    ):
         if config.variant == IpcVariant.COPY_ENGINE_ISLAND and world_size != 8:
             return False
         # A copy-engine variant is not exempt from the world-size-2 rule just

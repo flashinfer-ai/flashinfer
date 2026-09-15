@@ -334,11 +334,11 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
 ) -> torch.Tensor:
     """Run prequantized SM120 Sage block-sparse attention.
 
-    All CUDA storage is caller-owned. ``out`` is contiguous BF16 BHSD and
-    ``tma_descriptor_workspace`` is contiguous, 128-byte-aligned CUDA uint8
-    storage. Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS,
-    and the operation supports MHA, head dimension 128, non-causal forward
-    without LSE.
+    All CUDA storage is caller-owned. ``out`` is contiguous BF16 BHSD.
+    Tensor-map descriptors are passed by value as grid-constant kernel
+    parameters; ``tma_descriptor_workspace`` is accepted but unused.
+    Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS, and the
+    operation supports MHA, head dimension 128, non-causal forward without LSE.
     """
     import tvm_ffi  # noqa: PLC0415
 
@@ -367,10 +367,9 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
         "v_scale": v_scale,
         "q2k_block_index": q2k_block_index,
         "out": out,
-        "tma_descriptor_workspace": tma_descriptor_workspace,
     }
     if not all(isinstance(value, torch.Tensor) for value in tensors.values()):
-        raise TypeError("all input, output, and workspace values must be torch.Tensor")
+        raise TypeError("all input and output values must be torch.Tensor")
     device = q_int8.device
     if device.type != "cuda" or device.index != torch.cuda.current_device():
         raise ValueError("q_int8 must use the current CUDA device")
@@ -396,11 +395,6 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
     ):
         if tensor.dtype != torch.float32:
             raise TypeError(f"{name} must use torch.float32")
-    if tma_descriptor_workspace.dtype != torch.uint8:
-        raise TypeError("tma_descriptor_workspace must use torch.uint8")
-    if tma_descriptor_workspace.data_ptr() % 128:
-        raise ValueError("tma_descriptor_workspace must be 128-byte aligned")
-
     if q_int8.ndim != 4:
         raise ValueError("q_int8 must be rank-4 BHSD")
     batch, heads, seqlen_q, head_dim = (int(value) for value in q_int8.shape)
@@ -484,11 +478,6 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
         uniform_nonempty,
         int(contiguous_block_indices),
     )
-    required_workspace = int(record["tma_workspace_bytes"])
-    if tma_descriptor_workspace.numel() < required_workspace:
-        raise ValueError(
-            f"tma_descriptor_workspace requires at least {required_workspace} bytes"
-        )
     bindings = {
         "Q_map": q_int8,
         "K_map": k_int8,
@@ -507,7 +496,6 @@ def _bsa_attn_sm120_blk64_sage_fwd_cake(
         "num_k_blocks": k_blocks,
         "block_sparse_num": block_sparse_num,
         "softmax_scale": float(softmax_scale),
-        "tma_descriptor_workspace": tma_descriptor_workspace,
         "grid_x": q_blocks,
         "grid_y": heads,
         "grid_z": batch,
@@ -545,11 +533,11 @@ def bsa_attn_sm120_blk64_sage_fwd(
 ) -> torch.Tensor:
     """Run prequantized SM120 Sage block-sparse attention.
 
-    All CUDA storage is caller-owned. ``out`` is contiguous BF16 BHSD and
-    ``tma_descriptor_workspace`` is contiguous, 128-byte-aligned CUDA uint8
-    storage. Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS,
-    and the operation supports MHA, head dimension 128, non-causal forward
-    without LSE.
+    All CUDA storage is caller-owned. ``out`` is contiguous BF16 BHSD.
+    Tensor-map descriptors are passed by value as grid-constant kernel
+    parameters; ``tma_descriptor_workspace`` is accepted but unused.
+    Q/K use contiguous INT8 BHSD, V uses contiguous FP8 E4M3 HDS, and the
+    operation supports MHA, head dimension 128, non-causal forward without LSE.
 
     Parameters
     ----------
@@ -585,13 +573,20 @@ def bsa_attn_sm120_blk64_sage_fwd(
     out : torch.Tensor
         Caller-owned contiguous BF16 output with shape ``[B, H, Sq, 128]``.
     tma_descriptor_workspace : torch.Tensor
-        Caller-owned contiguous CUDA uint8 workspace, aligned to 128 bytes
-        and large enough for the selected generated kernel.
+        Accepted for compatibility and unused. An empty tensor is sufficient;
+        this operation neither reads nor writes its storage. Tensor-map
+        descriptors are passed by value in the kernel launch, so workspace
+        contents, lifetime, and reuse across streams do not affect attention.
     uniform_block_count : bool
         Whether every query block uses ``block_sparse_num`` selected blocks.
+        This is a caller-provided guarantee: when true, ``q2k_block_nums``
+        is ignored and its values are not checked.
     contiguous_block_indices : bool
         Whether selected block indices are contiguous. This optimization
-        requires ``uniform_block_count=True``.
+        requires ``uniform_block_count=True`` and trusts the caller's
+        guarantee without checking the indices. Non-contiguous top-k indices
+        must use ``False``, even when sorted. Incorrectly setting this flag
+        to ``True`` can produce incorrect output without raising an error.
     backend : str
         Backend name. The only supported value is ``"cake"``.
 
@@ -599,6 +594,21 @@ def bsa_attn_sm120_blk64_sage_fwd(
     -------
     torch.Tensor
         The caller-owned ``out`` tensor after attention output is written.
+
+    Notes
+    -----
+    Non-contiguous indices support both per-row ``q2k_block_nums`` and the
+    scalar ``block_sparse_num`` count, with every supported ``block_sizes``
+    layout and with aligned or partial final KV blocks. Omitting
+    ``q2k_block_nums`` uses the scalar count even when
+    ``uniform_block_count=False``. Setting ``uniform_block_count=True``
+    uses the scalar count and ignores any supplied per-row counts. A row
+    selecting zero blocks produces an exactly zero output.
+
+    Initialize the JIT module before CUDA Graph capture. Keep captured input
+    and output tensors alive while their graph is in use. Each captured launch
+    retains its own tensor-map descriptors, so launches with different tensor
+    bindings can be interleaved without shared descriptor storage.
     """
     if backend != "cake":
         raise ValueError(f"unsupported SM120 Sage backend: {backend!r}")

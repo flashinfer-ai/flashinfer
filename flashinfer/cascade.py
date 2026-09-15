@@ -516,6 +516,21 @@ class MultiLevelCascadeAttentionWrapper:
                 kv_data_type=kv_data_type,
             )
 
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Prewarm every level's lazy paged-KV-stride variant after :meth:`plan`.
+
+        Call this method before CUDA graph capture.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        for wrapper in self._batch_prefill_wrappers:
+            wrapper.prewarm_paged_kv_stride_variant(variant)
+
     begin_forward = plan
 
     @flashinfer_api(trace=multi_level_cascade_run_trace)
@@ -1001,6 +1016,20 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             head_dim,
             page_size,
         )
+
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Prewarm the underlying prefill wrapper's paged-KV-stride variant.
+
+        Call this method after :meth:`begin_forward` and before CUDA graph capture.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        self._batch_prefill_wrapper.prewarm_paged_kv_stride_variant(variant)
 
     @flashinfer_api
     def forward(

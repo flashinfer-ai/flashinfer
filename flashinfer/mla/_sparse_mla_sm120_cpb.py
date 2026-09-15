@@ -83,10 +83,13 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 # Only current-schema files load; any other version counts as absent and the
-# families recalibrate on the next tuning-mode pass.
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
+# families recalibrate on the next tuning-mode pass. v2: glm53_nope rows went
+# 656B -> 528B — constants and measured overrides can otherwise retain the old
+# 656B footprint, and a stale entry would silently overstate the L2 footprint
+# in the cpb guard.
+_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
 # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
@@ -555,6 +558,10 @@ def calibrate(
     props = torch.cuda.get_device_properties(device)
     sm_count = int(props.multi_processor_count)
     l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
+    # On integrated-memory devices (GB10) the L2 is shared with the CPU fabric
+    # and the effective streaming window measures ~half the reported size.
+    if int(getattr(props, "is_integrated", 0) or 0):
+        l2_cache_bytes //= 2
     bi = _CHUNK_WIDTH[family]
     w = bi * _BYTES_PER_TOKEN[family]
     # Families whose decode is instantiated at a single topk have a fixed N,
@@ -982,10 +989,12 @@ def _maybe_load_disk() -> None:
         return
     try:
         payload = json.loads(path.read_text())
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != _SCHEMA_VERSION
-        ):
+        if not isinstance(payload, dict):
+            return
+        if payload.get("schema_version") != _SCHEMA_VERSION:
+            # This file version cannot supply entries. Retry only after it
+            # changes, rather than reparsing stale tuning on every lookup.
+            _cache_mtime = mtime
             return
         devices = payload["devices"]
         if not isinstance(devices, dict):
