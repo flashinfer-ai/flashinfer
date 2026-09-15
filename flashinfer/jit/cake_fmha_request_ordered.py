@@ -34,6 +34,88 @@ _CONTRACT = {
 }
 
 
+_FP8Q_MANIFEST_NAME = "cake_fmha_request_ordered_paged_decode_fp8q_manifest.json"
+_FP8Q_CONTRACT: dict[str, Any] = {
+    "query_dtype": "float8_e4m3fn",
+    "output_dtype": "bfloat16",
+    "kv_dtype": "float8_e4m3fn",
+    "softmax_accumulation_dtype": "float32",
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 64,
+    "q_len": 6,
+    "batch_sizes": [64],
+    "minimum_kv_len": 6,
+    "write_lse": False,
+    "kv_strides": [32768, 256, 512, 1],
+    "shared_page_table": True,
+    "request_order": "device_int32_permutation",
+}
+
+
+def _fp8q_source_root() -> Path:
+    directory = "request_ordered_paged_decode_fp8q"
+    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory
+    for candidate in (installed, checkout):
+        if (candidate / _FP8Q_MANIFEST_NAME).is_file():
+            return candidate
+    raise FileNotFoundError("request-ordered FP8-Q sources were not found")
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_fp8q_manifest() -> dict[str, Any]:
+    """Authenticate the independent FP8-query, BF16-output export contract."""
+    root = _fp8q_source_root()
+    manifest = json.loads((root / _FP8Q_MANIFEST_NAME).read_text(encoding="utf-8"))
+    _require(
+        manifest.get("schema") == "flashinfer.cake_fmha_request_ordered_fp8q.v1",
+        "FP8-Q schema",
+    )
+    _require(manifest.get("target") == "sm_103a", "FP8-Q target")
+    _require(manifest.get("contract") == _FP8Q_CONTRACT, "FP8-Q contract")
+    modules, bindings = manifest.get("modules"), manifest.get("bindings")
+    _require(
+        isinstance(modules, list) and isinstance(bindings, list), "FP8-Q inventory"
+    )
+    names = _verify_modules(root, modules)
+    _require(
+        len(modules) == len(bindings) == len(_FP8Q_CONTRACT["batch_sizes"]),
+        "FP8-Q inventory count",
+    )
+    _require(manifest.get("module_count") == len(modules), "FP8-Q module count")
+    seen = set()
+    for binding in bindings:
+        batch = binding.get("batch_size")
+        _require(
+            batch in _FP8Q_CONTRACT["batch_sizes"] and batch not in seen, "FP8-Q batch"
+        )
+        seen.add(batch)
+        expected = dict(
+            batch_size=batch,
+            q_len=6,
+            num_q_heads=32,
+            num_kv_heads=2,
+            workspace_parts=1,
+            grid=[1, 1, batch * 2],
+            total_tiles=batch * 2,
+            write_lse=False,
+            query_dtype="float8_e4m3fn",
+        )
+        _require(
+            {key: value for key, value in binding.items() if key != "module_name"}
+            == expected,
+            "FP8-Q binding",
+        )
+        _require(binding.get("module_name") in names, "FP8-Q module binding")
+    _require(
+        {binding["module_name"] for binding in bindings} == names,
+        "FP8-Q module coverage",
+    )
+    return manifest
+
+
 @dataclass(frozen=True)
 class CakeFmhaRequestOrderedModuleSpec:
     """One authenticated generated source pair."""
@@ -321,14 +403,18 @@ def get_cake_fmha_request_ordered_module_spec(
         if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_")
         else (8, 1)
     )
-    runtime_q = "_runtime_q_" in name
-    root = _source_root(*geometry, runtime_q=runtime_q)
-    reader = (
-        get_cake_fmha_request_ordered_runtime_q_manifest
-        if runtime_q
-        else get_cake_fmha_request_ordered_manifest
-    )
-    manifest = reader(*geometry)
+    if name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_"):
+        root = _fp8q_source_root()
+        manifest = get_cake_fmha_request_ordered_fp8q_manifest()
+    else:
+        runtime_q = "_runtime_q_" in name
+        root = _source_root(*geometry, runtime_q=runtime_q)
+        reader = (
+            get_cake_fmha_request_ordered_runtime_q_manifest
+            if runtime_q
+            else get_cake_fmha_request_ordered_manifest
+        )
+        manifest = reader(*geometry)
     matches = [module for module in manifest["modules"] if module["name"] == name]
     if len(matches) != 1:
         raise ValueError(f"unknown request-ordered FMHA module: {name}")

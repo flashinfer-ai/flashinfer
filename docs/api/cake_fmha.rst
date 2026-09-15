@@ -103,3 +103,26 @@ head dimension 256 and page size 64, explicitly setting ``num_kv_splits=76``
 selects the O-only split route. This route requires at least 43,671,552 bytes
 in ``workspace_buffer`` and the existing separate 24-element completion buffer.
 The default route and LSE-returning routes are unchanged.
+
+FP8-query request-ordered route
+------------------------------
+
+An explicit ``query_dtype=torch.float8_e4m3fn`` plan selects a separate
+FP8 E4M3-query/FP8 E4M3-KV route with BF16 output. It currently supports batch
+64, six query tokens per request, 32 query heads, two KV heads, head dimension
+256 and page size 64 on a 152-SM SM103 device. Every KV length must be at least
+six; split execution and LSE output are unavailable for this export.
+
+Queries are contiguous ``[384, 32, 256]``. K/V use HND views
+``[pages, 2, 64, 256]`` with strides ``[32768, 256, 512, 1]``, directly viewing
+native ``[pages, 64, 2, 256]`` storage. Use shared contiguous int32 page tables,
+a device int32 request permutation, and device FP32 log2 QK/output scales.
+The kernel reads these caller buffers directly without external gather or
+scatter. The default BF16-query planner and its existing routes are unchanged.
+
+The existing ``CakeFmhaRequestOrderedCapture`` protocol applies. Give each live
+graph binding its own 128-byte-aligned uint8 workspace of at least 388 bytes,
+warm an ordinary invocation, record with the capture object, and finalize it
+before replay. Keep its workspace alive with the graph. Tensor contents may
+change in place while their storage, shape and minimum-length contract remain
+valid.

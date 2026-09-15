@@ -35,6 +35,7 @@ from .jit.cake_fmha import (
 )
 from .jit.cake_fmha_request_ordered import (
     get_cake_fmha_request_ordered_manifest,
+    get_cake_fmha_request_ordered_fp8q_manifest,
     get_cake_fmha_request_ordered_runtime_q_manifest,
     load_cake_fmha_request_ordered_module,
 )
@@ -54,6 +55,7 @@ class CakeFmhaRequestOrderedDecodePlan:
     write_lse: bool
     num_q_heads: int = 8
     num_kv_heads: int = 1
+    query_dtype: torch.dtype = torch.bfloat16
 
 
 def _request_ordered_plan_from_route(
@@ -322,6 +324,33 @@ def _dynamic_split_cake_fmha_request_ordered_plan(
     )
 
 
+def _fp8q_request_ordered_plan(
+    *, batch_size: int, q_len: int, num_q_heads: int, num_kv_heads: int, write_lse: bool
+) -> CakeFmhaRequestOrderedDecodePlan | None:
+    for row in get_cake_fmha_request_ordered_fp8q_manifest()["bindings"]:
+        if (
+            row["batch_size"],
+            row["q_len"],
+            row["num_q_heads"],
+            row["num_kv_heads"],
+            row["write_lse"],
+        ) == (batch_size, q_len, num_q_heads, num_kv_heads, write_lse):
+            grid_x, grid_y, grid_z = (int(value) for value in row["grid"])
+            return CakeFmhaRequestOrderedDecodePlan(
+                module_name=row["module_name"],
+                batch_size=batch_size,
+                q_len=q_len,
+                workspace_parts=row["workspace_parts"],
+                grid=(grid_x, grid_y, grid_z),
+                total_tiles=row["total_tiles"],
+                write_lse=write_lse,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                query_dtype=torch.float8_e4m3fn,
+            )
+    return None
+
+
 def plan_cake_fmha_request_ordered_paged_decode(
     kv_lens: Sequence[int],
     q_len: int,
@@ -332,6 +361,7 @@ def plan_cake_fmha_request_ordered_paged_decode(
     num_q_heads: int = 8,
     num_kv_heads: int = 1,
     num_kv_splits: int | None = None,
+    query_dtype: torch.dtype = torch.bfloat16,
 ) -> CakeFmhaRequestOrderedDecodePlan:
     """Select an exported schedule from host-visible immutable metadata.
 
@@ -339,6 +369,8 @@ def plan_cake_fmha_request_ordered_paged_decode(
     capture, then update the contents of the device ``request_order`` tensor
     in place between replays. An explicit num_kv_splits selects an exported
     split schedule; unavailable split/LSE combinations raise ValueError.
+    FP8 E4M3 queries select a separate B64/Q6, 32Q/2KV export with BF16
+    output, shared page tables, native HND views, and KV lengths at least six.
     """
 
     lengths = tuple(int(value) for value in kv_lens)
@@ -350,6 +382,24 @@ def plan_cake_fmha_request_ordered_paged_decode(
     logical_batch = batch_size if real_batch_size is None else int(real_batch_size)
     if not 0 < logical_batch <= batch_size:
         raise ValueError("real_batch_size must be in [1, len(kv_lens)]")
+
+    if query_dtype == torch.float8_e4m3fn:
+        if num_kv_splits is not None or min(lengths) < q_len:
+            raise ValueError("FP8-Q requires unsplit attention and kv_lens >= q_len")
+        selected = _fp8q_request_ordered_plan(
+            batch_size=batch_size,
+            q_len=q_len,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            write_lse=write_lse,
+        )
+        if selected is None:
+            raise ValueError(
+                "no exported FP8-Q request-order schedule for this shape/LSE mode"
+            )
+        return selected
+    if query_dtype != torch.bfloat16:
+        raise TypeError("request-ordered query_dtype must be bfloat16 or float8_e4m3fn")
 
     if num_kv_splits is not None:
         if (
@@ -421,6 +471,16 @@ def _is_authenticated_request_ordered_plan(
 ) -> bool:
     """Return whether ``plan`` names an exported mutable-order route."""
 
+    if plan.query_dtype == torch.float8_e4m3fn:
+        return plan == _fp8q_request_ordered_plan(
+            batch_size=plan.batch_size,
+            q_len=plan.q_len,
+            num_q_heads=plan.num_q_heads,
+            num_kv_heads=plan.num_kv_heads,
+            write_lse=plan.write_lse,
+        )
+    if plan.query_dtype != torch.bfloat16:
+        return False
     fallback = _fallback_cake_fmha_request_ordered_plan(
         batch_size=plan.batch_size,
         q_len=plan.q_len,
@@ -547,6 +607,52 @@ class CakeFmhaRequestOrderedCapture:
         self._state = "discarded"
 
 
+def _fp8q_request_ordered_arguments(
+    query,
+    key_cache,
+    value_cache,
+    out,
+    dummy,
+    request_order,
+    page_table,
+    seq_lens,
+    scale1,
+    scale2,
+):
+    """Bind the generated FP8-Q ABI through zero-copy views only."""
+    if key_cache.stride() != (32768, 256, 512, 1) or value_cache.stride() != (
+        32768,
+        256,
+        512,
+        1,
+    ):
+        raise ValueError(
+            "FP8-Q K/V require HND views with strides [32768, 256, 512, 1]"
+        )
+    q4 = query.view(torch.uint8).view(query.shape[0], 2, 16, 256)
+    return (
+        q4,
+        key_cache.view(torch.uint8),
+        value_cache.view(torch.uint8),
+        out,
+        dummy,
+        request_order,
+        1,
+        page_table,
+        seq_lens,
+        scale1,
+        scale2,
+        dummy,
+        dummy,
+        dummy,
+        page_table.shape[1],
+        0,
+        1,
+        1,
+        0,
+    )
+
+
 def _run_cake_fmha_request_ordered_paged_decode(
     *,
     backend: Literal["cake"],
@@ -587,8 +693,10 @@ def _run_cake_fmha_request_ordered_paged_decode(
         raise ValueError(
             "request-ordered Cake FMHA requires Q shape [batch*q_len, plan.num_q_heads, 256]"
         )
-    if query.dtype != torch.bfloat16 or not query.is_contiguous():
-        raise TypeError("request-ordered Cake FMHA requires contiguous BF16 Q")
+    if query.dtype != plan.query_dtype or not query.is_contiguous():
+        raise TypeError(
+            "request-ordered Cake FMHA requires contiguous Q matching plan.query_dtype"
+        )
     if (
         out.shape != query.shape
         or out.dtype != torch.bfloat16
@@ -703,6 +811,32 @@ def _run_cake_fmha_request_ordered_paged_decode(
     if not _is_authenticated_request_ordered_plan(plan):
         raise ValueError("request_order_plan does not match an exported route")
     tma_workspace = workspace_buffer[:384]
+    if plan.query_dtype == torch.float8_e4m3fn:
+        if not uses_shared_paged_kv_idx:
+            raise ValueError("the FP8-Q export requires a shared page table")
+        arguments = _fp8q_request_ordered_arguments(
+            query,
+            key_cache,
+            value_cache,
+            out,
+            lse_arg,
+            request_order,
+            page_table_arg,
+            seq_lens,
+            bmm1_scale_log2,
+            bmm2_scale,
+        )
+        import tvm_ffi
+
+        module = load_cake_fmha_request_ordered_module(plan.module_name)
+        with tvm_ffi.use_torch_stream():
+            if capture is None:
+                module.run(*arguments, tma_workspace, *plan.grid)
+            else:
+                capture._record(
+                    plan, workspace_buffer, (*arguments, tma_workspace, *plan.grid)
+                )
+        return
     if plan.workspace_parts == 1:
         partial_o = out
         partial_lse = lse_arg

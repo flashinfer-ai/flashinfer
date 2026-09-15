@@ -1,0 +1,66 @@
+{
+  "schema": "flashinfer.cake_fmha_request_ordered_fp8q.v1",
+  "target": "sm_103a",
+  "module_count": 1,
+  "contract": {
+    "query_dtype": "float8_e4m3fn",
+    "output_dtype": "bfloat16",
+    "kv_dtype": "float8_e4m3fn",
+    "softmax_accumulation_dtype": "float32",
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 64,
+    "q_len": 6,
+    "batch_sizes": [
+      64
+    ],
+    "minimum_kv_len": 6,
+    "write_lse": false,
+    "kv_strides": [
+      32768,
+      256,
+      512,
+      1
+    ],
+    "shared_page_table": true,
+    "request_order": "device_int32_permutation"
+  },
+  "modules": [
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_fp8q_7658a249f5d8093b3fab",
+      "arch": "sm_103a",
+      "closure_sha256": "71cd53ea0978939272526bc8c7a4e7825d5351caf9c1a8e22285536e8ff14a70",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_fp8q_7658a249f5d8093b3fab_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fp8q_7658a249f5d8093b3fab",
+      "ffi_entry": "run",
+      "tma_workspace_bytes": 384,
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_7658a249f5d8093b3fab_kernel.cu",
+      "device_sha256": "4c34ef8c29d49d93d5b921cca6a837a786ac78b84554cf0a8fd79ba0883f1abf",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_7658a249f5d8093b3fab_binding.cpp",
+      "binding_sha256": "8fb94461c73a037b63bda802d3c3d1288dd79bbcce9d10b3affa8b2b0be89a14",
+      "compile_options": [
+        "--use_fast_math"
+      ]
+    }
+  ],
+  "bindings": [
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_fp8q_7658a249f5d8093b3fab",
+      "batch_size": 64,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "workspace_parts": 1,
+      "grid": [
+        1,
+        1,
+        128
+      ],
+      "total_tiles": 128,
+      "write_lse": false,
+      "query_dtype": "float8_e4m3fn"
+    }
+  ]
+}

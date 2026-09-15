@@ -3696,16 +3696,24 @@ def trtllm_batch_decode_with_kv_cache(
         requests; lengths other than 1 or 6 use the generated runtime-Q
         bindings. Its contents may change in place between
         CUDA Graph replays; a null pointer preserves the existing path.
+        An explicit FP8-query plan additionally supports batch 64, six query
+        tokens per request, 32 query heads and two KV heads, with BF16 output.
+        That route requires KV lengths at least six, shared page tables, and
+        HND K/V views with strides ``[32768, 256, 512, 1]``.
 
     request_order_plan : Optional[CakeFmhaRequestOrderedDecodePlan] = None
         Optional immutable plan returned by
         :func:`flashinfer.plan_cake_fmha_request_ordered_paged_decode` before
-        graph capture. When omitted, request ordering uses a safe single-split
-        generated route. Page-table rows must be padded to
+        graph capture. The plan's ``query_dtype`` must match the query.
+        FP8 E4M3 queries require an explicit ``query_dtype=torch.float8_e4m3fn``
+        plan; output remains BF16. When omitted for BF16 queries, request
+        ordering uses a safe single-split generated route. Page-table rows must be padded to
         ``4 * ceil(max_seq_len / 256)`` entries. Run one eager invocation with
         the exact tensors and workspace before graph capture so its TMA
-        descriptors are initialized; subsequent replays may update only the
-        contents of ``request_order`` in place.
+        descriptors are initialized. With explicit capture preparation, query,
+        page-table, length, request-order and device-scale contents may change
+        in place between replays while retaining their storage and satisfying
+        the selected plan's shape and length contract.
 
     request_order_capture : Optional[CakeFmhaRequestOrderedCapture] = None
         Explicit preparation object from ``flashinfer.cake_fmha`` for Q tensors
@@ -4050,7 +4058,16 @@ def trtllm_batch_decode_with_kv_cache(
             out_scale_factor = None
             o_sf_start_index = 0
             if out_dtype is None:
-                out_dtype = out.dtype if out is not None else query.dtype
+                out_dtype = (
+                    out.dtype
+                    if out is not None
+                    else (
+                        torch.bfloat16
+                        if request_order is not None
+                        and query.dtype == torch.float8_e4m3fn
+                        else query.dtype
+                    )
+                )
             out = out if out is not None else torch.empty_like(query, dtype=out_dtype)
             if out_dtype not in (query.dtype, torch.float16, torch.bfloat16):
                 raise ValueError(f"Unsupported out_dtype: {out_dtype}")
@@ -4157,6 +4174,10 @@ def trtllm_batch_decode_with_kv_cache(
                     "bmm2_scale tensors so replay adds no scale-conversion kernel"
                 )
             if request_order_plan is None:
+                if query.dtype != torch.bfloat16:
+                    raise ValueError(
+                        "FP8-Q request ordering requires an explicit query_dtype plan"
+                    )
                 request_order_plan = _fallback_cake_fmha_request_ordered_plan(
                     batch_size=batch_size,
                     q_len=q_len_per_req,
@@ -4181,6 +4202,7 @@ def trtllm_batch_decode_with_kv_cache(
                 or request_order_plan.write_lse is not (lse is not None)
                 or request_order_plan.num_q_heads != query.shape[-2]
                 or request_order_plan.num_kv_heads != k_cache.shape[-3]
+                or request_order_plan.query_dtype != query.dtype
             ):
                 raise ValueError(
                     "request_order_plan does not match batch, q_len, heads, or LSE mode"
