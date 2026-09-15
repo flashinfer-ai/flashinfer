@@ -6,31 +6,80 @@ RAW_TACTICS = (
     ("raw", 64, 32, 8, False, True),
     ("raw", 32, 64, 13, True, True),
 )
-VERSION = "sm12x_cute_nvfp4_v1"
+VERSION = "sm12x_cute_nvfp4_v2"
 
 
 def check_shape(m, n, k):
-    if min(m, n, k) <= 0 or n % 128 or k % 256:
-        raise ValueError("SM12x cute-dsl requires M > 0, N % 128 = 0, K % 256 = 0")
+    if min(m, n, k) <= 0 or n % 64 or k % 64:
+        raise ValueError("SM12x cute-dsl requires M > 0, N % 64 = 0, K % 64 = 0")
     if max(m * k, n * k, m * n) >= 2**31:
         raise ValueError("SM12x cute-dsl requires element offsets below 2**31")
 
 
-def valid_tactics(m, n, k):
+def _sm121_tactic(m, n, k, compute_capability):
+    if compute_capability != (12, 1) or (n, k) not in (
+        (34816, 5120),
+        (5120, 17408),
+    ):
+        return None
+    if 1 <= m <= 16 or m == 32:
+        return ("narrow", 32, 128, 512)
+    if m == 64:
+        return ("b12x", 64, 128, 512)
+    if m == 128:
+        return ("b12x_single_cta", 128, 128, 256)
+    if (m, n, k) == (1024, 5120, 17408):
+        return ("raw", 64, 32, 8, False, True, 256, True)
+    return _sm121_cooperative_tactic(m, n, k, compute_capability)
+
+
+def _sm121_cooperative_tactic(m, n, k, compute_capability):
+    if compute_capability != (12, 1):
+        return None
+    if (m, n, k) in (
+        (256, 34816, 5120),
+        (256, 5120, 17408),
+        (512, 34816, 5120),
+    ):
+        return ("cooperative", 128, 128, 256)
+    if (m, n, k) == (512, 5120, 17408):
+        return ("cooperative", 128, 64, 256)
+    return None
+
+
+def valid_tactics(m, n, k, *, compute_capability=None):
     check_shape(m, n, k)
-    return NARROW_TACTICS + (RAW_TACTICS if m % 128 == 0 else ())
+    if n % 128 or k % 256:
+        return (NARROW_TACTICS[1],)
+    choices = NARROW_TACTICS + (RAW_TACTICS if m % 128 == 0 else ())
+    preferred = _sm121_tactic(m, n, k, compute_capability)
+    if preferred is None:
+        return choices
+    previous_default = default_tactic(m, n, k)
+    return tuple(
+        preferred if choice == previous_default else choice for choice in choices
+    )
 
 
-def compatible(m, n, k, tactic):
+def compatible(m, n, k, tactic, *, compute_capability=None):
     try:
-        choices = valid_tactics(m, n, k)
+        choices = valid_tactics(m, n, k, compute_capability=compute_capability)
+        legacy_choices = valid_tactics(m, n, k)
     except ValueError:
         return False
-    return tactic is None or tactic == -1 or tactic in choices
+    # Replacing a profiling offer must not invalidate an existing cached tactic.
+    return (
+        tactic is None or tactic == -1 or tactic in choices or tactic in legacy_choices
+    )
 
 
-def default_tactic(m, n, k):
+def default_tactic(m, n, k, *, compute_capability=None):
     check_shape(m, n, k)
+    if n % 128 or k % 256:
+        return NARROW_TACTICS[1]
+    preferred = _sm121_tactic(m, n, k, compute_capability)
+    if preferred is not None:
+        return preferred
     if m % 128 == 0:
         return RAW_TACTICS[int(n >= k)]
     return NARROW_TACTICS[int(m > 32)]

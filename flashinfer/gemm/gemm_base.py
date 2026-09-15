@@ -8065,9 +8065,10 @@ def mm_fp4(
         heuristic candidate for eligible SM100/SM103 problems and requires
         ``M <= 8``, 128x4 scale factors, and K divisible by 64 for NVFP4 or 128
         for MXFP4. On SM120/SM121, explicit ``"cute-dsl"`` supports packed
-        uint8 NVFP4 inputs with BF16 output, 128x4 scale factors, N divisible
-        by 128 and K divisible by 256. M may be ragged; scale storage must
-        retain its physical padding to a multiple of 128 rows.
+        uint8 NVFP4 inputs with BF16 output, 128x4 scale factors, and logical
+        N and K divisible by 64. Logical M may be ragged. A and B scale storage
+        must retain physical M and N padding, respectively, to multiples of
+        128 rows. Packed inputs and output retain their logical dimensions.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.

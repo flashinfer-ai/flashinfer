@@ -64,6 +64,8 @@ class Sm120BlockScaledGemmKernel:
         swizzle_size=1,
         raster_along_m=True,
         elected_release=False,
+        half_stage_wait=False,
+        extra_mainloop_stage=False,
     ):
         self.acc_dtype = acc_dtype
         self.sf_vec_size = sf_vec_size
@@ -74,6 +76,8 @@ class Sm120BlockScaledGemmKernel:
         self.swizzle_size = swizzle_size
         self.raster_along_m = raster_along_m
         self.elected_release = elected_release
+        self.half_stage_wait = half_stage_wait
+        self.extra_mainloop_stage = extra_mainloop_stage
         self.tiled_mma = None
 
         self.occupancy = 1
@@ -167,6 +171,7 @@ class Sm120BlockScaledGemmKernel:
             self.c_dtype,
             self.smem_capacity,
             self.occupancy,
+            self.extra_mainloop_stage,
         )
 
         assert self.epi_stage > 0, (
@@ -877,35 +882,44 @@ class Sm120BlockScaledGemmKernel:
                             tCsSFB_p = tCsSFB_copy_view[
                                 None, None, None, mainloop_consumer_state.index
                             ]
-                            mainloop_pipeline.consumer_wait(
-                                mainloop_consumer_state, peek_ab_full_status
+                            if not cutlass.const_expr(self.half_stage_wait):
+                                mainloop_pipeline.consumer_wait(
+                                    mainloop_consumer_state, peek_ab_full_status
+                                )
+                        if (
+                            not cutlass.const_expr(self.half_stage_wait)
+                            or k_block_idx != num_k_blocks - 1
+                        ):
+                            # Copy data from smem to tCrA/tCrB for the next k_block
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, k_block_next],
+                                tCrA_copy_view[None, None, k_block_next],
                             )
-                        # Copy data from smem to tCrA/tCrB for the next k_block
-                        cute.copy(
-                            smem_tiled_copy_A,
-                            tCsA_p[None, None, k_block_next],
-                            tCrA_copy_view[None, None, k_block_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_B,
-                            tCsB_p[None, None, k_block_next],
-                            tCrB_copy_view[None, None, k_block_next],
-                        )
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tCsB_p[None, None, k_block_next],
+                                tCrB_copy_view[None, None, k_block_next],
+                            )
 
-                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
-                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
-                        tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
-                        cute.copy(
-                            smem_tiled_copy_SFA,
-                            tCsSFA_p_filtered[None, None, k_block_next],
-                            tCrSFA_copy_view_filtered[None, None, k_block_next],
-                        )
-                        cute.copy(
-                            smem_tiled_copy_SFB,
-                            tCsSFB_p_filtered[None, None, k_block_next],
-                            tCrSFB_copy_view_filtered[None, None, k_block_next],
-                        )
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
+                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(
+                                tCrSFA_copy_view
+                            )
+                            tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                tCrSFB_copy_view
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFA,
+                                tCsSFA_p_filtered[None, None, k_block_next],
+                                tCrSFA_copy_view_filtered[None, None, k_block_next],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFB,
+                                tCsSFB_p_filtered[None, None, k_block_next],
+                                tCrSFB_copy_view_filtered[None, None, k_block_next],
+                            )
                         # Mixed FP4 x FP8 register-side bit shift before mma.sync to
                         # move the FP4 nibble (loaded into the LOW half of each Int8
                         # register byte by ldsm.b4x16_p64) into the MIDDLE of the byte
@@ -930,6 +944,44 @@ class Sm120BlockScaledGemmKernel:
                         for mma_n in cutlass.range_constexpr(
                             cute.size(accumulators, mode=[2])
                         ):
+                            if (
+                                cutlass.const_expr(self.half_stage_wait)
+                                and k_block_idx == num_k_blocks - 1
+                                and mma_n == cute.size(accumulators, mode=[2]) // 2
+                            ):
+                                mainloop_pipeline.consumer_wait(
+                                    mainloop_consumer_state, peek_ab_full_status
+                                )
+                                # Copy data from smem to tCrA/tCrB for the next k_block
+                                cute.copy(
+                                    smem_tiled_copy_A,
+                                    tCsA_p[None, None, k_block_next],
+                                    tCrA_copy_view[None, None, k_block_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_B,
+                                    tCsB_p[None, None, k_block_next],
+                                    tCrB_copy_view[None, None, k_block_next],
+                                )
+
+                                tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
+                                tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                                tCrSFA_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFA_copy_view
+                                )
+                                tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                    tCrSFB_copy_view
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFA,
+                                    tCsSFA_p_filtered[None, None, k_block_next],
+                                    tCrSFA_copy_view_filtered[None, None, k_block_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, k_block_next],
+                                    tCrSFB_copy_view_filtered[None, None, k_block_next],
+                                )
                             for mma_m_step in cutlass.range_constexpr(
                                 cute.size(accumulators, mode=[1])
                             ):
@@ -1177,6 +1229,7 @@ class Sm120BlockScaledGemmKernel:
         c_dtype: type[cutlass.Numeric],
         smem_capacity: int,
         occupancy: int,
+        extra_mainloop_stage: bool = False,
     ) -> tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -1223,6 +1276,18 @@ class Sm120BlockScaledGemmKernel:
             - mbar_helpers_bytes
             - epi_bytes
         ) // (ab_bytes_per_stage + sf_bytes_per_stage)
+        if extra_mainloop_stage and (
+            tile_shape_mnk == (128, 128, 128)
+            and epi_tile == (64, 32)
+            and a_dtype == cutlass.Float4E2M1FN
+            and b_dtype == cutlass.Float4E2M1FN
+            and sf_dtype == cutlass.Float8E4M3FN
+            and c_dtype == cutlass.BFloat16
+        ):
+            assert occupancy == 1 and smem_capacity == 101376
+            assert ab_bytes_per_stage + sf_bytes_per_stage == 18432
+            assert 1024 + 5 * 18432 + 2 * c_bytes_per_stage == smem_capacity
+            return 5, 2
         return ab_stage, epi_stage
 
     @staticmethod

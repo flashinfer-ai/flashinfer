@@ -29,7 +29,7 @@ def check_inputs(a, b, sfa, sfb, alpha, out_dtype, out):
         raise ValueError("SM12x cute-dsl requires E4M3 scale bytes")
     if sfa.shape != (((m + 127) // 128) * 128, k // 16) or sfb.shape != (
         k // 16,
-        n,
+        ((n + 127) // 128) * 128,
     ):
         raise ValueError("SM12x cute-dsl requires the physical 128x4 scale layout")
     if not sfa.is_contiguous() or not sfb.T.is_contiguous():
@@ -74,7 +74,7 @@ def check_requirement(a, b, sfa, sfb, alpha, dtype, out, block_size, nvfp4, sf8)
     return True
 
 
-def _compile(m, n, k, tactic):
+def _compile(m, n, k, tactic, *, compute_capability=None):
     import cutlass
     import cutlass.cute as cute
 
@@ -84,18 +84,54 @@ def _compile(m, n, k, tactic):
     from .. import dense_blockscaled_gemm_sm120_b12x as b12x
     from . import blockscaled_gemm_dispatch, narrow, raw
 
-    mac = get_max_active_clusters(1)
     family = tactic[0]
+    if family == "cooperative" and (
+        compute_capability != (12, 1)
+        or not policy.compatible(m, n, k, tactic, compute_capability=compute_capability)
+    ):
+        raise ValueError("Invalid SM121 cooperative tactic")
+    single_tile = family == "b12x_single_cta"
+    if single_tile and not policy.compatible(
+        m, n, k, tactic, compute_capability=compute_capability
+    ):
+        raise ValueError("Invalid SM121 single-CTA tactic")
+    # This nonpersistent specialization must launch every output tile.
+    mac = 544 if single_tile else get_max_active_clusters(1)
     if family == "raw":
-        _, epi_m, epi_n, swizzle, elected, raster_m = tactic
+        if len(tactic) == 6:
+            _, epi_m, epi_n, swizzle, elected, raster_m = tactic
+            tile_k, internal_swap = 128, False
+        elif (
+            len(tactic) == 8
+            and compute_capability == (12, 1)
+            and policy.compatible(
+                m, n, k, tactic, compute_capability=compute_capability
+            )
+        ):
+            _, epi_m, epi_n, swizzle, elected, raster_m, tile_k, internal_swap = tactic
+        else:
+            raise ValueError("Invalid SM12x raw tactic")
+        kernel_m, kernel_n = (n, m) if internal_swap else (m, n)
         gemm = raw.Sm120BlockScaledGemmKernel(
             cutlass.Float32,
             16,
-            (128, 128, 128),
+            (128, 128, tile_k),
             (epi_m, epi_n),
             swizzle_size=swizzle,
             elected_release=elected,
             raster_along_m=raster_m,
+            half_stage_wait=(
+                compute_capability == (12, 1)
+                and m == 8192
+                and (n, k) == (5120, 17408)
+                and tactic == ("raw", 64, 32, 8, False, True)
+            ),
+            extra_mainloop_stage=(
+                compute_capability == (12, 1)
+                and m in (4096, 8192)
+                and (n, k) == (5120, 17408)
+                and tactic == ("raw", 64, 32, 8, False, True)
+            ),
         )
 
         class Adapter:
@@ -123,17 +159,27 @@ def _compile(m, n, k, tactic):
                 bp = cute.recast_ptr(b.iterator, dtype=cutlass.Float4E2M1FN)
                 self.gemm(
                     cute.make_tensor(
-                        ap, cute.make_layout((m, k, 1), stride=(k, 1, m * k))
+                        bp if internal_swap else ap,
+                        cute.make_layout((kernel_m, k, 1), stride=(k, 1, kernel_m * k)),
                     ),
                     cute.make_tensor(
-                        bp, cute.make_layout((n, k, 1), stride=(k, 1, n * k))
+                        ap if internal_swap else bp,
+                        cute.make_layout((kernel_n, k, 1), stride=(k, 1, kernel_n * k)),
                     ),
                     cute.make_tensor(
-                        sfa, cute.make_layout((((m + 127) // 128 * 128) * k // 16,))
+                        sfb if internal_swap else sfa,
+                        cute.make_layout((((kernel_m + 127) // 128 * 128) * k // 16,)),
                     ),
-                    cute.make_tensor(sfb, cute.make_layout((n * k // 16,))),
                     cute.make_tensor(
-                        out.iterator, cute.make_layout((m, n, 1), stride=(n, 1, m * n))
+                        sfa if internal_swap else sfb,
+                        cute.make_layout((kernel_n * k // 16,)),
+                    ),
+                    cute.make_tensor(
+                        out.iterator,
+                        cute.make_layout(
+                            (kernel_m, kernel_n, 1),
+                            stride=(1, n, m * n) if internal_swap else (n, 1, m * n),
+                        ),
                     ),
                     alpha,
                     max_active_clusters,
@@ -141,11 +187,19 @@ def _compile(m, n, k, tactic):
                 )
 
         kernel = Adapter()
-        shape_name = f"m{m}_n{n}_k{k}_"
+        shape_name = (
+            f"m{m}_n{n}_k{k}_"
+            f"ab5{int(gemm.extra_mainloop_stage)}_half{int(gemm.half_stage_wait)}_"
+        )
         module = raw
     else:
         _, tile_m, tile_n, tile_k = tactic
-        module = narrow if family == "narrow" else b12x
+        if family == "cooperative":
+            from . import cooperative
+
+            module = cooperative
+        else:
+            module = narrow if family == "narrow" else b12x
         cls = module.DenseGemmKernel
         if not cls.can_implement(
             cutlass.Float4E2M1FN,
@@ -171,7 +225,7 @@ def _compile(m, n, k, tactic):
             (1, 1),
             mma_k=64,
             tile_k=tile_k,
-            single_work_tile_per_cta=False,
+            single_work_tile_per_cta=single_tile,
             use_prefetch=False,
             enable_pdl=False,
             direct_one_m_tile_scheduler=False,
@@ -195,7 +249,7 @@ def _compile(m, n, k, tactic):
         32,
         False,
         (m + 127) // 128,
-        n // 128,
+        (n + 127) // 128,
         k // 64,
         1,
         mac,
@@ -236,7 +290,9 @@ class Sm12xCuTeFp4GemmRunner(TunableRunner):
             if block_size != 16 or not nvfp4 or out is None:
                 return False
             shape = check_inputs(a, b, sfa, sfb, alpha, dtype, out)
-            return policy.compatible(*shape, tactic)
+            return policy.compatible(
+                *shape, tactic, compute_capability=get_compute_capability(a.device)
+            )
         except (ValueError, TypeError, AttributeError):
             return False
 
@@ -244,20 +300,30 @@ class Sm12xCuTeFp4GemmRunner(TunableRunner):
         if not self.validate_tactic(inputs, -1):
             return []
         a, b = inputs[:2]
-        return list(policy.valid_tactics(a.shape[0], b.shape[1], a.shape[1] * 2))
+        return list(
+            policy.valid_tactics(
+                a.shape[0],
+                b.shape[1],
+                a.shape[1] * 2,
+                compute_capability=get_compute_capability(a.device),
+            )
+        )
 
     def _get_compiled(self, inputs, tactic):
         a, b = inputs[:2]
         m, n, k = a.shape[0], b.shape[1], a.shape[1] * 2
         shape = (m, n, k) if tactic[0] == "raw" else ()
-        key = (get_device_index(a.device), tactic, shape)
+        compute_capability = get_compute_capability(a.device)
+        key = (get_device_index(a.device), compute_capability, tactic, shape)
         if key not in _COMPILED:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "SM12x cute-dsl needs eager preparation before capture"
                 )
             with torch.cuda.device(a.device):
-                _COMPILED[key] = _compile(m, n, k, tactic)
+                _COMPILED[key] = _compile(
+                    m, n, k, tactic, compute_capability=compute_capability
+                )
         return _COMPILED[key]
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
@@ -276,14 +342,16 @@ class Sm12xCuTeFp4GemmRunner(TunableRunner):
                 self._get_compiled(inputs, choice)
             return out
         if tactic is None or tactic == -1:
-            tactic = policy.default_tactic(m, n, k)
+            tactic = policy.default_tactic(
+                m, n, k, compute_capability=get_compute_capability(a.device)
+            )
         compiled = self._get_compiled(inputs, tactic)
         args = (
             a,
             b.T,
             out,
             (m + 127) // 128,
-            n // 128,
+            (n + 127) // 128,
             k // 64,
             sfa.data_ptr(),
             sfb.data_ptr(),

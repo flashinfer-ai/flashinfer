@@ -68,20 +68,24 @@ def _assert_bits(actual, expected):
 
 
 def make_inputs(m, n, k, seed):
-    padded = (m + 127) // 128 * 128
-    full = _operands(padded, n, k, seed)
-    # Logical A has no allocated padding; scale storage keeps physical128x4 rows.
-    return full, (full[0][:m].clone(), *full[1:])
+    padded_m = (m + 127) // 128 * 128
+    padded_n = (n + 127) // 128 * 128
+    full = _operands(padded_m, padded_n, k, seed)
+    # Logical A/B are compact; scale storage keeps physical 128x4 row padding.
+    return full, (full[0][:m].clone(), full[1].T[:n].clone().T, *full[2:])
 
 
-@pytest.mark.parametrize("m", [1, 4, 127, 128, 129, 5000, 8192])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [(m, 256, 256) for m in (1, 4, 127, 128, 129, 5000, 8192)]
+    + [(1, 192, 256), (5, 256, 320), (129, 192, 320)],
+)
 @pytest.mark.parametrize("pdl", [False, True])
-def test_public_and_each_tactic_full_bits_graph_mutation(m, pdl):
-    n, k = 256, 256
+def test_public_and_each_tactic_full_bits_graph_mutation(m, n, k, pdl):
     full, operands = make_inputs(m, n, k, 42)
     alpha = torch.tensor(1.25, dtype=torch.float32, device="cuda")
     out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
-    expected = _reference(*full, alpha)[:m]
+    expected = _reference(*full, alpha)[:m, :n]
     saved = [x.clone() for x in (*operands, alpha)]
     actual = mm_fp4(*operands, alpha, out=out, backend="cute-dsl", enable_pdl=pdl)
     assert actual.data_ptr() == out.data_ptr()
@@ -111,7 +115,7 @@ def test_public_and_each_tactic_full_bits_graph_mutation(m, pdl):
         for live, update in zip(operands, changed, strict=True):
             live.copy_(update)
         alpha.fill_(-0.75)
-        changed_expected = _reference(*changed_full, alpha)[:m]
+        changed_expected = _reference(*changed_full, alpha)[:m, :n]
         changed_saved = [x.clone() for x in (*operands, alpha)]
         out.fill_(float("nan"))
         graph.replay()
@@ -175,20 +179,20 @@ def test_public_rejects_cached_raw_for_ragged_actual_m(monkeypatch):
     raw = policy.RAW_TACTICS[0]
     assert runner.validate_tactic(aligned_inputs, raw)
     validation, compiled = [], []
-    original_validate = runner.validate_tactic
-    original_compiled = runner._get_compiled
+    original_validate = type(runner).validate_tactic
+    original_compiled = type(runner)._get_compiled
 
-    def validate(inputs, tactic):
-        result = original_validate(inputs, tactic)
+    def validate(self, inputs, tactic):
+        result = original_validate(self, inputs, tactic)
         validation.append((inputs[0].shape[0], tactic, result))
         return result
 
-    def get_compiled(inputs, tactic):
+    def get_compiled(self, inputs, tactic):
         compiled.append((inputs[0].shape[0], tactic))
-        return original_compiled(inputs, tactic)
+        return original_compiled(self, inputs, tactic)
 
-    monkeypatch.setattr(runner, "validate_tactic", validate)
-    monkeypatch.setattr(runner, "_get_compiled", get_compiled)
+    monkeypatch.setattr(type(runner), "validate_tactic", validate)
+    monkeypatch.setattr(type(runner), "_get_compiled", get_compiled)
     key = cache_key(actual_inputs)
     assert key == cache_key(aligned_inputs), "The actual public M bucket must alias"
     winners = tuner._winner_cache()
@@ -243,3 +247,206 @@ def test_zero_and_sparse_full_output(m, case):
         assert torch.equal(
             live.reshape(-1).view(torch.uint8), before.reshape(-1).view(torch.uint8)
         )
+
+
+@pytest.mark.parametrize("n,k", [(32, 256), (256, 96)])
+def test_public_rejects_dimensions_not_aligned_to_64(n, k):
+    _, operands = make_inputs(1, n, k, 42)
+    alpha = torch.tensor(1.25, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="N % 64 = 0, K % 64 = 0"):
+        mm_fp4(*operands, alpha, backend="cute-dsl")
+
+
+def test_public_rejects_tail_scales_without_physical_n_padding():
+    m, n, k = 1, 192, 256
+    _, operands = make_inputs(m, n, k, 42)
+    a, b, sfa, sfb = operands
+    alpha = torch.tensor(1.25, dtype=torch.float32, device="cuda")
+    truncated_sfb = sfb.T[:n].contiguous().T
+    with pytest.raises(ValueError, match="physical 128x4 scale layout"):
+        mm_fp4(a, b, sfa, truncated_sfb, alpha, backend="cute-dsl")
+
+
+def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
+    targets = [
+        (m, n, k)
+        for m in [*range(1, 17), 32, 64, 128]
+        for n, k in [(34816, 5120), (5120, 17408)]
+    ]
+    for m, n, k in targets:
+        old = policy.default_tactic(m, n, k)
+        choices = policy.valid_tactics(m, n, k)
+        for cc in [None, (12, 0)]:
+            assert policy.default_tactic(m, n, k, compute_capability=cc) == old
+            assert policy.valid_tactics(m, n, k, compute_capability=cc) == choices
+        expected = (
+            ("narrow", 32, 128, 512)
+            if m <= 32
+            else ("b12x", 64, 128, 512)
+            if m == 64
+            else ("b12x_single_cta", 128, 128, 256)
+        )
+        assert policy.default_tactic(m, n, k, compute_capability=(12, 1)) == expected
+        updated = policy.valid_tactics(m, n, k, compute_capability=(12, 1))
+        assert len(updated) == len(choices)
+        assert expected in updated
+        assert all(
+            policy.compatible(m, n, k, t, compute_capability=(12, 1)) for t in choices
+        )
+        assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
+    larger = [
+        ((256, 34816, 5120), ("cooperative", 128, 128, 256)),
+        ((256, 5120, 17408), ("cooperative", 128, 128, 256)),
+        ((512, 34816, 5120), ("cooperative", 128, 128, 256)),
+        ((512, 5120, 17408), ("cooperative", 128, 64, 256)),
+        ((1024, 5120, 17408), ("raw", 64, 32, 8, False, True, 256, True)),
+    ]
+    for shape, preferred in larger:
+        choices = policy.valid_tactics(*shape)
+        assert policy.default_tactic(*shape, compute_capability=(12, 1)) == preferred
+        assert len(policy.valid_tactics(*shape, compute_capability=(12, 1))) == len(
+            choices
+        )
+        assert all(
+            policy.compatible(*shape, t, compute_capability=(12, 1)) for t in choices
+        )
+        assert not policy.compatible(*shape, preferred, compute_capability=(12, 0))
+        assert policy.default_tactic(
+            *shape, compute_capability=(12, 0)
+        ) == policy.default_tactic(*shape)
+        assert policy.valid_tactics(*shape, compute_capability=(12, 0)) == choices
+    neighbors = [
+        (m, n, k)
+        for m in [17, 31, 33, 63, 65, 127, 129, 257, 513, 1025]
+        for n, k in [(34816, 5120), (5120, 17408)]
+    ]
+    neighbors += [(1024, 34816, 5120)]
+    neighbors += [
+        (m, n, k)
+        for m in [1, 16, 32, 64, 128]
+        for n, k in [(34944, 5120), (34816, 5376), (5120, 17664)]
+    ]
+    for shape in neighbors:
+        assert policy.default_tactic(
+            *shape, compute_capability=(12, 1)
+        ) == policy.default_tactic(*shape)
+        assert policy.valid_tactics(
+            *shape, compute_capability=(12, 1)
+        ) == policy.valid_tactics(*shape)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (m, n, k)
+        for m in [16, 32, 64, 128, 256, 512, 1024]
+        for n, k in [(34816, 5120), (5120, 17408)]
+    ]
+    + [(4096, 5120, 17408), (8192, 5120, 17408)],
+)
+def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypatch):
+    cc = get_compute_capability(torch.device("cuda"))
+    if cc != (12, 1):
+        pytest.skip("New defaults are qualified only on SM121")
+    _, operands = make_inputs(m, n, k, 42)
+    alpha = torch.tensor(1.25, dtype=torch.float32, device="cuda")
+    expected = mm_fp4(*operands, alpha, backend="cutlass")
+    out = torch.empty_like(expected)
+    runner, tuner = get_runner(), AutoTuner.get()
+    workspace = gemm_base._get_cache_buf(
+        "mm_fp4_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, operands[0].device
+    )
+    inputs = [*operands, alpha, out.dtype, out, 16, True, workspace]
+    key = tuner._get_cache_key(
+        "fp4_gemm",
+        runner,
+        tuner._get_input_sizes(inputs),
+        gemm_base._MM_FP4_TUNING_CONFIG_128x4,
+        runner.get_cache_key_extras(inputs),
+    )
+    winners = tuner._winner_cache()
+    sentinel = object()
+    previous = winners.pop(key, sentinel)
+    selected = []
+    original_get = type(runner)._get_compiled
+
+    def observe(self, inputs, tactic):
+        selected.append(tactic)
+        return original_get(self, inputs, tactic)
+
+    # Instance attributes participate in the tuner's runner hash.
+    monkeypatch.setattr(type(runner), "_get_compiled", observe)
+    assert hash(runner) == key.runner_hash
+    preferred = policy.default_tactic(m, n, k, compute_capability=cc)
+    try:
+        _assert_bits(mm_fp4(*operands, alpha, out=out, backend="cute-dsl"), expected)
+        assert selected and selected[-1] == preferred
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            mm_fp4(*operands, alpha, out=out, backend="cute-dsl")
+        _, changed = make_inputs(m, n, k, 123)
+        for live, update in zip(operands, changed, strict=True):
+            live.copy_(update)
+        alpha.fill_(-0.75)
+        changed_expected = mm_fp4(*operands, alpha, backend="cutlass")
+        out.fill_(float("nan"))
+        graph.replay()
+        _assert_bits(out, changed_expected)
+        # The new default does not silently migrate an existing cached choice.
+        legacy = policy.default_tactic(m, n, k)
+        winners[key] = (legacy, None)
+        _assert_bits(
+            mm_fp4(*operands, alpha, out=out, backend="cute-dsl"), changed_expected
+        )
+        assert selected[-1] == legacy
+    finally:
+        if previous is sentinel:
+            winners.pop(key, None)
+        else:
+            winners[key] = previous
+
+
+def test_compile_cache_binds_input_device_capability(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from flashinfer.gemm.kernels.sm12x_cute import runner as native
+
+    device = object()
+    capability = [(12, 1)]
+    calls = []
+    a = SimpleNamespace(shape=(64, 2560), device=device)
+    b = SimpleNamespace(shape=(2560, 34816))
+    tactic = ("narrow", 32, 128, 256)
+
+    def get_capability(actual_device):
+        assert actual_device is device
+        return capability[0]
+
+    def compile_kernel(m, n, k, choice, *, compute_capability):
+        calls.append((m, n, k, choice, compute_capability))
+        return object()
+
+    monkeypatch.setattr(native, "_COMPILED", {})
+    monkeypatch.setattr(native, "_compile", compile_kernel)
+    monkeypatch.setattr(native, "get_compute_capability", get_capability)
+    monkeypatch.setattr(native, "get_device_index", lambda _: 3)
+    monkeypatch.setattr(
+        native,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_current_stream_capturing=lambda: False,
+                device=lambda _: nullcontext(),
+            )
+        ),
+    )
+    runner = native.Sm12xCuTeFp4GemmRunner()
+    first = runner._get_compiled([a, b], tactic)
+    assert runner._get_compiled([a, b], tactic) is first
+    capability[0] = (12, 0)
+    assert runner._get_compiled([a, b], tactic) is not first
+    assert calls == [
+        (64, 34816, 5120, tactic, (12, 1)),
+        (64, 34816, 5120, tactic, (12, 0)),
+    ]
