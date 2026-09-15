@@ -21,6 +21,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
+| Build from source despite a prebuilt `flashinfer-jit-cache` | `export FLASHINFER_FORCE_JIT=1` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
 | Enable API logging (detailed) | `export FLASHINFER_LOGLEVEL=3` |
 | Enable API logging (with stats) | `export FLASHINFER_LOGLEVEL=5` |
@@ -578,6 +579,7 @@ match what the code uses today; values are strings unless noted.
 | Variable | Default | Read in | Effect |
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
+| `FLASHINFER_FORCE_JIT` | `0` | `flashinfer/jit/core.py` | `1`/`true`/`yes`/`on` ignores prebuilt AOT / `flashinfer-jit-cache` artifacts so every module is built from the source tree. The inverse of `FLASHINFER_DISABLE_JIT`; set it when editing `csrc/` or `include/` with a jit-cache wheel installed, since otherwise the prebuilt `.so` wins before the sources are consulted and the edit is silently ignored. Logs the bypassed artifact once per module. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |

@@ -104,6 +104,28 @@ class FlashInferJITLogger(logging.Logger):
 logger = FlashInferJITLogger("flashinfer.jit")
 
 
+def force_source_build() -> bool:
+    """True when prebuilt artifacts must be ignored in favor of a source build.
+
+    Set ``FLASHINFER_FORCE_JIT=1`` while developing against an installed
+    ``flashinfer-jit-cache`` (or any AOT provider) wheel. Without it a module
+    that ships prebuilt wins before the source tree is ever consulted, so an
+    edit under ``csrc/`` or ``include/`` is silently ignored and the stale
+    kernel runs. Clearing ``~/.cache/flashinfer`` does not help, because that
+    is not where the artifact came from; the alternative is moving the
+    module's directory out of the wheel by hand.
+
+    This is the inverse of ``FLASHINFER_DISABLE_JIT``, which refuses to build
+    anything the cache does not already hold.
+    """
+    return os.environ.get("FLASHINFER_FORCE_JIT", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def check_cuda_arch():
     # Collect all detected CUDA architectures
     eligible = False
@@ -377,7 +399,16 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def is_aot(self) -> bool:
-        return self.aot_path.exists()
+        aot_path = self.aot_path
+        if not aot_path.exists():
+            return False
+        if force_source_build():
+            logger.info_once(
+                f"FLASHINFER_FORCE_JIT is set: ignoring prebuilt {aot_path} "
+                f"and building {self.name} from source."
+            )
+            return False
+        return True
 
     @property
     def is_compiled(self) -> bool:
@@ -650,7 +681,7 @@ def build_jit_specs(
                 f"build_jit_specs only supports nvcc modules, got "
                 f"{type(spec).__name__} for {spec.name}"
             )
-        if skip_prebuilt and spec.aot_path.exists():
+        if skip_prebuilt and not force_source_build() and spec.aot_path.exists():
             continue
         lines.append(f"subninja {spec.ninja_path}")
         with FileLock(spec.lock_path, thread_local=False):
