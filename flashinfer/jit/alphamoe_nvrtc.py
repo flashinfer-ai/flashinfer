@@ -60,9 +60,16 @@ def _prepare_cubins(build_dir: Path, *, source_dir: Path, arches: tuple[str, ...
             source = source_path.read_text()
             module_ident = f"alphamoe_{key}_{arch}"
             options = [f"--gpu-architecture={arch}", "-default-device", *extra_opts]
-            inputs = {"source_sha256": _digest(source.encode()), "source_name": "kernel.cu",
-                      "module_ident": module_ident, "module_key": key, "entry": key,
-                      "kernel_symbol": symbol, "arch": arch, "compile_options": options}
+            inputs = {
+                "source_sha256": _digest(source.encode()),
+                "source_name": "kernel.cu",
+                "module_ident": module_ident,
+                "module_key": key,
+                "entry": key,
+                "kernel_symbol": symbol,
+                "arch": arch,
+                "compile_options": options,
+            }
             digest = _digest(json.dumps(inputs, sort_keys=True).encode())
             cubin = cache / f"{digest}.cubin"
             receipt = cache / f"{digest}.json"
@@ -70,16 +77,33 @@ def _prepare_cubins(build_dir: Path, *, source_dir: Path, arches: tuple[str, ...
                 reusable = False
                 if cubin.is_file() and receipt.is_file():
                     prior = json.loads(receipt.read_text())
-                    reusable = prior["inputs"] == inputs and prior["sha256"] == _digest(cubin.read_bytes())
+                    reusable = prior["inputs"] == inputs and prior["sha256"] == _digest(
+                        cubin.read_bytes()
+                    )
                 if not reusable:
-                    payload = nvrtc_compile(source, name="kernel.cu", arch=arch, extra_opts=extra_opts)
+                    payload = nvrtc_compile(
+                        source, name="kernel.cu", arch=arch, extra_opts=extra_opts
+                    )
                     cubin.write_bytes(payload)
-                    receipt.write_text(json.dumps({"inputs": inputs, "sha256": _digest(payload)}, indent=2) + "\n")
+                    receipt.write_text(
+                        json.dumps(
+                            {"inputs": inputs, "sha256": _digest(payload)}, indent=2
+                        )
+                        + "\n"
+                    )
             embedded[module_ident] = cubin
-            records.append({**inputs, "path": str(cubin), "sha256": _digest(cubin.read_bytes()),
-                            "source_path": str(source_path), "receipt_path": str(receipt)})
+            records.append(
+                {
+                    **inputs,
+                    "path": str(cubin),
+                    "sha256": _digest(cubin.read_bytes()),
+                    "source_path": str(source_path),
+                    "receipt_path": str(receipt),
+                }
+            )
     (build_dir / "alphamoe_nvrtc_receipt.json").write_text(
-        json.dumps({"complete": True, "embedded_cubins": records}, indent=2) + "\n")
+        json.dumps({"complete": True, "embedded_cubins": records}, indent=2) + "\n"
+    )
     return embedded
 
 
