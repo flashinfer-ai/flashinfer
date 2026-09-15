@@ -232,8 +232,8 @@ def autotune_bf16_nvfp4_mega_moe(
             max_tokens=cfg.num_tokens_per_rank,
             live_tokens=live_tokens,
             combine_dtype="bf16",
-            apply_topk_in_fc1=cfg.apply_topk_in_fc1,
-            defer_topk_reduce=cfg.defer_topk_reduce,
+            apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
+            use_custom_finalize=cfg.use_custom_finalize,
             p50_us=p50_s * 1e6,
             source="autotune_graph_events",
         )
