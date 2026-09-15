@@ -20,6 +20,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
@@ -210,6 +212,11 @@ def _smem_bytes(tactic: WarpSplitKTactic) -> int:
     return cursor + tactic.stages * 8
 
 
+def _k_tile_count_supported(k_tile: int, k_tile_count: int) -> bool:
+    # The two-tile 256-wide schedule can generate an invalid hinted LDGSTS.
+    return k_tile != 256 or k_tile_count != 2
+
+
 def _legal_stages(
     output_tile: int,
     token_tile: int,
@@ -219,12 +226,12 @@ def _legal_stages(
 ) -> tuple[int, ...]:
     # A single-stage ring only makes sense when K is one tile; with ring reuse it
     # cannot overlap anything, and ptxas mis-encodes its hinted LDGSTS.
-    if k // k_tile > _MAX_K_TILES:
+    k_tile_count = k // k_tile
+    if k_tile_count > _MAX_K_TILES or not _k_tile_count_supported(k_tile, k_tile_count):
         return ()
-    min_stages = _min_stages(k, k_tile)
     return tuple(
         stages
-        for stages in range(min_stages, min(_MAX_STAGES, k // k_tile) + 1)
+        for stages in range(_min_stages(k, k_tile), min(_MAX_STAGES, k_tile_count) + 1)
         if _smem_bytes(
             WarpSplitKTactic(output_tile, token_tile, k_tile, stages, b_loader_warps)
         )
@@ -255,14 +262,15 @@ def validate_tactic(tactic: WarpSplitKTactic, m: int, n: int, k: int) -> None:
         raise ValueError(f"unsupported shape {(m, n, k)}")
     if k <= 0 or k % tactic.k_tile:
         raise ValueError(f"K={k} must be divisible by k_tile={tactic.k_tile}")
-    if k // tactic.k_tile > _MAX_K_TILES:
+    k_tile_count = k // tactic.k_tile
+    if k_tile_count > _MAX_K_TILES:
         raise ValueError(
             f"K={k} spans more than {_MAX_K_TILES} tiles of {tactic.k_tile}"
         )
+    if not _k_tile_count_supported(tactic.k_tile, k_tile_count):
+        raise ValueError(f"unsupported k_tile={tactic.k_tile} for K={k}")
     if not (
-        _min_stages(k, tactic.k_tile)
-        <= tactic.stages
-        <= min(_MAX_STAGES, k // tactic.k_tile)
+        _min_stages(k, tactic.k_tile) <= tactic.stages <= min(_MAX_STAGES, k_tile_count)
     ):
         raise ValueError(f"invalid stages={tactic.stages}")
     required_smem = _smem_bytes(tactic)
@@ -380,6 +388,15 @@ def autotune_tactics(m: int, n: int, k: int) -> list[WarpSplitKTactic]:
                 continue  # a 32-token tile only pays for M > 16
             for k_tile in _SUPPORTED_K_TILES:
                 if k % k_tile:
+                    continue
+                # Prune same-grid token padding for multi-tile K.
+                # Wider tiles can win when K fits one tile.
+                if k // k_tile > 1 and any(
+                    smaller_token_tile < token_tile
+                    and (m + smaller_token_tile - 1) // smaller_token_tile
+                    == (m + token_tile - 1) // token_tile
+                    for smaller_token_tile in _SUPPORTED_TOKEN_TILES
+                ):
                     continue
                 for b_loader_warps in _SUPPORTED_B_LOADER_WARPS:
                     tactics.extend(
@@ -776,20 +793,32 @@ def _compile(
     use_pdl: bool,
     has_bias: bool,
 ):
-    device = _torch.device("cuda", device_index)
-    with _torch.cuda.device(device):
-        kernel = CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias)
-        tensors = tuple(
-            _from_dlpack(tensor)
-            for tensor in (
-                _torch.empty((n, k), device=device, dtype=dtype),
-                _torch.empty((m, k), device=device, dtype=dtype),
-                _torch.empty((n,), device=device, dtype=dtype),
-                _torch.empty((m, n), device=device, dtype=dtype),
-            )
+    def compile_kernel():
+        return cute_ext.compile(
+            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
+            *(
+                _from_dlpack(tensor)
+                for tensor in (
+                    _torch.empty((n, k), device="cuda", dtype=dtype),
+                    _torch.empty((m, k), device="cuda", dtype=dtype),
+                    _torch.empty((n,), device="cuda", dtype=dtype),
+                    _torch.empty((m, n), device="cuda", dtype=dtype),
+                )
+            ),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
         )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(device).cuda_stream)
-        return cute_ext.compile(kernel, *tensors, stream)
+
+    with _torch.cuda.device(device_index):
+        return build_and_load_cute_dsl_kernel(
+            "dense_bf16_gemm_warp_splitk",
+            f"{str(dtype).removeprefix('torch.')}_m{m}_n{n}_k{k}"
+            f"_out{tactic.output_tile}_token{tactic.token_tile}_kt{tactic.k_tile}"
+            f"_stages{tactic.stages}_bl{tactic.b_loader_warps}"
+            f"_pdl{int(use_pdl)}_bias{int(has_bias)}",
+            compile_kernel,
+            extra_key_files=(__file__,),
+        )
 
 
 def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=None):
@@ -801,15 +830,13 @@ def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=N
         compiled = _compile(
             device_index, a.dtype, m, n, k, tactic, pdl, bias is not None
         )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
         # Without bias the kernel never reads its bias argument; pass a row of
         # ``out`` so the launch signature stays fixed.
         compiled(
-            _from_dlpack(b.T),
-            _from_dlpack(a),
-            _from_dlpack(bias if bias is not None else out[0]),
-            _from_dlpack(out),
-            stream,
+            b.T,
+            a,
+            bias if bias is not None else out[0],
+            out,
         )
     return out
 

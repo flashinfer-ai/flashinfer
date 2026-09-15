@@ -1159,8 +1159,10 @@ def top_k_page_table_transform(
     - This is specifically designed for sparse attention's second stage.
     - ``input`` may have padding between rows, but its last dimension must be
       contiguous.
-    - If ``lengths[i] <= k``, raw indices are ``0..lengths[i]-1`` and remaining
-      positions are set to -1.
+    - If ``lengths[i] <= k``, all valid indices ``0..lengths[i]-1`` are
+      selected, including when ``k > max_len``. Outputs retain shape
+      ``(num_rows, k)``; unused positions are ``-1`` in both the mapped output
+      and optional raw indices. Padding is not translated through the page table.
 
     Examples
     --------
@@ -1369,8 +1371,9 @@ def top_k_ragged_transform(
     ----
     - This is specifically designed for sparse attention's second stage with
       ragged KV cache layout.
-    - If lengths[i] <= k, the output contains [offsets[i], offsets[i]+1, ..., offsets[i]+lengths[i]-1]
-      with remaining positions set to -1.
+    - If ``lengths[i] <= k``, all valid indices receive ``offsets[i]``,
+      including when ``k > max_len``. Output retains shape ``(num_rows, k)``;
+      unused positions remain ``-1`` without adding the offset.
 
     Examples
     --------

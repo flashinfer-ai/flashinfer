@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import importlib.metadata
 import io
 import json
@@ -693,6 +694,21 @@ def _torch_cuda_version() -> str:
         return "unavailable"
 
 
+def _cudnn_backend_version() -> str:
+    try:
+        cudnn = importlib.import_module("cudnn")
+    except ModuleNotFoundError as error:
+        if error.name != "cudnn":
+            return "unavailable"
+        return "not-installed"
+    except Exception:
+        return "unavailable"
+    try:
+        return str(cudnn.backend_version())
+    except Exception:
+        return "unavailable"
+
+
 @lru_cache(maxsize=1)
 def _runtime_version_line() -> str:
     versions = [
@@ -704,6 +720,7 @@ def _runtime_version_line() -> str:
         ("cuda-python", _package_version("cuda-python")),
         ("cuda-tile", _package_version("cuda-tile")),
         ("cuDNN-frontend", _package_version("nvidia-cudnn-frontend")),
+        ("cuDNN-backend", _cudnn_backend_version()),
         ("triton", _package_version("triton")),
         ("nccl-extensions", _package_version("nccl-extensions")),
         ("nccl4py", _package_version("nccl4py")),

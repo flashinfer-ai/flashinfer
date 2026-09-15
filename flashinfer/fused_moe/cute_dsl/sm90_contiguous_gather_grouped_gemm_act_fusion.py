@@ -55,15 +55,16 @@ def _get_compiled_gather_kernel(
     tile_shape_mn: Tuple[int, int],
     cluster_shape_mn: Tuple[int, int],
     topk: int,
+    swizzle_size: int,
     raster_along_m: bool,
     enable_pdl: bool,
 ) -> Any:
     """Get or compile one GEMM1 specialization.
 
     Problem dimensions, pointers, and the CUDA stream are runtime parameters;
-    pointer dtypes and the kernel-specializing parameters (tile/cluster/raster
-    tactics, ``topk``, ``max_active_clusters``, ``enable_pdl``) form the
-    process-local compile key.
+    pointer dtypes and the kernel-specializing parameters
+    (tile_size/cluster_shape_mn/swizzle_size/raster_along_m tactics, ``topk``,
+    ``max_active_clusters``, ``enable_pdl``) form the process-local compile key.
     """
     cache_key = (
         ab_dtype,
@@ -71,6 +72,7 @@ def _get_compiled_gather_kernel(
         tile_shape_mn,
         cluster_shape_mn,
         topk,
+        swizzle_size,
         raster_along_m,
         max_active_clusters,
         enable_pdl,
@@ -84,6 +86,7 @@ def _get_compiled_gather_kernel(
         tile_shape_mn=tile_shape_mn,
         topk=topk,
         cluster_shape_mn=cluster_shape_mn,
+        swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
     )
@@ -152,6 +155,7 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     permuted_m: int,
     tile_shape_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 1),
+    swizzle_size: int = 1,
     raster_along_m: bool = False,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -176,6 +180,9 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         permuted_m: ``max_num_tiles * tile_m`` (padded row count).
         tile_shape_mn: CTA tile over the accumulator (N counts up+gate
             columns); ``tile_n % 64 == 0``.
+        swizzle_size: Persistent-walk swizzle — groups the tile walk into
+            blocks of this many M-tiles so each expert's B streams once per
+            block instead of once per M-tile row (1 = plain N-fast walk).
 
     Returns:
         The output tensor ``[permuted_m, I]`` where ``I = w1_weight.shape[1] // 2``.
@@ -199,19 +206,6 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     num_local_experts, n, w_k = w1_weight.shape
     if w_k != k:
         raise ValueError(f"k mismatch: x k={k}, w1_weight k={w_k}")
-    if n % 64 != 0:
-        raise ValueError(f"w1_weight 2I dim ({n}) must be a multiple of 64")
-    # The epilogue writes full N tiles and the gather/mainloop assume whole
-    # K tiles — partial tiles would read/write out of bounds.
-    if n % tile_shape_mn[1] != 0:
-        raise ValueError(f"n={n} must be a multiple of tile_n={tile_shape_mn[1]}")
-    if k % 64 != 0:
-        raise ValueError(f"k={k} must be a multiple of the K tile (64)")
-    tile_m = tile_shape_mn[0]
-    if permuted_m % tile_m != 0:
-        raise ValueError(
-            f"permuted_m={permuted_m} must be a multiple of tile_m={tile_m}"
-        )
     if token_id_mapping.numel() != permuted_m:
         raise ValueError(
             f"token_id_mapping has {token_id_mapping.numel()} entries, "
@@ -227,8 +221,24 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         raise ValueError("out must be a contiguous tensor on x's device")
     c_dtype = TORCH_TO_CUTLASS_DTYPE[out.dtype]
 
-    if cluster_shape_mn == (2, 1) and (permuted_m // tile_shape_mn[0]) % 2 != 0:
-        cluster_shape_mn = (1, 1)  # odd M-tile count cannot pair
+    if not Sm90ContiguousGatherGroupedGemmActFusionKernel.can_implement(
+        ab_dtype,
+        ab_dtype,
+        c_dtype,
+        tile_shape_mn,
+        cluster_shape_mn,
+        permuted_m,
+        n,
+        k,
+        num_local_experts,
+        swizzle_size=swizzle_size,
+    ):
+        raise ValueError(
+            "sm90_contiguous_gather_grouped_gemm_act_fusion cannot implement "
+            f"tile_shape_mn={tile_shape_mn}, cluster_shape_mn={cluster_shape_mn}, "
+            f"swizzle_size={swizzle_size} for "
+            f"permuted_m={permuted_m}, n={n} (2I), k={k}, {x.dtype} -> {out.dtype}"
+        )
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
@@ -284,6 +294,7 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         tile_shape_mn=tile_shape_mn,
         cluster_shape_mn=cluster_shape_mn,
         topk=topk,
+        swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
         enable_pdl=enable_pdl,
     )

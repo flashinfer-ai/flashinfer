@@ -47,6 +47,11 @@ def _skip_if_not_sm100():
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
 
 
+def _skip_if_sm107() -> None:
+    if torch.cuda.get_device_capability() == (10, 7):
+        pytest.skip("these GDN kernels do not have an SM107 implementation")
+
+
 try:
     from flashinfer.gdn_kernels import gdn_decode_bf16_wy_output_only as wy
 
@@ -161,6 +166,7 @@ def test_wy_multistream_overlap_stress():
     work outlasts the host launch gap.
     """
     _skip_if_not_sm90_or_later()
+    _skip_if_sm107()
     if not WY_AVAILABLE:
         pytest.skip("gdn_decode_bf16_wy_output_only kernel not available")
 
@@ -271,6 +277,7 @@ def test_blackwell_prefill_workspace_not_in_compile_cache():
     callable and static metadata; the launch workspace (which the kernel
     rewrites with TMA descriptors every call) must not be stored there."""
     _skip_if_not_sm100()
+    _skip_if_sm107()
     from flashinfer.gdn_kernels.blackwell import gdn_prefill as prefill_mod
 
     device = torch.device("cuda")

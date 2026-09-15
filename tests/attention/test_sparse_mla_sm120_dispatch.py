@@ -59,6 +59,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _MODEL_TYPE_DOTS3_SWA,
     _decode_scratch_views,
     _decode_dispatch_error_message,
+    _packed_kv_page_block_size,
     _resolve_model_type,
 )
 from flashinfer.mla._sparse_mla_sm120_plan import (
@@ -143,6 +144,26 @@ def test_supported_configs_nvfp4_envelope() -> None:
 
     with pytest.raises(ValueError, match="kv_cache_format"):
         supported_sparse_mla_sm120_configs(kv_cache_format="int4")
+
+
+@pytest.mark.parametrize("layout", ["2d", "3d", "hnd", "nhd"])
+def test_glm53_canonical_payload_is_scoped_to_model(layout: str) -> None:
+    """A 528-byte row is valid only with GLM NoPE geometry and scale semantics."""
+    glm = _resolve_model_type(512, "arbitrary_fp32")
+    assert glm == _MODEL_TYPE_GLM53_NOPE
+    assert _resolve_model_type(512, "auto") == _MODEL_TYPE_DSV4
+    assert supported_sparse_mla_sm120_configs()["glm53_nope"].bytes_per_token == 528
+    shape = {
+        "2d": (2, 64 * 528),
+        "3d": (2, 64, 528),
+        "hnd": (2, 1, 64, 528),
+        "nhd": (2, 64, 1, 528),
+    }[layout]
+    cache = torch.empty(shape, dtype=torch.uint8, device="meta")
+    assert _packed_kv_page_block_size(cache, model_type=glm, name="kv") == 64
+    for model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        with pytest.raises(ValueError):
+            _packed_kv_page_block_size(cache, model_type=model_type, name="kv")
 
 
 def test_nvfp4_exact_head_scratch_view() -> None:
