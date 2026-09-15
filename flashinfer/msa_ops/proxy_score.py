@@ -25,7 +25,7 @@ from ..trace.templates.msa import (
     msa_proxy_score_fp4_trace,
     msa_proxy_score_trace,
 )
-from ..utils import get_device_sm_count, is_sm12x_supported
+from ..utils import get_device_sm_count, is_sm12x_supported, is_sm90a_supported
 from ._common import _BLK_KV
 
 # NVFP4 scale granularity: one e4m3 block scale per 16 e2m1 elements.
@@ -367,8 +367,11 @@ def msa_proxy_score(
         _q_offset_tensor,
     )
 
-    if not is_sm12x_supported(q.device):
-        raise RuntimeError("msa_proxy_score requires SM120 or SM121 and CUDA >= 12.8")
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
+        raise RuntimeError(
+            "msa_proxy_score requires SM90, SM120 or SM121 and CUDA >= 12.8"
+        )
     q_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float16) and not q_fp8:
         raise ValueError(f"q must be bf16, fp16, or fp8 e4m3, got {q.dtype}")
@@ -429,6 +432,23 @@ def msa_proxy_score(
         per_head = torch.empty(per_head_shape, dtype=torch.float32, device=dev)
     else:
         per_head = output
+
+    if sm90:
+        if not paged:
+            raise NotImplementedError("SM90 proxy-score requires the paged KV layout")
+        from ._sm90_dispatch import proxy_score_sm90
+
+        proxy_score_sm90(
+            q, k, cu_seqlens_q, pt_dev, k_len_or_cu, per_head,
+            max_seqlen_q=max_seqlen_q, batch_size=batch_size, kv_fp8=kv_fp8,
+            q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+        )
+        if not reduce_heads:
+            return per_head
+        if output is None:
+            output = torch.empty(final_shape, dtype=torch.float32, device=dev)
+        torch.amax(per_head, dim=0, keepdim=True, out=output)
+        return output
 
     group_size = num_qo_heads // num_kv_heads
     _PACK_ROWS = 64  # bf16 MMA q-tile rows (== m_block_size)
