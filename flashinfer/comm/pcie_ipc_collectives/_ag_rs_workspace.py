@@ -20,10 +20,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ._pcie_ipc_ag_rs_topology import resolve_pcie_ipc_ag_rs_topology
-from ._pcie_ipc_common import AG_RS_MAX_BLOCKS, PACK_BYTES
-from ._pcie_ipc_lifecycle import bind_stream, joint_check, release_workspace
-from .cuda_ipc import create_shared_buffer, free_shared_buffer
+from ._ag_rs_topology import resolve_pcie_ipc_ag_rs_topology
+from ._constants import AG_RS_MAX_BLOCKS, PACK_BYTES
+from ._lifecycle import bind_stream, joint_check, release_workspace
+from ..cuda_ipc import create_shared_buffer, free_shared_buffer
 
 
 PCIE_IPC_MAX_BLOCKS = AG_RS_MAX_BLOCKS

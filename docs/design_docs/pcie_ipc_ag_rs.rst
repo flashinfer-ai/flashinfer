@@ -8,6 +8,28 @@ Python API convention, not a different import mechanism. Applications should
 use the public exports; internal workspace, topology, JIT, and tuning helpers
 can change without becoming additional public APIs.
 
+Python package layout
+---------------------
+
+``flashinfer.comm.pcie_ipc_collectives`` groups the AG/RS Python implementation
+and shared PCIe collective helpers:
+
+- ``all_gather.py`` and ``reduce_scatter.py`` provide the workspace APIs;
+  ``all_gather_policy.py`` and ``reduce_scatter_policy.py`` define their launch
+  configurations, variants, and seed policies.
+- ``_ag_rs_workspace.py``, ``_ag_rs_tuning.py``, ``_ag_rs_module.py``, and
+  ``_ag_rs_topology.py`` contain AG/RS workspace management, exact-shape tuning,
+  JIT loading, and operator-specific topology admission.
+- ``_topology.py``, ``_lifecycle.py``, and ``_constants.py`` provide shared
+  GPU identity/NVML evidence, stream and resource lifecycle, and constants.
+  The existing AllReduce modules reuse these helpers but retain their current
+  locations in ``flashinfer.comm`` and their own policy and admission rules.
+
+Applications continue to import the public types from ``flashinfer.comm``.
+The general-purpose ``cuda_ipc.py`` utilities remain outside this package.
+CUDA headers, TVM-FFI bindings, JIT generators, and tests retain FlashInfer's
+existing ``include/``, ``csrc/``, ``flashinfer/jit/``, and ``tests/`` layout.
+
 What a variant describes
 ------------------------
 

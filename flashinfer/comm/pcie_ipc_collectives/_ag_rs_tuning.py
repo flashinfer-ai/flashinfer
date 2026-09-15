@@ -41,7 +41,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 
-from ._pcie_ipc_common import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
+from ._constants import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
 
 
 PCIE_IPC_TUNE_BLOCKS: Tuple[int, ...] = (
@@ -153,7 +153,7 @@ def default_cache_path(
     if override:
         base = Path(override)
     else:
-        from ..jit.env import FLASHINFER_WORKSPACE_DIR
+        from ...jit.env import FLASHINFER_WORKSPACE_DIR
 
         base = FLASHINFER_WORKSPACE_DIR / "autotune"
     dtype_name = str(dtype).removeprefix("torch.")

@@ -20,17 +20,17 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ..api_logging import flashinfer_api
-from ._pcie_ipc_collective_tuning import (
+from ...api_logging import flashinfer_api
+from ._ag_rs_tuning import (
     PCIE_IPC_TUNE_BATCHES,
     PCIE_IPC_TUNE_REPEAT,
     PCIE_IPC_TUNE_WARMUP,
     PcieIpcCollectiveTuningSpec,
     PcieIpcCollectiveTuningState,
 )
-from ._pcie_ipc_ag_rs_module import get_pcie_ipc_ag_rs_module
-from ._pcie_ipc_workspace import PCIE_IPC_MAX_BLOCKS, _PcieIpcWorkspace
-from .pcie_ipc_rs_policy import (
+from ._ag_rs_module import get_pcie_ipc_ag_rs_module
+from ._ag_rs_workspace import PCIE_IPC_MAX_BLOCKS, _PcieIpcWorkspace
+from .reduce_scatter_policy import (
     PcieIpcReduceScatterLaunchConfig,
     PcieIpcReduceScatterVariant,
     _is_launchable,

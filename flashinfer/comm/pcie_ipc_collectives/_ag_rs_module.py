@@ -20,8 +20,8 @@ from typing import List
 
 import torch
 
-from ..jit.comm import gen_pcie_ipc_ag_rs_module
-from ..utils import register_custom_op
+from ...jit.comm import gen_pcie_ipc_ag_rs_module
+from ...utils import register_custom_op
 
 
 @functools.cache

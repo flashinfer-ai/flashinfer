@@ -265,6 +265,9 @@ These standalone workspaces support BF16, FP16, and FP32 tensors at world sizes
 ReduceScatter output. Tensors must be contiguous, rank-2, 16-byte aligned, and
 contain complete 16-byte packs.
 
+Their Python implementation lives in ``flashinfer.comm.pcie_ipc_collectives``;
+the public entry points remain the ``flashinfer.comm`` exports shown below.
+
 As with :class:`PcieIpcAllReduceWorkspace`, construction, calls, and destruction
 are collective. Every rank must issue the same sequence and configuration, and
 one workspace belongs to one ordered CUDA stream. Keep the workspace alive

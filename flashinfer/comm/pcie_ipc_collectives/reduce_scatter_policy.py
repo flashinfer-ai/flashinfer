@@ -13,11 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Launch policy for the PCIe IPC all-gather.
+Launch policy for the PCIe IPC reduce-scatter.
 
-The policy is deliberately a pure, conservative seed. Launch geometry contains
-the actual CUDA grid size, not an upper bound that the launcher silently
-reduces. Device-specific choices belong in the tuner.
+The launch seed is deterministic and makes no device-name assumptions.
+``blocks`` is the actual grid size; device-specific choices belong in tuning.
 """
 
 from dataclasses import dataclass
@@ -25,28 +24,29 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
-from ._pcie_ipc_common import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
+from ._constants import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
 
 
-# Historical seed heuristics in per-rank input bytes. These are not universal
+# Historical seed heuristics in per-rank output bytes. These are not universal
 # measured crossovers; tune() compares every admitted variant on this device.
-_SEED_FLAT_TO_RECURSIVE_BYTES = 256 * 1024
-_SEED_COPY_ENGINE_BYTES = 512 * 1024
+_SEED_TOPOLOGY_CYCLIC_BYTES = 128 * 1024
+_SEED_FLAT_CYCLIC_BYTES = 4 * 1024 * 1024
 
 
-class PcieIpcAllGatherVariant(IntEnum):
-    """All-gather kernel selected across the FFI boundary."""
+class PcieIpcReduceScatterVariant(IntEnum):
+    """Reduce-scatter kernel selected across the FFI boundary."""
 
-    FLAT_PUSH = 0
-    RECURSIVE_DOUBLING = 1
-    COPY_ENGINE = 2
+    FLAT_CYCLIC = 0
+    FLAT_ONE_PACK = 1
+    TOPOLOGY_CYCLIC = 2
+    TOPOLOGY_ONE_PACK = 3
 
 
 @dataclass(frozen=True)
-class PcieIpcAllGatherLaunchConfig:
+class PcieIpcReduceScatterLaunchConfig:
     blocks: int
     threads: int
-    variant: PcieIpcAllGatherVariant
+    variant: PcieIpcReduceScatterVariant
 
 
 def _threads_for(num_packs: int) -> int:
@@ -61,40 +61,39 @@ def _threads_for(num_packs: int) -> int:
 
 def _is_launchable(
     world_size: int,
-    config: PcieIpcAllGatherLaunchConfig,
+    config: PcieIpcReduceScatterLaunchConfig,
     max_blocks: int,
     ordered_4plus4: bool = False,
 ) -> bool:
     if (
         type(config.blocks) is not int
         or type(config.threads) is not int
-        or not isinstance(config.variant, PcieIpcAllGatherVariant)
+        or not isinstance(config.variant, PcieIpcReduceScatterVariant)
     ):
         return False
     if not 0 < config.blocks <= max_blocks:
         return False
     if not 32 <= config.threads <= AG_RS_MAX_THREADS or config.threads % 32 != 0:
         return False
-    if config.variant == PcieIpcAllGatherVariant.COPY_ENGINE:
-        return (
-            world_size == 8
-            and ordered_4plus4
-            and config.blocks == 1
-            and config.threads == 32
-        )
-    if config.variant == PcieIpcAllGatherVariant.FLAT_PUSH:
-        return world_size == 4
-    return config.variant == PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
+    if config.variant in (
+        PcieIpcReduceScatterVariant.TOPOLOGY_CYCLIC,
+        PcieIpcReduceScatterVariant.TOPOLOGY_ONE_PACK,
+    ):
+        return world_size == 8 and ordered_4plus4
+    return world_size in (2, 4) and config.variant in (
+        PcieIpcReduceScatterVariant.FLAT_CYCLIC,
+        PcieIpcReduceScatterVariant.FLAT_ONE_PACK,
+    )
 
 
 @lru_cache(maxsize=None)
-def get_pcie_ipc_all_gather_launch_config(
+def get_pcie_ipc_reduce_scatter_launch_config(
     world_size: int,
     shard_numel: int,
     max_blocks: int = AG_RS_MAX_BLOCKS,
     element_size: int = 2,
     ordered_4plus4: bool = False,
-) -> Optional[PcieIpcAllGatherLaunchConfig]:
+) -> Optional[PcieIpcReduceScatterLaunchConfig]:
     """Return a deterministic launch seed, or ``None`` if unsupported."""
     if world_size not in (2, 4, 8):
         return None
@@ -105,24 +104,29 @@ def get_pcie_ipc_all_gather_launch_config(
         return None
     if max_blocks <= 0 or max_blocks > AG_RS_MAX_BLOCKS:
         return None
-
-    if world_size == 8 and ordered_4plus4:
-        if payload_bytes >= _SEED_COPY_ENGINE_BYTES:
-            return PcieIpcAllGatherLaunchConfig(
-                blocks=1,
-                threads=32,
-                variant=PcieIpcAllGatherVariant.COPY_ENGINE,
-            )
-        variant = PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
-    elif world_size == 4 and payload_bytes < _SEED_FLAT_TO_RECURSIVE_BYTES:
-        variant = PcieIpcAllGatherVariant.FLAT_PUSH
+    if world_size == 8 and not ordered_4plus4:
+        return None
+    if world_size == 8:
+        variant = (
+            PcieIpcReduceScatterVariant.TOPOLOGY_CYCLIC
+            if payload_bytes >= _SEED_TOPOLOGY_CYCLIC_BYTES
+            else PcieIpcReduceScatterVariant.TOPOLOGY_ONE_PACK
+        )
     else:
-        variant = PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
+        variant = (
+            PcieIpcReduceScatterVariant.FLAT_CYCLIC
+            if world_size == 2 and payload_bytes >= _SEED_FLAT_CYCLIC_BYTES
+            else PcieIpcReduceScatterVariant.FLAT_ONE_PACK
+        )
 
     num_packs = payload_bytes // PACK_BYTES
     threads = _threads_for(num_packs)
-    blocks = min(max_blocks, (num_packs + threads - 1) // threads)
-    config = PcieIpcAllGatherLaunchConfig(blocks, threads, variant)
+    useful_blocks = (num_packs + threads - 1) // threads
+    grid_cap = max_blocks
+    if variant == PcieIpcReduceScatterVariant.TOPOLOGY_CYCLIC:
+        grid_cap = min(grid_cap, 4 if payload_bytes >= 1024 * 1024 else 8)
+    blocks = min(grid_cap, useful_blocks)
+    config = PcieIpcReduceScatterLaunchConfig(blocks, threads, variant)
     return (
         config
         if _is_launchable(world_size, config, max_blocks, ordered_4plus4)

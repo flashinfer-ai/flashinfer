@@ -7,9 +7,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from flashinfer.comm import _pcie_ipc_ag_rs_topology as ag_rs_topology
-from flashinfer.comm import _pcie_ipc_topology as shared_topology
 from flashinfer.comm import pcie_ipc_topology as ar_topology
+from flashinfer.comm.pcie_ipc_collectives import _ag_rs_topology as ag_rs_topology
+from flashinfer.comm.pcie_ipc_collectives import _topology as shared_topology
 
 
 @pytest.fixture

@@ -14,31 +14,58 @@
 
 """CPU-only launch-policy and tuning-contract tests for PCIe IPC AG/RS."""
 
+import importlib
+
 import pytest
 import torch
 
-from flashinfer.comm._pcie_ipc_collective_tuning import (
+import flashinfer.comm as comm
+from flashinfer.comm.pcie_ipc_collectives._ag_rs_tuning import (
     PcieIpcCollectiveTuningState,
     candidate_configs,
     config_to_tactic,
     default_cache_path,
     tactic_to_config,
 )
-from flashinfer.comm._pcie_ipc_ag_rs_topology import (
+from flashinfer.comm.pcie_ipc_collectives._ag_rs_topology import (
     _RankLinks,
     decide_pcie_ipc_ag_rs_topology,
 )
-from flashinfer.comm.pcie_ipc_ag import _TUNING_SPEC as AG_TUNING_SPEC
-from flashinfer.comm.pcie_ipc_ag_policy import (
+from flashinfer.comm.pcie_ipc_collectives.all_gather import (
+    _TUNING_SPEC as AG_TUNING_SPEC,
+)
+from flashinfer.comm.pcie_ipc_collectives.all_gather_policy import (
     PcieIpcAllGatherVariant,
     get_pcie_ipc_all_gather_launch_config,
 )
-from flashinfer.comm.pcie_ipc_rs import _TUNING_SPEC as RS_TUNING_SPEC
-from flashinfer.comm.pcie_ipc_rs_policy import (
+from flashinfer.comm.pcie_ipc_collectives.reduce_scatter import (
+    _TUNING_SPEC as RS_TUNING_SPEC,
+)
+from flashinfer.comm.pcie_ipc_collectives.reduce_scatter_policy import (
     PcieIpcReduceScatterVariant,
     get_pcie_ipc_reduce_scatter_launch_config,
 )
-from flashinfer.comm._pcie_ipc_workspace import _PcieIpcWorkspace
+from flashinfer.comm.pcie_ipc_collectives._ag_rs_workspace import _PcieIpcWorkspace
+
+
+@pytest.mark.parametrize(
+    "module_name,symbol",
+    [
+        ("all_gather", "PcieIpcAllGatherWorkspace"),
+        ("all_gather_policy", "PcieIpcAllGatherLaunchConfig"),
+        ("all_gather_policy", "PcieIpcAllGatherVariant"),
+        ("all_gather_policy", "get_pcie_ipc_all_gather_launch_config"),
+        ("reduce_scatter", "PcieIpcReduceScatterWorkspace"),
+        ("reduce_scatter_policy", "PcieIpcReduceScatterLaunchConfig"),
+        ("reduce_scatter_policy", "PcieIpcReduceScatterVariant"),
+        ("reduce_scatter_policy", "get_pcie_ipc_reduce_scatter_launch_config"),
+    ],
+)
+def test_public_exports_match_collective_modules(module_name: str, symbol: str) -> None:
+    module = importlib.import_module(
+        f"flashinfer.comm.pcie_ipc_collectives.{module_name}"
+    )
+    assert getattr(comm, symbol) is getattr(module, symbol)
 
 
 def test_policy_uses_payload_bytes_at_variant_thresholds() -> None:

@@ -29,8 +29,8 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.comm import pcie_ipc_all_reduce_trace
 from ..jit.comm import gen_pcie_ipc_comm_module
 from ..utils import register_custom_op
-from ._pcie_ipc_common import AR_MAX_BLOCKS, PACK_BYTES
-from ._pcie_ipc_lifecycle import bind_stream, joint_check, release_workspace
+from .pcie_ipc_collectives._constants import AR_MAX_BLOCKS, PACK_BYTES
+from .pcie_ipc_collectives._lifecycle import bind_stream, joint_check, release_workspace
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 from .pcie_ipc_policy import IpcLaunchConfig, get_pcie_ipc_launch_config
 from .pcie_ipc_topology import resolve_pcie_ipc_profile

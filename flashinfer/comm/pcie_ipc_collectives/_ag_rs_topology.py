@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ._pcie_ipc_topology import PcieIpcTopologyEvidence, collect_pcie_ipc_topology
+from ._topology import PcieIpcTopologyEvidence, collect_pcie_ipc_topology
 
 
 @dataclass

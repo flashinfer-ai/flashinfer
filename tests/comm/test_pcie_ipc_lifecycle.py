@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.comm._pcie_ipc_lifecycle import (
+from flashinfer.comm.pcie_ipc_collectives._lifecycle import (
     bind_stream,
     joint_check,
     release_workspace,

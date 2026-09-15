@@ -23,8 +23,8 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.comm._pcie_ipc_ag_rs_module import get_pcie_ipc_ag_rs_module
-from flashinfer.comm.pcie_ipc_rs_policy import (
+from flashinfer.comm.pcie_ipc_collectives._ag_rs_module import get_pcie_ipc_ag_rs_module
+from flashinfer.comm.pcie_ipc_collectives.reduce_scatter_policy import (
     PcieIpcReduceScatterLaunchConfig,
     PcieIpcReduceScatterVariant,
 )

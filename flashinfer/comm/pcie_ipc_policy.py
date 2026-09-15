@@ -37,7 +37,7 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
-from ._pcie_ipc_common import AR_MAX_BLOCKS, PACK_BYTES
+from .pcie_ipc_collectives._constants import AR_MAX_BLOCKS, PACK_BYTES
 
 
 # Preserve the existing AllReduce policy name and configurable workspace default.

@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 import torch
 from torch.distributed import ProcessGroup
 
-from ._pcie_ipc_topology import (
+from .pcie_ipc_collectives._topology import (
     PcieIpcTopologyEvidence,
     collect_pcie_ipc_topology,
     probe_pcie_ipc_identity,
@@ -49,8 +49,8 @@ class PcieIpcRankTopology:
 
     ``peer_switch_local`` is keyed by the *peer GPU's UUID* so the decision
     layer can join results across ranks regardless of each process's
-    ``CUDA_VISIBLE_DEVICES`` ordering, and so the probe only ever describes
-    GPUs this rank can actually see.
+    ``CUDA_VISIBLE_DEVICES`` ordering. The collective resolver queries group
+    members even when their GPUs are hidden from this process's CUDA view.
     """
 
     rank: int
@@ -107,8 +107,8 @@ def decide_pcie_ipc_profile(
     An explicit ``requested`` profile always wins. Otherwise the group is
     switch-paired only if some rank positively observed a switch-local peer;
     anything unknown or unprobeable falls back to ``rootcplx-noswitch``.
-    Guessing wrong costs a tune cache keyed on the other fabric, so the label
-    that claims less is the safe default.
+    The profile keys the tuning cache and screens CE island candidates, so
+    the label that claims less is the safe default.
     """
     # The intra-node constraint is checked first: CUDA IPC cannot cross hosts,
     # so an explicit profile must not be able to wave it through.
@@ -133,10 +133,10 @@ def decide_pcie_ipc_profile(
             PROFILE_ROOTCPLX, f"probe failed on ranks {failed}; assuming no switch pair"
         )
 
-    # Only pairs where BOTH endpoints belong to this group count. The probe
-    # walks every GPU the process can see, which for a subgroup is a superset:
-    # a switch-local pair outside the group says nothing about how the group's
-    # own ranks talk to each other.
+    # Only pairs where BOTH endpoints belong to this group count. Standalone
+    # probes can include visible GPUs outside the group; the collective
+    # resolver already queries exact group members. An outside switch-local
+    # pair says nothing about how the group's own ranks talk to each other.
     members = {t.device_uuid for t in topologies if t.device_uuid}
     for t in topologies:
         for peer_uuid, switch_local in t.peer_switch_local.items():
