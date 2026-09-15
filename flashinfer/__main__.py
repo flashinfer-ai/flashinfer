@@ -15,15 +15,25 @@ limitations under the License.
 """
 
 import copy
+from email.parser import BytesParser
 import os
+from pathlib import Path
 import re
-from packaging.version import InvalidVersion, Version
 import subprocess
 import sys
+import tempfile
+import zipfile
 
 import click
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 from tabulate import tabulate  # type: ignore[import-untyped]
 import torch
+
+from .jit._cuda_architecture import (
+    select_compatible_cuda_architecture,
+)
 
 from .artifacts import (
     ArtifactPath,
@@ -161,8 +171,8 @@ def _normalize_jit_cache_provider_tag(cuda_architecture: str) -> str:
     return f"sm{normalized}"
 
 
-def _detect_jit_cache_provider_tags() -> tuple[str, ...]:
-    provider_tags = tuple(
+def _detect_jit_cache_target_tags() -> tuple[str, ...]:
+    target_tags = tuple(
         sorted(
             {
                 _normalize_jit_cache_provider_tag(f"{major}{minor}")
@@ -170,12 +180,122 @@ def _detect_jit_cache_provider_tags() -> tuple[str, ...]:
             }
         )
     )
-    if not provider_tags:
+    if not target_tags:
         raise click.ClickException(
             "No CUDA architecture could be detected. Pass --sm explicitly when "
             "installing minimal jit-cache providers on a host without a visible GPU."
         )
-    return provider_tags
+    return target_tags
+
+
+def _read_jit_cache_provider_tags(
+    shim_wheel: Path, expected_version: str
+) -> tuple[str, ...]:
+    """Read the provider inventory from an exact shim wheel."""
+    try:
+        with zipfile.ZipFile(shim_wheel) as archive:
+            metadata_paths = [
+                path
+                for path in archive.namelist()
+                if path.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_paths) != 1:
+                raise ValueError(
+                    f"expected one METADATA file, found {len(metadata_paths)}"
+                )
+            metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+
+        if canonicalize_name(metadata["Name"] or "") != "flashinfer-jit-cache":
+            raise ValueError(f"unexpected distribution {metadata['Name']!r}")
+        if Version(metadata["Version"] or "") != Version(expected_version):
+            raise ValueError(
+                f"shim version {metadata['Version']!r} does not match {expected_version}"
+            )
+
+        provider_tags = []
+        for requirement_text in metadata.get_all("Requires-Dist", []):
+            requirement = Requirement(requirement_text)
+            name = canonicalize_name(requirement.name)
+            match = re.fullmatch(r"flashinfer-jit-cache-(sm[0-9]{2,3}[af]?)", name)
+            if match is None:
+                raise ValueError(f"unexpected shim dependency {requirement_text!r}")
+            if str(requirement.specifier) != f"=={expected_version}":
+                raise ValueError(
+                    f"provider dependency is not pinned to {expected_version}: "
+                    f"{requirement_text!r}"
+                )
+            provider_tags.append(match.group(1))
+    except (
+        InvalidRequirement,
+        InvalidVersion,
+        OSError,
+        ValueError,
+        zipfile.BadZipFile,
+    ) as error:
+        raise click.ClickException(
+            f"Could not read provider inventory from {shim_wheel.name}: {error}"
+        ) from error
+
+    if not provider_tags:
+        raise click.ClickException(
+            f"The flashinfer-jit-cache {expected_version} shim has no providers."
+        )
+    return tuple(sorted(set(provider_tags)))
+
+
+def _get_available_jit_cache_provider_tags(
+    shim_requirement: str,
+    expected_version: str,
+    index_url: str,
+    nightly: bool,
+) -> tuple[str, ...]:
+    """Download the small shim wheel and return its published provider set."""
+    with tempfile.TemporaryDirectory(prefix="flashinfer-jit-cache-shim-") as temp_dir:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "download",
+            "--disable-pip-version-check",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--dest",
+            temp_dir,
+        ]
+        if nightly:
+            cmd.append("--pre")
+        cmd.extend(["--index-url", index_url, shim_requirement])
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise click.ClickException(
+                "Could not resolve the flashinfer-jit-cache shim needed to select "
+                f"a minimal provider (pip download exited with {result.returncode})."
+            )
+
+        shim_wheels = sorted(Path(temp_dir).glob("*.whl"))
+        if len(shim_wheels) != 1:
+            raise click.ClickException(
+                f"Expected one downloaded flashinfer-jit-cache shim, found "
+                f"{len(shim_wheels)}."
+            )
+        return _read_jit_cache_provider_tags(shim_wheels[0], expected_version)
+
+
+def _select_jit_cache_provider_tags(
+    target_tags: tuple[str, ...], available_provider_tags: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Select the best published provider for every requested CUDA target."""
+    selected = set()
+    for target in target_tags:
+        provider = select_compatible_cuda_architecture(target, available_provider_tags)
+        if provider is None:
+            available = ", ".join(available_provider_tags)
+            raise click.ClickException(
+                f"No published jit-cache provider is compatible with {target}. "
+                f"Available providers: {available}."
+            )
+        selected.add(provider)
+    return tuple(sorted(selected))
 
 
 def _build_jit_cache_provider_requirement(
@@ -287,7 +407,7 @@ def _install_jit_cache_wheel(
     provider_tags: tuple[str, ...] = ()
     requirements = [shim_requirement]
     if mode == "minimal":
-        provider_tags = tuple(
+        target_tags = tuple(
             sorted(
                 {
                     _normalize_jit_cache_provider_tag(architecture)
@@ -295,8 +415,21 @@ def _install_jit_cache_wheel(
                 }
             )
         )
-        if not provider_tags:
-            provider_tags = _detect_jit_cache_provider_tags()
+        if not target_tags:
+            target_tags = _detect_jit_cache_target_tags()
+        expected_version = (
+            f"{_get_public_flashinfer_version(resolved_flashinfer_version)}"
+            f"+{cuda_index_label}"
+        )
+        available_provider_tags = _get_available_jit_cache_provider_tags(
+            shim_requirement,
+            expected_version,
+            resolved_index_url,
+            nightly,
+        )
+        provider_tags = _select_jit_cache_provider_tags(
+            target_tags, available_provider_tags
+        )
         requirements.extend(
             _build_jit_cache_provider_requirement(
                 resolved_flashinfer_version, cuda_index_label, provider_tag

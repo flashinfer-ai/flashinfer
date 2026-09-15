@@ -6,6 +6,7 @@ you may not use this file except in compliance with the License.
 """
 
 from dataclasses import dataclass
+from numbers import Real
 from typing import Literal, Optional, Union, overload
 
 import torch
@@ -15,7 +16,8 @@ MLAInputAvailability = Literal["packed", "split", "redundant"]
 MLAChosenRepresentation = Literal["packed", "split"]
 MLALSEMode = Literal["none", "base2", "basee"]
 MLAOutputScaleMode = Literal["none", "per-tensor"]
-MLAScaleMode = Literal["default", "kv-per-tensor"]
+MLABmmScale = Union[float, torch.Tensor]
+MLAScaleMode = Literal["default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"]
 MLAStructuralInputKind = Literal[
     "packed", "adjacent-split", "independent-split", "dual"
 ]
@@ -26,6 +28,10 @@ def _raise_planned_run_mismatch(name: str, planned: object, actual: object) -> N
         f"MLA planned run argument {name} mismatch: planned {planned!r}, got "
         f"{actual!r}; re-plan with the needed arguments."
     )
+
+
+def _is_valid_bmm_scalar(value: object) -> bool:
+    return isinstance(value, Real) and not isinstance(value, bool)
 
 
 @dataclass(frozen=True)
@@ -108,6 +114,8 @@ class MLAInputContract:
     kv_cache_layout: Literal["packed", "split"] = "packed"
     head_dim_ckv: Optional[int] = None
     head_dim_kpe: Optional[int] = None
+    skip_softmax: bool = False
+    use_sinks: bool = False
 
     def validate_run_options(
         self,
@@ -120,6 +128,10 @@ class MLAInputContract:
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[MLABmmScale] = None,
+        bmm2_scale: Optional[MLABmmScale] = None,
     ) -> None:
         """Validate run-time options against this planned contract."""
 
@@ -140,6 +152,51 @@ class MLAInputContract:
                 "o_scale", self.output_scale, actual_output_scale
             )
 
+        actual_use_sinks = sinks is not None
+        if actual_use_sinks != self.use_sinks:
+            _raise_planned_run_mismatch("sinks", self.use_sinks, actual_use_sinks)
+        actual_skip_softmax = skip_softmax_threshold_scale_factor is not None
+        if actual_skip_softmax != self.skip_softmax:
+            _raise_planned_run_mismatch(
+                "skip_softmax", self.skip_softmax, actual_skip_softmax
+            )
+
+        has_kv_scale = (
+            ckv_scale is not None or ckv_scale_arr is not None or kpe_scale is not None
+        )
+        has_bmm_scale = bmm1_scale is not None or bmm2_scale is not None
+        if has_kv_scale and has_bmm_scale:
+            raise ValueError("KV and BMM scale families are mutually exclusive.")
+        if (bmm1_scale is None) != (bmm2_scale is None):
+            raise ValueError("bmm1_scale and bmm2_scale must be provided together.")
+        actual_scale_mode: MLAScaleMode
+        if bmm1_scale is not None and bmm2_scale is not None:
+            bmm1_is_tensor = isinstance(bmm1_scale, torch.Tensor)
+            bmm2_is_tensor = isinstance(bmm2_scale, torch.Tensor)
+            if bmm1_is_tensor != bmm2_is_tensor:
+                raise ValueError(
+                    "bmm1_scale and bmm2_scale must have the same scale type."
+                )
+            if bmm1_is_tensor:
+                raise ValueError(
+                    "BMM tensor scales are not supported by this planned-wrapper version."
+                )
+            if not _is_valid_bmm_scalar(bmm1_scale) or not _is_valid_bmm_scalar(
+                bmm2_scale
+            ):
+                raise TypeError(
+                    "bmm1_scale and bmm2_scale must be numeric scalar values."
+                )
+            actual_scale_mode = "bmm-scalar"
+        elif self.scale_mode == "kv-per-tensor":
+            actual_scale_mode = "kv-per-tensor"
+        else:
+            actual_scale_mode = "default"
+        if actual_scale_mode != self.scale_mode:
+            _raise_planned_run_mismatch(
+                "scale mode", self.scale_mode, actual_scale_mode
+            )
+
         if self.scale_mode == "kv-per-tensor":
             if (ckv_scale is None) == (ckv_scale_arr is None):
                 raise ValueError(
@@ -148,9 +205,7 @@ class MLAInputContract:
                 )
             if kpe_scale is None:
                 raise ValueError("kpe_scale is required when kv_data_type is FP8.")
-        elif (
-            ckv_scale is not None or ckv_scale_arr is not None or kpe_scale is not None
-        ):
+        elif has_kv_scale:
             raise ValueError(
                 "ckv_scale / ckv_scale_arr / kpe_scale are only valid when "
                 "kv_data_type is FP8."

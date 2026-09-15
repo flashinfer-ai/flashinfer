@@ -19,6 +19,7 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.nn.functional as F
 
 from flashinfer.moe_ep import (
@@ -63,12 +64,15 @@ def problem():
     assert int(os.environ["LOCAL_WORLD_SIZE"]) == _WORLD
     assert rank == local_rank, "this test requires a single node"
     torch.cuda.set_device(local_rank)
+    # Use the validated peer-memory transport for this eight-rank backend.
+    symm_mem.set_backend("NVSHMEM")
     if not dist.is_initialized():
         dist.init_process_group("nccl", timeout=timedelta(minutes=10))
     assert dist.get_world_size() == _WORLD
     assert dist.get_rank() == rank
 
     # The independent reference must use FP32 accumulation, not TF32 products.
+    old_tf32_override = os.environ.pop("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", None)
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     generator = torch.Generator(device="cuda").manual_seed(20260910 + rank)
@@ -117,6 +121,8 @@ def problem():
     finally:
         layer.destroy()
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
+        if old_tf32_override is not None:
+            os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = old_tf32_override
         # The shared conftest destroys the process group once per session.
 
 
