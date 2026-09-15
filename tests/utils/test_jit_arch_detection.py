@@ -15,7 +15,7 @@ def test_check_cuda_arch_refreshes_stale_global_context(monkeypatch):
 
     jit_core.check_cuda_arch()
 
-    assert jit_core.current_compilation_context.TARGET_CUDA_ARCHS == {(12, "0f")}
+    assert {(12, "0f")} == jit_core.current_compilation_context.TARGET_CUDA_ARCHS
 
 
 def test_check_cuda_arch_error_reports_detected_archs(monkeypatch):
@@ -40,7 +40,9 @@ def test_normalize_sm120_uses_cuda_12_8_compatible_suffix(monkeypatch):
 
 
 def test_normalize_sm120_prefers_f_suffix_on_cuda_12_9(monkeypatch):
-    monkeypatch.setattr("flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda _version: True)
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda _version: True
+    )
 
     assert CompilationContext._normalize_cuda_arch(12, 0) == (12, "0f")
 
