@@ -80,6 +80,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
+# Standalone cuDNN Frost Python sources and the native MoE adapter, compiled on first use.
+"flashinfer.experimental.cudnn_frost_selected_kernels" = ["artifacts/*.json", "artifacts/sources/*.py", "csrc/**"]
 # Generated sources for the experimental exact-SM110 GQA decode backend.
 "flashinfer.experimental.sm110_gqa_decode" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
@@ -120,6 +122,7 @@ follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
 exclude = [
+  "flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/sources/",
   "flashinfer-cubin/",
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
@@ -164,6 +167,7 @@ exclude = [
 [tool.ruff]
 # Ruff infers the target from project.requires-python.
 extend-exclude = [
+  "flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/sources/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
   "flashinfer/cute_dsl/attention/fmha/helpers",
