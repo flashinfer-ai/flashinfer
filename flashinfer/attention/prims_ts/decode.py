@@ -3719,10 +3719,6 @@ class BatchDecodePagedTSWrapper:
         allocated when omitted, initialized during planning, retained by the
         frozen plan state, and never reset by ``run``.
 
-        ``split_kv=True`` permits automatic useful split fanout; False forces
-        S1 independently of ``packed_query``. Pass False for prefill and True
-        for decode. This choice is frozen for the lifetime of the plan.
-
         Parameters
         ----------
         device : int, str, or torch.device
@@ -3773,6 +3769,11 @@ class BatchDecodePagedTSWrapper:
             must be 32-byte aligned and large enough for the selected plan.
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
+        split_kv : bool
+            Permit automatic useful split fanout (True, default), or force
+            unsplit execution (False), independently of ``packed_query``.
+            Typically False for prefill and True for decode. This choice is
+            frozen for the lifetime of the plan.
         """
 
         if not isinstance(packed_query, bool):
