@@ -1,4 +1,4 @@
-"""End-to-end command-line contract for the production TRTLLM DA benchmark."""
+"""End-to-end command-line contract for the backend-aware DA MoE benchmark."""
 
 from __future__ import annotations
 
