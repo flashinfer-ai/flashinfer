@@ -318,6 +318,14 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
+    if backend == "cudnn":
+        # Deliberately narrower than the phase-neutral facade's enum: cuDNN's
+        # engine serves ordinary multi-token prefill only.
+        raise ValueError(
+            "backend='cudnn' covers ordinary multi-token prefill only, so it is "
+            "reachable through flashinfer.recurrent_kda rather than this decode "
+            "entry point"
+        )
     if backend not in ("cute-dsl", "cake", "auto"):
         raise ValueError(
             f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"

@@ -14,7 +14,9 @@
 
 import dataclasses
 import importlib
+import inspect
 import math
+import typing
 from types import SimpleNamespace
 
 import pytest
@@ -283,6 +285,34 @@ def test_public_backend_option_rejects_unknown_value_cpu(monkeypatch):
     tensors = [object() for _ in range(5)]
     with pytest.raises(ValueError, match="backend must be"):
         recurrent_kda(*tensors, backend="unknown")
+
+
+def test_decode_facade_rejects_cudnn_by_naming_the_phase_neutral_facade_cpu(
+    monkeypatch,
+):
+    """The two facades' ``backend`` enums differ on purpose, so say why.
+
+    ``"cudnn"`` is valid on ``flashinfer.recurrent_kda`` and not here, because
+    the cuDNN engine serves ordinary multi-token prefill only. A caller who
+    switches import paths should learn that from the error rather than read it
+    as an unrecognised value.
+    """
+    monkeypatch.setattr(
+        kda_decode_module,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail(f"unexpected kernel call: {kwargs}"),
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.raises(ValueError, match="flashinfer.recurrent_kda"):
+        recurrent_kda(*tensors, backend="cudnn")
+
+    top_level = importlib.import_module("flashinfer.kda").recurrent_kda
+    assert "cudnn" in typing.get_args(
+        inspect.signature(top_level).parameters["backend"].annotation
+    )
+    assert "cudnn" not in typing.get_args(
+        inspect.signature(recurrent_kda).parameters["backend"].annotation
+    )
 
 
 def test_cake_backend_rejects_empty_packed_decode_instead_of_noop_cpu():
