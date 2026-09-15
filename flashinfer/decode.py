@@ -810,6 +810,43 @@ def single_decode_with_kv_cache(
         return out
 
 
+def _resolve_decode_tensor_core_backend(
+    backend: str,
+    device: torch.device,
+    pos_encoding_mode: str,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    head_dim: int,
+    q_len_per_req: int,
+) -> str:
+    """Resolve ``auto`` for the tensor-core path exactly the way :meth:`plan` does.
+
+    Decode on tensor cores is planned through the prefill scheduler, and which
+    one it gets depends on the dtypes, so sizing has to answer this question
+    the same way the plan will.
+    """
+    if backend == "auto":
+        if {torch.float8_e4m3fn, torch.float8_e5m2} & {q_data_type, kv_data_type}:
+            backend = determine_attention_backend(
+                device,
+                PosEncodingMode[pos_encoding_mode].value,
+                False,  # use_fp16_qk_reductions
+                False,  # use_custom_mask
+                q_data_type,
+                kv_data_type,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+            )
+        else:
+            backend = "fa2"
+    if q_len_per_req > 1 and backend == "fa3":
+        raise NotImplementedError(
+            "q_len_per_req > 1 is currently only supported on the "
+            "fa2 tensor-core backend."
+        )
+    return backend
+
+
 class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with paged kv-cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
@@ -1249,26 +1286,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 module = self._jit_module
             else:
-                if backend == "auto":
-                    if {
-                        torch.float8_e4m3fn,
-                        torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
-                        backend = determine_attention_backend(
-                            self.device,
-                            PosEncodingMode[pos_encoding_mode].value,
-                            False,  # use_fp16_qk_reductions
-                            False,  # use_custom_mask
-                            q_data_type,
-                            kv_data_type,
-                        )
-                    else:
-                        backend = "fa2"
-                if q_len_per_req > 1 and backend == "fa3":
-                    raise NotImplementedError(
-                        "q_len_per_req > 1 is currently only supported on the "
-                        "fa2 tensor-core backend."
-                    )
+                backend = _resolve_decode_tensor_core_backend(
+                    backend,
+                    self.device,
+                    pos_encoding_mode,
+                    q_data_type,
+                    kv_data_type,
+                    head_dim,
+                    q_len_per_req,
+                )
                 module = get_batch_prefill_module(
                     backend,
                     q_data_type,
@@ -1363,6 +1389,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         q_len_per_req: int = 1,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
     ) -> Tuple[int, int]:
         r"""Return a workspace size no plan within the given bounds can exceed.
 
@@ -1382,9 +1410,43 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Largest ``batch_size`` (that is, ``len(indptr) - 1``) any plan will use.
         max_num_pages_per_request : int
             Largest paged-KV length of a single request, in pages.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``,
+            the window size will be set to the full length of the sequence.
+            Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2,
+            etc.), if not provided, will be set to ``0``.
+        q_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to
+            ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to
+            ``q_data_type``.
         q_len_per_req : int
             Query rows per request, for the tensor-core path where decode is
             planned as a prefill. Defaults to ``1``.
+        fixed_split_size : Optional[int]
+            The fixed split size the plans will use, in pages. A fixed split
+            bypasses the scheduler's own ceiling, so the bound has to know
+            about it. Only the tensor-core path accepts one.
+        disable_split_kv : bool
+            Whether the plans will disable split-kv. Defaults to ``False``.
+            Only the tensor-core path accepts it.
 
         Returns
         -------
@@ -1399,6 +1461,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         if max_batch_size < 0 or max_num_pages_per_request < 0:
             raise ValueError("workspace_size_upper_bound bounds must be non-negative")
+        if q_len_per_req < 1:
+            raise ValueError("q_len_per_req must be at least 1")
 
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
@@ -1420,8 +1484,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if self.use_tensor_cores:
             # The tensor-core path plans decode through the prefill scheduler,
             # so its bound is the prefill bound for q_len_per_req rows each.
+            # Which prefill scheduler it gets depends on the dtypes, so it is
+            # resolved the way plan() resolves it rather than assumed.
+            backend = _resolve_decode_tensor_core_backend(
+                backend,
+                self.device,
+                pos_encoding_mode,
+                q_data_type,
+                kv_data_type,
+                head_dim,
+                q_len_per_req,
+            )
             module = get_batch_prefill_module(
-                "fa2",
+                backend,
                 q_data_type,
                 kv_data_type,
                 o_data_type,
@@ -1450,11 +1525,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self.is_cuda_graph_enabled,
                 head_dim,
                 head_dim,
-                -1,  # fixed_split_size
-                False,  # disable_split_kv
+                -1 if fixed_split_size is None else fixed_split_size,
+                disable_split_kv,
                 0,  # num_colocated_ctas
             ]
         else:
+            if fixed_split_size is not None or disable_split_kv:
+                raise NotImplementedError(
+                    "fixed_split_size and disable_split_kv are only accepted "
+                    "on the tensor-core decode path"
+                )
             module = get_batch_decode_module(
                 q_data_type,
                 kv_data_type,
