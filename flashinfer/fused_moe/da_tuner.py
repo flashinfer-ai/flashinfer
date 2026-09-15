@@ -18,6 +18,7 @@ from flashinfer.fused_moe.da_moe import (
     DAMoEDispatcher,
     DAPlan,
     DAPlanMode,
+    _local_load_spectrum,
 )
 
 
@@ -357,6 +358,8 @@ class DAPlanCompiler:
         self,
         *,
         num_experts: int,
+        local_expert_offset: int = 0,
+        num_local_experts: int | None = None,
         guard_enabled: bool = True,
         margin: float = 0.0,
         control_overhead_us: float = 12.0,
@@ -364,12 +367,21 @@ class DAPlanCompiler:
         """Configure guard policy without changing candidate construction."""
         if num_experts <= 0:
             raise ValueError("num_experts must be positive")
+        if num_local_experts is None:
+            num_local_experts = num_experts
+        if local_expert_offset < 0 or not (
+            0 < num_local_experts <= num_experts - local_expert_offset
+        ):
+            raise ValueError("the local expert shard must fit within num_experts")
         if not 0.0 <= margin < 1.0:
             raise ValueError("guard margin must be in [0, 1)")
         if not math.isfinite(control_overhead_us) or control_overhead_us < 0:
             raise ValueError("control_overhead_us must be finite and nonnegative")
         # Global expert width consumed by the runtime selector and uploaded spectra.
         self._num_experts = num_experts
+        # Runtime and exemplar histograms count only assignments owned by this rank.
+        self._local_expert_offset = local_expert_offset
+        self._num_local_experts = num_local_experts
         # Whether matched ordinary measurements gate final admission.
         self._guard_enabled = guard_enabled
         # Required relative win applied to the matched baseline.
@@ -491,14 +503,13 @@ class DAPlanCompiler:
         )
 
     def _selector_spectrum_fingerprint(self, selection: DAProfileSelection) -> bytes:
-        """Fingerprint the exact global-domain load spectrum consumed by kNN."""
-        ids = selection.expert_ids.detach().to(device="cpu", dtype=torch.int64)
-        if bool(((ids < 0) | (ids >= self._num_experts)).any()):
-            raise ValueError("Selector exemplar contains an out-of-range expert ID")
-        loads = (
-            torch.bincount(ids.flatten(), minlength=self._num_experts)
-            .sort(descending=True)
-            .values
+        """Fingerprint the local-only load spectrum consumed by kNN."""
+        loads = _local_load_spectrum(
+            selection.expert_ids.detach().to(device="cpu", dtype=torch.int64),
+            num_experts=self._num_experts,
+            local_expert_offset=self._local_expert_offset,
+            num_local_experts=self._num_local_experts,
+            normalize=False,
         )
         return loads.contiguous().view(torch.uint8).numpy().tobytes()
 

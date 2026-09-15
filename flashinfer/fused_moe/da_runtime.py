@@ -478,7 +478,11 @@ class DaMoeOperationState:
         # Immutable process-local registry identity.
         self.key = key
         # Sole plan, resource, dispatch, and graph-lease policy owner.
-        self.dispatcher = DAMoEDispatcher(key.num_experts)
+        self.dispatcher = DAMoEDispatcher(
+            key.num_experts,
+            local_expert_offset=key.local_expert_offset,
+            num_local_experts=key.num_local_experts,
+        )
         # Exact full-operation timings reused within this domain.
         self._measurements = FullOpMeasurementCache()
         # Number of ordinary per-tile finalists reused by PrimsTS DA planning.
@@ -723,6 +727,8 @@ class DaMoeOperationState:
         # Candidate selection and guard admission share measurements but remain separate phases.
         compiler = DAPlanCompiler(
             num_experts=self.key.num_experts,
+            local_expert_offset=self.key.local_expert_offset,
+            num_local_experts=self.key.num_local_experts,
             guard_enabled=config.baseline_guard_enabled,
             margin=config.baseline_guard_margin,
             control_overhead_us=config.control_overhead_us,

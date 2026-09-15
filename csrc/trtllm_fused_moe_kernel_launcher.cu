@@ -6462,6 +6462,7 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
     da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, true>
         <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
             static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+            local_expert_offset, local_num_experts,
             static_cast<float const*>(exemplar_spectra.data_ptr()),
             static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
             static_cast<int>(num_selector_exemplars), conditional_handle,
@@ -6470,6 +6471,7 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
     da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
         <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
             static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+            local_expert_offset, local_num_experts,
             static_cast<float const*>(exemplar_spectra.data_ptr()),
             static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
             static_cast<int>(num_selector_exemplars), conditional_handle,
@@ -6478,6 +6480,7 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
     da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false>
         <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
             static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+            local_expert_offset, local_num_experts,
             static_cast<float const*>(exemplar_spectra.data_ptr()),
             static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
             static_cast<int>(num_selector_exemplars), conditional_handle,

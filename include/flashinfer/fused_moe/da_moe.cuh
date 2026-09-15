@@ -701,7 +701,8 @@ __device__ __forceinline__ void DAFinishSelection(int* counts, float* similariti
 template <int MaxExperts, int MaxExemplars, bool PackedRoutingEntries = false,
           typename RoutingEntry = int32_t>
 __global__ void DASelectorKernel(const RoutingEntry* routing_entries, int64_t assignment_numel,
-                                 int num_experts, const float* exemplar_spectra,
+                                 int num_experts, int local_expert_offset, int num_local_experts,
+                                 const float* exemplar_spectra,
                                  const int32_t* exemplar_body_indices, int num_selector_exemplars,
                                  cudaGraphConditionalHandle conditional_handle,
                                  int32_t* selected_body) {
@@ -745,8 +746,9 @@ __global__ void DASelectorKernel(const RoutingEntry* routing_entries, int64_t as
           expert >>= 16;
         }
       }
-      items[item] =
-          static_cast<unsigned short>(expert >= 0 && expert < num_experts ? expert : MaxExperts);
+      const bool is_local =
+          expert >= local_expert_offset && expert < local_expert_offset + num_local_experts;
+      items[item] = static_cast<unsigned short>(is_local ? expert : MaxExperts);
     }
     BlockHistogram(histogram_storage).Composite(items, histogram);
     __syncthreads();

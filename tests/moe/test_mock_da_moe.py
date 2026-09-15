@@ -403,5 +403,56 @@ def test_mock_da_moe_cuda_graph_reference_design() -> None:
     assert lifecycle["released_idle_resources"] == 1
 
 
+def test_selector_ignores_retained_nonlocal_assignments() -> None:
+    """Changing only remote expert IDs must not change the selected DA body."""
+    runner = MockDAMoERunner(
+        num_experts=8,
+        local_expert_offset=2,
+        num_local_experts=3,
+    )
+    inputs = runner.moe_runner.allocate_inputs(8, 16, 2)
+    spread = torch.tensor(
+        [[2, 3], [3, 4], [4, 2], [2, 3]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    concentrated = torch.full_like(spread, 2)
+    runner.publish_plan([spread, concentrated], [0, 1])
+
+    first = torch.tensor(
+        [[2, 0], [2, 1], [2, 5], [2, 6]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    second = torch.tensor(
+        [[2, 7], [2, 6], [2, 1], [2, 0]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    no_local_work = torch.tensor(
+        [[0, 1], [5, 6], [6, 7], [0, 7]] * 2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    inputs.expert_ids.copy_(first)
+    runner.prepare(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs.as_list(), tactic=0)
+    lease = runner.acquire_graph_lease(graph)
+
+    try:
+        selected = []
+        for expert_ids in (first, second, no_local_work):
+            inputs.expert_ids.copy_(expert_ids)
+            graph.replay()
+            torch.cuda.synchronize()
+            selected.append(int(runner.selected_body_tensor().item()))
+        assert selected == [1, 1, 0]
+    finally:
+        graph.reset()
+        lease.release()
+
+
 if __name__ == "__main__":
     main()
