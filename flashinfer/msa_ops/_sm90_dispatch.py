@@ -86,16 +86,20 @@ def topk_select_sm90(
     """
     if topk != 16:
         raise NotImplementedError(f"SM90 msa_topk_select supports topk=16 only, got {topk}")
-    if force_begin_blocks or force_end_blocks:
-        raise NotImplementedError("SM90 msa_topk_select does not implement forced blocks")
+    from .cute_dsl.topk_select_sm90 import run as _topk
+
+    # Forced blocks and per-token validity are applied inside the kernel at the
+    # score load, so they cost no extra traffic and no extra launch. Biasing
+    # max_score in a separate pass instead measured 431us against a 6.8us kernel.
+    nvp = None
     if num_valid_pages is not None and not (
         isinstance(num_valid_pages, int) and num_valid_pages == max_score.shape[1]
     ):
-        raise NotImplementedError(
-            "SM90 msa_topk_select clamps via the -inf tiles in max_score; "
-            "an explicit num_valid_pages is not implemented"
-        )
-    from .cute_dsl.topk_select_sm90 import run as _topk
+        if not isinstance(num_valid_pages, torch.Tensor):
+            raise NotImplementedError(
+                "SM90 msa_topk_select takes num_valid_pages as a per-token tensor"
+            )
+        nvp = num_valid_pages.to(torch.int32).contiguous()
 
     # The kernel emits (Hq, total_q, topk); this op returns (total_q, Hq, topk).
     # Permuting the caller's buffer gives the kernel's view for free whenever that
@@ -105,10 +109,10 @@ def topk_select_sm90(
     hq, _, total_q = max_score.shape
     view = output.permute(1, 0, 2)
     if view.is_contiguous():
-        _topk(max_score, None, None, view)
+        _topk(max_score, None, None, view, nvp, force_begin_blocks, force_end_blocks)
         return output
     tmp = torch.empty((hq, total_q, topk), dtype=torch.int32, device=max_score.device)
-    _topk(max_score, None, None, tmp)
+    _topk(max_score, None, None, tmp, nvp, force_begin_blocks, force_end_blocks)
     output.copy_(tmp.permute(1, 0, 2))
     return output
 

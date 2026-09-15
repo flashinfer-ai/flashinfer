@@ -130,6 +130,19 @@ NEG_BIG = -3.0e38             # finite empty-slot sentinel: -inf would turn
                               # low mantissa bits) and far below any real
                               # proxy score, which is O(1).
 PAD_LIM = -1.0e30
+# Forced-block bias, applied at the score load. Distinct per tile: two tiles
+# carrying an identical score can take the same rank in the strict-< ranking
+# below, which leaves one output slot unwritten. FORCE_STEP keeps the forced
+# run strictly decreasing while staying far above any real proxy score (O(1)).
+# Forced tiles are made strictly decreasing in t so no two can tie: the rank
+# below is a strict <, and a tie leaves an output slot unwritten. Bases are
+# chosen so ONE step clears the fp32 ULP at both (1e10 > ULP(1e16) = 1.1e9 and
+# > ULP(1e14) = 1.1e7) -- a step that rounds away at the larger base would
+# silently reintroduce the ties. The bands stay disjoint through t = 8192 and
+# sit 14 orders above any real proxy score, which is O(1).
+FORCE_BEGIN_BASE = 1.0e16
+FORCE_END_BASE = 1.0e14
+FORCE_STEP = 1.0e10
 SENT = 16777216.0             # 2^24: empty slot, sorts last, decodes to -1
 IDX_BIAS_BITS = 1258291200    # 0x4b000000: monotone fp32 key for index 0
 FULL = 0xFFFFFFFF
@@ -209,7 +222,8 @@ _ASC = _mk_asc_stages()        # 10 lane-parallel stages, ascending
 
 
 @cute.kernel
-def _fill_kernel(mS: cute.Tensor, mO: cute.Tensor):
+def _fill_kernel(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
+                 MASK: cutlass.Constexpr):
     tidx, _, _ = cute.arch.thread_idx()
     bx, _, _ = cute.arch.block_idx()
     lane = tidx & Int32(31)
@@ -224,6 +238,11 @@ def _fill_kernel(mS: cute.Tensor, mO: cute.Tensor):
         head = row // Nq
         tok = row - head * Nq
         ok = slot < T
+        if cutlass.const_expr(MASK):
+            # Every tile fits in the top-k here, so forcing selects nothing new;
+            # only the per-token validity bound can exclude a tile.
+            nvp_f = min(max(mNVP[tok], Int32(0)), T)
+            ok = (slot < T) and (slot < nvp_f)
         score = mS[head, min(slot, T - Int32(1)), tok]
         finite = ok and (score > Float32(PAD_LIM))
         mO[head, tok, slot] = slot if finite else Int32(-1)
@@ -380,7 +399,9 @@ def _filter_push(cbv: cute.Tensor, cbi: cute.Tensor,
 def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
                  bvi: cute.Tensor, cbv: cute.Tensor, cbi: cute.Tensor,
                  gcol: cute.Tensor, tid: Int32, n: Int32,
-                 t00: Int32, istep: Int32, TL: cutlass.Constexpr):
+                 t00: Int32, istep: Int32, nvp_c: Int32, fb_c: Int32,
+                 hi_c: Int32, TL: cutlass.Constexpr,
+                 MASK: cutlass.Constexpr):
     """Scan in eight-score groups, merging only threshold survivors."""
     # The compact view aliases the first-tile scratch.  Every thread must
     # finish gathering its exact first-tile values before the overwrite.
@@ -396,7 +417,17 @@ def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
     for k in cutlass.range(0, ngrp, 1):
         t0 = t00 + istep * (Int32(TL) + (k << 3))
         for u in cutlass.range_constexpr(8):
-            xs[u] = cute.arch.fmax(gcol[t0 + istep * u], Float32(NEG_BIG))
+            _t = t0 + istep * u
+            _xf = cute.arch.fmax(gcol[_t], Float32(NEG_BIG))
+            if cutlass.const_expr(MASK):
+                _tf = Float32(FORCE_STEP) * (_t).to(Float32)
+                _xf = (
+                    Float32(NEG_BIG) if (_t) >= nvp_c
+                    else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
+                          else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
+                                else _xf))
+                )
+            xs[u] = _xf
         # Blocked order makes n warp-uniform; the vote keeps every lane on
         # the same drain schedule even when per-column survivor counts differ.
         if cute.arch.vote_any_sync(count[0] >= Int32(8)):
@@ -411,8 +442,17 @@ def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
         tm1 = t00 + istep * (n - Int32(1))
         for u in cutlass.range_constexpr(8):
             ok = (utail + Int32(u)) < n
-            xf = cute.arch.fmax(gcol[min(t0 + istep * u, tm1)],
-                                Float32(NEG_BIG))
+            _t = min(t0 + istep * u, tm1)
+            _xf = cute.arch.fmax(gcol[_t], Float32(NEG_BIG))
+            if cutlass.const_expr(MASK):
+                _tf = Float32(FORCE_STEP) * (_t).to(Float32)
+                _xf = (
+                    Float32(NEG_BIG) if (_t) >= nvp_c
+                    else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
+                          else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
+                                else _xf))
+                )
+            xf = _xf
             xs[u] = xf if ok else Float32(NEG_BIG)
         if cute.arch.vote_any_sync(count[0] >= Int32(8)):
             _filter_drain(av, ai, bv, bvi, cbv, cbi, tid, True)
@@ -603,6 +643,9 @@ def _coop_final_store(sbv: cute.Tensor, sbi: cute.Tensor, mO: cute.Tensor,
 def _topk_kernel(
     mS: cute.Tensor,
     mO: cute.Tensor,
+    mNVP: cute.Tensor,
+    FB: Int32,
+    FE: Int32,
     T: Int32,
     Nq: Int32,
     LW: cutlass.Constexpr,
@@ -610,7 +653,7 @@ def _topk_kernel(
     TL: cutlass.Constexpr,
     FILTER: cutlass.Constexpr,
     C0: cutlass.Constexpr,
-):
+    MASK: cutlass.Constexpr,):
     c, w, _ = cute.arch.thread_idx()
     bq, h, _ = cute.arch.block_idx()
 
@@ -742,9 +785,30 @@ def _topk_kernel(
     # of a warp load on its own sector, so the loads have to be in flight
     # together or the warp pays the L2 latency once per tile.  Keeping the
     # shared stores out of this loop leaves no dependence between the TL loads.
+    # Forced blocks and per-token validity are folded in here rather than
+    # biasing max_score in a separate pass: the scores are already in flight,
+    # so this costs a few predicated selects and no extra memory traffic.
+    nvp_c = T
+    fb_c = Int32(0)
+    hi_c = T
+    if cutlass.const_expr(MASK):
+        nvp_c = min(max(mNVP[colr], Int32(0)), T)
+        fb_c = min(FB, nvp_c)
+        fe_c = min(FE, nvp_c - fb_c)
+        hi_c = nvp_c - fe_c
     for u in cutlass.range_constexpr(TL):
         ok = Int32(u) < n
-        xf = cute.arch.fmax(gcol[min(t00 + step * u, Tm1)], Float32(NEG_BIG))
+        t_u = min(t00 + step * u, Tm1)
+        _xf = cute.arch.fmax(gcol[t_u], Float32(NEG_BIG))
+        if cutlass.const_expr(MASK):
+            _tf = Float32(FORCE_STEP) * (t_u).to(Float32)
+            _xf = (
+                Float32(NEG_BIG) if (t_u) >= nvp_c
+                else (Float32(FORCE_BEGIN_BASE) - _tf if (t_u) < fb_c
+                      else (Float32(FORCE_END_BASE) - _tf if (t_u) >= hi_c
+                            else _xf))
+            )
+        xf = _xf
         bv[u] = xf if ok else Float32(NEG_BIG)
     for u in cutlass.range_constexpr(TL):
         ssc[u, tid] = bv[u]
@@ -771,14 +835,24 @@ def _topk_kernel(
     if cutlass.const_expr(TL >= TOPK):
         if cutlass.const_expr(FILTER):
             _filter_scan(av, ai, bv, bvi, cbv, cbi, gcol, tid,
-                         n, t00, Int32(step), TL)
+                         n, t00, Int32(step), nvp_c, fb_c, hi_c, TL, MASK)
         else:
             rem = max(n - Int32(TL), Int32(0))
             nfull = rem // Int32(TL)
             for k in cutlass.range(0, nfull, 1):
                 t0 = t00 + step * (Int32(TL) + k * Int32(TL))
                 for u in cutlass.range_constexpr(TL):
-                    bv[u] = cute.arch.fmax(gcol[t0 + step * u], Float32(NEG_BIG))
+                    _t = t0 + step * u
+                    _xf = cute.arch.fmax(gcol[_t], Float32(NEG_BIG))
+                    if cutlass.const_expr(MASK):
+                        _tf = Float32(FORCE_STEP) * (_t).to(Float32)
+                        _xf = (
+                            Float32(NEG_BIG) if (_t) >= nvp_c
+                            else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
+                                  else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
+                                        else _xf))
+                        )
+                    bv[u] = _xf
                 for u in cutlass.range_constexpr(TL):
                     ssc[u, tid] = bv[u]
                     bvi[u] = (bvi[u] & Int32(-TL)) | Int32(u)
@@ -789,8 +863,17 @@ def _topk_kernel(
                 t0 = t00 + step * utail
                 for u in cutlass.range_constexpr(TL):
                     ok = (utail + Int32(u)) < n
-                    xf = cute.arch.fmax(
-                        gcol[min(t0 + step * u, Tm1)], Float32(NEG_BIG))
+                    _t = min(t0 + step * u, Tm1)
+                    _xf = cute.arch.fmax(gcol[_t], Float32(NEG_BIG))
+                    if cutlass.const_expr(MASK):
+                        _tf = Float32(FORCE_STEP) * (_t).to(Float32)
+                        _xf = (
+                            Float32(NEG_BIG) if (_t) >= nvp_c
+                            else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
+                                  else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
+                                        else _xf))
+                        )
+                    xf = _xf
                     bv[u] = xf if ok else Float32(NEG_BIG)
                 for u in cutlass.range_constexpr(TL):
                     ssc[u, tid] = bv[u]
@@ -1080,24 +1163,26 @@ def _topk_kernel(
 
 
 @cute.jit
-def _launch_fill(mS: cute.Tensor, mO: cute.Tensor):
+def _launch_fill(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
+                 MASK: cutlass.Constexpr):
     rows = mS.shape[0] * mS.shape[2]
-    _fill_kernel(mS, mO).launch(
+    _fill_kernel(mS, mO, mNVP, MASK).launch(
         grid=[(rows + Int32(7)) // Int32(8), 1, 1],
         block=[FILL_BLOCK, 1, 1],
     )
 
 
 @cute.jit
-def _launch(mS: cute.Tensor, mO: cute.Tensor, LW: cutlass.Constexpr,
+def _launch(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
+            FB: Int32, FE: Int32, LW: cutlass.Constexpr,
             DENSE: cutlass.Constexpr, TL: cutlass.Constexpr,
             FILTER: cutlass.Constexpr,
-            C0: cutlass.Constexpr):
+            C0: cutlass.Constexpr, MASK: cutlass.Constexpr):
     Hq = mS.shape[0]
     Nq = mS.shape[2]
     C = Int32(C0)
-    _topk_kernel(mS, mO, mS.shape[1], Nq,
-                 LW, DENSE, TL, FILTER, C0).launch(
+    _topk_kernel(mS, mO, mNVP, FB, FE, mS.shape[1], Nq,
+                 LW, DENSE, TL, FILTER, C0, MASK).launch(
         grid=[(Nq + C - Int32(1)) // C, Hq, 1],
         block=[C0, 1 << LW, 1],
     )
@@ -1316,33 +1401,46 @@ _compiled_fill = None
 
 
 @torch.no_grad()
-def run(max_score, cu_seqlens_q, context_lens, topk_idx):
+def run(max_score, cu_seqlens_q, context_lens, topk_idx,
+        num_valid_pages=None, force_begin=0, force_end=0):
+    """Top-k KV-block selection.
+
+    ``num_valid_pages`` is a per-token int32 tensor of causal extents;
+    ``force_begin`` / ``force_end`` pin the sink blocks and the trailing local
+    window. All three are applied at the score load inside the kernel, so the
+    unmasked path is unchanged and costs nothing.
+    """
     global _compiled_fill
     Hq, T, Nq = max_score.shape
+    mask = num_valid_pages is not None or bool(force_begin) or bool(force_end)
+    nvp = num_valid_pages
+    if nvp is None:
+        nvp = torch.empty(0, dtype=torch.int32, device=max_score.device)
+
+    def _dyn(t, ld):
+        return from_dlpack(t, enable_tvm_ffi=True,
+                           use_32bit_stride=True).mark_layout_dynamic(leading_dim=ld)
+
     if T <= TOPK:
-        if _compiled_fill is None:
-            s_c = from_dlpack(max_score, enable_tvm_ffi=True,
-                              use_32bit_stride=True).mark_layout_dynamic(leading_dim=2)
-            o_c = from_dlpack(topk_idx, enable_tvm_ffi=True,
-                              use_32bit_stride=True).mark_layout_dynamic(leading_dim=2)
-            _compiled_fill = cute.compile(
-                _launch_fill, s_c, o_c, options="--enable-tvm-ffi")
-        _compiled_fill(max_score, topk_idx)
+        key = ("fill", mask)
+        fn = _cache.get(key)
+        if fn is None:
+            fn = cute.compile(_launch_fill, _dyn(max_score, 2), _dyn(topk_idx, 2),
+                              _dyn(nvp, 0), mask, options="--enable-tvm-ffi")
+            _cache[key] = fn
+        fn(max_score, topk_idx, nvp)
         return
 
     plan = _plan(int(Hq), int(T), int(Nq))
     # C is the CTA's occupancy-derived column tile, not a workload threshold.
     # Keying it makes the block extent and all row/group address arithmetic
     # compile-time constants while preserving the same algorithm for every C.
-    key = plan
+    key = plan + (mask,)
     fn = _cache.get(key)
     if fn is None:
-        s_c = from_dlpack(max_score, enable_tvm_ffi=True,
-                          use_32bit_stride=True).mark_layout_dynamic(leading_dim=2)
-        o_c = from_dlpack(topk_idx, enable_tvm_ffi=True,
-                          use_32bit_stride=True).mark_layout_dynamic(leading_dim=2)
-        fn = cute.compile(_launch, s_c, o_c,
-                          key[0], key[1], key[2], key[3], key[4],
+        fn = cute.compile(_launch, _dyn(max_score, 2), _dyn(topk_idx, 2),
+                          _dyn(nvp, 0), Int32(force_begin), Int32(force_end),
+                          plan[0], plan[1], plan[2], plan[3], plan[4], mask,
                           options="--enable-tvm-ffi")
         _cache[key] = fn
-    fn(max_score, topk_idx)
+    fn(max_score, topk_idx, nvp, force_begin, force_end)
