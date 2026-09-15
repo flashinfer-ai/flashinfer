@@ -1,11 +1,13 @@
 {
   "name": "prims_ts_block_sparse_wrapper_h8_kv8_d128",
-  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and live per-KV-head BSR metadata. Block geometry and mask type are retained by plan() and represented as optional trace context.",
+  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and live per-KV-head bsr metadata. Block geometry and mask type are retained by plan() and represented as optional trace context.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparseTSWrapper.run",
     "backend:prims-ts",
     "sparse:block",
+    "sparse-format:bsr",
+    "routes:exact",
     "status:experimental"
   ],
   "axes": {
@@ -33,6 +35,10 @@
       "type": "const",
       "value": 128
     },
+    "num_kv_valid_words": {
+      "type": "var",
+      "description": "Number of optional token-validity words per batch."
+    },
     "num_q_block_offsets": {
       "type": "var",
       "description": "Number of BSR row offsets per batch and KV head."
@@ -41,9 +47,9 @@
       "type": "var",
       "description": "Capacity of the runtime KV-block ID tensor."
     },
-    "num_kv_valid_words": {
-      "type": "var",
-      "description": "Number of optional token-validity words per batch."
+    "pattern_heads_shared": {
+      "type": "const",
+      "value": 0
     }
   },
   "constraints": [
@@ -53,8 +59,8 @@
     "q_block_size > 0",
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
-    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "mask_type is None or mask_type in ('dense', 'causal')"
   ],
   "inputs": {

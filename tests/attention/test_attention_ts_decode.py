@@ -59,6 +59,10 @@ from flashinfer.attention.prims_ts.decode import (
     _validate_storage_page_size,
 )
 from flashinfer.attention.prims_ts.split_kv_mode_policy import select_split_kv_modes
+from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+    QTokenKvBlockSparsePagedTSWrapper,
+    get_q_token_kv_block_sparse_workspace_size,
+)
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
     FmhaDecodeConfig,
     make_decode_config,
@@ -100,14 +104,18 @@ from flashinfer.utils import is_sm100a_supported
         pytest.param([8192], 8192, 24, 2, 4, 4, id="tp1-prefill-q4"),
         pytest.param([4] * 8, 32, 24, 2, 4, 4, id="tp1-small-q4"),
         pytest.param([4] * 8, 32, 12, 1, 4, 4, id="tp2-small-q4"),
+        pytest.param([3, 2], 6, 12, 1, 3, 3, id="q3-variable-with-padding"),
         pytest.param([4] * 64, 256, 6, 1, 4, 4, id="tp4-q4"),
         pytest.param([4] * 64 + [0], 256, 24, 2, 4, 4, id="zero-length"),
         pytest.param([2] * 128, 256, 6, 1, 2, 2, id="mtp-q2"),
         pytest.param([4] * 38, 152, 12, 1, 2, 2, id="caller-q2"),
-        pytest.param([4] * 64, 256, 20, 1, 4, None, id="tileq64-cap"),
+        pytest.param([4] * 64, 256, 20, 1, 4, 4, id="q4-fits-tileq128"),
+        pytest.param([4] * 64, 256, 40, 1, 4, None, id="tileq128-cap"),
         pytest.param([5] * 32, 160, 12, 1, 5, 5, id="mtp4-q5-bs32"),
         pytest.param([5] * 16, 80, 12, 1, 5, 5, id="mtp4-q5-bs16"),
-        pytest.param([5] * 64, 320, 16, 1, 5, None, id="mtp4-tileq64-cap"),
+        pytest.param([5] * 64, 320, 16, 1, 5, 5, id="mtp4-fits-tileq128"),
+        pytest.param([5] * 64, 320, 32, 1, 5, None, id="mtp4-tileq128-cap"),
+        pytest.param([8, 7], 16, 12, 1, 8, 8, id="q8-variable-with-padding"),
         pytest.param([1] * 1024, 1024, 12, 1, 4, 4, id="sq1-boundaries"),
         pytest.param([4, 3], 7, 12, 1, 4, 4, id="variable-length"),
         pytest.param([4] * 19 + [0], 80, 24, 2, 4, 4, id="graph-padding"),
@@ -178,52 +186,18 @@ def test_prims_ts_q_token_kv_block_sparse_fixed_group_validation_is_public() -> 
         )
 
 
-@pytest.mark.parametrize(
-    (
-        "batch_size",
-        "seq_len_q",
-        "selected_seq_len_kv",
-        "num_qo_heads",
-        "num_kv_heads",
-        "multi_processor_count",
-        "expected_group_size",
-    ),
-    (
-        # One MTP3 request cannot fill a wave even after useful split-KV, so
-        # expose four independent Q1 routes instead of building one Q4 union.
-        (1, 4, 2051, 12, 1, 152, 1),
-        # Eight MTP3 requests have enough K/V work to fill a wave as Q4.
-        (8, 4, 2051, 12, 1, 152, 4),
-        # Q5 fits TileQ64 for Qwen's twelve query heads per K/V head.
-        (16, 5, 2051, 12, 1, 152, 5),
-        # Divisibility is not required: two Q2 routes cover three live rows.
-        (64, 3, 2051, 12, 1, 152, 2),
-        # A long packed-prefill request supplies independent routes directly.
-        (1, 8192, 2051, 12, 1, 152, 5),
-        # Head capacity, rather than SQ, caps the largest legal group.
-        (8, 5, 2051, 16, 1, 152, 4),
-    ),
-)
-def test_suggest_prims_ts_q_token_kv_block_sparse_group_size(
-    batch_size: int,
-    seq_len_q: int,
-    selected_seq_len_kv: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    multi_processor_count: int,
-    expected_group_size: int,
-) -> None:
-    assert (
-        suggest_prims_ts_q_token_kv_block_sparse_group_size(
-            batch_size,
-            seq_len_q,
-            selected_seq_len_kv,
-            num_qo_heads,
-            num_kv_heads,
-            multi_processor_count,
+def test_q_token_sparse_recommendation_uses_caller_capacity(monkeypatch):
+    """Recommendations fit complete head groups without querying the device."""
+
+    def no_device_query(*args, **kwargs):
+        raise AssertionError("use the supplied SM count")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", no_device_query)
+    for batch, sq, ratio in ((1, 4, 12), (64, 3, 64), (1, 8191, 17)):
+        group = suggest_prims_ts_q_token_kv_block_sparse_group_size(
+            batch, sq, 2051, ratio * 2, 2, 148, head_dim=128
         )
-        == expected_group_size
-    )
+        assert 1 <= group <= min(8, sq, 128 // ratio)
 
 
 @pytest.mark.parametrize(
@@ -250,6 +224,22 @@ def test_suggest_prims_ts_q_token_kv_block_sparse_group_size_rejects_invalid_ext
     arguments[argument] = value
     with pytest.raises((TypeError, ValueError)):
         suggest_prims_ts_q_token_kv_block_sparse_group_size(**arguments)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"head_dim": 32},
+        {"q_data_type": torch.float32},
+        {"q_data_type": "bfloat16"},
+        {"split_kv": 1},
+    ),
+)
+def test_q_token_kv_block_sparse_recommendation_rejects_invalid_recipe(kwargs):
+    with pytest.raises((ValueError, TypeError)):
+        suggest_prims_ts_q_token_kv_block_sparse_group_size(
+            1, 4, 2051, 12, 1, 148, **kwargs
+        )
 
 
 @pytest.mark.parametrize(
@@ -1828,22 +1818,86 @@ def _apply_speculative_tail_markers(case):
     return _with_reference(case)
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("dtype", "page_size"), ((torch.bfloat16, 16), (torch.float16, 128))
+)
+def test_attention_ts_decode_paged_wide_head_group_graph(dtype, page_size):
+    """Ordinary paged Keeps must bind its per-instance K/V staging base."""
+    kv_lens = (512, 507)
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=128,
+        num_kv_heads=1,
+        head_dim=128,
+        seq_len_q=1,
+        page_size=page_size,
+        qkv_dtype=dtype,
+        output_dtype=dtype,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=41283,
+    )
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        case.q.device,
+        len(kv_lens),
+        128,
+        1,
+        128,
+        page_size,
+        max(kv_lens),
+        q_data_type=dtype,
+        mask_type="causal",
+        split_kv=False,
+    )
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=case.q.device)
+    out = torch.empty_like(case.q)
+
+    def run():
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            seq_lens,
+            case.block_tables,
+            out=out,
+            validate=False,
+        )
+
+    assert run() is out
+    _assert_case_correct(out, case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        out.fill_(torch.nan)
+        graph.replay()
+        _assert_case_correct(out, case)
+
+
 def test_attention_ts_decode_storage_page_size_contract() -> None:
-    """Keep encoded locators explicit and restricted to semantic page four."""
+    """An encoded fragment must divide its physical cache page."""
 
     assert _validate_storage_page_size(4, 4) == 4
     assert _validate_storage_page_size(4, 16) == 16
     with pytest.raises(ValueError, match="divisible by page_size"):
         _validate_storage_page_size(4, 18)
-    with pytest.raises(ValueError, match="require page_size=4"):
-        _validate_storage_page_size(16, 32)
+    assert _validate_storage_page_size(8, 32) == 32
+    assert _validate_storage_page_size(16, 32) == 32
+    with pytest.raises(ValueError, match="divisible by page_size"):
+        _validate_storage_page_size(16, 24)
     with pytest.raises(TypeError, match="must be a positive integer"):
         _validate_storage_page_size(4, True)
 
 
-@pytest.mark.parametrize("page_size", (4, 32))
-def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(page_size):
-    """A raw sparse flag must not enable the exception for ordinary paging."""
+@pytest.mark.parametrize("page_size", (4, 32, 128))
+@pytest.mark.parametrize("sparse", (False, True))
+def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(
+    page_size, sparse
+):
+    """The FP8/BF16 reducer is qualified for every sparse fragment size."""
     cfg = FmhaDecodeConfig(
         headdim=256,
         q_dtype=Float8E4M3FN,
@@ -1852,12 +1906,12 @@ def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(page_
         use_paged_kv=True,
         num_tokens_per_page=page_size,
         groups_tokens_heads_q=True,
-        use_q_token_kv_block_sparse_route=True,
+        use_q_token_kv_block_sparse_route=sparse,
         heads_q_per_kv=12,
         max_seq_len_q=4,
         tile_size_q=64,
     )
-    assert cfg.supports_reduction_dtypes is (page_size == 4)
+    assert cfg.supports_reduction_dtypes is sparse
 
 
 def test_attention_ts_decode_public_query_geometry_guards() -> None:
@@ -2098,6 +2152,35 @@ def test_attention_ts_decode_register_reallocation_follows_task_graph(
         assert all(value is not None and value % 8 == 0 for value in budgets)
 
 
+@pytest.mark.parametrize("load_warps", (4, 8))
+def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
+    load_warps: int,
+) -> None:
+    """Extra producers must not request unassigned registers outside the CTA pool."""
+    config = FmhaDecodeConfig(
+        use_keeps_mma_ab=True,
+        tile_size_q=128,
+        tile_size_kv=128,
+        headdim=256,
+        head_dim_per_stage_kv=128,
+        num_insts_kv=1,
+        o_stages=1,
+        load_warp_idx=16,
+        load_num_warps=load_warps,
+    )
+    threads = config.threads_per_cta
+    softmax_warps = config.softmax0_num_warps
+    correction_warps = config.correction_num_warps
+    producer_warps = threads // 32 - softmax_warps - correction_warps
+    requested = 32 * (
+        softmax_warps * config.softmax_task_num_registers
+        + correction_warps * config.correction_task_num_registers
+        + producer_warps * config.mma_load_task_num_registers
+    )
+    initial_per_thread = 65536 // (threads * 8) * 8
+    assert requested <= threads * initial_per_thread
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> None:
@@ -2210,6 +2293,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "out",
         "out_dtype",
         "page_size",
+        "split_kv",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
@@ -2234,6 +2318,7 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "seq_lens",
         "workspace_buffer",
         "storage_page_size",
+        "split_kv",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -2281,7 +2366,6 @@ _FORBIDDEN_DECODE_TUNING_PARAMETERS = frozenset(
         "reduction_mode",
         "schedule",
         "single_kv",
-        "split_kv",
         "split_kv_mode",
         "splits_kv",
         "tile_size_kv",
@@ -2328,6 +2412,13 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
     for surface in _DECODE_PUBLIC_SURFACES:
         parameters = inspect.signature(surface).parameters
         for parameter in parameters.values():
+            if parameter.name == "split_kv":
+                # A public on/off permission is not a tile, fanout or reducer
+                # tuning knob. It is fixed at planning, not on run().
+                assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+                assert parameter.default is True
+                assert parameter.annotation in (bool, "bool")
+                continue
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
                 continue
@@ -3996,7 +4087,7 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     monkeypatch.setattr(
         decode_module,
         "_resolve_decode_launch_spec",
-        lambda *_args: fake_spec,
+        lambda *_args, **_kwargs: fake_spec,
     )
     monkeypatch.setattr(
         decode_module,
@@ -4949,6 +5040,134 @@ def test_attention_ts_decode_split_work_floor_is_explicit() -> None:
         select_splits_kv(**inputs, min_loop_iters_per_split=0)
 
 
+@pytest.mark.parametrize(
+    "controls",
+    (
+        {"split_kv_mode": "gmem_reduction"},
+        {"splits_kv": 4},
+        {"args": {"use_split_kv": True, "splits_kv": 4}},
+    ),
+)
+def test_fmha_split_control_rejects_conflicting_explicit_requests(controls):
+    with pytest.raises(ValueError, match="split_kv=False conflicts"):
+        make_decode_config(split_kv=False, **controls)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize("dtype", (torch.bfloat16,))
+@pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
+@pytest.mark.parametrize("split_kv", (False, True), ids=("no-split", "split"))
+def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
+    torch.manual_seed(5914)
+    batch, sq, hq, dim, page, context = 2, 4, 16, 128, 32, 8192
+    lengths_q = [4, 3] if packed else [4, 4]
+    offsets = (
+        torch.tensor([0, 4, sum(lengths_q)], device="cuda", dtype=torch.int32)
+        if packed
+        else None
+    )
+    query_shape = (sum(lengths_q), hq, dim) if packed else (batch, sq, hq, dim)
+    query = torch.randn(query_shape, device="cuda", dtype=dtype) * 0.25
+    k = (
+        torch.randn(batch * context // page, 1, page, dim, device="cuda", dtype=dtype)
+        * 0.25
+    )
+    v = torch.randn_like(k)
+    table = torch.randperm(k.shape[0], device="cuda", dtype=torch.int32).reshape(
+        batch, -1
+    )
+    lengths = torch.tensor([8192, 4096], device="cuda", dtype=torch.int32)
+    out = torch.empty_like(query)
+    byte_count = get_prims_ts_batch_decode_workspace_size(
+        batch,
+        hq,
+        1,
+        dim,
+        page,
+        context,
+        seq_len_q=sq,
+        qo_indptr=offsets,
+        max_seq_len_q=sq if packed else None,
+        q_dtype=dtype,
+        out_dtype=dtype,
+        mask_type="causal",
+        device=query.device,
+        split_kv=split_kv,
+    )
+    workspace = torch.empty(byte_count, device="cuda", dtype=torch.uint8)
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        query.device,
+        batch,
+        hq,
+        1,
+        dim,
+        page,
+        context,
+        max_seq_len_q=sq,
+        packed_query=packed,
+        q_data_type=dtype,
+        o_data_type=dtype,
+        mask_type="causal",
+        workspace_buffer=workspace,
+        split_kv=split_kv,
+    )
+    if not split_kv:
+        assert not dict(wrapper._policy)["use_split_kv"]
+
+    from flashinfer.fi_trace import fi_trace
+
+    trace = fi_trace(
+        wrapper.run,
+        q=query,
+        paged_kv_cache=(k, v),
+        seq_lens=lengths,
+        block_tables=table,
+        qo_indptr=offsets,
+        out=out,
+    )
+    assert trace["axes"]["split_kv_allowed"]["value"] == int(split_kv)
+
+    def run():
+        wrapper.run(
+            query, (k, v), lengths, table, qo_indptr=offsets, out=out, validate=False
+        )
+
+    def check():
+        first = 0
+        for request, q_len in enumerate(lengths_q):
+            visible = int(lengths[request])
+            tokens = torch.arange(visible, device="cuda")
+            physical = table[request, tokens // page].long()
+            keys, values = (
+                k[physical, 0, tokens % page].float(),
+                v[physical, 0, tokens % page].float(),
+            )
+            for local_q in range(q_len):
+                end = visible - q_len + local_q + 1
+                actual_q = query[first + local_q] if packed else query[request, local_q]
+                expected = (actual_q.float() @ keys[:end].T * dim**-0.5).softmax(
+                    -1
+                ) @ values[:end]
+                actual = out[first + local_q] if packed else out[request, local_q]
+                torch.testing.assert_close(
+                    actual.float(), expected, rtol=0.02, atol=0.01
+                )
+            first += q_len
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for current_lengths in ([15, 7], [8192, 4096]):
+        lengths.copy_(torch.tensor(current_lengths, device="cuda", dtype=torch.int32))
+        out.fill_(torch.nan)
+        graph.replay()
+        check()
+
+
 def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> None:
     """Keep the legacy public Q8 override outside KV256 selection."""
 
@@ -5048,6 +5267,7 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
     page_size: int = 4,
     mask_type: str = "causal",
     window_left: int = -1,
+    split_kv: bool = True,
 ):
     """Resolve QToken-KvBlock-Sparse-Attention policy without requiring a CUDA device in host tests."""
 
@@ -5082,6 +5302,7 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
             window_left,
             16,
             True,
+            split_kv=split_kv,
         )
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
@@ -5091,218 +5312,72 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
     (
         "batch_size",
         "num_qo_heads",
-        "num_kv_heads",
         "group_size",
         "max_kv_len",
         "qkv_dtype",
         "output_dtype",
         "use_packed_q",
-        "expected_tile_size_q",
-        "expected_keeps",
-        "expected_splits",
+        "split_kv",
     ),
     (
-        pytest.param(
-            16,
-            6,
-            1,
-            1,
-            2051,
-            "bfloat16",
-            "bfloat16",
-            False,
-            8,
-            False,
-            8,
-            id="fixed-bf16-q1-split-tile8",
-        ),
-        pytest.param(
-            16,
-            12,
-            1,
-            1,
-            2051,
-            "bfloat16",
-            "bfloat16",
-            False,
-            16,
-            False,
-            8,
-            id="fixed-bf16-q1-tile16",
-        ),
-        pytest.param(
-            256,
-            6,
-            1,
-            1,
-            2051,
-            "bfloat16",
-            "bfloat16",
-            False,
-            8,
-            False,
-            1,
-            id="fixed-bf16-q1-direct-tile8",
-        ),
-        pytest.param(
-            16,
-            12,
-            1,
-            2,
-            2051,
-            "bfloat16",
-            "bfloat16",
-            False,
-            32,
-            False,
-            5,
-            id="fixed-bf16-q2-tile32",
-        ),
-        pytest.param(
-            16,
-            12,
-            1,
-            4,
-            2051,
-            "bfloat16",
-            "bfloat16",
-            False,
-            64,
-            True,
-            9,
-            id="fixed-bf16-q4-tile64",
-        ),
-        pytest.param(
-            32,
-            12,
-            1,
-            5,
-            2051,
-            "bfloat16",
-            "bfloat16",
-            False,
-            64,
-            True,
-            4,
-            id="fixed-bf16-q5-tile64",
-        ),
-        pytest.param(
-            128,
-            12,
-            1,
-            2,
-            8208,
-            "bfloat16",
-            "bfloat16",
-            True,
-            32,
-            False,
-            1,
-            id="packed-bf16-q2-nonsplit",
-        ),
-        pytest.param(
-            16,
-            12,
-            1,
-            2,
-            2524,
-            "float8_e4m3fn",
-            "bfloat16",
-            False,
-            32,
-            False,
-            5,
-            id="fixed-fp8-q2-split",
-        ),
-        pytest.param(
-            256,
-            12,
-            1,
-            2,
-            2524,
-            "float8_e4m3fn",
-            "float16",
-            False,
-            64,
-            True,
-            1,
-            id="fixed-fp8-q2-direct-keeps",
-        ),
+        (16, 6, 1, 2051, "bfloat16", "bfloat16", False, True),
+        (16, 12, 4, 2051, "bfloat16", "bfloat16", False, True),
+        (128, 12, 2, 8208, "bfloat16", "bfloat16", True, False),
+        (1024, 12, 8, 16416, "float8_e4m3fn", "bfloat16", True, False),
     ),
 )
 def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
     monkeypatch,
     batch_size: int,
     num_qo_heads: int,
-    num_kv_heads: int,
     group_size: int,
     max_kv_len: int,
     qkv_dtype: str,
     output_dtype: str,
     use_packed_q: bool,
-    expected_tile_size_q: int,
-    expected_keeps: bool,
-    expected_splits: int,
+    split_kv: bool,
 ) -> None:
-    """Cover the complete fixed-group QToken-KvBlock-Sparse-Attention policy without shape thresholds."""
+    """Fixed G must fit Q capacity, useful KV work, and one split service wave."""
+    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
+        MAX_SPLITS_KV,
+    )
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        MIN_LOOP_ITERS_PER_SPLIT,
+    )
 
     spec = _resolve_q_token_kv_block_sparse_policy_for_test(
         monkeypatch,
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
         group_size=group_size,
         max_kv_len=max_kv_len,
         qkv_dtype=qkv_dtype,
         output_dtype=output_dtype,
         use_packed_q=use_packed_q,
+        split_kv=split_kv,
     )
     cfg = spec.config
-    heads_q_per_kv = num_qo_heads // num_kv_heads
-    group_rows = heads_q_per_kv * group_size
+    group_rows = num_qo_heads * group_size  # This cohort has one KV head.
 
-    assert cfg.use_q_token_kv_block_sparse_route
-    assert cfg.groups_tokens_heads_q
-    assert cfg.tile_size_q == expected_tile_size_q
-    structural_tile_size_q = next(
-        tile for tile in (8, 16, 32, 64) if group_rows <= tile
-    )
-    if qkv_dtype == "float8_e4m3fn" and expected_splits == 1:
-        assert cfg.tile_size_q == 64
-    else:
-        assert cfg.tile_size_q == structural_tile_size_q
+    assert cfg.use_q_token_kv_block_sparse_route and cfg.groups_tokens_heads_q
     assert cfg.q_tokens_per_cta >= group_size
-    assert cfg.use_keeps_mma_ab is expected_keeps
-    assert cfg.num_insts_kv == (1 if expected_keeps else 2)
+    assert group_rows <= cfg.tile_size_q <= 128
     assert cfg.tile_size_kv == 128
-    assert cfg.head_dim_per_stage_kv == 128
     assert cfg.use_variable_seqlens_q is use_packed_q
-    assert cfg.use_persistent_scheduler is False
-    assert cfg.load_num_warps == 8
-
-    assert cfg.splits_kv == cfg.max_splits_kv == expected_splits
-    assert cfg.use_split_kv is (expected_splits > 1)
-    assert cfg.use_separate_reduction_kernel is (expected_splits > 1)
-    assert cfg.use_cluster_smem_reduction is False
-    if use_packed_q:
-        assert expected_splits == 1
-    else:
-        base_grid = batch_size * num_kv_heads
-        min_loop_iters = 1 if group_size == 1 else 2
-        work_bound = math.ceil(max_kv_len / (128 * cfg.num_insts_kv * min_loop_iters))
-        max_policy_splits = 8 if group_size == 1 else 16
-        assert expected_splits <= min(max_policy_splits, work_bound)
-        assert expected_splits == 1 or base_grid * expected_splits <= 148
-
+    assert cfg.use_split_kv is (cfg.splits_kv > 1)
+    if not split_kv:
+        assert cfg.splits_kv == 1
+    iteration_tokens = cfg.tile_size_kv * cfg.num_insts_kv
+    work_bound = max(
+        1,
+        max_kv_len // iteration_tokens
+        if group_size == 1
+        else math.ceil(max_kv_len / (iteration_tokens * MIN_LOOP_ITERS_PER_SPLIT)),
+    )
+    assert cfg.splits_kv <= min(MAX_SPLITS_KV, work_bound, max(148 // batch_size, 1))
     expected_partial_o_shape = (
-        (
-            batch_size,
-            num_kv_heads,
-            expected_splits,
-            group_rows,
-            256,
-        )
-        if expected_splits > 1
+        (batch_size, 1, cfg.splits_kv, group_rows, 256)
+        if cfg.use_split_kv
         else (1, 1, 1, 1, 1)
     )
     assert spec.scratch_shapes[0] == expected_partial_o_shape
@@ -5312,14 +5387,14 @@ def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
     ("overrides", "message"),
     (
         pytest.param(
-            {"group_size": 3},
+            {"group_size": 9},
             "group_size must be one of",
             id="unsupported-group",
         ),
         pytest.param(
-            {"group_size": 5, "num_qo_heads": 16},
-            "exceeds the TileQ64/head capacity",
-            id="group-exceeds-tileq64",
+            {"group_size": 8, "num_qo_heads": 24},
+            "exceeds the TileQ128/head capacity",
+            id="group-exceeds-tileq128",
         ),
         pytest.param(
             {"mask_type": "dense"},
@@ -5332,19 +5407,19 @@ def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
             id="sliding-window",
         ),
         pytest.param(
-            {"page_size": 16},
-            "sparse_block_size=4",
-            id="non-page4",
+            {"page_size": 2},
+            "supported sparse-fragment size",
+            id="unsupported-fragment",
         ),
         pytest.param(
-            {"head_dim": 128},
-            "head_dim=256",
-            id="non-d256",
+            {"head_dim": 32},
+            "head_dim in",
+            id="unsupported-dimension",
         ),
         pytest.param(
-            {"qkv_dtype": "float16", "output_dtype": "float16"},
-            "BF16 Q/K/V/output or FP8",
-            id="unsupported-dtype",
+            {"qkv_dtype": "float16", "output_dtype": "bfloat16"},
+            "matching output",
+            id="mismatched-output-dtype",
         ),
     ),
 )
@@ -6731,3 +6806,374 @@ def test_attention_ts_decode_page_cache_sliding_product(
 
     policy = _exercise_auto_case(case)
     assert policy["window_left"] == 127
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch"),
+    (
+        (1, 64, 3, 4, 16, False, False, 256),
+        (3, 128, 4, 8, 16, True, False, 2),
+        (5, 128, 6, 16, 128, False, True, 2),
+        (4, 256, 12, 32, 16, True, False, 256),
+        (8, 64, 3, 64, 128, False, True, 2),
+        (8, 128, 12, 128, 20, True, False, 256),
+    ),
+)
+def test_q_token_sparse_geometry_graph(
+    group, dim, ratio, block, page, packed, shared, batch
+):
+    """Check sparse geometry and persistent reuse against an independent mask."""
+    torch.manual_seed(71845)
+    context, topk, hkv = 1024, 3, 2
+    q = torch.randn(batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16)
+    rows = batch * group - int(packed)
+    query = q.reshape(-1, hkv * ratio, dim)[:rows] if packed else q[:, None]
+    out = torch.empty_like(query)
+    offsets = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * group
+    offsets[-1] = rows
+    width = (context + page - 1) // page
+    table = torch.randperm(batch * width, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    k = torch.randn(batch * width, hkv, page, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    if context % page:
+        k[table[:, -1].long(), :, context % page :] = 0
+        v[table[:, -1].long(), :, context % page :] = 0
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(
+        group
+    )[:rows]
+    positions = (
+        (context - group + torch.arange(group, device="cuda")).expand(batch, -1).clone()
+    )
+    pattern_heads = 1 if shared else hkv
+    candidates = (context - group - block) // block
+    ids = (
+        torch.rand(batch, group, pattern_heads, candidates, device="cuda")
+        .argsort(-1)[..., :topk]
+        .to(torch.int32)
+    )
+    sparse_ids = ids.reshape(batch * group, pattern_heads, topk)[:rows]
+    if shared:
+        sparse_ids = sparse_ids[:, 0]
+    qo_indptr = offsets if packed else None
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            k,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            qo_indptr=qo_indptr,
+            seq_len_q=group if packed else None,
+            kv_block_size=block,
+            split_kv=False,
+            share_pattern_across_kv_heads=shared,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        batch,
+        group,
+        hkv * ratio,
+        hkv,
+        dim,
+        block,
+        page,
+        topk,
+        context,
+        device=q.device,
+        workspace_buffer=workspace,
+        use_packed_q=packed,
+        split_kv=False,
+        share_pattern_across_kv_heads=shared,
+        q_data_type=q.dtype,
+    )
+
+    def run():
+        wrapper.run(
+            query,
+            (k, v),
+            table,
+            sparse_ids,
+            requests,
+            positions.flatten()[:rows],
+            qo_indptr=qo_indptr,
+            out=out,
+        )
+
+    tokens = torch.arange(context, device="cuda")
+    physical = table[:, tokens // page].long()
+    keys = k[physical, :, tokens % page].float()
+    values = v[physical, :, tokens % page].float()
+
+    def check():
+        selected = (tokens // block == ids[..., None]).any(-2)
+        tail = tokens // block == (positions[..., None, None] + 1) // block
+        visible = (selected | tail) & (tokens <= positions[..., None, None])
+        scores = (
+            torch.einsum(
+                "bghrd,bkhd->bghrk",
+                q.view(batch, group, hkv, ratio, dim).float(),
+                keys,
+            )
+            * dim**-0.5
+        )
+        scores.masked_fill_(~visible[..., None, :], -torch.inf)
+        expected = torch.einsum("bghrk,bkhd->bghrd", scores.softmax(-1), values)
+        torch.testing.assert_close(
+            out.reshape(rows, hkv * ratio, dim).float(),
+            expected.reshape(batch * group, hkv * ratio, dim)[:rows],
+            rtol=0.03,
+            atol=0.01,
+        )
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    ids.add_(1).remainder_(candidates)
+    positions.sub_(block)
+    out.fill_(torch.nan)
+    graph.replay()
+    check()
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("storage", "fmt"),
+    (("contiguous", "bsr"), ("contiguous", "bitmask"), ("paged", "bsr")),
+)
+@pytest.mark.parametrize("shared", (False, True))
+def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
+    from flashinfer.attention.prims_ts.block_sparse import (
+        BlockSparseTSWrapper,
+        BlockSparsePagedTSWrapper,
+        block_sparse_attention,
+        block_sparse_attention_with_paged_kv_cache,
+    )
+    from tests.attention.test_attention_ts_block_sparse import (
+        _Case,
+        _make_bsr,
+        _make_exact_block_bits,
+        _reference,
+    )
+
+    block, mask = 64, "causal"
+    torch.manual_seed(45132)
+    batch, sq, sk, hq, hkv, dim, qb, page = 2, 32, 256, 12, 3, 128, 16, 64
+    q = torch.randn(batch, sq, hq, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, sk, hkv, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    pattern_heads = 1 if shared else hkv
+    case = _Case(
+        "pattern-heads",
+        batch,
+        hq,
+        sq,
+        sk,
+        qb,
+        block,
+        q.dtype,
+        mask,
+        "none",
+        "static",
+        num_kv_heads=hkv,
+    )
+    valid = tuple(frozenset(range(sk)) for _ in range(batch))
+
+    def patterns(shift):
+        raw = tuple(
+            tuple(
+                tuple(
+                    (0, 1 + (b + h + row + shift) % (sk // block - 1))
+                    for row in range(sq // qb)
+                )
+                for h in range(pattern_heads)
+            )
+            for b in range(batch)
+        )
+        full = (
+            tuple(tuple(rows[0] for _ in range(hkv)) for rows in raw) if shared else raw
+        )
+        return raw, full
+
+    raw, full = patterns(0)
+    indptr, indices = _make_bsr(raw)
+    bits = _make_exact_block_bits(raw, sk // block)
+    static = dict(
+        device=q.device,
+        max_blocks_per_row=2,
+        use_kv_valid_bits=False,
+        mask_type=mask,
+        q_data_type=q.dtype,
+        share_pattern_across_kv_heads=shared,
+    )
+    if storage == "paged":
+        pages = torch.randperm(batch * sk // page, device="cuda", dtype=torch.int32)
+        cache_k = torch.empty(
+            batch * sk // page, hkv, page, dim, device="cuda", dtype=q.dtype
+        )
+        cache_v = torch.empty_like(cache_k)
+        for request in range(batch):
+            for logical in range(sk // page):
+                physical = pages[request * (sk // page) + logical]
+                cache_k[physical] = k[
+                    request, logical * page : (logical + 1) * page
+                ].transpose(0, 1)
+                cache_v[physical] = v[
+                    request, logical * page : (logical + 1) * page
+                ].transpose(0, 1)
+        page_indptr = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * (
+            sk // page
+        )
+        lens = torch.full((batch,), sk, device="cuda", dtype=torch.int32)
+        w = BlockSparsePagedTSWrapper()
+        w.plan(batch, sq, sk, hq, hkv, dim, qb, block, page, **static)
+
+        def run():
+            return w.run(
+                q,
+                (cache_k, cache_v),
+                page_indptr,
+                pages,
+                lens,
+                indptr,
+                indices,
+                out=out,
+            )
+
+        eager = block_sparse_attention_with_paged_kv_cache(
+            q,
+            (cache_k, cache_v),
+            page_indptr,
+            pages,
+            indptr,
+            indices,
+            qb,
+            block,
+            max_seq_len_kv=sk,
+            seq_lens_kv=lens,
+            mask_type=mask,
+            share_pattern_across_kv_heads=shared,
+        )
+    else:
+        w = BlockSparseTSWrapper()
+        w.plan(batch, sq, sk, hq, hkv, dim, qb, block, sparse_format=fmt, **static)
+        route_args = dict(
+            block_indptr=indptr if fmt == "bsr" else None,
+            block_indices=indices if fmt == "bsr" else None,
+            exact_block_bits=bits if fmt == "bitmask" else None,
+        )
+
+        def run():
+            return w.run(q, k, v, **route_args, out=out)
+
+        eager = block_sparse_attention(
+            q,
+            k,
+            v,
+            q_block_size=qb,
+            kv_block_size=block,
+            sparse_format=fmt,
+            mask_type=mask,
+            share_pattern_across_kv_heads=shared,
+            **route_args,
+        )
+    expected = _reference(case, q, k, v, full, valid, dim**-0.5)
+    torch.testing.assert_close(eager, expected, rtol=0.03, atol=0.01)
+    run()
+    torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    raw, full = patterns(1)
+    new_indptr, new_indices = _make_bsr(raw)
+    indptr.copy_(new_indptr)
+    indices.copy_(new_indices)
+    bits.copy_(_make_exact_block_bits(raw, sk // block))
+    graph.replay()
+    expected = _reference(case, q, k, v, full, valid, dim**-0.5)
+    torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize("dtype", (torch.bfloat16,))
+def test_dense_encoded_eight_token_fragments(dtype):
+    """The common paged loader also accepts eight-token encoded fragments."""
+    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+
+    torch.manual_seed(4173)
+    batch, sq, hkv, ratio, dim, storage, fragment, context = (
+        2,
+        4,
+        2,
+        8,
+        128,
+        32,
+        8,
+        1024,
+    )
+    q = torch.randn(batch, sq, hkv * ratio, dim, device="cuda", dtype=dtype)
+    k = torch.randn(
+        batch * context // storage, hkv, storage, dim, device="cuda", dtype=dtype
+    )
+    v = torch.randn_like(k)
+    physical = torch.randperm(k.shape[0], device="cuda", dtype=torch.int32).reshape(
+        batch, -1
+    )
+    per_page = storage // fragment
+    table = (
+        physical[:, :, None] * per_page
+        + torch.arange(per_page, device="cuda", dtype=torch.int32)
+    ).reshape(batch, -1)
+    lengths = torch.tensor((1024, 777), device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        q.device,
+        batch,
+        hkv * ratio,
+        hkv,
+        dim,
+        fragment,
+        context,
+        storage_page_size=storage,
+        max_seq_len_q=sq,
+        mask_type="causal",
+        q_data_type=dtype,
+        split_kv=False,
+    )
+
+    def run():
+        wrapper.run(q, (k, v), lengths, table, out=out, validate=False)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(torch.nan)
+    graph.replay()
+    for b in range(batch):
+        for qi in range(sq):
+            tokens = torch.arange(int(lengths[b]) - sq + qi + 1, device="cuda")
+            pages = physical[b, tokens // storage].long()
+            for head in range(hkv):
+                keys = k[pages, head, tokens % storage].float()
+                values = v[pages, head, tokens % storage].float()
+                qs = q[b, qi, head * ratio : (head + 1) * ratio].float()
+                expected = (qs @ keys.T * dim**-0.5).softmax(-1) @ values
+                torch.testing.assert_close(
+                    out[b, qi, head * ratio : (head + 1) * ratio].float(),
+                    expected,
+                    rtol=0.03,
+                    atol=0.01,
+                )
