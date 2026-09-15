@@ -41,6 +41,8 @@ from typing import (
 import torch
 import torch.distributed as dist
 
+from ._pcie_ipc_common import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
+
 
 PCIE_IPC_TUNE_BLOCKS: Tuple[int, ...] = (
     1,
@@ -54,15 +56,14 @@ PCIE_IPC_TUNE_BLOCKS: Tuple[int, ...] = (
     24,
     32,
     48,
-    64,
+    AG_RS_MAX_BLOCKS,
 )
-PCIE_IPC_TUNE_THREADS: Tuple[int, ...] = (64, 128, 256, 512)
+PCIE_IPC_TUNE_THREADS: Tuple[int, ...] = (64, 128, 256, AG_RS_MAX_THREADS)
 PCIE_IPC_TUNE_BATCHES: Tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 PCIE_IPC_TUNE_WARMUP = 10
 PCIE_IPC_TUNE_REPEAT = 50
 
 _CACHE_FORMAT_VERSION = 1
-_PACK_BYTES = 16
 _INIT_MAX_VALUE = 8
 
 
@@ -189,12 +190,12 @@ def candidate_configs(
     if (
         shard_numel <= 0
         or element_size <= 0
-        or _PACK_BYTES % element_size != 0
-        or payload_bytes % _PACK_BYTES != 0
+        or PACK_BYTES % element_size != 0
+        or payload_bytes % PACK_BYTES != 0
     ):
         return ()
 
-    shard_packs = payload_bytes // _PACK_BYTES
+    shard_packs = payload_bytes // PACK_BYTES
     configs: List[_ConfigT] = []
     for variant in spec.grid_variants:
         for block_count in blocks:
@@ -422,7 +423,7 @@ class PcieIpcCollectiveTuningState(Generic[_ConfigT, _VariantT]):
                 for hidden in hidden_values
                 if not any(
                     batch * hidden <= self.workspace.max_numel
-                    and batch * hidden * self.workspace.element_size % _PACK_BYTES == 0
+                    and batch * hidden * self.workspace.element_size % PACK_BYTES == 0
                     for batch in self.tune_batches
                 )
             )

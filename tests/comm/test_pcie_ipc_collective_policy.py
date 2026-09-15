@@ -119,6 +119,28 @@ def test_workspace_constructor_jointly_checks_collective_identity(monkeypatch) -
         )
 
 
+@pytest.mark.parametrize("element_size", [2, 4])
+@pytest.mark.parametrize("offset", [-16, 0, 16])
+def test_rs_flat_seed_threshold_does_not_apply_to_tp4(
+    element_size: int, offset: int
+) -> None:
+    # This is a seed regression check, not a claim about measured performance.
+    payload_bytes = 4 * 1024 * 1024 + offset
+    tp2 = get_pcie_ipc_reduce_scatter_launch_config(
+        2, payload_bytes // element_size, element_size=element_size
+    )
+    tp4 = get_pcie_ipc_reduce_scatter_launch_config(
+        4, payload_bytes // element_size, element_size=element_size
+    )
+    expected_tp2 = (
+        PcieIpcReduceScatterVariant.FLAT_ONE_PACK
+        if offset < 0
+        else PcieIpcReduceScatterVariant.FLAT_CYCLIC
+    )
+    assert tp2.variant == expected_tp2
+    assert tp4.variant == PcieIpcReduceScatterVariant.FLAT_ONE_PACK
+
+
 def test_policy_admits_only_world_size_specific_variants() -> None:
     assert (
         get_pcie_ipc_all_gather_launch_config(2, 8).variant
@@ -143,6 +165,95 @@ def test_policy_admits_only_world_size_specific_variants() -> None:
         == PcieIpcReduceScatterVariant.TOPOLOGY_ONE_PACK
     )
     assert get_pcie_ipc_reduce_scatter_launch_config(8, 8) is None
+
+
+@pytest.mark.parametrize("payload_bytes", [4 * 1024, 8 * 1024 * 1024])
+@pytest.mark.parametrize(
+    "spec,world_size,ordered_4plus4,expected_variants",
+    [
+        (
+            AG_TUNING_SPEC,
+            2,
+            False,
+            {PcieIpcAllGatherVariant.RECURSIVE_DOUBLING},
+        ),
+        (
+            AG_TUNING_SPEC,
+            4,
+            False,
+            {
+                PcieIpcAllGatherVariant.FLAT_PUSH,
+                PcieIpcAllGatherVariant.RECURSIVE_DOUBLING,
+            },
+        ),
+        (
+            AG_TUNING_SPEC,
+            8,
+            False,
+            {PcieIpcAllGatherVariant.RECURSIVE_DOUBLING},
+        ),
+        (
+            AG_TUNING_SPEC,
+            8,
+            True,
+            {
+                PcieIpcAllGatherVariant.RECURSIVE_DOUBLING,
+                PcieIpcAllGatherVariant.COPY_ENGINE,
+            },
+        ),
+        (
+            RS_TUNING_SPEC,
+            2,
+            False,
+            {
+                PcieIpcReduceScatterVariant.FLAT_CYCLIC,
+                PcieIpcReduceScatterVariant.FLAT_ONE_PACK,
+            },
+        ),
+        (
+            RS_TUNING_SPEC,
+            4,
+            False,
+            {
+                PcieIpcReduceScatterVariant.FLAT_CYCLIC,
+                PcieIpcReduceScatterVariant.FLAT_ONE_PACK,
+            },
+        ),
+        (RS_TUNING_SPEC, 8, False, set()),
+        (
+            RS_TUNING_SPEC,
+            8,
+            True,
+            {
+                PcieIpcReduceScatterVariant.TOPOLOGY_CYCLIC,
+                PcieIpcReduceScatterVariant.TOPOLOGY_ONE_PACK,
+            },
+        ),
+    ],
+)
+def test_tuning_explores_all_admitted_variants_across_seed_thresholds(
+    spec, world_size, ordered_4plus4, expected_variants, payload_bytes
+) -> None:
+    configs = candidate_configs(
+        spec,
+        world_size=world_size,
+        shard_numel=payload_bytes // 2,
+        element_size=2,
+        max_blocks=3,
+        ordered_4plus4=ordered_4plus4,
+        blocks=(0, 1, 3, 4),
+        threads=(64, 512, 1024),
+    )
+    assert {config.variant for config in configs} == expected_variants
+    # A smaller workspace capacity and the AG/RS kernel's thread limit must
+    # constrain every candidate, including alternatives to the default seed.
+    assert all(0 < config.blocks <= 3 and config.threads <= 512 for config in configs)
+    assert all(
+        config.threads == 32
+        for config in configs
+        if spec is AG_TUNING_SPEC
+        and config.variant == PcieIpcAllGatherVariant.COPY_ENGINE
+    )
 
 
 def test_candidate_enumeration_and_tactic_round_trip_are_dtype_generic() -> None:

@@ -21,11 +21,12 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ._pcie_ipc_ag_rs_topology import resolve_pcie_ipc_ag_rs_topology
+from ._pcie_ipc_common import AG_RS_MAX_BLOCKS, PACK_BYTES
+from ._pcie_ipc_lifecycle import bind_stream, joint_check, release_workspace
 from .cuda_ipc import create_shared_buffer, free_shared_buffer
 
 
-PCIE_IPC_MAX_BLOCKS = 64
-_PACK_BYTES = 16
+PCIE_IPC_MAX_BLOCKS = AG_RS_MAX_BLOCKS
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 
@@ -79,7 +80,7 @@ class _PcieIpcWorkspace:
             error = f"dtype {dtype} unsupported; expected one of {_SUPPORTED_DTYPES}"
         else:
             self._element_size = torch.empty((), dtype=dtype).element_size()
-            pack_elements = _PACK_BYTES // self.element_size
+            pack_elements = PACK_BYTES // self.element_size
             if type(max_numel) is not int or max_numel <= 0:
                 error = f"max_numel must be a positive integer, got {max_numel!r}"
             elif max_numel % pack_elements != 0:
@@ -157,28 +158,13 @@ class _PcieIpcWorkspace:
 
     def _joint_check(self, local: dict, what: str) -> None:
         """Make a construction or tuning decision identical on every rank."""
-        gathered: List[Optional[dict]] = [None] * self.world_size
-        dist.all_gather_object(gathered, local, group=self.group)
-        entries = [entry for entry in gathered if entry is not None]
-
-        failed = {
-            rank: entry["error"]
-            for rank, entry in enumerate(entries)
-            if entry.get("error")
-        }
-        if failed:
-            raise ValueError(f"{self._collective_name} failed while {what}: {failed}")
-
-        mismatched = {
-            key: [entry[key] for entry in entries]
-            for key in local
-            if key != "error" and len({repr(entry[key]) for entry in entries}) > 1
-        }
-        if mismatched:
-            raise ValueError(
-                "every rank must use identical collective arguments, "
-                f"but these differ: {mismatched}"
-            )
+        joint_check(
+            self.group,
+            self.world_size,
+            local,
+            what,
+            collective_name=self._collective_name,
+        )
 
     @property
     def handle(self) -> int:
@@ -231,16 +217,7 @@ class _PcieIpcWorkspace:
         return self._placement_fingerprint
 
     def _check_stream(self, operation: str) -> None:
-        if torch.cuda.is_current_stream_capturing():
-            return
-        current = torch.cuda.current_stream(self.device)
-        if self._stream is None:
-            self._stream = current
-        elif current != self._stream:
-            raise RuntimeError(
-                f"this workspace is bound to {self._stream}, but {operation} "
-                f"was called on {current}; use one workspace per stream"
-            )
+        self._stream = bind_stream(self.device, self._stream, operation)
 
     def rebind_stream(self) -> None:
         """Allow the next call to bind after the previous stream is ordered."""
@@ -258,7 +235,7 @@ class _PcieIpcWorkspace:
             and inp.is_contiguous()
             and inp.numel() > 0
         )
-        if supported and inp.data_ptr() % _PACK_BYTES != 0:
+        if supported and inp.data_ptr() % PACK_BYTES != 0:
             raise ValueError("input must be 16-byte aligned")
         return supported
 
@@ -275,7 +252,7 @@ class _PcieIpcWorkspace:
             )
         if not out.is_contiguous():
             raise ValueError("output must be contiguous")
-        if out.data_ptr() % _PACK_BYTES != 0:
+        if out.data_ptr() % PACK_BYTES != 0:
             raise ValueError("output must be 16-byte aligned")
 
     @staticmethod
@@ -289,24 +266,8 @@ class _PcieIpcWorkspace:
 
     def destroy(self) -> None:
         """Collectively wait for users, dispose the handle, and free the slab."""
-        if (
-            self._handle is None
-            and self._ipc_ptrs is None
-            and self._tuning_state is None
-        ):
-            return
-
-        torch.cuda.synchronize(self.device)
-        if self._tuning_state is not None:
-            self._tuning_state = None
-        if self._handle is not None:
-            if self._dispose is None:
-                raise RuntimeError("workspace has no dispose operation")
-            self._dispose(self._handle)
-            self._handle = None
-        if self._ipc_ptrs is not None:
-            free_shared_buffer(self._ipc_ptrs, group=self.group)
-            self._ipc_ptrs = None
+        release_workspace(self, dispose=self._dispose, free=free_shared_buffer)
+        self._tuning_state = None
 
     def __enter__(self):
         return self

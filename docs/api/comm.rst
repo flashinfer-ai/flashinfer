@@ -298,6 +298,14 @@ every candidate against NCCL, minimizes the maximum latency across ranks, and
 persists exact-shape results. The cache key includes the collective, world size,
 topology/rank-placement fingerprint, workspace limits, dtype, and shape.
 
+The seed thresholds are heuristics; support does not imply a performance win.
+The variant names combine communication schedule, transport, and batching:
+``COPY_ENGINE`` uses recursive doubling, and ``ONE_PACK`` means one 16-byte
+pack per thread in a grid-sized batch. See
+:doc:`PCIe IPC AG/RS schedules <../design_docs/pcie_ipc_ag_rs>` for the seven
+variants, synchronization/traffic models, topology boundary, and measurement
+provenance.
+
 .. autosummary::
     :toctree: ../generated
 

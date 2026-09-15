@@ -16,6 +16,7 @@
 
 import os
 from contextlib import suppress
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -71,7 +72,7 @@ def _reference(inp: torch.Tensor, world_size: int) -> torch.Tensor:
 
 
 def _fp32_reference(inp: torch.Tensor, world_size: int, rank: int) -> torch.Tensor:
-    reduced = inp.float()
+    reduced = inp.to(torch.float32, copy=True)
     dist.all_reduce(reduced)
     local_rows = inp.shape[0] // world_size
     return reduced.narrow(0, rank * local_rows, local_rows).to(inp.dtype)
@@ -111,12 +112,9 @@ def _queued_epoch_stress(
     device: torch.device,
     hidden: int,
 ) -> None:
-    """Exercise changing call epochs without per-launch host synchronization."""
+    """Queue mixed variants/grids eagerly and in changed-input graph replays."""
     queued = []
-    variants = (
-        PcieIpcReduceScatterVariant.FLAT_CYCLIC,
-        PcieIpcReduceScatterVariant.FLAT_ONE_PACK,
-    )
+    variants = tuple(config.variant for config in _configs(world_size))
     for step in range(10):
         rows = 1 + step % 2
         inp = (
@@ -133,9 +131,9 @@ def _queued_epoch_stress(
         reference = _reference(inp, world_size)
         out = torch.empty_like(reference)
         config = PcieIpcReduceScatterLaunchConfig(
-            1 if step % 2 == 0 else 3,
+            1 if (step // len(variants)) % 2 == 0 else 3,
             64,
-            variants[step % 2],
+            variants[step % len(variants)],
         )
         queued.append((inp, out, reference, config))
 
@@ -148,6 +146,32 @@ def _queued_epoch_stress(
     _assert_close_collectively(
         torch.cat([out.flatten() for _, out, _, _ in queued]),
         torch.cat([reference.flatten() for _, _, reference, _ in queued]),
+    )
+
+    # Build references before capture/replay so no NCCL operation orders the
+    # custom launches. Keep a separate output snapshot for every queued replay.
+    expected = [
+        [_reference(inp + replay, world_size) for inp, _, _, _ in queued]
+        for replay in range(1, 5)
+    ]
+    observed = [[torch.empty_like(out) for _, out, _, _ in queued] for _ in expected]
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for inp, out, _, config in queued:
+            out.fill_(float("nan"))
+            workspace.reduce_scatter(inp, out=out, config=config)
+    for snapshots in observed:
+        for inp, _, _, _ in queued:
+            inp.add_(1)
+        graph.replay()
+        for snapshot, (_, out, _, _) in zip(snapshots, queued, strict=True):
+            snapshot.copy_(out)
+    torch.cuda.synchronize(device)
+    _assert_close_collectively(
+        torch.cat([out.flatten() for replay in observed for out in replay]),
+        torch.cat([out.flatten() for replay in expected for out in replay]),
     )
 
 
@@ -163,6 +187,7 @@ def _worker(world_size: int, rank: int, port: int) -> None:
                 dist.group.WORLD,
                 max_numel=2 * hidden,
                 dtype=dtype,
+                max_blocks=3,
                 tune_batches=(1,),
                 tune_cache=cache,
             )
@@ -220,14 +245,22 @@ def _worker(world_size: int, rank: int, port: int) -> None:
                     generator=generator,
                 )
                 rtol, atol = _TOLERANCE[dtype]
+                floating_reference = _fp32_reference(floating, world_size, rank)
                 _assert_close_collectively(
                     workspace.reduce_scatter(floating),
-                    _fp32_reference(floating, world_size, rank),
+                    floating_reference,
                     rtol=rtol,
                     atol=atol,
                 )
+                for config in _configs(world_size):
+                    _assert_close_collectively(
+                        workspace.reduce_scatter(floating, config=config),
+                        floating_reference,
+                        rtol=rtol,
+                        atol=atol,
+                    )
 
-                if world_size == 4 and dtype is torch.bfloat16:
+                if world_size in (4, 8) and dtype is torch.bfloat16:
                     _queued_epoch_stress(workspace, world_size, rank, device, hidden)
 
                 if world_size == 2 and dtype is torch.bfloat16:
@@ -244,8 +277,17 @@ def _worker(world_size: int, rank: int, port: int) -> None:
                     torch.cuda.synchronize(device)
                     _assert_close_collectively(out, reference)
 
-                if world_size == 2 and dtype is torch.float32:
-                    tuned = workspace.tune([hidden], warmup=1, repeat=2)
+                if dtype is torch.float32:
+                    state = workspace._tuning_state
+                    with patch.object(
+                        state, "_latency_us", wraps=state._latency_us
+                    ) as measured:
+                        tuned = workspace.tune([hidden], warmup=1, repeat=2)
+                    # A variant reaches timing only after real GPU correctness
+                    # screening. max_blocks=3 keeps this smoke search bounded.
+                    assert {
+                        call.args[2].variant for call in measured.call_args_list
+                    } == {config.variant for config in _configs(world_size)}
                     assert (hidden, 1) in tuned
                     assert workspace.tuned_launch_config(inp) == tuned[(hidden, 1)]
             finally:

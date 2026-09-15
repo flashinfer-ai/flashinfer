@@ -15,13 +15,14 @@ limitations under the License.
 """
 
 import hashlib
-import socket
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+from ._pcie_ipc_topology import PcieIpcTopologyEvidence, collect_pcie_ipc_topology
 
 
 @dataclass
@@ -41,51 +42,20 @@ class PcieIpcAgRsTopology:
     placement_fingerprint: str
 
 
-def _identity(rank: int, device: torch.device) -> _RankLinks:
-    result = _RankLinks(rank=rank)
-    try:
-        result.hostname = socket.gethostname()
-        properties = torch.cuda.get_device_properties(device)
-        uuid = getattr(properties, "uuid", None)
-        if uuid is None:
-            raise RuntimeError("CUDA device UUID is unavailable")
-        result.device_uuid = f"GPU-{uuid}"
-    except Exception as err:  # noqa: BLE001 - unknown topology fails closed
-        result.probe_error = f"{type(err).__name__}: {err}"
-    return result
-
-
-def _probe_links(identity: _RankLinks, peer_uuids: List[str]) -> _RankLinks:
-    result = _RankLinks(
-        rank=identity.rank,
-        hostname=identity.hostname,
-        device_uuid=identity.device_uuid,
-        probe_error=identity.probe_error,
+def _rank_links(topology: PcieIpcTopologyEvidence) -> _RankLinks:
+    system = topology.system_level
+    return _RankLinks(
+        rank=topology.rank,
+        hostname=topology.hostname,
+        device_uuid=topology.device_uuid,
+        peer_system=(
+            {uuid: level >= system for uuid, level in topology.peer_ancestors.items()}
+            if system is not None
+            else {}
+        ),
+        pair_errors=topology.pair_errors,
+        probe_error=topology.probe_error,
     )
-    if result.probe_error:
-        return result
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            source = pynvml.nvmlDeviceGetHandleByUUID(result.device_uuid.encode())
-            for peer_uuid in peer_uuids:
-                if peer_uuid == result.device_uuid:
-                    continue
-                try:
-                    peer = pynvml.nvmlDeviceGetHandleByUUID(peer_uuid.encode())
-                    ancestor = pynvml.nvmlDeviceGetTopologyCommonAncestor(source, peer)
-                    result.peer_system[peer_uuid] = (
-                        ancestor >= pynvml.NVML_TOPOLOGY_SYSTEM
-                    )
-                except pynvml.NVMLError as err:
-                    result.pair_errors[peer_uuid] = str(err)
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as err:  # noqa: BLE001 - unknown topology fails closed
-        result.probe_error = f"{type(err).__name__}: {err}"
-    return result
 
 
 def _fingerprint(topologies: List[_RankLinks]) -> str:
@@ -173,21 +143,7 @@ def resolve_pcie_ipc_ag_rs_topology(
     group: ProcessGroup, device: torch.device
 ) -> PcieIpcAgRsTopology:
     """Collect exact rank UUIDs, then query TP8 peer links through NVML."""
-    rank = dist.get_rank(group=group)
-    world_size = dist.get_world_size(group=group)
-    local_identity = _identity(rank, device)
-    identities: List[Optional[_RankLinks]] = [None] * world_size
-    dist.all_gather_object(identities, local_identity, group=group)
-    gathered_identities = [identity for identity in identities if identity is not None]
-    if world_size != 8:
-        return decide_pcie_ipc_ag_rs_topology(gathered_identities)
-
-    peer_uuids = [
-        identity.device_uuid for identity in gathered_identities if identity.device_uuid
-    ]
-    local_links = _probe_links(local_identity, peer_uuids)
-    links: List[Optional[_RankLinks]] = [None] * world_size
-    dist.all_gather_object(links, local_links, group=group)
-    return decide_pcie_ipc_ag_rs_topology(
-        [topology for topology in links if topology is not None]
+    gathered = collect_pcie_ipc_topology(
+        group, device, probe_links=dist.get_world_size(group=group) == 8
     )
+    return decide_pcie_ipc_ag_rs_topology([_rank_links(t) for t in gathered])

@@ -14,18 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import socket
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import torch
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+from ._pcie_ipc_topology import (
+    PcieIpcTopologyEvidence,
+    collect_pcie_ipc_topology,
+    probe_pcie_ipc_identity,
+    probe_pcie_ipc_links,
+)
 
 # Which fabric the group is on. The distinction is the interconnect, not the
 # GPU: the same card behaves differently depending on whether its NUMA island
-# contains a PCIe switch. It selects no kernel -- it keys the tune cache, so two
-# topologies on one machine do not read each other's measurements.
+# contains a PCIe switch. The profile keys the tune cache and screens CE island
+# candidates; it does not establish an ordered 4+4 rank placement.
 PROFILE_ROOTCPLX = "rootcplx-noswitch"
 PROFILE_SWITCHPAIR = "pcieswitch-pairs"
 PCIE_IPC_PROFILES = (PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR)
@@ -63,74 +68,35 @@ class PcieIpcProfileDecision:
     reason: str
 
 
+def _profile_links(topology: PcieIpcTopologyEvidence) -> PcieIpcRankTopology:
+    hostbridge = topology.hostbridge_level
+    return PcieIpcRankTopology(
+        rank=topology.rank,
+        hostname=topology.hostname,
+        device_index=topology.device_index,
+        device_uuid=topology.device_uuid,
+        peer_switch_local=(
+            {
+                uuid: level < hostbridge
+                for uuid, level in topology.peer_ancestors.items()
+            }
+            if hostbridge is not None
+            else {}
+        ),
+        pair_errors=topology.pair_errors,
+        probe_error=topology.probe_error,
+    )
+
+
 def probe_pcie_ipc_rank_topology(
     rank: int, device: Optional[torch.device] = None
 ) -> PcieIpcRankTopology:
-    """Probe whether this rank's GPU shares a PCIe switch with any peer.
+    """Probe this rank's GPU against other visible GPUs, recording failures.
 
-    Never raises: any failure is recorded in ``probe_error`` and the decision
-    layer treats an unknown topology conservatively.
-
-    Only the GPU this rank owns is probed against the other visible GPUs, so a
-    job pinned to a subset of the machine describes that subset rather than the
-    whole host. That matters on a mixed box where one island sits behind a
-    switch and another does not.
+    The collective resolver exchanges group UUIDs first so it can also query
+    peers hidden by this process's ``CUDA_VISIBLE_DEVICES``.
     """
-    topo = PcieIpcRankTopology(rank=rank)
-    try:
-        topo.hostname = socket.gethostname()
-        parsed = (
-            torch.device("cuda", torch.cuda.current_device())
-            if device is None
-            else torch.device(device)
-        )
-        if parsed.type != "cuda":
-            raise ValueError(f"probe requires a CUDA device, got {parsed!r}")
-        device_index = (
-            parsed.index if parsed.index is not None else torch.cuda.current_device()
-        )
-        topo.device_index = device_index
-
-        import pynvml
-
-        pynvml.nvmlInit()
-        try:
-
-            def _uuid(idx: int) -> str:
-                props = torch.cuda.get_device_properties(idx)
-                uuid = getattr(props, "uuid", None)
-                if uuid is None:
-                    raise RuntimeError(
-                        "torch.cuda.get_device_properties(...).uuid unavailable; "
-                        "cannot establish physical GPU identity"
-                    )
-                return f"GPU-{uuid}"
-
-            def _handle(idx: int):
-                return pynvml.nvmlDeviceGetHandleByUUID(_uuid(idx).encode())
-
-            topo.device_uuid = _uuid(device_index)
-            my_handle = _handle(device_index)
-            # NVML_TOPOLOGY_HOSTBRIDGE is the first level that leaves the switch
-            # fabric, so anything strictly below it means the pair talks through
-            # a PCIe switch without reaching the host bridge.
-            hostbridge = pynvml.NVML_TOPOLOGY_HOSTBRIDGE
-            for peer in range(torch.cuda.device_count()):
-                if peer == device_index:
-                    continue
-                peer_uuid = _uuid(peer)
-                try:
-                    level = pynvml.nvmlDeviceGetTopologyCommonAncestor(
-                        my_handle, _handle(peer)
-                    )
-                    topo.peer_switch_local[peer_uuid] = level < hostbridge
-                except pynvml.NVMLError as pair_err:
-                    topo.pair_errors[peer_uuid] = str(pair_err)
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:  # noqa: BLE001 - any probe failure => conservative fallback
-        topo.probe_error = f"{type(e).__name__}: {e}"
-    return topo
+    return _profile_links(probe_pcie_ipc_links(probe_pcie_ipc_identity(rank, device)))
 
 
 def decide_pcie_ipc_profile(
@@ -201,10 +167,5 @@ def resolve_pcie_ipc_profile(
     unsupported topology costs nothing, and gathers the per-rank probes so
     every rank reaches the same decision from the same evidence.
     """
-    rank = dist.get_rank(group=group)
-    local = probe_pcie_ipc_rank_topology(rank, device=device)
-    gathered: List[Optional[PcieIpcRankTopology]] = [None] * dist.get_world_size(
-        group=group
-    )
-    dist.all_gather_object(gathered, local, group=group)
-    return decide_pcie_ipc_profile(requested, [t for t in gathered if t is not None])
+    gathered = collect_pcie_ipc_topology(group, device)
+    return decide_pcie_ipc_profile(requested, [_profile_links(t) for t in gathered])

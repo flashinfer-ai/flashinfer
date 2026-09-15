@@ -25,12 +25,13 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
+from ._pcie_ipc_common import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
 
-_PACK_BYTES = 16
-_MAX_THREADS = 512
-_MAX_BLOCKS = 64
-_FLAT_TO_RECURSIVE_BYTES = 256 * 1024
-_COPY_ENGINE_BYTES = 512 * 1024
+
+# Historical seed heuristics in per-rank input bytes. These are not universal
+# measured crossovers; tune() compares every admitted variant on this device.
+_SEED_FLAT_TO_RECURSIVE_BYTES = 256 * 1024
+_SEED_COPY_ENGINE_BYTES = 512 * 1024
 
 
 class PcieIpcAllGatherVariant(IntEnum):
@@ -55,7 +56,7 @@ def _threads_for(num_packs: int) -> int:
         return 128
     if num_packs <= 16384:
         return 256
-    return _MAX_THREADS
+    return AG_RS_MAX_THREADS
 
 
 def _is_launchable(
@@ -72,7 +73,7 @@ def _is_launchable(
         return False
     if not 0 < config.blocks <= max_blocks:
         return False
-    if not 32 <= config.threads <= _MAX_THREADS or config.threads % 32 != 0:
+    if not 32 <= config.threads <= AG_RS_MAX_THREADS or config.threads % 32 != 0:
         return False
     if config.variant == PcieIpcAllGatherVariant.COPY_ENGINE:
         return (
@@ -90,7 +91,7 @@ def _is_launchable(
 def get_pcie_ipc_all_gather_launch_config(
     world_size: int,
     shard_numel: int,
-    max_blocks: int = _MAX_BLOCKS,
+    max_blocks: int = AG_RS_MAX_BLOCKS,
     element_size: int = 2,
     ordered_4plus4: bool = False,
 ) -> Optional[PcieIpcAllGatherLaunchConfig]:
@@ -100,25 +101,25 @@ def get_pcie_ipc_all_gather_launch_config(
     if element_size not in (2, 4):
         return None
     payload_bytes = shard_numel * element_size
-    if shard_numel <= 0 or payload_bytes % _PACK_BYTES != 0:
+    if shard_numel <= 0 or payload_bytes % PACK_BYTES != 0:
         return None
-    if max_blocks <= 0 or max_blocks > _MAX_BLOCKS:
+    if max_blocks <= 0 or max_blocks > AG_RS_MAX_BLOCKS:
         return None
 
     if world_size == 8 and ordered_4plus4:
-        if payload_bytes >= _COPY_ENGINE_BYTES:
+        if payload_bytes >= _SEED_COPY_ENGINE_BYTES:
             return PcieIpcAllGatherLaunchConfig(
                 blocks=1,
                 threads=32,
                 variant=PcieIpcAllGatherVariant.COPY_ENGINE,
             )
         variant = PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
-    elif world_size == 4 and payload_bytes < _FLAT_TO_RECURSIVE_BYTES:
+    elif world_size == 4 and payload_bytes < _SEED_FLAT_TO_RECURSIVE_BYTES:
         variant = PcieIpcAllGatherVariant.FLAT_PUSH
     else:
         variant = PcieIpcAllGatherVariant.RECURSIVE_DOUBLING
 
-    num_packs = payload_bytes // _PACK_BYTES
+    num_packs = payload_bytes // PACK_BYTES
     threads = _threads_for(num_packs)
     blocks = min(max_blocks, (num_packs + threads - 1) // threads)
     config = PcieIpcAllGatherLaunchConfig(blocks, threads, variant)
