@@ -10,6 +10,7 @@ source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
 finish_sccache_stats() {
   local exit_code=$?
+  cleanup_jit_cache_python_build || true
   collect_sccache_stats || true
   return "${exit_code}"
 }
@@ -28,6 +29,8 @@ echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
 
+: "${PYTORCH_INDEX:?PYTORCH_INDEX must be set}"
+
 compute_jit_cache_parallelism
 
 # Display build environment info
@@ -35,6 +38,7 @@ echo "CUDA Version: ${CUDA_VERSION}"
 echo "CPU Architecture: ${ARCH}"
 echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
+echo "PyTorch Index: ${PYTORCH_INDEX}"
 echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
@@ -58,21 +62,22 @@ export PATH="$HOME/.local/bin:$PATH"
 export PATH="/opt/python/${PYTHON_ABI}-${PYTHON_ABI}/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
 
+EXPECTED_CUDA_VERSION="${CUDA_MAJOR}.${CUDA_MINOR}"
+validate_jit_cache_cuda_toolchain "${EXPECTED_CUDA_VERSION}"
+
 echo "::group::Install build system"
-pip install --upgrade build
+setup_jit_cache_python_build python3 "${EXPECTED_CUDA_VERSION}" "${PYTORCH_INDEX}"
 echo "::endgroup::"
 
 # Optional: set up sccache for compiler caching with S3 backend
 if [ -n "$SCCACHE_BUCKET" ]; then
-  echo "::group::Install sccache"
   export SCCACHE_BUCKET
   setup_sccache "cuda${CUDA_MAJOR}${CUDA_MINOR}-$(uname -m)" "$(cd .. && pwd -P)"
-  echo "::endgroup::"
 fi
 
 # Clean any previous builds
 echo "Cleaning previous builds..."
-rm -rf dist build *.egg-info
+rm -rf -- dist build ./*.egg-info
 
 # Build the wheel using the build module for better isolation
 echo "Building wheel..."

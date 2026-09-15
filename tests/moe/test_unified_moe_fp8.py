@@ -9,7 +9,11 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.fused_moe import (
-    ActivationConfig,
+    # Typed activation values
+    GeGLU,
+    ReLU2,
+    SwiGLU,
+    # Unified configs, packs, and runners
     BackendOptions,
     ExecutionConfig,
     ExpertConfig,
@@ -18,7 +22,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
@@ -32,6 +36,7 @@ from flashinfer.quantization.fp8_quantization import (
 )
 from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
+from tests.moe.utils import assert_trtllm_packed_call_contract
 
 
 def _build_per_tensor_fp8_runner(config):
@@ -81,7 +86,7 @@ def _mxfp8_quant_matrix(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
-    if variant is QuantVariant.DeepSeekFp8:
+    if variant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
         x = _deepseek_dequant_activations(x_q, x_scale)
         w1 = _deepseek_dequant_weights(
             view["gemm1_weights"], view["gemm1_weights_scale"]
@@ -107,9 +112,9 @@ def _dequant_view(variant, x_q, x_scale, view, canonical_w1, canonical_w2):
 
 
 def _requant_intermediate(inter: torch.Tensor, variant) -> torch.Tensor:
-    if variant is QuantVariant.DeepSeekFp8:
+    if variant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
         q, sf = TrtllmFp8BlockConfig.prepare_activations(
-            inter.to(torch.bfloat16), variant=variant
+            inter.to(torch.bfloat16), quant=variant
         )
         return _deepseek_dequant_activations(q, sf)
     q, sf = _mxfp8_quant_matrix(inter.to(torch.bfloat16))
@@ -127,13 +132,18 @@ def _block_fp8_reference(
     gemm1_alpha=None,
     gemm1_beta=None,
     gemm1_clamp_limit=None,
+    activation=None,
+    narrow_routing_weights=True,
 ):
     """Dequantized block-FP8 MoE reference.
 
     ``gemm1_alpha`` / ``gemm1_beta`` / ``gemm1_clamp_limit`` are the optional
     per-expert SwiGLU OA controls; leaving all three unset reproduces plain SwiGLU.
     """
-    weights = weights.to(torch.bfloat16).float()
+    activation = activation or SwiGLU()
+    if narrow_routing_weights:
+        weights = weights.to(torch.bfloat16)
+    weights = weights.float()
     has_oa = (
         gemm1_alpha is not None
         or gemm1_beta is not None
@@ -144,18 +154,30 @@ def _block_fp8_reference(
         token, slot = torch.where(ids == local_expert + expert_offset)
         if token.numel() == 0:
             continue
-        up = x[token] @ w1[local_expert, :INTERMEDIATE].t()
-        gate = x[token] @ w1[local_expert, INTERMEDIATE:].t()
-        if gemm1_clamp_limit is not None:
-            limit = gemm1_clamp_limit[local_expert].float()
-            up = up.clamp(min=-limit, max=limit)
-            gate = gate.clamp(max=limit)
-        if has_oa:
-            alpha = 1.0 if gemm1_alpha is None else gemm1_alpha[local_expert].float()
-            beta = 0.0 if gemm1_beta is None else gemm1_beta[local_expert].float()
-            act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+        fc1 = x[token] @ w1[local_expert].t()
+        if isinstance(activation, ReLU2):
+            act = F.relu(fc1) ** 2
         else:
-            act = F.silu(gate) * up
+            up, gate = fc1[:, :INTERMEDIATE], fc1[:, INTERMEDIATE:]
+            if isinstance(activation, GeGLU):
+                act = F.gelu(gate) * up
+            else:
+                if gemm1_clamp_limit is not None:
+                    limit = gemm1_clamp_limit[local_expert].float()
+                    up = up.clamp(min=-limit, max=limit)
+                    gate = gate.clamp(max=limit)
+                if has_oa:
+                    alpha = (
+                        1.0
+                        if gemm1_alpha is None
+                        else gemm1_alpha[local_expert].float()
+                    )
+                    beta = (
+                        0.0 if gemm1_beta is None else gemm1_beta[local_expert].float()
+                    )
+                    act = gate * torch.sigmoid(alpha * gate) * (up + beta)
+                else:
+                    act = F.silu(gate) * up
         inter = _requant_intermediate(act, variant)
         expert_out = inter @ w2[local_expert].t()
         out[token] += weights[token, slot, None] * expert_out
@@ -168,16 +190,38 @@ def _assert_fp8_close(actual, expected):
     check_accuracy(expected.float(), actual.float(), atol=0.05, rtol=0.3, percent=0.99)
 
 
-def _make_block_fp8_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS):
+def _assert_closer_to(actual, expected, wrong, *, margin=1.25):
+    """Assert the output is closer to the requested formula than a wrong one.
+
+    The standard FP8 absolute tolerance exceeds this fixture's output scale, so
+    it cannot distinguish GeGLU from SwiGLU. Compare mean errors instead; this
+    fixture gives about 1.5x separation, while scaling it up amplifies
+    quantization error more than the activation difference.
+    """
+    correct_error = (actual.float() - expected.float()).abs().mean().item()
+    wrong_error = (actual.float() - wrong.float()).abs().mean().item()
+    assert correct_error * margin < wrong_error, (
+        f"output is not measurably closer to the expected activation: "
+        f"correct_error={correct_error:.6f}, wrong_error={wrong_error:.6f} "
+        f"(need correct * {margin} < wrong). The runner may be evaluating a "
+        f"different activation formula than the one requested."
+    )
+
+
+def _make_block_fp8_case(
+    variant, *, activation=None, expert_offset=0, local_experts=NUM_EXPERTS
+):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260717)
     x = torch.randn(
         TOKENS, HIDDEN, device=device, dtype=torch.bfloat16, generator=generator
     )
+    activation = activation or SwiGLU()
+    gemm1_rows = INTERMEDIATE * (2 if activation.is_gated else 1)
     w1 = (
         torch.randn(
             local_experts,
-            2 * INTERMEDIATE,
+            gemm1_rows,
             HIDDEN,
             device=device,
             dtype=torch.bfloat16,
@@ -211,14 +255,15 @@ def _make_block_fp8_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS)
         dim=-1,
     )
 
-    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, quant=variant)
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
-        variant=variant,
+        quant=variant,
         num_local_experts=local_experts,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
+        activation=activation,
         device=device,
     )
     weight_pack = MoEWeightPack()
@@ -228,13 +273,13 @@ def _make_block_fp8_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS)
             num_experts=expert_offset + local_experts,
             top_k=TOP_K,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=expert_offset,
             local_num_experts=local_experts,
         ),
-        activation=ActivationConfig.swiglu,
+        activation=activation,
         backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)),
         execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
     )
@@ -248,7 +293,13 @@ def _make_block_fp8_case(variant, *, expert_offset=0, local_experts=NUM_EXPERTS)
     return pack, weight_pack, config, dequant
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     pack, weights, config, (x, w1, w2) = _make_block_fp8_case(variant)
     reference = _block_fp8_reference(
@@ -256,12 +307,101 @@ def test_block_fp8_layer_and_direct_runner_match_reference(variant):
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
-    direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    inputs = runner.pack_inputs(pack, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
+    direct = runner.forward(inputs, tactic=-1)
     _assert_fp8_close(direct, reference)
     _assert_fp8_close(layer(pack, weights), reference)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_block_fp8_unpacked_routing_forwards_inputs_and_matches_reference(
+    variant, weights_dtype
+):
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    packed, weights, config, (x, w1, w2) = _make_block_fp8_case(
+        variant, expert_offset=8, local_experts=8
+    )
+    ids = packed.topk_ids
+    route_weights = packed.topk_weights.to(weights_dtype)
+    unpacked = MoEActivationPack(
+        hidden_states_q=packed.hidden_states_q,
+        hidden_states_scale=packed.hidden_states_scale,
+        topk_ids=ids,
+        topk_weights=route_weights,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    reference = _block_fp8_reference(
+        x,
+        w1,
+        w2,
+        ids,
+        route_weights,
+        variant,
+        expert_offset=8,
+        narrow_routing_weights=False,
+    )
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    inputs = runner.pack_inputs(unpacked, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _assert_fp8_close(runner.forward(inputs, tactic=-1), reference)
+    _assert_fp8_close(layer(unpacked, weights), reference)
+
+
+@pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))
+def test_mxfp8_new_activation_layer_and_direct_match_reference(activation):
+    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+        activation=activation,
+    )
+
+    def _reference(act):
+        return _block_fp8_reference(
+            x,
+            w1,
+            w2,
+            pack.topk_ids,
+            pack.topk_weights,
+            QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+            activation=act,
+        )
+
+    reference = _reference(activation)
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
+    _assert_fp8_close(direct, reference)
+    _assert_fp8_close(layer(pack, weights), reference)
+
+    if activation.is_gated:
+        # Compare formulas with matching weight geometry. ReLU2 uses I-row
+        # weights, so a gated dispatch is structurally invalid instead.
+        _assert_closer_to(direct, reference, _reference(SwiGLU()))
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
     """The unified runner forwards the SwiGLU OA params from the weight view.
 
@@ -315,7 +455,9 @@ def test_block_fp8_swiglu_oa_params_reach_the_kernel(variant):
 @pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
 def test_block_fp8_swiglu_oa_params_rejected_when_malformed(key):
     """Malformed OA params fail at the runner boundary, naming the offending key."""
-    pack, weights, config, _ = _make_block_fp8_case(QuantVariant.DeepSeekFp8)
+    pack, weights, config, _ = _make_block_fp8_case(
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8)
+    )
     runner = MoELayer(config).runners[0]
     view = weights.get_view("trtllm_fp8_block")
     device = pack.hidden_states_q.device
@@ -356,7 +498,7 @@ def test_mxfp8_prepared_weight_layout_matches_expected_permutation():
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.MxFp8,
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         num_local_experts=1,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
@@ -422,7 +564,7 @@ def test_mxfp8_preparation_rejects_unshufflable_dimensions(
         TrtllmFp8BlockConfig.prepare_weights(
             w1,
             w2,
-            variant=QuantVariant.MxFp8,
+            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
             num_local_experts=1,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -435,7 +577,7 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     runner = layer.runners[0]
     inputs = runner.pack_inputs(act_pack, weights)
     routing_replay = torch.empty_like(expected_ids, dtype=torch.int16)
-    runner._static_kwargs["routing_replay_out"] = routing_replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=routing_replay)
     actual = runner.forward(inputs, tactic=-1)
     torch.testing.assert_close(
         torch.sort(routing_replay.to(torch.int32), dim=-1).values,
@@ -446,7 +588,13 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     return actual
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_from_logits_matches_prerouted(variant):
     pack, weights, config, _ = _make_block_fp8_case(variant)
     logits = torch.randn(TOKENS, NUM_EXPERTS, device="cuda", dtype=torch.float32)
@@ -492,7 +640,13 @@ def _deepseek_v3_route(logits, bias, *, top_k, n_group, topk_group, scale):
     return selected.to(torch.int32), weights
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
     num_experts = 64
     pack, weights, config, _ = _make_block_fp8_case(variant, local_experts=num_experts)
@@ -549,7 +703,13 @@ def test_block_fp8_deepseek_v3_from_logits_matches_prerouted(variant):
     _assert_fp8_close(actual, expected)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_nonzero_expert_offset(variant):
     offset = 8
     pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
@@ -572,7 +732,13 @@ def test_block_fp8_nonzero_expert_offset(variant):
     _assert_fp8_close(actual, expected)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.DeepSeekFp8, QuantVariant.MxFp8])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+    ],
+)
 def test_block_fp8_prerouted_cuda_graph(variant):
     pack, weights, config, _ = _make_block_fp8_case(variant)
     layer = MoELayer(config)
@@ -618,7 +784,10 @@ def _per_tensor_fp8_reference(
     intermediate_scale: torch.Tensor,
     expert_offset: int = 0,
     routing_scales_on_input: bool = False,
+    activation=None,
+    wrong_formula: bool = False,
 ) -> torch.Tensor:
+    activation = activation or SwiGLU()
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     routing_weights = routing_weights.to(torch.bfloat16).float()
     x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
@@ -635,9 +804,20 @@ def _per_tensor_fp8_reference(
         if routing_scales_on_input:
             routed_x = routed_x * routing_weights[token, slot, None]
         gemm1 = routed_x @ w1_deq[local_expert].t()
-        up = gemm1[:, :INTERMEDIATE]
-        gate = gemm1[:, INTERMEDIATE:]
-        intermediate = F.silu(gate) * up
+        if wrong_formula:
+            # Negative-control path: a genuinely different non-gated formula
+            # (plain ReLU instead of ReLU^2) over the same weights and scales.
+            intermediate = F.relu(gemm1)
+        elif isinstance(activation, ReLU2):
+            intermediate = F.relu(gemm1) ** 2
+        else:
+            up = gemm1[:, :INTERMEDIATE]
+            gate = gemm1[:, INTERMEDIATE:]
+            intermediate = (
+                F.gelu(gate) * up
+                if isinstance(activation, GeGLU)
+                else F.silu(gate) * up
+            )
         intermediate_q = (intermediate * intermediate_scale).clamp(-fp8_max, fp8_max)
         intermediate_deq = (
             intermediate_q.to(torch.float8_e4m3fn).float() / intermediate_scale
@@ -660,14 +840,18 @@ def _make_per_tensor_fp8_case(
     num_experts: int = NUM_EXPERTS,
     local_num_experts: int = NUM_EXPERTS,
     local_expert_offset: int = 0,
+    activation=None,
+    with_wrong_formula_reference: bool = False,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda")
     x = torch.randn(TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
+    activation = activation or SwiGLU()
+    gemm1_rows = INTERMEDIATE * (2 if activation.is_gated else 1)
     w1 = (
         torch.randn(
             local_num_experts,
-            2 * INTERMEDIATE,
+            gemm1_rows,
             HIDDEN,
             device=device,
             dtype=torch.bfloat16,
@@ -708,6 +892,7 @@ def _make_per_tensor_fp8_case(
         num_local_experts=local_num_experts,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
+        activation=activation,
         device=device,
     )
     if routing_input_mode is RoutingInputMode.FromLogits:
@@ -737,13 +922,15 @@ def _make_per_tensor_fp8_case(
             top_k=top_k,
             method=routing_method,
         ),
-        quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        ),
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_num_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
         ),
-        activation=ActivationConfig.swiglu,
+        activation=activation,
         backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
         execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
     )
@@ -757,12 +944,56 @@ def _make_per_tensor_fp8_case(
         intermediate_scale,
         expert_offset=local_expert_offset,
         routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
+        activation=activation,
     )
-    return act, weights, config, ref, selected_experts
+    if not with_wrong_formula_reference:
+        return act, weights, config, ref, selected_experts
+    # Same inputs and scales, deliberately wrong activation formula: the
+    # negative control for the permissive tolerance in
+    # _assert_per_tensor_fp8_close.
+    wrong_ref = _per_tensor_fp8_reference(
+        x,
+        w1,
+        w2,
+        selected_experts,
+        routing_weights,
+        input_scale,
+        intermediate_scale,
+        expert_offset=local_expert_offset,
+        routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
+        activation=activation,
+        wrong_formula=True,
+    )
+    return act, weights, config, ref, selected_experts, wrong_ref
 
 
 def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
     check_accuracy(out.float(), ref.float(), atol=0.05, rtol=0.3, percent=0.99)
+
+
+def _assert_per_tensor_fp8_discriminates(
+    out: torch.Tensor, wrong_ref: torch.Tensor
+) -> None:
+    """Verify FP8 tolerance rejects a genuinely wrong activation formula.
+
+    A rescaled reference is ineffective because these outputs are smaller than
+    the absolute tolerance.
+    """
+    try:
+        check_accuracy(
+            out.float(), wrong_ref.float(), atol=0.05, rtol=0.3, percent=0.99
+        )
+    except Exception as exc:
+        # Only a tolerance rejection counts as discrimination. check_accuracy
+        # also raises on non-finite inputs, and swallowing that would let a NaN
+        # or Inf output masquerade as a passing negative control.
+        if "Mismatch percentage" not in str(exc):
+            raise
+        return
+    pytest.fail(
+        "output also matched a deliberately wrong activation reference; the "
+        "tolerance cannot detect a wrong-formula regression."
+    )
 
 
 @pytest.mark.parametrize(
@@ -783,8 +1014,25 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
 
     runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
     direct_out = runner.forward(inputs)
     _assert_per_tensor_fp8_close(direct_out, ref)
+
+
+@pytest.mark.parametrize("activation", (ReLU2(),))
+def test_fp8_per_tensor_new_activation_matches_reference(activation):
+    act, weights, config, ref, _, wrong_ref = _make_per_tensor_fp8_case(
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        activation=activation,
+        with_wrong_formula_reference=True,
+    )
+    layer_out = MoELayer(config)(act, weights)
+    _assert_per_tensor_fp8_close(layer_out, ref)
+    _assert_per_tensor_fp8_discriminates(layer_out, wrong_ref)
+
+    runner = _build_per_tensor_fp8_runner(config)
+    direct = runner.forward(runner.pack_inputs(act, weights))
+    _assert_per_tensor_fp8_close(direct, ref)
 
 
 @pytest.mark.parametrize(
@@ -888,7 +1136,7 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
     )
-    runner._static_kwargs["routing_replay_out"] = replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=replay)
     runner.forward(inputs)
     torch.testing.assert_close(
         replay.to(torch.int32).sort(dim=-1).values,
@@ -939,7 +1187,12 @@ SHARED_ROUTED_SCALE = 2.5
 
 
 def _make_shared_expert_case(
-    variant, *, num_shared, shared_scale=4.0, num_experts=SHARED_EXPERTS_E
+    variant,
+    *,
+    num_shared,
+    activation=None,
+    shared_scale=4.0,
+    num_experts=SHARED_EXPERTS_E,
 ):
     """Build a DSv3 case with distinguishable shared rows.
 
@@ -949,11 +1202,13 @@ def _make_shared_expert_case(
     gen = torch.Generator(device=device).manual_seed(20260801)
     rows = num_experts + num_shared
 
+    activation = activation or SwiGLU()
+    gemm1_rows = INTERMEDIATE * (2 if activation.is_gated else 1)
     x = torch.randn(TOKENS, HIDDEN, device=device, dtype=torch.bfloat16, generator=gen)
     w1 = (
         torch.randn(
             rows,
-            2 * INTERMEDIATE,
+            gemm1_rows,
             HIDDEN,
             device=device,
             dtype=torch.bfloat16,
@@ -975,16 +1230,17 @@ def _make_shared_expert_case(
     w1[num_experts:] *= shared_scale
     w2[num_experts:] *= shared_scale
 
-    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, quant=variant)
     # prepare_weights takes the *physical* row count, which includes the shared
     # experts; the routed-only count lives in RoutingConfig/ExpertConfig.
     view = TrtllmFp8BlockConfig.prepare_weights(
         w1,
         w2,
-        variant=variant,
+        quant=variant,
         num_local_experts=rows,
         hidden_size=HIDDEN,
         intermediate_size=INTERMEDIATE,
+        activation=activation,
         device=device,
     )
     weights = MoEWeightPack()
@@ -1004,12 +1260,12 @@ def _make_shared_expert_case(
             topk_group=SHARED_TOPK_GROUP,
             routed_scaling_factor=SHARED_ROUTED_SCALE,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             num_fused_shared_experts=num_shared,
         ),
-        activation=ActivationConfig.swiglu,
+        activation=activation,
         backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)),
         execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
     )
@@ -1052,19 +1308,33 @@ def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
         # the same launch the unified runner performs.
         fp8_quantization_type=(
             Fp8QuantizationType.MxFp8
-            if config.quant.variant is QuantVariant.MxFp8
+            if config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
             else Fp8QuantizationType.DeepSeekFp8
         ),
-        use_shuffled_weight=config.quant.variant is QuantVariant.MxFp8,
+        use_shuffled_weight=config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8),
         num_fused_shared_experts=num_shared,
+        activation_type=int(config.activation.type),
+        gemm1_alpha=view.get("gemm1_alpha"),
+        gemm1_beta=view.get("gemm1_beta"),
+        gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
     )
 
 
 @pytest.mark.parametrize(
     "variant,num_shared",
     [
-        pytest.param(QuantVariant.DeepSeekFp8, 1, id="deepseek-s1"),
-        pytest.param(QuantVariant.MxFp8, 2, id="mxfp8-s2"),
+        pytest.param(
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+            1,
+            id="deepseek-s1",
+        ),
+        pytest.param(
+            QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+            2,
+            id="mxfp8-s2",
+        ),
     ],
 )
 def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
@@ -1076,11 +1346,24 @@ def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
     _assert_fp8_close(actual, expected)
 
 
+@pytest.mark.parametrize("activation", (GeGLU(), ReLU2()))
+def test_mxfp8_new_activations_match_flat_launcher(activation):
+    pack, weights, config, view, (logits, bias) = _make_shared_expert_case(
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+        num_shared=0,
+        activation=activation,
+    )
+    actual = MoELayer(config)(pack, weights).clone()
+    expected = _legacy_block_fp8_shared(pack, view, logits, bias, config, 0)
+    _assert_fp8_close(actual, expected)
+
+
 @pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
 def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
     num_shared = 1
     pack, weights, config, view, _ = _make_shared_expert_case(
-        QuantVariant.DeepSeekFp8, num_shared=num_shared
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        num_shared=num_shared,
     )
     runner = MoELayer(config).runners[0]
     device = pack.hidden_states_q.device
@@ -1099,7 +1382,9 @@ def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
 
 def test_block_fp8_fused_shared_experts_contribute():
     """Verify shared rows contribute independently of the legacy cross-check."""
-    variant = QuantVariant.DeepSeekFp8
+    variant = QuantConfig(
+        weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+    )
     num_shared = 1
     pack, weights, config, _, _ = _make_shared_expert_case(
         variant, num_shared=num_shared
@@ -1123,7 +1408,8 @@ def test_block_fp8_fused_shared_experts_contribute():
 def test_block_fp8_fused_shared_experts_cuda_graph_replay():
     """Verify that static S reaches routing during CUDA graph replay."""
     pack, weights, config, _, _ = _make_shared_expert_case(
-        QuantVariant.DeepSeekFp8, num_shared=1
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        num_shared=1,
     )
     from flashinfer.fused_moe.runners import TrtllmFp8BlockRunner
 

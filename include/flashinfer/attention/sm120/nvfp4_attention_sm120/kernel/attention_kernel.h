@@ -49,9 +49,9 @@ using namespace cute;
 #define NVFP4_ATTENTION_MIN_BLOCKS_PER_SM 1
 #endif
 
-#define CONSUMER_REG_ALLOC 232
+#define CONSUMER_REG_ALLOC (Is_causal ? 240 : 232)
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler>
+template <typename Ktraits, bool Is_causal, bool ReturnLSE, typename TileScheduler>
 __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp,
                                   NVFP4_ATTENTION_MIN_BLOCKS_PER_SM)
     attention_kernel_ws(
@@ -145,15 +145,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp,
   params_epilogue_barrier.group_size_list = epilogue_barrier_group_size_list;
   EpilogueBarrier barrier_o(shared_storage.barrier_o, params_epilogue_barrier);
 
-  using MathOrderBarrier = typename Ktraits::MathOrderBarrier;
-  uint32_t math_order_group_sizes[2] = {cutlass::NumThreadsPerWarpGroup,
-                                        cutlass::NumThreadsPerWarpGroup};
-  typename MathOrderBarrier::Params math_order_params;
-
-  math_order_params.group_id = (warp_group_role == WarpGroupRole::Consumer1) ? 1 : 0;
-  math_order_params.group_size_list = math_order_group_sizes;
-  MathOrderBarrier math_order(shared_storage.math_order, math_order_params);
-
   CollectiveMainloop collective_mainloop;
   CollectiveEpilogue collective_epilogue;
 
@@ -240,16 +231,18 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp,
 
       collective_mainloop.mma(mainloop_params, pipeline_q, pipeline_k, pipeline_v, smem_pipe_read_q,
                               smem_pipe_read_k, smem_pipe_read_v, tOrO, softmax_fused, n_block_max,
-                              mma_thread_idx, work_idx, m_block, wg_id, shared_storage, math_order);
+                              mma_thread_idx, work_idx, m_block, wg_id, shared_storage);
 
       barrier_o.wait();
 
       collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, mma_thread_idx, wg_id);
 
-      LSEWriter<Ktraits>::write_lse(
-          epilogue_params.ptr_LSE, select<0, 2, 3>(epilogue_params.shape_O),
-          epilogue_params.stride_LSE, softmax_fused, mainloop_params.softmax_scale_log2,
-          tiled_mma_pv, mma_thread_idx, m_block * kBlockM + wg_id * kBlockMPerWG, bidh, bidb);
+      if constexpr (ReturnLSE) {
+        LSEWriter<Ktraits>::write_lse(
+            epilogue_params.ptr_LSE, select<0, 2, 3>(epilogue_params.shape_O),
+            epilogue_params.stride_LSE, softmax_fused, mainloop_params.softmax_scale_log2,
+            tiled_mma_pv, mma_thread_idx, m_block * kBlockM + wg_id * kBlockMPerWG, bidh, bidb);
+      }
 
       barrier_o.arrive();
 

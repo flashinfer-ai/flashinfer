@@ -15,18 +15,24 @@ limitations under the License.
 """
 
 from .cake_selective_state_update import cake_selective_state_update
-from .checkpointing_ssu import checkpointing_ssu
 from .selective_state_update import selective_state_update
+from .checkpointing_ssu import (
+    allocate_checkpointing_ssu_scratch,
+    checkpointing_ssu,
+)
+from .replayssm_materialize import replayssm_materialize
 
 __all__ = [
     "cake_selective_state_update",
     "selective_state_update",
     "checkpointing_ssu",
+    "allocate_checkpointing_ssu_scratch",
+    "replayssm_materialize",
 ]
 
 try:
-    from .ssd_combined import SSDCombined
+    from .ssd_combined import SSDCombined, ssd_combined_fwd
 
-    __all__.append("SSDCombined")
+    __all__.extend(("SSDCombined", "ssd_combined_fwd"))
 except ImportError:
     pass

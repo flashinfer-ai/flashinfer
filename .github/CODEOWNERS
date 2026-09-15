@@ -4,81 +4,83 @@
 #   - Last matching pattern wins (GitHub semantics).
 #   - Catch-all ensures every PR gets at least one core-maintainer review.
 #   - Prefer @flashinfer-ai/<team> over individual users. (currently working around this)
+#   - Full codebase approvers (@aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu)
+#     are listed on EVERY rule
 
 # ── Catch-all: core maintainers review everything not covered below ──
-* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka @Anerudhan
+* @yzh119 @sricketts @aleozlx @yongwww @cyx-6 @saltyminty @bkryu @yyihuang @kahyunnam @jimmyzho @nv-yunzheq @samuellees @dhiraj113 @qsang-nv @jiahanc @qiching @feih-nv @Aneureka @Anerudhan @Jingfan-Sun @YangXu1990uiuc
 
 # ── Attention ──
-csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
-csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv
-tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho
+csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc
+include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
 
 # ── GEMM ──
-flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
-include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
-tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao
+flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc
+include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc
+tests/gemm/                    @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc
 
 # ── Grouped GEMM ──
-flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao
-include/flashinfer/grouped_mm/   @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao
-tests/grouped_mm/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao
+flashinfer/grouped_mm/           @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
+include/flashinfer/grouped_mm/   @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
+tests/grouped_mm/                @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
 
 # ── MOE ──
-csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
-tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao
+csrc/fused_moe/                       @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
+flashinfer/fused_moe/                 @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
+include/flashinfer/trtllm/fused_moe/  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
+tests/moe/                            @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @feih-nv @Aneureka @StudyingShao @Jingfan-Sun @YangXu1990uiuc @bkryu
 
 # ── MOE_EP ──
-flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
-tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @mhoqueanik @feih-nv @Aneureka
+flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @bkryu
+tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @bkryu
 
 # ── Communication ──
-flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
-include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
-tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan
+flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @Jingfan-Sun @YangXu1990uiuc
+include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @Jingfan-Sun @YangXu1990uiuc
+tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @Jingfan-Sun @YangXu1990uiuc
 
 # ── Norm ──
-flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww
-tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww
+flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/norm/                    @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc
 
 # ── GDN ──
-benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
-tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc
+benchmarks/gdn/                          @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+csrc/gdn_prefill_launcher.cu             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+csrc/gdn_prefill_sm90_kernel_inst.jinja  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/gdn_decode.py                 @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/gdn_kernels/                  @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/gdn_prefill.py                @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/jit/gdn.py                    @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/gdn/                               @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @aleozlx @Jingfan-Sun @YangXu1990uiuc
 
 # ── MAMBA ──
-csrc/checkpointing_ssu*         @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-csrc/selective_state_update*    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-flashinfer/jit/mamba/           @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-flashinfer/mamba/               @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
-tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun
+csrc/checkpointing_ssu*         @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
+csrc/selective_state_update*    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
+csrc/seq_chunk_cumsum*          @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/jit/mamba/           @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/mamba/               @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
+include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @aleozlx @Jingfan-Sun @YangXu1990uiuc
 
 # ── KDA ──
-benchmarks/bench_recurrent_kda*          @kahyunnam @yzh119 @bkryu @jimmyzho
-csrc/kda/                                @kahyunnam @yzh119 @bkryu @jimmyzho
-docs/api/kda.rst                         @kahyunnam @yzh119 @bkryu @jimmyzho
-docs/api/kda_decode.rst                  @kahyunnam @yzh119 @bkryu @jimmyzho
-docs/api/kda_prefill.rst                 @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/jit/flash_kda.py              @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/jit/flash_kda_decode.py       @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda.py                        @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda_decode.py                 @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda_kernels/                  @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/kda_prefill.py                @kahyunnam @yzh119 @bkryu @jimmyzho
-flashinfer/trace/templates/kda.py        @kahyunnam @yzh119 @bkryu @jimmyzho
-tests/jit/test_flash_kda*                @kahyunnam @yzh119 @bkryu @jimmyzho
-tests/kda/                               @kahyunnam @yzh119 @bkryu @jimmyzho
+benchmarks/bench_recurrent_kda*          @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+csrc/kda/                                @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+docs/api/kda.rst                         @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+docs/api/kda_decode.rst                  @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+docs/api/kda_prefill.rst                 @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/jit/flash_kda.py              @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/jit/flash_kda_decode.py       @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/kda.py                        @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/kda_decode.py                 @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/kda_kernels/                  @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/kda_prefill.py                @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+flashinfer/trace/templates/kda.py        @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/jit/test_flash_kda*                @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/kda/                               @kahyunnam @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc
 
 # ── Autotuner ──
-flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx
-tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx
+flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc
+tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc

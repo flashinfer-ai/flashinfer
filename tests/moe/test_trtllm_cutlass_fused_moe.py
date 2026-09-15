@@ -770,6 +770,8 @@ def test_moe_fp8(
     ids=["swiglu", "swiglustep", "relu2"],
 )
 @pytest.mark.parametrize("use_4over6", [False, True])
+# use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
@@ -785,6 +787,7 @@ def test_moe_nvfp4(
     quantized_input,
     activation_type,
     use_4over6,
+    use_autotune,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -875,19 +878,20 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    _ = fused_moe.cutlass_fused_moe(
-        hidden_states,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w1_q.contiguous().view(torch.long),
-        w2_q.contiguous().view(torch.long),
-        otype,
-        quant_scales=quant_scales,
-        input_sf=input_sf,
-        output=flash_output,
-        activation_type=activation_type,
-        swiglu_limit=swiglu_limit,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1_q.contiguous().view(torch.long),
+            w2_q.contiguous().view(torch.long),
+            otype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            output=flash_output,
+            activation_type=activation_type,
+            swiglu_limit=swiglu_limit,
+        )
 
     # Ref check
     a_fp4, a_scale_interleaved = fp4_quantize(x, a1_gs)
@@ -3481,6 +3485,74 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     profile_label = "autotune" if use_autotune else "default"
     with autotune(True) if use_autotune else nullcontext():
         assert_flash_output(profile_label, run_flash())
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 Humming tiny-amax regression requires SM90",
+)
+@pytest.mark.parametrize("tiny_stage", ["input", "post_activation"])
+def test_moe_fp8_mxfp4_humming_tiny_amax_stays_finite(tiny_stage):
+    """A tiny nonzero row must not overflow its dynamic FP8 scale."""
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    e, m, n, k = 1, 1, 512, 512
+
+    if tiny_stage == "input":
+        x = torch.full((m, k), 3e-37, device=device, dtype=torch.bfloat16)
+        fc1_expert_residual_scale = torch.ones(e, device=device)
+    else:
+        x = (torch.randn(m, k, device=device) * 0.05).to(torch.bfloat16)
+        fc1_expert_residual_scale = torch.full((e,), 3e-18, device=device)
+    w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
+    w1_raw_scale = torch.full(
+        (e, 2 * n, k // 32), 122, device=device, dtype=torch.uint8
+    )
+    w2_raw_scale = torch.full((e, k, n // 32), 122, device=device, dtype=torch.uint8)
+
+    w1_processed, w1_exp_offset, _ = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w1, w1_raw_scale, interleave=False
+        )
+    )
+    w2_processed, w2_exp_offset, w2_residual = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w2, w2_raw_scale, interleave=False
+        )
+    )
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w1_processed, "fp4_fp8"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w2_processed, "fp4_fp8"
+    )
+    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_exp_offset)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_exp_offset)
+
+    selected_experts = torch.zeros((m, 1), device=device, dtype=torch.int32)
+    routing_weights = torch.ones((m, 1), device=device, dtype=torch.float32)
+    output = torch.zeros((m, k), device=device, dtype=torch.bfloat16)
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_il,
+        w2_il,
+        torch.bfloat16,
+        quant_scales=[
+            w1_scale_il.view(torch.int32),
+            fc1_expert_residual_scale,
+            torch.ones((), device=device, dtype=torch.float32),
+            w2_scale_il.view(torch.int32),
+            w2_residual * 64.0,
+        ],
+        use_w4_group_scaling=True,
+        use_wfp4afp8_humming=True,
+        output=output,
+    )
+
+    assert torch.isfinite(output).all()
 
 
 # W4A8 Hopper interleaved path.

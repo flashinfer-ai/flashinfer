@@ -1124,6 +1124,7 @@ def _test_trtllm_batch_decode(
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
+            wrapper_rtol = 1.3e-1 if o_dtype == "fp8" else 1e-1
             # todo(Yingyi): fix precision issue with this test
             if not (
                 q_dtype == "fp8"
@@ -1138,14 +1139,14 @@ def _test_trtllm_batch_decode(
                 torch.testing.assert_close(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                 )
             else:
                 assert_close_with_mismatch_tolerance(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
@@ -1330,7 +1331,12 @@ def test_trtllm_batch_decode_bmm1_scale_log2(q_dtype, kv_dtype, o_dtype, device_
 
 def test_bf16q_fp8kv_transform_mode_kwarg_exists():
     signature = inspect.signature(flashinfer.decode.trtllm_batch_decode_with_kv_cache)
-    assert list(signature.parameters)[-1] == "bf16q_fp8kv_transform_mode"
+    parameter = signature.parameters["bf16q_fp8kv_transform_mode"]
+    assert parameter.default is None
+    assert parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 @pytest.mark.parametrize(

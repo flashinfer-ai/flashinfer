@@ -56,9 +56,7 @@ SKIP_MISSING_MODULES = {"flashinfer"}
 # Modules whose STALE entries should be skipped
 SKIP_STALE_MODULES = {"flashinfer.testing"}
 # Per-module symbol ignore list
-DOC_IGNORE = {
-    "flashinfer.fused_moe": {"cute_dsl_fused_moe_nvfp4"},
-}
+DOC_IGNORE: dict[str, set[str]] = {}
 
 
 # ---------------------------------------------------------------------------
