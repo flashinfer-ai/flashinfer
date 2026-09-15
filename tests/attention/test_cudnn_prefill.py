@@ -51,7 +51,7 @@ def test_cudnn_prefill(
     q_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0) * head_dim * num_qo_heads,
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
         ]
     ).int()
 
@@ -248,7 +248,7 @@ def test_cudnn_prefill_fp8(
     q_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0) * head_dim * num_qo_heads,
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
         ]
     ).int()
 

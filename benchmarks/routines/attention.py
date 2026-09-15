@@ -1674,7 +1674,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         )
         .long()
         .to(device)
-    )  # For cuDNN
+    )  # Element-unit offsets, for the low-level cudnn-native call only
     qo_indptr = (
         torch.cat(
             [
@@ -1875,7 +1875,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 )
             )
             backend_wrappers["cudnn"].plan(
-                q_indptr,
+                qo_indptr,
                 kv_indptr,
                 kv_indices,
                 kv_last_page_len,
@@ -2612,7 +2612,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         )
         .long()
         .to(device)
-    )  # For cuDNN
+    )  # Element-unit offsets, for the low-level cudnn-native call only
 
     k_indptr = torch.cat(
         [
@@ -2728,8 +2728,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 )
             )
             backend_wrappers[backend].plan(
-                qo_indptr=q_indptr,
-                kv_indptr=k_indptr,
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim_qk,
@@ -2743,8 +2743,6 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 seq_lens_q=actual_seq_lens_q_device,
                 max_token_per_sequence=s_qo,
                 max_sequence_kv=s_kv,
-                v_indptr=v_indptr,
-                o_indptr=o_indptr,
             )
 
     q_scale, k_scale, v_scale = None, None, None
