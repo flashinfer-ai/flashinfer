@@ -1875,24 +1875,32 @@ def _blackwell_ragged_auto_upgrade(
     ``auto`` routes past them instead of failing (``cudnn_indptr_is_int32`` and
     ``cutlass_work_items`` both exist for that reason).
     """
+    # Universal disqualifiers: no backend in the walk implements these, so an
+    # upgrade would silently drop the feature.
     if (
         kv_layout != "NHD"
         or q_data_type != kv_data_type
         or pos_encoding_mode != PosEncodingMode.NONE.value
         or has_custom_mask
-        or window_left >= 0
         or logits_soft_cap != 0.0
         or has_multi_item_scoring
-        or has_sinks
     ):
         return None
+    # Sliding window and attention sinks are per-backend: cuDNN builds both into
+    # its SDPA graph (diagonal_band_left_bound / sink_token), while the CUTLASS
+    # run path receives only `causal` and the scales and would ignore them.
+    needs_window_or_sinks = window_left >= 0 or has_sinks
     for backend in _blackwell_ragged_auto_order(head_dim_qk, head_dim_vo):
         if backend == "cudnn":
             if (
                 is_sm100a_supported(device)
-                # fp16 / bf16 only: the cuDNN run branch below takes the caller's
-                # tensors as they are, and the wrapper's fp8 handling (scales,
-                # descale tensors) lives on the paths after it.
+                # fp16 / bf16 only. cuDNN itself does fp8 (`sdpa_fp8`), and the
+                # wrapper's cuDNN branch now normalises scalar scales so an fp8
+                # call reaches it intact -- but `auto` still stays away: the fp8
+                # output is not yet validated against a reference here, and the
+                # fp8 graph has been observed taking minutes to compile at
+                # production shapes, which is not something to hand a caller who
+                # only asked for "auto". Explicit `backend="cudnn"` works.
                 and q_data_type in (torch.float16, torch.bfloat16)
                 and _cudnn_supports_direct_seqlens(q_data_type)
                 and (head_dim_qk, head_dim_vo) in _CUDNN_RAGGED_AUTO_HEAD_DIMS
@@ -1908,6 +1916,8 @@ def _blackwell_ragged_auto_upgrade(
                 and not single_token_gqa
             ):
                 return backend
+        elif backend == "cutlass" and needs_window_or_sinks:
+            continue
         elif backend == "cutlass":
             if (
                 (is_sm100a_supported(device) or is_sm110a_supported(device))
@@ -5266,12 +5276,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cuDNN ragged prefill backend requires kv_layout='NHD'"
                 )
-            if getattr(self, "_sinks", None) is not None:
-                raise NotImplementedError(
-                    "attention sinks were set on the wrapper (_sinks) but the "
-                    "cuDNN ragged prefill backend does not consume them; plan() "
-                    "again (auto routes past cuDNN when sinks are set) or use fa2"
-                )
             if (
                 return_lse
                 and self._max_token_per_sequence == 1
@@ -5319,6 +5323,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,
+                # cuDNN builds the band into the mask subgraph; -1 (disabled)
+                # becomes None so a full-attention call keeps its plain graph.
+                window_left=(window_left if window_left >= 0 else None),
+                sinks=getattr(self, "_sinks", None),
             )
 
             # base already handled inside cudnn_batch_prefill_with_kv_cache
