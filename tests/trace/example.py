@@ -58,10 +58,12 @@ mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_no_split_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
 prims_ts_batch_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_s2048_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
+prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_no_split_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
@@ -94,6 +96,12 @@ mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
+prims_ts_block_sparse_shared_h8_kv8_d128_qb64_kb64.json
+prims_ts_block_sparse_wrapper_shared_h8_kv8_d128.json
+prims_ts_paged_block_sparse_combined_shared_h8_kv8_d128_qb64_kb64_ps64.json
+prims_ts_paged_block_sparse_tuple_shared_h8_kv8_d128_qb64_kb64_ps64.json
+prims_ts_paged_block_sparse_wrapper_combined_shared_h8_kv8_d128_ps64.json
+prims_ts_paged_block_sparse_wrapper_tuple_shared_h8_kv8_d128_ps64.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
@@ -701,147 +709,153 @@ rag.run(q_r, k_r, v_r)
 # Trace the one-shot APIs directly so their schemas remain available without
 # compiling the SM100/SM103 kernel. Reusable-wrapper traces below use a real
 # plan and are guarded for machines that cannot build the PrimTS kernel.
-bs_B, bs_Sq, bs_Skv, bs_H, bs_D = 2, 128, 512, 8, 128
-bs_q_block, bs_kv_block, bs_topk = 64, 64, 4
-bs_num_q_blocks = (bs_Sq + bs_q_block - 1) // bs_q_block
-bs_num_rows = bs_B * bs_H * bs_num_q_blocks
-bs_q = torch.randn(bs_B, bs_Sq, bs_H, bs_D, dtype=torch.float16, device=device)
-bs_k = torch.randn(bs_B, bs_Skv, bs_H, bs_D, dtype=torch.float16, device=device)
-bs_v = torch.randn_like(bs_k)
-bs_row_bases = (
-    torch.arange(bs_B * bs_H, dtype=torch.int32, device=device)
-    * (bs_num_q_blocks * bs_topk)
-).reshape(bs_B, bs_H, 1)
-bs_row_offsets = (
-    torch.arange(bs_num_q_blocks + 1, dtype=torch.int32, device=device) * bs_topk
-)
-bs_block_indptr = (bs_row_bases + bs_row_offsets).contiguous()
-bs_block_indices = torch.tensor([0, 2, 4, 6], dtype=torch.int32, device=device).repeat(
-    bs_num_rows
-)
-bs_valid_bits = torch.full(
-    (bs_B, (bs_Skv + 31) // 32),
-    0xFFFFFFFF,
-    dtype=torch.uint32,
-    device=device,
-)
-bs_out = torch.empty_like(bs_q)
-
-block_sparse_attention.fi_trace(
-    save_dir=SAVE_DIR,
-    q=bs_q,
-    k=bs_k,
-    v=bs_v,
-    block_indptr=bs_block_indptr,
-    block_indices=bs_block_indices,
-    q_block_size=bs_q_block,
-    kv_block_size=bs_kv_block,
-    kv_valid_bits=bs_valid_bits,
-    mask_type="dense",
-    out=bs_out,
-)
-
-# ── PrimTS paged block-sparse (both public cache forms) ──────────────────
-bs_page_size = 64
-bs_pages_per_request = bs_Skv // bs_page_size
-bs_num_pages = bs_B * bs_pages_per_request
-bs_paged_kv_indptr = (
-    torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
-)
-# Keep one spare entry to demonstrate that this tensor is capacity: the live
-# prefix is selected by bs_paged_kv_indptr[-1].
-bs_paged_kv_indices = torch.cat(
-    (
-        torch.arange(bs_num_pages, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
+for bs_shared in (False, True):
+    bs_B, bs_Sq, bs_Skv, bs_H, bs_D = 2, 128, 512, 8, 128
+    bs_q_block, bs_kv_block, bs_topk = 64, 64, 4
+    bs_num_q_blocks = (bs_Sq + bs_q_block - 1) // bs_q_block
+    bs_pattern_heads = 1 if bs_shared else bs_H
+    bs_num_rows = bs_B * bs_pattern_heads * bs_num_q_blocks
+    bs_q = torch.randn(bs_B, bs_Sq, bs_H, bs_D, dtype=torch.float16, device=device)
+    bs_k = torch.randn(bs_B, bs_Skv, bs_H, bs_D, dtype=torch.float16, device=device)
+    bs_v = torch.randn_like(bs_k)
+    bs_row_bases = (
+        torch.arange(bs_B * bs_pattern_heads, dtype=torch.int32, device=device)
+        * (bs_num_q_blocks * bs_topk)
+    ).reshape(bs_B, bs_pattern_heads, 1)
+    bs_row_offsets = (
+        torch.arange(bs_num_q_blocks + 1, dtype=torch.int32, device=device) * bs_topk
     )
-)
-bs_seq_lens_kv = torch.full((bs_B,), bs_Skv, dtype=torch.int32, device=device)
-# Exercise a live length that does not fill its last page.
-bs_seq_lens_kv[0] = bs_Skv - bs_page_size // 2
-bs_k_cache = torch.randn(
-    bs_num_pages,
-    bs_H,
-    bs_page_size,
-    bs_D,
-    dtype=torch.float16,
-    device=device,
-)
-bs_v_cache = torch.randn_like(bs_k_cache)
-bs_combined_cache = torch.stack((bs_k_cache, bs_v_cache), dim=1)
+    bs_block_indptr = (bs_row_bases + bs_row_offsets).contiguous()
+    bs_block_indices = torch.tensor(
+        [0, 2, 4, 6], dtype=torch.int32, device=device
+    ).repeat(bs_num_rows)
+    bs_valid_bits = torch.full(
+        (bs_B, (bs_Skv + 31) // 32),
+        0xFFFFFFFF,
+        dtype=torch.uint32,
+        device=device,
+    )
+    bs_out = torch.empty_like(bs_q)
 
-for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
-    block_sparse_attention_with_paged_kv_cache.fi_trace(
+    block_sparse_attention.fi_trace(
         save_dir=SAVE_DIR,
         q=bs_q,
-        paged_kv_cache=bs_paged_cache,
-        paged_kv_indptr=bs_paged_kv_indptr,
-        paged_kv_indices=bs_paged_kv_indices,
+        k=bs_k,
+        v=bs_v,
         block_indptr=bs_block_indptr,
         block_indices=bs_block_indices,
         q_block_size=bs_q_block,
         kv_block_size=bs_kv_block,
-        max_seq_len_kv=bs_Skv,
-        seq_lens_kv=bs_seq_lens_kv,
         kv_valid_bits=bs_valid_bits,
         mask_type="dense",
+        share_pattern_across_kv_heads=bs_shared,
         out=bs_out,
     )
 
-with contextlib.suppress(Exception):
-    bs_wrapper = BlockSparseTSWrapper()
-    bs_wrapper.plan(
-        bs_B,
-        bs_Sq,
-        bs_Skv,
-        bs_H,
-        bs_H,
-        bs_D,
-        bs_q_block,
-        bs_kv_block,
-        device=device,
-        max_blocks_per_row=bs_topk,
-        use_kv_valid_bits=True,
+    # ── PrimTS paged block-sparse (both public cache forms) ──────────────────
+    bs_page_size = 64
+    bs_pages_per_request = bs_Skv // bs_page_size
+    bs_num_pages = bs_B * bs_pages_per_request
+    bs_paged_kv_indptr = (
+        torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
     )
-    bs_wrapper.run(
-        bs_q,
-        bs_k,
-        bs_v,
-        bs_block_indptr,
-        bs_block_indices,
-        kv_valid_bits=bs_valid_bits,
-        out=bs_out,
+    # Keep one spare entry to demonstrate that this tensor is capacity: the live
+    # prefix is selected by bs_paged_kv_indptr[-1].
+    bs_paged_kv_indices = torch.cat(
+        (
+            torch.arange(bs_num_pages, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+        )
     )
-
-
-with contextlib.suppress(Exception):
-    bs_paged_wrapper = BlockSparsePagedTSWrapper()
-    bs_paged_wrapper.plan(
-        bs_B,
-        bs_Sq,
-        bs_Skv,
+    bs_seq_lens_kv = torch.full((bs_B,), bs_Skv, dtype=torch.int32, device=device)
+    # Exercise a live length that does not fill its last page.
+    bs_seq_lens_kv[0] = bs_Skv - bs_page_size // 2
+    bs_k_cache = torch.randn(
+        bs_num_pages,
         bs_H,
-        bs_H,
-        bs_D,
-        bs_q_block,
-        bs_kv_block,
         bs_page_size,
+        bs_D,
+        dtype=torch.float16,
         device=device,
-        max_blocks_per_row=bs_topk,
-        use_kv_valid_bits=True,
     )
+    bs_v_cache = torch.randn_like(bs_k_cache)
+    bs_combined_cache = torch.stack((bs_k_cache, bs_v_cache), dim=1)
+
     for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
-        bs_paged_wrapper.run(
+        block_sparse_attention_with_paged_kv_cache.fi_trace(
+            save_dir=SAVE_DIR,
+            q=bs_q,
+            paged_kv_cache=bs_paged_cache,
+            paged_kv_indptr=bs_paged_kv_indptr,
+            paged_kv_indices=bs_paged_kv_indices,
+            block_indptr=bs_block_indptr,
+            block_indices=bs_block_indices,
+            q_block_size=bs_q_block,
+            kv_block_size=bs_kv_block,
+            max_seq_len_kv=bs_Skv,
+            seq_lens_kv=bs_seq_lens_kv,
+            kv_valid_bits=bs_valid_bits,
+            mask_type="dense",
+            share_pattern_across_kv_heads=bs_shared,
+            out=bs_out,
+        )
+
+    with contextlib.suppress(Exception):
+        bs_wrapper = BlockSparseTSWrapper()
+        bs_wrapper.plan(
+            bs_B,
+            bs_Sq,
+            bs_Skv,
+            bs_H,
+            bs_H,
+            bs_D,
+            bs_q_block,
+            bs_kv_block,
+            device=device,
+            max_blocks_per_row=bs_topk,
+            use_kv_valid_bits=True,
+            share_pattern_across_kv_heads=bs_shared,
+        )
+        bs_wrapper.run(
             bs_q,
-            bs_paged_cache,
-            bs_paged_kv_indptr,
-            bs_paged_kv_indices,
-            bs_seq_lens_kv,
+            bs_k,
+            bs_v,
             bs_block_indptr,
             bs_block_indices,
             kv_valid_bits=bs_valid_bits,
             out=bs_out,
         )
+
+    with contextlib.suppress(Exception):
+        bs_paged_wrapper = BlockSparsePagedTSWrapper()
+        bs_paged_wrapper.plan(
+            bs_B,
+            bs_Sq,
+            bs_Skv,
+            bs_H,
+            bs_H,
+            bs_D,
+            bs_q_block,
+            bs_kv_block,
+            bs_page_size,
+            device=device,
+            max_blocks_per_row=bs_topk,
+            use_kv_valid_bits=True,
+            share_pattern_across_kv_heads=bs_shared,
+        )
+        for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
+            bs_paged_wrapper.run(
+                bs_q,
+                bs_paged_cache,
+                bs_paged_kv_indptr,
+                bs_paged_kv_indices,
+                bs_seq_lens_kv,
+                bs_block_indptr,
+                bs_block_indices,
+                kv_valid_bits=bs_valid_bits,
+                out=bs_out,
+            )
+
 # ── MLA paged decode (DeepSeek-V3 TP=8, h=16/ckv=512/kpe=64) ─────────────────
 mla_b, mla_h, ckv, kpe = 128, 16, 512, 64
 
@@ -2159,29 +2173,32 @@ for _pts_semantic_PS in (32, 4):
         )
 
         _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-        _pts_wrapper.plan(
-            _pts_q.device,
-            _pts_B,
-            _pts_Hq,
-            _pts_Hkv,
-            _pts_D,
-            _pts_semantic_PS,
-            _pts_SK,
-            max_seq_len_q=_pts_SQ,
-            packed_query=False,
-            q_data_type=_pts_q.dtype,
-            kv_data_type=_pts_k.dtype,
-            o_data_type=torch.bfloat16,
-            mask_type="causal",
-            workspace_buffer=_pts_workspace,
-            storage_page_size=_pts_PS,
-        )
-        _pts_wrapper.run(
-            _pts_q,
-            _pts_cache,
-            _pts_seq_lens,
-            _pts_block_tables,
-        )
+        # Split permission is a shared FMHA control, not a Q-storage mode.
+        for _pts_split_kv in (True, False):
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_seq_len_q=_pts_SQ,
+                packed_query=False,
+                q_data_type=_pts_q.dtype,
+                kv_data_type=_pts_k.dtype,
+                o_data_type=torch.bfloat16,
+                mask_type="causal",
+                workspace_buffer=_pts_workspace,
+                storage_page_size=_pts_PS,
+                split_kv=_pts_split_kv,
+            )
+            _pts_wrapper.run(
+                _pts_q,
+                _pts_cache,
+                _pts_seq_lens,
+                _pts_block_tables,
+            )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).

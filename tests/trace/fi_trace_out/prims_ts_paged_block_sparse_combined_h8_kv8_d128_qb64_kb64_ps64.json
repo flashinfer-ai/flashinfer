@@ -6,6 +6,8 @@
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
     "backend:prims-ts",
     "sparse:block",
+    "sparse-format:bsr",
+    "routes:exact",
     "status:experimental",
     "kv-cache:paged"
   ],
@@ -30,14 +32,6 @@
       "type": "const",
       "value": 128
     },
-    "num_q_block_offsets": {
-      "type": "var",
-      "description": "Number of BSR row offsets per batch and KV head."
-    },
-    "num_block_indices": {
-      "type": "var",
-      "description": "Capacity of the runtime KV-block ID tensor."
-    },
     "num_kv_valid_words": {
       "type": "var",
       "description": "Number of optional token-validity words per batch."
@@ -49,6 +43,14 @@
     "kv_block_size": {
       "type": "const",
       "value": 64
+    },
+    "num_q_block_offsets": {
+      "type": "var",
+      "description": "Number of BSR row offsets per batch and KV head."
+    },
+    "num_block_indices": {
+      "type": "var",
+      "description": "Capacity of the runtime KV-block ID tensor."
     },
     "max_seq_len_kv": {
       "type": "var",
@@ -74,6 +76,10 @@
       "type": "const",
       "value": 2,
       "description": "K/V plane count; required to be 2."
+    },
+    "pattern_heads_shared": {
+      "type": "const",
+      "value": 0
     }
   },
   "constraints": [
@@ -83,8 +89,8 @@
     "q_block_size > 0",
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
-    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "kv_valid_bits is None or num_kv_valid_words == (max_seq_len_kv + 31) // 32",
+    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "mask_type is None or mask_type in ('dense', 'causal')",
     "num_page_offsets == batch_size + 1",
     "paged_kv_indptr[0].item() == 0",
@@ -131,7 +137,7 @@
       ],
       "dtype": "uint32",
       "optional": true,
-      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; the mask applies only to exact routes."
     },
     "q_block_size": {
       "shape": null,
@@ -187,6 +193,11 @@
       ],
       "dtype": "int32",
       "description": "Live per-request logical K/V lengths read for this call."
+    },
+    "share_pattern_across_kv_heads": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
     }
   },
   "outputs": {

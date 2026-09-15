@@ -153,6 +153,11 @@
       "dtype": "dtype",
       "optional": true
     },
+    "split_kv": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
+    },
     "semantic_page_size": {
       "shape": null,
       "dtype": "int32",

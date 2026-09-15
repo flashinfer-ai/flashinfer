@@ -166,6 +166,11 @@
       "shape": null,
       "dtype": "string",
       "optional": true
+    },
+    "split_kv": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
     }
   },
   "outputs": {

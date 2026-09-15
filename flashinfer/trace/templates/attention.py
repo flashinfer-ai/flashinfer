@@ -333,6 +333,49 @@ gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
 # reusable wrapper traces retain the same geometry as optional plan context.
 
 
+@lru_cache(maxsize=None)
+def _prims_ts_sparse_pattern_trace(
+    base: TraceTemplate, shared: bool, *, bound: bool
+) -> TraceTemplate:
+    """Separate the sparse pattern's head axis from the physical KV heads."""
+    axes = dict(base.axes)
+    inputs = dict(base.inputs)
+    axes["pattern_heads_shared"] = Const(abbrev="", value=int(shared))
+    if not bound:
+        inputs["share_pattern_across_kv_heads"] = Scalar("bool", optional=True)
+    if shared:
+        axes["num_pattern_heads"] = Const(abbrev="", value=1)
+        for name in ("block_indptr", "exact_block_bits"):
+            descriptor = inputs.get(name)
+            if isinstance(descriptor, Tensor):
+                inputs[name] = Tensor(
+                    [
+                        "num_pattern_heads" if dim == "num_kv_heads" else dim
+                        for dim in descriptor.dim_names
+                    ],
+                    param=descriptor.param,
+                    tuple_idx=descriptor.tuple_idx,
+                    dtype=descriptor.dtype,
+                    optional=descriptor.optional,
+                    description="One sparse pattern head shared by all physical KV heads.",
+                )
+    return TraceTemplate(
+        op_type=base.op_type,
+        name_prefix=f"{base.name_prefix}{'_shared' if shared else ''}",
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(base.outputs),
+        constraints=list(base.constraints),
+        tags=list(base.tags),
+        description=base.description.replace(
+            "per-KV-head", "shared" if shared else "per-KV-head"
+        ),
+        reference=base.reference,
+        check=base.check,
+        init=base.init,
+    )
+
+
 def _make_prims_ts_block_sparse_trace(
     *, sparse_format: str = "bsr", use_proxy_routes: bool = False
 ) -> TraceTemplate:
@@ -533,12 +576,18 @@ def prims_ts_block_sparse_trace_dispatch(**kwargs):
 
     sparse_format = kwargs.get("sparse_format", "bsr")
     use_proxy_routes = kwargs.get("use_proxy_routes", False)
-    return _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)]
+    return _prims_ts_sparse_pattern_trace(
+        _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)],
+        kwargs.get("share_pattern_across_kv_heads", False),
+        bound=False,
+    )
 
 
-prims_ts_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
-)
+prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    _prims_ts_sparse_pattern_trace(template, shared, bound=False)
+    for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
+    for shared in (False, True)
+]
 
 
 def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
@@ -677,12 +726,18 @@ def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
     """Select the tuple or combined paged-KV block-sparse schema."""
 
     combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
-    return _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES[combined]
+    return _prims_ts_sparse_pattern_trace(
+        _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES[combined],
+        kwargs.get("share_pattern_across_kv_heads", False),
+        bound=False,
+    )
 
 
-prims_ts_paged_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
-)
+prims_ts_paged_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    _prims_ts_sparse_pattern_trace(template, shared, bound=False)
+    for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
+    for shared in (False, True)
+]
 
 
 def _copy_scalar_as_optional(inputs: dict[str, Tensor | Scalar], name: str) -> None:
@@ -816,12 +871,18 @@ def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
         state.sparse_format,  # type: ignore[attr-defined]
         state.use_proxy_routes,  # type: ignore[attr-defined]
     )
-    return _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES[route_mode]
+    return _prims_ts_sparse_pattern_trace(
+        _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES[route_mode],
+        getattr(state, "share_pattern_across_kv_heads", False),
+        bound=True,
+    )
 
 
-prims_ts_block_sparse_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
-)
+prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    _prims_ts_sparse_pattern_trace(template, shared, bound=True)
+    for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
+    for shared in (False, True)
+]
 
 
 def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceTemplate:
@@ -862,14 +923,22 @@ _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {
 def prims_ts_paged_block_sparse_wrapper_trace_dispatch(**kwargs):
     """Trace a planned paged block-sparse wrapper for either cache form."""
 
-    _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparsePagedTSWrapper")
+    state = _require_prims_ts_block_sparse_wrapper_state(
+        kwargs, "BlockSparsePagedTSWrapper"
+    )
     combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
-    return _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES[combined]
+    return _prims_ts_sparse_pattern_trace(
+        _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES[combined],
+        getattr(state, "share_pattern_across_kv_heads", False),
+        bound=True,
+    )
 
 
-prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
-)
+prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    _prims_ts_sparse_pattern_trace(template, shared, bound=True)
+    for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
+    for shared in (False, True)
+]
 
 
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,
@@ -1070,6 +1139,7 @@ def _make_attention_ts_decode_trace(
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
+            "split_kv": Scalar("bool", optional=True),
         }
     )
     if encoded_page_size:
@@ -1216,6 +1286,7 @@ def _make_prims_ts_decode_trace(
             "mask_type": Scalar("string", optional=True),
             "window_left": Scalar("int32", optional=True),
             "kv_layout": Scalar("string", optional=True),
+            "split_kv": Scalar("bool", optional=True),
         }
     )
     if encoded_page_size:
@@ -1320,6 +1391,7 @@ def _make_prims_ts_decode_wrapper_trace(
     kv_lengths_mode: str,
     plan_owns_seq_lens: bool,
     encoded_page_size: bool = False,
+    split_kv: bool = True,
 ):
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
@@ -1329,6 +1401,7 @@ def _make_prims_ts_decode_wrapper_trace(
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
+        "split_kv_allowed": Const(abbrev="", value=int(split_kv)),
         "max_seq_len_q": Const(
             abbrev="maxq",
             value=max_seq_len_q,
@@ -1452,6 +1525,7 @@ def _make_prims_ts_decode_wrapper_trace(
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
             f"{'_plan_seq_lens' if plan_owns_seq_lens else ''}"
+            f"{'_no_split' if not split_kv else ''}"
         ),
         description=(
             "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, "
@@ -1534,6 +1608,7 @@ def _get_prims_ts_decode_wrapper_trace(
     kv_lengths_mode: str,
     plan_owns_seq_lens: bool,
     encoded_page_size: bool = False,
+    split_kv: bool = True,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen FMHA plan identity."""
 
@@ -1549,6 +1624,7 @@ def _get_prims_ts_decode_wrapper_trace(
         kv_lengths_mode=kv_lengths_mode,
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
+        split_kv=split_kv,
     )
 
 
@@ -1631,6 +1707,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         kv_lengths_mode=str(state.kv_lengths_mode),
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
+        split_kv=bool(getattr(state, "split_kv", True)),
     )
 
 

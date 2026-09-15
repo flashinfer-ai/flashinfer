@@ -397,19 +397,19 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
         "flashinfer.attention.prims_ts.block_sparse",
         "BlockSparseTSWrapper.run",
-    ): 4,
+    ): 8,
     (
         "flashinfer.attention.prims_ts.block_sparse",
         "BlockSparsePagedTSWrapper.run",
-    ): 2,
-    (
-        "flashinfer.attention.prims_ts.block_sparse",
-        "block_sparse_attention",
     ): 4,
     (
         "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention",
+    ): 8,
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
         "block_sparse_attention_with_paged_kv_cache",
-    ): 2,
+    ): 4,
     (
         "flashinfer.attention.prims_ts.decode",
         "batch_decode_with_paged_kv_cache",
@@ -579,6 +579,10 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_bitmask",
         "prims_ts_block_sparse_bsr_proxy",
         "prims_ts_block_sparse_bitmask_proxy",
+        "prims_ts_block_sparse_shared",
+        "prims_ts_block_sparse_bitmask_shared",
+        "prims_ts_block_sparse_bsr_proxy_shared",
+        "prims_ts_block_sparse_bitmask_proxy_shared",
     }
     contiguous_wrapper_traces = {
         template.name_prefix: template
@@ -589,6 +593,10 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_wrapper_bitmask",
         "prims_ts_block_sparse_wrapper_bsr_proxy",
         "prims_ts_block_sparse_wrapper_bitmask_proxy",
+        "prims_ts_block_sparse_wrapper_shared",
+        "prims_ts_block_sparse_wrapper_bitmask_shared",
+        "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
+        "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
     }
     route_modes = {
         ("bsr", False): ("", {"block_indptr", "block_indices"}),
@@ -617,6 +625,14 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         suffix,
         expected_inputs,
     ) in route_modes.items():
+        shared_trace = prims_ts_block_sparse_trace_dispatch(
+            sparse_format=sparse_format,
+            use_proxy_routes=use_proxy_routes,
+            share_pattern_across_kv_heads=True,
+        )
+        assert shared_trace.axes["num_pattern_heads"].value == 1
+        pattern_name = "block_indptr" if sparse_format == "bsr" else "exact_block_bits"
+        assert shared_trace.inputs[pattern_name].dim_names[1] == "num_pattern_heads"
         one_shot_template = one_shot_traces[f"prims_ts_block_sparse{suffix}"]
         wrapper_template = contiguous_wrapper_traces[
             f"prims_ts_block_sparse_wrapper{suffix}"
@@ -733,6 +749,8 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
     assert set(wrapper_paged_templates) == {
         "prims_ts_paged_block_sparse_wrapper_tuple",
         "prims_ts_paged_block_sparse_wrapper_combined",
+        "prims_ts_paged_block_sparse_wrapper_tuple_shared",
+        "prims_ts_paged_block_sparse_wrapper_combined_shared",
     }
     for template in (
         contiguous_wrapper_trace,
@@ -1268,6 +1286,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
             None,
         ),
         ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens),
+        ({**fmha_base, "split_kv": False}, seq_lens),
     )
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_definitions = []
@@ -1293,6 +1312,8 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     assert "mask:causal" in fmha_definitions[1]["tags"]
     assert "seq-lens-source:run" in fmha_definitions[0]["tags"]
     assert "seq-lens-source:plan" in fmha_definitions[4]["tags"]
+    assert fmha_definitions[0]["axes"]["split_kv_allowed"]["value"] == 1
+    assert fmha_definitions[-1]["axes"]["split_kv_allowed"]["value"] == 0
 
     mla_kwargs = {
         "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),

@@ -282,7 +282,7 @@ def validate_block_sparse_run(
         batch_size=state.batch_size,
         seq_len_q=state.seq_len_q,
         seq_len_kv=state.seq_len_kv,
-        num_kv_heads=state.num_kv_heads,
+        num_kv_heads=1 if state.share_pattern_across_kv_heads else state.num_kv_heads,
         q_block_size=state.q_block_size,
         kv_block_size=state.kv_block_size,
         use_kv_valid_bits=state.use_kv_valid_bits,

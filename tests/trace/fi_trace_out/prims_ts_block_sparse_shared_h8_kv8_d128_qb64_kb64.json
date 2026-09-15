@@ -1,15 +1,14 @@
 {
-  "name": "prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and live request page tables, K/V lengths, and per-KV-head BSR metadata.",
+  "name": "prims_ts_block_sparse_shared_h8_kv8_d128_qb64_kb64",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and shared BSR metadata.",
   "op_type": "block_sparse",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
+    "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention",
     "backend:prims-ts",
     "sparse:block",
     "sparse-format:bsr",
     "routes:exact",
-    "status:experimental",
-    "kv-cache:paged"
+    "status:experimental"
   ],
   "axes": {
     "batch_size": {
@@ -19,6 +18,10 @@
     "seq_len_q": {
       "type": "var",
       "description": "Fixed query length per request."
+    },
+    "seq_len_kv": {
+      "type": "var",
+      "description": "Fixed key/value length per request."
     },
     "num_qo_heads": {
       "type": "const",
@@ -52,29 +55,13 @@
       "type": "var",
       "description": "Capacity of the runtime KV-block ID tensor."
     },
-    "max_seq_len_kv": {
-      "type": "var",
-      "description": "Static maximum logical K/V length planned for every request."
-    },
-    "num_pages": {
-      "type": "var",
-      "description": "Total number of allocated physical KV pages."
-    },
-    "page_size": {
-      "type": "const",
-      "value": 64
-    },
-    "num_page_offsets": {
-      "type": "var",
-      "description": "Length of the request-to-page indptr array."
-    },
-    "num_page_indices": {
-      "type": "var",
-      "description": "Capacity of the runtime physical-page ID tensor; the final live page-table offset may be smaller."
-    },
     "pattern_heads_shared": {
       "type": "const",
-      "value": 0
+      "value": 1
+    },
+    "num_pattern_heads": {
+      "type": "const",
+      "value": 1
     }
   },
   "constraints": [
@@ -84,19 +71,9 @@
     "q_block_size > 0",
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
-    "kv_valid_bits is None or num_kv_valid_words == (max_seq_len_kv + 31) // 32",
+    "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
     "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
-    "mask_type is None or mask_type in ('dense', 'causal')",
-    "num_page_offsets == batch_size + 1",
-    "paged_kv_indptr[0].item() == 0",
-    "min(paged_kv_indptr[1:] - paged_kv_indptr[:-1]) >= 0",
-    "paged_kv_indptr[-1].item() <= num_page_indices",
-    "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)",
-    "min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)",
-    "max(seq_lens_kv) <= max_seq_len_kv",
-    "page_size in (16, 32, 64, 128)",
-    "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
-    "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0"
+    "mask_type is None or mask_type in ('dense', 'causal')"
   ],
   "inputs": {
     "q": {
@@ -108,14 +85,32 @@
       ],
       "dtype": "float16"
     },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len_kv",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len_kv",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
     "block_indptr": {
       "shape": [
         "batch_size",
-        "num_kv_heads",
+        "num_pattern_heads",
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+      "description": "One sparse pattern head shared by all physical KV heads."
     },
     "block_indices": {
       "shape": [
@@ -150,52 +145,6 @@
       "shape": null,
       "dtype": "float32",
       "optional": true
-    },
-    "k_cache": {
-      "shape": [
-        "num_pages",
-        "num_kv_heads",
-        "page_size",
-        "head_dim"
-      ],
-      "dtype": "float16",
-      "description": "K pages in the separate HND paged-cache form."
-    },
-    "v_cache": {
-      "shape": [
-        "num_pages",
-        "num_kv_heads",
-        "page_size",
-        "head_dim"
-      ],
-      "dtype": "float16",
-      "description": "V pages in the separate HND paged-cache form."
-    },
-    "paged_kv_indptr": {
-      "shape": [
-        "num_page_offsets"
-      ],
-      "dtype": "int32",
-      "description": "Live request offsets into paged_kv_indices, read for this call."
-    },
-    "paged_kv_indices": {
-      "shape": [
-        "num_page_indices"
-      ],
-      "dtype": "int32",
-      "description": "Runtime physical-page ID capacity; only the prefix ending at paged_kv_indptr[-1] is live."
-    },
-    "max_seq_len_kv": {
-      "shape": null,
-      "dtype": "int32",
-      "description": "Static maximum logical K/V length used for planning."
-    },
-    "seq_lens_kv": {
-      "shape": [
-        "batch_size"
-      ],
-      "dtype": "int32",
-      "description": "Live per-request logical K/V lengths read for this call."
     },
     "share_pattern_across_kv_heads": {
       "shape": null,

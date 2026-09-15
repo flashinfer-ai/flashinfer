@@ -1,6 +1,6 @@
 {
-  "name": "prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and live request page tables, K/V lengths, and per-KV-head BSR metadata.",
+  "name": "prims_ts_paged_block_sparse_tuple_shared_h8_kv8_d128_qb64_kb64_ps64",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and live request page tables, K/V lengths, and shared BSR metadata.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
@@ -74,7 +74,11 @@
     },
     "pattern_heads_shared": {
       "type": "const",
-      "value": 0
+      "value": 1
+    },
+    "num_pattern_heads": {
+      "type": "const",
+      "value": 1
     }
   },
   "constraints": [
@@ -111,11 +115,11 @@
     "block_indptr": {
       "shape": [
         "batch_size",
-        "num_kv_heads",
+        "num_pattern_heads",
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+      "description": "One sparse pattern head shared by all physical KV heads."
     },
     "block_indices": {
       "shape": [
