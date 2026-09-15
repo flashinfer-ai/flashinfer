@@ -3078,12 +3078,24 @@ void trtllm_moe_run_deepseek_fp8_activation(
       << "DeepSeek FP8 activation: activation_output must be uint8 FP8 storage.";
   TVM_FFI_ICHECK_EQ(activation_output_scale.dtype(), dl_float32)
       << "DeepSeek FP8 activation: activation_output_scale must be float32.";
-  TVM_FFI_ICHECK_EQ(total_num_padded_tokens.dtype(), dl_int32)
-      << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
-  TVM_FFI_ICHECK_EQ(cta_idx_xy_to_mn_limit.dtype(), dl_int32)
-      << "DeepSeek FP8 activation: cta_idx_xy_to_mn_limit must be int32.";
-  TVM_FFI_ICHECK_EQ(num_non_exiting_ctas.dtype(), dl_int32)
-      << "DeepSeek FP8 activation: num_non_exiting_ctas must be int32.";
+  auto check_metadata = [&](TensorView const& tensor, int64_t min_size, char const* name) {
+    CHECK_INPUT_AND_TYPE(tensor, dl_int32);
+    CHECK_DEVICE(tensor, activation_output);
+    CHECK_DIM(1, tensor);
+    TVM_FFI_ICHECK_GE(tensor.size(0), min_size) << name << " is too small.";
+  };
+  check_metadata(total_num_padded_tokens, 1, "total_num_padded_tokens");
+  check_metadata(num_non_exiting_ctas, 1, "num_non_exiting_ctas");
+
+  CHECK_DIM(2, gemm1_output_scale);
+  TVM_FFI_ICHECK_GT(tile_tokens_dim, 0);
+  TVM_FFI_ICHECK_LE(tile_tokens_dim, std::numeric_limits<int32_t>::max());
+  // Routing allocates GEMM1 scales for its maximum padded rows. Validate the full
+  // CTA capacity without reading the device-side count or synchronizing the stream.
+  auto const max_num_padded_tokens = gemm1_output_scale.size(1);
+  auto const max_num_ctas =
+      max_num_padded_tokens / tile_tokens_dim + (max_num_padded_tokens % tile_tokens_dim != 0);
+  check_metadata(cta_idx_xy_to_mn_limit, max_num_ctas, "cta_idx_xy_to_mn_limit");
 
   auto const activation = validateAndCastActivationType(activation_type);
   moe::dev::activation::Data activationData{};

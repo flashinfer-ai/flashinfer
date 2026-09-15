@@ -593,6 +593,63 @@ def test_deepseek_fp8_activation_routing_workset(
     )
 
 
+@pytest.mark.parametrize(
+    "name,invalid",
+    [
+        ("padded", "empty"),
+        ("count", "empty"),
+        ("count", "cpu"),
+        ("limits", "cpu"),
+        ("limits", "other_device"),
+        ("limits", "rank"),
+        ("limits", "strided"),
+        ("limits", "short"),
+    ],
+)
+def test_deepseek_fp8_activation_rejects_invalid_metadata(name, invalid):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM100 or SM103.")
+    if invalid == "other_device" and torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA devices.")
+
+    metadata = {
+        "padded": torch.zeros(1, device="cuda", dtype=torch.int32),
+        "limits": torch.zeros(2, device="cuda", dtype=torch.int32),
+        "count": torch.zeros(1, device="cuda", dtype=torch.int32),
+    }
+    metadata[name] = {
+        "empty": lambda x: x[:0],
+        "cpu": lambda x: x.cpu(),
+        "other_device": lambda x: x.to(
+            f"cuda:{(x.device.index + 1) % torch.cuda.device_count()}"
+        ),
+        "rank": lambda x: x.unsqueeze(0),
+        "strided": lambda x: x[:1].expand(2),
+        "short": lambda x: x[:1],
+    }[invalid](metadata[name])
+
+    moe_op = get_trtllm_moe_sm100_module().moe_op
+    # Two routing tiles, even though this invocation has no active local CTAs.
+    with pytest.raises(RuntimeError):
+        moe_op.trtllm_moe_run_deepseek_fp8_activation(
+            torch.zeros((16, 256), device="cuda", dtype=torch.uint8),
+            torch.ones((2, 16), device="cuda"),
+            torch.zeros((16, 128), device="cuda", dtype=torch.uint8),
+            torch.ones((1, 16), device="cuda"),
+            metadata["padded"],
+            metadata["limits"],
+            metadata["count"],
+            8,
+            1,
+            1,
+            128,
+            int(ActivationType.Swiglu),
+            False,
+        )
+    # Rejection must happen on the host, without poisoning the CUDA context.
+    torch.cuda.synchronize()
+
+
 # Test: TopK routing
 @pytest.mark.parametrize("num_tokens", [8, 128])  # Limited for GeGlu
 @pytest.mark.parametrize("hidden_size", [1024])
