@@ -1346,6 +1346,151 @@ class BatchDecodeWithPagedKVCacheWrapper:
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
+    @flashinfer_api
+    def workspace_size_upper_bound(
+        self,
+        *,
+        max_batch_size: int,
+        max_num_pages_per_request: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pos_encoding_mode: str = "NONE",
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        q_len_per_req: int = 1,
+    ) -> Tuple[int, int]:
+        r"""Return a workspace size no plan within the given bounds can exceed.
+
+        :meth:`workspace_size` answers for one specific ``plan()``. This answers
+        for every ``plan()`` with at most ``max_batch_size`` requests of at most
+        ``max_num_pages_per_request`` pages each, so a caller that must reserve
+        before it knows the shapes it will serve can size the buffers once.
+
+        The bound comes from the same work-estimation call the real plan makes,
+        run against the largest batch of the longest requests, and from the
+        ceiling the partition search enforces on ``padded_batch_size``. It
+        always assumes the partitioned kernel, which is the allocating case.
+
+        Parameters
+        ----------
+        max_batch_size : int
+            Largest ``batch_size`` (that is, ``len(indptr) - 1``) any plan will use.
+        max_num_pages_per_request : int
+            Largest paged-KV length of a single request, in pages.
+        q_len_per_req : int
+            Query rows per request, for the tensor-core path where decode is
+            planned as a prefill. Defaults to ``1``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
+        Raises
+        ------
+        NotImplementedError
+            If the resolved backend cannot bound its workspace. Callers must
+            fall back to their own default allocation in that case.
+        """
+        if max_batch_size < 0 or max_num_pages_per_request < 0:
+            raise ValueError("workspace_size_upper_bound bounds must be non-negative")
+
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+
+        backend = self._backend
+        if backend in ("cute-dsl", "trtllm-gen"):
+            raise NotImplementedError(
+                "workspace_size_upper_bound is not available for decode backend "
+                f"{backend!r}"
+            )
+
+        if self.use_tensor_cores:
+            # The tensor-core path plans decode through the prefill scheduler,
+            # so its bound is the prefill bound for q_len_per_req rows each.
+            module = get_batch_prefill_module(
+                "fa2",
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                torch.int32,
+                head_dim,
+                head_dim,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left >= 0,
+                logits_soft_cap > 0,
+                False,
+            )
+            bound_fn = getattr(module, "workspace_size_upper_bound", None)
+            if bound_fn is None:
+                raise NotImplementedError(
+                    "workspace_size_upper_bound is not available for decode "
+                    f"backend {backend!r}"
+                )
+            args = [
+                self._float_workspace_buffer,
+                max_batch_size,
+                max_batch_size * q_len_per_req,
+                max_num_pages_per_request,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                -1,  # fixed_split_size
+                False,  # disable_split_kv
+                0,  # num_colocated_ctas
+            ]
+        else:
+            module = get_batch_decode_module(
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                torch.int32,
+                head_dim,
+                head_dim,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left != -1,
+                logits_soft_cap > 0,
+            )
+            bound_fn = getattr(module, "workspace_size_upper_bound", None)
+            if bound_fn is None:
+                raise NotImplementedError(
+                    "workspace_size_upper_bound is not available for decode "
+                    f"backend {backend!r}"
+                )
+            args = [
+                self._float_workspace_buffer,
+                max_batch_size,
+                max_num_pages_per_request,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                window_left,
+                logits_soft_cap,
+                head_dim,
+                head_dim,
+                torch.empty(0, dtype=q_data_type),
+                torch.empty(0, dtype=kv_data_type),
+            ]
+
+        float_workspace_size, int_workspace_size = bound_fn(*args)
+        return int(float_workspace_size), int(int_workspace_size)
+
     @flashinfer_api(trace=gqa_paged_decode_plan_trace)
     def plan(
         self,
