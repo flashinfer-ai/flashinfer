@@ -527,11 +527,12 @@ void nvfp4_quantize_smooth_lora_down_geometry_sm120(TensorView x, TensorView pqs
                                                     int geometry_variant);
 // Producer entry that takes the geometry as numbers rather than as an index
 // into a ladder both languages have to agree on; see nvfp4_smooth_quantize_sm100.cu.
-void nvfp4_quantize_smooth_lora_down_dyn_sm120(TensorView x, TensorView pqs,
-                                               TensorView global_scale, TensorView l2t_smoothed,
-                                               TensorView xq, TensorView sf, TensorView down,
-                                               int family, int tiling0, int tiling1, int tiling2,
-                                               int address_policy);
+void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs,
+                                                    TensorView global_scale,
+                                                    TensorView l2t_smoothed, TensorView xq,
+                                                    TensorView sf, TensorView down, int family,
+                                                    int tiling0, int tiling1, int tiling2,
+                                                    int address_policy, bool signal_launch);
 
 void nvfp4_quantize_smooth_lora_down_overlap_sm120(TensorView x, TensorView pqs,
                                                    TensorView global_scale, TensorView l2t_smoothed,
@@ -703,16 +704,17 @@ void dispatch_svdquant_producer_sm120(TensorView x, TensorView pqs, TensorView g
                                       TensorView l2t_smoothed, TensorView xq, TensorView a_sf,
                                       TensorView down, TensorView workspace_buffer,
                                       int producer_family = -1, int tiling0 = 0, int tiling1 = 0,
-                                      int tiling2 = 0, int address_policy = 0) {
+                                      int tiling2 = 0, int address_policy = 0,
+                                      bool enable_pdl = false) {
   if (producer_family == 3) {
     nvfp4_quantize_smooth_lora_down_cublaslt_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf,
                                                    down, workspace_buffer);
     return;
   }
   if (producer_family >= 0) {
-    nvfp4_quantize_smooth_lora_down_dyn_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
-                                              producer_family, tiling0, tiling1, tiling2,
-                                              address_policy);
+    nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(
+        x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, producer_family, tiling0, tiling1,
+        tiling2, address_policy, producer_family == 4 && enable_pdl);
     return;
   }
   nvfp4_quantize_smooth_lora_down_geometry_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
@@ -761,10 +763,10 @@ void nvfp4_svdquant_linear_sm120(TensorView x, TensorView pqs, TensorView global
   // the L2T layout before this call, so layout and dispatch cannot disagree.
   namespace prefix_route = flashinfer::gemm::svdquant_sm120_prefix_route;
   int const k3_row = prefix_route::k3_row_of(tactic);
-  dispatch_svdquant_producer_sm120(x, pqs, global_scale, l2t_smoothed, xq, a_sf, down,
-                                   workspace_buffer, static_cast<int>(producer_family),
-                                   static_cast<int>(tiling0), static_cast<int>(tiling1),
-                                   static_cast<int>(tiling2), static_cast<int>(address_policy));
+  dispatch_svdquant_producer_sm120(
+      x, pqs, global_scale, l2t_smoothed, xq, a_sf, down, workspace_buffer,
+      static_cast<int>(producer_family), static_cast<int>(tiling0), static_cast<int>(tiling1),
+      static_cast<int>(tiling2), static_cast<int>(address_policy), enable_pdl);
   if (configure_case7_persisting_l2) {
     std::size_t const max_budget = static_cast<std::size_t>(max_persisting_l2_bytes);
     std::size_t const xq_budget = max_budget > sf_bytes ? max_budget - sf_bytes : 0;

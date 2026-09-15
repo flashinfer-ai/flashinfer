@@ -773,7 +773,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   st = gemm.initialize(args, gemmWorkspace, stream);
   if (st != cutlass::Status::kSuccess)
     throw std::runtime_error("nvfp4_svdquant_gemm (sm120): initialize failed");
-  st = gemm.run(args, gemmWorkspace, stream, nullptr, enable_pdl);
+  st = gemm.run(stream, nullptr, enable_pdl);
   if (st != cutlass::Status::kSuccess)
     throw std::runtime_error("nvfp4_svdquant_gemm (sm120): run failed");
 }

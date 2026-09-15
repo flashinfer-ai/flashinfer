@@ -1417,13 +1417,11 @@ def test_sm120_h3_row68_admission_is_exactly_one_new_shape() -> None:
 
 
 def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
-    """Each H3 admission invalidates only its exact stale v5 record.
+    """Long-K H3 routes retain v6; added packed candidates advance short-K routes.
 
-    A cached v5 record for any admitted route holds the decision taken when no
-    fused runner existed. The bump is scoped to those six routes: a global bump
-    stranded the retained v5 winner of every unrelated shape and
-    forced a re-tune, one of which selected a slower tactic and regressed its
-    shape. The tactic encoding is unchanged because no tactic id moved.
+    The historical six-route admission manifest stays unchanged. Its K7168
+    routes now offer packed small-M producers and use v10. Existing producer
+    indices and the consumer tactic encoding retain their meaning.
     """
     assert (
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
@@ -1441,7 +1439,7 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
             _H3_ROW52_M, _H3_ROW50_K, _H3_ROW52_RANK
         )
-        == 6
+        == 10
     )
     assert (
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
@@ -1459,7 +1457,7 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
             _H3_ROW61_M, _H3_ROW59_K, _H3_ROW52_RANK
         )
-        == 6
+        == 10
     )
     assert (
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
@@ -1477,10 +1475,10 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
         svdquant_sm120_cutlass._sm120_linear_route_abi_version(
             _H3_ROW70_M, _H3_ROW68_K, _H3_ROW52_RANK
         )
-        == 6
+        == 10
     )
 
-    # Scoped, not global: the base version every other shape keys on is untouched.
+    # The historical manifest and fallback base remain unchanged.
     assert svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_ABI_VERSION == 5
     assert (
         frozenset(
@@ -1494,7 +1492,7 @@ def test_sm120_h3_routes_bump_abi_only_where_the_runner_set_changed() -> None:
             }
         )
         == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V6_MKR
-    ), "only the six H3 routes with a screened producer may carry the bump"
+    ), "the original six-route admission manifest must remain stable"
     assert svdquant_sm120_cutlass._SM120_TACTIC_ABI_VERSION == 3
 
 
@@ -1549,13 +1547,14 @@ def test_sm120_h3_promoted_producers_are_wired_to_their_routes() -> None:
 
 
 def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
-    """Nine measured K12 routes admit exactly their own (M, K)."""
+    """Retain the nine-route manifest while refreshing added packed candidates."""
     expected_mkr = frozenset(
         (m, k, _H3_ROW52_RANK) for m, k, _ in _H3_REMAINING_BATCH4_CANDIDATES
     )
     assert expected_mkr == svdquant_sm120_cutlass._SM120_LINEAR_ROUTE_V7_MKR
 
     for m, k, launch in _H3_REMAINING_BATCH4_CANDIDATES:
+        expected_version = 7 if k == 14336 else 10
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(
             m, k, _H3_ROW52_RANK
         )
@@ -1563,13 +1562,13 @@ def test_sm120_h3_remaining_batch4_routes_are_exact() -> None:
         _assert_admission_tracks_the_ladder(m, k, 64)
         assert (
             svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, _H3_ROW52_RANK)
-            == 7
+            == expected_version
         )
         assert (
             svdquant_sm120_cutlass._sm120_linear_op_name(
                 m, k, _H3_ROW52_RANK, enable_pdl=False
             )
-            == "svdquant_linear_sm120_routes_v7_tactics_v3"
+            == f"svdquant_linear_sm120_routes_v{expected_version}_tactics_v3"
         )
         _assert_shape_computes_geometry(m, k, launch)
         # The FFI used to carry an "m == M && k == K" branch per admitted shape.
@@ -1620,7 +1619,7 @@ def test_sm120_batch4_gap_closure_routes_are_exact() -> None:
 
 
 def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
-    """Five K5376 producers stay scoped to ten measured full shapes."""
+    """Historical K5376 routes gain a fresh search over packed candidates."""
     expected = (
         (1935, 21504, 5376, 32),
         (1935, 28672, 5376, 32),
@@ -1648,7 +1647,7 @@ def test_sm120_batch4_k5376_fused_routes_are_exact() -> None:
     for m, _, k, rank in expected:
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
         _assert_admission_tracks_the_ladder(m + 1, k, rank)
-        assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, rank) == 8
+        assert svdquant_sm120_cutlass._sm120_linear_route_abi_version(m, k, rank) == 10
 
     _assert_launch_geometry_is_computed(
         "launch_large_m_kernel<6913, 5376, 192, 32, 128>"

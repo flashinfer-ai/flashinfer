@@ -22,20 +22,12 @@ LinearRouteKey: TypeAlias = tuple[int, int, int]
 
 SM120_TACTIC_ABI_VERSION: Final = 3
 
-# v4 is the packed (consumer row, producer variant) grammar. It is deliberately
-# NOT a global bump. Where the producer axis is degenerate -- every shape off
-# the nine-entry ladder -- a packed tactic is the same integer as the bare row
-# it replaces and selects the same thing, so a v3 record still resolves
-# correctly and throwing it away would cost a re-profile for nothing.
-#
-# The cost of getting that wrong is recorded in
-# test_sm120_linear_op_name_keeps_v5_for_every_other_shape: an earlier global
-# bump made every unrelated shape miss its record and re-profile, and one such
-# re-tune picked a slower tactic and regressed that shape.
+# Preserve cached winners wherever the linear candidate set is unchanged.
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
+SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 
-# A route version changes only when the runner set for that exact (M, K, rank)
-# changes. Unlisted shapes retain the v5 namespace and its persisted winner.
+# Historical route versions remain the fallback for shapes without the new
+# packed small-M family. Candidate admission below determines the v10 scope.
 SM120_LINEAR_ROUTE_ABI_OVERRIDES: Final[Mapping[LinearRouteKey, int]] = (
     MappingProxyType(
         {
@@ -85,19 +77,18 @@ SM120_LINEAR_ROUTE_V9_MKR: Final = _route_keys_for_version(9)
 
 def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
     """Return the persistent route namespace for one exact linear shape."""
+    if rank == 32 and any(
+        family == SM120_FAMILY_SMALL_M_PACKED
+        for family, _, _ in sm120_producer_variants(m, k)
+    ):
+        return SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION
     return SM120_LINEAR_ROUTE_ABI_OVERRIDES.get(
         (m, k, rank), SM120_LINEAR_ROUTE_ABI_VERSION
     )
 
 
 def sm120_tactic_abi_version(m: int, k: int) -> int:
-    """Return the tactic namespace for one exact shape.
-
-    One namespace for every shape now that a tactic is just a K3 consumer row.
-    It stayed shape-keyed while a second, producer-geometry axis was packed into
-    the same integer, because only the shapes that carried that axis had a
-    candidate space that changed meaning.
-    """
+    """Return the shared namespace for the unchanged consumer-row encoding."""
     return SM120_TACTIC_ABI_VERSION
 
 
@@ -166,10 +157,9 @@ def sm120_producer_geometry_is_valid(
     return shared_bytes <= _GEOMETRY_SHARED_LIMIT
 
 
-# The small-M producer is a second kernel with its own tiling, and its own
-# constraints. Both families are built for every tiling in their ladder; which
-# family and tiling a shape may use is arithmetic, and which is fastest is the
-# tuner's to find.
+# The row-major and packed small-M families share these tilings and launch
+# constraints. The packed family additionally requires a supported L2T pack.
+# The autotuner measures every admitted family and tiling.
 SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
     (256, 16, 4),
     (768, 8, 8),
@@ -191,13 +181,13 @@ SM120_FAMILY_M537: Final = 2
 # here hands the choice to the autotuner, which is the only thing that can know
 # whether it wins on a card nobody measured.
 SM120_FAMILY_CUBLASLT: Final = 3
+SM120_FAMILY_SMALL_M_PACKED: Final = 4
 
-# The M537 producer reads L2T in a prepacked layout while every other family
-# reads it row-major. That is a property of the family, not of the shape: hand a
-# packed matrix to a row-major reader and it misreads rather than fails, which is
-# how a tactic that selected one producer while the caller packed for another
-# turns into a wrong answer instead of an error.
-SM120_FAMILY_PACKS_L2T: Final[frozenset[int]] = frozenset({SM120_FAMILY_M537})
+# M537 and packed small-M producers share the lane-packed L2T layout. Other
+# families read row-major L2T, so the selected family determines preprocessing.
+SM120_FAMILY_PACKS_L2T: Final[frozenset[int]] = frozenset(
+    {SM120_FAMILY_M537, SM120_FAMILY_SMALL_M_PACKED}
+)
 
 # The M537 producer is a family of kernels for one exact M, parameterised on K
 # and its own role split. It cannot generalise -- M is baked into how the roles
@@ -240,7 +230,7 @@ def sm120_producer_variants(
 ) -> tuple[tuple[int, tuple[int, int, int], int], ...]:
     """Every (family, tiling, address policy) this exact shape can run.
 
-    Both producer families are enumerated from their own constraints, so a shape
+    Producer families are enumerated from their own constraints, so a shape
     nobody measured still reaches the fused prefix and a card nobody measured on
     ranks the candidates itself. The address policy is a large-M axis only; the
     small-M kernel forms its addresses differently and takes 0.
@@ -261,11 +251,16 @@ def sm120_producer_variants(
         if sm120_m537_is_valid(m, k)
         else ()
     )
-    # Offered wherever a native producer is, and last, so the variant indices of
-    # every shape that had one before keep their meaning.
+    # Retain the original native and cuBLASLt ordering. New packed candidates
+    # follow them so every legacy producer index keeps its meaning.
     native = large + small + m537
     cublaslt = ((SM120_FAMILY_CUBLASLT, (0, 0, 0), 0),) if native else ()
-    return native + cublaslt
+    packed_small = (
+        tuple((SM120_FAMILY_SMALL_M_PACKED, tiling, 0) for _, tiling, _ in small)
+        if k in (3072, 5120, 5376, 7168)
+        else ()
+    )
+    return native + cublaslt + packed_small
 
 
 def sm120_variant_packs_l2t(m: int, k: int, variant: int) -> bool:
@@ -318,20 +313,6 @@ def sm120_decode_producer_variant(
 
 PrefixRoute: TypeAlias = str
 PrefixRouteKey: TypeAlias = tuple[int, int]
-
-# Mirror of the exact-shape ladder in
-# include/flashinfer/gemm/svdquant_sm120_prefix_route.h: (default, admitted).
-# The two sides must agree because the M537 native producer consumes a prepacked
-# LoRA-down matrix while the cuBLASLt prefix consumes the row-major one; the
-# packed layout below is chosen from the effective route, not from the shape.
-#
-# Every alternate rung this ladder once carried was measured and refuted, so each shape now admits only its measured default. The
-# C++ header records the per-rung medians. The table is retained for the
-# gate/layout reconciliation, not as a live A/B instrument.
-
-# Shapes whose native producer is the M537 mixed kernel, which indexes L2T with
-# the prepacked layout. Row-major L2T on those routes would be misread.
-
 
 # --- the producer axis of a packed tactic ------------------------------------
 #
