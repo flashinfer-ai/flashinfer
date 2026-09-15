@@ -340,6 +340,11 @@ def run_dist_aware_tactic(
             "DA runtime backend does not match its operation domain: "
             f"{runtime_backend.value} != {backend_identity.value}"
         )
+    # Synthetic DA profiles draw top_k distinct experts from the local shard. Until the
+    # separate partial-occupancy workload model is implemented, keep valid EP shapes whose
+    # global top-k exceeds the local shard on the ordinary autotuner path.
+    if top_k > num_local_experts:
+        return run_fixed_tactic(baseline_tactic)
     if routing_input_mode == RoutingInputMode.FromLogits:
         routing_logits = inputs[routing_id_index]
         hidden_states = inputs[MoeRunnerInputs.idx("hidden_states")]

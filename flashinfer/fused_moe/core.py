@@ -106,7 +106,7 @@ from ..utils import (
     register_custom_op,
     register_fake_op,
 )
-from .da_moe import DA_MAX_EXPERTS, DABody, DAGraphTopology, DAPlan
+from .da_moe import DA_MAX_EXPERTS, DA_MAX_TOP_K, DABody, DAGraphTopology, DAPlan
 from .utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -2151,6 +2151,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and do_finalize
             and gemm1_lora_delta is None
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
@@ -2403,7 +2404,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
         # output format. The exact launcher owns dtype, optional-operand, and top-k validation.
-        da_eligible = do_finalize and 0 < num_experts <= DA_MAX_EXPERTS
+        da_eligible = (
+            do_finalize
+            and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
+        )
         if not da_eligible:
             return run_selected_tactic(tactic)
 
@@ -2659,6 +2664,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 and expert_weights.dtype == torch.float32
             )
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
@@ -3230,6 +3236,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and gemm1_lora_delta is None
             and _nfse == 0
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
@@ -3627,6 +3634,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and gemm1_lora_delta is None
             and num_fused_shared_experts == 0
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)
@@ -3977,6 +3985,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             and do_finalize
             and gemm1_lora_delta is None
             and 0 < num_experts <= DA_MAX_EXPERTS
+            and 0 < top_k <= DA_MAX_TOP_K
         )
         if not da_eligible:
             return run_selected_tactic(tactic)

@@ -14,8 +14,10 @@ import torch
 
 _ResultT = TypeVar("_ResultT")
 
-# Maximum local-expert domain supported by the DA selector implementation.
-DA_MAX_EXPERTS = 512
+# Maximum global-expert domain supported by the DA selector implementation.
+DA_MAX_EXPERTS = 1024
+# Maximum routed experts per token supported by the fused DA preamble.
+DA_MAX_TOP_K = 32
 # Immutable maximum number of distribution exemplar rows in one DA plan.
 DA_MAX_EXEMPLARS = 8
 # Immutable maximum number of unique conditional child bodies.

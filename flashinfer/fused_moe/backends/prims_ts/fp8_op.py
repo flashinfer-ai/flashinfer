@@ -395,12 +395,14 @@ def prims_ts_fp8_per_tensor_scale_moe(
         )
         return output if do_finalize else intermediate_output
 
-    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS, DA_MAX_TOP_K
 
     # DA requires finalization because the runtime-selected tactic may change the
     # intermediate output format. The finalize kernel captured in the CUDA Graph
     # normalizes that format.
-    if not (do_finalize and 0 < num_experts <= DA_MAX_EXPERTS):
+    if not (
+        do_finalize and 0 < num_experts <= DA_MAX_EXPERTS and 0 < top_k <= DA_MAX_TOP_K
+    ):
         return run_selected_tactic(tactic)
 
     from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da
@@ -1005,12 +1007,14 @@ def _prims_ts_fp8_block_scale_moe_impl(
         )
         return output if do_finalize else intermediate_output
 
-    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS, DA_MAX_TOP_K
 
     # DA requires finalization because the runtime-selected tactic may change the
     # intermediate output format. The finalize kernel captured in the CUDA Graph
     # normalizes that format.
-    if not (do_finalize and 0 < num_experts <= DA_MAX_EXPERTS):
+    if not (
+        do_finalize and 0 < num_experts <= DA_MAX_EXPERTS and 0 < top_k <= DA_MAX_TOP_K
+    ):
         return run_selected_tactic(tactic)
 
     from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da

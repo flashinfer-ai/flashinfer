@@ -716,7 +716,8 @@ inline RoutingInputMode validateMultiTileRoutingInputs(
   TVM_FFI_ICHECK_GT(topk_ids.size(0), 0) << "topk_ids must contain at least one token.";
   TVM_FFI_ICHECK_EQ(topk_ids.size(1), top_k) << "topk_ids dim1 must match top_k.";
   TVM_FFI_ICHECK_GT(top_k, 0) << "top_k must be positive.";
-  TVM_FFI_ICHECK_LE(top_k, 8) << "fused multi-tile routing supports top_k <= 8.";
+  TVM_FFI_ICHECK_LE(top_k, da_moe::kDAMaxTopK)
+      << "fused multi-tile routing supports top_k <= " << da_moe::kDAMaxTopK << ".";
   TVM_FFI_ICHECK_GE(num_experts, top_k) << "num_experts must be at least top_k.";
   TVM_FFI_ICHECK_LE(num_experts, da_moe::kDAMaxExperts)
       << "fused multi-tile routing supports num_experts <= " << da_moe::kDAMaxExperts << ".";
@@ -6458,33 +6459,42 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
                                                     cudaGraphCondAssignDefault));
   int64_t const assignment_numel = topk_ids.numel();
   bool const packed_ids = input_mode == RoutingInputMode::PackedPrecomputed;
-  if (packed_ids) {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, true>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            local_expert_offset, local_num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
-  } else if (topk_ids.dtype() == dl_int16) {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            local_expert_offset, local_num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
+  auto launch_selector_for_max_experts = [&](auto max_experts_tag) {
+    constexpr int kMaxExperts = decltype(max_experts_tag)::value;
+    if (packed_ids) {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, true>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    } else if (topk_ids.dtype() == dl_int16) {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, false, int16_t>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int16_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    } else {
+      da_moe::DASelectorKernel<kMaxExperts, da_moe::kDAMaxExemplars, false>
+          <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
+              static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
+              local_expert_offset, local_num_experts,
+              static_cast<float const*>(exemplar_spectra.data_ptr()),
+              static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
+              static_cast<int>(num_selector_exemplars), conditional_handle,
+              static_cast<int32_t*>(selected_body.data_ptr()));
+    }
+  };
+  constexpr int kMaxExpertsWithTwoBinsPerThread = 2 * da_moe::kDASelectorBlockThreads;
+  if (num_experts <= kMaxExpertsWithTwoBinsPerThread) {
+    launch_selector_for_max_experts(std::integral_constant<int, kMaxExpertsWithTwoBinsPerThread>{});
   } else {
-    da_moe::DASelectorKernel<da_moe::kDAMaxExperts, da_moe::kDAMaxExemplars, false>
-        <<<1, da_moe::kDASelectorBlockThreads, 0, stream>>>(
-            static_cast<int32_t const*>(topk_ids.data_ptr()), assignment_numel, num_experts,
-            local_expert_offset, local_num_experts,
-            static_cast<float const*>(exemplar_spectra.data_ptr()),
-            static_cast<int32_t const*>(exemplar_body_indices.data_ptr()),
-            static_cast<int>(num_selector_exemplars), conditional_handle,
-            static_cast<int32_t*>(selected_body.data_ptr()));
+    launch_selector_for_max_experts(std::integral_constant<int, da_moe::kDAMaxExperts>{});
   }
   CHECK_CUDA_ERROR(cudaPeekAtLastError());
   da_moe::ActiveCaptureContext after_selector{};

@@ -454,5 +454,44 @@ def test_selector_ignores_retained_nonlocal_assignments() -> None:
         lease.release()
 
 
+def test_selector_supports_1024_experts_and_topk32() -> None:
+    """The compiled selector must distinguish spectra at both DA capacity bounds."""
+    local_expert_offset = 480
+    num_local_experts = 64
+    runner = MockDAMoERunner(
+        num_experts=1024,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+    )
+    inputs = runner.moe_runner.allocate_inputs(64, 16, 32)
+    spread = (
+        torch.arange(inputs.expert_ids.numel(), device="cuda", dtype=torch.int32)
+        .remainder(num_local_experts)
+        .add(local_expert_offset)
+        .view_as(inputs.expert_ids)
+    )
+    concentrated = torch.full_like(spread, local_expert_offset)
+    runner.publish_plan([spread, concentrated], [0, 1])
+
+    inputs.expert_ids.copy_(spread)
+    runner.prepare(inputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs.as_list(), tactic=0)
+    lease = runner.acquire_graph_lease(graph)
+
+    try:
+        selected = []
+        for expert_ids in (spread, concentrated):
+            inputs.expert_ids.copy_(expert_ids)
+            graph.replay()
+            torch.cuda.synchronize()
+            selected.append(int(runner.selected_body_tensor().item()))
+        assert selected == [0, 1]
+    finally:
+        graph.reset()
+        lease.release()
+
+
 if __name__ == "__main__":
     main()
