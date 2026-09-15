@@ -20,6 +20,7 @@ by measuring each runner's best tactic, then dispatches to the winner.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -29,6 +30,7 @@ from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
+    BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeWarpDecodeConfig,
@@ -83,10 +85,8 @@ from .runners import (
 )
 from .utils import map_to_hybrid_bucket
 
-
-# Union of the concrete runners the layer dispatches to.  All share
-# backend_key / tuning_config / pack_inputs as attributes or class members;
-# typing the list with this Union gives mypy the visibility it needs.
+# Concrete configured runners; automatic implementations are loaded lazily
+# through the registration contract, without naming them in this module.
 _RunnerT = Union[
     CakeWarpDecodeRunner,
     CutlassBf16Runner,
@@ -185,6 +185,8 @@ class MoELayer:
 
         major, minor = get_compute_capability(self.device)
         arch = major * 10 + minor
+        self._arch = arch
+        self._automatic_runners: Dict[str, Any] = {}
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
@@ -200,7 +202,12 @@ class MoELayer:
                 # Construction is inside the guard because a runner may reject an
                 # unsupported config while binding backend resources; letting that
                 # escape would abort selection instead of skipping the backend.
-                runner = runner_cls(config, device=self.device)
+                # Repeated backend types may specify different stage tactics.
+                # Bind this candidate, so each runner sees its own options.
+                runner_config = replace(
+                    config, backend=BackendOptions(candidates=(backend_cfg,))
+                )
+                runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
@@ -261,7 +268,7 @@ class MoELayer:
         # caches its own winner; the mode qualifier keeps a winner tuned for
         # one routing input style (e.g. pre-routed → CuteDSL) from being
         # dispatched a pack it cannot execute (FromLogits).
-        self._winners: Dict[Tuple[int, Any], Tuple[_RunnerT, Any]] = {}
+        self._winners: Dict[tuple, Tuple[_RunnerT, Any]] = {}
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
@@ -315,6 +322,8 @@ class MoELayer:
         # mode-qualified cache key below.
         mode = act_pack.routing_input_mode
         runners = [r for r in self.runners if mode in r.supported_routing_modes]
+        additional = self._additional_candidates(act_pack, weight_pack)
+        runners.extend(additional)
         if not runners:
             raise NotImplementedError(
                 f"MoELayer: none of the usable backends "
@@ -323,18 +332,49 @@ class MoELayer:
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
-        winner = self._winners.get((bucket, mode))
+        # Optional plans can have exact geometry. Qualify their cache by both
+        # shape and eligible candidate set; rejected per-call layouts must not
+        # reuse a winner from a different set. Original bucket keys stay intact.
+        winner_key = (
+            (
+                bucket,
+                mode,
+                "automatic",
+                tuple(r.backend_key for r in additional),
+                tuple(act_pack.hidden_states_q.shape),
+            )
+            if additional
+            else (bucket, mode)
+        )
+        winner = self._winners.get(winner_key)
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
-            self._winners[(bucket, mode)] = winner
+            self._winners[winner_key] = winner
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
+        if any(runner is candidate for candidate in additional):
+            from ..api_logging import warn_experimental_backend_once
+
+            warn_experimental_backend_once("MoELayer", runner.backend_key)
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(
             inputs,
             tactic=tactic,
             **runner.launch_kwargs_for(inputs),
+        )
+
+    def _additional_candidates(self, act_pack, weight_pack):
+        from .auto_candidates import additional_candidates
+
+        return additional_candidates(
+            self.config,
+            self.device,
+            getattr(self, "_arch", None),
+            act_pack,
+            weight_pack,
+            tuning=self.tuner.is_tuning_mode,
+            cache=getattr(self, "_automatic_runners", {}),
         )
 
     def _select_winner(
@@ -345,12 +385,6 @@ class MoELayer:
     ) -> Tuple[_RunnerT, Any]:
         """Run per-runner autotune, then measure each winner-tactic and
         pick cross-backend winner."""
-        # Lazy import: keep the library import path (``import flashinfer``) free
-        # of a dependency on the testing framework. The GPU timing helper is only
-        # needed here, on the autotune path. Relocating it to a non-testing
-        # utility module is the cleaner long-term fix (post-MVP).
-        from ..testing.utils import bench_gpu_time
-
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
@@ -366,6 +400,12 @@ class MoELayer:
                 inputs=inputs,
                 **launch_kwargs,
             )
+            # Still select the best tactic, but no cross-backend measurement
+            # can change the winner when only one runner is eligible.
+            if len(runners) == 1:
+                return runner, tactic
+            from ..testing.utils import bench_gpu_time
+
             # Measure runner at its winning tactic.  Use CUDA-graph timing so
             # the cross-backend comparison reflects production (graph-captured)
             # latency rather than per-call launch/Python overhead — at low token
