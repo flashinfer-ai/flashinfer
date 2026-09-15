@@ -14,6 +14,7 @@
 
 """TraceTemplates for GEMM operations."""
 
+import functools
 import math
 from typing import Any, cast
 
@@ -918,15 +919,139 @@ mm_bf16_fp4_cute_dsl_sm100_trace = TraceTemplate(
 )
 
 
+def _mm_bf16_fp4_native_reference(
+    a, b, b_descale, alpha=None, block_size=16, out_dtype=None, out=None
+):
+    """Decode canonical NVFP4 bytes and padded 128x4 E4M3 block scales."""
+    n, k_half = b.shape
+    k = k_half * 2
+    sf_bytes = _unswizzle_sf_128x4(
+        b_descale.view(torch.uint8).reshape(-1), n, k // block_size
+    ).contiguous()
+    sf = sf_bytes.view(torch.float8_e4m3fn).float().repeat_interleave(block_size, 1)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=b.device,
+    )
+    codes = torch.stack((b & 15, b >> 4), dim=-1).long().reshape(n, k)
+    weight = lut[codes] * sf
+    if alpha is not None:
+        weight = weight * alpha.float()
+    result = (a.float() @ weight.T).to(out_dtype or a.dtype)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+cast(Any, _mm_bf16_fp4_native_reference)._trace_reference_dependencies = (
+    _unswizzle_batched_sf_128x4,
+    _unswizzle_sf_128x4,
+)
+
+
+def _mm_bf16_fp4_native_init(
+    *,
+    M: int,
+    N: int = 2048,
+    K: int = 7168,
+    block_size: int = 16,
+    K_packed: int = 0,  # derived
+    SF_dim_0: int = 0,  # derived from N/K padding
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build canonical weights without creating an alternate representation."""
+    del SF_dim_0, K_packed
+    from flashinfer import nvfp4_quantize  # noqa: PLC0415
+    from flashinfer.quantization.fp4_quantization import SfLayout  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("native mm_bf16_fp4 init requires CUDA")
+    if torch.cuda.get_device_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        raise NotImplementedError("native mm_bf16_fp4 requires SM120/121")
+    if not 1 <= M <= 16 or block_size != 16:
+        raise NotImplementedError("native mm_bf16_fp4 requires M<=16 and block_size=16")
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    g_w = 2688.0 / w.float().abs().max()
+    b, sf = nvfp4_quantize(
+        w, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False, backend="cute-dsl"
+    )
+    return dict(
+        a=a,
+        b=b,
+        b_descale=sf.reshape(-1),
+        alpha=g_w.reciprocal().reshape(1),
+        backend="cute-dsl-native",
+        block_size=block_size,
+    )
+
+
+@functools.cache
+def _mm_bf16_fp4_native_trace(scale_ndim):
+    """Preserve the caller's view of the contiguous canonical scale buffer."""
+    return TraceTemplate(
+        op_type="gemm_bf16_fp4",
+        name_prefix=f"mm_bf16_fp4_cute_dsl_native_sf{scale_ndim}d",
+        description=(
+            "BF16 x NVFP4 GEMM with canonical uint8 weights and padded 128x4-swizzled "
+            "E4M3 block scales on SM120/121. No alternate weight preparation; M<=16."
+        ),
+        axes={
+            "M": Var(),
+            "N": Const(),
+            "K": Const(),
+            "K_packed": Const(),
+            "block_size": Const(),
+            **{f"SF_dim_{i}": Const() for i in range(scale_ndim)},
+        },
+        inputs={
+            "A": Tensor(["M", "K"], param="a"),
+            "B": Tensor(["N", "K_packed"], param="b"),
+            "b_descale": Tensor(
+                [f"SF_dim_{i}" for i in range(scale_ndim)],
+                description="Contiguous 128x4-swizzled E4M3 buffer, including N/K padding.",
+            ),
+            "alpha": Tensor(["1"], optional=True),
+            "block_size": Scalar("int32"),
+            "out_dtype": Scalar("dtype", optional=True),
+            "out": Tensor(["M", "N"], optional=True),
+        },
+        outputs={
+            "C": Tensor(
+                ["M", "N"],
+                dtype="bfloat16",
+                dtype_from="out",
+                dtype_from_scalar="out_dtype",
+            )
+        },
+        constraints=["K == K_packed * 2", "block_size == 16", "1 <= M <= 16"],
+        tags=["status:verified", "quantization:fp4"],
+        reference=_mm_bf16_fp4_native_reference,
+        check=_fp4_gemm_check,
+        init=_mm_bf16_fp4_native_init if scale_ndim == 1 else None,
+    )
+
+
+mm_bf16_fp4_native_trace = _mm_bf16_fp4_native_trace(1)
+
+
 def mm_bf16_fp4_trace_dispatch(**kwargs):
     """Return the TraceTemplate for an ``mm_bf16_fp4`` call by backend.
 
     ``prepare_bf16_fp4_weights`` produces three distinct layouts: cute-dsl on
     SM12x tile-packs the weight into int32, cute-dsl on SM100/103 keeps the
     canonical uint8 weight but hands back a 6-D scale view, and cudnn keeps the
-    canonical weight with linear 2-D scales.  Pass as
+    canonical weight with linear 2-D scales. The explicit cute-dsl-native
+    backend consumes the contiguous canonical 128x4 scale buffer directly. Pass as
     ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
+    if kwargs.get("backend") == "cute-dsl-native":
+        sf = kwargs.get("b_descale")
+        return _mm_bf16_fp4_native_trace(sf.ndim if sf is not None else 1)
     b = kwargs.get("b")
     if b is not None and b.dtype == torch.int32:
         return mm_bf16_fp4_cute_dsl_trace
@@ -939,6 +1064,8 @@ def mm_bf16_fp4_trace_dispatch(**kwargs):
 # Expose the templates so _attach_fi_trace auto-registers them for the
 # consistency tests (same pattern as the MoE routing dispatchers).
 mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mm_bf16_fp4_native_trace,
+    _mm_bf16_fp4_native_trace(2),
     mm_bf16_fp4_cudnn_trace,
     mm_bf16_fp4_cute_dsl_trace,
     mm_bf16_fp4_cute_dsl_sm100_trace,
