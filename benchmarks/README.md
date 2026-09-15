@@ -52,7 +52,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16 and NVFP4 W4A4 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
+    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16, NVFP4 W4A4/W4A16, and MXFP4 W4A4/W4A16 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
@@ -109,8 +109,10 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 ### Single Test Run
 A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <routine_name> <flags>`.
 
-The unified MoE comparison runs both backends from the same routing, activation,
-and weight inputs. This example uses the Nemotron-3.5-Lightning MoE shape:
+The unified MoE comparison runs the selected backends from the same routing, activation,
+and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
+`nvfp4_w4a16`, `mxfp4`, and `mxfp4_w4a16`. This example uses the
+Nemotron-3.5-Lightning MoE shape:
 
 ```bash
 python3 flashinfer_benchmark.py --routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune
@@ -120,6 +122,9 @@ CUDA graph timing is enabled by default and captures one MoE invocation per
 graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
 timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotuned
 results use `cutlass_autotune` and `cutile_autotune`.
+On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
+and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
+`--autotune` does not expand its search space. MXFP4 is not supported by b12x.
 
 Representative Qwen3.6 and Nemotron cases are in `samples/sample_testlist.txt`.
 
@@ -559,7 +564,7 @@ Legend:
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
-| **unified_moe** |  |  |  | cutlass, cutile (BF16) | cutlass, cutile (BF16) | cutlass | cutlass | cutlass, cutile |
+| **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass | cutlass | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
