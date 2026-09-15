@@ -360,8 +360,8 @@ def test_supports_decode_rejects_mismatches() -> None:
     assert not dsv4.supports_decode(64, 0)  # topk below min_topk=1
     assert not dsv4.supports_decode(256, 256)  # num_heads past the runtime-H ceiling
     assert dsv4.supports_decode(48, 256)  # arbitrary H <= 128 rides runtime-H
-    assert dsv4.supports_decode(64, 256, page_block_size=32)  # instantiated page
-    assert not dsv4.supports_decode(64, 256, page_block_size=48)  # uninstantiated
+    assert dsv4.supports_decode(64, 256, page_block_size=32)
+    assert dsv4.supports_decode(64, 256, page_block_size=48)
     assert not dsv4.supports_decode(64, 256, page_block_size=0)
     assert not dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS + 1)
     assert dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS)
@@ -453,8 +453,11 @@ def test_error_message_names_page_block_size_mismatch() -> None:
         model_type=_MODEL_TYPE_DSV4,
         extra_topk=0,
     )
-    assert "page_block_size=48 is unsupported" in msg
-    assert "instantiated only for page_block_size in (32, 64)" in msg
+    assert "page_block_size=48 is unsupported" not in msg
+    config = supported_sparse_mla_sm120_configs()["dsv4"]
+    assert config.page_block_size_is_runtime
+    assert not config.page_block_sizes
+    assert supported_sparse_mla_sm120_configs()["dsv4_1"].page_block_size_is_runtime
     assert "num_heads=64 exceeds" not in msg
     assert "topk=256 is below" not in msg
 

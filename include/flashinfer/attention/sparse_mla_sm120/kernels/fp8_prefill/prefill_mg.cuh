@@ -61,6 +61,15 @@ __device__ __forceinline__ void prefill_mg_impl(
   [[maybe_unused]] const size_t extra_page_stride_bytes =
       DUAL_CACHE ? cold.extra_page_stride_bytes : (size_t)0;
   using KV = KVCacheTraits<MT>;
+  constexpr int PAGE_MAIN = PAGE_BLOCK_SIZE;
+  constexpr int PAGE_EXTRA =
+      PAGE_BLOCK_SIZE == 0 && PAGE_BLOCK_SIZE_EXTRA != 2 ? 0 : PAGE_BLOCK_SIZE_EXTRA;
+  const PageGeom pg_main = page_geom(PAGE_MAIN == 0 ? cold.page_block_size : PAGE_MAIN,
+                                     KVIOTraits<MT>::IO_STRIDE, cold.main_div);
+  [[maybe_unused]] const PageGeom pg_extra =
+      page_geom(PAGE_EXTRA == 0 ? cold.extra_page_block_size : PAGE_EXTRA,
+                KVIOTraits<MT>::IO_STRIDE, cold.extra_div);
+  constexpr bool REUSE_ADDRESS = MT == ModelType::DSV4;
   // CT pinned to FP8: XV always uses FP8 W; QkMode only flips the QK side.
   using CT = ComputeTraits<MT, QkComputeMode::FP8, BI, N_MATH_WARPS>;
   using LMG = SmemLayoutMG<MT, QkMode>;
@@ -120,9 +129,15 @@ __device__ __forceinline__ void prefill_mg_impl(
     flashinfer::sparse_mla_sm120::pipeline::BulkReady::init_slots<2>(sm.mbar_kv(0));
   bar_sync_t<Fp8PrefillSync::CTA_INIT, BLOCK_THREADS>();
 
+  constexpr bool H32_FP8_SINGLE =
+      MT == ModelType::DSV4 && NUM_HEADS == 32 && QkMode == QkComputeMode::FP8 && !DUAL_CACHE;
+  constexpr int IO_REGS = H32_FP8_SINGLE ? 24 : 32;
+  constexpr int MATH_REGS = H32_FP8_SINGLE ? 240 : 232;
+  static_assert(MATH_REGS * MATH_THREADS + IO_REGS * IO_THREADS <= 168 * BLOCK_THREADS);
+
   // ── IO warps ────────────────────────────────────────────────────
   if (wy == 2) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(32));
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(IO_REGS));
 
     const int io_tid = threadIdx.x - N_MATH_WARPS * 32;
     const int32_t* idx_base = indices + (size_t)s_i * cold.topk;
@@ -152,27 +167,59 @@ __device__ __forceinline__ void prefill_mg_impl(
         return (t * BI + io_tid < topk_len) ? __ldg(idx_base + t * BI + io_tid) : -1;
       }
     };
-    // Scales first (plain stores, no mbar signal), then bulk gather
-    // (cp.async.bulk signals mbar_kv on completion); threadfence_block makes
-    // the scale stores visible before the bulk completion event wakes math.
+    // DSV4 ordinary address/scale stores use a counted CTA store handoff;
+    // bulk completion alone does not publish stores from all IO threads.
     auto issue_tile = [&](int logical_ti, int buf, int staged) {
+      if constexpr (REUSE_ADDRESS) {
+        const uint8_t* address;
+        if constexpr (DUAL_CACHE) {
+          if (logical_ti >= main_ni) {
+            address = prefill_kv_entry_base<MT, PAGE_EXTRA>(KV_cache_extra, staged,
+                                                            extra_page_stride_bytes, pg_extra);
+            io_gather_scales<MT, PAGE_EXTRA, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged,
+                                                             KV_cache_extra, io_tid,
+                                                             extra_page_stride_bytes, pg_extra);
+          } else {
+            address =
+                prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, staged, page_stride_bytes, pg_main);
+            io_gather_scales<MT, PAGE_MAIN, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
+                                                            io_tid, page_stride_bytes, pg_main);
+          }
+        } else {
+          address =
+              prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, staged, page_stride_bytes, pg_main);
+          io_gather_scales<MT, PAGE_MAIN, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
+                                                          io_tid, page_stride_bytes, pg_main);
+        }
+        if (io_tid == 0) BulkReady::expect(sm.mbar_kv(buf), BI * KV::KV_SMEM_COPY_BYTES);
+        if (io_tid < BI) {
+          auto addresses = reinterpret_cast<const uint8_t**>(smem_raw + LMG::OFF_KV_ADDRESS);
+          addresses[buf * BI + io_tid] = address;
+          cp_async_bulk_g2s_l2hint(sm.kv_buf(buf) + io_tid * KV::KV_SMEM_STRIDE, address,
+                                   KV::KV_SMEM_COPY_BYTES, sm.mbar_kv(buf), kv_l2_policy);
+        }
+        flashinfer::sparse_mla_sm120::pipeline::StoreHandoff<6, 7, IO_THREADS,
+                                                             MATH_THREADS>::publish(buf);
+        return;
+      }
       if constexpr (DUAL_CACHE) {
         if (logical_ti >= main_ni) {
-          io_gather_scales<MT, PAGE_BLOCK_SIZE_EXTRA, BI, IO_THREADS>(
-              sm.kv_scale_buf(buf), staged, KV_cache_extra, io_tid, extra_page_stride_bytes);
+          io_gather_scales<MT, PAGE_EXTRA, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged,
+                                                           KV_cache_extra, io_tid,
+                                                           extra_page_stride_bytes, pg_extra);
           __threadfence_block();
-          io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE_EXTRA, true, BI, IO_THREADS>(
+          io_bulk_gather_tile<MT, PAGE_EXTRA, true, BI, IO_THREADS>(
               sm.kv_buf(buf), staged, KV_cache_extra, sm.mbar_kv(buf), io_tid,
-              extra_page_stride_bytes, kv_l2_policy);
+              extra_page_stride_bytes, kv_l2_policy, pg_extra);
           return;
         }
       }
-      io_gather_scales<MT, PAGE_BLOCK_SIZE, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
-                                                            io_tid, page_stride_bytes);
+      io_gather_scales<MT, PAGE_MAIN, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
+                                                      io_tid, page_stride_bytes, pg_main);
       __threadfence_block();
-      io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, true, BI, IO_THREADS>(
+      io_bulk_gather_tile<MT, PAGE_MAIN, true, BI, IO_THREADS>(
           sm.kv_buf(buf), staged, KV_cache, sm.mbar_kv(buf), io_tid, page_stride_bytes,
-          kv_l2_policy);
+          kv_l2_policy, pg_main);
     };
 
     int staged = load_idx(0);
@@ -193,7 +240,7 @@ __device__ __forceinline__ void prefill_mg_impl(
 
     // ── Math warps ──────────────────────────────────────────────────
   } else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(232));
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(MATH_REGS));
 
     const int lane = threadIdx.x & 31;
     const int mwarp = warp_rank;
@@ -270,9 +317,15 @@ __device__ __forceinline__ void prefill_mg_impl(
         page_stride_bytes_now = page_stride_bytes;
       }
 
-      // Entry base: only gid's entry needed (rope prefetch + QK rope)
+      // The store handoff publishes every IO writer; KvFree retires all XV
+      // readers before IO can overwrite this slot two tiles later.
       const uint8_t* entry_base_gid;
-      {
+      if constexpr (REUSE_ADDRESS) {
+        flashinfer::sparse_mla_sm120::pipeline::StoreHandoff<6, 7, IO_THREADS, MATH_THREADS>::wait(
+            ti & 1);
+        auto addresses = reinterpret_cast<const uint8_t* const*>(smem_raw + LMG::OFF_KV_ADDRESS);
+        entry_base_gid = addresses[(ti & 1) * BI + qk_nb + gid];
+      } else {
         // Position and runtime length are cache-section-relative under dual cache.
         const int section_tile = (DUAL_CACHE && !is_main) ? (ti - main_ni) : ti;
         const int len_now = (DUAL_CACHE && !is_main) ? topk_len_extra : topk_len;
@@ -281,14 +334,14 @@ __device__ __forceinline__ void prefill_mg_impl(
         if constexpr (DUAL_CACHE) {
           if (is_main) {
             entry_base_gid =
-                prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx, page_stride_bytes);
+                prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, idx, page_stride_bytes, pg_main);
           } else {
-            entry_base_gid = prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE_EXTRA>(
-                KV_cache_extra, idx, extra_page_stride_bytes);
+            entry_base_gid = prefill_kv_entry_base<MT, PAGE_EXTRA>(
+                KV_cache_extra, idx, extra_page_stride_bytes, pg_extra);
           }
         } else {
           entry_base_gid =
-              prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx, page_stride_bytes);
+              prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, idx, page_stride_bytes, pg_main);
         }
       }
 
@@ -736,25 +789,29 @@ __device__ __forceinline__ void prefill_mg_impl(
       // ── XV rope BF16 MMA (DSV4, both groups) ──────────────
       if constexpr (KV::V_HAS_ROPE) {
         bar_sync_t<Fp8PrefillSync::MATH, MATH_THREADS>();
-        // Entries past the phase's runtime length carry stale caller padding;
-        // the rope reads re-derive gmem addresses from `ib`, so pass the bound.
+        // DSV4 IO already maps negative indices and stale padding to the zero row.
         const int valid_len = (DUAL_CACHE && !is_main)
                                   ? min(BI, topk_len_extra - (ti - main_ni) * BI)
                                   : min(BI, topk_len - ti * BI);
-        if constexpr (DUAL_CACHE) {
+        if constexpr (REUSE_ADDRESS) {
+          auto addresses = reinterpret_cast<const uint8_t* const*>(smem_raw + LMG::OFF_KV_ADDRESS);
+          xv_rope_mma_mg<MT, PAGE_MAIN, MG_N_HG>(
+              acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+              reinterpret_cast<bf16*>(sm.w_fp8()), addresses + (ti & 1) * BI);
+        } else if constexpr (DUAL_CACHE) {
           if (is_main) {
-            xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, p, ib, valid_len, kv_global,
-                                                         mwarp, lane, page_stride_bytes_now,
-                                                         reinterpret_cast<bf16*>(sm.w_fp8()));
-          } else {
-            xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE_EXTRA, MG_N_HG>(
+            xv_rope_mma_mg<MT, PAGE_MAIN, MG_N_HG>(
                 acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
-                reinterpret_cast<bf16*>(sm.w_fp8()));
+                reinterpret_cast<bf16*>(sm.w_fp8()), nullptr, pg_main);
+          } else {
+            xv_rope_mma_mg<MT, PAGE_EXTRA, MG_N_HG>(
+                acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+                reinterpret_cast<bf16*>(sm.w_fp8()), nullptr, pg_extra);
           }
         } else {
-          xv_rope_mma_mg<MT, PAGE_BLOCK_SIZE, MG_N_HG>(acc_rope, p, ib, valid_len, kv_global, mwarp,
-                                                       lane, page_stride_bytes_now,
-                                                       reinterpret_cast<bf16*>(sm.w_fp8()));
+          xv_rope_mma_mg<MT, PAGE_MAIN, MG_N_HG>(
+              acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+              reinterpret_cast<bf16*>(sm.w_fp8()), nullptr, pg_main);
         }
       }
       Fp8PrefillSync::KvFree<IO_THREADS, MATH_THREADS>::release(ti & 1);

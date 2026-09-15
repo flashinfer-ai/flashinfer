@@ -31,8 +31,7 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
 
 // Thin TVM-FFI wrapper for the decode-dsv4 standalone path. The caller passes
 // already-sized scratch tensors mid_out + mid_lse plus the output and lse.
-// Handles DSV4 decode with page_block_size=64 and the supported head/top-k
-// instantiation grid in sparse_mla_sm120_decode.cu.
+// DSV4 accepts independent positive page sizes with aligned page strides.
 template <bool BF16 = false>
 void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indices,
                               TensorView mid_out, TensorView mid_lse, TensorView output,

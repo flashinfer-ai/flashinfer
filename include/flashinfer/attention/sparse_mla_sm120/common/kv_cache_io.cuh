@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <flashinfer/fastdiv.cuh>
+
 #include "../arch/cp_async.cuh"
 #include "../model/kv_cache_traits.cuh"
 #include "../pipeline/staged_pipeline.cuh"
@@ -74,6 +76,24 @@ __device__ __forceinline__ size_t inline_row_advance(size_t stride_kv_block, int
   return stride_kv_block / page_block_size;
 }
 
+struct PageGeom {
+  int pbs;
+  size_t footer;
+  flashinfer::uint_fastdiv divisor;
+};
+
+__device__ __forceinline__ PageGeom page_geom(int pbs, int row_bytes,
+                                              flashinfer::uint_fastdiv divisor) {
+  return {pbs, (size_t)pbs * (size_t)row_bytes, divisor};
+}
+
+__device__ __forceinline__ void page_divmod(int idx, const PageGeom pg, int& bi, int& li) {
+  uint32_t q, r;
+  pg.divisor.divmod(uint32_t(idx), q, r);
+  bi = int(q);
+  li = int(r);
+}
+
 // Math-side index normalization: lanes at or past the tile's runtime length
 // carry stale caller padding, and the math-side rope reads are real loads
 // (not hints), so a garbage positive index would form a wild gmem address.
@@ -95,7 +115,7 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
                                                     const uint8_t* __restrict__ kv_ptr,
                                                     uint64_t* mbar, int io_tid,
                                                     size_t stride_kv_block,
-                                                    uint64_t cache_policy = 0) {
+                                                    uint64_t cache_policy = 0, PageGeom pg = {}) {
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
   constexpr int COPY_BYTES = KV::KV_SMEM_COPY_BYTES;
@@ -114,6 +134,10 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, int idx,
   const uint8_t* src;
   if constexpr (KV::SCALE_IN_KV_SMEM) {
     src = kv_ptr + (size_t)idx * inline_row_advance(stride_kv_block, PAGE_BLOCK_SIZE);
+  } else if constexpr (PAGE_BLOCK_SIZE == 0) {
+    int bi, li;
+    page_divmod(idx, pg, bi, li);
+    src = kv_ptr + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
   } else {
     constexpr int pbs = PAGE_BLOCK_SIZE;
     src = kv_ptr + (size_t)(idx / pbs) * stride_kv_block + (size_t)(idx % pbs) * IO::IO_STRIDE;
@@ -160,7 +184,7 @@ __device__ __forceinline__ void io_bulk_prefetch_l2(int idx, const uint8_t* __re
 template <ModelType MT, int PAGE_BLOCK_SIZE, int TILE_BI, int TILE_IO_THREADS>
 __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
                                                  const uint8_t* __restrict__ kv_ptr, int io_tid,
-                                                 size_t stride_kv_block) {
+                                                 size_t stride_kv_block, PageGeom pg = {}) {
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
   if constexpr (KV::SCALE_IN_KV_SMEM) return;
@@ -184,8 +208,15 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
   const bool valid = idx >= 0;
   idx = valid ? idx : 0;
 
-  const uint8_t* src = kv_ptr + (size_t)(idx / pbs) * stride_kv_block +
-                       (size_t)pbs * IO::IO_STRIDE + (size_t)(idx % pbs) * SCALE_BYTES;
+  const uint8_t* src;
+  if constexpr (PAGE_BLOCK_SIZE == 0) {
+    int bi, li;
+    page_divmod(idx, pg, bi, li);
+    src = kv_ptr + (size_t)bi * stride_kv_block + pg.footer + (size_t)li * SCALE_BYTES;
+  } else {
+    src = kv_ptr + (size_t)(idx / pbs) * stride_kv_block + (size_t)pbs * IO::IO_STRIDE +
+          (size_t)(idx % pbs) * SCALE_BYTES;
+  }
   src = valid ? src : sparse_mla_zero_row;
   if constexpr (SCALE_BYTES == sizeof(uint4)) {
     *reinterpret_cast<uint4*>(scale_dst + io_tid * SCALE_BYTES) =

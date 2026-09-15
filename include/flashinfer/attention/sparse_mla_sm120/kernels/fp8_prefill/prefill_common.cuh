@@ -98,7 +98,7 @@ struct Fp8PrefillSync {
 
 template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
-    const uint8_t* __restrict__ kv_global, int idx, size_t stride_kv_block) {
+    const uint8_t* __restrict__ kv_global, int idx, size_t stride_kv_block, PageGeom pg = {}) {
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
   // Addressing mode follows the scale layout, not V_HAS_ROPE: an inline-scale
@@ -113,7 +113,12 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
   const bool valid = idx >= 0;
   idx = valid ? idx : 0;
   const uint8_t* base;
-  if constexpr (!KV::SCALE_IN_KV_SMEM) {
+  if constexpr (PAGE_BLOCK_SIZE == 0) {
+    static_assert(MT == ModelType::DSV4);
+    int bi, li;
+    page_divmod(idx, pg, bi, li);
+    base = kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
+  } else if constexpr (!KV::SCALE_IN_KV_SMEM) {
     const int bi = idx / PAGE_BLOCK_SIZE;
     const int li = idx % PAGE_BLOCK_SIZE;
     base = kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;

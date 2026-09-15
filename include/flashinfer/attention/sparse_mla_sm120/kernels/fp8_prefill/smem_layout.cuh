@@ -162,7 +162,10 @@ struct SmemLayoutMG {
   static constexpr size_t OFF_W_FP8 = OFF_W_SC_ALL + SMEM_W_SC_ALL;
   static constexpr size_t OFF_SCRATCH = OFF_W_FP8;
   static constexpr size_t OFF_MBAR_KV = (OFF_W_FP8 + SMEM_W_FP8_MG + 7) / 8 * 8;
-  static constexpr size_t TOTAL = OFF_MBAR_KV + SMEM_MBAR_KV;
+  static constexpr size_t OFF_KV_ADDRESS = OFF_MBAR_KV + SMEM_MBAR_KV;
+  static constexpr size_t SMEM_KV_ADDRESS =
+      MT == ModelType::DSV4 ? 2 * TILE_BI * sizeof(uint64_t) : 0;
+  static constexpr size_t TOTAL = OFF_KV_ADDRESS + SMEM_KV_ADDRESS;
 
   static_assert(TOTAL <= 101376, "MG smem exceeds 99KB per-block limit");
 };
