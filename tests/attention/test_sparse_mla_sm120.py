@@ -2405,6 +2405,94 @@ def test_sparse_mla_sm120_prefill_dsv4_bounds_stale_padding(dual: bool) -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize(
+    "dual,poison_extra", [(False, False), (True, False), (True, True)]
+)
+def test_sparse_mla_sm120_prefill_dsv4_positive_padding_ignores_nan_rows(
+    dual: bool, poison_extra: bool
+) -> None:
+    """In-range padding past topk_length must not read NaN data or rope.
+
+    Unlike out-of-range padding, this address can only be rejected by the
+    valid-length mask. Compare each cache phase with canonical -1 padding.
+    """
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    num_tokens, num_heads, d_qk = 128, 64, 512  # Force the prefill route.
+    num_blocks, page_block_size = 4, 64
+    topk, topk_len = 128, 96  # Exercise a partially valid final tile.
+    poison_slot = 7  # Nonzero, in range, and excluded from every valid prefix.
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    caches, indices = [], []
+    for cache_index in range(2 if dual else 1):
+        kv = (
+            torch.randn(
+                num_blocks,
+                page_block_size,
+                1,
+                d_qk,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        packed = quantize_kv_dsv4(kv)
+        if cache_index == int(poison_extra):
+            # DSV4 stores 576 data bytes per row, then 8 footer bytes per row.
+            # Poison both FP8 data and BF16 rope, as well as the scale footer.
+            flat = packed.view(num_blocks, -1)
+            flat[0, poison_slot * 576 : (poison_slot + 1) * 576].fill_(0xFF)
+            footer = page_block_size * 576 + poison_slot * 8
+            flat[0, footer : footer + 8].fill_(0xFF)
+        caches.append(packed)
+        idx = torch.randint(
+            poison_slot + 1,
+            num_blocks * page_block_size,
+            (num_tokens, topk),
+            device=device,
+            dtype=torch.int32,
+        )
+        idx[:, topk_len:] = -1
+        indices.append(idx)
+    lengths = torch.full((num_tokens,), topk_len, device=device, dtype=torch.int32)
+
+    def run():
+        output = torch.empty_like(q)
+        lse = torch.empty((num_tokens, num_heads), device=device, dtype=torch.float32)
+        kwargs = (
+            dict(
+                extra_kv_cache=caches[1],
+                extra_indices=indices[1],
+                extra_topk_length=lengths,
+            )
+            if dual
+            else {}
+        )
+        sparse_mla_sm120_paged_attention(
+            q,
+            caches[0],
+            indices[0],
+            output,
+            lse,
+            d_qk**-0.5,
+            d_v=d_qk,
+            topk_length=lengths,
+            **kwargs,
+        )
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(lse).all()
+        return output, lse
+
+    sentinel_out, sentinel_lse = run()
+    indices[int(poison_extra)][:, topk_len:] = poison_slot
+    padded_out, padded_lse = run()
+    torch.testing.assert_close(padded_out, sentinel_out, atol=0, rtol=0)
+    torch.testing.assert_close(padded_lse, sentinel_lse, atol=0, rtol=0)
+
+
 def test_sparse_mla_sm120_prefill_dots3_swa_bounds_stale_padding() -> None:
     """DOTS3_SWA (SG/BI=32 split producer-consumer path) with stale padding.
 
