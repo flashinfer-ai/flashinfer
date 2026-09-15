@@ -15,7 +15,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     SM12xMxfp8Mxfp4Config,
     SiTU,
@@ -120,7 +120,11 @@ def test_sm12x_mxfp8_mxfp4_unified_runner_matches_reference(activation):
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.MXFP4, per_token_scale=False),
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP4,
+            activation=QuantFormat.MXFP8,
+            per_token_scale=False,
+        ),
         experts=ExpertConfig(intermediate_size=intermediate, local_num_experts=experts),
         activation=activation,
         backend=BackendOptions(candidates=(backend,)),
