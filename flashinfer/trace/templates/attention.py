@@ -1631,7 +1631,8 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         kv_lengths_mode=str(state.kv_lengths_mode),
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
-        split_kv=bool(getattr(state, "split_kv", True)),
+        # Preserve caller permission, not whether this shape actually splits.
+        split_kv=bool(dict(getattr(state, "policy", ())).get("split_kv_allowed", True)),
     )
 
 
