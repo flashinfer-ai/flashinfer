@@ -22,6 +22,10 @@
       "value": 4,
       "description": "Fixed query length per request."
     },
+    "split_kv_allowed": {
+      "type": "const",
+      "value": 1
+    },
     "max_seq_len_q": {
       "type": "const",
       "value": 4,

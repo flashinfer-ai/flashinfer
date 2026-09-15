@@ -1,5 +1,5 @@
 {
-  "name": "prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32",
+  "name": "prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_no_split_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32",
   "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size. Every run supplies a fixed row-strided page table and K/V lengths; packed-Q runs also supply Q offsets.",
   "op_type": "gqa_paged",
   "tags": [
@@ -24,7 +24,7 @@
     },
     "split_kv_allowed": {
       "type": "const",
-      "value": 1
+      "value": 0
     },
     "max_seq_len_q": {
       "type": "const",

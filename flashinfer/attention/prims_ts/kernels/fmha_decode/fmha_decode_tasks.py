@@ -572,6 +572,8 @@ def _prepared_sparse_row_address(
     q_token_base = _q_group_token_base(cfg, q_group_idx)
     q_block = q_token_base // cutlass.Int32(cfg.q_block_size)
     num_q_blocks = (cfg.max_seq_len_q + cfg.q_block_size - 1) // cfg.q_block_size
+    if cutlass.const_expr(cfg.shares_sparse_pattern):
+        return b_idx * cutlass.Int32(num_q_blocks) + q_block
     return (b_idx * num_heads_kv + h_idx) * cutlass.Int32(num_q_blocks) + q_block
 
 
@@ -1033,7 +1035,7 @@ class DecodeGenTask(Task):
 
 
 # ======================================================================
-# LoadTask — warp 13 (or warp 15 under CLC persistent), 1 warp
+# LoadTask — independently configured Q/K/V TMA issuer warps
 # K and V share a single SmemKv ring; loads alternate K and V tiles.
 #   HEAD:    Q + K0 + K1
 #   LOOP[i]: K(i+2) + V(i)
@@ -1352,10 +1354,10 @@ def create_page_offsets_task(
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
-    """Prefetch page-table entries that LoadTask consumes for paged KV.
+    """Prefetch page-table entries for the shared-KV load task.
 
-    The schedule matches LoadTask's K/V cadence exactly so the page-offsets
-    ring and the SmemKv ring stay aligned.
+    A held native window is published once per CTA work item and retained
+    through the V tail. Other profiles mirror LoadTask's K/V cadence.
     """
     hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
@@ -1518,7 +1520,7 @@ def create_page_offsets_task_one_inst_qkv(
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
-    """Prefetch page-table entries for the one-inst keepsMmaAb QKV path."""
+    """Prefetch offsets for one-instance Keeps, using the configured producer warps."""
     hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def page_offsets_schedule_body(
@@ -1612,6 +1614,9 @@ def create_load_task_split_kv(
         raise ValueError("each split K resource requires its matching V resource")
     if smem_k0 is None and smem_k1 is None:
         raise ValueError("at least one split K/V instance is required")
+    hold_page_window = smem_page_offsets_v is None and _can_hold_native_page_window(
+        cfg, smem_page_offsets
+    )
 
     def load_schedule_body(
         smem_q: MemoryResource | None,
@@ -1681,19 +1686,26 @@ def create_load_task_split_kv(
             section: FmhaStage,
         ) -> None:
             """Acquire, load all head-dim stages, and release page offsets."""
-            _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
+            if not hold_page_window:
+                _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 resource.acquire()
                 getattr(resource, label)(
                     section=section, head_dim_stage_idx=head_dim_stage_idx
                 )
                 resource.commit()
-            _page_offsets_release(offsets)
+            if not hold_page_window:
+                _page_offsets_release(offsets)
 
         if smem_q is not None:
             smem_q.acquire()
             smem_q.tma_load()
             smem_q.commit()
+
+        if hold_page_window:
+            # Both instruction streams use the same immutable locator span.
+            # Keep its stage live across all K/V tiles, not one stage per load.
+            _page_offsets_consume(smem_page_offsets)
 
         head_routes = []
         for (
@@ -1752,6 +1764,8 @@ def create_load_task_split_kv(
                     smem_page_offsets_v_local,
                     FmhaStage.Tail,
                 )
+        if hold_page_window:
+            _page_offsets_release(smem_page_offsets)
 
     @_schedule_with_optional_resources
     def load_schedule(

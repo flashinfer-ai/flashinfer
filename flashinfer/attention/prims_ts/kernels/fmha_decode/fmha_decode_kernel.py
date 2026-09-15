@@ -34,6 +34,7 @@ import math
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
+from .direct_q1_metadata import DirectQ1MetadataView, HeadIndexedMetadataView
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
@@ -583,7 +584,14 @@ def _build_decode_gen_schedule(
         and cfg.num_insts_kv == 2
     )
     use_separate_kv_page_offset_resources = (
-        use_dense_page_offsets and use_per_inst_kv_resources and not use_one_inst_qkv
+        use_dense_page_offsets
+        and use_per_inst_kv_resources
+        and not use_one_inst_qkv
+        and not (
+            use_native_paged_kv
+            and cfg.uses_q_token_kv_block_sparse_page_route
+            and cfg.uses_held_encoded_locator_window
+        )
     )
     # Paired resources publish independent K0/K1 and V0/V1 stages. Shared
     # split-KV retains the aligned 32-ID representation for its optional
@@ -1705,7 +1713,19 @@ def _build_decode_gen_schedule(
                     }
                 )
         elif use_per_inst_kv_resources:
-            if smem_page_offsets_v is not None:
+            if (
+                smem_page_offsets_v is None
+                and smem_page_offsets.holds_encoded_locator_window
+            ):
+                # Independent K/V data FIFOs can still share a single
+                # read-only locator window until the last V tile is issued.
+                dma_consumer_release_labels.update(
+                    {
+                        (smem_page_offsets, resource): {"read_offsets"}
+                        for resource in (smem_k0, smem_k1, smem_v0, smem_v1)
+                    }
+                )
+            elif smem_page_offsets_v is not None:
                 dma_consumer_release_labels.update(
                     {
                         (smem_page_offsets, smem_k0): {"read_offsets_k0"},
@@ -2109,9 +2129,9 @@ def _run_decode_gen_active(
     g_h_k: Int32,
     g_scale_s_log2_e: Float32,
     g_output_scale: Float32,
-    g_seqlens_kv: cute.Pointer,
+    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
     g_cu_seqlens_q: cute.Pointer,
-    g_page_idx_kv: cute.Pointer,
+    g_page_idx_kv: cute.Pointer | DirectQ1MetadataView,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2448,9 +2468,9 @@ def _run_decode_gen_runtime_prefix(
     g_h_k: Int32,
     g_scale_s_log2_e: Float32,
     g_output_scale: Float32,
-    g_seqlens_kv: cute.Pointer,
+    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
     g_cu_seqlens_q: cute.Pointer,
-    g_page_idx_kv: cute.Pointer,
+    g_page_idx_kv: cute.Pointer | DirectQ1MetadataView,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2626,9 +2646,9 @@ def decode_gen_kernel(
     g_h_k: Int32,
     g_scale_s_log2_e: Float32,
     g_output_scale: Float32,
-    g_seqlens_kv: cute.Pointer,
+    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
     g_cu_seqlens_q: cute.Pointer,
-    g_page_idx_kv: cute.Pointer,
+    g_page_idx_kv: cute.Pointer | DirectQ1MetadataView,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2655,6 +2675,23 @@ def decode_gen_kernel(
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
+    if cutlass.const_expr(
+        cfg.use_q_token_kv_block_sparse_route and not cfg.shares_sparse_pattern
+    ):
+        if cutlass.const_expr(isinstance(g_page_idx_kv, DirectQ1MetadataView)):
+            g_page_idx_kv = g_page_idx_kv.with_head(h_k_idx)
+        else:
+            g_seqlens_kv = HeadIndexedMetadataView(g_seqlens_kv, g_h_k, h_k_idx)
+            g_page_idx_kv = g_page_idx_kv + Int64(h_k_idx) * g_page_table_stride
+            g_page_table_stride = g_page_table_stride * Int64(g_h_k)
+            g_q_token_kv_block_sparse_page_memberships = (
+                g_q_token_kv_block_sparse_page_memberships
+                + Int64(h_k_idx)
+                * Int64(g_q_token_kv_block_sparse_page_membership_stride)
+            )
+            g_q_token_kv_block_sparse_page_membership_stride = (
+                g_q_token_kv_block_sparse_page_membership_stride * g_h_k
+            )
     q_group_idx = q_group_cta_idx
     if cutlass.const_expr(cfg.use_split_kv):
         # Grid coordinates and scratch linearization retain configured fanout.
@@ -2823,10 +2860,10 @@ def fmha_decode_launch(
     k_iter: cute.Pointer,
     v_iter: cute.Pointer,
     o_iter: cute.Pointer,
-    seqlens_kv_iter: cute.Pointer,
+    seqlens_kv_iter: cute.Pointer | DirectQ1MetadataView,
     cu_seqlens_q_iter: cute.Pointer,
     total_q_tokens: Int32,
-    page_idx_kv_iter: cute.Pointer,
+    page_idx_kv_iter: cute.Pointer | DirectQ1MetadataView,
     q_token_kv_block_sparse_page_memberships_iter: cute.Pointer,
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,

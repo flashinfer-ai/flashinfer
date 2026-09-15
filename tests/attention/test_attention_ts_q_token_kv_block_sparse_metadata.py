@@ -55,6 +55,7 @@ def get_prims_ts_q_token_kv_block_sparse_workspace_size(
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
     sparse_block_size: int = 4,
+    split_kv: bool = True,
 ) -> int:
     """Adapt internal accuracy cases to the renamed public workspace API."""
 
@@ -68,6 +69,7 @@ def get_prims_ts_q_token_kv_block_sparse_workspace_size(
         qo_indptr=qo_indptr,
         seq_len_q=max_seq_len_q,
         kv_block_size=sparse_block_size,
+        split_kv=split_kv,
     )
 
 
@@ -88,6 +90,7 @@ def prims_ts_q_token_kv_block_sparse_attention(
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
     sparse_block_size: int = 4,
+    split_kv: bool = True,
 ) -> torch.Tensor:
     """Adapt internal accuracy cases to the renamed public eager API."""
 
@@ -107,6 +110,7 @@ def prims_ts_q_token_kv_block_sparse_attention(
         out=out,
         o_data_type=out_dtype,
         qo_indptr=qo_indptr,
+        split_kv=split_kv,
     )
 
 
@@ -153,6 +157,8 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "device",
         "workspace_buffer",
         "use_packed_q",
+        "split_kv",
+        "share_pattern_across_kv_heads",
         "mask_type",
         "q_data_type",
         "kv_data_type",
@@ -211,6 +217,7 @@ def test_q_token_kv_block_sparse_apis_require_static_max_seq_len_kv(
         # CUDA-graph padding is a separate route and cannot fill the final
         # partial route of the last real request.
         ((0, 5), 8, 4, (0, 4, 5, 8)),
+        ((0, 5, 8), 10, 3, (0, 3, 5, 8, 10)),
         # Query grouping is independent of sparse_block_size=4: Q5/MTP4
         # partitions eighty fixed-width rows into sixteen routes.
         ((0, 80), 80, 5, tuple(range(0, 81, 5))),
@@ -299,11 +306,11 @@ def test_q_token_kv_block_sparse_block_size_must_be_integer(
         )
 
 
-@pytest.mark.parametrize("sparse_block_size", (1, 2, 8, 16))
-def test_q_token_kv_block_sparse_other_power_of_two_sparse_block_sizes_are_not_implemented(
+@pytest.mark.parametrize("sparse_block_size", (1, 2, 256))
+def test_q_token_kv_block_sparse_unsupported_power_of_two_block_sizes(
     sparse_block_size: int,
 ) -> None:
-    with pytest.raises(NotImplementedError, match="only sparse_block_size=4"):
+    with pytest.raises(NotImplementedError, match="sparse_block_size must be"):
         get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes(
             4,
             8,
@@ -400,12 +407,22 @@ def test_unified_q_token_kv_block_sparse_workspace_8k_q_128k_kv_owns_metadata_ou
         device="cuda",
         num_query_groups=2048,
         use_packed_q=True,
+        split_kv=False,
     )
 
-    assert layout.q_token_kv_block_sparse_page_indices_shape == (2048, 4 * 513)
-    assert layout.q_token_kv_block_sparse_page_indices_bytes == 16_809_984
-    assert layout.q_token_kv_block_sparse_page_memberships_shape == (2048, 513)
-    assert layout.q_token_kv_block_sparse_page_memberships_bytes == 4_202_496
+    # The 128K physical cache reservation is not the per-request model bound.
+    page_capacity = min(4 * 513, 8192 // 4)
+    membership_words = (page_capacity + 3) // 4
+    assert layout.q_token_kv_block_sparse_page_indices_shape == (2048, page_capacity)
+    assert layout.q_token_kv_block_sparse_page_indices_bytes == 2048 * page_capacity * 4
+    assert layout.q_token_kv_block_sparse_page_memberships_shape == (
+        2048,
+        membership_words,
+    )
+    assert (
+        layout.q_token_kv_block_sparse_page_memberships_bytes
+        == 2048 * membership_words * 4
+    )
     assert not layout.uses_split_kv
     assert layout.total_bytes == (
         layout.attention_workspace_byte_offset + layout.attention_scratch_bytes
@@ -413,15 +430,21 @@ def test_unified_q_token_kv_block_sparse_workspace_8k_q_128k_kv_owns_metadata_ou
 
     workspace = torch.empty(layout.total_bytes, dtype=torch.uint8, device="cuda")
     views = layout.bind(workspace)
-    assert views.q_token_kv_block_sparse_page_indices.shape == (2048, 4 * 513)
+    assert views.q_token_kv_block_sparse_page_indices.shape == (2048, page_capacity)
     assert views.q_token_kv_block_sparse_page_indices.data_ptr() == workspace.data_ptr()
-    assert views.q_token_kv_block_sparse_page_indices.numel() == 8192 * 513
-    assert views.q_token_kv_block_sparse_page_memberships.shape == (2048, 513)
+    assert views.q_token_kv_block_sparse_page_indices.numel() == 2048 * page_capacity
+    assert views.q_token_kv_block_sparse_page_memberships.shape == (
+        2048,
+        membership_words,
+    )
     assert views.q_token_kv_block_sparse_page_memberships.data_ptr() == (
         workspace.data_ptr()
         + layout.q_token_kv_block_sparse_page_memberships_byte_offset
     )
-    assert views.q_token_kv_block_sparse_page_memberships.numel() == 2048 * 513
+    assert (
+        views.q_token_kv_block_sparse_page_memberships.numel()
+        == 2048 * membership_words
+    )
     assert views.seq_lens.numel() == 2048
     assert views.seq_lens.data_ptr() == (
         workspace.data_ptr() + layout.seq_lens_byte_offset
@@ -531,11 +554,11 @@ def test_fixed_q_token_kv_block_sparse_workspace_size_rejects_packed_route_bound
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("use_packed_q", (False, True))
-def test_q_token_kv_block_sparse_workspace_size_enforces_q64_group_capacity(
+def test_q_token_kv_block_sparse_workspace_size_enforces_q128_group_capacity(
     use_packed_q: bool,
 ) -> None:
-    group_size = 5
-    num_qo_heads = 16
+    group_size = 8
+    num_qo_heads = 24
     if use_packed_q:
         query = torch.empty(
             (group_size, num_qo_heads, 256),
@@ -556,7 +579,7 @@ def test_q_token_kv_block_sparse_workspace_size_enforces_q64_group_capacity(
     k_cache = torch.empty((64, 1, 16, 256), dtype=torch.bfloat16, device="cuda")
     block_table = torch.empty((1, 64), dtype=torch.int32, device="cuda")
 
-    with pytest.raises(ValueError, match="TileQ64/head capacity"):
+    with pytest.raises(ValueError, match="TileQ128/head capacity"):
         get_prims_ts_q_token_kv_block_sparse_workspace_size(
             query,
             k_cache,
@@ -673,10 +696,9 @@ def _reference(
             physical_page = int(table[request, storage_page].item())
             locator = physical_page * subpages_per_storage_page + token_offset // 4
             q_token_kv_block_sparse_page_indices[group, rank] = locator
-            membership_word = rank // 4
-            membership_shift = (rank % 4) * 8
-            q_token_kv_block_sparse_page_memberships[group, membership_word] |= (
-                membership << membership_shift
+            # Assign bytes directly: Q8 can set the sign bit of an Int32 word.
+            q_token_kv_block_sparse_page_memberships.view(torch.uint8)[group, rank] = (
+                membership
             )
         last_tail = (int(positions[group_end - 1].item()) + 1) % 4
         tail_padding = 0 if last_tail == 0 else 4 - last_tail
@@ -743,6 +765,243 @@ def _make_case(group_size: int, block_topk: int, storage_page_size: int = 16):
         groups * table_width, dtype=torch.int32, device="cuda"
     ).reshape(groups, table_width)
     return blocks, block_table, requests, positions, storage_page_size
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("packed", (False, True))
+@pytest.mark.parametrize("position_dtype", (torch.int32, torch.int64))
+@pytest.mark.parametrize("page_size", (16, 784))
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_direct_q1_metadata_views_match_materialized_graph_replay(
+    packed: bool, position_dtype: torch.dtype, page_size: int
+) -> None:
+    """Lazy views preserve causal-prefix, tail, strided-input and inert-row semantics."""
+    import cutlass
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda_drv
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.direct_q1_metadata import (
+        DirectQ1MetadataView,
+    )
+
+    rows, topk, model_len = 24, 512, 8192
+    capacity = topk + 1
+    torch.manual_seed(1879)
+    blocks = torch.randint(0, 2048, (rows, topk * 2), device="cuda", dtype=torch.int32)[
+        :, :topk
+    ]
+    blocks[:, 0] = -1
+    blocks[:, 1] = 2048
+    width = (model_len + page_size - 1) // page_size
+    table = torch.arange(4 * width, device="cuda", dtype=torch.int32).reshape(
+        2, width * 2
+    )[:, :width]
+    table[0, 0] = -1
+    requests = torch.arange(rows, device="cuda", dtype=torch.int32) % 2
+    requests[-2:] = torch.tensor([-1, 2], device="cuda", dtype=torch.int32)
+    positions = torch.tensor(
+        [-1, 0, 1, 2, 3, 7, 2050, 8191, 8192, torch.iinfo(position_dtype).max] * 2
+        + [100, 101, 102, 103],
+        device="cuda",
+        dtype=position_dtype,
+    )
+    offsets = torch.arange(rows + 1, device="cuda", dtype=torch.int32)
+    if packed:
+        offsets[1] = 0  # Empty route followed by an oversized G1 route.
+        offsets[4] = -1
+        offsets[-1] = rows + 1
+    inputs = (blocks, table, requests, positions)
+    actual_pages = torch.empty((rows, capacity), device="cuda", dtype=torch.int32)
+    actual_lengths = torch.empty(rows, device="cuda", dtype=torch.int32)
+
+    @cute.kernel
+    def materialize(pages, lengths, output, seq):
+        route = cute.arch.block_idx()[0]
+        lane = cute.arch.thread_idx()[0]
+        if lane == 0:
+            seq[route] = lengths[route]
+        for slot in cutlass.range(lane, capacity, 128):
+            output[route, slot] = pages[cutlass.Int64(route) * capacity + slot]
+
+    @cute.jit
+    def launch(raw, qo, output, seq, stream):
+        pages = DirectQ1MetadataView(
+            raw,
+            qo,
+            packed=packed,
+            model_len=model_len,
+            page_size=page_size,
+            page_capacity=capacity,
+            lengths=False,
+        )
+        lengths = DirectQ1MetadataView(
+            raw,
+            qo,
+            packed=packed,
+            model_len=model_len,
+            page_size=page_size,
+            page_capacity=capacity,
+            lengths=True,
+        )
+        materialize(pages, lengths, output, seq).launch(
+            grid=(rows, 1, 1), block=(128, 1, 1), stream=stream
+        )
+
+    args = (
+        tuple(cute.runtime.from_dlpack(t) for t in inputs),
+        cute.runtime.from_dlpack(offsets),
+        cute.runtime.from_dlpack(actual_pages),
+        cute.runtime.from_dlpack(actual_lengths),
+    )
+    compiled = cute.compile(
+        launch, *args, cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
+    compiled(*args, cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(*args, cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream))
+    for replay in range(3):
+        if replay:
+            positions[:8].add_(1)
+            blocks[:, 2:10].fill_(replay)
+        graph.replay()
+        expected = build_prims_ts_q_token_kv_block_sparse_metadata(
+            *inputs,
+            group_size=1,
+            storage_page_size=page_size,
+            max_seq_len_kv=model_len,
+            qo_indptr=offsets if packed else None,
+        )
+        torch.testing.assert_close(actual_pages, expected[0])
+        torch.testing.assert_close(actual_lengths, expected[2])
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_q1_short_page_window_and_causal_tail_graph(dtype):
+    """Short causal prefixes and tails stay valid with multiple page-staging warps."""
+    torch.manual_seed(2831)
+    query = (torch.randn((1, 1, 1, 12, 256), device="cuda") * 0.25).to(dtype)
+    k = (torch.randn((1, 1, 16, 256), device="cuda") * 0.25).to(dtype)
+    v = (torch.randn((1, 1, 16, 256), device="cuda") * 0.25).to(dtype)
+    table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    blocks = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    requests = torch.zeros(1, device="cuda", dtype=torch.int32)
+    positions = torch.zeros(1, device="cuda", dtype=torch.int64)
+    out = torch.empty(query.shape, device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(
+        get_prims_ts_q_token_kv_block_sparse_workspace_size(
+            query, k, table, block_topk=1, max_seq_len_kv=16, out_dtype=out.dtype
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    plan = prepare_prims_ts_q_token_kv_block_sparse_attention(
+        query,
+        (k, v),
+        blocks,
+        table,
+        requests,
+        positions,
+        workspace,
+        out=out,
+        max_seq_len_kv=16,
+    )
+
+    def run():
+        plan.run(query, blocks, table, requests, positions, out=out)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for visible in (1, 2, 3, 4, 5, 7, 8, 1):
+        positions.fill_(visible - 1)
+        out.fill_(torch.nan)
+        graph.replay()
+        selected = list(range(min(visible // 4, 1) * 4))
+        selected += list(range((visible // 4) * 4, visible))
+        indices = torch.tensor(selected, device="cuda", dtype=torch.int64)
+        keys = k[0, 0].float()[indices]
+        values = v[0, 0].float()[indices]
+        expected = (
+            torch.softmax(query[0, 0, 0].float() @ keys.T * 256**-0.5, dim=-1) @ values
+        )
+        torch.testing.assert_close(out[0, 0, 0].float(), expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_q1_page_prefetch_does_not_read_uninitialized_suffix(dtype):
+    """Replay growing prefixes across two producer warps and a strided row boundary."""
+    torch.manual_seed(7193)
+    rows, topk, page_size, context, dim = 2, 65, 16, 272, 256
+    query = (torch.randn(rows, 1, 1, 12, dim, device="cuda") * 0.25).to(dtype)
+    cache_shape = (rows * context // page_size, 1, page_size, dim)
+    k = (torch.randn(cache_shape, device="cuda") * 0.25).to(dtype)
+    v = (torch.randn(cache_shape, device="cuda") * 0.25).to(dtype)
+    table = torch.randperm(cache_shape[0], device="cuda", dtype=torch.int32).reshape(
+        rows, -1
+    )
+    # Non-16-byte row pitch; only the causal prefix will ever be initialized.
+    blocks = torch.empty(rows, topk + 1, device="cuda", dtype=torch.int32)[:, :topk]
+    requests = torch.arange(rows, device="cuda", dtype=torch.int32)
+    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
+    out = torch.empty_like(query, dtype=torch.bfloat16)
+    workspace = torch.empty(
+        get_prims_ts_q_token_kv_block_sparse_workspace_size(
+            query,
+            k,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            out_dtype=out.dtype,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    plan = prepare_prims_ts_q_token_kv_block_sparse_attention(
+        query,
+        (k, v),
+        blocks,
+        table,
+        requests,
+        positions,
+        workspace,
+        max_seq_len_kv=context,
+        out=out,
+    )
+
+    def run():
+        plan.run(query, blocks, table, requests, positions, out=out)
+
+    # A tail-only route must not touch the initially uninitialized raw array.
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for visible in (1, 3, 4, 127, 128, 129, 255, 256, 259, 260, 263, 5):
+        for row in range(rows):
+            length = max(1, visible - row)
+            count = min(length // 4, topk)
+            blocks[row, :count].copy_(
+                torch.arange(count, device="cuda", dtype=torch.int32)
+            )
+            positions[row] = length - 1
+        out.fill_(torch.nan)
+        graph.replay()
+        for row in range(rows):
+            length = max(1, visible - row)
+            keys = k[table[row].long(), 0].reshape(-1, dim)[:length].float()
+            values = v[table[row].long(), 0].reshape(-1, dim)[:length].float()
+            expected = (
+                torch.softmax(query[row, 0, 0].float() @ keys.T * dim**-0.5, dim=-1)
+                @ values
+            )
+            torch.testing.assert_close(
+                out[row, 0, 0].float(), expected, rtol=0.02, atol=0.02
+            )
 
 
 def _make_sort_union_case(group_size: int, packed: bool):
@@ -841,7 +1100,7 @@ def _make_wide_sort_union_case(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("group_size", (2, 4, 5))
+@pytest.mark.parametrize("group_size", (2, 3, 4, 5, 6, 7, 8))
 @pytest.mark.parametrize("packed", (False, True))
 @pytest.mark.parametrize("max_seq_len_kv", (8192, 9600))
 def test_q_token_kv_block_sparse_sort_union_matches_reference(
@@ -896,8 +1155,11 @@ def test_q_token_kv_block_sparse_sort_union_matches_reference(
     (
         (4, False, 16_385),
         (2, False, 32 * 1024),
+        (3, True, 128 * 1024),
         (4, True, 64 * 1024),
         (5, False, 128 * 1024),
+        (8, False, 128 * 1024),
+        (8, True, 128 * 1024),
     ),
 )
 def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
@@ -1012,7 +1274,9 @@ def test_q_token_kv_block_sparse_sort_union_emits_partial_causal_tail() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(("group_size", "packed"), ((4, True), (5, False)))
+@pytest.mark.parametrize(
+    ("group_size", "packed"), ((3, False), (3, True), (4, True), (5, False))
+)
 def test_q_token_kv_block_sparse_sort_union_graph_replay_is_exact(
     group_size: int,
     packed: bool,
@@ -1678,12 +1942,15 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     calls: dict[str, object] = {}
 
     class FakeAttentionPlan:
+        _direct_q1_inputs = ()
+
         def _run_unchecked(
             self,
             actual_query: torch.Tensor,
             out: torch.Tensor,
             scale_qk: float,
             scale_v: float,
+            direct_q1_inputs=None,
         ) -> torch.Tensor:
             expected_query = _as_lower_level_decode_view(query)
             expected_output = _as_lower_level_decode_view(output)
@@ -1825,12 +2092,15 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
     calls: dict[str, torch.Tensor] = {}
 
     class FakeAttentionPlan:
+        _direct_q1_inputs = ()
+
         def _run_unchecked(
             self,
             actual_query: torch.Tensor,
             out: torch.Tensor,
             scale_qk: float,
             scale_v: float,
+            direct_q1_inputs=None,
         ) -> torch.Tensor:
             expected_shape = (
                 (batch_size, 12, 256)
@@ -1924,12 +2194,15 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     calls: dict[str, bool] = {}
 
     class FakeAttentionPlan:
+        _direct_q1_inputs = ()
+
         def _run_unchecked(
             self,
             actual_query: torch.Tensor,
             actual_output: torch.Tensor,
             _scale_qk: float,
             _scale_v: float,
+            direct_q1_inputs=None,
         ) -> torch.Tensor:
             expected_shape = (
                 (2, 12, 256) if group_size == 1 else (2, group_size, 12, 256)
@@ -1988,7 +2261,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("group_size", (1, 2, 4, 5))
+@pytest.mark.parametrize("group_size", (1, 2, 3, 4, 5, 6, 7, 8))
 def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
     group_size: int,
 ) -> None:
@@ -2058,21 +2331,11 @@ def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-def test_q_token_kv_block_sparse_fixed_decode_supports_suggested_padded_final_route() -> (
-    None
-):
-    """Automatic Q2 may pad SQ3 with one disposable semantic row."""
-
-    seq_len_q = 3
-    group_size = suggest_prims_ts_q_token_kv_block_sparse_group_size(
-        batch_size=1,
-        seq_len_q=seq_len_q,
-        selected_seq_len_kv=2051,
-        num_qo_heads=12,
-        num_kv_heads=1,
-        multi_processor_count=1,
-    )
-    assert group_size == 2
+@pytest.mark.parametrize(("seq_len_q", "group_size"), ((3, 2), (5, 3)))
+def test_q_token_kv_block_sparse_fixed_decode_supports_padded_final_route(
+    seq_len_q: int, group_size: int
+) -> None:
+    """Caller-selected G may pad a shorter final route with semantic dummy rows."""
     live_rows = seq_len_q
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     rows = math.ceil(seq_len_q / group_size) * group_size
@@ -2301,12 +2564,15 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     calls: dict[str, object] = {}
 
     class FakeAttentionPlan:
+        _direct_q1_inputs = ()
+
         def _run_unchecked(
             self,
             actual_query: torch.Tensor,
             actual_output: torch.Tensor,
             scale_qk: float,
             scale_v: float,
+            direct_q1_inputs=None,
         ) -> torch.Tensor:
             expected_query = _as_lower_level_decode_view(query)
             assert actual_query.shape == expected_query.shape
@@ -2667,9 +2933,9 @@ def test_prepared_q_token_kv_block_sparse_plan_replays_without_counter_reset(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_and_graph() -> (
-    None
-):
+def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_and_graph(
+    monkeypatch,
+) -> None:
     """Exercise the production low-grid Q1 policy and its PDL reducer."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
@@ -2822,6 +3088,11 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     )
     torch.cuda.synchronize()
 
+    def unexpected_metadata(*args, **kwargs):
+        raise AssertionError("G1 must not launch a separate metadata kernel")
+
+    monkeypatch.setattr(type(plan._metadata_plan), "run", unexpected_metadata)
+
     def reference_for_context(visible_tokens: int) -> torch.Tensor:
         reference = torch.empty_like(query, dtype=torch.float32)
         scale = head_dim**-0.5
@@ -2870,11 +3141,14 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("rows", (1, 2))
-def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(rows: int) -> None:
+@pytest.mark.parametrize("num_kv_heads", (1, 2))
+def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(
+    rows: int, num_kv_heads: int
+) -> None:
     """Cover tiny fixed Q1 decode graph buckets."""
 
     block_topk = 512
-    num_qo_heads = 12
+    num_qo_heads = 12 * num_kv_heads
     head_dim = 256
     storage_page_size = 1600
     blocks, table, requests, positions, _ = _make_case(1, block_topk, storage_page_size)
@@ -2896,7 +3170,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(rows: int) -> 
     k_cache = (
         torch.randn(
             int(table.max().item()) + 1,
-            1,
+            num_kv_heads,
             storage_page_size,
             head_dim,
             dtype=torch.bfloat16,
@@ -2956,6 +3230,27 @@ def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(rows: int) -> 
     torch.cuda.synchronize()
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+
+    # Move through S16's full, partial and short active prefixes without
+    # recapture. A separately computed FP32 result guards against stale
+    # partials, counters, and tail locators when the captured fanout is fixed.
+    for visible in (2051, 259, 2048):
+        positions.fill_(visible - 1)
+        blocks.copy_(torch.arange(block_topk, device="cuda", dtype=torch.int32))
+        output.fill_(torch.nan)
+        graph.replay()
+        expected = torch.empty_like(output, dtype=torch.float32)
+        for row in range(rows):
+            pages = table[row].long()
+            for head in range(num_kv_heads):
+                head_slice = slice(head * 12, (head + 1) * 12)
+                k = k_cache[pages, head].reshape(-1, head_dim)[:visible].float()
+                v = v_cache[pages, head].reshape(-1, head_dim)[:visible].float()
+                q = query[row, 0, 0, head_slice].float()
+                expected[row, 0, 0, head_slice] = (
+                    torch.softmax(q @ k.T * head_dim**-0.5, dim=-1) @ v
+                )
+        torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.02)
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
@@ -3273,7 +3568,15 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
             unified_views.q_token_kv_block_sparse_page_memberships,
             unified_views.seq_lens,
         ),
-        raw_metadata,
+        (
+            raw_metadata[0][
+                :, : unified_views.q_token_kv_block_sparse_page_indices.shape[1]
+            ],
+            raw_metadata[1][
+                :, : unified_views.q_token_kv_block_sparse_page_memberships.shape[1]
+            ],
+            raw_metadata[2],
+        ),
     )
     torch.testing.assert_close(
         _as_lower_level_decode_view(unified_output),
@@ -3366,21 +3669,36 @@ def test_q_token_kv_block_sparse_metadata_matches_reference(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_reference() -> (
-    None
-):
-    """Decode page-four routes without observing poisoned metadata padding."""
+@pytest.mark.parametrize(
+    ("group_size", "num_qo_heads"),
+    (
+        (4, 12),
+        (6, 12),
+        (7, 12),
+        (8, 12),
+        pytest.param(3, 2, id="g3-tileq8"),
+        pytest.param(3, 4, id="g3-tileq16"),
+        pytest.param(3, 6, id="g3-tileq32"),
+        pytest.param(3, 12, id="g3-tileq64"),
+        pytest.param(3, 32, id="g3-tileq128"),
+    ),
+)
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_reference(
+    group_size: int, num_qo_heads: int, dtype: torch.dtype
+) -> None:
+    """Check both score-row halves, all membership bits, and causal tails."""
 
-    group_size = 4
-    block_topk = 8
-    num_qo_heads = 12
+    block_topk = 64
     head_dim = 256
-    positions = torch.arange(31, 35, dtype=torch.int64, device="cuda")
+    positions = torch.arange(1023, 1023 + group_size, dtype=torch.int64, device="cuda")
     requests = torch.zeros(group_size, dtype=torch.int32, device="cuda")
     blocks = torch.arange(block_topk, dtype=torch.int32, device="cuda").repeat(
         group_size, 1
     )
-    table = torch.arange(64, dtype=torch.int32, device="cuda").unsqueeze(0)
+    # Each query owns a distinct selected page, including q7's 0x80 membership.
+    blocks[:, -1] = torch.arange(64, 64 + group_size, dtype=torch.int32, device="cuda")
+    table = torch.arange(384, dtype=torch.int32, device="cuda").unsqueeze(0)
     torch.manual_seed(9527)
     query = torch.randn(
         1,
@@ -3390,10 +3708,14 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
         head_dim,
         dtype=torch.bfloat16,
         device="cuda",
+    ).to(dtype)
+    k_cache = torch.randn(384, 1, 4, head_dim, dtype=torch.bfloat16, device="cuda").to(
+        dtype
     )
-    k_cache = torch.randn(64, 1, 4, head_dim, dtype=torch.bfloat16, device="cuda")
-    v_cache = torch.randn_like(k_cache)
-    output = torch.empty_like(query)
+    v_cache = torch.randn(384, 1, 4, head_dim, dtype=torch.bfloat16, device="cuda").to(
+        dtype
+    )
+    output = torch.empty_like(query, dtype=torch.bfloat16)
     # Poison metadata padding so the consumer cannot accidentally interpret
     # unspecified bytes beyond the live membership prefix as valid pages.
     workspace = torch.full(
@@ -3404,6 +3726,7 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
                 table,
                 block_topk=block_topk,
                 max_seq_len_kv=table.shape[1] * k_cache.shape[2],
+                out_dtype=output.dtype,
             ),
         ),
         0xFF,
@@ -3425,8 +3748,9 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     for query_idx, position in enumerate(positions.tolist()):
         visible_tokens = position + 1
         full_pages = min(visible_tokens // 4, block_topk)
-        token_chunks = [k_cache[page, 0].float() for page in range(full_pages)]
-        value_chunks = [v_cache[page, 0].float() for page in range(full_pages)]
+        pages = blocks[query_idx, :full_pages].tolist()
+        token_chunks = [k_cache[page, 0].float() for page in pages]
+        value_chunks = [v_cache[page, 0].float() for page in pages]
         tail_tokens = visible_tokens % 4
         if tail_tokens:
             tail_page = visible_tokens // 4
@@ -3441,7 +3765,10 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
         probability = torch.softmax(scores, dim=-1)
         reference[0, 0, query_idx] = torch.einsum("ht,thd->hd", probability, values)
 
-    torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=1e-2)
+    tolerance = 5e-2 if dtype == torch.float8_e4m3fn else 2e-2
+    torch.testing.assert_close(
+        output.float(), reference, rtol=tolerance, atol=tolerance
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -3499,7 +3826,7 @@ def test_packed_q_token_kv_block_sparse_metadata_handles_partial_request_groups(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("group_size", (1, 2, 4, 5))
+@pytest.mark.parametrize("group_size", (1, 2, 3, 4, 5, 8))
 def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
     group_size: int,
 ) -> None:
@@ -3527,7 +3854,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
         [torch.roll(base_blocks, row % 3) for row in range(rows)]
     ).contiguous()
     table = torch.arange(2 * 129, dtype=torch.int32, device="cuda").reshape(2, 129)
-    if group_size == 5:
+    if group_size in (3, 5):
         from flashinfer.attention.prims_ts import decode as decode_module
 
         decode_module._resolve_decode_launch_spec.cache_clear()
@@ -3551,9 +3878,9 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
             True,
             True,
         )
-        # Two packed route rows fit in one wave, so this case qualifies the
-        # metadata acquire without introducing a split-reduction dependency.
-        assert split_spec.config.splits_kv == 1
+        # These packed routes fit in one wave, so this case qualifies the
+        # metadata acquire with the now layout-independent split selection.
+        assert split_spec.config.use_variable_seqlens_q
         assert split_spec.config.use_pdl
     # Zero Q/K makes softmax exactly uniform. Comparing the grouped result to
     # Q1 then checks route membership and packed output placement without
@@ -3674,7 +4001,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
     torch.cuda.synchronize()
     torch.testing.assert_close(prepared_output, packed_output, rtol=0, atol=0)
 
-    if group_size == 5:
+    if group_size in (3, 5):
         original_positions = positions.clone()
         original_q1_output = q1_output.clone()
         positions.copy_(
@@ -3792,7 +4119,7 @@ def test_q1_graph_replay_overwrites_newly_live_page_indices() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("group_size", (4, 5))
+@pytest.mark.parametrize("group_size", (3, 4, 5))
 def test_grouped_metadata_cuda_graph_reloads_inputs(group_size: int) -> None:
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     long_positions = positions.clone()

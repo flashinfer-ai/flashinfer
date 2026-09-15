@@ -145,6 +145,11 @@
       "shape": null,
       "dtype": "dtype",
       "optional": true
+    },
+    "split_kv": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
     }
   },
   "outputs": {
