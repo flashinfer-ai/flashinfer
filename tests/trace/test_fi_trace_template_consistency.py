@@ -1286,7 +1286,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
             None,
         ),
         ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens),
-        ({**fmha_base, "split_kv": False}, seq_lens),
+        ({**fmha_base, "policy": (("split_kv_allowed", False),)}, seq_lens),
     )
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_definitions = []

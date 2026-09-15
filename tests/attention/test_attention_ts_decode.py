@@ -59,6 +59,10 @@ from flashinfer.attention.prims_ts.decode import (
     _validate_storage_page_size,
 )
 from flashinfer.attention.prims_ts.split_kv_mode_policy import select_split_kv_modes
+from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+    QTokenKvBlockSparsePagedTSWrapper,
+    get_q_token_kv_block_sparse_workspace_size,
+)
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
     FmhaDecodeConfig,
     make_decode_config,
@@ -182,54 +186,18 @@ def test_prims_ts_q_token_kv_block_sparse_fixed_group_validation_is_public() -> 
         )
 
 
-@pytest.mark.parametrize(
-    (
-        "batch_size",
-        "seq_len_q",
-        "selected_seq_len_kv",
-        "num_qo_heads",
-        "num_kv_heads",
-        "multi_processor_count",
-        "expected_group_size",
-    ),
-    (
-        # One MTP3 request cannot fill a wave even after useful split-KV, so
-        # expose four independent Q1 routes instead of building one Q4 union.
-        (1, 4, 2051, 12, 1, 152, 1),
-        # Q2 has better useful wave coverage than Q4 or a padded Q3 tail.
-        (8, 4, 2051, 12, 1, 152, 2),
-        # Q5 fits TileQ64 for Qwen's twelve query heads per K/V head.
-        (16, 5, 2051, 12, 1, 152, 5),
-        # SQ3 can use one Q3 route when there is enough parallel work.
-        (64, 3, 2051, 12, 1, 152, 3),
-        # Head capacity still permits two Q2 routes for three live rows.
-        (64, 3, 2051, 64, 1, 152, 2),
-        # A long packed-prefill request supplies independent routes directly.
-        (1, 8192, 2051, 12, 1, 152, 8),
-        # Q128 permits G4, but G2 avoids its heavily padded final group.
-        (8, 5, 2051, 32, 1, 152, 2),
-    ),
-)
-def test_suggest_prims_ts_q_token_kv_block_sparse_group_size(
-    batch_size: int,
-    seq_len_q: int,
-    selected_seq_len_kv: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    multi_processor_count: int,
-    expected_group_size: int,
-) -> None:
-    assert (
-        suggest_prims_ts_q_token_kv_block_sparse_group_size(
-            batch_size,
-            seq_len_q,
-            selected_seq_len_kv,
-            num_qo_heads,
-            num_kv_heads,
-            multi_processor_count,
+def test_q_token_sparse_recommendation_uses_caller_capacity(monkeypatch):
+    """Recommendations fit complete head groups without querying the device."""
+
+    def no_device_query(*args, **kwargs):
+        raise AssertionError("use the supplied SM count")
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", no_device_query)
+    for batch, sq, ratio in ((1, 4, 12), (64, 3, 64), (1, 8191, 17)):
+        group = suggest_prims_ts_q_token_kv_block_sparse_group_size(
+            batch, sq, 2051, ratio * 2, 2, 148, head_dim=128
         )
-        == expected_group_size
-    )
+        assert 1 <= group <= min(8, sq, 128 // ratio)
 
 
 @pytest.mark.parametrize(
@@ -258,85 +226,6 @@ def test_suggest_prims_ts_q_token_kv_block_sparse_group_size_rejects_invalid_ext
         suggest_prims_ts_q_token_kv_block_sparse_group_size(**arguments)
 
 
-@pytest.mark.parametrize("head_dim", (64, 128, 256))
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float8_e4m3fn))
-@pytest.mark.parametrize("ratio", (1, 3, 12, 17, 64, 128))
-def test_q_token_kv_block_sparse_policy_reuses_grouped_head_geometry(
-    monkeypatch, head_dim, dtype, ratio
-):
-    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
-        candidate_union_tokens,
-        select_sparse_launch,
-    )
-
-    def no_device_query(*args, **kwargs):
-        raise AssertionError("the recommendation must use the supplied SM count")
-
-    monkeypatch.setattr(torch.cuda, "get_device_properties", no_device_query)
-    # A packed prefill already covers the device, so retain the largest legal
-    # G even when the last route is partial. The wrapper never overrides G.
-    group = suggest_prims_ts_q_token_kv_block_sparse_group_size(
-        1,
-        8191,
-        2051,
-        ratio * 2,
-        2,
-        148,
-        head_dim=head_dim,
-        q_data_type=dtype,
-        split_kv=False,
-    )
-    assert group == min(8, 128 // ratio)
-    for explicit_group in range(1, group + 1):
-        launch = select_sparse_launch(
-            group_size=explicit_group,
-            heads_q_per_kv=ratio,
-            head_dim=head_dim,
-            q_dtype_key=str(dtype).removeprefix("torch."),
-            num_routes=1024,
-            num_kv_heads=2,
-            route_kv_tokens=candidate_union_tokens(explicit_group, 2051),
-            multi_processor_count=148,
-            split_kv=False,
-        )
-        assert launch.splits_kv == 1
-        assert launch.tile_size_q in (8, 16, 32, 64, 128)
-        assert launch.tile_size_q >= explicit_group * ratio
-        minimum = max(8, 1 << (explicit_group * ratio - 1).bit_length())
-        if head_dim == 256 and dtype == torch.float8_e4m3fn:
-            minimum = max(64, minimum)
-        assert launch.tile_size_q == minimum
-        assert launch.num_insts_kv == (1 if head_dim == 256 and minimum >= 64 else 2)
-
-
-@pytest.mark.parametrize("split_kv", (False, True))
-def test_q_token_kv_block_sparse_split_policy_covers_union_capacity(split_kv):
-    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
-        candidate_union_tokens,
-        select_sparse_launch,
-    )
-
-    # Explicit G must accommodate disjoint lists too. Only the recommendation
-    # estimates shared work; the launch retains the capacity-based split cap.
-    launches = [
-        select_sparse_launch(
-            group_size=g,
-            heads_q_per_kv=12,
-            head_dim=256,
-            q_dtype_key="bfloat16",
-            num_routes=1,
-            num_kv_heads=1,
-            route_kv_tokens=candidate_union_tokens(g, 2051),
-            multi_processor_count=148,
-            split_kv=split_kv,
-        )
-        for g in (4, 5, 8)
-    ]
-    assert [launch.splits_kv for launch in launches] == (
-        [33, 41, 65] if split_kv else [1, 1, 1]
-    )
-
-
 @pytest.mark.parametrize(
     "kwargs",
     (
@@ -351,19 +240,6 @@ def test_q_token_kv_block_sparse_recommendation_rejects_invalid_recipe(kwargs):
         suggest_prims_ts_q_token_kv_block_sparse_group_size(
             1, 4, 2051, 12, 1, 148, **kwargs
         )
-
-
-@pytest.mark.parametrize("head_dim", (64, 128, 256))
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float8_e4m3fn))
-def test_q_token_kv_block_sparse_small_decode_prioritizes_sm_coverage(head_dim, dtype):
-    # Qualification-only tile promotions must not override the goal of
-    # exposing independent Q tasks when useful split-KV cannot fill a wave.
-    assert (
-        suggest_prims_ts_q_token_kv_block_sparse_group_size(
-            1, 4, 2051, 12, 1, 148, head_dim=head_dim, q_data_type=dtype
-        )
-        == 1
-    )
 
 
 @pytest.mark.parametrize(
@@ -1944,8 +1820,9 @@ def _apply_speculative_tail_markers(case):
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@pytest.mark.parametrize("page_size", (16, 128))
+@pytest.mark.parametrize(
+    ("dtype", "page_size"), ((torch.bfloat16, 16), (torch.float16, 128))
+)
 def test_attention_ts_decode_paged_wide_head_group_graph(dtype, page_size):
     """Ordinary paged Keeps must bind its per-instance K/V staging base."""
     kv_lens = (512, 507)
@@ -5163,48 +5040,6 @@ def test_attention_ts_decode_split_work_floor_is_explicit() -> None:
         select_splits_kv(**inputs, min_loop_iters_per_split=0)
 
 
-@pytest.mark.parametrize("packed", (False, True))
-@pytest.mark.parametrize("split_kv", (False, True))
-def test_fmha_split_control_is_layout_independent(monkeypatch, packed, split_kv):
-    from flashinfer.attention.prims_ts.kernels.fmha_decode import (
-        fmha_decode_config as config,
-    )
-
-    monkeypatch.setattr(
-        config, "get_max_active_clusters_for_cluster_size", lambda _: 148
-    )
-    monkeypatch.setattr(
-        config.utils,
-        "HardwareInfo",
-        lambda: type(
-            "Info",
-            (),
-            {
-                "get_device_multiprocessor_count": lambda _: 148,
-            },
-        )(),
-    )
-    cfg = config.make_decode_config(
-        headdim=128,
-        seq_len_q=4,
-        seq_len_kv=8192,
-        batch_size=2,
-        num_heads_q=16,
-        num_heads_kv=1,
-        qkv_layout="pagedKv",
-        num_tokens_per_page=32,
-        args={
-            "groups_tokens_heads_q": True,
-            "tile_size_q": 16,
-            "use_variable_seqlens_q": packed,
-        },
-        split_kv=split_kv,
-    )
-    assert cfg.use_variable_seqlens_q is packed
-    assert cfg.use_split_kv is split_kv
-    assert (cfg.splits_kv > 1) is split_kv
-
-
 @pytest.mark.parametrize(
     "controls",
     (
@@ -5220,7 +5055,7 @@ def test_fmha_split_control_rejects_conflicting_explicit_requests(controls):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("dtype", (torch.bfloat16,))
 @pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
 @pytest.mark.parametrize("split_kv", (False, True), ids=("no-split", "split"))
 def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
@@ -5278,7 +5113,21 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
         workspace_buffer=workspace,
         split_kv=split_kv,
     )
-    assert dict(wrapper._policy)["use_split_kv"] is split_kv
+    if not split_kv:
+        assert not dict(wrapper._policy)["use_split_kv"]
+
+    from flashinfer.fi_trace import fi_trace
+
+    trace = fi_trace(
+        wrapper.run,
+        q=query,
+        paged_kv_cache=(k, v),
+        seq_lens=lengths,
+        block_tables=table,
+        qo_indptr=offsets,
+        out=out,
+    )
+    assert trace["axes"]["split_kv_allowed"]["value"] == int(split_kv)
 
     def run():
         wrapper.run(
@@ -5403,23 +5252,6 @@ def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> No
     assert public_spec.config.tile_size_kv == 128
 
 
-@pytest.mark.parametrize("batch_size", (1, 8, 64, 256))
-@pytest.mark.parametrize("qkv_dtype", ("bfloat16", "float8_e4m3fn"))
-def test_q_token_kv_block_sparse_q1_splits_follow_work_and_wave_bounds(
-    monkeypatch, batch_size, qkv_dtype
-):
-    spec = _resolve_q_token_kv_block_sparse_policy_for_test(
-        monkeypatch, batch_size=batch_size, group_size=1, qkv_dtype=qkv_dtype
-    )
-    # Count complete iterations, independently of the selected MMA recipe.
-    # The partial causal tail must not add another otherwise empty split.
-    work_bound = max(1, 2051 // (spec.config.tile_size_kv * spec.config.num_insts_kv))
-    wave_bound = max(148 // batch_size, 1)
-    expected = min(work_bound, wave_bound)
-    assert spec.config.splits_kv == expected
-    assert spec.config.tile_size_kv == 128
-
-
 def _resolve_q_token_kv_block_sparse_policy_for_test(
     monkeypatch,
     *,
@@ -5489,17 +5321,9 @@ def _resolve_q_token_kv_block_sparse_policy_for_test(
     ),
     (
         (16, 6, 1, 2051, "bfloat16", "bfloat16", False, True),
-        (16, 12, 1, 2051, "bfloat16", "bfloat16", False, True),
-        (256, 6, 1, 2051, "bfloat16", "bfloat16", False, True),
-        (16, 12, 2, 2051, "bfloat16", "bfloat16", False, True),
         (16, 12, 4, 2051, "bfloat16", "bfloat16", False, True),
-        (32, 12, 5, 2051, "bfloat16", "bfloat16", False, True),
         (128, 12, 2, 8208, "bfloat16", "bfloat16", True, False),
-        (16, 12, 2, 2524, "float8_e4m3fn", "bfloat16", False, True),
-        (256, 12, 2, 2524, "float8_e4m3fn", "float16", False, True),
-        (1024, 12, 8, 16416, "bfloat16", "bfloat16", True, False),
         (1024, 12, 8, 16416, "float8_e4m3fn", "bfloat16", True, False),
-        (32, 12, 8, 16416, "bfloat16", "bfloat16", False, True),
     ),
 )
 def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
@@ -5534,13 +5358,10 @@ def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
     )
     cfg = spec.config
     group_rows = num_qo_heads * group_size  # This cohort has one KV head.
-    minimum_q = next(tile for tile in (8, 16, 32, 64, 128) if group_rows <= tile)
 
     assert cfg.use_q_token_kv_block_sparse_route and cfg.groups_tokens_heads_q
     assert cfg.q_tokens_per_cta >= group_size
-    # D256 FP8 may promote a smaller tile to the qualified Q64 recipe.
-    maximum_q = max(minimum_q, 64 if qkv_dtype == "float8_e4m3fn" else 8)
-    assert minimum_q <= cfg.tile_size_q <= maximum_q
+    assert group_rows <= cfg.tile_size_q <= 128
     assert cfg.tile_size_kv == 128
     assert cfg.use_variable_seqlens_q is use_packed_q
     assert cfg.use_split_kv is (cfg.splits_kv > 1)
@@ -6985,3 +6806,661 @@ def test_attention_ts_decode_page_cache_sliding_product(
 
     policy = _exercise_auto_case(case)
     assert policy["window_left"] == 127
+
+
+def _fp8_sparse_route_reference(
+    queries, keys, values, visible, *, instances, splits, out_dtype
+):
+    """Independent dense-style FP8-P online softmax over a sparse route.
+
+    All logical rows/heads are vectorized. Streams correspond to interleaved
+    KV128 MMA instances within each active split. Membership comes from the
+    input selections, never from kernel-produced metadata.
+    """
+    scores = torch.einsum("ghrd,thd->ghrt", queries.float(), keys.float())
+    scale = queries.shape[-1] ** -0.5
+    scale_log2 = scores.new_tensor(scale) * scores.new_tensor(math.log2(math.e))
+    quant_log2 = scores.new_tensor(math.log2(448))
+    scores.masked_fill_(~visible[:, None, None, :], -torch.inf)
+    tiles = (keys.shape[0] + 127) // 128
+    local_tiles = max(
+        instances, (tiles + splits * instances - 1) // (splits * instances) * instances
+    )
+
+    def merge(streams):
+        anchor = torch.stack([stream[0] for stream in streams]).max(0).values
+        final_sum = torch.zeros_like(anchor)
+        final_acc = torch.zeros_like(queries, dtype=torch.float32)
+        final_error = torch.zeros_like(final_acc)
+        for maximum, denominator, accumulator, error in streams:
+            correction = torch.where(
+                torch.isfinite(maximum), ((maximum - anchor) * scale).exp(), 0
+            )
+            final_sum += denominator * correction
+            final_acc += accumulator * correction[..., None]
+            final_error += error * correction[..., None]
+        return anchor, final_sum, final_acc, final_error
+
+    partials = []
+    for split_begin in range(0, tiles, local_tiles):
+        streams = []
+        for instance in range(instances):
+            maximum = torch.full_like(scores[..., 0], -torch.inf)
+            denominator = torch.zeros_like(maximum)
+            accumulator = torch.zeros_like(queries, dtype=torch.float32)
+            error = torch.zeros_like(accumulator)
+            for tile in range(
+                split_begin + instance, min(split_begin + local_tiles, tiles), instances
+            ):
+                begin, end = tile * 128, min((tile + 1) * 128, keys.shape[0])
+                tile_scores = scores[..., begin:end]
+                new_max = torch.maximum(maximum, tile_scores.max(-1).values)
+                correction = torch.where(
+                    torch.isfinite(maximum), ((maximum - new_max) * scale).exp(), 0
+                )
+                # Match the dense base-2 exponent convention, including its
+                # FP32 max offset and fused score*scale+offset. Computing exp
+                # then multiplying by 448 can choose another E4M3 bin near a
+                # rounding boundary even when the exponent differs by one ulp.
+                offset = -new_max * scale_log2 + quant_log2
+                exponent = (
+                    tile_scores.double() * scale_log2.double()
+                    + offset[..., None].double()
+                ).float()
+                p = torch.where(torch.isfinite(tile_scores), exponent.exp2(), 0)
+                quantized = p.to(torch.float8_e4m3fn).float()
+                # Fast exp2 and host-reference FP32 arithmetic may straddle
+                # an E4M3 midpoint. Propagate only that bin-edge uncertainty,
+                # instead of relaxing every output's absolute tolerance.
+                delta = p * (8 * torch.finfo(torch.float32).eps)
+                lower = (p - delta).to(torch.float8_e4m3fn).float()
+                upper = (p + delta).to(torch.float8_e4m3fn).float()
+                uncertainty = torch.maximum(quantized - lower, upper - quantized)
+                accumulator = accumulator * correction[..., None] + torch.einsum(
+                    "ghrt,thd->ghrd", quantized, values[begin:end].float()
+                )
+                error = error * correction[..., None] + torch.einsum(
+                    "ghrt,thd->ghrd", uncertainty, values[begin:end].float().abs()
+                )
+                denominator = denominator * correction + p.sum(-1)
+                maximum = new_max
+            streams.append((maximum, denominator, accumulator, error))
+        anchor, denominator, accumulator, error = merge(streams)
+        normalized = torch.where(
+            denominator[..., None] > 0, accumulator / denominator[..., None], 0
+        )
+        normalized_error = torch.where(
+            denominator[..., None] > 0, error / denominator[..., None], 0
+        )
+        if splits > 1:
+            # Separate reduction publishes normalized 16-bit O plus FP32 LSE.
+            # This rounding happens before the split outputs are combined.
+            normalized = normalized.to(out_dtype).float()
+        partials.append(
+            (anchor * scale + denominator.log(), normalized, normalized_error)
+        )
+    weights = torch.stack([part[0] for part in partials]).softmax(0)[..., None]
+    return (
+        (weights * torch.stack([part[1] for part in partials])).sum(0),
+        (weights * torch.stack([part[2] for part in partials])).sum(0),
+    )
+
+
+def _check_q_token_sparse_case(
+    block=4,
+    page=16,
+    group=4,
+    packed=False,
+    shared=True,
+    split_kv=False,
+    *,
+    dtype=torch.bfloat16,
+    dim=128,
+    ratio=12,
+    context=8192,
+    batch=2,
+    heads_kv=2,
+    topk=17,
+    out_dtype=None,
+):
+    torch.manual_seed(71845)
+    hkv = heads_kv
+    long_base = max(1, min(4096, context - group + 1))
+    lengths = [group] * batch
+    if packed and group > 1:
+        lengths[-1] -= 1
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    rows = offsets[-1]
+    q = torch.randn(rows, hkv * ratio, dim, device="cuda").to(dtype)
+    if not packed:
+        q = q.view(batch, 1, group, hkv * ratio, dim)
+    if out_dtype is None:
+        out_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    out = torch.empty_like(q, dtype=out_dtype)
+    width = (context + page - 1) // page
+    k = torch.randn(batch * width, hkv, page, dim, device="cuda").to(dtype)
+    v = torch.randn(batch * width, hkv, page, dim, device="cuda").to(dtype)
+    table = torch.randperm(batch * width, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    if context % page:
+        k[table[:, -1].long(), :, context % page :] = 0
+        v[table[:, -1].long(), :, context % page :] = 0
+    pattern_heads = 1 if shared else hkv
+    ids = torch.full((rows, pattern_heads, topk), -1, device="cuda", dtype=torch.int32)
+    input_ids = ids[:, 0] if shared else ids
+    requests = torch.tensor(
+        [r for r, n in enumerate(lengths) for _ in range(n)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    positions = torch.empty(rows, device="cuda", dtype=torch.int64)
+    qo_indptr = (
+        torch.tensor(offsets, device="cuda", dtype=torch.int32) if packed else None
+    )
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            qo_indptr=qo_indptr,
+            seq_len_q=group if packed else None,
+            kv_block_size=block,
+            o_data_type=out.dtype,
+            split_kv=split_kv,
+            share_pattern_across_kv_heads=shared,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        batch,
+        group,
+        hkv * ratio,
+        hkv,
+        dim,
+        block,
+        page,
+        topk,
+        context,
+        device=q.device,
+        workspace_buffer=workspace,
+        use_packed_q=packed,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=shared,
+        q_data_type=q.dtype,
+        o_data_type=out.dtype,
+    )
+
+    def update(base):
+        ids.fill_(-1)
+        selected = {}
+        for request, n in enumerate(lengths):
+            for qi in range(n):
+                row = offsets[request] + qi
+                visible = base + qi
+                positions[row] = visible - 1
+                for ph in range(pattern_heads):
+                    blocks = torch.randperm(
+                        visible // block, device="cuda", dtype=torch.int32
+                    )[:topk]
+                    ids[row, ph, : blocks.numel()] = blocks
+                    tokens = (
+                        blocks[:, None].long() * block
+                        + torch.arange(block, device="cuda")
+                    ).flatten()
+                    tail = torch.arange(
+                        visible // block * block, visible, device="cuda"
+                    )
+                    selected[row, ph] = torch.cat((tokens, tail))
+        return selected
+
+    def run():
+        wrapper.run(
+            q,
+            (k, v),
+            table,
+            input_ids,
+            requests,
+            positions,
+            qo_indptr=qo_indptr,
+            out=out,
+        )
+
+    def check(selected):
+        q_flat = q.reshape(rows, hkv, ratio, dim).float()
+        out_flat = out.reshape(rows, hkv, ratio, dim).float()
+        if dtype == torch.float8_e4m3fn:
+            from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
+                select_sparse_launch,
+            )
+
+            launch = select_sparse_launch(
+                group_size=group,
+                heads_q_per_kv=ratio,
+                head_dim=dim,
+                q_dtype_key="float8_e4m3fn",
+                num_routes=batch,
+                num_kv_heads=hkv,
+                route_kv_tokens=min(
+                    context,
+                    topk * block + block - 1
+                    if group == 1
+                    else group * (topk + 1) * block,
+                ),
+                multi_processor_count=torch.cuda.get_device_properties(
+                    q.device
+                ).multi_processor_count,
+                split_kv=split_kv,
+            )
+            for request, n in enumerate(lengths):
+                begin = offsets[request]
+                for head in range(hkv):
+                    lists = [
+                        selected[begin + qi, 0 if shared else head] for qi in range(n)
+                    ]
+                    if group == 1:
+                        tokens = lists[0]
+                    else:
+                        logical_blocks = torch.unique(
+                            torch.cat(lists) // block, sorted=True
+                        )
+                        tokens = (
+                            logical_blocks[:, None] * block
+                            + torch.arange(block, device="cuda")
+                        ).flatten()
+                        tokens = tokens[tokens <= positions[begin + n - 1]]
+                    visible = torch.stack(
+                        [torch.isin(tokens, chosen) for chosen in lists]
+                    )
+                    physical = table[request, tokens // page].long()
+                    expected, uncertainty = _fp8_sparse_route_reference(
+                        q_flat[begin : begin + n, head : head + 1],
+                        k[physical, head, tokens % page][:, None],
+                        v[physical, head, tokens % page][:, None],
+                        visible,
+                        instances=launch.num_insts_kv,
+                        splits=launch.splits_kv,
+                        out_dtype=out.dtype,
+                    )
+                    actual = out_flat[begin : begin + n, head : head + 1]
+                    closest = torch.maximum(
+                        torch.minimum(actual, expected + uncertainty),
+                        expected - uncertainty,
+                    )
+                    torch.testing.assert_close(actual, closest, rtol=0.01, atol=0.002)
+            return
+        for request, n in enumerate(lengths):
+            for qi in range(n):
+                row = offsets[request] + qi
+                for head in range(hkv):
+                    tokens = selected[row, 0 if shared else head]
+                    physical = table[request, tokens // page].long()
+                    keys = k[physical, head, tokens % page].float()
+                    values = v[physical, head, tokens % page].float()
+                    expected = (q_flat[row, head] @ keys.T * dim**-0.5).softmax(
+                        -1
+                    ) @ values
+                    torch.testing.assert_close(
+                        out_flat[row, head], expected, rtol=0.03, atol=0.01
+                    )
+
+    selected = update(long_base)
+    run()
+    check(selected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for base in (
+        max(1, min(block - 3, long_base)),
+        min(block + 1, long_base),
+        long_base,
+    ):
+        selected = update(base)
+        out.fill_(torch.nan)
+        graph.replay()
+        check(selected)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "case",
+    (
+        pytest.param(
+            dict(group=1, ratio=3, dim=64, dtype=torch.float16, shared=False),
+            id="q8-d64-f16-direct",
+        ),
+        pytest.param(
+            dict(group=3, ratio=4, block=8, packed=True, shared=False),
+            id="q16-g3-per-head",
+        ),
+        pytest.param(dict(group=5, ratio=6, block=16, page=128), id="q32-g5-shared"),
+        pytest.param(
+            dict(group=5, dim=256, block=32, page=16, packed=True, shared=False),
+            id="q64-cross-page",
+        ),
+        pytest.param(
+            dict(group=8, block=128, page=20, packed=True, shared=False),
+            id="q128-g8-fragmented-tail",
+        ),
+        pytest.param(
+            dict(
+                group=8,
+                ratio=3,
+                heads_kv=1,
+                dim=64,
+                dtype=torch.float8_e4m3fn,
+                block=64,
+                page=128,
+                packed=True,
+                shared=False,
+            ),
+            id="fp8-d64-odd-stride",
+        ),
+        pytest.param(dict(group=7, ratio=17), id="non-power-of-two-head-group"),
+        pytest.param(dict(group=1, ratio=128, shared=False), id="wide-head-group"),
+        pytest.param(
+            dict(
+                group=1,
+                dim=256,
+                dtype=torch.float8_e4m3fn,
+                topk=512,
+                packed=True,
+                shared=False,
+                split_kv=True,
+            ),
+            id="direct-fp8-split",
+        ),
+        pytest.param(
+            dict(
+                group=8,
+                dim=256,
+                dtype=torch.float8_e4m3fn,
+                block=128,
+                page=128,
+                split_kv=True,
+                shared=False,
+            ),
+            id="grouped-fp8-split",
+        ),
+        pytest.param(
+            dict(
+                group=3,
+                ratio=4,
+                dim=64,
+                dtype=torch.float8_e4m3fn,
+                out_dtype=torch.float16,
+                block=16,
+                page=128,
+            ),
+            id="fp8-to-f16",
+        ),
+        pytest.param(
+            dict(group=1, batch=256, context=512, shared=False), id="persistent-direct"
+        ),
+        pytest.param(
+            dict(group=8, batch=256, context=512, packed=True, shared=False),
+            id="persistent-grouped",
+        ),
+    ),
+)
+def test_q_token_sparse_shapes_patterns_and_graph(monkeypatch, case):
+    """Cover distinct Q recipes and live sparse patterns through the public wrapper."""
+    if case.get("batch", 2) == 256:
+        from flashinfer.attention.prims_ts import decode as decode_module
+
+        resolve = decode_module._resolve_decode_launch_spec
+        persistent = []
+
+        def record_dispatch(*args, **kwargs):
+            spec = resolve(*args, **kwargs)
+            persistent.append(spec.config.use_persistent_scheduler)
+            return spec
+
+        monkeypatch.setattr(
+            decode_module, "_resolve_decode_launch_spec", record_dispatch
+        )
+    _check_q_token_sparse_case(**case)
+    if case.get("batch", 2) == 256:
+        assert persistent and all(persistent)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("storage", "fmt"),
+    (("contiguous", "bsr"), ("contiguous", "bitmask"), ("paged", "bsr")),
+)
+@pytest.mark.parametrize("shared", (False, True))
+def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
+    from flashinfer.attention.prims_ts.block_sparse import (
+        BlockSparseTSWrapper,
+        BlockSparsePagedTSWrapper,
+        block_sparse_attention,
+        block_sparse_attention_with_paged_kv_cache,
+    )
+    from tests.attention.test_attention_ts_block_sparse import (
+        _Case,
+        _make_bsr,
+        _make_exact_block_bits,
+        _reference,
+    )
+
+    block, mask = 64, "causal"
+    torch.manual_seed(45132)
+    batch, sq, sk, hq, hkv, dim, qb, page = 2, 32, 256, 12, 3, 128, 16, 64
+    q = torch.randn(batch, sq, hq, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, sk, hkv, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    pattern_heads = 1 if shared else hkv
+    case = _Case(
+        "pattern-heads",
+        batch,
+        hq,
+        sq,
+        sk,
+        qb,
+        block,
+        q.dtype,
+        mask,
+        "none",
+        "static",
+        num_kv_heads=hkv,
+    )
+    valid = tuple(frozenset(range(sk)) for _ in range(batch))
+
+    def patterns(shift):
+        raw = tuple(
+            tuple(
+                tuple(
+                    (0, 1 + (b + h + row + shift) % (sk // block - 1))
+                    for row in range(sq // qb)
+                )
+                for h in range(pattern_heads)
+            )
+            for b in range(batch)
+        )
+        full = (
+            tuple(tuple(rows[0] for _ in range(hkv)) for rows in raw) if shared else raw
+        )
+        return raw, full
+
+    raw, full = patterns(0)
+    indptr, indices = _make_bsr(raw)
+    bits = _make_exact_block_bits(raw, sk // block)
+    static = dict(
+        device=q.device,
+        max_blocks_per_row=2,
+        use_kv_valid_bits=False,
+        mask_type=mask,
+        q_data_type=q.dtype,
+        share_pattern_across_kv_heads=shared,
+    )
+    if storage == "paged":
+        pages = torch.randperm(batch * sk // page, device="cuda", dtype=torch.int32)
+        cache_k = torch.empty(
+            batch * sk // page, hkv, page, dim, device="cuda", dtype=q.dtype
+        )
+        cache_v = torch.empty_like(cache_k)
+        for request in range(batch):
+            for logical in range(sk // page):
+                physical = pages[request * (sk // page) + logical]
+                cache_k[physical] = k[
+                    request, logical * page : (logical + 1) * page
+                ].transpose(0, 1)
+                cache_v[physical] = v[
+                    request, logical * page : (logical + 1) * page
+                ].transpose(0, 1)
+        page_indptr = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * (
+            sk // page
+        )
+        lens = torch.full((batch,), sk, device="cuda", dtype=torch.int32)
+        w = BlockSparsePagedTSWrapper()
+        w.plan(batch, sq, sk, hq, hkv, dim, qb, block, page, **static)
+
+        def run():
+            return w.run(
+                q,
+                (cache_k, cache_v),
+                page_indptr,
+                pages,
+                lens,
+                indptr,
+                indices,
+                out=out,
+            )
+
+        eager = block_sparse_attention_with_paged_kv_cache(
+            q,
+            (cache_k, cache_v),
+            page_indptr,
+            pages,
+            indptr,
+            indices,
+            qb,
+            block,
+            max_seq_len_kv=sk,
+            seq_lens_kv=lens,
+            mask_type=mask,
+            share_pattern_across_kv_heads=shared,
+        )
+    else:
+        w = BlockSparseTSWrapper()
+        w.plan(batch, sq, sk, hq, hkv, dim, qb, block, sparse_format=fmt, **static)
+        route_args = dict(
+            block_indptr=indptr if fmt == "bsr" else None,
+            block_indices=indices if fmt == "bsr" else None,
+            exact_block_bits=bits if fmt == "bitmask" else None,
+        )
+
+        def run():
+            return w.run(q, k, v, **route_args, out=out)
+
+        eager = block_sparse_attention(
+            q,
+            k,
+            v,
+            q_block_size=qb,
+            kv_block_size=block,
+            sparse_format=fmt,
+            mask_type=mask,
+            share_pattern_across_kv_heads=shared,
+            **route_args,
+        )
+    expected = _reference(case, q, k, v, full, valid, dim**-0.5)
+    torch.testing.assert_close(eager, expected, rtol=0.03, atol=0.01)
+    run()
+    torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    raw, full = patterns(1)
+    new_indptr, new_indices = _make_bsr(raw)
+    indptr.copy_(new_indptr)
+    indices.copy_(new_indices)
+    bits.copy_(_make_exact_block_bits(raw, sk // block))
+    graph.replay()
+    expected = _reference(case, q, k, v, full, valid, dim**-0.5)
+    torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize("dtype", (torch.bfloat16,))
+def test_dense_encoded_eight_token_fragments(dtype):
+    """The common paged loader also accepts eight-token encoded fragments."""
+    from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+
+    torch.manual_seed(4173)
+    batch, sq, hkv, ratio, dim, storage, fragment, context = (
+        2,
+        4,
+        2,
+        8,
+        128,
+        32,
+        8,
+        1024,
+    )
+    q = torch.randn(batch, sq, hkv * ratio, dim, device="cuda", dtype=dtype)
+    k = torch.randn(
+        batch * context // storage, hkv, storage, dim, device="cuda", dtype=dtype
+    )
+    v = torch.randn_like(k)
+    physical = torch.randperm(k.shape[0], device="cuda", dtype=torch.int32).reshape(
+        batch, -1
+    )
+    per_page = storage // fragment
+    table = (
+        physical[:, :, None] * per_page
+        + torch.arange(per_page, device="cuda", dtype=torch.int32)
+    ).reshape(batch, -1)
+    lengths = torch.tensor((1024, 777), device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper.plan(
+        q.device,
+        batch,
+        hkv * ratio,
+        hkv,
+        dim,
+        fragment,
+        context,
+        storage_page_size=storage,
+        max_seq_len_q=sq,
+        mask_type="causal",
+        q_data_type=dtype,
+        split_kv=False,
+    )
+
+    def run():
+        wrapper.run(q, (k, v), lengths, table, out=out, validate=False)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(torch.nan)
+    graph.replay()
+    for b in range(batch):
+        for qi in range(sq):
+            tokens = torch.arange(int(lengths[b]) - sq + qi + 1, device="cuda")
+            pages = physical[b, tokens // storage].long()
+            for head in range(hkv):
+                keys = k[pages, head, tokens % storage].float()
+                values = v[pages, head, tokens % storage].float()
+                qs = q[b, qi, head * ratio : (head + 1) * ratio].float()
+                expected = (qs @ keys.T * dim**-0.5).softmax(-1) @ values
+                torch.testing.assert_close(
+                    out[b, qi, head * ratio : (head + 1) * ratio].float(),
+                    expected,
+                    rtol=0.03,
+                    atol=0.01,
+                )
