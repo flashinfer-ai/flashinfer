@@ -184,7 +184,6 @@ def _run_trtllm_gen_routed_fused_moe_case(
         routing_logits,
         None,  # routing_bias
         hidden_states,
-        hidden_states_scale,
         w13,
         w13_scale,
         None,  # w13_bias
@@ -210,6 +209,7 @@ def _run_trtllm_gen_routed_fused_moe_case(
         enable_pdl,
         activation_type.value,  # act_type
         None,
+        hidden_states_scale=hidden_states_scale,
     )[0].to(torch.float)
 
     if routing_method_type == RoutingMethodType.Renormalize:
