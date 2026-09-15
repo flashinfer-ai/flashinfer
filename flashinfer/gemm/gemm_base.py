@@ -734,8 +734,8 @@ def mm_bf16(
         available low-M kernels on their supported buckets and a single
         cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
         warm-up tunes both ranges; with bias the direct kernel is excluded.
-        Warp Split-K reuses compiled tactics across M while still tuning each
-        M bucket independently.
+        Direct and warp Split-K reuse compiled kernels across M for matching
+        tactics, while each M bucket still tunes independently.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     Returns
