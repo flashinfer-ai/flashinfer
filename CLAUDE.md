@@ -187,6 +187,21 @@ median_time_ms = statistics.median(times)
 
 → **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
 
+`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
+CuTe-DSL grouped FP8 API; `group_deepgemm_fp8_nt_groupwise` keeps its original
+DeepGEMM-only signature. Both use per-row expert indices, unlike the indptr-based
+`group_gemm_fp8_nt_groupwise` API.
+
+For contiguous grouped FP8 GEMM, `python benchmarks/bench_grouped_fp8.py
+--production-shapes` compares DeepGEMM and CuTe-DSL with preallocated outputs;
+`--cache-probe` measures first-call and new-token-count compilation separately.
+Compiled grouped CuTe-DSL kernels are reused across token counts with the same
+128-row alignment class, with at most two variants per device and weight shape.
+Concurrent misses share one compilation; warm hits do not acquire the compile lock.
+The standalone API's optional `validate_indices=True` checks expert-index values
+and synchronizes with the CPU. Validate new routing data before CUDA graph
+capture; the default path assumes valid indices and performs metadata checks only.
+
 ## Code Linting
 
 Run all pre-commit hooks:
@@ -574,9 +589,8 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
 | `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
 | `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
-| `FLASHINFER_JIT_CACHE_WHEEL_KIND` | `legacy` | `flashinfer-jit-cache/build_backend.py` | Select `legacy` for the monolithic binary wheel or experimental `shim` mode for a pure-Python wheel whose dependencies install binary providers. |
-| `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | falls back to `FLASHINFER_CUDA_ARCH_LIST` | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. Required for a shim build when `FLASHINFER_CUDA_ARCH_LIST` is unset. |
-| `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | unset | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building an experimental binary provider wheel. |
+| `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
+| `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 ##### Cubin / Artifact Loader
 
@@ -706,13 +720,20 @@ users should normally leave the batch-size policy at its defaults.
 When ready to distribute:
 
 ```bash
-# Build flashinfer-jit-cache package
-cd flashinfer-jit-cache
-export FLASHINFER_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a 10.0a 11.0a 12.0f"
-python -m build --no-isolation --wheel
+# Build one binary provider for the target GPU.
+export FLASHINFER_JIT_CACHE_PROVIDER_ARCH=9.0a
+python -m build --no-isolation --wheel flashinfer-jit-cache-provider
+
+# Build the matching shim with an exact dependency on that provider.
+export FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="9.0a"
+python -m build --no-isolation --wheel flashinfer-jit-cache
 ```
 
-This runs `flashinfer/aot.py` which calls all registered `gen_*_module()` functions and pre-compiles them.
+The provider build runs `flashinfer/aot.py`, which calls the registered
+`gen_*_module()` functions and pre-compiles them for exactly one architecture.
+The shim contains metadata and exact dependencies, not compiled kernels. Use
+the same `FLASHINFER_LOCAL_VERSION` and `FLASHINFER_DEV_RELEASE_SUFFIX` values
+for every provider and its shim when producing CUDA-specific or nightly wheels.
 
 ## Build System Details
 

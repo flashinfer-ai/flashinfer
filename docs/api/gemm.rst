@@ -63,6 +63,7 @@ FP8 GEMM
     gemm_fp8_nt_blockscaled
     gemm_fp8_nt_groupwise
     group_gemm_fp8_nt_groupwise
+    group_gemm_fp8_nt_groupwise_contiguous
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
