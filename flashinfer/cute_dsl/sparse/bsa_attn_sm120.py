@@ -627,8 +627,7 @@ def bsa_attn_sm120_blk64_sage_fwd(
         Positive finite softmax scale. ``None`` selects ``1 / sqrt(128)``.
     out : torch.Tensor, optional
         Pre-allocated contiguous BF16 output with shape ``[B, H, Sq, 128]``.
-        Required for ``backend="cake"``, which is caller-owned and neither
-        reads nor writes storage beyond it. For ``backend="cute_dsl"``,
+        Required for ``backend="cake"``. For ``backend="cute_dsl"``,
         allocated internally when not provided.
     tma_descriptor_workspace : torch.Tensor, optional
         Caller-owned contiguous CUDA uint8 workspace, aligned to 128 bytes.
@@ -668,8 +667,9 @@ def bsa_attn_sm120_blk64_sage_fwd(
     ``q2k_block_nums`` uses the scalar count even when
     ``uniform_block_count=False``. Under ``backend="cake"``, setting
     ``uniform_block_count=True`` uses the scalar count and ignores any
-    supplied per-row counts; ``backend="cute_dsl"`` does not accept this
-    flag. A row selecting zero blocks produces an exactly zero output.
+    supplied per-row counts; ``backend="cute_dsl"`` accepts the flag but
+    silently ignores it. A row selecting zero blocks produces an exactly
+    zero output.
 
     Initialize the JIT module before CUDA Graph capture. Keep captured input
     and output tensors alive while their graph is in use. Each captured launch
