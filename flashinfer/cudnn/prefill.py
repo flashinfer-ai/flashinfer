@@ -949,6 +949,16 @@ def cudnn_batch_prefill_with_kv_cache(
             device=q.device,
             dtype=torch.float32,
         )
+    if lse is not None:
+        # The graph declares Stats as contiguous float32 on q's device and binds
+        # this buffer to it directly, so check here rather than letting cuDNN
+        # execute against storage the declared strides do not describe.
+        if lse.dtype != torch.float32:
+            raise ValueError(f"lse must have dtype torch.float32, got {lse.dtype}")
+        if lse.device != q.device:
+            raise ValueError(f"lse must be on {q.device}, got {lse.device}")
+        if not lse.is_contiguous():
+            raise ValueError("lse must be contiguous")
     lse_packed = lse is not None and tuple(lse.shape) == packed_shape
     if lse is not None and not lse_packed and tuple(lse.shape) != padded_shape:
         raise ValueError(
