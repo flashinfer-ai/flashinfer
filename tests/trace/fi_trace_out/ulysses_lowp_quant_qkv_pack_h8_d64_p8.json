@@ -1,0 +1,125 @@
+{
+  "name": "ulysses_lowp_quant_qkv_pack_h8_d64_p8",
+  "description": "Split-path quantize+pack of one Ulysses shard with externally finalized per-group Q/K amax (stats protocol 2: groups may straddle ranks and were max-merged / derived across the group). Byte contract validated in tests/comm/test_ulysses_lowp.py.",
+  "op_type": "comm",
+  "tags": [
+    "fi_api:flashinfer.comm.ulysses_lowp.quant_qkv_pack",
+    "stage:comm",
+    "quantization:float8_e4m3fn"
+  ],
+  "axes": {
+    "batch": {
+      "type": "var"
+    },
+    "local_sequence": {
+      "type": "var"
+    },
+    "q_slots": {
+      "type": "var"
+    },
+    "k_slots": {
+      "type": "var"
+    },
+    "chunk_bytes": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 64,
+      "description": "Head dimension, 64 or 128."
+    },
+    "world_size": {
+      "type": "const",
+      "value": 8,
+      "description": "Ulysses group size."
+    }
+  },
+  "constraints": [
+    "head_dim in [64, 128]",
+    "q_slots == (local_sequence + 62) // 32",
+    "k_slots == (local_sequence + 126) // 64"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch",
+        "local_sequence",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "batch",
+        "local_sequence",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "batch",
+        "local_sequence",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k_mean_global": {
+      "shape": [
+        "batch",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "q_amax_final": {
+      "shape": [
+        "batch",
+        "num_heads",
+        "q_slots"
+      ],
+      "dtype": "float32"
+    },
+    "k_amax_final": {
+      "shape": [
+        "batch",
+        "num_heads",
+        "k_slots"
+      ],
+      "dtype": "float32"
+    },
+    "v_scale_global": {
+      "shape": [
+        "batch",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float32"
+    },
+    "rank": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "world_size": {
+      "shape": null,
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "payload": {
+      "shape": [
+        "world_size",
+        "chunk_bytes"
+      ],
+      "dtype": "uint8"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

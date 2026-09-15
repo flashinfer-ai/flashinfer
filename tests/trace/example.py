@@ -13,6 +13,16 @@ The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 Requires a CUDA-capable GPU.
 
 Results:
+- ulysses_lowp_k_sum_v_amax_h8_d64.json
+- ulysses_lowp_q_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d64_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d64_p8.json
+- ulysses_lowp_k_sum_v_amax_h8_d128.json
+- ulysses_lowp_q_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d128_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d128_p8.json
 - We would get these example json files under fi_trace_out directory:
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
@@ -2651,3 +2661,58 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+
+# Ulysses trace schemas can be generated on CPU, independently of kernel support.
+def dump_ulysses_lowp_traces(save_dir):
+    from flashinfer.comm import ulysses_lowp as lowp
+
+    for head_dim in (64, 128):
+        q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+        mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
+        qs = torch.empty(1, 8, 3, dtype=torch.float32)
+        ks = torch.empty(1, 8, 2, dtype=torch.float32)
+        spec = lowp.payload_spec(
+            batch_size=1,
+            local_sequence=65,
+            num_heads=8,
+            head_dim=head_dim,
+            world_size=8,
+        )
+        calls = (
+            (lowp.k_sum_v_amax, dict(k=q, v=q)),
+            (lowp.q_grouped_amax, dict(q=q, rank=0, world_size=8)),
+            (lowp.k_grouped_amax, dict(k=q, k_mean_global=mean, rank=0, world_size=8)),
+            (
+                lowp.quant_qkv_pack,
+                dict(
+                    q=q,
+                    k=q,
+                    v=q,
+                    k_mean_global=mean,
+                    q_amax_final=qs,
+                    k_amax_final=ks,
+                    v_scale_global=mean.float(),
+                    rank=0,
+                    world_size=8,
+                ),
+            ),
+            (
+                lowp.unpack_for_sage,
+                dict(
+                    recv_u8=torch.empty(8, spec["chunk_bytes"], dtype=torch.uint8),
+                    batch_size=1,
+                    local_sequence=65,
+                    local_heads=1,
+                    head_dim=head_dim,
+                    world_size=8,
+                ),
+            ),
+        )
+        for fn, kwargs in calls:
+            definition = fn.fi_trace(**kwargs)
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_lowp_traces(SAVE_DIR)

@@ -459,6 +459,84 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
     dispose_ulysses_a2a
     ulysses_a2a
 
+Low-Precision Ulysses Payloads
+------------------------------------
+
+.. currentmodule:: flashinfer.comm
+
+These primitives quantize BF16/FP16 Q/K/V before a caller-owned all-to-all.
+Q/K use INT8 and V uses FP8 E4M3 internally. The caller owns the statistics
+AllGather, payload all-to-all, attention backend and output communication.
+Use ``UlyssesLowpSageLayoutSM90`` on Hopper and ``UlyssesLowpSageLayout`` on
+SM89/SM120. Both accept head dimensions 64 and 128. See the
+:download:`design document <../design_docs/ulysses_lowp.md>` for the global-grid
+contract and the complete execution sequence.
+
+.. autosummary::
+    :toctree: ../generated
+
+    UlyssesLowpSageLayout
+    UlyssesLowpSageLayoutSM90
+    StatsContext
+    V2GStats
+    ulysses_lowp_capability
+    ulysses_lowp_payload_spec
+    ulysses_lowp_k_sum_v_amax
+    ulysses_lowp_q_grouped_amax
+    ulysses_lowp_k_grouped_amax
+    ulysses_lowp_boundary_descriptors
+    ulysses_lowp_merge_boundary_amax
+    ulysses_lowp_k_boundary_minmax
+    ulysses_lowp_derive_k_boundary_amax
+    ulysses_lowp_zero_scale_and_padding
+    ulysses_lowp_quant_q_into_payload
+    ulysses_lowp_quant_kv_into_payload
+    ulysses_lowp_quant_qkv_pack
+    ulysses_lowp_unpack_for_sage
+    ulysses_lowp_local_stats
+    ulysses_lowp_finalize_stats
+    ulysses_lowp_quant_and_pack
+    ulysses_lowp_verify_duplicate_scale_slots
+    ulysses_lowp_quant_v_fp8_with_scale
+
+Geometry helpers also remain available through the ``ulysses_lowp_`` prefix:
+``stats_protocol_for`` selects the boundary protocol, ``required_alignment``
+returns the global padding multiple, ``aligned_length`` rounds up the live
+sequence, and ``scale_widths`` computes consumer Q/K scale counts. On Hopper,
+use the corresponding SM90 layout methods so these calculations use its grid.
+
+Module-level primitives
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Module-level tensor operations use the SM89/SM120 grid. On Hopper, call the
+corresponding SM90 layout methods. Inputs are CUDA BF16/FP16 tensors with a
+dense last dimension and 16-byte-aligned rows; outputs are contiguous.
+
+.. currentmodule:: flashinfer.comm.ulysses_lowp
+
+.. autosummary::
+    :toctree: ../generated
+
+    capability
+    payload_spec
+    k_sum_v_amax
+    q_grouped_amax
+    k_grouped_amax
+    boundary_descriptors
+    merge_boundary_amax
+    k_boundary_minmax
+    derive_k_boundary_amax
+    zero_scale_and_padding
+    quant_q_into_payload
+    quant_kv_into_payload
+    quant_qkv_pack
+    unpack_for_sage
+    local_stats
+    finalize_stats
+    quant_and_pack
+    verify_duplicate_scale_slots
+    quant_v_fp8_with_scale
+
 MNNVL (Multi-Node NVLink)
 -------------------------
 

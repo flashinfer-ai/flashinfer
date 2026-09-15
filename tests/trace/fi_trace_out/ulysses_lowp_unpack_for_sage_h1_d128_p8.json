@@ -1,0 +1,144 @@
+{
+  "name": "ulysses_lowp_unpack_for_sage_h1_d128_p8",
+  "description": "Receiver side of the low-precision Ulysses A2A: rebuild this rank's heads over the full logical sequence from the received per-source chunks -- INT8 Q/K [B,S,h,D], FP8 V in SageAttention's 16-token permuted [B,D,h,padded_S] layout, and the fp32 Q/K group scales at the consumer's width. Pure byte movement; validated bit-for-bit in tests/comm/test_ulysses_lowp.py.",
+  "op_type": "comm",
+  "tags": [
+    "fi_api:flashinfer.comm.ulysses_lowp.unpack_for_sage",
+    "stage:comm"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "local_sequence": {
+      "type": "var"
+    },
+    "logical_sequence": {
+      "type": "var",
+      "description": "local_sequence * world_size."
+    },
+    "padded_sequence": {
+      "type": "var",
+      "description": "ceil(logical_sequence / 64) * 64."
+    },
+    "q_scale_width": {
+      "type": "var"
+    },
+    "k_scale_width": {
+      "type": "var"
+    },
+    "chunk_bytes": {
+      "type": "var"
+    },
+    "local_heads": {
+      "type": "const",
+      "value": 1,
+      "description": "Heads this rank attends."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Head dimension, 64 or 128."
+    },
+    "world_size": {
+      "type": "const",
+      "value": 8,
+      "description": "Ulysses group size."
+    }
+  },
+  "constraints": [
+    "head_dim in [64, 128]",
+    "logical_sequence == local_sequence * world_size",
+    "padded_sequence == (logical_sequence + 63) // 64 * 64",
+    "q_scale_width % 4 == 0",
+    "0 < q_scale_width <= (logical_sequence + 127) // 128 * 4",
+    "0 < k_scale_width <= (logical_sequence + 63) // 64",
+    "q_scale_width == (k_scale_width + 1) // 2 * 4"
+  ],
+  "inputs": {
+    "recv_u8": {
+      "shape": [
+        "world_size",
+        "chunk_bytes"
+      ],
+      "dtype": "uint8",
+      "description": "Received payload; row s came from source rank s."
+    },
+    "batch_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "local_sequence": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "local_heads": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "head_dim": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "world_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "aligned": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "scale_sequence": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "q_int8": {
+      "shape": [
+        "batch_size",
+        "logical_sequence",
+        "local_heads",
+        "head_dim"
+      ],
+      "dtype": "int8"
+    },
+    "k_int8": {
+      "shape": [
+        "batch_size",
+        "logical_sequence",
+        "local_heads",
+        "head_dim"
+      ],
+      "dtype": "int8"
+    },
+    "v_fp8_packed": {
+      "shape": [
+        "batch_size",
+        "head_dim",
+        "local_heads",
+        "padded_sequence"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "q_scale": {
+      "shape": [
+        "batch_size",
+        "local_heads",
+        "q_scale_width"
+      ],
+      "dtype": "float32"
+    },
+    "k_scale": {
+      "shape": [
+        "batch_size",
+        "local_heads",
+        "k_scale_width"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
