@@ -154,11 +154,6 @@ def _swaps_routed_coordinate(
     return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
-    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16
-
-
 def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one tcgen05 MMA instruction."""
     return 32 if cfg.use_fp8_qkv else 16
@@ -398,12 +393,6 @@ def _major_k_stride_bytes(dtype_bytes: int, headdim: int) -> int:
     else:
         rows_per_swizzle_blk = 1
     return 128 * rows_per_swizzle_blk
-
-
-@cute.jit
-def _fp8_log2_quant_scale() -> Float32:
-    """Return log2 scaling used by FP8 probability quantization."""
-    return Float32(8.8073549)
 
 
 def _neg_max_f32() -> Float32:

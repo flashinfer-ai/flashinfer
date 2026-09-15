@@ -1255,13 +1255,6 @@ class TmemSResource(DecodeGenResourceBase):
                 new_max_arr=new_max_arr,
                 s_arr=s_arr,
                 use_sparse=False,
-                sparse_origin0=Int32(0),
-                sparse_origin1=Int32(0),
-                sparse_route_flags=Int32(0),
-                sparse_token_word0=Uint32(0xFFFFFFFF),
-                sparse_token_word1=Uint32(0xFFFFFFFF),
-                sparse_token_word2=Uint32(0xFFFFFFFF),
-                sparse_token_word3=Uint32(0xFFFFFFFF),
             )
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
@@ -2180,13 +2173,13 @@ class TmemSResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
         use_sparse: Constexpr[bool],
-        sparse_origin0: Int32,
-        sparse_origin1: Int32,
-        sparse_route_flags: Int32,
-        sparse_token_word0: Uint32,
-        sparse_token_word1: Uint32,
-        sparse_token_word2: Uint32,
-        sparse_token_word3: Uint32,
+        sparse_origin0: Int32 | None = None,
+        sparse_origin1: Int32 | None = None,
+        sparse_route_flags: Int32 | None = None,
+        sparse_token_word0: Uint32 | None = None,
+        sparse_token_word1: Uint32 | None = None,
+        sparse_token_word2: Uint32 | None = None,
+        sparse_token_word3: Uint32 | None = None,
     ) -> tuple[object, object, object, object]:
         """Mask streamed K32 score fragments in place and reduce their max.
 
@@ -2203,6 +2196,16 @@ class TmemSResource(DecodeGenResourceBase):
         fragment_regs = cfg.softmax_score_fragment_regs
         # The seven-slot softmax metadata ABI carries exactly four token words.
         assert num_fragments == 4 and fragment_regs == 32
+        if cutlass.const_expr(not use_sparse):
+            # A dense tile has no route: no atoms, no validity flags, and
+            # all-ones token words.
+            sparse_origin0 = Int32(0)
+            sparse_origin1 = Int32(0)
+            sparse_route_flags = Int32(0)
+            sparse_token_word0 = Uint32(0xFFFFFFFF)
+            sparse_token_word1 = Uint32(0xFFFFFFFF)
+            sparse_token_word2 = Uint32(0xFFFFFFFF)
+            sparse_token_word3 = Uint32(0xFFFFFFFF)
         task_cache = _decode_gen_task_cache(stage_info)
         keep_words = cutlass.Array(
             Uint32, num_fragments, space=cutlass.AddressSpace.rmem
