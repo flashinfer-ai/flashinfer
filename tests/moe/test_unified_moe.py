@@ -55,6 +55,7 @@ from flashinfer.fused_moe import (
     SwiGLUStep,
     # Unified configs, packs, and runners
     ActivationType,
+    ActivationPackKind,
     BackendOptions,
     CuteDslConfig,
     CuteDslRunner,
@@ -1203,6 +1204,16 @@ class TestMoERunnerSupport:
                     "activation classes"
                 )
 
+    def test_registered_runners_declare_activation_pack_kind(self):
+        for runner_cls in set(_BACKEND_RUNNERS.values()):
+            declared = runner_cls.supported_activation_pack_kind
+            assert declared, (
+                f"{runner_cls.__name__} must declare supported_activation_pack_kind"
+            )
+            if isinstance(declared, dict):
+                assert set(declared) == set(runner_cls.supported_quant_variants)
+                assert all(declared.values())
+
     def test_declarative_activation_capabilities(self):
         cutlass = (
             SwiGLU,
@@ -1336,7 +1347,7 @@ class TestMoERunnerSupport:
         )
         act = MoEActivationPack(
             hidden_states_q=torch.empty(4, 64, dtype=torch.uint8),
-            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            hidden_states_scale=torch.empty(4, 8, dtype=torch.uint8),
             topk_ids=torch.zeros(4, 2, dtype=torch.int32),
             topk_weights=torch.ones(4, 2, dtype=torch.bfloat16),
         )
@@ -1433,6 +1444,10 @@ class TestMoERunnerSupport:
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
             )
+            supported_activation_pack_kind: ClassVar[dict] = {
+                (QuantFormat.NVFP4, QuantFormat.NVFP4): ActivationPackKind.NVFP4_PACKED,
+                (QuantFormat.MXFP4, QuantFormat.MXFP8): ActivationPackKind.MXFP8,
+            }
             supported_activation_classes_by_quant: ClassVar[dict] = {
                 (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU,),
             }
@@ -1450,6 +1465,7 @@ class TestMoERunnerSupport:
         # is pair-keyed, so check_support succeeds when the runner lists it.
         class _Mxfp4xMxfp4Runner(MoERunner):
             supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP4),)
+            supported_activation_pack_kind = ActivationPackKind.BF16
             supported_activation_classes_by_quant = {
                 (QuantFormat.MXFP4, QuantFormat.MXFP4): (SwiGLU,),
             }
@@ -1677,6 +1693,7 @@ class TestMoERunnerSupport:
     def test_moe_runner_quant_support_check(self):
         class Runner(MoERunner):
             supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_activation_pack_kind = ActivationPackKind.NVFP4_PACKED
             supported_activation_classes = (SwiGLU,)
 
             def get_valid_tactics(self, inputs, profile):
@@ -1692,6 +1709,7 @@ class TestMoERunnerSupport:
     def test_moe_runner_without_activation_capability_is_rejected(self):
         class Runner(MoERunner):
             supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_activation_pack_kind = ActivationPackKind.NVFP4_PACKED
 
             def get_valid_tactics(self, inputs, profile):
                 return []
@@ -1703,6 +1721,24 @@ class TestMoERunnerSupport:
         runner.config = self._nvfp4_swiglu()
         with pytest.raises(
             NotImplementedError, match="declares no supported activation classes"
+        ):
+            runner.check_support()
+
+    def test_moe_runner_without_pack_kind_is_rejected(self):
+        class Runner(MoERunner):
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_activation_classes = (SwiGLU,)
+
+            def get_valid_tactics(self, inputs, profile):
+                return []
+
+            def forward(self, inputs, **kwargs):
+                return None
+
+        runner = Runner()
+        runner.config = self._nvfp4_swiglu()
+        with pytest.raises(
+            NotImplementedError, match="must declare supported_activation_pack_kind"
         ):
             runner.check_support()
 
@@ -1977,6 +2013,246 @@ class TestActivationPackValidation:
         fields[field_name] = torch.zeros(t.shape, dtype=t.dtype, device="meta")
         with pytest.raises(ValueError, match="device"):
             MoEActivationPack(x, **fields)
+
+
+class TestActivationPackKind:
+    """Layout tokens inferred from dtypes/scale shape; MoELayer filters by them."""
+
+    def _nvfp4_config(self, backend):
+        return MoEConfig(
+            routing=RoutingConfig(num_experts=4, top_k=2),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            experts=ExpertConfig(intermediate_size=256),
+            backend=backend,
+        )
+
+    def _packed_act(self, num_tokens=2, hidden=64):
+        return MoEActivationPack(
+            torch.empty(num_tokens, hidden // 2, dtype=torch.uint8),
+            torch.empty(num_tokens, hidden // 16, dtype=torch.uint8),
+            torch.zeros(num_tokens, 2, dtype=torch.int32),
+            torch.ones(num_tokens, 2),
+        )
+
+    def _bf16_act(self, num_tokens=2, hidden=64):
+        return MoEActivationPack(
+            torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
+            None,
+            torch.zeros(num_tokens, 2, dtype=torch.int32),
+            torch.ones(num_tokens, 2),
+        )
+
+    def test_infers_known_layouts(self):
+        assert (
+            self._packed_act().activation_pack_kind == ActivationPackKind.NVFP4_PACKED
+        )
+        assert self._bf16_act().activation_pack_kind == ActivationPackKind.BF16
+        fp8 = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.float8_e4m3fn),
+            None,
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        assert fp8.activation_pack_kind == ActivationPackKind.FP8_E4M3
+        fp8_scalar = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.float8_e4m3fn),
+            torch.ones((), dtype=torch.float32),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        assert fp8_scalar.activation_pack_kind == ActivationPackKind.FP8_E4M3_SCALAR
+        fp8_block = MoEActivationPack(
+            torch.empty(2, 128, dtype=torch.float8_e4m3fn),
+            torch.empty(1, 2, dtype=torch.float32),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        assert fp8_block.activation_pack_kind == ActivationPackKind.FP8_BLOCK
+        mxfp8 = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.float8_e4m3fn),
+            torch.empty(2, 2, dtype=torch.uint8),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        assert mxfp8.activation_pack_kind == ActivationPackKind.MXFP8
+        mxfp8_e4m3_sf = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.float8_e4m3fn),
+            torch.empty(2, 2, dtype=torch.float8_e4m3fn),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        assert mxfp8_e4m3_sf.activation_pack_kind == ActivationPackKind.MXFP8
+        swizzled_numel = 128 * 4
+        swizzled = MoEActivationPack(
+            torch.empty(16, 128, dtype=torch.float8_e4m3fn),
+            torch.empty(swizzled_numel, dtype=torch.uint8),
+            torch.zeros(16, 2, dtype=torch.int32),
+            torch.ones(16, 2),
+        )
+        assert swizzled.activation_pack_kind == ActivationPackKind.MXFP8_SWIZZLED
+
+    def test_fail_closed_on_leftover_bf16_scale(self):
+        act = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.bfloat16),
+            torch.empty(0),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        assert act.activation_pack_kind == ActivationPackKind.UNKNOWN
+
+    def _install_mixed_nvfp4_fakes(self, monkeypatch, packed_cls, bf16_cls):
+        from flashinfer.fused_moe import layer as layer_module
+
+        monkeypatch.setattr(
+            layer_module, "get_compute_capability", lambda device: (10, 0)
+        )
+        monkeypatch.setitem(layer_module._BACKEND_RUNNERS, TrtllmFp4Config, packed_cls)
+        monkeypatch.setitem(layer_module._BACKEND_RUNNERS, CutlassNvfp4Config, bf16_cls)
+
+    def _mixed_nvfp4_layer(self, monkeypatch, packed_cls, bf16_cls):
+        self._install_mixed_nvfp4_fakes(monkeypatch, packed_cls, bf16_cls)
+        cfg = self._nvfp4_config(
+            BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
+        )
+        layer = MoELayer(cfg, device=torch.device("cpu"))
+        layer._select_winner = lambda _act, _weights, runners: (runners[0], -1)
+        return layer
+
+    def test_layer_drops_wrong_kind_and_keeps_matching(self, monkeypatch):
+        packed_calls = []
+        bf16_calls = []
+
+        class PackedFake(MoERunner):
+            backend_key = "fake_packed"
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_activation_classes = (SwiGLU,)
+            supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+            supported_activation_pack_kind = ActivationPackKind.NVFP4_PACKED
+
+            def __init__(self, config, device):
+                super().__init__()
+                self.config = config
+                self.device = device
+
+            def _pack_inputs(self, act, weights):
+                packed_calls.append(act.activation_pack_kind)
+                return []
+
+            def launch_kwargs_for(self, inputs):
+                return {}
+
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.empty(0)
+
+            def get_valid_tactics(self, inputs, profile):
+                return [-1]
+
+        class Bf16Fake(PackedFake):
+            backend_key = "fake_bf16"
+            supported_activation_pack_kind = ActivationPackKind.BF16
+
+            def _pack_inputs(self, act, weights):
+                bf16_calls.append(act.activation_pack_kind)
+                return []
+
+        layer = self._mixed_nvfp4_layer(monkeypatch, PackedFake, Bf16Fake)
+        assert {r.backend_key for r in layer.runners} == {"fake_packed", "fake_bf16"}
+
+        layer(self._packed_act(), MoEWeightPack())
+        assert packed_calls == [ActivationPackKind.NVFP4_PACKED]
+        assert bf16_calls == []
+        assert layer.winner_backend == "fake_packed"
+
+        packed_calls.clear()
+        layer(self._bf16_act(), MoEWeightPack())
+        assert packed_calls == []
+        assert bf16_calls == [ActivationPackKind.BF16]
+        assert layer.winner_backend == "fake_bf16"
+
+        kinds = {key[2] for key in layer._winners}
+        assert kinds == {
+            ActivationPackKind.NVFP4_PACKED,
+            ActivationPackKind.BF16,
+        }
+
+    def test_layer_same_kind_mix_still_competes(self, monkeypatch):
+        seen = []
+
+        class FakeA(MoERunner):
+            backend_key = "fake_a"
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_activation_classes = (SwiGLU,)
+            supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+            supported_activation_pack_kind = ActivationPackKind.BF16
+
+            def __init__(self, config, device):
+                super().__init__()
+                self.config = config
+                self.device = device
+
+            def _pack_inputs(self, act, weights):
+                return []
+
+            def launch_kwargs_for(self, inputs):
+                return {}
+
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.empty(0)
+
+            def get_valid_tactics(self, inputs, profile):
+                return [-1]
+
+        class FakeB(FakeA):
+            backend_key = "fake_b"
+
+        layer = self._mixed_nvfp4_layer(monkeypatch, FakeA, FakeB)
+
+        def _select(act, weights, runners):
+            seen.extend(r.backend_key for r in runners)
+            return runners[0], -1
+
+        layer._select_winner = _select
+        layer(self._bf16_act(), MoEWeightPack())
+        assert seen == ["fake_a", "fake_b"]
+
+    def test_layer_unknown_kind_uses_existing_empty_subset_error(self, monkeypatch):
+        class PackedFake(MoERunner):
+            backend_key = "fake_packed"
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+            supported_activation_classes = (SwiGLU,)
+            supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+            supported_activation_pack_kind = ActivationPackKind.NVFP4_PACKED
+
+            def __init__(self, config, device):
+                super().__init__()
+                self.config = config
+                self.device = device
+
+            def _pack_inputs(self, act, weights):
+                return []
+
+            def launch_kwargs_for(self, inputs):
+                return {}
+
+            def forward(self, inputs, tactic=-1, **kwargs):
+                return torch.empty(0)
+
+            def get_valid_tactics(self, inputs, profile):
+                return [-1]
+
+        class Bf16Fake(PackedFake):
+            backend_key = "fake_bf16"
+            supported_activation_pack_kind = ActivationPackKind.BF16
+
+        layer = self._mixed_nvfp4_layer(monkeypatch, PackedFake, Bf16Fake)
+        unknown = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.bfloat16),
+            torch.empty(0),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+        )
+        with pytest.raises(NotImplementedError, match="activation_pack_kind='unknown'"):
+            layer(unknown, MoEWeightPack())
 
 
 class TestRunnerBoundaryValidation:

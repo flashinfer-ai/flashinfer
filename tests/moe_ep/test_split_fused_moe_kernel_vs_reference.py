@@ -194,7 +194,7 @@ def test_split_bf16_kernel_matches_torch_reference():
 
     act = MoEActivationPack(
         hidden_states_q=x,
-        hidden_states_scale=torch.empty(0, device=x.device),
+        hidden_states_scale=None,
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights.to(torch.float32),
     )

@@ -21,6 +21,7 @@ from flashinfer.fused_moe import (
     SwiGLUStep,
     # Unified configs, packs, and runners
     BackendOptions,
+    ActivationPackKind,
     CutlassBf16Config,
     CutlassBf16Runner,
     CutlassFp8BlockConfig,
@@ -149,6 +150,7 @@ def test_all_registered_runners_use_enforced_lifecycle():
         assert issubclass(runner_type, MoERunner)
         assert runner_type.check_support is MoERunner.check_support
         assert runner_type.build is MoERunner.build
+        assert runner_type.pack_inputs is MoERunner.pack_inputs
 
 
 @pytest.mark.parametrize("runner_type", tuple(_BACKEND_RUNNERS.values()))
@@ -172,6 +174,7 @@ def test_moe_runner_enforces_lifecycle_order():
 
     class Runner(MoERunner):
         supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+        supported_activation_pack_kind = ActivationPackKind.BF16
         supported_activation_classes = (SwiGLU,)
 
         def _check_support(self):
@@ -1189,6 +1192,9 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
         supported_output_formats = (QuantFormat.BF16,)
         supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
         backend_key = "recording"
+
+        def pack_kind_for_config(self):
+            return ActivationPackKind.BF16
 
         @classmethod
         def supports_quant(cls, quant):
