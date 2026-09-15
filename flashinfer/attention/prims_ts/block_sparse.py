@@ -20,6 +20,8 @@ an immutable revision. ``run()`` validates compact BSHD Q/K/V and caller-owned
 routing tensors, then enqueues route preparation followed by attention in one
 compiled adapter on the caller's CUDA stream. The one-shot entry point retains
 synchronous canonical-BSR inspection to derive its temporary plan capacity.
+A dense plan (``use_block_sparse=False``) keeps the tile selection but attends
+over the whole K/V sequence without route preparation.
 
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
 kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
@@ -43,7 +45,10 @@ from flashinfer.trace.templates.attention import (
 )
 
 from ._block_sparse.common import _validate_contiguous_route_mode
-from ._block_sparse.config import _validate_block_sparse_static_profile
+from ._block_sparse.config import (
+    _CAPACITY_UNSET,
+    _validate_block_sparse_static_profile,
+)
 from ._block_sparse.inspection import (
     _inspect_block_sparse_bsr,
     _inspect_paged_block_sparse_metadata,
@@ -124,6 +129,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
     using them. CUDA Graph capture pins plan-owned state only, so captured
     routing storage remains the caller's responsibility.
 
+    A dense plan (``use_block_sparse=False``) attends over the whole K/V
+    sequence with the same tile selection; it owns no routing storage and its
+    runs take Q/K/V only.
+
     One plan revision owns one mutable route workspace. Its runs must be ordered
     on one stream or externally synchronized; unordered concurrent runs require
     distinct wrappers.
@@ -142,8 +151,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_block_size: int,
         *,
         device: torch.device | str | int,
-        max_blocks_per_row: int,
-        use_kv_valid_bits: bool,
+        use_block_sparse: bool = True,
+        max_blocks_per_row: int | None = None,
+        use_kv_valid_bits: bool = False,
         sparse_format: Literal["bsr", "bitmask"] = "bsr",
         use_proxy_routes: bool = False,
         mask_type: Literal["dense", "causal"] = "dense",
@@ -165,6 +175,15 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         tensor identities and index extents to each run as long as they fit
         this declared capacity.
 
+        ``use_block_sparse=False`` plans dense attention over the whole K/V
+        sequence instead. A dense plan owns no route workspace and launches no
+        route preparation, so ``max_blocks_per_row``, ``use_kv_valid_bits``,
+        ``sparse_format``, and ``use_proxy_routes`` must keep their defaults,
+        and :meth:`run` takes Q/K/V only. The block sizes select the same Q
+        tile and KV route as a block-sparse plan, and the scheduler follows
+        the decode kernel's launch heuristic between the static grid and the
+        persistent scheduler.
+
         MHA, GQA, and MQA are supported with ``Hq / Hkv`` a power of two no
         greater than 32 and ``D=128``. Q, K, V, and O use one matching
         ``torch.float16`` or ``torch.bfloat16`` dtype. Runtime tensor shapes
@@ -183,9 +202,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         exact-route work. Every run prepares its selected BSR or bitmask into
         compact, profile-selected fixed-width route metadata, and the attention
         core consumes only that metadata. This remains true when every KV block
-        is selected;
-        callers that know a pattern is dense should choose the dense FMHA API
-        explicitly.
+        is selected; callers that know a pattern is dense should plan the dense
+        mode instead.
 
         Planning does not inspect routing values and does not synchronize the
         host. Reusable runs trust those values; assertion-enabled CuTe DSL
@@ -200,7 +218,23 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         runs require distinct wrappers.
         """
 
-        _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
+        if use_block_sparse:
+            if max_blocks_per_row is None:
+                raise ValueError(
+                    "max_blocks_per_row is required by a block-sparse plan"
+                )
+            _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
+        else:
+            for name, value, default in (
+                ("max_blocks_per_row", max_blocks_per_row, None),
+                ("use_kv_valid_bits", use_kv_valid_bits, False),
+                ("sparse_format", sparse_format, "bsr"),
+                ("use_proxy_routes", use_proxy_routes, False),
+            ):
+                if value != default:
+                    raise ValueError(
+                        f"{name} is unsupported by a dense contiguous plan"
+                    )
         static = _validate_block_sparse_static_profile(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -215,7 +249,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
             output_dtype=o_data_type,
-            max_blocks_per_row=max_blocks_per_row,
+            max_blocks_per_row=(
+                max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
+            ),
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -233,6 +269,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 plan_stream=plan_stream,
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
+                use_block_sparse=use_block_sparse,
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
@@ -263,6 +300,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         supplied; otherwise it is a newly allocated compact BSHD tensor.
         Only O is returned; this PrimTS API does not return LSE. The launch is
         enqueued asynchronously on the caller's current CUDA stream.
+
+        A dense contiguous plan attends over the whole K/V sequence and rejects
+        every routing argument below; all of them must remain ``None``. Tracing
+        a dense run has no trace template and raises ``NotImplementedError``.
 
         A BSR plan consumes compact Int32 ``block_indptr`` with shape
         ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and compact Int32

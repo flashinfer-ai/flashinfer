@@ -179,6 +179,13 @@ semantic KV block. The final partial block uses only its structural tokens.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
 proxy summaries or their represented mass.
 
+`BlockSparseTSWrapper.plan(..., use_block_sparse=False)` plans dense attention
+over the whole contiguous K/V sequence with the same Q-tile and KV-route
+selection and the same profile matrix as a block-sparse plan. A dense plan
+owns no route workspace, launches no route preparation, and its `run` takes
+Q/K/V only; its scheduler follows the decode kernel's launch heuristic between
+the static grid and the persistent scheduler.
+
 ## Validation
 
 Run the numerical, graph, scheduler/resource, and public-surface

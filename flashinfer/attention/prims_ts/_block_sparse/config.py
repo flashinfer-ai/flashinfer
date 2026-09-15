@@ -84,6 +84,9 @@ class _BlockSparseCompileKey:
     sparse_format: Literal["bsr", "bitmask"] = "bsr"
     use_proxy_routes: bool = False
     page_size: int | None = None
+    # A dense key keeps the Q-tile and KV-route selection; its configuration
+    # reads none of the routing fields above.
+    use_block_sparse: bool = True
 
 
 @dataclass(frozen=True)
@@ -221,6 +224,48 @@ def _select_block_sparse_scheduler(
     ):
         return q_tile_size, False
 
+    return q_tile_size, _select_persistent_launch(
+        device_index=device_index,
+        batch_size=batch_size,
+        seq_len_q=seq_len_q,
+        # Each task is sized by its prepared route capacity, not by the K/V
+        # extent.
+        seq_len_kv=max_row_route_capacity * kv_route_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        q_tile_size=q_tile_size,
+        kv_route_size=kv_route_size,
+        persistent_min_waves=(
+            _CAUSAL_CLC_WAVE_THRESHOLD
+            if mask_type == "causal"
+            else _BLOCK_SPARSE_CLC_MIN_WAVES
+        ),
+        persistent_min_tiles_per_cta=(
+            _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
+        ),
+    )
+
+
+def _select_persistent_launch(
+    *,
+    device_index: int,
+    batch_size: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    q_tile_size: int,
+    kv_route_size: int,
+    persistent_min_waves: int = 1,
+    persistent_min_tiles_per_cta: int = 1,
+) -> bool:
+    """Ask the decode kernel's launch heuristic for the CLC work-tile loop.
+
+    ``seq_len_kv`` is the K/V extent the heuristic sizes each task by. A
+    ``gmem_reduction`` outcome maps to the static grid, because these plans
+    never split K/V across CTAs.
+    """
+
     from ..kernels.fmha_decode.fmha_decode_config import (
         _select_auto_launch_mode,
         make_q_tile_geometry,
@@ -228,27 +273,34 @@ def _select_block_sparse_scheduler(
 
     q_geometry = make_q_tile_geometry(
         rows_per_cta=q_tile_size,
-        heads_q_per_kv=heads_q_per_kv,
+        heads_q_per_kv=num_qo_heads // num_kv_heads,
         groups_tokens_heads_q=True,
     )
-    scheduler_kv_capacity_tokens = max_row_route_capacity * kv_route_size
     with torch.cuda.device(device_index):
         mode = _select_auto_launch_mode(
             batch_size=batch_size,
             num_heads_kv=num_kv_heads,
-            seq_len_kv=scheduler_kv_capacity_tokens,
+            seq_len_kv=seq_len_kv,
             num_q_tiles=q_geometry.num_q_ctas(seq_len_q),
             tile_size_kv=kv_route_size,
-            persistent_min_waves=(
-                _CAUSAL_CLC_WAVE_THRESHOLD
-                if mask_type == "causal"
-                else _BLOCK_SPARSE_CLC_MIN_WAVES
-            ),
-            persistent_min_tiles_per_cta=(
-                _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
-            ),
+            persistent_min_waves=persistent_min_waves,
+            persistent_min_tiles_per_cta=persistent_min_tiles_per_cta,
         )
-    return q_tile_size, mode == "persistent"
+    return mode == "persistent"
+
+
+def _validate_dense_contiguous_kv_extent(
+    *,
+    seq_len_kv: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Reject a contiguous K/V batch stride the launch ABI cannot express."""
+
+    if seq_len_kv * num_kv_heads * head_dim > _SIGNED_INT32_MAX:
+        raise OverflowError(
+            "dense contiguous K/V batch stride must fit in signed int32"
+        )
 
 
 def _validate_matching_dtypes(
@@ -411,16 +463,21 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "tile_size_q": q_tile_size,
         "tile_size_kv": key.kv_route_size,
         "groups_tokens_heads_q": True,
-        "use_block_sparse": True,
-        "q_block_size": key.q_block_size,
-        "kv_block_size": key.kv_block_size,
-        "use_kv_valid_bits": key.use_kv_valid_bits,
-        "use_parallel_sparse_kv_loads": key.use_parallel_sparse_kv_loads,
+        "use_block_sparse": key.use_block_sparse,
     }
+    if key.use_block_sparse:
+        config_args.update(
+            {
+                "q_block_size": key.q_block_size,
+                "kv_block_size": key.kv_block_size,
+                "use_kv_valid_bits": key.use_kv_valid_bits,
+                "use_parallel_sparse_kv_loads": key.use_parallel_sparse_kv_loads,
+            }
+        )
+        if key.use_proxy_routes:
+            config_args["use_block_sparse_proxy_routes"] = True
     if key.use_persistent_scheduler:
         config_args["use_persistent_scheduler"] = True
-    if key.use_proxy_routes:
-        config_args["use_block_sparse_proxy_routes"] = True
     layout_args: dict[str, object]
     if key.page_size is None:
         layout_args = {"qkv_layout": "contiguousKv"}
@@ -466,6 +523,7 @@ def _resolve_block_sparse_launch_spec(
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     page_size: int | None = None,
+    use_block_sparse: bool = True,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -473,22 +531,46 @@ def _resolve_block_sparse_launch_spec(
     index values and physical-tail morphology never specialize this cache
     entry. Proxy and exact routes share one scheduler selection. An
     unsupported persistent profile falls back to its valid static
-    counterpart.
+    counterpart. A dense plan keeps the block-sparse tile selection and sizes
+    its scheduler decision by the whole K/V sequence instead of a route
+    capacity.
     """
 
-    q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
-        device_index=device_index,
-        batch_size=batch_size,
-        seq_len_q=seq_len_q,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        q_block_size=q_block_size,
-        kv_block_size=kv_block_size,
-        kv_route_size=kv_route_size,
-        mask_type=mask_type,
-        use_kv_valid_bits=use_kv_valid_bits,
-        max_row_route_capacity=max_row_route_capacity,
-    )
+    if use_block_sparse:
+        q_tile_size, use_persistent_scheduler = _select_block_sparse_scheduler(
+            device_index=device_index,
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            q_block_size=q_block_size,
+            kv_block_size=kv_block_size,
+            kv_route_size=kv_route_size,
+            mask_type=mask_type,
+            use_kv_valid_bits=use_kv_valid_bits,
+            max_row_route_capacity=max_row_route_capacity,
+        )
+    else:
+        q_tile_size = _select_block_sparse_q_tile_size(
+            q_block_size=q_block_size,
+            heads_q_per_kv=num_qo_heads // num_kv_heads,
+            kv_block_size=kv_block_size,
+        )
+        use_persistent_scheduler = _select_persistent_launch(
+            device_index=device_index,
+            batch_size=batch_size,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            q_tile_size=q_tile_size,
+            kv_route_size=kv_route_size,
+        )
+        _validate_dense_contiguous_kv_extent(
+            seq_len_kv=seq_len_kv,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
     compile_key = _BlockSparseCompileKey(
         device_index=device_index,
         batch_size=batch_size,
@@ -504,7 +586,8 @@ def _resolve_block_sparse_launch_spec(
         mask_type=mask_type,
         use_kv_valid_bits=use_kv_valid_bits,
         use_persistent_scheduler=use_persistent_scheduler,
-        use_parallel_sparse_kv_loads=_select_parallel_sparse_kv_loads(
+        use_parallel_sparse_kv_loads=use_block_sparse
+        and _select_parallel_sparse_kv_loads(
             kv_block_size=kv_block_size,
             use_kv_valid_bits=use_kv_valid_bits,
             max_row_route_capacity=max_row_route_capacity,
@@ -513,6 +596,7 @@ def _resolve_block_sparse_launch_spec(
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         page_size=page_size,
+        use_block_sparse=use_block_sparse,
     )
     try:
         config = _make_block_sparse_config(compile_key)
@@ -522,7 +606,8 @@ def _resolve_block_sparse_launch_spec(
         compile_key = replace(
             compile_key,
             use_persistent_scheduler=False,
-            use_parallel_sparse_kv_loads=_select_parallel_sparse_kv_loads(
+            use_parallel_sparse_kv_loads=use_block_sparse
+            and _select_parallel_sparse_kv_loads(
                 kv_block_size=kv_block_size,
                 use_kv_valid_bits=use_kv_valid_bits,
                 max_row_route_capacity=max_row_route_capacity,
@@ -567,8 +652,10 @@ __all__ = [
     "_resolve_block_sparse_launch_spec",
     "_select_block_sparse_kv_route_size",
     "_select_parallel_sparse_kv_loads",
+    "_select_persistent_launch",
     "_should_consider_clc",
     "_validate_block_sparse_static_profile",
+    "_validate_dense_contiguous_kv_extent",
     "_validate_matching_dtypes",
     "_validate_max_blocks_per_row",
 ]

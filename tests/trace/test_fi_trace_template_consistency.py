@@ -630,6 +630,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         )
         wrapper = SimpleNamespace(
             _plan_state=SimpleNamespace(
+                use_block_sparse=True,
                 sparse_format=sparse_format,
                 use_proxy_routes=use_proxy_routes,
             )
