@@ -195,6 +195,9 @@ class W4A16Fc2Epilogue(EpilogueContext):
     def signal_fc2_done(self, work_tile_info, next_work_tile_info, flag_tracker):
         publish: cutlass.Constexpr = self.token_back_by_dispatch
         if cutlass.const_expr(publish):
+            # The epilogue rendezvous orders all STGs before this fence;
+            # publish them to the async proxy before dispatch TMA reads.
+            cute.arch.fence_proxy("async.global")
             flag_addr = (
                 self.token_comm_args.fc2_done_counter.iterator
                 + work_tile_info.expert_idx
@@ -339,6 +342,9 @@ class W4A16Fc1Epilogue(EpilogueContext):
 
     @cute.jit
     def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
+        # The epilogue rendezvous orders all STGs before this fence;
+        # publish them to the async proxy before FC2 TMA reads.
+        cute.arch.fence_proxy("async.global")
         # Only in-bound intermediate_downproj tiles signal; OOB -> null slot.
         if cutlass.const_expr(
             self.static_expert_shape is None
