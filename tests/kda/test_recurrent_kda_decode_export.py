@@ -13,6 +13,10 @@
 # limitations under the License.
 
 import dataclasses
+import os
+import subprocess
+import sys
+import textwrap
 import importlib
 import inspect
 import math
@@ -307,6 +311,40 @@ def test_decode_facade_deprecation_points_at_the_canonical_entry_point_cpu(
     assert record[0].filename == __file__
 
 
+def test_decode_facade_deprecation_blames_the_caller_under_api_logging_cpu():
+    """Attribution must survive FLASHINFER_LOGLEVEL>0 (see #5248 review).
+
+    The loglevel fixes the decorator chain's depth at import time, so it cannot
+    be varied in-process; a subprocess is the only way to pin it.
+    """
+
+    program = textwrap.dedent(
+        """
+        import warnings
+        from flashinfer.kda_decode import recurrent_kda
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                recurrent_kda(*[object()] * 5)
+            except Exception:
+                pass
+        blamed = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        print(blamed[0].filename if blamed else "NONE")
+        """
+    )
+    env = {**os.environ, "FLASHINFER_LOGLEVEL": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    blamed = result.stdout.strip().splitlines()[-1]
+    assert blamed == "<string>", f"warning blamed {blamed!r}, not the caller"
+
+
 def test_omitted_backend_stays_distinguishable_from_explicit_cute_dsl_cpu():
     """``None`` records "not requested", which an explicit value cannot.
 
@@ -317,6 +355,22 @@ def test_omitted_backend_stays_distinguishable_from_explicit_cute_dsl_cpu():
     callers who named ``"cute-dsl"``.
     """
     assert inspect.signature(recurrent_kda).parameters["backend"].default is None
+
+
+def _backend_enum(func) -> set[str]:
+    """The ``backend`` annotation's literal values, through any ``Optional``.
+
+    ``get_args`` on ``Optional[Literal[...]]`` yields the inner ``Literal`` and
+    ``NoneType`` rather than the strings, so the enum has to be unwrapped one
+    level to be assertable at all.
+    """
+
+    annotation = inspect.signature(func).parameters["backend"].annotation
+    args = typing.get_args(annotation)
+    values = {arg for arg in args if isinstance(arg, str)}
+    for arg in args:
+        values |= {inner for inner in typing.get_args(arg) if isinstance(inner, str)}
+    return values
 
 
 def test_decode_facade_rejects_cudnn_by_naming_the_phase_neutral_facade_cpu(
@@ -339,12 +393,11 @@ def test_decode_facade_rejects_cudnn_by_naming_the_phase_neutral_facade_cpu(
         recurrent_kda(*tensors, backend="cudnn")
 
     top_level = importlib.import_module("flashinfer.kda").recurrent_kda
-    assert "cudnn" in typing.get_args(
-        inspect.signature(top_level).parameters["backend"].annotation
-    )
-    assert "cudnn" not in typing.get_args(
-        inspect.signature(recurrent_kda).parameters["backend"].annotation
-    )
+    assert "cudnn" in _backend_enum(top_level)
+    assert "cudnn" not in _backend_enum(recurrent_kda)
+    # Without this the negative assertion above passes vacuously whenever the
+    # annotation stops being unwrappable, which is how it read before #5248.
+    assert "cute-dsl" in _backend_enum(recurrent_kda)
 
 
 def test_cake_backend_rejects_empty_packed_decode_instead_of_noop_cpu():

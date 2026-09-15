@@ -23,6 +23,8 @@ Kernel implementations are in ``flashinfer.kda_kernels``; callers may
 explicitly select Cake or use its narrow native auto-dispatch contract.
 """
 
+import inspect
+import os
 import warnings
 from typing import Literal, Optional
 
@@ -65,6 +67,31 @@ _RECURRENT_KDA_AVAILABLE = _run_recurrent_kda is not None
 
 # What an omitted backend on the deprecated decode facade resolves to. Held
 # separately from the signature default so the two stay distinguishable.
+_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _caller_stacklevel() -> int:
+    """Depth of the nearest frame outside this package.
+
+    The decorator chain between the caller and this function grows when API
+    logging is enabled, so a fixed stacklevel blames an internal frame at
+    FLASHINFER_LOGLEVEL>0 -- useless for a warning whose job is to name the
+    call the caller has to change.
+    """
+
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None:
+        parent = frame.f_back
+        level += 1
+        if parent is not None and not os.path.abspath(
+            parent.f_code.co_filename
+        ).startswith(_PACKAGE_ROOT):
+            return level
+        frame = parent
+    return 3
+
+
 _RELEASED_DECODE_BACKEND: Literal["cute-dsl"] = "cute-dsl"
 
 
@@ -341,7 +368,7 @@ def recurrent_kda(
         "what this entry point accepts, and defaults to backend='auto'. "
         "Scheduled for removal in a future release.",
         DeprecationWarning,
-        stacklevel=3,
+        stacklevel=_caller_stacklevel(),
     )
     if backend is None:
         backend = _RELEASED_DECODE_BACKEND
