@@ -753,6 +753,12 @@ class FmhaDecodeConfig:
     def uses_task_register_reallocation(self) -> bool:
         return self.use_keeps_mma_ab and (
             self.tile_size_q == 128
+            # Persistent grouped masks keep additional routing/softmax state
+            # live. Reuse the same CTA-pool budgets to give it register headroom.
+            or (
+                self.use_persistent_scheduler
+                and self.uses_q_token_kv_block_sparse_page_membership
+            )
             or (
                 self.tile_size_q == 64
                 and self.tile_size_kv == 256
