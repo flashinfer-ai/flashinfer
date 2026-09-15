@@ -295,6 +295,8 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
     larger = [
+        ((512, 8192, 28672), ("cooperative", 128, 128, 256)),
+        ((512, 5120, 4096), ("cooperative", 128, 64, 256)),
         ((256, 34816, 5120), ("cooperative", 128, 128, 256)),
         ((256, 5120, 17408), ("cooperative", 128, 128, 256)),
         ((512, 34816, 5120), ("cooperative", 128, 128, 256)),
@@ -322,6 +324,13 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
     ]
     neighbors += [(1024, 34816, 5120)]
     neighbors += [
+        (256, 8192, 28672),
+        (1024, 8192, 28672),
+        (512, 8320, 28672),
+        (512, 8192, 28928),
+    ]
+    neighbors += [(256, 5120, 4096), (1024, 5120, 4096), (512, 5120, 4352)]
+    neighbors += [
         (m, n, k)
         for m in [1, 16, 32, 64, 128]
         for n, k in [(34944, 5120), (34816, 5376), (5120, 17664)]
@@ -342,7 +351,12 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         for m in [16, 32, 64, 128, 256, 512, 1024]
         for n, k in [(34816, 5120), (5120, 17408)]
     ]
-    + [(4096, 5120, 17408), (8192, 5120, 17408)],
+    + [
+        (4096, 5120, 17408),
+        (8192, 5120, 17408),
+        (512, 5120, 4096),
+        (512, 8192, 28672),
+    ],
 )
 def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypatch):
     cc = get_compute_capability(torch.device("cuda"))
