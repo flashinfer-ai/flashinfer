@@ -41,6 +41,7 @@ Key features:
 """
 
 import functools
+import os
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,6 +62,8 @@ from flashinfer.cute_dsl.utils import (
 
 # Import the Blackwell (SM100) kernel implementation
 from .blackwell.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+    PEER_DST_RANK_LIMIT,
+    PEER_DST_ROW_LIMIT,
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
 )
 
@@ -180,6 +183,54 @@ def create_finalize_fusion_tensors(
 _finalize_kernel_cache: Dict[Tuple, Any] = {}
 
 
+def _peer_scatter_sync_checks_enabled(device: torch.device) -> bool:
+    """Whether to run the device-synchronizing peer-destination bounds check.
+
+    Off by default: the check reads token_dst_local_idx back to the host, which
+    would sync on every forward. Follow the same opt-in switch the MLA wrapper
+    uses (`_validate_dsv4_sync_checks` in flashinfer/mla/_core.py), and never
+    sync during CUDA graph capture.
+    """
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
+        return False
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                return False
+    return True
+
+
+def _peer_wrapper_kwargs(
+    use_peer_scatter: bool,
+    peer_addresses_ptr,
+    token_dst_rank_ptr,
+    token_dst_local_idx_ptr,
+    *,
+    world_size: Optional[int] = None,
+    peer_rows: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build the peer-scatter keyword arguments for the Blackwell wrapper.
+
+    Returns an empty dict when peer scatter is off, so the default path
+    traces and launches the wrapper with exactly the arguments it used before
+    this feature existed. ``world_size``/``peer_rows`` are compile-time only:
+    pass them at the ``cute.compile`` site and omit them at the launch site,
+    the same way ``tile_size`` and ``max_active_clusters`` are handled.
+    """
+    if not use_peer_scatter:
+        return {}
+    kwargs: Dict[str, Any] = {
+        "peer_addresses_ptr": peer_addresses_ptr,
+        "token_dst_rank_ptr": token_dst_rank_ptr,
+        "token_dst_local_idx_ptr": token_dst_local_idx_ptr,
+    }
+    if world_size is not None:
+        kwargs["world_size"] = world_size
+    if peer_rows is not None:
+        kwargs["peer_rows"] = peer_rows
+    return kwargs
+
+
 def _get_compiled_finalize_kernel(
     # Problem dimensions (runtime parameters - NOT in cache key)
     seq_len: int,
@@ -201,6 +252,9 @@ def _get_compiled_finalize_kernel(
     num_tiles_ptr,
     token_scales_ptr,
     a_per_token_scale_ptr,
+    peer_addresses_ptr,
+    token_dst_rank_ptr,
+    token_dst_local_idx_ptr,
     max_active_clusters: int,
     stream,
     # Tactic parameters (compile-time - IN cache key)
@@ -222,6 +276,14 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    # Peer-scatter (cross-GPU combine fused into the epilogue). world_size and
+    # peer_rows are compile-time: both are fixed by the symmetric-memory
+    # allocation for the lifetime of the process, so baking them keeps the peer
+    # table and the combine-buffer view statically shaped.
+    use_peer_scatter: bool = False,
+    world_size: int = 0,
+    peer_rows: int = 0,
+    peer_release_fence: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -257,9 +319,19 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        use_peer_scatter,
+        world_size,
+        peer_rows,
+        peer_release_fence,
     )
 
     if cache_key not in _finalize_kernel_cache:
+        if is_rubin and use_peer_scatter:
+            raise NotImplementedError(
+                "use_peer_scatter is not supported by the Rubin (SM107) "
+                "finalize grouped GEMM kernel: its wrapper has no peer-address "
+                "parameters."
+            )
         if is_rubin:
             if use_a_per_token_scale:
                 raise NotImplementedError(
@@ -307,6 +379,8 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                use_peer_scatter=use_peer_scatter,
+                peer_release_fence=peer_release_fence,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -346,6 +420,16 @@ def _get_compiled_finalize_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            # Keyword-only, and omitted entirely when peer scatter is off, so
+            # the default path traces exactly the signature it did before.
+            **_peer_wrapper_kwargs(
+                use_peer_scatter,
+                peer_addresses_ptr,
+                token_dst_rank_ptr,
+                token_dst_local_idx_ptr,
+                world_size=world_size,
+                peer_rows=peer_rows,
+            ),
         )
 
         _finalize_kernel_cache[cache_key] = compiled_gemm
@@ -381,6 +465,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    peer_addresses: Optional[torch.Tensor] = None,
+    token_dst_rank: Optional[torch.Tensor] = None,
+    token_dst_local_idx: Optional[torch.Tensor] = None,
+    peer_release_fence: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -417,13 +505,39 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         sm_count: Number of SMs to use. Default: max available.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        peer_addresses: Optional peer combine-buffer base addresses, shape
+             ``(world_size,)``, int64, on device. Passing it turns on
+             peer-scatter mode: instead of storing to the local ``out``, the
+             epilogue stores each ``(token, k_slot)`` row into the combine
+             buffer of the rank that owns the token, at tile granularity and
+             overlapped with this kernel's own compute. Entry ``r`` must be the
+             address of rank ``r``'s combine buffer in this process' address
+             space, as produced by
+             ``SymmetricBuffer.rendezvous(materialize_peer_addresses=True)``.
+             Requires ``use_fused_finalize=False`` and is Blackwell-only.
+        token_dst_rank: Owning rank per token, shape ``(seq_len,)``, int32.
+             Required with ``peer_addresses``.
+        token_dst_local_idx: Token index within its owning rank, shape
+             ``(seq_len,)``, int32. Required with ``peer_addresses``.
+        peer_release_fence: Drain the outstanding bulk copies and issue a
+             system-scope release fence once per CTA before GEMM2 exits, so
+             that the kernel cannot finish until its peer writes have landed.
+             Without it, ordering rests on kernel completion alone. Only
+             meaningful with ``peer_addresses``.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
-             in fused mode and ``(seq_len * topk, n)`` otherwise.
+             in fused mode and ``(seq_len * topk, n)`` otherwise. In
+             peer-scatter mode this is the caller-provided local combine
+             buffer, which the kernel does not write through directly -- every
+             store goes through ``peer_addresses``, including this rank's own
+             entry.
 
     Notes:
         - A caller-provided fused output must be zero-initialized.
+        - Peer-scatter mode needs no zero-initialization: every
+          ``(token, k_slot)`` slot has exactly one writer across the whole
+          world, because exactly one rank owns the expert for that route.
         - Call create_finalize_fusion_tensors() to create permuted_idx_to_expanded_idx and token_final_scales.
         - Supports SM100/SM103, plus W4A4 on SM107 with Rubin tactic parameters.
         - Deterministic mode requires a separate ``moe_unpermute`` call.
@@ -496,6 +610,96 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
                 f"a_per_token_scale must have shape ({permuted_m},), "
                 f"got {tuple(a_per_token_scale.shape)}"
             )
+
+    use_peer_scatter = peer_addresses is not None
+    world_size = 0
+    if use_peer_scatter:
+        if use_fused_finalize:
+            raise ValueError(
+                "peer_addresses requires use_fused_finalize=False: peer "
+                "scatter gives every (token, k_slot) route its own destination "
+                "slot on the owning rank, so the epilogue writes with the "
+                "plain non-accumulating store and the routing-weight reduction "
+                "runs afterwards on that rank."
+            )
+        if peer_release_fence and use_fused_finalize:
+            raise ValueError("peer_release_fence requires use_fused_finalize=False")
+        if token_dst_rank is None or token_dst_local_idx is None:
+            raise ValueError(
+                "peer_addresses requires both token_dst_rank and token_dst_local_idx"
+            )
+        if out is None:
+            raise ValueError(
+                "peer_addresses requires an explicit out: it must be this "
+                "rank's symmetric combine buffer, not a fresh allocation"
+            )
+        for name, tensor, dtype, shape in (
+            ("peer_addresses", peer_addresses, torch.int64, None),
+            ("token_dst_rank", token_dst_rank, torch.int32, (seq_len,)),
+            ("token_dst_local_idx", token_dst_local_idx, torch.int32, (seq_len,)),
+        ):
+            if tensor.device.type != "cuda":
+                raise ValueError(f"{name} must be on CUDA device")
+            if tensor.dtype != dtype:
+                raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            if shape is not None and tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+                )
+        if peer_addresses.dim() != 1:
+            raise ValueError(
+                f"peer_addresses must be 1-D (world_size,), got "
+                f"{tuple(peer_addresses.shape)}"
+            )
+        world_size = peer_addresses.shape[0]
+        # The epilogue packs (destination rank, destination row) into the one
+        # int32 metadata slot the meta warp already stages per row, so both
+        # fields must fit. See the PEER_DST_* constants in the Blackwell kernel.
+        if world_size > PEER_DST_RANK_LIMIT:
+            raise ValueError(
+                f"peer scatter supports at most {PEER_DST_RANK_LIMIT} ranks, "
+                f"got world_size={world_size}"
+            )
+        if out.shape[0] > PEER_DST_ROW_LIMIT:
+            raise ValueError(
+                f"peer scatter supports combine buffers of at most "
+                f"{PEER_DST_ROW_LIMIT} rows, got {out.shape[0]}"
+            )
+        # The epilogue stores to peer_addresses[dst_rank] + (dst_local_idx *
+        # topk + k) * n without any device-side bounds check, so an
+        # out-of-range destination map writes into unrelated memory on another
+        # GPU. Peer buffers are symmetric, hence out.shape[0] bounds every
+        # rank. This costs a device sync, so it is opt-in.
+        if _peer_scatter_sync_checks_enabled(out.device):
+            max_rank = int(token_dst_rank.max().item()) if seq_len else -1
+            max_local = int(token_dst_local_idx.max().item()) if seq_len else -1
+            min_idx = (
+                min(
+                    int(token_dst_rank.min().item()),
+                    int(token_dst_local_idx.min().item()),
+                )
+                if seq_len
+                else 0
+            )
+            if min_idx < 0:
+                raise ValueError(
+                    "token_dst_rank and token_dst_local_idx must be "
+                    f"non-negative, got minimum {min_idx}"
+                )
+            if max_rank >= world_size:
+                raise ValueError(
+                    f"token_dst_rank must be < world_size={world_size}, got "
+                    f"maximum {max_rank}"
+                )
+            max_row = max_local * topk + topk - 1
+            if max_row >= out.shape[0]:
+                raise ValueError(
+                    f"token_dst_local_idx={max_local} with topk={topk} needs "
+                    f"combine-buffer row {max_row}, but the buffer has only "
+                    f"{out.shape[0]} rows"
+                )
 
     # Check compute capability
     major, minor = get_compute_capability(a.device)
@@ -574,7 +778,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
         )
 
-    output_rows = seq_len if use_fused_finalize else seq_len * topk
+    if use_peer_scatter:
+        # `out` is this rank's symmetric combine buffer. Its row count is the
+        # per-rank slot count (identical on every rank by construction), not
+        # seq_len * topk, because it is indexed by the OWNING rank's local
+        # token index rather than by this rank's gathered token index.
+        output_rows = out.shape[0]
+    else:
+        output_rows = seq_len if use_fused_finalize else seq_len * topk
 
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
@@ -653,6 +864,24 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     else:
         a_per_token_scale_ptr = None
 
+    if use_peer_scatter:
+        peer_addresses_ptr = make_ptr(
+            cutlass.Int64,
+            peer_addresses.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        )
+        token_dst_rank_ptr = make_ptr(
+            cutlass.Int32, token_dst_rank.data_ptr(), cute.AddressSpace.gmem
+        )
+        token_dst_local_idx_ptr = make_ptr(
+            cutlass.Int32, token_dst_local_idx.data_ptr(), cute.AddressSpace.gmem
+        )
+    else:
+        peer_addresses_ptr = None
+        token_dst_rank_ptr = None
+        token_dst_local_idx_ptr = None
+
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -676,6 +905,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         num_tiles_ptr=num_tiles_ptr,
         token_scales_ptr=token_scales_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
+        peer_addresses_ptr=peer_addresses_ptr,
+        token_dst_rank_ptr=token_dst_rank_ptr,
+        token_dst_local_idx_ptr=token_dst_local_idx_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         sf_vec_size=sf_vec_size,
@@ -693,6 +925,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        use_peer_scatter=use_peer_scatter,
+        world_size=world_size,
+        peer_rows=output_rows if use_peer_scatter else 0,
+        peer_release_fence=peer_release_fence,
     )
 
     # Execute kernel with runtime parameters.
@@ -722,6 +958,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         seq_len,
         topk,
         stream=stream,
+        # world_size/peer_rows are compile-time and are deliberately absent
+        # here, exactly like tile_size and max_active_clusters.
+        **_peer_wrapper_kwargs(
+            use_peer_scatter,
+            peer_addresses_ptr,
+            token_dst_rank_ptr,
+            token_dst_local_idx_ptr,
+        ),
     )
 
     return out

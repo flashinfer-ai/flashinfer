@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import math
 from enum import IntEnum
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -250,6 +250,194 @@ def moe_permute(
         enable_pdl,
         _get_cuda_stream_ptr(),
     )
+
+
+def build_peer_scatter_destination_map(
+    sizes: Sequence[int],
+    device: Union[torch.device, str],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Expand an all-gather ``sizes`` vector into a per-token destination map.
+
+    ``all_gather``/``all_gatherv`` concatenates each rank's rows in rank order,
+    so a row of the gathered activation tensor belongs to exactly one source
+    rank and its index within that rank is fully determined by ``sizes``. The
+    map is therefore a pure function of ``sizes``: nothing is derived inside
+    the GEMM2 kernel and nothing is searched at runtime.
+
+    Args:
+        sizes: Number of tokens contributed by each rank, in rank order.
+            Its length is the world size and ``sum(sizes)`` is the gathered
+            token count, i.e. the ``num_tokens`` GEMM2 sees.
+        device: CUDA device for the returned tensors.
+
+    Returns:
+        ``(token_dst_rank, token_dst_local_idx)``, both int32 of shape
+        ``(sum(sizes),)``: the rank that owns each gathered token, and that
+        token's index within its owning rank. Pass both to
+        :func:`~flashinfer.fused_moe.cute_dsl.fused_moe.cute_dsl_fused_moe`
+        alongside ``peer_addresses``.
+    """
+    counts = [int(size) for size in sizes]
+    if any(count < 0 for count in counts):
+        raise ValueError(f"sizes must be non-negative, got {counts}")
+    if not counts:
+        raise ValueError("sizes must name at least one rank")
+
+    # Built on the host and copied once. This is per-forward setup, not a hot
+    # path, and a rank-order loop on device would be world_size tiny launches.
+    ranks = torch.arange(len(counts), dtype=torch.int32)
+    token_dst_rank = torch.repeat_interleave(ranks, torch.tensor(counts))
+    token_dst_local_idx = torch.cat(
+        [torch.arange(count, dtype=torch.int32) for count in counts]
+        + [torch.empty(0, dtype=torch.int32)]
+    )
+    return token_dst_rank.to(device), token_dst_local_idx.to(device)
+
+
+class PeerCombineBuffer(NamedTuple):
+    """A symmetric combine buffer plus the peer table GEMM2 scatters through."""
+
+    tensor: torch.Tensor
+    peer_addresses: torch.Tensor
+    handle: object  # keeps the rendezvous mapping alive; do not drop it
+    source: str  # which API produced the table, for diagnostics
+
+
+def allocate_peer_combine_buffer(
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    device: Union[torch.device, str],
+    group: "torch.distributed.ProcessGroup",
+) -> PeerCombineBuffer:
+    """Allocate the symmetric combine buffer and its ``[world_size]`` peer table.
+
+    This is a collective call: every rank in ``group`` must reach it with the
+    same ``shape`` and ``dtype``.
+
+    Prefers :class:`~flashinfer.comm.mnnvl_cutedsl.symmetric_buffer.SymmetricBuffer`.
+    That path needs a PyTorch exposing ``_symmetric_memory.get_backend`` and
+    ``handle.get_remote_tensor``; older builds (for example the torch 2.8 in
+    NGC ``pytorch:25.08``) expose ``handle.get_buffer`` instead, so fall back to
+    driving the rendezvous handle directly. Both routes produce the same thing:
+    a ``[world_size]`` int64 tensor whose entry ``r`` holds the address of rank
+    ``r``'s buffer in this process' address space, which is exactly what the
+    ``peer_addresses`` argument of the GEMM2 finalize kernel consumes.
+
+    Args:
+        shape: Buffer shape, ``(rows, hidden_size)``. Identical on every rank.
+        dtype: Buffer element type, matching the MoE output dtype.
+        device: CUDA device to allocate on.
+        group: Process group spanning the ranks that scatter into each other.
+
+    Returns:
+        A :class:`PeerCombineBuffer`. Keep it alive for as long as the kernel
+        may write through it: dropping it unmaps the peer memory.
+    """
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+
+    from ...comm.mnnvl_cutedsl.symmetric_buffer import SymmetricBuffer
+    from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
+
+    world_size = dist.get_world_size(group)
+    try:
+        buffer = SymmetricBuffer.allocate(
+            shape, dtype, torch.device(device), group, materialize_peer_addresses=True
+        )
+        return PeerCombineBuffer(
+            buffer.tensor,
+            buffer.peer_addresses,
+            buffer._handle,
+            "SymmetricBuffer.allocate",
+        )
+    except AttributeError:
+        # This PyTorch predates the APIs SymmetricBuffer needs; fall through.
+        pass
+
+    _enable_symm_mem_for_group(group.group_name)
+    tensor = symm_mem.empty(tuple(shape), dtype=dtype, device=device)
+    handle = symm_mem.rendezvous(tensor, group)
+    addresses = [
+        handle.get_buffer(peer, tuple(shape), dtype).data_ptr()
+        for peer in range(world_size)
+    ]
+    if not all(addresses):
+        raise RuntimeError("symmetric peer mapping is unavailable")
+    if len(set(addresses)) != world_size:
+        raise RuntimeError(f"peer addresses are not distinct: {addresses}")
+    peer_addresses = torch.tensor(addresses, dtype=torch.int64, device=tensor.device)
+    return PeerCombineBuffer(
+        tensor, peer_addresses, handle, "symm_mem.rendezvous + handle.get_buffer"
+    )
+
+
+def peer_scatter_local_reduce(
+    combine_buffer: torch.Tensor,
+    topk_scales: torch.Tensor,
+    num_local_tokens: int,
+    top_k: int,
+    output: Optional[torch.Tensor] = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Reduce a peer-scatter combine buffer over ``top_k`` on the owning rank.
+
+    This is the ``local_reduce`` half of the ``p2p+local_reduce`` design: after
+    every rank's GEMM2 has landed its peer writes -- which the caller must
+    guarantee with a barrier on the process group backing the symmetric memory
+    -- the rank that owns a token holds all ``top_k`` of its partial results in
+    its own ``combine_buffer`` and applies the routing weights here.
+
+    Every slot is written exactly once, by whichever rank owns the expert for
+    that route, so no masking is needed and the identity index map below is
+    always fully valid.
+
+    Args:
+        combine_buffer: This rank's symmetric combine buffer, shape
+            ``(rows, hidden_size)`` with ``rows >= num_local_tokens * top_k``,
+            laid out as ``local_token_idx * top_k + k_slot``.
+        topk_scales: Routing weights for this rank's own tokens, shape
+            ``(num_local_tokens, top_k)``.
+        num_local_tokens: Number of tokens this rank owns.
+        top_k: Experts routed to per token.
+        output: Optional destination, shape ``(num_local_tokens, hidden_size)``.
+        enable_pdl: Forwarded to :func:`moe_unpermute`.
+
+    Returns:
+        The reduced output, shape ``(num_local_tokens, hidden_size)``.
+    """
+    hidden_size = combine_buffer.shape[-1]
+    expected_rows = num_local_tokens * top_k
+    if combine_buffer.shape[0] < expected_rows:
+        raise ValueError(
+            f"combine_buffer must have at least {expected_rows} rows for "
+            f"num_local_tokens={num_local_tokens} and top_k={top_k}, got "
+            f"{combine_buffer.shape[0]}"
+        )
+    if tuple(topk_scales.shape) != (num_local_tokens, top_k):
+        raise ValueError(
+            f"topk_scales must have shape ({num_local_tokens}, {top_k}), got "
+            f"{tuple(topk_scales.shape)}"
+        )
+    if output is None:
+        output = torch.empty(
+            (num_local_tokens, hidden_size),
+            dtype=combine_buffer.dtype,
+            device=combine_buffer.device,
+        )
+    identity_map = torch.arange(
+        expected_rows, dtype=torch.int32, device=combine_buffer.device
+    ).view(num_local_tokens, top_k)
+    moe_unpermute(
+        permuted_input=combine_buffer[:expected_rows],
+        output=output,
+        expanded_idx_to_permuted_idx=identity_map,
+        topk_scales=topk_scales,
+        num_tokens=num_local_tokens,
+        top_k=top_k,
+        input_is_expanded=True,
+        enable_pdl=enable_pdl,
+    )
+    return output
 
 
 def moe_unpermute(

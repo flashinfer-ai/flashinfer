@@ -183,6 +183,39 @@ def blk_copy(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_copy_peer(dst_addr, src_smem, size, loc=None, ip=None):
+    """Bulk-copy one output row to a raw 64-bit global address.
+
+    Identical instruction to :func:`blk_copy`; the only difference is that the
+    destination is passed as an already-computed byte address instead of being
+    read off a tensor iterator. That lets the caller name memory belonging to a
+    peer GPU, whose base pointer is only known at runtime (see
+    ``SymmetricBuffer.peer_addresses`` in
+    ``flashinfer/comm/mnnvl_cutedsl/symmetric_buffer.py``), rather than a
+    compile-time-known ``out`` tensor.
+
+    Peer memory is ordinary mapped global memory here, so no reduction variant
+    is needed: the MoE peer-scatter path gives every ``(token, k_slot)`` route
+    its own destination slot and therefore has exactly one writer per row.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            dst_addr.ir_value(loc=loc, ip=ip),
+            src_smem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            size.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
     llvm.inline_asm(
         None,
