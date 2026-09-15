@@ -1218,9 +1218,8 @@ def top_k_page_table_transform(
         and input.is_contiguous()
     )
 
-    if can_use_cub_topk(
-        algo, input, tie_break, deterministic
-    ) and is_cub_page_table_transform_beneficial(
+    cub_supported = can_use_cub_topk(algo, input, tie_break, deterministic)
+    use_cub = cub_supported and is_cub_page_table_transform_beneficial(
         algo,
         input.size(0),
         input.size(1),
@@ -1228,7 +1227,26 @@ def top_k_page_table_transform(
         tie_break,
         dsa_graph_safe,
         clusters_eligible,
-    ):
+    )
+    if dsa_graph_safe and not use_cub:
+        # Capability takes precedence over performance: FilteredTopK needs
+        # 128 KiB of shared memory, which does not fit on SM120/SM121.
+        with torch.cuda.device(device):
+            # Keep the k limit in sync with FILTERED_TOPK_MAX_K in topk.cuh.
+            native_supported = k <= 2048 and can_implement_filtered_topk()
+        if not native_supported:
+            if not cub_supported:
+                raise NotImplementedError(
+                    "top_k_page_table_transform with dsa_graph_safe=True requires "
+                    "native FilteredTopK (k <= 2048 and 128 KiB shared memory) "
+                    "or a supported CUB call. Native FilteredTopK cannot serve "
+                    f"this call (k={k}, device={device}), and CUB is unavailable "
+                    "for the requested dtype, shape, deterministic mode, or "
+                    f"FLASHINFER_TOPK_ALGO override ({algo!r})."
+                )
+            use_cub = True
+
+    if use_cub:
         topk_module = get_topk_module()
         # Host-side size query (launches nothing); the workspace is cached per device
         # so repeated calls (including under CUDA graph capture) reuse a stable
