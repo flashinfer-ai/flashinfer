@@ -119,7 +119,11 @@ def refresh_current_compilation_context() -> CompilationContext:
 
 
 def check_cuda_arch():
-    compilation_context = refresh_current_compilation_context()
+    compilation_context = current_compilation_context
+    # Retry empty detection, but trust populated metadata: forked workers must
+    # reuse the parent's architecture set without reinitializing CUDA.
+    if not compilation_context.TARGET_CUDA_ARCHS:
+        compilation_context = refresh_current_compilation_context()
     # Collect all detected CUDA architectures
     eligible = False
     for major, minor in compilation_context.TARGET_CUDA_ARCHS:

@@ -18,8 +18,23 @@ def test_check_cuda_arch_refreshes_stale_global_context(monkeypatch):
     assert {(12, "0f")} == jit_core.current_compilation_context.TARGET_CUDA_ARCHS
 
 
+def test_check_cuda_arch_reuses_populated_context(monkeypatch):
+    cached_context = SimpleNamespace(TARGET_CUDA_ARCHS={(12, "0f")})
+
+    def unexpected_probe():
+        raise AssertionError("A populated context must not re-probe CUDA")
+
+    monkeypatch.setattr(jit_core, "current_compilation_context", cached_context)
+    monkeypatch.setattr(jit_core, "CompilationContext", unexpected_probe)
+
+    jit_core.check_cuda_arch()
+
+    assert jit_core.current_compilation_context is cached_context
+    assert {(12, "0f")} == cached_context.TARGET_CUDA_ARCHS
+
+
 def test_check_cuda_arch_error_reports_detected_archs(monkeypatch):
-    stale_context = SimpleNamespace(TARGET_CUDA_ARCHS={(12, "0f")})
+    stale_context = SimpleNamespace(TARGET_CUDA_ARCHS=set())
     empty_context = SimpleNamespace(TARGET_CUDA_ARCHS=set())
 
     monkeypatch.setattr(jit_core, "current_compilation_context", stale_context)
