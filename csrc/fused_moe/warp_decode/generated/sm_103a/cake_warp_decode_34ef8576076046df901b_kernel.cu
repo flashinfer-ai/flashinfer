@@ -435,7 +435,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
+kernel_cake_warp_decode_34ef8576076046df901b(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -518,12 +518,12 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
             mbarrier_init(smem + 176, 1);
             mbarrier_init(smem + 184, 1);
             mbarrier_init(smem + 192, 1);
-            // sfb_free: 5 barriers, init_count=1
-            mbarrier_init(smem + 200, 1);
-            mbarrier_init(smem + 208, 1);
-            mbarrier_init(smem + 216, 1);
-            mbarrier_init(smem + 224, 1);
-            mbarrier_init(smem + 232, 1);
+            // sfb_free: 5 barriers, init_count=128
+            mbarrier_init(smem + 200, 128);
+            mbarrier_init(smem + 208, 128);
+            mbarrier_init(smem + 216, 128);
+            mbarrier_init(smem + 224, 128);
+            mbarrier_init(smem + 232, 128);
             // tmem_sfa_full: 5 barriers, init_count=1
             mbarrier_init(smem + 240, 1);
             mbarrier_init(smem + 248, 1);
@@ -832,7 +832,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                 acc_stage += 1;
                 if (acc_stage == 2) { acc_stage = 0; _phase_mma_full ^= 1; }
                 mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid = 0;
                 unsigned int next_x = 0;
                 unsigned int next_y = 0;
@@ -893,14 +892,13 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     if (warp == 4) {
                         if (elect_sync()) {
                             mbarrier_arrive(tmem_sfb_full_addr + (stage) * 8);
-                            mbarrier_arrive(sfb_free_addr + (stage) * 8);
                         }
                     }
+                    mbarrier_arrive(sfb_free_addr + (stage) * 8);
                     stage += 1;
                     if (stage == 5) { stage = 0; _phase_sfb_full ^= 1; _phase_k_done ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_1 = 0;
                 unsigned int next_x_1 = 0;
                 unsigned int next_y_1 = 0;
@@ -982,7 +980,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     if (stage_1 == 5) { stage_1 = 0; _phase_k_done_1 ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_2 = 0;
                 unsigned int next_x_2 = 0;
                 unsigned int next_y_2 = 0;
@@ -1054,7 +1051,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     if (stage_2 == 5) { stage_2 = 0; _phase_sfb_free ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_3 = 0;
                 unsigned int next_x_3 = 0;
                 unsigned int next_y_3 = 0;
@@ -1108,7 +1104,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     if (stage_3 == 5) { stage_3 = 0; _phase_k_done_2 ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_4) * 8, _phase_work_full_4);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_4 = 0;
                 unsigned int next_x_4 = 0;
                 unsigned int next_y_4 = 0;
@@ -1156,7 +1151,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     if (stage_4 == 5) { stage_4 = 0; _phase_sfa_free ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_5) * 8, _phase_work_full_5);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_5 = 0;
                 unsigned int next_x_5 = 0;
                 unsigned int next_y_5 = 0;
@@ -1216,7 +1210,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     if (stage_5 == 5) { stage_5 = 0; _phase_sfa_full ^= 1; _phase_k_done_3 ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_6) * 8, _phase_work_full_6);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_6 = 0;
                 unsigned int next_x_6 = 0;
                 unsigned int next_y_6 = 0;
@@ -1367,7 +1360,6 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                 acc_stage_1 += 1;
                 if (acc_stage_1 == 2) { acc_stage_1 = 0; _phase_mma_free ^= 1; }
                 mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_full_7);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_7 = 0;
                 unsigned int next_x_7 = 0;
                 unsigned int next_y_7 = 0;
@@ -1419,8 +1411,8 @@ kernel_cake_warp_decode_93e7dae962e4d046b7b0(const __grid_constant__ CUtensorMap
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(work_full_addr + (work_stage_8) * 8);
                 }
+                __syncwarp();
                 mbarrier_wait(work_full_addr + (work_stage_8) * 8, _phase_work_full_8);
-                asm volatile("barrier.sync 6, 512;" ::: "memory");
                 unsigned int valid_8 = 0;
                 unsigned int next_x_8 = 0;
                 unsigned int next_y_8 = 0;

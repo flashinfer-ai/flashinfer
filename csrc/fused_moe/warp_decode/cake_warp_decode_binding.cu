@@ -386,6 +386,18 @@ int64_t PrepareWorkspaceAlways(const Invocation& invocation, const Schedule& sch
       << "warp-decode prepared-workspace receipt capacity is exhausted";
   CheckManifestStatus(generated::PrepareWorkspace(invocation, schedule, stream));
 
+  // Match source preparation: the FC1 epilogue stores only valid routed rows,
+  // while FC2 loads complete N8 tiles of packed activations and scale factors.
+  // Initialize the three caller-owned scratch regions once, outside capture.
+  // Metadata/counters precede intermediate; activation constants start at clamp_limit.
+  generated::detail::WorkspaceView scratch{};
+  TVM_FFI_ICHECK(generated::detail::ResolveWorkspace(
+      invocation.shape, schedule, invocation.workspace, &scratch));
+  const size_t scratch_bytes = static_cast<size_t>(
+      reinterpret_cast<uint8_t*>(scratch.clamp_limit) - scratch.intermediate);
+  CheckCuda(cudaMemsetAsync(scratch.intermediate, 0, scratch_bytes, stream),
+            "cudaMemsetAsync(workspace intermediate, scales and partials)");
+
   // Preparation is deliberately outside timed and capture regions. Complete it
   // before returning so a subsequent launch on any CUDA stream has a concrete
   // happens-before edge without adding an external-event node to captured graphs.
@@ -486,18 +498,12 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
     attributes[attribute_count].val.cooperative = 1;
     ++attribute_count;
   }
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 13020
-  if (launch.allow_oversized_smem) {
-    attributes[attribute_count].id = cudaLaunchAttributeSharedMemoryMode;
-    attributes[attribute_count].val.sharedMemoryMode = cudaSharedMemoryModeAllowNonPortable;
-    ++attribute_count;
-  }
-#else
-  // Older runtimes use the per-function MaxDynamicSharedMemorySize attribute
-  // configured by generated::EnsureDeviceReady. CUDA 13.2 added the explicit
-  // per-launch non-portable shared-memory mode used above.
+  // EnsureDeviceReady opts each supported kernel into its exact dynamic
+  // shared-memory size and rejects requests above the device opt-in ceiling.
+  // Preserve the default launch mode so CUDA uses that function attribute,
+  // matching the source launch; a second per-launch nonportable override is
+  // unnecessary for this export contract.
   (void)launch.allow_oversized_smem;
-#endif
 
   cudaLaunchConfig_t config{};
   config.gridDim = launch.grid;
