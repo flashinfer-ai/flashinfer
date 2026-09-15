@@ -76,6 +76,11 @@ repos:
     hooks:
       # Run the linter.
       - id: ruff-check
+      - id: ruff-check
+        alias: sm12x-import-order
+        name: ruff check (SM12x import order)
+        args: [--select, I]
+        files: ^flashinfer/fused_moe/cute_dsl/blackwell_sm12x/.*\.py$
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]
