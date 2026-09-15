@@ -33,8 +33,8 @@ _SMOKE_CASES = [
     (1, 1024, 3072, torch.bfloat16, True, False, "tinygemm", False),
     (32, 1024, 1024, torch.bfloat16, False, False, "cutile", False),
     (25, 2048, 1024, torch.bfloat16, False, False, "cute-dsl", False),
-    # Warp Split-K: tuned low-M with bias and PDL; other runners serve M > 16
-    # or K above its tile bound.
+    # Warp Split-K: tuned low-M with bias and PDL; M > 16 (32-token tile, tail rows)
+    # on the default tactic; K above its tile bound (served by the other runners).
     (8, 768, 7168, torch.bfloat16, True, True, "cute-dsl", True),
     (17, 2304, 1536, torch.bfloat16, False, False, "cute-dsl", False),
     (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),

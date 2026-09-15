@@ -723,13 +723,12 @@ def mm_bf16(
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M kernels for M <= 32
-        (direct and cluster Split-K, plus warp Split-K for M <= 16) and
-        cuBLASLt above that.
+        (direct, cluster Split-K and warp Split-K) and cuBLASLt above that.
         It is never auto-selected; serving frameworks must select it
         explicitly. Without autotuning, M > 32 runs cuBLASLt; below, the
         direct kernel runs where its shape heuristic applies, otherwise the
-        warp Split-K kernel whenever it is eligible (M <= 16, N % 16 == 0,
-        K % 128 == 0 with at most 64 K tiles; requires CuTe DSL >= 4.7), and
+        warp Split-K kernel whenever it is eligible (N % 16 == 0, K % 128 == 0
+        with at most 64 K tiles; requires CuTe DSL >= 4.7), and
         cluster Split-K otherwise. With autotuning, one call profiles the
         available low-M kernels on their supported buckets and a single
         cuBLASLt fallback runner on each M > 32 bucket, so a single large-M
@@ -2361,7 +2360,6 @@ def _cute_dsl_warp_splitk_bf16_gemm_runner(compute_capability: int):
                 return False
             a, b, *_ = inputs
             try:
-                # Older autotune caches may contain the removed 32-token tile.
                 validate_tactic(
                     WarpSplitKTactic(*tactic), a.shape[0], b.shape[1], a.shape[1]
                 )
@@ -2530,11 +2528,11 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
 def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
-    Keep every available runner for synthesized buckets: warp Split-K serves
-    M <= 16, direct and cluster Split-K serve M <= 32, and only the cuBLASLt
-    fallback offers tactics above 32. Runtime-supported runners come first
-    so ``[0]`` remains a valid no-autotune default. Within that group, prefer
-    direct where its shape heuristic applies, then warp, then cluster Split-K.
+    Keep every available runner for synthesized buckets: low-M kernels serve
+    M <= 32, and only the cuBLASLt fallback offers tactics above 32.
+    Runtime-supported runners come first so ``[0]`` is a valid no-autotune
+    default. Within that group, prefer direct where its shape heuristic applies,
+    then warp, then cluster Split-K.
     """
     from ..cute_dsl.availability import is_cute_dsl_experimental_available
     from .kernels.dense_bf16_gemm_direct import prefer_direct_bf16_gemm_sm100

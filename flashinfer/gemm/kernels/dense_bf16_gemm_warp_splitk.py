@@ -24,7 +24,7 @@ _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
 _A_LOADER_WARPS = 2
 _A_LOADER_THREADS = _A_LOADER_WARPS * 32
-_MAX_M = 16
+_MAX_M = 32
 # Ring depth cap: cold-read bandwidth saturates around 12 stages (96 KB in
 # flight), so deeper rings only enlarge the tactic space.
 _MAX_STAGES = 16
@@ -32,7 +32,7 @@ _MAX_STAGES = 16
 # code size stay proportionate (64 tiles of 256 elements = K 16384).
 _MAX_K_TILES = 64
 _SUPPORTED_OUTPUT_TILES = (16, 32)
-_SUPPORTED_TOKEN_TILES = (8, 16)
+_SUPPORTED_TOKEN_TILES = (8, 16, 32)
 _SUPPORTED_K_TILES = (128, 256)
 _SUPPORTED_B_LOADER_WARPS = (1, 2)
 _SMEM_CAPACITY = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
@@ -342,7 +342,7 @@ def default_tactic(m: int, n: int, k: int) -> WarpSplitKTactic:
     # Splitting M over two half-size token tiles doubles the CTA count at the
     # cost of a second pass over each weight tile; that only pays while the
     # doubled grid still fits in one wave.
-    token_tile = 8 if m <= 8 else 16
+    token_tile = 8 if m <= 8 else 16 if m <= 16 else 32
     if token_tile > 8 and 2 * (n // output_tile) <= sm_count:
         token_tile //= 2
     # Two B-loader warps pay off once the ring is reused (long K); for a handful
@@ -381,6 +381,8 @@ def autotune_tactics(m: int, n: int, k: int) -> list[WarpSplitKTactic]:
         if n % output_tile:
             continue
         for token_tile in _SUPPORTED_TOKEN_TILES:
+            if token_tile > 16 and m <= 16:
+                continue  # A 32-token tile only pays for M > 16.
             for k_tile in _SUPPORTED_K_TILES:
                 if k % k_tile:
                     continue
