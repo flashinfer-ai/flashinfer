@@ -5054,7 +5054,7 @@ def test_fmha_split_control_rejects_conflicting_explicit_requests(controls):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize("dtype", (torch.bfloat16,))
 @pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
 @pytest.mark.parametrize("split_kv", (False, True), ids=("no-split", "split"))
