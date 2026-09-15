@@ -17,6 +17,11 @@ def check_shape(m, n, k):
 
 
 def _sm121_tactic(m, n, k, compute_capability):
+    if compute_capability == (12, 1) and (m, n, k) in (
+        (2000, 2688, 3712),
+        (2000, 3712, 2688),
+    ):
+        return ("cooperative", 128, 128, 256)
     if compute_capability == (12, 1) and (m, n, k) == (512, 8192, 4096):
         return ("cooperative", 128, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) == (1024, 7168, 4608):
@@ -75,7 +80,7 @@ def _sm121_cooperative_tactic(m, n, k, compute_capability):
 def valid_tactics(m, n, k, *, compute_capability=None):
     check_shape(m, n, k)
     if n % 128 or k % 256:
-        return (NARROW_TACTICS[1],)
+        return (_sm121_tactic(m, n, k, compute_capability) or NARROW_TACTICS[1],)
     choices = NARROW_TACTICS + (RAW_TACTICS if m % 128 == 0 else ())
     preferred = _sm121_tactic(m, n, k, compute_capability)
     if preferred is None:
@@ -101,7 +106,7 @@ def compatible(m, n, k, tactic, *, compute_capability=None):
 def default_tactic(m, n, k, *, compute_capability=None):
     check_shape(m, n, k)
     if n % 128 or k % 256:
-        return NARROW_TACTICS[1]
+        return _sm121_tactic(m, n, k, compute_capability) or NARROW_TACTICS[1]
     preferred = _sm121_tactic(m, n, k, compute_capability)
     if preferred is not None:
         return preferred
