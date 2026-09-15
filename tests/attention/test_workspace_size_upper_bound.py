@@ -32,6 +32,7 @@ def _bare_prefill_wrapper(backend="auto", is_cuda_graph_enabled=False):
     wrapper._jit_module = None
     wrapper.device = torch.device("cpu")
     wrapper._use_cuda_graph = is_cuda_graph_enabled
+    wrapper._max_total_num_rows = None
     wrapper._float_workspace_buffer = torch.empty(1, dtype=torch.uint8)
     return wrapper
 
@@ -55,10 +56,15 @@ class _ModuleWithoutBound:
 class _ModuleWithBound:
     def __init__(self):
         self.args = None
+        self.size_args = None
 
     def workspace_size_upper_bound(self, *args):
         self.args = args
         return (1024, 64)
+
+    def workspace_size(self, *args):
+        self.size_args = args
+        return (512, 32)
 
 
 def test_prefill_bound_resolves_auto_with_the_head_dims_plan_uses(monkeypatch):
@@ -303,8 +309,103 @@ def test_cta_tile_q_candidates_have_a_single_source():
     assert "FA2CtaTileQIsCandidate(cta_tile_q)" in utils
 
 
+def test_prefill_sizing_and_bounding_ask_the_resolver_the_same_question(monkeypatch):
+    """The two sizing paths must hand the resolver identical arguments.
+
+    Counting call sites only shows they go through the same function; this
+    shows they go through it with the same question, which is what makes the
+    answers comparable.
+    """
+    calls = []
+
+    def recording_resolver(*args):
+        calls.append(args[1:])
+        return "fa2"
+
+    monkeypatch.setattr(prefill_module, "_resolve_prefill_backend", recording_resolver)
+    bound_module = _ModuleWithBound()
+    monkeypatch.setattr(
+        prefill_module, "get_batch_prefill_module", lambda *a, **k: bound_module
+    )
+
+    wrapper = _bare_prefill_wrapper()
+    shape = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=192,
+        page_size=16,
+        head_dim_vo=128,
+        pos_encoding_mode="NONE",
+        window_left=-1,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    wrapper.workspace_size_upper_bound(
+        max_batch_size=4,
+        max_total_num_rows=64,
+        max_num_pages_per_request=8,
+        **shape,
+    )
+
+    qo_indptr = torch.tensor([0, 3], dtype=torch.int32)
+    wrapper.workspace_size(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=torch.tensor([0, 2], dtype=torch.int32),
+        paged_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor([8], dtype=torch.int32),
+        **shape,
+    )
+
+    assert len(calls) == 2
+    # device, pos_encoding_mode, fp16 reduction, custom mask, dtypes, head dims
+    assert calls[0] == calls[1]
+
+
+def test_decode_sizing_and_bounding_ask_the_resolver_the_same_question(monkeypatch):
+    """Tensor-core decode resolves the same way for both sizing paths."""
+    calls = []
+
+    def recording_resolver(*args):
+        calls.append(args[1:])
+        return "fa2"
+
+    monkeypatch.setattr(
+        decode_module, "_resolve_decode_tensor_core_backend", recording_resolver
+    )
+    bound_module = _ModuleWithBound()
+    monkeypatch.setattr(
+        decode_module, "get_batch_prefill_module", lambda *a, **k: bound_module
+    )
+
+    wrapper = _bare_decode_wrapper()
+    shape = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=16,
+        pos_encoding_mode="NONE",
+        window_left=-1,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    wrapper.workspace_size_upper_bound(
+        max_batch_size=4,
+        max_num_pages_per_request=8,
+        **shape,
+    )
+    wrapper.workspace_size(
+        indptr=torch.tensor([0, 2], dtype=torch.int32),
+        indices=torch.tensor([0, 1], dtype=torch.int32),
+        last_page_len=torch.tensor([8], dtype=torch.int32),
+        **shape,
+    )
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
 def test_plan_and_sizing_share_the_backend_resolvers():
-    """Only the shared helpers decide `auto` on the wrapper paths.
+    """A structural guard: only the shared helpers decide `auto`.
 
     Sizing that resolved `auto` separately from the plan it sizes for is the
     defect these helpers exist to prevent, so no wrapper path may keep its own
@@ -321,3 +422,272 @@ def test_plan_and_sizing_share_the_backend_resolvers():
     # the helper, whose definition is the third occurrence in each file.
     assert prefill_source.count("_resolve_prefill_backend(") >= 4
     assert decode_source.count("_resolve_decode_tensor_core_backend(") >= 4
+
+
+# ---------------------------------------------------------------------------
+# GPU tests. These build the real wrappers and call the real entry points, so
+# nothing here may be reached through a monkeypatched module: the point is to
+# find out whether the bound the C++ computes actually covers what the planner
+# asks for.
+# ---------------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="workspace upper-bound GPU tests require CUDA",
+)
+
+
+def _distributions(max_batch_size: int, max_total_num_rows: int, max_pages: int):
+    """Request shapes inside the bounds, biased rather than uniform.
+
+    The bound's claim is that it covers any distribution of rows and KV
+    lengths over the batch, which a uniform grid cannot test.
+    """
+    shapes = []
+    for batch_size in range(1, max_batch_size + 1):
+        rows = max_total_num_rows
+        even = max(rows // batch_size, 1)
+        # uniform
+        shapes.append(([even] * batch_size, [max_pages] * batch_size))
+        if batch_size == 1:
+            continue
+        # one request carries almost everything
+        skewed = [rows - (batch_size - 1)] + [1] * (batch_size - 1)
+        shapes.append((skewed, [max_pages] * batch_size))
+        # short and long alternating
+        alternating = [
+            1 if index % 2 else max(even * 2, 1) for index in range(batch_size)
+        ]
+        shapes.append((alternating, [max_pages] * batch_size))
+        # the long-q request is not the long-kv one
+        pages = [1] * batch_size
+        pages[-1] = max_pages
+        shapes.append((skewed, pages))
+        # a request with no query rows, where the planner allows it
+        zero_query = [0] + [even] * (batch_size - 1)
+        shapes.append((zero_query, [max_pages] * batch_size))
+    return [
+        (q, kv)
+        for q, kv in shapes
+        if sum(q) <= max_total_num_rows and len(q) <= max_batch_size
+    ]
+
+
+def _boundary_query_lens():
+    return [15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129]
+
+
+def _paged_inputs(q_lens, kv_pages, page_size, device="cuda"):
+    qo_indptr = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+    kv_indptr = torch.tensor(
+        [0, *torch.tensor(kv_pages).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    kv_indices = torch.arange(int(kv_indptr[-1]), dtype=torch.int32, device=device)
+    last_page_len = torch.full(
+        (len(q_lens),), page_size, dtype=torch.int32, device=device
+    )
+    return qo_indptr, kv_indptr, kv_indices, last_page_len
+
+
+@requires_cuda
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    ("fixed_split_size", "disable_split_kv"),
+    [
+        pytest.param(None, False, id="default-split"),
+        pytest.param(4, False, id="fixed-split"),
+        pytest.param(None, True, id="split-disabled"),
+    ],
+)
+def test_prefill_upper_bound_covers_every_reachable_shape(
+    use_cuda_graph, fixed_split_size, disable_split_kv
+):
+    """No plan inside the bounds may need more than the bound reports."""
+    import flashinfer
+
+    page_size = 16
+    max_batch_size, max_total_num_rows, max_pages = 4, 64, 8
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        use_cuda_graph=use_cuda_graph,
+    )
+    bound_float, bound_int = wrapper.workspace_size_upper_bound(
+        max_batch_size=max_batch_size,
+        max_total_num_rows=max_total_num_rows,
+        max_num_pages_per_request=max_pages,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        fixed_split_size=fixed_split_size,
+        disable_split_kv=disable_split_kv,
+    )
+
+    for q_lens, kv_pages in _distributions(
+        max_batch_size, max_total_num_rows, max_pages
+    ):
+        qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
+            q_lens, kv_pages, page_size
+        )
+        try:
+            shape_float, shape_int = wrapper.workspace_size(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr,
+                paged_kv_indices=kv_indices,
+                paged_kv_last_page_len=last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                page_size=page_size,
+                causal=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+            )
+        except ValueError:
+            # A shape the planner itself refuses is out of scope.
+            continue
+        assert shape_float <= bound_float, (q_lens, kv_pages, shape_float, bound_float)
+        assert shape_int <= bound_int, (q_lens, kv_pages, shape_int, bound_int)
+
+
+@requires_cuda
+@pytest.mark.parametrize("query_len", _boundary_query_lens())
+def test_prefill_upper_bound_covers_the_tile_boundaries(query_len):
+    """The tile the planner picks changes around these lengths."""
+    import flashinfer
+
+    page_size = 16
+    max_batch_size, max_pages = 4, 8
+    max_total_num_rows = max_batch_size * max(_boundary_query_lens())
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
+    )
+    bound_float, bound_int = wrapper.workspace_size_upper_bound(
+        max_batch_size=max_batch_size,
+        max_total_num_rows=max_total_num_rows,
+        max_num_pages_per_request=max_pages,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+    )
+
+    for batch_size in range(1, max_batch_size + 1):
+        q_lens = [query_len] * batch_size
+        qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
+            q_lens, [max_pages] * batch_size, page_size
+        )
+        shape_float, shape_int = wrapper.workspace_size(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=kv_indptr,
+            paged_kv_indices=kv_indices,
+            paged_kv_last_page_len=last_page_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            causal=True,
+        )
+        assert shape_float <= bound_float, (query_len, batch_size, shape_float)
+        assert shape_int <= bound_int, (query_len, batch_size, shape_int)
+
+
+@requires_cuda
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+def test_decode_upper_bound_covers_every_reachable_shape(use_tensor_cores):
+    """Both decode planners have to stay inside their own bound."""
+    import flashinfer
+
+    page_size = 16
+    max_batch_size, max_pages = 8, 8
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        use_tensor_cores=use_tensor_cores,
+    )
+    bound_float, bound_int = wrapper.workspace_size_upper_bound(
+        max_batch_size=max_batch_size,
+        max_num_pages_per_request=max_pages,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+    )
+
+    for batch_size in range(1, max_batch_size + 1):
+        for pages in ({1}, {max_pages}, {1, max_pages}):
+            kv_pages = [
+                sorted(pages)[index % len(pages)] for index in range(batch_size)
+            ]
+            _, kv_indptr, kv_indices, last_page_len = _paged_inputs(
+                [1] * batch_size, kv_pages, page_size
+            )
+            shape_float, shape_int = wrapper.workspace_size(
+                indptr=kv_indptr,
+                indices=kv_indices,
+                last_page_len=last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+            )
+            assert shape_float <= bound_float, (batch_size, kv_pages, shape_float)
+            assert shape_int <= bound_int, (batch_size, kv_pages, shape_int)
+
+
+@requires_cuda
+def test_prefill_plan_succeeds_with_buffers_sized_from_the_bound():
+    """A bound is only useful if a plan actually fits in it."""
+    import flashinfer
+
+    page_size = 16
+    max_batch_size, max_total_num_rows, max_pages = 4, 64, 8
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
+    )
+    bound_float, bound_int = wrapper.workspace_size_upper_bound(
+        max_batch_size=max_batch_size,
+        max_total_num_rows=max_total_num_rows,
+        max_num_pages_per_request=max_pages,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+    )
+    wrapper.reset_workspace_buffer(
+        torch.empty(max(bound_float, 1), dtype=torch.uint8, device="cuda"),
+        torch.empty(max(bound_int, 1), dtype=torch.uint8, device="cuda"),
+    )
+
+    for q_lens, kv_pages in _distributions(
+        max_batch_size, max_total_num_rows, max_pages
+    ):
+        if 0 in q_lens:
+            continue
+        qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
+            q_lens, kv_pages, page_size
+        )
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            paged_kv_indptr=kv_indptr,
+            paged_kv_indices=kv_indices,
+            paged_kv_last_page_len=last_page_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            causal=True,
+        )
