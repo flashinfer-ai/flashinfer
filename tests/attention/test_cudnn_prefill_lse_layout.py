@@ -196,6 +196,38 @@ def test_cudnn_prefill_lse_rejects_other_shapes():
         )
 
 
+def test_cudnn_prefill_lse_rejects_padded_with_stats_offsets():
+    """Stats offsets address packed rows, so they cannot accompany a padded
+    buffer: cuDNN would write every request after the first to the wrong
+    rows."""
+    _skip_unless_cudnn()
+    device = "cuda:0"
+    batch_size, s_qo, s_kv, h_qo, h_kv, d = 2, 32, 64, 4, 4, 128
+    q_lens, kv_lens, qo_indptr, kv_indptr, q, k, v = _ragged_case(
+        batch_size, s_qo, s_kv, h_qo, h_kv, d, device
+    )
+    ws = torch.empty(64 * 1024 * 1024, dtype=torch.int8, device=device)
+    with pytest.raises(ValueError, match="batch_offsets_stats addresses a packed"):
+        cudnn_batch_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            float(d**-0.5),
+            ws,
+            max_token_per_sequence=s_qo,
+            max_sequence_kv=s_kv,
+            actual_seq_lens_q=q_lens.view(batch_size, 1, 1, 1),
+            actual_seq_lens_kv=kv_lens.view(batch_size, 1, 1, 1),
+            causal=False,
+            return_lse=True,
+            batch_offsets_q=qo_indptr,
+            batch_offsets_k=kv_indptr,
+            batch_offsets_stats=qo_indptr,
+            batch_offsets_units="tokens",
+            lse=torch.empty(batch_size, s_qo, h_qo, device=device, dtype=torch.float32),
+        )
+
+
 @pytest.mark.parametrize("causal", [True, False])
 def test_ragged_wrapper_cudnn_return_lse(causal):
     """``BatchPrefillWithRaggedKVCacheWrapper(backend="cudnn").run(...,
@@ -211,14 +243,14 @@ def test_ragged_wrapper_cudnn_return_lse(causal):
     scale = float(d**-0.5)
     ws = torch.empty(128 * 1024 * 1024, device=device, dtype=torch.uint8)
 
-    # The cuDNN ragged wrapper takes element-unit indptrs (see
-    # test_cudnn_prefill_deepseek.py); the default backend takes token units.
+    # Same token-unit indptrs for both backends; the cuDNN wrapper derives
+    # everything else (seq lens, max lengths, Stats offsets) from them.
     w_cudnn = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws, "NHD", backend="cudnn"
     )
     w_cudnn.plan(
-        qo_indptr=qo_indptr * (h_qo * d),
-        kv_indptr=kv_indptr * (h_kv * d),
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
         num_qo_heads=h_qo,
         num_kv_heads=h_kv,
         head_dim_qk=d,
@@ -228,12 +260,6 @@ def test_ragged_wrapper_cudnn_return_lse(causal):
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
-        seq_lens=kv_lens,
-        seq_lens_q=q_lens,
-        max_token_per_sequence=s_qo,
-        max_sequence_kv=s_kv,
-        v_indptr=kv_indptr * (h_kv * d),
-        o_indptr=qo_indptr * (h_qo * d),
     )
     out, lse = w_cudnn.run(q, k, v, return_lse=True)
 
