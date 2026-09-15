@@ -74,9 +74,9 @@ def get_available_cubin_files(
                 logger.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
 
-    # TODO: check if we really want to return an empty collection here instead of crashing.
-    logger.error("Max retries reached. Fetch failed.")
-    return tuple()
+    raise RuntimeError(
+        f"Failed to fetch the cubin artifact index {source} after {retries} attempts"
+    )
 
 
 def get_available_header_files(
@@ -120,7 +120,9 @@ def get_available_header_files(
                     logger.info(f"Retrying in {delay} seconds...")
                     time.sleep(delay)
 
-        logger.error(f"Max retries reached for {url}. Fetch failed.")
+        raise RuntimeError(
+            f"Failed to fetch the header artifact index {url} after {retries} attempts"
+        )
 
     fetch_directory(source)
     logger.info(f"result: {result}")

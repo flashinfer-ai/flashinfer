@@ -4,6 +4,7 @@ from pathlib import Path
 from flashinfer.artifacts import (
     ArtifactPath,
     get_available_cubin_files,
+    get_available_header_files,
     get_subdir_file_list,
 )
 
@@ -228,6 +229,13 @@ def _mock_file_index_responses():
     responses.add(
         responses.GET, deepgemm_source, body=success_deepgemm_response, status=200
     )
+    for source in (fmha_source, gemm_source, bmm_source):
+        responses.add(
+            responses.GET,
+            safe_urljoin(source, "include/"),
+            body='<a href="../">../</a>',
+            status=200,
+        )
 
 
 @responses.activate
@@ -254,32 +262,32 @@ def test_get_available_cubin_files():
 
 @responses.activate
 def test_get_available_cubin_files_non_200_response():
-    """Test that non-200 response codes return an empty tuple."""
+    """Artifact index HTTP failures must stop the build after retries."""
     gemm_path = "037e528e719ec3456a7d7d654f26b805e44c63b1/gemm-8704aa4-f91dc9e/"
     source = safe_urljoin(test_cubin_repository, gemm_path)
 
-    # Test 404 Not Found
-    responses.add(responses.GET, source, status=404)
-    available_cubin_files = get_available_cubin_files(
-        source, retries=1, delay=0, timeout=5
-    )
-    assert available_cubin_files == ()
+    for status in (404, 500, 403):
+        responses.reset()
+        responses.add(responses.GET, source, status=status)
+        with pytest.raises(RuntimeError, match="Failed to fetch the cubin artifact"):
+            get_available_cubin_files(source, retries=1, delay=0, timeout=5)
 
-    # Reset responses and test 500 Internal Server Error
-    responses.reset()
-    responses.add(responses.GET, source, status=500)
-    available_cubin_files = get_available_cubin_files(
-        source, retries=1, delay=0, timeout=5
-    )
-    assert available_cubin_files == ()
 
-    # Reset responses and test 403 Forbidden
-    responses.reset()
-    responses.add(responses.GET, source, status=403)
-    available_cubin_files = get_available_cubin_files(
-        source, retries=1, delay=0, timeout=5
+@responses.activate
+def test_get_available_header_files_rejects_partial_index():
+    """A failed child directory must not return an incomplete header list."""
+    source = "https://example.test/artifacts/"
+    child_source = safe_urljoin(source, "nested/")
+    responses.add(
+        responses.GET,
+        source,
+        body='<a href="root.h">root.h</a><a href="nested/">nested/</a>',
+        status=200,
     )
-    assert available_cubin_files == ()
+    responses.add(responses.GET, child_source, status=500)
+
+    with pytest.raises(RuntimeError, match="Failed to fetch the header artifact"):
+        get_available_header_files(source, retries=1, delay=0, timeout=5)
 
 
 def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
