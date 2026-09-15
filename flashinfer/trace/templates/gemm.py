@@ -927,6 +927,8 @@ def mm_bf16_fp4_trace_dispatch(**kwargs):
     canonical weight with linear 2-D scales.  Pass as
     ``trace=mm_bf16_fp4_trace_dispatch`` to ``@flashinfer_api``.
     """
+    if kwargs.get("backend") == "cute-dsl-native":
+        return None
     b = kwargs.get("b")
     if b is not None and b.dtype == torch.int32:
         return mm_bf16_fp4_cute_dsl_trace
