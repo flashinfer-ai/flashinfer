@@ -1,0 +1,159 @@
+{
+  "argv": [
+    "--vibecuda",
+    "--mode",
+    "varlen",
+    "--sequence-lengths",
+    "96",
+    "160",
+    "--nheads",
+    "8",
+    "--ngroups",
+    "8",
+    "--state-dtype",
+    "float16",
+    "--seq-idx-dtype",
+    "int64",
+    "--preprocess-dtype",
+    "float32",
+    "--has-z"
+  ],
+  "cake_cute_parity": {
+    "final_states_tolerance_passed": true,
+    "out_tolerance_passed": true
+  },
+  "contract_version": "pr4576-route-matrix-12-seed7-v2",
+  "execution_error": null,
+  "mode": "in-process",
+  "report": {
+    "cake_ms": 0.0774885,
+    "cake_truth_final_states": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.002972841262817383,
+      "max_rel": 101.73307800292969,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "cake_truth_out": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.19601821899414062,
+      "max_rel": 52.43576431274414,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "candidate_no_worse_than_cake": {
+      "final_states": true,
+      "out": true,
+      "reference": "fp64_sequential_recurrence"
+    },
+    "final_states": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.0002899169921875,
+      "max_rel": 0.17660818994045258,
+      "mismatch_count": 245,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "flashinfer_ms": 0.0736325,
+    "full_write": {
+      "fully_written": true,
+      "out_numel": 131072,
+      "sentinel": "NaN",
+      "unwritten_elements": 0
+    },
+    "out": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.015625,
+      "max_rel": 0.06122449040412903,
+      "mismatch_count": 67,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "shape": {
+      "batch": 1,
+      "chunk_size": 128,
+      "chunks_per_sequence": 1,
+      "d_has_hdim": false,
+      "dstate": 128,
+      "dt_limit": [
+        0.001,
+        0.1
+      ],
+      "has_z": true,
+      "headdim": 64,
+      "initial_states": "random",
+      "input_layout": "contiguous",
+      "mode": "varlen",
+      "ngroups": 8,
+      "nheads": 8,
+      "num_sequences": 2,
+      "preprocess_dtype": "float32",
+      "seed": 7,
+      "seq_idx_dtype": "int64",
+      "seqlen": 256,
+      "sequence_lengths": [
+        96,
+        160
+      ],
+      "state_dtype": "float16"
+    },
+    "speedup": 0.9502377772185551,
+    "timing_backend": "cupti",
+    "truth_reference": "fp64_sequential_recurrence",
+    "vibecuda_final_states": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.00048828125,
+      "max_rel": 5.772861480712891,
+      "mismatch_count": 13299,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "vibecuda_ms": 0.037056,
+    "vibecuda_out": {
+      "atol": 0.01,
+      "bitwise_equal": false,
+      "max_abs": 0.0009765625,
+      "max_rel": 0.006451612804085016,
+      "mismatch_count": 1,
+      "numel": 131072,
+      "rtol": 0.01,
+      "tolerance_passed": true
+    },
+    "vibecuda_speedup_vs_cake": 2.091118847150259,
+    "vibecuda_truth_final_states": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.002972841262817383,
+      "max_rel": 157.26039123535156,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    },
+    "vibecuda_truth_out": {
+      "atol": 0.06,
+      "bitwise_equal": false,
+      "max_abs": 0.19601821899414062,
+      "max_rel": 52.43576431274414,
+      "mismatch_count": 131072,
+      "numel": 131072,
+      "rtol": 0.06,
+      "tolerance_passed": true
+    }
+  },
+  "row": "fp16_v_i64_h8_g8",
+  "validation_failures": [],
+  "wall_s": 3.409
+}

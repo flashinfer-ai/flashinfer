@@ -1052,6 +1052,23 @@ def _triton_supports_current_arch() -> bool:
         return True
 
 
+def _module_uses_triton(fspath) -> bool:
+    """Whether a test module ends up compiling Triton kernels.
+
+    Matches tests that compile Triton reference kernels directly and tests
+    built around the SSDCombined ``cute`` backend, whose dt preprocessor is
+    itself a Triton kernel.
+    """
+    try:
+        from pathlib import Path
+
+        text = Path(str(fspath)).read_text(encoding="utf-8")
+    except OSError:
+        # Err on the safe side: keep the skip for unreadable modules.
+        return True
+    return "triton" in text or 'backend="cute"' in text or "backend='cute'" in text
+
+
 def pytest_collection_modifyitems(config, items):
     if items and not _triton_supports_current_arch():
         import pytest
@@ -1062,6 +1079,11 @@ def pytest_collection_modifyitems(config, items):
             "abort the process at compile time)"
         )
         for item in items:
+            # Only tests that compile the Triton mamba reference kernels are
+            # affected; pure nvcc/CuTe/TVM-FFI backends (cake/vibecuda SSD,
+            # seq_chunk_cumsum, cake/selective_state_update) still run.
+            if not _module_uses_triton(item.fspath):
+                continue
             item.add_marker(skip_triton)
         return
 
