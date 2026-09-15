@@ -716,6 +716,21 @@ def run_cake_dsv4(
 
     if route in ("bf16_h128_topk128x", "bf16_h128_topk4x_v52", "bf16_h128_prefill_v42"):
         num_splits = 5 if route == "bf16_h128_topk4x_v52" else 1
+        program_variant = route
+        if (
+            route == "bf16_h128_topk128x"
+            and _target_arch(query.device) == "sm_100a"
+            and 256 < sparse_topk <= 384
+        ):
+            num_splits = 3
+            program_variant = "bf16_h128_topk128x_split3_sm100"
+        elif (
+            route == "bf16_h128_topk128x"
+            and _target_arch(query.device) == "sm_100a"
+            and sparse_topk == 388
+        ):
+            num_splits = 4
+            program_variant = "bf16_h128_topk128x_split4_sm100"
         partial_o, partial_lse = _partition_workspace(
             workspace_buffer, out_rows, num_query_tokens, num_heads, num_splits
         )
@@ -726,7 +741,7 @@ def run_cake_dsv4(
         )
         total_work_items = num_query_tokens * num_splits
         _launch_program(
-            route,
+            program_variant,
             stream=stream,
             Q=query,
             SWA_cache=swa,
