@@ -671,14 +671,15 @@ class TmemCorrResource(DecodeGenResourceBase):
         num_o_chunks: Constexpr[int],
         output_f32_regs: Constexpr[int],
     ) -> tuple[cutlass.Array, cutlass.Array]:
-        """Load matching chunks from the two final Swaps O stages."""
+        """Load matching chunks from the active final Swaps O stages."""
         cfg = self.cfg
         o0_vals = cutlass.Array(
             Float32, output_f32_regs, space=cutlass.AddressSpace.rmem
         )
-        o1_vals = cutlass.Array(
-            Float32, output_f32_regs, space=cutlass.AddressSpace.rmem
-        )
+        if cutlass.const_expr(cfg.num_insts_kv != 1):
+            o1_vals = cutlass.Array(
+                Float32, output_f32_regs, space=cutlass.AddressSpace.rmem
+            )
         for chunk_idx in cutlass.range_constexpr(num_o_chunks):
             o0_loaded = prims.tcgen05_ld(
                 "16x256b",
@@ -688,18 +689,23 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
                 num=q_repeats,
             )
-            o1_loaded = prims.tcgen05_ld(
-                "16x256b",
-                prims.make_tmem_ptr(
-                    base_addr1 + Int32(cfg.swaps_o_chunk_tmem_offset(chunk_idx)),
-                    Float32,
-                ),
-                num=q_repeats,
-            )
+            if cutlass.const_expr(cfg.num_insts_kv != 1):
+                o1_loaded = prims.tcgen05_ld(
+                    "16x256b",
+                    prims.make_tmem_ptr(
+                        base_addr1 + Int32(cfg.swaps_o_chunk_tmem_offset(chunk_idx)),
+                        Float32,
+                    ),
+                    num=q_repeats,
+                )
             for reg_idx in cutlass.range_constexpr(4 * q_repeats):
                 o0_vals[chunk_idx * 4 * q_repeats + reg_idx] = o0_loaded[reg_idx]
-                o1_vals[chunk_idx * 4 * q_repeats + reg_idx] = o1_loaded[reg_idx]
+                if cutlass.const_expr(cfg.num_insts_kv != 1):
+                    o1_vals[chunk_idx * 4 * q_repeats + reg_idx] = o1_loaded[reg_idx]
         cute.arch.fence_view_async_tmem_load()
+        if cutlass.const_expr(cfg.num_insts_kv == 1):
+            # Preserve the return shape; one-instance epilogues only consume o0.
+            return o0_vals, o0_vals
         return o0_vals, o1_vals
 
     @cute.jit
@@ -3373,7 +3379,9 @@ class TmemCorrResource(DecodeGenResourceBase):
                 inst0_max = inst0_new_max_arr[scale_idx]
                 inst1_max = inst1_new_max_arr[scale_idx]
                 uses_inst0 = inst0_max != _neg_max_f32()
-                uses_inst1 = inst1_max != _neg_max_f32()
+                uses_inst1 = False
+                if cutlass.const_expr(cfg.num_insts_kv != 1):
+                    uses_inst1 = inst1_max != _neg_max_f32()
 
                 final_max_val = _neg_max_f32()
                 if uses_inst0:
@@ -3561,14 +3569,20 @@ class TmemCorrResource(DecodeGenResourceBase):
                     )
                     else (exp_scale1[scale_base], exp_scale1[scale_base + 1])
                 )
-                partial_pair = ffma2(
-                    partial_scale0,
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        partial_scale1,
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    partial_pair = fmul2(
+                        partial_scale0,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    partial_pair = ffma2(
+                        partial_scale0,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            partial_scale1,
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                        ),
+                    )
                 if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                     regs_partial_o[pair_idx] = self._pack_separate_partial_o_pair(
                         partial_pair[0], partial_pair[1]
@@ -3683,28 +3697,40 @@ class TmemCorrResource(DecodeGenResourceBase):
                 scale_base1 = ((pair_idx1 % (2 * q_repeats)) // 2) * 2
                 reg_base0 = pair_idx0 * 2
                 reg_base1 = pair_idx1 * 2
-                final_pair0 = ffma2(
-                    (final_scale0[scale_base0], final_scale0[scale_base0 + 1]),
-                    (o0_vals[reg_base0], o0_vals[reg_base0 + 1]),
-                    fmul2(
-                        (
-                            final_scale1[scale_base0],
-                            final_scale1[scale_base0 + 1],
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair0 = fmul2(
+                        (final_scale0[scale_base0], final_scale0[scale_base0 + 1]),
+                        (o0_vals[reg_base0], o0_vals[reg_base0 + 1]),
+                    )
+                else:
+                    final_pair0 = ffma2(
+                        (final_scale0[scale_base0], final_scale0[scale_base0 + 1]),
+                        (o0_vals[reg_base0], o0_vals[reg_base0 + 1]),
+                        fmul2(
+                            (
+                                final_scale1[scale_base0],
+                                final_scale1[scale_base0 + 1],
+                            ),
+                            (o1_vals[reg_base0], o1_vals[reg_base0 + 1]),
                         ),
-                        (o1_vals[reg_base0], o1_vals[reg_base0 + 1]),
-                    ),
-                )
-                final_pair1 = ffma2(
-                    (final_scale0[scale_base1], final_scale0[scale_base1 + 1]),
-                    (o0_vals[reg_base1], o0_vals[reg_base1 + 1]),
-                    fmul2(
-                        (
-                            final_scale1[scale_base1],
-                            final_scale1[scale_base1 + 1],
+                    )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair1 = fmul2(
+                        (final_scale0[scale_base1], final_scale0[scale_base1 + 1]),
+                        (o0_vals[reg_base1], o0_vals[reg_base1 + 1]),
+                    )
+                else:
+                    final_pair1 = ffma2(
+                        (final_scale0[scale_base1], final_scale0[scale_base1 + 1]),
+                        (o0_vals[reg_base1], o0_vals[reg_base1 + 1]),
+                        fmul2(
+                            (
+                                final_scale1[scale_base1],
+                                final_scale1[scale_base1 + 1],
+                            ),
+                            (o1_vals[reg_base1], o1_vals[reg_base1 + 1]),
                         ),
-                        (o1_vals[reg_base1], o1_vals[reg_base1 + 1]),
-                    ),
-                )
+                    )
                 # bmm2_scale is already folded into ``final_scale*`` above.
                 regs_o[packed_idx] = _pack_float4_to_fp8_e4m3(
                     final_pair0[0],
@@ -3718,17 +3744,23 @@ class TmemCorrResource(DecodeGenResourceBase):
                 # to the final output dtype.
                 scale_base = ((pair_idx % (2 * q_repeats)) // 2) * 2
                 reg_base = pair_idx * 2
-                final_pair = ffma2(
-                    (final_scale0[scale_base], final_scale0[scale_base + 1]),
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        (
-                            final_scale1[scale_base],
-                            final_scale1[scale_base + 1],
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair = fmul2(
+                        (final_scale0[scale_base], final_scale0[scale_base + 1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    final_pair = ffma2(
+                        (final_scale0[scale_base], final_scale0[scale_base + 1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            (
+                                final_scale1[scale_base],
+                                final_scale1[scale_base + 1],
+                            ),
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
                         ),
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                    )
                 if cutlass.const_expr(cfg.use_bf16_output):
                     regs_o[pair_idx] = _pack_float2_to_bf16(
                         final_pair[0], final_pair[1]
@@ -3858,7 +3890,9 @@ class TmemCorrResource(DecodeGenResourceBase):
             inst0_max = inst0_new_max_arr[scale_idx]
             inst1_max = inst1_new_max_arr[scale_idx]
             uses_inst0 = inst0_max != _neg_max_f32()
-            uses_inst1 = inst1_max != _neg_max_f32()
+            uses_inst1 = False
+            if cutlass.const_expr(cfg.num_insts_kv != 1):
+                uses_inst1 = inst1_max != _neg_max_f32()
             final_max[scale_idx] = _neg_max_f32()
             if uses_inst0:
                 final_max[scale_idx] = inst0_max
@@ -3882,14 +3916,20 @@ class TmemCorrResource(DecodeGenResourceBase):
             final_scale0[scale_idx] = Float32(0.0)
             final_scale1[scale_idx] = Float32(0.0)
 
-        final_sums = ffma2(
-            (exp_scale0[0], exp_scale0[1]),
-            (inst0_sum_arr[0], inst0_sum_arr[1]),
-            fmul2(
-                (exp_scale1[0], exp_scale1[1]),
-                (inst1_sum_arr[0], inst1_sum_arr[1]),
-            ),
-        )
+        if cutlass.const_expr(cfg.num_insts_kv == 1):
+            final_sums = fmul2(
+                (exp_scale0[0], exp_scale0[1]),
+                (inst0_sum_arr[0], inst0_sum_arr[1]),
+            )
+        else:
+            final_sums = ffma2(
+                (exp_scale0[0], exp_scale0[1]),
+                (inst0_sum_arr[0], inst0_sum_arr[1]),
+                fmul2(
+                    (exp_scale1[0], exp_scale1[1]),
+                    (inst1_sum_arr[0], inst1_sum_arr[1]),
+                ),
+            )
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             final_sum[scale_idx] = final_sums[scale_idx]
 
@@ -4031,14 +4071,20 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             for reg_idx in cutlass.range_constexpr(cfg.num_fp16_output_regs):
                 reg_base = reg_idx * 2
-                partial_pair = ffma2(
-                    partial_scale0_pair,
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        partial_scale1_pair,
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    partial_pair = fmul2(
+                        partial_scale0_pair,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    partial_pair = ffma2(
+                        partial_scale0_pair,
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            partial_scale1_pair,
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                        ),
+                    )
                 if cutlass.const_expr(cfg.use_separate_reduction_kernel):
                     regs_partial_o[reg_idx] = self._pack_separate_partial_o_pair(
                         partial_pair[0], partial_pair[1]
@@ -4150,22 +4196,34 @@ class TmemCorrResource(DecodeGenResourceBase):
                 pair_idx1 = pair_idx0 + 1
                 src_idx0 = pair_idx0 * 2
                 src_idx1 = pair_idx1 * 2
-                final_pair0 = ffma2(
-                    (final_scale0[0], final_scale0[1]),
-                    (o0_vals[src_idx0], o0_vals[src_idx0 + 1]),
-                    fmul2(
-                        (final_scale1[0], final_scale1[1]),
-                        (o1_vals[src_idx0], o1_vals[src_idx0 + 1]),
-                    ),
-                )
-                final_pair1 = ffma2(
-                    (final_scale0[0], final_scale0[1]),
-                    (o0_vals[src_idx1], o0_vals[src_idx1 + 1]),
-                    fmul2(
-                        (final_scale1[0], final_scale1[1]),
-                        (o1_vals[src_idx1], o1_vals[src_idx1 + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair0 = fmul2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx0], o0_vals[src_idx0 + 1]),
+                    )
+                else:
+                    final_pair0 = ffma2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx0], o0_vals[src_idx0 + 1]),
+                        fmul2(
+                            (final_scale1[0], final_scale1[1]),
+                            (o1_vals[src_idx0], o1_vals[src_idx0 + 1]),
+                        ),
+                    )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair1 = fmul2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx1], o0_vals[src_idx1 + 1]),
+                    )
+                else:
+                    final_pair1 = ffma2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[src_idx1], o0_vals[src_idx1 + 1]),
+                        fmul2(
+                            (final_scale1[0], final_scale1[1]),
+                            (o1_vals[src_idx1], o1_vals[src_idx1 + 1]),
+                        ),
+                    )
                 regs_o[packed_idx] = _pack_float4_to_fp8_e4m3(
                     final_pair0[0],
                     final_pair0[1],
@@ -4175,14 +4233,20 @@ class TmemCorrResource(DecodeGenResourceBase):
         else:
             for reg_idx in cutlass.range_constexpr(cfg.num_fp16_output_regs):
                 reg_base = reg_idx * 2
-                final_pair = ffma2(
-                    (final_scale0[0], final_scale0[1]),
-                    (o0_vals[reg_base], o0_vals[reg_base + 1]),
-                    fmul2(
-                        (final_scale1[0], final_scale1[1]),
-                        (o1_vals[reg_base], o1_vals[reg_base + 1]),
-                    ),
-                )
+                if cutlass.const_expr(cfg.num_insts_kv == 1):
+                    final_pair = fmul2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                    )
+                else:
+                    final_pair = ffma2(
+                        (final_scale0[0], final_scale0[1]),
+                        (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        fmul2(
+                            (final_scale1[0], final_scale1[1]),
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                        ),
+                    )
                 if cutlass.const_expr(cfg.use_bf16_output):
                     regs_o[reg_idx] = _pack_float2_to_bf16(final_pair[0], final_pair[1])
                 else:

@@ -2303,10 +2303,11 @@ def _set_explicit(
     explicit_fields: set[str],
 ) -> None:
     """Set a field and add it to explicit fields."""
-    if field_name in explicit_fields:
-        assert getattr(cfg, field_name) == value, (
+    current = getattr(cfg, field_name)
+    if field_name in explicit_fields and current != value:
+        raise ValueError(
             f"conflicting {field_name} selections: "
-            f"config overrides requested {value} but it's currently set to {getattr(cfg, field_name)}"
+            f"config overrides requested {current}, but this profile requires {value}"
         )
     setattr(cfg, field_name, value)
     explicit_fields.add(field_name)

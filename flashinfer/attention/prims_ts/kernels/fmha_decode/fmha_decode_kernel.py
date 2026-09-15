@@ -463,9 +463,10 @@ def _build_decode_gen_schedule(
         Agent.Thread, cfg.page_offsets_num_warps * WARP_SIZE
     )
     load_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.load_num_warps * WARP_SIZE)
-    transform_kv_grp = pipeline.CooperativeGroup(
-        Agent.Thread, cfg.transform_kv_num_warps * WARP_SIZE
-    )
+    if cfg.use_transform_kv:
+        transform_kv_grp = pipeline.CooperativeGroup(
+            Agent.Thread, cfg.transform_kv_num_warps * WARP_SIZE
+        )
     umma_hw = pipeline.CooperativeGroup(Agent.Thread)
     # The staged one-instance S/P overlay uses this group for overwrite credit.
     mma_grp = pipeline.CooperativeGroup(Agent.Thread, cfg.mma_num_warps * WARP_SIZE)
