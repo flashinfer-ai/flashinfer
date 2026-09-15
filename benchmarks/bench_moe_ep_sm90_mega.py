@@ -276,7 +276,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
         mma_tiler_mnk=(tile[0], tile[1], 128),
         load_balance_mode=args.load_balance_mode,
         gate_up_clamp=args.gate_up_clamp,
-        in_kernel_fc2_reduce=False,
+        enable_in_kernel_fc2_reduce=False,
         token_back_by_dispatch=(args.token_back == "reuse_dispatch_warps"),
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
