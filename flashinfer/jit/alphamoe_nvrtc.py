@@ -90,7 +90,6 @@ def get_alphamoe_nvrtc_spec(source_dir: Path, selected_archs):
         raise ValueError(f"Unsupported AlphaMoE router targets: {arches}")
     digest = hashlib.sha256(Path(__file__).read_bytes())
     digest.update((source_dir.parent / "alphamoe_fused_router.cu").read_bytes())
-    digest.update(json.dumps(arches).encode())
     for key in _ENTRIES:
         digest.update((source_dir / f"{key}.cu").read_bytes())
     flags = ["-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1"]
