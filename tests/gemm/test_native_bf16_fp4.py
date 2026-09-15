@@ -77,14 +77,6 @@ def test_prepare_preserves_both_buffer_objects():
     )
 
 
-def test_trace_does_not_mislabel_native_scales_as_cudnn():
-    """A trace for linear scales would describe a different computation."""
-    from flashinfer import fi_trace
-
-    a, b, sf, _ = make_case(1, 129, 80)
-    assert fi_trace(mm_bf16_fp4, a=a, b=b, b_descale=sf, backend=BACKEND) == {}
-
-
 def test_all_codes_and_nonunit_scales_with_one_hot_inputs():
     """Select one weight at a time so cancellation cannot hide packing mistakes."""
     a, b, sf, weight = make_case(16, 129, 64)
@@ -178,7 +170,7 @@ def test_graph_replay_reads_live_alpha_and_inputs_on_current_stream(
 )
 def test_autotuned_tactic_matches_reference(m, n, k, alpha_value, out_dtype):
     """Every tactic must reload shared operands when its staging buffer wraps."""
-    from flashinfer.experimental.native_bf16_fp4.runner import get_runner
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
 
     a, b, sf, weight = make_case(m, n, k)
     out = torch.empty((m, n), device="cuda", dtype=out_dtype)
@@ -214,7 +206,7 @@ def test_output_alias_is_rejected():
 @pytest.mark.parametrize("unaligned", ["activation", "weight", "scale"])
 def test_unaligned_canonical_buffers_use_valid_tactics(unaligned):
     """A valid narrow-aligned buffer must not reach a 16-byte asynchronous load."""
-    from flashinfer.experimental.native_bf16_fp4.runner import get_runner
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
 
     a, b, sf, weight = make_case(3, 129, 128)
     tensors = {"activation": a, "weight": b, "scale": sf}

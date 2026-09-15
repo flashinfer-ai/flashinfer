@@ -7,8 +7,8 @@ from typing import Any
 
 import torch
 
-from ...autotuner import AutoTuner, TunableRunner, TuningConfig
-from ...utils import get_compute_capability, get_device_index
+from ....autotuner import AutoTuner, TunableRunner, TuningConfig
+from ....utils import get_compute_capability, get_device_index
 
 _COMPILED: dict[tuple, Any] = {}
 _TUNING_CONFIG = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
@@ -18,8 +18,8 @@ def _compile(m, n, k, enable_pdl, tactic):
     import cutlass
     import cutlass.cute as cute
 
-    from ...cute_dsl import fp4_common
-    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ....cute_dsl import fp4_common
+    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from . import n64_staged_kernel, kernel
 
     tk, warps, splits, stages = tactic

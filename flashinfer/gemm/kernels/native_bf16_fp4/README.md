@@ -1,6 +1,6 @@
 # Native-layout W4A16 on SM12x
 
-This experimental CuTe DSL backend computes BF16 x NVFP4 directly from
+This CuTe DSL backend computes BF16 x NVFP4 directly from
 canonical packed weights and 128x4-swizzled E4M3 block scales. It performs
 no preparation of alternate weight or scale buffers, or full-matrix dequantization.
 
@@ -73,12 +73,12 @@ and CUDA graph warmup remain necessary. The combined integration's first
 launch also reported a larger temporary memory peak than its warm repeat;
 sharing weights does not imply identical peak startup memory.
 Native checkpoint scale layouts other than 128x4 are not supported.
-Trace export is not yet available for this layout.
+Trace export describes the canonical scale layout and BF16 or FP16 output.
 
 Run correctness tests with:
 
 ```bash
-.venv/bin/python -m pytest tests/experimental/test_native_bf16_fp4.py -v
+.venv/bin/python -m pytest tests/gemm/test_native_bf16_fp4.py -v
 ```
 
 Use the existing benchmark harness for comparisons. Preparation and tuning

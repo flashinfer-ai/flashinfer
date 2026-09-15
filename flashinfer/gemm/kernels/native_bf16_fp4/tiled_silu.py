@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from ...utils import get_compute_capability, get_device_index
+from ....utils import get_compute_capability, get_device_index
 
 _COMPILED: dict[tuple, Any] = {}
 
@@ -17,8 +17,8 @@ def _compile(m, k, block, vector, enable_pdl):
     import cutlass.cute as cute
     from cutlass import Float32, Uint32
 
-    from ...cute_dsl import fp4_common
-    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from ....cute_dsl import fp4_common
+    from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
     @cute.jit
     def silu_float(value):

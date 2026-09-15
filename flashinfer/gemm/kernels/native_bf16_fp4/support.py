@@ -4,7 +4,7 @@
 
 import torch
 
-from ...utils import experimental_backend, supported_compute_capability
+from ....utils import supported_compute_capability
 
 
 def check_weights(b, b_descale, alpha, block_size=16):
@@ -36,7 +36,6 @@ def check_weights(b, b_descale, alpha, block_size=16):
     return n, k
 
 
-@experimental_backend
 @supported_compute_capability([120, 121])
 def check_native_bf16_fp4(
     a,

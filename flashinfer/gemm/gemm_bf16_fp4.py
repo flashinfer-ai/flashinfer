@@ -10,8 +10,8 @@ from typing import Literal, Optional, Tuple
 
 import torch
 
-from ..api_logging import flashinfer_api, warn_experimental_backend_once
-from ..experimental.native_bf16_fp4.support import check_native_bf16_fp4
+from ..api_logging import flashinfer_api
+from .kernels.native_bf16_fp4.support import check_native_bf16_fp4
 from ..trace.templates.gemm import mm_bf16_fp4_trace_dispatch
 from ..utils import (
     backend_requirement,
@@ -287,7 +287,7 @@ def prepare_bf16_fp4_weights(
             forward the returned tuple to :func:`flashinfer.mm_bf16_fp4`.
         backend: Identifier of a supported backend: ``"cudnn"``,
             ``"cute-dsl"``, ``"blackwell-native"``, or
-            ``"blackwell-tiled"``. The experimental ``"cute-dsl-native"``
+            ``"blackwell-tiled"``. The ``"cute-dsl-native"``
             backend returns the original canonical buffers without preparation.
         block_size: SF block size.  Always 16 for FP4.
 
@@ -323,10 +323,9 @@ def prepare_bf16_fp4_weights(
         if alpha.dtype != torch.float32:
             raise TypeError(f"alpha must be float32; got {alpha.dtype}")
     if backend == "cute-dsl-native":
-        from ..experimental.native_bf16_fp4.support import check_weights
+        from .kernels.native_bf16_fp4.support import check_weights
 
         check_weights(b, b_descale, alpha, block_size)
-        warn_experimental_backend_once("prepare_bf16_fp4_weights", backend)
         return b, b_descale, alpha
     if backend == "cudnn":
         from .gemm_bf16_fp4_cudnn import _prepare_cudnn
@@ -377,9 +376,10 @@ def mm_bf16_fp4(
 ) -> torch.Tensor:
     """BF16 x FP4 GEMM: ``out = (a @ dequant(b).T) * alpha``.
 
-    Intended to support **W4A16** workloads (4-bit weights, 16-bit activations)
-    nvfp4 weights must be prepared for ``backend`` by
-    :func:`prepare_bf16_fp4_weights`.  ``b``, ``b_descale``, and ``alpha``.
+    Supports **W4A16** workloads (4-bit weights, 16-bit activations).
+    Prepare weights for the selected backend with :func:`prepare_bf16_fp4_weights`.
+    The explicit ``cute-dsl-native`` backend needs no preparation: it accepts
+    canonical packed weights and 128x4-swizzled scales directly.
 
     Example:
         .. code-block:: python
@@ -415,7 +415,7 @@ def mm_bf16_fp4(
     """
     out_dtype = out_dtype or a.dtype
     if backend == "cute-dsl-native":
-        from ..experimental.native_bf16_fp4.runner import run
+        from .kernels.native_bf16_fp4.runner import run
 
         return run(a, b, b_descale, alpha, out_dtype, out, enable_pdl)
     if backend == "cudnn":

@@ -10,7 +10,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ...cute_dsl.fp4_common import (
+from ....cute_dsl.fp4_common import (
     f16x2_to_f32x2,
     fp4_decode_2,
     fp4_decode_4bytes,
