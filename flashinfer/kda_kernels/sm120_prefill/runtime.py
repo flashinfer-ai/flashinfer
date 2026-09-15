@@ -26,44 +26,42 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""The one thing ``decomp`` and ``fused`` share.
+"""Host-side runtime shared by the ``decomp`` and ``fused`` prefill variants.
 
-Both variants implement the same operation and neither can see the other, so
-anything they both consume has to live somewhere neither owns.  That is this
-module, and the bar for entering it is deliberately high: a helper belongs here
-only when both variants call it, it means the same thing to both, its lifetime
-is the same for both, and a unit test can pin it without a device kernel.
+Both variants implement the same operation and neither imports the other, so
+what they both consume on the host lives here:
 
-What that admits:
-
+* the shape constants and numeric floors of the contract, and the error type
+  both raise;
 * the canonical launch description and the shape/dtype/alias validation that
-  produces it, plus the error type both raise;
+  produces it;
 * the exact ``sm_120a`` target check, expressed through
   :mod:`flashinfer.cute_dsl.utils` and never by writing ``CUTE_DSL_ARCH``;
-* the bounded per-device cache, the capture probe, tensor identity, pinned
-  descriptor staging and the cache statistics -- the *containers*, not the
-  cache instances, which stay with the variant that keys them;
+* the bounded per-device cache, the capture probe, tensor identity and pinned
+  descriptor staging -- the *containers*, not the cache instances, which stay
+  with the variant that keys them;
 * canonical INT32 ``cu_seqlens``, the workspace resource slot, the graph
   stream/signature binding and the resource lifetime that goes with it;
 * the naming convention for :func:`~flashinfer.jit.build_and_load_cute_dsl_kernel`.
 
-What it excludes, and why the exclusion is not cosmetic: every layout, swizzle,
-TMA descriptor, PTX helper and device kernel.  The two variants have helpers
-with matching names -- both have a ``raw_bf16_s128``, both have a pairwise
-image -- and the images are not the same, because the shapes they index are
-not the same.  Hoisting one and letting the other call it would be a silent
-numerical change, so neither is hoisted.
-
-Nothing here imports ``decomp`` or ``fused``, and importing this module loads
-no device code and compiles nothing.
+Importing this module loads no device code, compiles nothing and does not
+import ``cutlass``: the facade and the public dispatcher must be able to
+answer "not eligible" on any host.  Device-side helpers the two variants share
+-- PTX wrappers, TMA loads and stores, shared-memory layout constants -- live
+in ``device_common.py``, which does import the CuTe DSL.  Layouts, swizzles,
+TMA descriptor construction and the kernels themselves stay with their
+variant: helpers with matching names in ``decomp`` and ``fused`` index
+different shapes, and hoisting one would be a silent numerical change.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import math
+import ctypes
 import os
 import threading
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -87,6 +85,15 @@ DV = 128
 
 #: log2(e).  The gate is evaluated in the log2 domain by both variants.
 LOG2_E = 1.4426950408889634
+
+#: Clamp on the gate's chunk prefix, in the log2 domain.  Here rather than in
+#: each variant because it is a numeric boundary of the contract, not a guard:
+#: both variants must apply the same floor, and one definition cannot drift.
+PREFIX_FLOOR = -126.0
+
+#: Floor on the Q/K L2 sum of squares before its reciprocal square root.
+#: Shared for the same reason as :data:`PREFIX_FLOOR`.
+NORM_FLOOR = 1.0e-24
 
 #: The safe gate's worst-case chunk prefix is ``16 * lower_bound * log2e``,
 #: which reaches the ``rcp.approx.ftz`` cliff at ``lower_bound == -5.4585``.
@@ -112,6 +119,17 @@ class KDAPrefillValidationError(ValueError):
     A ``ValueError`` subclass rather than a bare one so a caller can tell a
     contract violation from an unrelated failure, and so the public adapter in
     ``flashinfer/kda_prefill.py`` can let it propagate unchanged.
+
+    The line this draws, since both variants also raise plain ``ValueError``
+    and the split is not obvious from a count: this type is for what the
+    *caller* got wrong -- everything :func:`validate_inputs` checks, plus the
+    two cross-cutting checks a variant owns (``cu_seqlens`` disagreeing with
+    the state shapes, and ``safe_gate=False`` on ``decomp``).  A plain
+    ``ValueError`` is for an invariant of this backend's own construction: a
+    TMA spec it built itself, a workspace geometry, a derived grid extent, a
+    config object.  A well-formed call cannot reach one, so raising the
+    contract type there would tell a caller their inputs were bad when they
+    were not.
     """
 
 
@@ -122,17 +140,16 @@ class UnsupportedArchitectureError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Architecture and compile target.
 #
-# Two separate questions, and conflating them is how a report ends up naming a
-# target the artifact does not have:
+# Two separate questions, and both must hold:
 #
 #   1. is the *device* compute capability 12.0?
 #   2. can the installed CuTe DSL and CUDA toolkit compile and load ``sm_120a``
 #      natively -- not a family-conditional ``sm_120f`` fallback?
 #
-# Both must hold.  Neither is answered by mutating ``CUTE_DSL_ARCH``: the DSL
-# captures its default target when ``cutlass`` is first imported, so a write
-# here would not retarget an already-imported DSL, and a write before import
-# would change every other CuTe-DSL kernel in the process.
+# Neither is answered by mutating ``CUTE_DSL_ARCH``: the DSL captures its
+# default target when ``cutlass`` is first imported, so a write here would not
+# retarget an already-imported DSL, and a write before import would change
+# every other CuTe-DSL kernel in the process.
 # ---------------------------------------------------------------------------
 
 SM120_CAPABILITY = (12, 0)
@@ -210,17 +227,16 @@ def sm120a_compile_options(enable_tvm_ffi: bool = True) -> tuple:
 
     An explicit :class:`cute.GPUArch` rather than an environment variable, for
     the reason above.  ``EnableTVMFFI`` is not optional either: it selects the
-    argument-marshalling ABI, and the slow one costs about 4x of the host path.
+    argument-marshalling ABI, and the ctypes fallback is several times slower
+    to invoke.
 
     **These must be passed with ``cute.compile[options](...)``, not
-    ``cute.compile(..., options=options)``.** The keyword form accepts the
+    ``cute.compile(..., options=options)``.**  The keyword form accepts the
     tuple and silently ignores ``EnableTVMFFI``: it yields a
     ``CudaDialectJitCompiledFunction``, which marshals every argument through
     ``ctypes.addressof``, where the subscript form yields a
-    ``TVMFFIJitCompiledFunctionWithKwargs``. Measured on this backend, that
-    mistake cost 82 us of host time per call against 17.5 us -- invisible
-    against a 1 ms kernel and 4x the entire call at B=1 T=16 H=4.
-    :func:`assert_tvm_ffi_dispatched` exists so it cannot happen quietly again.
+    ``TVMFFIJitCompiledFunctionWithKwargs``.  The mistake produces no error,
+    only a slower call, so :func:`assert_tvm_ffi_dispatched` checks the result.
     """
     import cutlass.cute as cute
 
@@ -234,9 +250,8 @@ def assert_tvm_ffi_dispatched(compiled, kernel_name: str):
     """Refuse a compiled entry that fell back to the ctypes argument path.
 
     The fallback is not an error the DSL reports -- it produces a working
-    callable that is simply several times slower to invoke, which is the kind
-    of regression that gets attributed to the kernel months later. Checking the
-    type is cheap and happens once per specialization.
+    callable that is simply slower to invoke.  Checking the type is cheap and
+    happens once per specialization.
     """
     compiled_type = type(compiled)
     known_tvm_ffi_types = {
@@ -260,51 +275,33 @@ def assert_tvm_ffi_dispatched(compiled, kernel_name: str):
 # Persistent JIT.
 #
 # The op namespace is fixed and distinct from every other KDA entry point, so
-# a cross-implementation A/B cannot reuse another implementation's cached
-# artifact and misreport reuse as agreement.
+# this backend can never load another implementation's cached artifact.
 # ---------------------------------------------------------------------------
 
-#: Logical compile namespace.  Bumping the suffix invalidates every artifact.
-JIT_MODULE_NAME = "flashinfer-kda-prefill-sm120-v1"
-
-
-def _assert_cache_target_matches() -> None:
-    """The persistent cache's arch must be the one we asked ``cute`` for.
-
-    ``JitSpecCuteDsl`` derives its module directory and its ``meta.json`` arch
-    from ``CUTE_DSL_ARCH`` or the current device's capability.  We pass an
-    explicit ``GPUArch(sm_120a)``, so if those two ever disagree the artifact
-    on disk is named for one target and built for another -- the exact failure
-    the plan forbids.  Checking is cheap; guessing is not recoverable.
-    """
-    from ...jit.cute_dsl_core import _get_compile_arch
-
-    resolved = _get_compile_arch()
-    expected = SM120_CODE_TARGET.replace("_", "")
-    if resolved != expected:
-        raise UnsupportedArchitectureError(
-            f"the CuTe-DSL persistent cache resolves its target to "
-            f"{resolved!r} while this backend compiles for {expected!r}; "
-            f"refusing to write an artifact whose name does not describe it "
-            f"(unset CUTE_DSL_ARCH to let it follow the device)"
-        )
+#: Op-family name of the persistent cache module.  An identifier, like the
+#: other adopters' names, because it also prefixes the exported C symbol.
+JIT_MODULE_NAME = "kda_prefill_sm120"
 
 
 def _module_key_files() -> tuple:
     """Every source file whose content should invalidate this module.
 
-    All four package files, for both variants, and deliberately the *same*
-    tuple for every kernel in the namespace.  ``JitSpecCuteDsl`` writes one
+    Every package file, for both variants, and deliberately the *same* tuple
+    for every kernel in the namespace.  ``JitSpecCuteDsl`` writes one
     ``meta.json`` per module directory and wipes the directory whenever a
-    kernel arrives with a different source hash -- so passing each variant only
-    its own file made ``decomp`` and ``fused`` invalidate each other on every
-    alternation, which a benchmark sees as a recompile per switch and a
-    correctness A/B sees as a cold build every time.
+    kernel arrives with a different source hash, so kernels in one namespace
+    keyed on different files would invalidate each other.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     return tuple(
         os.path.join(here, name)
-        for name in ("runtime.py", "decomp.py", "fused.py", "__init__.py")
+        for name in (
+            "runtime.py",
+            "device_common.py",
+            "decomp.py",
+            "fused.py",
+            "__init__.py",
+        )
     )
 
 
@@ -318,21 +315,17 @@ def build_kernel(kernel_name: str, compile_fn, *, device, key_files=()):
     the module namespace, not of one kernel in it, so it always uses
     :func:`_module_key_files`.
 
-    Falls back to a plain in-process ``compile_fn()`` when the persistent path
-    raises.  That is a real possibility rather than defensive coding: whether
-    ``export_to_c`` can round-trip a given compiled object is a property of the
-    pinned CuTe DSL, not of this code.  When it cannot, the kernel still
-    compiles and still runs -- only the cross-process cache is lost, and
-    :func:`persistent_cache_status` says so rather than leaving a warning in a
-    log for someone to notice.
+    The cache infrastructure already degrades export and load failures to a
+    warning.  What can still escape it is a filesystem or lock problem with the
+    cache directory itself, and only that is caught here: the kernel is then
+    compiled in-process without caching, with a warning.  A compile error
+    propagates unchanged rather than being retried.
     """
-    # JitSpecCuteDsl derives its cache arch, loads the object module and runs a
-    # cold compile against the current CUDA context.  The public API accepts a
-    # tensor on a non-current device, so all three operations must happen under
-    # the input tensor's device guard rather than whichever device the caller
-    # happened to leave current.
+    # The object module is loaded and a cold compile runs against the current
+    # CUDA context.  The public API accepts a tensor on a non-current device,
+    # so both must happen under the input tensor's device guard rather than
+    # whichever device the caller happened to leave current.
     with torch.cuda.device(device):
-        _assert_cache_target_matches()
         from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
         del key_files
@@ -342,66 +335,19 @@ def build_kernel(kernel_name: str, compile_fn, *, device, key_files=()):
                 kernel_name,
                 compile_fn,
                 extra_key_files=_module_key_files(),
+                arch=SM120_CODE_TARGET,
             )
-        except Exception as exc:  # noqa: BLE001 -- see the docstring
-            _record_persistent_cache_failure(kernel_name, exc)
+        except OSError as exc:
+            from ...jit.core import logger
+
+            logger.warning(
+                "CuTe-DSL persistent cache unavailable for %s (%s: %s); "
+                "compiling in-process without caching",
+                kernel_name,
+                type(exc).__name__,
+                exc,
+            )
             return compile_fn()
-
-
-def persistent_cache_status() -> dict:
-    """Whether a compiled kernel can actually survive this process.
-
-    Reported rather than assumed, because on some pinned CuTe DSL releases it
-    cannot.  ``JitSpecCuteDsl`` exports with
-    ``export_to_c(path, function_name=...)`` and reloads the result as a
-    TVM-FFI callable; a DSL whose ``export_to_c`` takes
-    ``(file_path, file_name, function_prefix)`` and emits a plain C entry
-    satisfies neither half.  FlashInfer degrades gracefully when that happens
-    -- it keeps the in-process kernel and logs a warning -- so nothing breaks,
-    but every process pays a cold compile and no amount of reading the cache
-    directory reveals why.
-
-    ``supported`` is False exactly when the export signature does not match.
-    The check is static: it inspects the signature and compiles nothing.
-    """
-    status = {
-        "module": JIT_MODULE_NAME,
-        "supported": False,
-        "reason": "",
-        "failures": dict(_PERSISTENT_CACHE_FAILURES),
-    }
-    try:
-        import inspect
-
-        from cutlass.base_dsl.dsl import JitCompiledFunction
-
-        parameters = inspect.signature(JitCompiledFunction.export_to_c).parameters
-        if "function_name" in parameters:
-            status["supported"] = True
-        else:
-            status["reason"] = (
-                "the installed CuTe DSL exports with "
-                f"export_to_c{inspect.signature(JitCompiledFunction.export_to_c)}, "
-                "which FlashInfer's persistent CuTe-DSL cache does not call; "
-                "kernels compile in-process every run"
-            )
-    except Exception as exc:  # noqa: BLE001 -- reporting only
-        status["reason"] = f"could not inspect the DSL export API: {exc}"
-    return status
-
-
-_PERSISTENT_CACHE_FAILURES: "OrderedDict[str, str]" = OrderedDict()
-
-
-def _record_persistent_cache_failure(kernel_name: str, exc: BaseException) -> None:
-    _PERSISTENT_CACHE_FAILURES[kernel_name] = f"{type(exc).__name__}: {exc}"
-    while len(_PERSISTENT_CACHE_FAILURES) > 32:
-        _PERSISTENT_CACHE_FAILURES.popitem(last=False)
-
-
-def persistent_cache_unavailable_reason(kernel_name: str) -> Optional[str]:
-    """Why ``kernel_name`` fell back to an in-process compile, if it did."""
-    return _PERSISTENT_CACHE_FAILURES.get(kernel_name)
 
 
 # ---------------------------------------------------------------------------
@@ -429,16 +375,12 @@ def persistent_cache_unavailable_reason(kernel_name: str) -> Optional[str]:
 def capturing() -> bool:
     """Is the current stream inside a CUDA graph capture?
 
-    Both cross-stream primitives below are illegal there: ``cudaStreamWaitEvent``
-    on an event recorded outside the capture, and ``record_stream``, which is a
-    caching-allocator operation with no graph representation.  Either
-    invalidates the capture, and the failure surfaces later as "operation
-    failed due to a previous error during capture" rather than at the call.
-
-    Skipping them is correct, not a workaround.  A capture replays only work it
-    recorded, so an entry it reads was already live and reachable when the
-    capture began: there is no other stream to order against and no lifetime
-    for the allocator to extend.
+    The cache paths below skip their ``wait_event`` / ``record_stream`` pair
+    under capture; ``record_stream`` in particular is a caching-allocator
+    operation with no graph representation.  Skipping is correct, not a
+    workaround: a capture replays only work it recorded, so an entry it reads
+    was already live and reachable when the capture began -- there is no other
+    stream to order against and no lifetime for the allocator to extend.
     """
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
@@ -669,8 +611,6 @@ class IdentityCache:
         return None
 
     def put(self, tensor: torch.Tensor, value) -> None:
-        import weakref
-
         key = id(tensor)
 
         def _purge(_ref, _key=key):
@@ -693,13 +633,13 @@ class IdentityCache:
 # ---------------------------------------------------------------------------
 # Flat CuTe views of torch tensors, cached on the address they describe.
 #
-# Every launch converts its tensors with ``from_dlpack(t.reshape(-1))``, and at
-# ~5 us each that is tens of microseconds per launch on tensors whose addresses
-# have not moved.  The conversion is a pure function of (pointer, element
-# count, dtype, alignment), so keying on exactly those four is sound. With
+# Every launch converts its tensors with ``from_dlpack(t.reshape(-1))``, and
+# repeating that on tensors whose addresses have not moved is avoidable host
+# time.  The conversion is a pure function of (pointer, element count, dtype,
+# alignment), so keying on exactly those four is sound.  With
 # ``enable_tvm_ffi=True``, the CuTe view owns a TVM-FFI DLPack consumer object;
 # that object keeps the reshaped tensor's storage alive until the view is
-# evicted. The allocator therefore cannot recycle a live entry's address, and
+# evicted.  The allocator therefore cannot recycle a live entry's address, and
 # the LRU below bounds that retention.
 # ---------------------------------------------------------------------------
 
@@ -707,21 +647,15 @@ class IdentityCache:
 #: limit.  A forward touches ~25 tensors, so this holds several shapes' worth.
 #:
 #: One of three caches that can hold a buffer alive -- the others are the plan
-#: memo and :data:`MAX_ENTRIES` -- and any one of them is enough.  Measured:
-#: lowering this alone changes the retention by nothing at all, because the
-#: plan memo still has the tensors; the three only bind together.
+#: memo and :data:`MAX_ENTRIES` -- and any one of them is enough, so lowering
+#: this alone does not shorten the retention; the three only bind together.
 FLAT_VIEW_MAX_ENTRIES = 256
 
 _FLAT_VIEWS: "OrderedDict[tuple, Any]" = OrderedDict()
-_FLAT_STATS = {"hits": 0, "misses": 0}
 
-#: Held on the miss path only.  ``flat_view`` runs once per tensor per launch --
-#: five times before a kernel that can be nine microseconds long -- so a lock on
-#: the hit path is measurable where one on the miss path is not.  The hit path
-#: is two C-level dict operations, each atomic under the GIL: the worst a race
-#: can do there is evict an entry that was just touched, which costs one rebuild
-#: and no correctness.  ``_FLAT_STATS`` is advisory for the same reason; its
-#: increments are not atomic and are not read by anything that decides.
+#: Held on both paths.  ``get`` and ``move_to_end`` are each atomic under the
+#: GIL but not jointly: an eviction or ``clear_flat_views`` between them raises
+#: ``KeyError`` from ``move_to_end`` on an entry that was just hit.
 _FLAT_VIEWS_LOCK = threading.RLock()
 
 
@@ -731,9 +665,7 @@ def _require_tvm_ffi() -> None:
     The persistent cache reloads artifacts with
     ``load_module(..., enable_tvm_ffi=True)``, and the compiled entry rejects
     a view built without it (``'_Tensor' object has no attribute
-    '_tvm_ffi_tensor'``).  Falling back to the ctypes argument path would cost
-    ~3.3x of the host path silently, which is the kind of regression that gets
-    attributed to the kernel months later.
+    '_tvm_ffi_tensor'``), so a missing package is reported here instead.
     """
     if importlib.util.find_spec("tvm_ffi") is None:
         raise RuntimeError(
@@ -762,13 +694,11 @@ def flat_view(tensor: torch.Tensor, *, align: int = 16):
     from cutlass.cute.runtime import from_dlpack
 
     key = (tensor.data_ptr(), tensor.numel(), tensor.dtype, align)
-    hit = _FLAT_VIEWS.get(key)
-    if hit is not None:
-        _FLAT_VIEWS.move_to_end(key)
-        _FLAT_STATS["hits"] += 1
-        return hit
-
-    _FLAT_STATS["misses"] += 1
+    with _FLAT_VIEWS_LOCK:
+        hit = _FLAT_VIEWS.get(key)
+        if hit is not None:
+            _FLAT_VIEWS.move_to_end(key)
+            return hit
     _require_tvm_ffi()
     view = from_dlpack(tensor.reshape(-1), assumed_align=align, enable_tvm_ffi=True)
     # Under tvm-ffi the extent is part of the compiled entry's signature, so a
@@ -783,20 +713,15 @@ def flat_view(tensor: torch.Tensor, *, align: int = 16):
     return view
 
 
-def flat_view_stats() -> dict:
-    return dict(_FLAT_STATS, entries=len(_FLAT_VIEWS))
-
-
 def clear_flat_views() -> None:
     with _FLAT_VIEWS_LOCK:
         _FLAT_VIEWS.clear()
-        _FLAT_STATS.update(hits=0, misses=0)
 
 
 # ---------------------------------------------------------------------------
 # Capture-safe descriptor upload.
 #
-# A descriptor build copies from pageable host memory, which is a 0.0 us memcpy
+# A descriptor build copies from pageable host memory, which is harmless
 # outside a capture and fatal inside one:
 #
 #     RuntimeError: Cannot copy between CPU and CUDA tensors during CUDA graph
@@ -813,13 +738,13 @@ def clear_flat_views() -> None:
 #:
 #: The event is what makes the reuse safe.  A ``non_blocking`` copy out of
 #: pinned memory returns before the transfer runs -- it is queued behind
-#: whatever else is on the stream, which in a busy loop is milliseconds -- so
-#: refilling the buffer for the next descriptor build would overwrite bytes the
-#: DMA has not read yet, and the descriptor that reached the device would be a
-#: mix of two.  Two builds of one size is the common case rather than a corner:
-#: the sizes are a function of the descriptor count, so any two cold calls of
-#: the same shape collide.  Waiting here costs nothing a steady state pays,
-#: because a build is a cache miss only.
+#: whatever else is on the stream -- so refilling the buffer for the next
+#: descriptor build would overwrite bytes the DMA has not read yet, and the
+#: descriptor that reached the device would be a mix of two.  Two builds of one
+#: size is the common case rather than a corner: the sizes are a function of
+#: the descriptor count, so any two cold calls of the same shape collide.
+#: Waiting here costs nothing a steady state pays, because a build is a cache
+#: miss only.
 _PINNED_STAGING: dict = {}
 _PINNED_STAGING_LOCK = threading.RLock()
 
@@ -910,9 +835,8 @@ def is_exact_alias(x: Optional[torch.Tensor], y: Optional[torch.Tensor]) -> bool
     )
 
 
-# Moved here from the decomposed variant: both variants have to check their
-# grid against the device, so the helper that asks the driver belongs with
-# the other shared device queries rather than inside one of them.
+# Both variants check their grid against the device limits, so the driver query
+# lives here with the other shared device queries.
 _GRID_LIMITS: dict[int, tuple[int, int]] = {}
 
 
@@ -920,7 +844,7 @@ def max_grid_dims(device: torch.device) -> tuple[int, int]:
     """``(maxGridSize[0], maxGridSize[1])`` for ``device``.
 
     ``torch.cuda.get_device_properties`` does not expose the grid limits, so
-    this goes to the driver, and caches: plan Section 9.2 runs the check on
+    this goes to the driver.  The result is cached because the check runs on
     every launch, before anything is allocated.
     """
     index = torch.cuda.current_device() if device.index is None else device.index
@@ -1102,13 +1026,12 @@ def check_flat_output_range(total_tokens: int, heads: int) -> None:
       view of the output crosses into the compiled entry, so it needs the
       *count* to fit -- one more than the largest index.
 
-    The second is the binding one, and it was measured rather than assumed: at
-    exactly 2**31 elements the DSL raises ``OverflowError: Value overflow:
-    2147483648 exceeds range of l`` out of ``build_memref_desc``, which names
-    neither the tensor nor the shape that caused it.  So the count is the
-    bound, and both failures are refused here where the shape is still in hand:
-    the wrapped index would write far below the buffer without saying anything,
-    and the DSL error arrives at compile time with nothing a caller can act on.
+    The second is the binding one: at 2**31 elements the DSL raises
+    ``OverflowError`` out of ``build_memref_desc``, naming neither the tensor
+    nor the shape that caused it.  So the count is the bound, and both failures
+    are refused here where the shape is still in hand: the wrapped index would
+    write far below the buffer without saying anything, and the DSL error
+    arrives at compile time with nothing a caller can act on.
     """
     elements = total_tokens * heads * DV
     if elements > INT32_MAX:
@@ -1468,13 +1391,6 @@ def canonical_offsets(
     return validate_packed_offsets(cu_seqlens, total_tokens)
 
 
-def offsets_cache_stats(device) -> dict:
-    return {
-        "packed": _PACKED_OFFSETS.stats(device),
-        "fixed": _FIXED_OFFSETS.stats(device),
-    }
-
-
 def clear_offsets_caches() -> None:
     _PACKED_OFFSETS.clear()
     _FIXED_OFFSETS.clear()
@@ -1635,10 +1551,9 @@ class SM120PrefillResources:
 def current_stream_ptr(device: Optional[torch.device] = None) -> int:
     """The current CUDA stream's raw handle.
 
-    Only ever compared, never dereferenced.  ``torch.cuda.current_stream()``
-    builds a Stream object through five Python frames, which is measurable once
-    the rest of the host path is memoized, so the raw accessor is used where
-    this torch provides it.
+    Only ever compared, never dereferenced.  The raw accessor is used where
+    this torch provides it because ``torch.cuda.current_stream()`` constructs
+    a ``Stream`` object, which is avoidable overhead on a memoized host path.
     """
     if not torch.cuda.is_available():
         return 0
@@ -1662,21 +1577,14 @@ NO_VERSION = object()
 def tensor_version(tensor: torch.Tensor):
     """``tensor._version``, or :data:`NO_VERSION` where it does not exist.
 
-    Reading ``_version`` on an inference tensor raises ``RuntimeError:
-    Inference tensors do not track version counter``, and ``inference_mode`` is
-    how serving actually calls this backend -- so a cache that reads it
-    unguarded works in a benchmark and fails in production.
-
-    The consequence is worth stating rather than hiding. The version guards
-    against an in-place edit at an unchanged address; without it, a cached
-    entry for such a tensor cannot be invalidated by content. For the
-    activations that does not matter: a call plan is a function of addresses,
-    shapes and dtypes, and their contents are *expected* to change between
-    calls. It matters for ``cu_seqlens``, whose values are read on the host --
-    so under ``inference_mode`` those values are a caller contract, exactly as
-    they already are for the SM100-family backend. A caller who refills an
-    offsets buffer in place must either use a different buffer or call
-    ``clear_kda_prefill_sm120_caches()``.
+    Reading ``_version`` on a tensor created under ``torch.inference_mode()``
+    raises ``RuntimeError: Inference tensors do not track version counter``,
+    so the read is guarded.  Without a version an entry cannot be invalidated
+    by an in-place write at an unchanged address.  That is harmless for the
+    activations, whose contents are expected to change between calls, but
+    ``cu_seqlens`` is read on the host: under ``inference_mode`` a caller who
+    refills an offsets buffer in place must use a different buffer or call
+    ``clear_kda_prefill_sm120_caches()``, as for the SM100-family backend.
     """
     try:
         return tensor._version
@@ -1737,58 +1645,335 @@ def clear_shared_caches() -> None:
     clear_pinned_staging()
 
 
+# ---------------------------------------------------------------------------
+# Per-variant call memo and plan execution.
+# ---------------------------------------------------------------------------
+
+#: Marks a call with no tokens (or no chunks), so the zero-work path is reached
+#: on a memo hit without re-deriving the metadata that proves it.
+STATE_ONLY_PLAN = object()
+
+#: One entry per distinct set of buffers a caller uses; a serving loop that
+#: reuses its activations needs exactly one.  A ceiling on how many rotating
+#: buffer sets stay fast, not a memory budget: below it the retained memory is
+#: the same whatever the value, and above it a hit becomes a plan rebuild.
+CALL_PLAN_MAX_ENTRIES = 16
+
+
+def state_only(initial_state, final_state) -> None:
+    """The zero-work path: no launch, only the state ABI is left to honour."""
+    if final_state is None:
+        return
+    if initial_state is None:
+        final_state.zero_()
+        return
+    if is_exact_alias(initial_state, final_state):
+        return
+    final_state.copy_(initial_state)
+
+
+def execute(plan, initial_state, final_state) -> None:
+    """Run an already-resolved plan.
+
+    Split from the lookup so the facade, which keeps its own memo on the same
+    tensor identities, does not repeat the comparison to find the plan again.
+    """
+    if plan is STATE_ONLY_PLAN:
+        state_only(initial_state, final_state)
+        return
+    plan.run()
+
+
+class PlanMemo:
+    """Two-level memo from a call's tensors to its launch plan, one per variant.
+
+    :meth:`fast_path` recognises the previous call by object identity and
+    version without building a key; :meth:`get` and :meth:`remember_plan` are
+    the bounded LRU behind it, keyed on :func:`tensor_identity`.  Neither level
+    holds a caller's tensors: the fast path keeps weak references and the LRU
+    keys on identity tuples.  What an entry does retain is its plan, and a plan
+    retains the buffers its descriptors and views address.  ``build_lock``
+    serializes the miss path: plan construction, descriptor encoding and the
+    compile behind it are not re-entrant, and the two memo levels in front of
+    it mean a warm caller never takes it.  The LRU methods take the same lock,
+    so a ``clear`` cannot land between a lookup and its ``move_to_end``.
+    """
+
+    def __init__(self, max_entries: int = CALL_PLAN_MAX_ENTRIES) -> None:
+        self.max_entries = max_entries
+        self.plans: "OrderedDict[tuple, Any]" = OrderedDict()
+        #: ``(weakrefs, versions, scalars, resource token, stream, plan)`` of
+        #: the previous call, or ``None``.
+        self.last: Optional[tuple] = None
+        self.build_lock = threading.RLock()
+
+    def identity(self, device, tensors, scalars: tuple, resources) -> tuple:
+        # The stream of the *inputs'* device: a plan bakes that device's current
+        # stream into its argument tuple, so keying on the current device's
+        # stream would let two streams on the inputs' device share one entry.
+        return (
+            tuple(tensor_identity(t) for t in tensors),
+            scalars,
+            resource_cache_token(resources),
+            current_stream_ptr(device),
+        )
+
+    def fast_path(self, device, tensors, scalars: tuple, resources):
+        """The previous call's plan if this call is identical to it, else ``None``."""
+        last = self.last
+        if last is None:
+            return None
+        last_tensors, last_versions, last_scalars, last_resources, last_stream, plan = (
+            last
+        )
+        if last_scalars != scalars:
+            return None
+        if last_resources is not resource_cache_token(resources):
+            return None
+        if last_stream != current_stream_ptr(device):
+            return None
+        if len(last_tensors) != len(tensors):
+            return None
+        for ref, tensor in zip(last_tensors, tensors, strict=True):
+            if ref is None:
+                if tensor is not None:
+                    return None
+            elif ref() is not tensor:
+                return None
+        for tensor, version in zip(tensors, last_versions, strict=True):
+            if tensor is not None and tensor_version(tensor) != version:
+                return None
+        return plan
+
+    def remember(self, device, tensors, scalars: tuple, resources, plan) -> None:
+        self.last = (
+            tuple(None if t is None else weakref.ref(t) for t in tensors),
+            tuple(None if t is None else tensor_version(t) for t in tensors),
+            scalars,
+            resource_cache_token(resources),
+            current_stream_ptr(device),
+            plan,
+        )
+
+    def get(self, key):
+        with self.build_lock:
+            plan = self.plans.get(key)
+            if plan is not None:
+                self.plans.move_to_end(key)
+            return plan
+
+    def remember_plan(self, key, plan) -> None:
+        with self.build_lock:
+            self.plans[key] = plan
+            while len(self.plans) > self.max_entries:
+                self.plans.popitem(last=False)
+
+    def clear(self) -> None:
+        with self.build_lock:
+            self.plans.clear()
+            self.last = None
+
+
+# ---------------------------------------------------------------------------
+# TMA descriptors.
+# ---------------------------------------------------------------------------
+
+#: Bytes of one ``CUtensorMap``.
+DESCRIPTOR_BYTES = 128
+
+_TMA_DTYPES = {
+    torch.bfloat16: "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+    torch.float32: "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
+}
+_TMA_SWIZZLES = {
+    "128B": "CU_TENSOR_MAP_SWIZZLE_128B",
+    "NONE": "CU_TENSOR_MAP_SWIZZLE_NONE",
+}
+_TMA_INTERLEAVES = {"NONE": "CU_TENSOR_MAP_INTERLEAVE_NONE"}
+_TMA_L2_PROMOTIONS = {"128B": "CU_TENSOR_MAP_L2_PROMOTION_L2_128B"}
+_TMA_OOB_FILLS = {"NONE": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"}
+
+
+@dataclass(frozen=True)
+class TensorMapSpec:
+    """One descriptor's complete ``cuTensorMapEncodeTiled`` configuration.
+
+    Two roles that produce equal specs are the same descriptor, so both
+    variants deduplicate on equality.  Only the fields below vary between
+    roles; the encoder's remaining arguments are fixed by the contract and are
+    carried so the cache key and the equality test cover them.
+    """
+
+    dtype: torch.dtype
+    base: int
+    global_dims: tuple[int, ...]
+    global_stride_bytes: tuple[int, ...]
+    box_dims: tuple[int, ...]
+    element_strides: tuple[int, ...] = (1, 1, 1)
+    interleave: str = "NONE"
+    swizzle: str = "128B"
+    l2_promotion: str = "128B"
+    oob_fill: str = "NONE"
+
+    @property
+    def rank(self) -> int:
+        return len(self.global_dims)
+
+    @property
+    def element_size(self) -> int:
+        return self.dtype.itemsize
+
+    @property
+    def box_bytes(self) -> int:
+        n = 1
+        for b in self.box_dims:
+            n *= b
+        return n * self.element_size
+
+    def key(self, device) -> tuple:
+        """Full cache key: device plus every encoder field."""
+        index = device.index if isinstance(device, torch.device) else device
+        return (
+            index,
+            self.base,
+            self.dtype,
+            self.rank,
+            self.global_dims,
+            self.global_stride_bytes,
+            self.box_dims,
+            self.element_strides,
+            self.interleave,
+            self.swizzle,
+            self.l2_promotion,
+            self.oob_fill,
+        )
+
+    def validate(self) -> None:
+        """Check what the driver will not.
+
+        The driver rejects some of this itself, but with an error that names a
+        parameter index rather than a role, and it accepts a misaligned global
+        base outright; the corruption from that shows up as wrong numbers in
+        one head, far from here.
+        """
+        if self.rank != 3:
+            raise ValueError(f"TMA rank must be 3, got {self.rank}")
+        if self.base % GLOBAL_BASE_ALIGN:
+            raise ValueError(
+                f"TMA global base must be {GLOBAL_BASE_ALIGN}-byte aligned, "
+                f"got {self.base:#x}"
+            )
+        if any(d <= 0 for d in self.global_dims):
+            raise ValueError(
+                f"TMA global dims must be positive, got {self.global_dims}"
+            )
+        if len(self.global_stride_bytes) != self.rank - 1:
+            raise ValueError(
+                "TMA global strides cover dimensions 1..rank-1 only, got "
+                f"{len(self.global_stride_bytes)} for rank {self.rank}"
+            )
+        for s in self.global_stride_bytes:
+            if s <= 0 or s % GLOBAL_BASE_ALIGN:
+                raise ValueError(
+                    f"TMA global strides must be positive and "
+                    f"{GLOBAL_BASE_ALIGN}-byte aligned, got {self.global_stride_bytes}"
+                )
+        if len(self.box_dims) != self.rank:
+            raise ValueError(f"TMA box must have rank {self.rank}")
+        if any(not 1 <= b <= 256 for b in self.box_dims):
+            raise ValueError(
+                f"TMA box extents must be in [1, 256], got {self.box_dims}"
+            )
+        if self.dtype not in _TMA_DTYPES:
+            raise ValueError(f"unsupported TMA element type {self.dtype}")
+        if self.swizzle not in _TMA_SWIZZLES:
+            raise ValueError(
+                f"swizzle must be one of {tuple(_TMA_SWIZZLES)}, got {self.swizzle!r}"
+            )
+        inner_bytes = self.box_dims[0] * self.element_size
+        if self.swizzle == "128B" and inner_bytes != 128:
+            raise ValueError(
+                f"a 128B-swizzled inner box must be exactly 128 bytes, got {inner_bytes}"
+            )
+        if self.swizzle == "NONE" and (inner_bytes % 16 or inner_bytes > 512):
+            raise ValueError(
+                f"an unswizzled inner box must be a multiple of 16 bytes and at most "
+                f"512, got {inner_bytes}"
+            )
+
+    def encode(self) -> bytes:
+        """Encode this spec as its :data:`DESCRIPTOR_BYTES` raw bytes."""
+        import cuda.bindings.driver as drv
+
+        self.validate()
+        err, tmap = drv.cuTensorMapEncodeTiled(
+            getattr(drv.CUtensorMapDataType, _TMA_DTYPES[self.dtype]),
+            self.rank,
+            self.base,
+            [drv.cuuint64_t(d) for d in self.global_dims],
+            [drv.cuuint64_t(s) for s in self.global_stride_bytes],
+            [drv.cuuint32_t(b) for b in self.box_dims],
+            [drv.cuuint32_t(e) for e in self.element_strides],
+            getattr(drv.CUtensorMapInterleave, _TMA_INTERLEAVES[self.interleave]),
+            getattr(drv.CUtensorMapSwizzle, _TMA_SWIZZLES[self.swizzle]),
+            getattr(drv.CUtensorMapL2promotion, _TMA_L2_PROMOTIONS[self.l2_promotion]),
+            getattr(drv.CUtensorMapFloatOOBfill, _TMA_OOB_FILLS[self.oob_fill]),
+        )
+        if int(err) != 0:
+            raise RuntimeError(f"cuTensorMapEncodeTiled failed: {err}")
+        # cuda-python wraps the descriptor, so take its address via getPtr().
+        return bytes(ctypes.string_at(tmap.getPtr(), DESCRIPTOR_BYTES))
+
+
+def descriptor_cache_key(specs: dict, device, roles) -> tuple:
+    """Cache key of a role -> spec map: every encoder field of every role."""
+    return tuple((role, specs[role].key(device)) for role in roles if role in specs)
+
+
 __all__ = [
-    "DK",
-    "DV",
-    "GLOBAL_BASE_ALIGN",
-    "GRAPH_PINS",
-    "INT32_MAX",
-    "JIT_MODULE_NAME",
-    "LOG2_E",
-    "LOWER_BOUND_RANGE",
-    "MAX_ENTRIES",
-    "READ_ONLY_ROLES",
-    "SM120_CAPABILITY",
-    "SM120_CODE_TARGET",
+    "assert_tvm_ffi_dispatched",
     "BoundedDeviceCache",
-    "CacheStats",
-    "CanonicalInputs",
-    "CanonicalOffsets",
-    "GraphResourcePins",
-    "IdentityCache",
-    "KDAPrefillValidationError",
-    "SM120PrefillResources",
-    "UnsupportedArchitectureError",
     "build_kernel",
     "canonical_offsets",
     "capturing",
-    "check_tma_base_alignment",
-    "clear_flat_views",
+    "check_flat_output_range",
     "clear_offsets_caches",
     "clear_pinned_staging",
     "clear_shared_caches",
-    "check_flat_output_range",
     "current_stream_ptr",
-    "fixed_offsets",
+    "DESCRIPTOR_BYTES",
+    "descriptor_cache_key",
+    "DK",
+    "DV",
+    "execute",
     "flat_view",
-    "flat_view_stats",
+    "GLOBAL_BASE_ALIGN",
+    "GRAPH_PINS",
+    "IdentityCache",
+    "INT32_MAX",
     "intervals_overlap",
     "is_exact_alias",
-    "offsets_cache_stats",
-    "persistent_cache_status",
-    "persistent_cache_unavailable_reason",
-    "record_stream_once",
-    "resource_cache_token",
-    "require_sm120a",
-    "sm120a_available",
-    "assert_tvm_ffi_dispatched",
-    "sm120a_compile_options",
-    "storage_interval",
-    "NO_VERSION",
+    "KDAPrefillValidationError",
+    "LOG2_E",
     "max_grid_dims",
+    "NO_VERSION",
+    "NORM_FLOOR",
+    "PlanMemo",
+    "PREFIX_FLOOR",
+    "record_stream_once",
+    "require_sm120a",
+    "resource_cache_token",
+    "SM120_CODE_TARGET",
+    "sm120a_available",
+    "sm120a_compile_options",
+    "SM120PrefillResources",
+    "STATE_ONLY_PLAN",
+    "storage_interval",
     "tensor_identity",
     "tensor_layout_identity",
     "tensor_version",
+    "TensorMapSpec",
+    "UnsupportedArchitectureError",
     "upload_bytes",
     "validate_inputs",
     "validate_packed_offsets",

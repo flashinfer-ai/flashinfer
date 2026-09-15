@@ -523,18 +523,15 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
         # The SM120 backend's per-workspace state, created on first use by
-        # ``_sm120_prefill_resources``. A Cake-only caller carries this one
-        # ``None`` field and never imports CuTe DSL; composing rather than
-        # subclassing keeps ``RecurrentKDAPrefillWorkspace`` the single public
-        # workspace type while letting each backend own the buffers only it
-        # understands.
+        # ``_sm120_prefill_resources``.  Composed rather than subclassed so
+        # ``RecurrentKDAPrefillWorkspace`` stays the single public workspace
+        # type while each backend owns the buffers only it understands; a
+        # Cake-only caller carries one ``None`` field and never imports CuTe DSL.
         self._sm120_state: Optional[object] = None
-        #: Guards the creation of ``_sm120_state``.  Two threads reaching a
-        #: workspace's first SM120 call would otherwise both read ``None`` and
-        #: both construct: one assignment wins and the loser runs against an
-        #: orphan with its own lock, its own scratch and its own capture flag,
-        #: so nothing serializes the launch sequence, device memory doubles,
-        #: and a capture is recorded where no one will look for it.
+        #: Guards the creation of ``_sm120_state``: two threads reaching a
+        #: workspace's first SM120 call must not each construct one, since the
+        #: loser would run against an orphan with its own lock, scratch and
+        #: capture flag.
         self._sm120_state_lock = threading.Lock()
 
 
@@ -7156,32 +7153,39 @@ def _run_sm120_kda_prefill(
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
 
     def _resolve_final_state():
-        """The public state contract, applied here rather than in the backend.
+        """Apply the public state contract; returns ``(final_state, is_private)``.
 
         The backend's ABI is the kernels' own -- ``initial_state`` read,
-        ``final_state`` written, the exact alias between them allowed -- and the
-        public promise is a different one: a supplied initial state is updated
-        in place, whether or not a final state was requested. Aliasing the two
-        is how that promise is kept, and doing it here preserves the backend's
-        direct validation ABI.
+        ``final_state`` written, the exact alias between them allowed -- while
+        the public promise is that a supplied initial state is updated in place
+        whether or not a final state was requested.  Aliasing the two here is
+        how that promise is kept.  ``is_private`` says this call allocated the
+        buffer for itself, which lets the backend keep its call memo warm across
+        a buffer that is a new object every time.
 
         Callable rather than a value because the workspace branch resolves it
         under ``resources.lock``: the middle case can *replace* workspace-owned
-        scratch, and doing that outside the hold that guards the spent flag lets
-        a second thread drop the buffer a first thread's live graph reads at its
-        captured address.
+        scratch, which must not happen outside the hold that guards the spent
+        flag.
         """
         if initial_state is not None:
-            return initial_state
+            return initial_state, False
         if output_final_state:
-            return _sm120_final_state_scratch(
+            state = _sm120_final_state_scratch(
                 num_sequences, q.shape[2], q.device, resources
             )
+            # Without a workspace that is a fresh buffer on every call, existing
+            # only to be written and then handed back.  The backend has to key
+            # its call memo on the address rather than on the object, or every
+            # such call misses and rebuilds its plan.  The workspace branch
+            # returns one stable buffer and needs no such licence.
+            return state, resources is None
         # Nothing to store: the kernels skip the state write entirely rather
         # than filling a buffer the caller will not read.
-        return None
+        return None, False
 
-    def _launch(final_state):
+    def _launch(resolved):
+        final_state, final_state_is_private = resolved
         run(
             q=q,
             k=k,
@@ -7194,6 +7198,7 @@ def _run_sm120_kda_prefill(
             lower_bound=float(lower_bound),
             initial_state=initial_state,
             final_state=final_state,
+            final_state_is_private=final_state_is_private,
             cu_seqlens=cu_seqlens,
             output=out,
             resources=resources,
@@ -7205,18 +7210,14 @@ def _run_sm120_kda_prefill(
 
     if resources is None:
         # Refuse capture here, at the outermost adapter, rather than relying on
-        # the guards further down.  Those sit on cache *misses* -- the
-        # device-to-host read for cu_seqlens, the canonical-offsets allocation
-        # -- so a warm cache walks straight past them and the capture succeeds.
-        #
-        # It must not.  Without an explicit workspace, the descriptors and
-        # scratch a capture records belong to a bounded LRU, and the graph holds
-        # their raw addresses.  Nothing pins them: the next distinct shape can
-        # evict the entry, and clear_kda_prefill_sm120_caches() drops it
-        # outright.  Replay then reads freed memory, arbitrarily far from the
-        # call that captured it, and the symptom is wrong output rather than an
-        # error.  An explicit workspace is what makes those addresses the
-        # caller's to keep alive.
+        # the guards further down: those sit on cache *misses* (the
+        # device-to-host read for cu_seqlens, the canonical-offsets allocation),
+        # so a warm cache walks straight past them.  Without an explicit
+        # workspace the descriptors and scratch a capture records belong to a
+        # bounded LRU: the next distinct shape can evict them and
+        # clear_kda_prefill_sm120_caches() drops them outright, after which
+        # replay reads freed memory and the symptom is wrong output rather than
+        # an error.
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "CUDA graph capture of the SM120 KDA prefill backend requires "
@@ -7230,15 +7231,10 @@ def _run_sm120_kda_prefill(
     # The workspace serializes its own launch sequence: the decomposed variant
     # enqueues two kernels that share one scratch arena, and two host threads
     # interleaving those pairs would have the second prepare overwrite factors
-    # the first recurrence has not read yet.
-    #
-    # One hold covers the spent check, the scratch resolution and the launch.
-    # Split, they race each other: a thread that read ``captured`` as False can
-    # replace ``state_scratch`` after another thread's capture has recorded the
-    # old buffer's address, and two threads wanting different state shapes can
-    # each install their own, leaving the loser holding a ``final_state`` the
-    # workspace no longer owns. The backend re-checks the flag, which orders the
-    # launches, but it cannot undo a replacement that already happened.
+    # the first recurrence has not read yet.  One hold covers the spent check,
+    # the scratch resolution and the launch; split, a thread that read
+    # ``captured`` as False could replace ``state_scratch`` after another
+    # thread's capture recorded the old buffer's address.
     with resources.lock:
         if resources.captured:
             raise RuntimeError(
